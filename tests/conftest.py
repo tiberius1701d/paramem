@@ -196,10 +196,10 @@ def donor_checkpoint_cache(model_and_tokenizer, tmp_path):
     under ``tests/fixtures/sandbox/data/ha/adapters`` (gitignored) and
     copies it into the test's own ``tmp_path`` donor directory before the
     test runs, so :meth:`~paramem.training.consolidation.ConsolidationLoop
-    ._maybe_seed_from_donor` finds a valid checkpoint on first look.
+    ._resolve_donor_checkpoint` finds a valid checkpoint on first look.
 
     Both the cache path and the destination path are derived through the
-    SAME production primitives ``_maybe_seed_from_donor`` itself uses
+    SAME production primitives ``_resolve_donor_checkpoint`` itself uses
     (:func:`~paramem.training.donor.donor_store_dir` for the path,
     :func:`~paramem.training.donor.donor_checkpoint_valid` for the gate) --
     this fixture never re-derives the topology id or the validity rule.
@@ -213,7 +213,7 @@ def donor_checkpoint_cache(model_and_tokenizer, tmp_path):
     ``base_model_id`` is read from the real loaded model
     (``model.config._name_or_path``), mirroring
     ``self.model.get_base_model().config._name_or_path`` in
-    ``_maybe_seed_from_donor`` (this fixture's model is the plain,
+    ``_resolve_donor_checkpoint`` (this fixture's model is the plain,
     not-yet-PEFT-wrapped base model, so no ``get_base_model()`` unwrap is
     needed).
 

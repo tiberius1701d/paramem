@@ -12,9 +12,9 @@ Also pins the GPU-lock topology of the shared extraction stage
 - eviction always happens INSIDE the lock (``lock_held=True``);
 - the interim tick passes ``lock_held=False`` — the stage acquires the lock
   itself and releases it on return, so every interim restore (no-facts,
-  simulate, replay-disabled, and the ExtractionFailed abort) runs OUTSIDE the
-  lock (``lock_held=False``); the post-training restore inside the BG worker
-  is the one exception (``lock_held=True`` — the worker holds the lock);
+  simulate, and the ExtractionFailed abort) runs OUTSIDE the lock
+  (``lock_held=False``); the post-training restore inside the BG worker is
+  the one exception (``lock_held=True`` — the worker holds the lock);
 - the full cycle's consume-pending pre-stage passes ``lock_held=True`` — it
   already runs under the BackgroundTrainer worker's lock, so the stage must
   NOT acquire (the lock is non-reentrant: a second acquisition deadlocks the
@@ -55,7 +55,6 @@ def _make_loop_no_qa():
     """Loop that returns empty QA so the no-facts early exit fires."""
     loop = MagicMock()
     loop.shutdown_requested = False
-    loop.config.indexed_key_replay = True
     loop.config.consolidation.mode = "train"
     # extract_session returns empty lists — no QA extracted.
     loop.extract_session.return_value = ([], [])
@@ -124,7 +123,7 @@ def _make_state_patch(pending, config, target_profile="gpu"):
         "tokenizer": MagicMock(),
         "consolidation_loop": None,
         # MemoryStore is lifespan-owned; threaded through to create_consolidation_loop.
-        "memory_store": _MS(replay_enabled=False),
+        "memory_store": _MS(),
         "ha_client": None,
         "speaker_store": None,
         "consolidating": True,
@@ -380,6 +379,251 @@ def test_interim_extraction_failed_abort_restores_voice_outside_lock(tmp_path):
     )
 
 
+def test_train_mode_with_relations_reaches_training_dispatch_before_marking_consolidated(
+    tmp_path,
+):
+    """Extracted relations in train mode must reach the background-training
+    submit — sessions are never marked consolidated without one.
+
+    Regression pin: a since-deleted scheduled-tick branch extracted content,
+    skipped training entirely, and still called ``mark_consolidated``,
+    silently discarding session content with nothing learned. This proves
+    ``_extract_and_start_training`` always reaches ``_run_stage_b_cycle``
+    (the background-training dispatch) when there are extracted relations to
+    train on, and does not call ``mark_consolidated`` itself before that
+    dispatch — only the dispatched training body (``_run_interim_training``,
+    passed as ``body``) may retire sessions, and it only runs once the
+    background trainer actually executes it.
+    """
+    import paramem.server.app as app_module
+
+    pending = _make_pending(source_type="transcript", n=1)
+    config = _make_config(mode="train", tmp_path=tmp_path)
+
+    with _patch_extract_training(pending, config, target_profile="gpu") as (
+        mock_profile,
+        mock_buffer,
+    ):
+        loop = _make_loop_no_qa()
+        # Non-empty extraction result — bypasses the no-facts early exit.
+        loop.extract_session.return_value = (
+            [{"subject": "s", "predicate": "p", "object": "o"}],
+            [],
+        )
+        with (
+            patch("paramem.server.app.create_consolidation_loop", return_value=loop),
+            patch("paramem.server.app._run_stage_b_cycle") as mock_stage_b,
+        ):
+            app_module._extract_and_start_training()
+
+    mock_stage_b.assert_called_once()
+    assert mock_stage_b.call_args.kwargs["body"] is not None, (
+        "training dispatch must submit a training body — a call with no body "
+        "would mean nothing was actually trained"
+    )
+    mock_buffer.mark_consolidated.assert_not_called()
+
+
+def test_interim_noop_staging_retires_extracted_sessions_exactly_once(tmp_path):
+    """An interim tick whose staging pass finds nothing to stage (the
+    no-ledger ``"noop"`` outcome, ``adapter_name`` ``None``) must still
+    retire the sessions the pre-stage successfully extracted, via the
+    shared ``_retire_extracted_sessions`` -- no ledger was ever written for
+    that outcome, so the finalizer's own ledger-based retirement
+    (``_retire_ledger_sessions_and_dispose``) has nothing to read.  The
+    fallback itself runs INSIDE the returned finalizer (``_finalize_interim``,
+    fed by the *extraction* the dispatch site bound into it) rather than
+    inside ``body`` -- the finalizer must actually be called to observe it.
+    Without this fallback the sessions would re-extract on every tick
+    forever.
+    """
+    import paramem.server.app as app_module
+    from paramem.training import stage_ledger as sl
+
+    pending = _make_pending(source_type="transcript", n=1)
+    config = _make_config(mode="train", tmp_path=tmp_path)
+
+    with _patch_extract_training(pending, config, target_profile="gpu") as (
+        mock_profile,
+        mock_buffer,
+    ):
+        mock_buffer.retirable.side_effect = lambda raw: sorted(raw)
+
+        loop = _make_loop_no_qa()
+        # Non-empty extraction result — bypasses the no-facts early exit.
+        loop.extract_session.return_value = (
+            [{"subject": "s", "predicate": "p", "object": "o"}],
+            [],
+        )
+        # The exact shape run_consolidation_cycle's own staged-nothing
+        # branch returns: no ledger was ever written for this outcome.
+        loop.run_consolidation_cycle.return_value = {
+            "triples_extracted": 1,
+            "new_keys": [],
+            "adapter_name": None,
+            "mode": "noop",
+            "venue": "train",
+            "error": None,
+            "completed": False,
+        }
+
+        with (
+            patch("paramem.server.app.create_consolidation_loop", return_value=loop),
+            patch("paramem.server.app._run_stage_b_cycle") as mock_stage_b,
+        ):
+            app_module._extract_and_start_training()
+
+        mock_stage_b.assert_called_once()
+        body = mock_stage_b.call_args.kwargs["body"]
+        cycle_mode, finalizer = body(loop, MagicMock())
+        assert cycle_mode == "noop"
+
+        # The no-ledger retirement fallback now runs inside the shared
+        # finalizer (_finalize_interim) itself, fed by the *extraction* the
+        # dispatch site bound into it -- not inside `body` -- so the
+        # finalizer must actually run to observe it.
+        finalizer()
+
+    mock_buffer.mark_consolidated.assert_called_once()
+    retired_ids = mock_buffer.mark_consolidated.call_args.args[0]
+    assert retired_ids == ["sid-0"], f"expected the extracted session retired; got {retired_ids}"
+    assert sl.read_ledger(tmp_path / "state") is None, (
+        "the no-staging outcome must leave no pending record behind"
+    )
+
+
+def test_simulate_mode_with_relations_retires_sessions_and_disposes_the_ledger(tmp_path):
+    """A successful simulate tick must retire its sessions AND dispose the
+    event's ledger — not just retire.
+
+    A first-run simulate dispatch runs the same event-kind finalizer
+    (``_finalize_interim``) a resumed interim event uses, whatever the
+    venue — never a separate hand-rolled finalizer.  That shared finalizer
+    routes retirement AND disposal through
+    ``_retire_ledger_sessions_and_dispose``, which reads the ledger fresh
+    and calls ``stage_ledger.dispose`` -- the one path-only disposal
+    implementation.  An earlier, now-deleted simulate-only finalizer once
+    retired sessions directly from the app-layer extraction tracker without
+    ever disposing the ledger, 409'ing every consolidation door as
+    ``consolidation_pending`` until a later dispatch burned the already-
+    finished tick as a resume; the shared finalizer this test now exercises
+    cannot regress that way, since disposal is part of the one retirement
+    path every caller shares.
+    """
+    import paramem.server.app as app_module
+    from tests._fold_fixtures import _make_loop
+
+    pending = _make_pending(source_type="transcript", n=1)
+    config = _make_config(mode="simulate", tmp_path=tmp_path)
+    config.consolidation.training_temp_limit = 0  # ThermalPolicy disabled
+    config.consolidation.max_interim_count = 7
+    config.consolidation.refresh_cadence = ""
+
+    with _patch_extract_training(pending, config, target_profile="gpu") as (
+        mock_profile,
+        mock_buffer,
+    ):
+        # retirable() is the document-atomic gate; pass sessions through so
+        # completed_session_ids (now the source _await_bg_cycle threads into
+        # run_consolidation_cycle's session_ids kwarg) returns a real list,
+        # not a bare MagicMock's default empty iteration.
+        mock_buffer.retirable.side_effect = lambda ids: sorted(ids)
+
+        # A real loop (real GraphMerger/MemoryStore) -- simulate mode runs
+        # stage_event/run_build_and_publish for real, no PEFT/GPU fakes
+        # needed (the simulate venue never touches a model).
+        loop = _make_loop(tmp_path)
+
+        def _fake_extract_session(transcript, session_id, speaker_id, **kwargs):
+            loop.merger.graph.add_edge(
+                "alex",
+                "berlin",
+                predicate="lives in",
+                relation_type="factual",
+                sessions=[session_id],
+            )
+            loop.merger.graph.nodes["alex"]["speaker_id"] = speaker_id
+            return (
+                [
+                    {
+                        "subject": "alex",
+                        "predicate": "lives in",
+                        "object": "berlin",
+                        "session_ids": [session_id],
+                    }
+                ],
+                [],
+            )
+
+        loop.extract_session = MagicMock(side_effect=_fake_extract_session)
+
+        with patch("paramem.server.app.create_consolidation_loop", return_value=loop):
+            app_module._extract_and_start_training()
+
+    mock_buffer.mark_consolidated.assert_called_once()
+    assert not (loop._fold_state_dir / "stage_ledger.json").exists(), (
+        "a successful simulate tick must dispose its own ledger, not leave it "
+        "pending for the next dispatch to wrongly resume"
+    )
+
+
+def test_simulate_noop_staging_retires_extracted_sessions_exactly_once(tmp_path):
+    """A simulate tick whose staging pass finds nothing to stage (the
+    no-ledger ``"noop"`` outcome, ``adapter_name`` ``None``) must still
+    retire the sessions the pre-stage successfully extracted, via the
+    shared ``_retire_extracted_sessions`` -- the one no-ledger fallback
+    call site, inside ``_finalize_interim`` itself (the same finalizer the
+    train-venue interim tick and a resumed interim event use).  No ledger
+    was ever written for that outcome, so the finalizer's own ledger-based
+    retirement (``_retire_ledger_sessions_and_dispose``) has nothing to
+    read.  Without this the sessions would re-extract on every tick
+    forever, exactly the interim regression this mirrors.
+    """
+    import paramem.server.app as app_module
+
+    pending = _make_pending(source_type="transcript", n=1)
+    config = _make_config(mode="simulate", tmp_path=tmp_path)
+    config.consolidation.training_temp_limit = 0  # ThermalPolicy disabled
+    config.consolidation.max_interim_count = 7
+    config.consolidation.refresh_cadence = ""
+
+    with _patch_extract_training(pending, config, target_profile="gpu") as (
+        mock_profile,
+        mock_buffer,
+    ):
+        mock_buffer.retirable.side_effect = lambda raw: sorted(raw)
+
+        loop = _make_loop_no_qa()
+        loop.config.consolidation.mode = "simulate"
+        # Non-empty extraction result — bypasses the no-facts early exit.
+        loop.extract_session.return_value = (
+            [{"subject": "s", "predicate": "p", "object": "o"}],
+            [],
+        )
+
+        # The exact shape run_consolidation_cycle's own staged-nothing
+        # branch returns: no ledger was ever written for this outcome.
+        noop_result = {
+            "triples_extracted": 1,
+            "new_keys": [],
+            "adapter_name": None,
+            "mode": "noop",
+            "venue": "simulate",
+            "error": None,
+            "completed": False,
+        }
+
+        with (
+            patch("paramem.server.app.create_consolidation_loop", return_value=loop),
+            patch("paramem.server.app._await_bg_cycle", return_value=noop_result),
+        ):
+            app_module._extract_and_start_training()
+
+    mock_buffer.mark_consolidated.assert_called_once()
+    retired_ids = mock_buffer.mark_consolidated.call_args.args[0]
+    assert retired_ids == ["sid-0"], f"expected the extracted session retired; got {retired_ids}"
+
+
 # ---------------------------------------------------------------------------
 # Tests — the shared extraction stage (_extract_pending_sessions)
 # ---------------------------------------------------------------------------
@@ -550,6 +794,31 @@ def test_consume_pending_evicts_and_restores_voice_inside_worker_lock(tmp_path):
     ]
     # Extraction succeeded (no facts after dedup) → the session retires.
     mock_buffer.mark_consolidated.assert_called_once()
+
+
+def test_consume_pending_training_abort_never_retires_sessions(tmp_path):
+    """Consume-pending: a training abort (yield-to-inference / graceful
+    shutdown) mid-bundle must NOT retire sessions -- only the honest
+    no-facts noop may.
+
+    Regression pin: both outcomes reach the app layer with
+    ``tiers_rebuilt=[]`` (the driver publishes nothing either way), but an
+    abort means nothing was actually learned from the extracted content --
+    retiring the session here would be an unrecoverable loss (plaintext
+    transcript gone, nothing encoded, and /reconsolidate rebuilds from
+    stored knowledge, which never received this content either).
+    """
+    config = _make_config(tmp_path=tmp_path)
+    config.consolidation.max_interim_count = 0  # consume-pending mode
+    config.consolidation.mode = "train"
+
+    loop = _make_loop_no_qa()
+    loop.consolidate.return_value = {"tiers_rebuilt": [], "aborted": True}
+
+    outcome, profile_calls, mock_buffer = _run_consume_pending_cycle(config, loop)
+
+    assert outcome == "aborted"
+    mock_buffer.mark_consolidated.assert_not_called()
 
 
 def test_consume_pending_abort_restores_voice_and_returns_extraction_failed(tmp_path):

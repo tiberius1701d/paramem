@@ -45,7 +45,7 @@ def _make_config(tmp_path: Path, max_total_disk_gb: float = 1.0) -> ServerConfig
     config.security = SecurityConfig(
         backups=ServerBackupsConfig(
             schedule="daily 04:00",
-            artifacts=["config", "graph", "registry"],
+            artifacts=["snapshot_bundle"],
             max_total_disk_gb=max_total_disk_gb,
         )
     )
@@ -53,21 +53,37 @@ def _make_config(tmp_path: Path, max_total_disk_gb: float = 1.0) -> ServerConfig
 
 
 def _make_loop(graph_bytes: bytes, tmp_path: Path) -> MagicMock:
-    """Return a mock ConsolidationLoop with output_dir set and episodic/graph.json on disk.
+    """Return a mock ConsolidationLoop with output_dir set and a REAL written
+    simulate slot bound to an empty registry under ``episodic/``.
 
-    Preflight reads the on-disk ``output_dir/episodic/graph.json`` via
-    ``read_maybe_encrypted`` rather than calling ``loop.merger.save_bytes()``
-    (which serialises an empty in-memory graph after the cycle's finally-block reset).
-    The test fixture writes ``graph_bytes`` to the file so the preflight
-    estimate equals ``len(graph_bytes)`` for the graph contribution.
+    Preflight reads the BOUND slot's ``graph.json`` via ``read_maybe_encrypted``
+    (resolved through ``find_live_slot(episodic_root, tier_registry_sha256(episodic_root))``)
+    rather than calling ``loop.merger.save_bytes()`` (which serialises an
+    empty in-memory graph after the cycle's finally-block reset) or reading a
+    bare tier-root path (nothing writes one any more). The fixture writes
+    *graph_bytes* verbatim as the slot's payload through the same promotion
+    sequence production uses (:func:`~paramem.adapters.slot.write_slot`), so
+    the preflight estimate equals ``len(graph_bytes)`` for the graph
+    contribution -- binding to the empty-registry convention
+    (``registry_sha256=""``) since no registry file is written here.
 
     The assertion in each test must match ``len(graph_bytes)`` (the on-disk
     length returned by ``read_maybe_encrypted``), NOT ``loop.merger.save_bytes()``.
     """
+    from paramem.adapters.manifest import graph_payload_manifest
+    from paramem.adapters.slot import write_slot
+
     loop = MagicMock()
-    graph_path = tmp_path / "episodic" / "graph.json"
-    graph_path.parent.mkdir(parents=True, exist_ok=True)
-    graph_path.write_bytes(graph_bytes)
+    episodic_root = tmp_path / "episodic"
+    episodic_root.mkdir(parents=True, exist_ok=True)
+    manifest = graph_payload_manifest(
+        name="episodic", key_count=0, registry_sha256="", window_stamp=""
+    )
+    write_slot(
+        episodic_root,
+        manifest=manifest,
+        write_payload=lambda pending: (pending / "graph.json").write_bytes(graph_bytes),
+    )
     loop.output_dir = str(tmp_path)
     return loop
 
@@ -92,7 +108,7 @@ class TestPreFlightPassCleanStore:
             loop=_make_loop(b"{}", tmp_path),
             backups_root=backups_root,
             live_config_path=live_config,
-            registry_path=None,
+            adapter_dir=None,
         )
 
         assert isinstance(result, PreFlightCheck)
@@ -129,7 +145,7 @@ class TestPreFlightFailsAtOverCap:
             loop=None,
             backups_root=backups_root,
             live_config_path=live_config,
-            registry_path=None,
+            adapter_dir=None,
         )
 
         assert result.fail_code == "disk_pressure"
@@ -144,7 +160,7 @@ class TestPreFlightFailsAtOverCap:
 
 class TestPreFlightCloudOnlyLoopNone:
     def test_preflight_cloud_only_loop_none(self, tmp_path: Path) -> None:
-        """loop=None → graph contribution = 0; config + registry still summed."""
+        """loop=None → graph contribution = 0; config + per-tier bookkeeping still summed."""
         config = _make_config(tmp_path, max_total_disk_gb=10.0)
         backups_root = tmp_path / "backups"
         backups_root.mkdir(parents=True, exist_ok=True)
@@ -152,18 +168,19 @@ class TestPreFlightCloudOnlyLoopNone:
         live_config = tmp_path / "server.yaml"
         live_config.write_bytes(b"model: mistral\n")
 
-        registry = tmp_path / "registry.json"
-        registry.write_bytes(b'{"keys": []}')
+        adapter_dir = tmp_path / "adapters"
+        (adapter_dir / "episodic").mkdir(parents=True)
+        (adapter_dir / "episodic" / "key_metadata.json").write_bytes(b'{"keys": []}')
 
         result = compute_pre_flight_check(
             server_config=config,
             loop=None,
             backups_root=backups_root,
             live_config_path=live_config,
-            registry_path=registry,
+            adapter_dir=adapter_dir,
         )
 
-        # estimate = config_bytes + 0 (no graph) + registry_bytes
+        # estimate = config_bytes + 0 (no graph) + per-tier key_metadata.json bytes
         assert result.estimate_bytes == len(b"model: mistral\n") + len(b'{"keys": []}')
         assert result.fail_code is None  # well under 10 GB cap
 
@@ -175,7 +192,7 @@ class TestPreFlightCloudOnlyLoopNone:
 
 class TestPreFlightNoRegistryFile:
     def test_preflight_no_registry_file(self, tmp_path: Path) -> None:
-        """registry_path absent → registry contribution = 0."""
+        """No per-tier key_metadata.json on disk → registry contribution = 0."""
         config = _make_config(tmp_path, max_total_disk_gb=10.0)
         backups_root = tmp_path / "backups"
         backups_root.mkdir(parents=True, exist_ok=True)
@@ -183,17 +200,18 @@ class TestPreFlightNoRegistryFile:
         live_config = tmp_path / "server.yaml"
         live_config.write_bytes(b"model: mistral\n")
 
-        missing_registry = tmp_path / "no_such_file.json"
+        adapter_dir = tmp_path / "adapters"
+        adapter_dir.mkdir(parents=True)  # exists, but no tier carries key_metadata.json
 
         result = compute_pre_flight_check(
             server_config=config,
             loop=_make_loop(b"graph_bytes", tmp_path),
             backups_root=backups_root,
             live_config_path=live_config,
-            registry_path=missing_registry,
+            adapter_dir=adapter_dir,
         )
 
-        # estimate = config_bytes + on-disk graph_bytes + 0 (missing registry).
+        # estimate = config_bytes + on-disk graph_bytes + 0 (no key_metadata.json).
         # _make_loop writes graph_bytes to output_dir/episodic/graph.json;
         # read_maybe_encrypted returns exactly those bytes.
         expected = len(b"model: mistral\n") + len(b"graph_bytes")
@@ -238,16 +256,16 @@ class TestPreFlightPropagatesReadErrors:
                 loop=loop,
                 backups_root=backups_root,
                 live_config_path=live_config,
-                registry_path=None,
+                adapter_dir=None,
             )
 
     def test_preflight_raises_when_graph_unreadable(self, tmp_path: Path) -> None:
         """read_maybe_encrypted on graph.json raising propagates — no partial estimate.
 
-        Preflight reads graph bytes from output_dir/episodic/graph.json via
-        read_maybe_encrypted instead of loop.merger.save_bytes(). When that read
-        fails (e.g. PermissionError), the failure must propagate rather than be
-        counted as a 0-byte contribution.
+        Preflight reads graph bytes from the episodic tier's BOUND slot
+        graph.json via read_maybe_encrypted instead of loop.merger.save_bytes().
+        When that read fails (e.g. PermissionError), the failure must
+        propagate rather than be counted as a 0-byte contribution.
         """
         config = _make_config(tmp_path, max_total_disk_gb=10.0)
         backups_root = tmp_path / "backups"
@@ -256,11 +274,17 @@ class TestPreFlightPropagatesReadErrors:
         live_config = tmp_path / "server.yaml"
         live_config.write_bytes(b"model: mistral\n")
 
-        # Write a valid graph.json so output_dir/episodic/graph.json exists,
-        # then simulate a PermissionError on its read_bytes call.
+        # Write a valid graph.json so the episodic tier's bound slot carries
+        # one, then simulate a PermissionError on its read_bytes call.
         loop_dir = tmp_path / "loop_dir"
         loop = _make_loop(b'{"nodes":[],"links":[]}', loop_dir)
-        graph_path = loop_dir / "episodic" / "graph.json"
+        slot_dirs = [
+            p
+            for p in (loop_dir / "episodic").iterdir()
+            if p.is_dir() and not p.name.startswith(".")
+        ]
+        assert len(slot_dirs) == 1
+        graph_path = slot_dirs[0] / "graph.json"
 
         original_read_bytes = Path.read_bytes
 
@@ -278,11 +302,11 @@ class TestPreFlightPropagatesReadErrors:
                 loop=loop,
                 backups_root=backups_root,
                 live_config_path=live_config,
-                registry_path=None,
+                adapter_dir=None,
             )
 
     def test_preflight_raises_when_registry_unreadable(self, tmp_path: Path) -> None:
-        """PermissionError reading the registry file propagates — no partial estimate."""
+        """PermissionError reading a per-tier key_metadata.json propagates — no partial estimate."""
         config = _make_config(tmp_path, max_total_disk_gb=10.0)
         backups_root = tmp_path / "backups"
         backups_root.mkdir(parents=True, exist_ok=True)
@@ -290,7 +314,9 @@ class TestPreFlightPropagatesReadErrors:
         live_config = tmp_path / "server.yaml"
         live_config.write_bytes(b"model: mistral\n")
 
-        registry = tmp_path / "registry.json"
+        adapter_dir = tmp_path / "adapters"
+        (adapter_dir / "episodic").mkdir(parents=True)
+        registry = adapter_dir / "episodic" / "key_metadata.json"
         registry.write_bytes(b'{"keys": []}')
 
         original_read_bytes = Path.read_bytes
@@ -309,7 +335,7 @@ class TestPreFlightPropagatesReadErrors:
                 loop=None,
                 backups_root=backups_root,
                 live_config_path=live_config,
-                registry_path=registry,
+                adapter_dir=adapter_dir,
             )
 
     def test_preflight_raises_when_disk_usage_scan_fails(self, tmp_path: Path) -> None:
@@ -333,12 +359,12 @@ class TestPreFlightPropagatesReadErrors:
                 loop=None,
                 backups_root=backups_root,
                 live_config_path=live_config,
-                registry_path=None,
+                adapter_dir=None,
             )
 
     def test_preflight_raises_when_encrypted_component_unreadable(self, tmp_path: Path) -> None:
         """An age-encrypted artifact with no daily identity loaded raises — every
-        component present (config, graph, registry) but none is estimated."""
+        component present (config, graph, per-tier bookkeeping) but none is estimated."""
         config = _make_config(tmp_path, max_total_disk_gb=10.0)
         backups_root = tmp_path / "backups"
         backups_root.mkdir(parents=True, exist_ok=True)
@@ -346,8 +372,9 @@ class TestPreFlightPropagatesReadErrors:
         live_config = tmp_path / "server.yaml"
         live_config.write_bytes(b"model: mistral\n")
 
-        registry = tmp_path / "registry.json"
-        registry.write_bytes(b'{"keys": []}')
+        adapter_dir = tmp_path / "adapters"
+        (adapter_dir / "episodic").mkdir(parents=True)
+        (adapter_dir / "episodic" / "key_metadata.json").write_bytes(b'{"keys": []}')
 
         loop = _make_loop(b'{"nodes":[],"links":[]}', tmp_path)
 
@@ -363,7 +390,7 @@ class TestPreFlightPropagatesReadErrors:
                 loop=loop,
                 backups_root=backups_root,
                 live_config_path=live_config,
-                registry_path=registry,
+                adapter_dir=adapter_dir,
             )
 
 
@@ -394,7 +421,7 @@ class TestPreFlightRejectsUnmeasurableCap:
                 loop=None,
                 backups_root=backups_root,
                 live_config_path=live_config,
-                registry_path=None,
+                adapter_dir=None,
             )
 
     def test_preflight_raises_when_config_none(self, tmp_path: Path) -> None:
@@ -410,5 +437,5 @@ class TestPreFlightRejectsUnmeasurableCap:
                 loop=None,
                 backups_root=backups_root,
                 live_config_path=live_config,
-                registry_path=None,
+                adapter_dir=None,
             )

@@ -9,24 +9,32 @@ and the system retains the source mode on next boot.
 State file location: ``<paths.adapters>/.active_store_migration.json``
 (age-encrypted via ``write_infra_bytes`` when the daily identity is loaded).
 
-Under the unified layout (2026-05-16), ``graph.json`` lives at
-``<adapter_dir>/<tier>/graph.json`` in **both** train and simulate modes.
-The distinction between modes is whether adapter weight slot subdirectories
-(containing ``adapter_model.safetensors``) exist alongside the graph.
+Both venues write into the same shape: a fresh timestamped slot directory
+under the tier root (``<adapter_dir>/<tier>/<ts>/``), written through the
+shared slot envelope (:func:`~paramem.adapters.slot.write_slot`) — a train
+slot carries ``adapter_model.safetensors``, a simulate slot carries
+``graph.json``. The bound slot for a tier is resolved the same way in
+either venue: :func:`~paramem.adapters.manifest.find_live_slot` against
+:func:`~paramem.adapters.manifest.tier_registry_sha256`. The distinction
+between modes is which payload kind the bound slot's manifest declares
+(``manifest.payload.kind``), never a flat filename check at the tier root.
 
 Two directions:
 
-* ``simulate_to_train``: read ``<adapter_dir>/<name>/graph.json`` →
-  train into a staging slot → recall probe the staged weights at
+* ``simulate_to_train``: read the tier's bound simulate slot's ``graph.json``
+  → train into a staging slot → recall probe the staged weights at
   ``loop.config.recall_sanity_threshold`` → on pass, promote into
-  ``<name>`` and atomic-save the slot. On fail, ``<name>`` is never
-  touched (it stays at LoRA-zero) and the graph is left intact.
+  ``<name>`` and durably commit the tier slot (weights, bookkeeping, and
+  registry, in that order) via :func:`~paramem.memory.persistence.commit_tier_slot`.
+  On fail, ``<name>`` is never touched (it stays at LoRA-zero) and the source
+  simulate slot is left intact.
 
-* ``train_to_simulate``: verify ``<adapter_dir>/<name>/graph.json`` exists
-  and covers all active keys; reconstruct from weights if missing →
-  delete all timestamped weight slot subdirs under the resolved slot root
-  (graph.json and registries are preserved). On fail, remove any
-  freshly-written graph.json and leave the adapter slots intact.
+* ``train_to_simulate``: resolve the tier's bound train slot; when no bound
+  simulate slot already covers the current active keys, reconstruct the
+  graph from weights and write it into a fresh simulate slot through the same
+  envelope the train venue uses → delete the train weight slot(s). On fail,
+  nothing is written (the sanity check runs before the write, not after — see
+  :func:`_migrate_tier_train_to_simulate`) and the train slot is left intact.
 
 Per-store failures are recorded in the state file but do not abort the
 remaining stores — the operator can re-trigger to retry.
@@ -45,13 +53,14 @@ that were loaded at boot.  Do not change ``detect_mode_switch`` to inspect
 interim dirs — it would produce false positives on partially-consolidated
 systems.
 
-``_has_tier_graph`` walks subdirectories so interim simulate-mode graph.json
-files under ``<adapter_dir>/<tier>/interim_<stamp>/`` are detected correctly.
+``detect_mode_switch`` classifies each main tier's payload by reading its
+bound slot's manifest (``payload.kind``, via ``find_live_slot`` +
+``read_manifest``) — never a sibling interim slot's own bound slot, since
+each main tier's bound slot is resolved against that tier's own root.
 """
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import shutil
@@ -167,30 +176,12 @@ def clear_state(adapter_dir: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _has_tier_graph(adapter_dir: Path, tier: str) -> bool:
-    """Return True when a per-tier ``graph.json`` exists under the unified layout.
-
-    Under the unified layout graph.json lives at
-    ``<adapter_dir>/<tier>/graph.json`` for both simulate and train modes.
-    In simulate mode, interim cycles write graph.json under
-    ``<adapter_dir>/<tier>/interim_<stamp>/graph.json`` — those subdirectory
-    files count as well.
-
-    Walks the tier directory tree so both the main-slot file and any
-    interim simulate-mode slot files are detected.
-    """
-    tier_root = Path(adapter_dir) / tier
-    if not tier_root.is_dir():
-        return False
-    return any(tier_root.rglob("graph.json"))
-
-
 def _has_adapter_registry(adapter_dir: Path, tier: str) -> bool:
     """Return True when a per-tier indexed_key_registry.json exists for *tier*.
 
     The canonical layout is ``<adapter_dir>/<tier>/indexed_key_registry.json``.
-    This is the commit signal written last by ``_save_adapters``: its presence
-    on disk means all preceding adapter files are complete.
+    This is the commit signal written last by ``commit_tier_slot``: its
+    presence on disk means all preceding adapter files are complete.
     """
     return (Path(adapter_dir) / tier / "indexed_key_registry.json").exists()
 
@@ -202,16 +193,33 @@ def detect_mode_switch(config: "ServerConfig") -> Optional[MigrationState]:
 
     1. If a state file exists, return it (migration was started, possibly
        interrupted, must be resumed before inference is consistent).
-    2. Otherwise compare disk contents to the operator's yaml ``mode``:
+    2. Otherwise compare each main tier's actual on-disk payload — resolved
+       via its own bound slot
+       (:func:`~paramem.adapters.manifest.find_live_slot` against
+       :func:`~paramem.adapters.manifest.tier_registry_sha256`, read back
+       via :func:`~paramem.adapters.manifest.read_manifest`'s
+       ``payload.kind``; a main tier with no bound slot contributes ``None``,
+       and a bound slot is always resolved against that tier's own root, so
+       a sibling interim slot's payload never satisfies it) — to the
+       operator's yaml ``mode``:
 
-       * ``mode=train`` and graph.json present but adapter registry absent
-         → ``simulate_to_train`` migration is needed.
-       * ``mode=simulate`` and adapter registry present but graph.json absent
-         → ``train_to_simulate`` migration is needed.
+       * ``mode=train`` and a main tier carries a ``"simulate"`` payload but
+         none carries ``"train"`` → ``simulate_to_train`` migration is needed.
+       * ``mode=simulate`` and a main tier carries a ``"train"`` payload but
+         none carries ``"simulate"`` → ``train_to_simulate`` migration is
+         needed.
 
     Returns ``None`` when the active store is consistent with the mode
     (no migration needed).
     """
+    from paramem.adapters.manifest import (
+        ManifestNotFoundError,
+        ManifestSchemaError,
+        find_live_slot,
+        read_manifest,
+        tier_registry_sha256,
+    )
+
     existing = load_state(config.adapter_dir)
     if existing is not None:
         return existing
@@ -220,8 +228,23 @@ def detect_mode_switch(config: "ServerConfig") -> Optional[MigrationState]:
     if target_mode not in ("simulate", "train"):
         return None  # unsupported mode — let upstream complain
 
-    simulate_present = any(_has_tier_graph(config.adapter_dir, t) for t in TIERS)
-    adapter_present = any(_has_adapter_registry(config.adapter_dir, t) for t in TIERS)
+    adapter_dir = Path(config.adapter_dir)
+    payload_kinds: list["str | None"] = []
+    for t in TIERS:
+        tier_root = adapter_dir / t
+        bound = find_live_slot(tier_root, tier_registry_sha256(tier_root))
+        kind: "str | None" = None
+        if bound is not None:
+            try:
+                kind = read_manifest(bound).payload.kind
+            except (ManifestNotFoundError, ManifestSchemaError):
+                # Race: meta.json removed/corrupted between find_live_slot's
+                # scan and this read — treat as no bound payload, same as
+                # slot=None, rather than raising out of a detection pass.
+                kind = None
+        payload_kinds.append(kind)
+    simulate_present = "simulate" in payload_kinds
+    adapter_present = "train" in payload_kinds
 
     if target_mode == "train" and simulate_present and not adapter_present:
         return MigrationState.for_mode_switch(source_mode="simulate", target_mode="train")
@@ -256,6 +279,16 @@ def migrate(
     cleanly (``state.all_tiers_done(registered_tiers)``) — only then is the
     state file removed and the source-side artifacts deleted.
 
+    This migration is content-PRESERVING (it re-encodes the same keys in
+    the other venue, never replacing what a pending event derived
+    against), so it requires a coherent tree: when a consolidation event's
+    stage ledger is still pending, this function refuses outright — see
+    the ``RuntimeError`` below — before touching the state file, so the
+    pending record, its extraction tree, and all scratch stay exactly as
+    they were and the effective mode is not flipped.  A pending event must
+    resume to completion (publishing per its own ledger's recorded venue)
+    before a migration can run against the tree it leaves behind.
+
     Raises:
         RuntimeError: When ``loop.store.tiers_with_registry()`` returns an
             empty list BUT on-disk source content exists.  This indicates that
@@ -266,6 +299,13 @@ def migrate(
             effective mode — a silent data-loss path.  The state file is NOT
             cleared so the migration stays pending and is surfaced on retry
             after the operator resolves the corrupt registry.
+        RuntimeError: When a consolidation event's stage ledger is still
+            pending.  Raised before ``save_state`` runs, so a first-time
+            mode-switch trigger never even creates the migration state
+            file — the caller resumes the pending event (``POST
+            /consolidate`` resumes it; the schedule otherwise resumes it
+            on its own next dispatch) and this function is called again
+            once the tree is coherent.
 
     Returns the updated state.
     """
@@ -275,10 +315,12 @@ def migrate(
 
     if not registered_tiers:
         adapter_dir = Path(config.adapter_dir)
-        disk_has_content = (
-            any(_has_adapter_registry(adapter_dir, t) for t in TIERS)
-            or any(_has_tier_graph(adapter_dir, t) for t in TIERS)
-            or any(True for _ in iter_interim_dirs(adapter_dir))
+        # No separate payload-sniff check: any main tier carrying either
+        # venue's payload also carries a registry file (both commit
+        # primitives write the registry last, as the commit signal), so
+        # _has_adapter_registry already corroborates disk content on its own.
+        disk_has_content = any(_has_adapter_registry(adapter_dir, t) for t in TIERS) or any(
+            True for _ in iter_interim_dirs(adapter_dir)
         )
         if disk_has_content:
             raise RuntimeError(
@@ -288,6 +330,24 @@ def migrate(
             )
         # Legitimately empty store (fresh install, no keys, no on-disk content):
         # fall through — all_tiers_done([]) is vacuously True, state cleared.
+
+    # This migration retrains and rewrites every main tier's weight slot and
+    # registry (below) -- content-PRESERVING, not content-replacing, so a
+    # pending consolidation event's ledger cannot be discarded to make room
+    # for it (that rule is reserved for operations that replace the content
+    # the event derived against, e.g. a snapshot-bundle restore or a
+    # base-swap rollback).  Refuse instead, path-only, before ``save_state``
+    # below so a first-time mode-switch trigger never creates the migration
+    # state file over a tree that is not yet coherent.
+    from paramem.training import stage_ledger as _sl
+
+    _sl_state_dir = _sl.data_state_dir(config.paths.data)
+    if _sl.read_ledger(_sl_state_dir) is not None:
+        raise RuntimeError(
+            "active-store migration: a pending consolidation event must complete "
+            "before the store migration can run — POST /consolidate resumes it, "
+            "or the schedule will on its own next dispatch"
+        )
 
     save_state(config.adapter_dir, state)  # ensure file exists at start
 
@@ -332,9 +392,12 @@ def migrate(
 def _delete_weight_slots(slot_root: Path) -> int:
     """Delete adapter weight-slot subdirectories under *slot_root*.
 
-    A weight slot is a subdirectory containing ``adapter_model.safetensors`` or
-    ``adapter_config.json``.  ``graph.json`` and ``indexed_key_registry.json``
-    at the slot-root top level are preserved.
+    A weight slot is a subdirectory containing ``adapter_model.safetensors``
+    or ``adapter_config.json``. A simulate-payload slot (its ``graph.json``
+    lives inside its OWN timestamped subdirectory, never at *slot_root*'s
+    top level — nothing writes a tier-root ``graph.json`` any more) never
+    matches this predicate and is preserved, as is ``indexed_key_registry.json``
+    at *slot_root*'s top level.
     Returns the number of slots removed.
     """
     deleted = 0
@@ -350,100 +413,137 @@ def _delete_weight_slots(slot_root: Path) -> int:
     return deleted
 
 
+def _delete_orphaned_simulate_slots(slot_root: Path, *, keep: Path) -> int:
+    """Delete simulate-payload slot subdirectories under *slot_root* other
+    than *keep* — the simulate→train crash-resume cleanup mirror of
+    :func:`_delete_weight_slots`.
+
+    On crash between the train-slot commit and the old simulate slot's
+    delete (:func:`_migrate_tier_simulate_to_train`'s step 7→8), a resumed
+    retry's ``find_live_slot`` binds the already-committed TRAIN slot —
+    the stale simulate slot is invisible to that resolution but still on
+    disk as a sibling directory. This sweeps it, mirroring
+    :func:`_migrate_tier_train_to_simulate`'s own resume behaviour (which
+    always runs its weight-slot cleanup after the already-written branch,
+    never short-circuits without it).
+
+    A slot is identified by its OWN manifest's ``payload.kind`` (venue-blind
+    resolution, never a filename sniff) so this only ever removes a
+    simulate-kind slot, never *keep* or an unrelated directory. A
+    subdirectory whose ``meta.json`` is missing or unreadable is left
+    alone — this is a best-effort orphan sweep, not
+    ``cleanup_partial_slots``'s scratch-removal contract.
+
+    Args:
+        slot_root: Directory holding the tier's timestamped slots.
+        keep: The slot to never delete (the tier's current bound slot).
+
+    Returns:
+        The number of slots removed.
+    """
+    from paramem.adapters.manifest import ManifestNotFoundError, ManifestSchemaError, read_manifest
+    from paramem.memory.interim_adapter import INTERIM_DIR_PREFIX
+
+    deleted = 0
+    if not slot_root.exists():
+        return deleted
+    for child in list(slot_root.iterdir()):
+        if not child.is_dir() or child.name.startswith(".") or child == keep:
+            continue
+        if child.name.startswith(INTERIM_DIR_PREFIX):
+            # A main tier's slot root (e.g. <adapter_dir>/episodic/) holds
+            # sibling interim_<stamp>/ containers, not written slots of THIS
+            # tier — they are owned by find_live_slot + the boot-time
+            # keyless-tier sweep, never by this orphan cleanup (mirrors the
+            # same skip in integrity.py's partial-slot sweep).
+            continue
+        try:
+            manifest = read_manifest(child)
+        except (ManifestNotFoundError, ManifestSchemaError):
+            continue
+        if manifest.payload.kind == "simulate":
+            shutil.rmtree(child)
+            deleted += 1
+    return deleted
+
+
 def _migrate_tier_train_to_simulate(
     loop: "ConsolidationLoop", config: "ServerConfig", name: str
 ) -> None:
-    """Switch a store from train to simulate by removing adapter weight slots.
+    """Switch a store from train to simulate by writing a graph slot and dropping weights.
 
     Handles both main tiers (``"episodic"``, ``"semantic"``, ``"procedural"``)
-    and interim adapters (``"episodic_interim_<stamp>"``).  The on-disk slot
+    and interim adapters (``"episodic_interim_<stamp>"``).  The on-disk tier
     root is resolved via :func:`adapter_slot_root_for_name` so the correct
     hierarchy is used for each store.
 
-    Under the unified layout (2026-05-16), ``graph.json`` lives at the slot
-    root in **both** train and simulate modes.  The "active store" distinction
-    is just "are adapter weight slots present alongside the graph?":
+    Both venues write into the same tier root, each into its own timestamped
+    slot (:func:`~paramem.adapters.slot.write_slot`) — the "active store"
+    distinction is which payload kind the tier's BOUND slot's manifest
+    declares, resolved by :func:`~paramem.adapters.manifest.find_live_slot`
+    against :func:`~paramem.adapters.manifest.tier_registry_sha256`, never a
+    flat filename check at the tier root.
 
-    * train: timestamped weight slot dirs + graph.json + registries
-    * simulate: graph.json + registries only (no weight slots)
+    The migration to simulate:
 
-    The migration to simulate therefore reduces to:
-
-    1. Verify ``<slot_root>/graph.json`` exists and carries every active
-       registry key (sanity check).  If missing (legacy deployment that ran
-       before graph.json was universal), fall back to weight reconstruction
-       once to materialise it.
-    2. Delete all timestamped adapter weight slot subdirectories under
-       *slot_root* (directories containing ``adapter_model.safetensors`` or
-       ``adapter_config.json``).  The top-level slot directory, graph.json,
-       and registries are preserved — only the weight payload is removed.
+    1. When the tier's currently-bound slot is already a simulate payload
+       (a resumed retry that written but crashed before deleting the train
+       slot(s) below), skip straight to step 3 — nothing to reconstruct or
+       rewrite.
+    2. Otherwise, reconstruct the graph from weights
+       (:func:`~paramem.graph.reconstruct.reconstruct_graph`), verify it
+       carries every active registry key (sanity check, BEFORE anything is
+       written to disk — a failure here leaves the tree untouched, so there
+       is nothing to roll back), then write it into a fresh simulate slot
+       through the shared envelope
+       (:func:`~paramem.adapters.manifest.graph_payload_manifest` +
+       :func:`~paramem.adapters.slot.write_slot`) stamped with the tier's
+       current registry hash — the same hash the just-written slot needs to
+       bind on the next boot/reload.
+    3. Delete all timestamped adapter weight-slot subdirectories under the
+       tier root (directories containing ``adapter_model.safetensors`` or
+       ``adapter_config.json``) — the newly-written simulate slot carries
+       neither filename, so this never touches it.  The tier root, the
+       simulate slot, and the tier-root registry/bookkeeping files are
+       preserved — only the train payload is removed.
 
     Raises:
         _TierSkipped: When there are no active registry keys for this store.
-        RuntimeError: When the post-step sanity check fails (graph.json
-            missing keys after reconstruction).
+        RuntimeError: When the reconstructed graph is missing an active key
+            (sanity check) — raised BEFORE anything is written, so nothing is
+            rolled back.
     """
+    from paramem.adapters.manifest import find_live_slot, read_manifest, tier_registry_sha256
     from paramem.memory.interim_adapter import adapter_slot_root_for_name
-    from paramem.memory.persistence import (
-        iter_entries,
-        load_memory_from_disk,
-    )
+    from paramem.memory.persistence import iter_entries
 
-    if not loop.store.replay_enabled:
-        raise _TierSkipped(f"replay disabled on loop; store {name} skipped")
     active_keys = loop.store.active_keys_in_tier(name)
+    slot_root = adapter_slot_root_for_name(Path(config.adapter_dir), name)
+
     if not active_keys:
-        # Empty tier: nothing to migrate to graph.json, but DELETE any stale weight
-        # slots so the tier is cleanly simulate (no weights).  Critical for a
+        # Empty tier: nothing to write, but DELETE any stale weight slots so
+        # the tier is cleanly simulate (no weights).  Critical for a
         # base-swap: an undeleted OLD-model slot survives both Phase A and Phase B
         # (each skips empty tiers), and the next boot/reload then reports a spurious
         # ``fingerprint_mismatch`` of that old-model slot against the NEW model
         # instead of a clean 0-key tier.  For a same-model mode-switch this is also
         # correct — an empty simulate tier should carry no weight slots.
-        slot_root = adapter_slot_root_for_name(Path(config.adapter_dir), name)
         deleted = _delete_weight_slots(slot_root)
         raise _TierSkipped(
             f"no active registry keys for store {name}; deleted {deleted} stale weight slot(s)"
         )
 
-    slot_root = adapter_slot_root_for_name(Path(config.adapter_dir), name)
-    target_graph = slot_root / "graph.json"
+    live_digest = tier_registry_sha256(slot_root)
+    bound_slot = find_live_slot(slot_root, live_digest)
+    already_written = (
+        bound_slot is not None and read_manifest(bound_slot).payload.kind == "simulate"
+    )
 
-    # Step 1: ensure graph.json is current.  Post-architecture cycles
-    # write it on every consolidation, so this is the fast path.  On
-    # legacy deployments (trained before graph.json was universal) we
-    # reconstruct it from weights once.
-    needs_reconstruction = not target_graph.exists()
-    if not needs_reconstruction:
-        loaded = load_memory_from_disk(target_graph)
-        graph_keys = {q["key"] for q in iter_entries(loaded)}
-        active_key_set = set(active_keys)
-        if graph_keys != active_key_set:
-            # Equality, not a superset test: a graph carrying EXTRA (e.g.
-            # forgotten-but-not-yet-erased, or otherwise stale) keys must not
-            # pass as fresh — the registry is the lifecycle authority.
-            # reconstruct_graph rebuilds strictly from active_keys_in_tier
-            # (paramem.graph.reconstruct.reconstruct_graph probes
-            # active_keys_in_tier), so it cannot re-mint a key the registry
-            # does not know even though this branch fires more often than the
-            # old subset check.
-            needs_reconstruction = True
-            missing = active_key_set - graph_keys
-            extra = graph_keys - active_key_set
-            logger.info(
-                "train_to_simulate store %s: graph.json key set does not match the "
-                "active registry (missing=%d, extra=%d) — reconstructing from weights",
-                name,
-                len(missing),
-                len(extra),
-            )
-
-    if needs_reconstruction:
+    if not already_written:
+        from paramem.adapters.manifest import graph_payload_manifest
+        from paramem.adapters.slot import payload_filename, write_slot
         from paramem.graph.reconstruct import ReconstructionError, reconstruct_graph
-        from paramem.memory.persistence import (
-            _IK_KEY_ATTR,
-            save_memory_to_disk,
-        )
+        from paramem.memory.persistence import _IK_KEY_ATTR, save_memory_to_disk
 
         try:
             result = reconstruct_graph(loop, tier=name, strict=True)
@@ -456,32 +556,51 @@ def _migrate_tier_train_to_simulate(
             ik_key = data.get(_IK_KEY_ATTR)
             if ik_key is None:
                 continue
-            bk = loop.store.bookkeeping_for_key(ik_key) or {}
-            data["speaker_id"] = bk.get("speaker_id", "")
-        slot_root.mkdir(parents=True, exist_ok=True)
-        save_memory_to_disk(graph, target_graph)
+            data["speaker_id"] = loop.store.bookkeeping_for_key(ik_key)["speaker_id"]
 
-        # Sanity-check after reconstruction.
-        loaded = load_memory_from_disk(target_graph)
-        graph_keys = {q["key"] for q in iter_entries(loaded)}
+        # Sanity check BEFORE writing — nothing is written yet, so a failure
+        # here leaves the tree exactly as it was; there is no write to roll
+        # back.
+        graph_keys = {e["key"] for e in iter_entries(graph)}
         missing = [k for k in active_keys if k not in graph_keys]
         if missing:
-            target_graph.unlink(missing_ok=True)
             raise RuntimeError(
                 f"train_to_simulate store {name}: sanity check failed — "
-                f"{len(missing)} key(s) missing after reconstruction: "
-                f"{missing[:5]!r}{'...' if len(missing) > 5 else ''}; "
-                f"rolled back simulate-store write"
+                f"{len(missing)} key(s) missing from the reconstructed graph: "
+                f"{missing[:5]!r}{'...' if len(missing) > 5 else ''}"
             )
 
-    # Step 2: drop adapter weight slot subdirectories from the slot root
-    # (graph.json + registries at the top of slot_root are preserved).
+        manifest = graph_payload_manifest(
+            name=name,
+            key_count=len(active_keys),
+            registry_sha256=live_digest,
+            # This path never stamps a cadence window (same as the
+            # simulate_to_train direction's commit_tier_slot call below) —
+            # window_stamp is provenance-only, read by nothing else.
+            window_stamp="",
+        )
+
+        def _write_graph_payload(pending_slot: Path, _graph=graph) -> None:
+            save_memory_to_disk(_graph, pending_slot / payload_filename("simulate"))
+
+        bound_slot = write_slot(slot_root, manifest=manifest, write_payload=_write_graph_payload)
+        logger.info(
+            "train_to_simulate store %s: written simulate slot -> %s (%d keys)",
+            name,
+            bound_slot,
+            len(active_keys),
+        )
+
+    # Drop adapter weight-slot subdirectories from the tier root — the
+    # freshly-written simulate slot carries neither adapter_model.safetensors
+    # nor adapter_config.json, so it is never among them.
     deleted_slots = _delete_weight_slots(slot_root)
     logger.info(
         "active_store_migration: store %s switched to simulate;"
-        " %d keys retained in graph.json; deleted %d weight slot(s) from %s",
+        " %d keys retained in simulate slot %s; deleted %d weight slot(s) from %s",
         name,
         len(active_keys),
+        bound_slot,
         deleted_slots,
         slot_root,
     )
@@ -514,24 +633,34 @@ def _tier_adapter_config(loop: "ConsolidationLoop", name: str):
 def _migrate_tier_simulate_to_train(
     loop: "ConsolidationLoop", config: "ServerConfig", name: str
 ) -> None:
-    """Read simulate-store graph.json → train into ``<name>`` adapter →
-    probe at ``loop.config.recall_sanity_threshold`` → on pass, persist slot + delete source graph.
+    """Read the bound simulate-slot's graph.json → train into ``<name>`` adapter →
+    probe at ``loop.config.recall_sanity_threshold`` → on pass, persist slot + delete source slot.
 
     Handles both main tiers (``"episodic"``, ``"semantic"``,
     ``"procedural"``) and interim adapters
-    (``"episodic_interim_<stamp>"``).  The on-disk slot root and the LoRA
+    (``"episodic_interim_<stamp>"``).  The on-disk tier root and the LoRA
     config are both resolved by name — interim stores use the episodic config
     and the path under ``<adapter_dir>/episodic/interim_<stamp>/``.
 
     Caller must hold the GPU lock — training and the recall probe both
     drive the model forward and would race STT/TTS otherwise.
 
-    The simulate-mode store holds entries in ``graph.json``.
+    The simulate-mode store holds entries in the tier's bound slot's
+    ``graph.json``, resolved the same way the train venue resolves its own
+    bound slot: :func:`~paramem.adapters.manifest.find_live_slot` against
+    :func:`~paramem.adapters.manifest.tier_registry_sha256`.
 
     Sequence:
 
-    1. Load source graph from the resolved slot root ``graph.json``; extract
-       entry dicts via ``iter_entries``.
+    1. Resolve the tier's bound slot; skip (``_TierSkipped``) when there is
+       none, or when its manifest already declares a ``"train"`` payload (a
+       resumed retry that committed the train slot but crashed before
+       deleting the source simulate slot below — this arm sweeps any
+       orphaned simulate slot(s) still on disk, via
+       :func:`_delete_orphaned_simulate_slots`, before skipping, mirroring
+       :func:`_migrate_tier_train_to_simulate`'s own resume cleanup).  Load
+       the bound slot's ``graph.json``; extract entry dicts via
+       ``iter_entries``.
     2. Hot-load into ``loop.store`` + register keys into the per-store
        registry inside ``loop.store`` with ``adapter_id=name`` so the recall
        probe can find them.  The store entry itself is content-only
@@ -561,49 +690,77 @@ def _migrate_tier_simulate_to_train(
        :class:`~paramem.training.consolidation.RecallGateRejected` and *name*
        is never touched — it stays exactly at Step 3's LoRA-zero state, so
        there is nothing to roll back.
-    7. On pass: ``atomic_save_adapter`` writes the slot under the resolved
-       slot root.  ``indexed_key_registry.json`` (carrying the unified simhash
-       map) is written as the commit signal.  Delete the source graph.json.
+    7. On pass: :func:`~paramem.memory.persistence.commit_tier_slot` (train
+       mode) writes the adapter weight slot under the resolved tier root and
+       flushes ``indexed_key_registry.json`` (carrying the unified simhash map)
+       as the commit signal — the same per-tier commit primitive every other
+       durable tier write (interim slots, main-tier folds, the trial tree)
+       uses.  Delete the source simulate slot directory (not merely its
+       ``graph.json`` file — the whole timestamped slot, meta.json included)
+       — guarded on ``source_slot.exists()``: ``commit_tier_slot``'s own
+       ``prune_old_slots`` call may already have retired it as a prior slot
+       of the same tier root, so a fully successful migration must not fail
+       on an already-gone source slot.
     """
-    from paramem.adapters.manifest import build_manifest_for
+    from paramem.adapters.manifest import find_live_slot, read_manifest, tier_registry_sha256
+    from paramem.adapters.slot import payload_filename
     from paramem.memory.entry import build_registry as _build_reg
     from paramem.memory.entry import content_only_entry
     from paramem.memory.interim_adapter import adapter_slot_root_for_name
-    from paramem.memory.persistence import iter_entries, load_memory_from_disk
-    from paramem.models.loader import (
-        atomic_save_adapter,
-        create_adapter,
-        switch_adapter,
-    )
+    from paramem.memory.persistence import commit_tier_slot, iter_entries, load_memory_from_disk
+    from paramem.models.loader import create_adapter, switch_adapter
 
-    # Source graph is at the unified layout location resolved by name.
+    # Resolve the tier's bound slot the same way the train venue does.
     slot_root = adapter_slot_root_for_name(Path(config.adapter_dir), name)
-    source_graph = slot_root / "graph.json"
-    if not source_graph.exists():
-        raise _TierSkipped(f"no graph.json at {source_graph}")
+    source_slot = find_live_slot(slot_root, tier_registry_sha256(slot_root))
+    if source_slot is None:
+        raise _TierSkipped(f"no bound slot under {slot_root}")
+    source_manifest = read_manifest(source_slot)
+    if source_manifest.payload.kind != "simulate":
+        # Resume after a crash between the train-slot commit (step 7) and
+        # the source-slot delete (step 8): the tier's bound slot is already
+        # train — sweep any orphaned simulate slot(s) left behind by the
+        # interrupted step 8 before skipping, so a resumed migration still
+        # converges on a clean tree instead of leaking the old payload
+        # forever.
+        _delete_orphaned_simulate_slots(slot_root, keep=source_slot)
+        raise _TierSkipped(
+            f"bound slot {source_slot} already carries a "
+            f"{source_manifest.payload.kind!r} payload — nothing to migrate"
+        )
+    source_graph = source_slot / payload_filename("simulate")
 
     graph = load_memory_from_disk(source_graph)
     entries = list(iter_entries(graph))
     if not entries:
         raise _TierSkipped(f"empty graph.json at {source_graph}")
 
-    # Registry-authoritative filter: a crash between the forget handler's
-    # registry.save and its graph erase (persistence.erase_keys_from_graph_file)
-    # can transiently leave graph.json a SUPERSET of the tier registry — a
-    # forgotten key's edge still on disk after the registry has already
-    # dropped it.  The registry is the lifecycle authority, so when it is
-    # non-empty, filter entries down to keys it still knows; this is the only
-    # thing standing between that crash window and a re-keyed fact (the
-    # forget handler deliberately writes the registry first).
-    known_keys = set(loop.store.registry(name).list_known())
-    if known_keys:
-        filtered_entries = [e for e in entries if e["key"] in known_keys]
+    # Registry-authoritative filter: graph.json can transiently be a
+    # SUPERSET of the tier's ACTIVE keys — a stale edge still on disk after
+    # the registry has withheld (or never knew) the key. Producers of this
+    # shape are a torn restore (registry and graph.json restored out of
+    # order — see ``restore_bundle``'s registry-last rule), a torn simulate
+    # write (``commit_tier_slot`` crashes between writing graph.json and the
+    # registry flush that follows it), or an ordinary operator erase: the
+    # forget door no longer erases graph content at all, it stale-marks, and
+    # a withheld key's graph.json edge must not be hot-loaded and retrained
+    # here — ``MemoryStore.put``'s ``register=True`` default would
+    # re-register it as active, resurrecting the erasure. The registry is
+    # the lifecycle authority regardless of producer, so when it holds any
+    # active key, filter entries down to the keys it still holds ACTIVE.
+    # A side effect: ``replace_simhashes_in_tier`` (below, step 2) refuses a
+    # ``new_simhashes`` map naming a withheld id — with this filter in
+    # place, ``entries`` (and so the map it builds) never names one, so
+    # that refusal path is unreachable from this caller.
+    active_keys = set(loop.store.registry(name).list_active())
+    if active_keys:
+        filtered_entries = [e for e in entries if e["key"] in active_keys]
         dropped = len(entries) - len(filtered_entries)
         if dropped:
             logger.warning(
-                "simulate_to_train store %s: dropped %d graph entr%s not known to the "
-                "tier registry (stale/orphaned graph content, e.g. a crash between "
-                "forget's registry save and graph erase)",
+                "simulate_to_train store %s: dropped %d graph entr%s not active in the "
+                "tier registry (withheld or orphaned graph content, e.g. a torn restore, "
+                "a torn simulate write, or an operator erase)",
                 name,
                 dropped,
                 "y" if dropped == 1 else "ies",
@@ -612,34 +769,35 @@ def _migrate_tier_simulate_to_train(
         if not entries:
             raise _TierSkipped(
                 f"all graph entries at {source_graph} filtered out — "
-                f"none are known to the {name} tier registry"
+                f"none are active in the {name} tier registry"
             )
     else:
-        # An empty in-memory registry is ambiguous UNLESS the on-disk file's
-        # presence disambiguates it:
+        # No ACTIVE key in the in-memory registry is ambiguous UNLESS the
+        # on-disk file's presence disambiguates it:
         #
-        # * Registry file PRESENT and empty is authoritative — forget can
-        #   erase a tier's last key (registry.save lands durably) and then
-        #   crash before its graph erase runs.  On-disk presence with zero
-        #   known keys proves the tier really has none, so the stale graph
-        #   content left behind must not resurrect as a freshly-keyed fact.
-        #   Skip the tier, matching how other already-refused tiers report.
-        # * Registry file ABSENT is the commit_tier_slot torn-write case (the
-        #   registry write never landed) — indistinguishable from a
-        #   transient unmounted tier and can never prove orphanhood, so all
-        #   entries are kept and a WARNING is logged instead (unchanged from
-        #   before this guard was added).
+        # * Registry file PRESENT is authoritative whether it holds withheld
+        #   markers or nothing at all — the tier has no active key, so its
+        #   graph content is not migrated and the tier is skipped. The
+        #   producers of this shape are an operator erase that withheld the
+        #   tier's last active key, and a rebuild that published a tier with
+        #   none.
+        # * Registry file ABSENT is the torn weight-before-registry-write case
+        #   (shared by commit_tier_slot and the fold's write_tier_slot +
+        #   publish_tier_registry — the registry write never landed) —
+        #   indistinguishable from a transient unmounted tier and can never
+        #   prove orphanhood, so all entries are kept and a WARNING is
+        #   logged instead (unchanged from before this guard was added).
         registry_file = slot_root / "indexed_key_registry.json"
         if registry_file.exists():
             raise _TierSkipped(
-                f"tier registry at {registry_file} is present and empty — treating "
-                f"{len(entries)} graph entr{'y' if len(entries) == 1 else 'ies'} at "
-                f"{source_graph} as already-erased, not migrating"
+                f"tier registry at {registry_file} is present with no active key — "
+                f"treating {len(entries)} graph entr{'y' if len(entries) == 1 else 'ies'} "
+                f"at {source_graph} as already-erased, not migrating"
             )
         logger.warning(
             "simulate_to_train store %s: tier registry file is absent at %s — migrating "
             "all %d graph entries unfiltered (an absent registry cannot distinguish a "
-            "torn commit_tier_slot write from a transient unmounted tier)",
+            "torn weight-before-registry commit write from a transient unmounted tier)",
             name,
             registry_file,
             len(entries),
@@ -651,16 +809,12 @@ def _migrate_tier_simulate_to_train(
     # per key).  ``iter_entries`` only carries {key, subject, predicate,
     # object, speaker_id} — no relation_type/reinforcement_count/timestamps
     # — so a registered key needs its provenance row from elsewhere.  The
-    # ordinary mode-switch path reuses ``loop`` (the live singleton, whose
-    # store already carries bookkeeping loaded at boot); a base-swap Phase B
-    # loop is constructed against an empty live store, so its bookkeeping is
-    # read from the on-disk key_metadata.json instead — ik_key is stable
-    # across a base swap, so a key's old-model bookkeeping row is its
-    # correct provenance under the new model too.
-    from paramem.server.consolidation import _load_key_metadata
-
-    _disk_metadata = _load_key_metadata(config.key_metadata_path)
-    _disk_bookkeeping: dict = _disk_metadata.get("keys", {}) if _disk_metadata else {}
+    # base-swap worker already hydrates the loop store via
+    # ``load_bookkeeping_from_disk`` before ``migrate()`` runs (see the
+    # ordinary mode-switch path, which reuses ``loop`` — the live singleton,
+    # whose store already carries bookkeeping loaded at boot), so
+    # ``loop.store.bookkeeping_for_key(key)`` is the row source for both
+    # venues; there is no separate on-disk read here.
 
     # Step 2: hot-load into the loop's memory store so the recall probe
     # (which reads from loop.store) can find the keys.  Mirrors the
@@ -682,20 +836,21 @@ def _migrate_tier_simulate_to_train(
         # Pair the registration with a bookkeeping record — an active key
         # with no provenance row trips the main-tiers fold's
         # registry_bookkeeping_divergence integrity gate on the next full
-        # consolidation.  Priority: an already-loaded live-store record,
-        # then the on-disk key_metadata.json row, then the source graph
-        # entry's own speaker_id (``iter_entries`` carries it — the same
-        # quantity ``build_tier_graph_from_store`` wrote from bookkeeping
-        # when the graph was produced, so it is in-hand attribution, not a
-        # guess), then an empty-speaker / unknown-relation-type default only
-        # when none of the three has a value for this key (the same minimal
-        # shape MemoryStore.reinforce writes for a never-bookkept key, so it
-        # reads as a legitimate — if unattributed — provenance row rather
-        # than a divergence).  A discarded graph attribution here would mint
-        # an unattributed key that the router never indexes (router.py only
+        # consolidation.  Priority: an already-loaded live-store record
+        # (the sole reader of on-disk bookkeeping now — see the module note
+        # above), then the source graph entry's own speaker_id
+        # (``iter_entries`` carries it — the same quantity
+        # ``build_tier_graph_from_store`` wrote from bookkeeping when the
+        # graph was produced, so it is in-hand attribution, not a guess),
+        # then an empty-speaker / unknown-relation-type default only when
+        # neither has a value for this key (the same minimal shape
+        # MemoryStore.reinforce writes for a never-bookkept key, so it reads
+        # as a legitimate — if unattributed — provenance row rather than a
+        # divergence).  A discarded graph attribution here would mint an
+        # unattributed key that the router never indexes (router.py only
         # indexes non-empty speaker ids) — trained but unreachable at
         # inference.
-        bk = loop.store.bookkeeping_for_key(key) or _disk_bookkeeping.get(key) or {}
+        bk = loop.store.bookkeeping_for_key(key) or {}
         bk_speaker_id = bk.get("speaker_id") or kp.get("speaker_id", "")
         loop.store.set_bookkeeping(
             key,
@@ -705,6 +860,7 @@ def _migrate_tier_simulate_to_train(
             last_reinforced_cycle=bk.get("last_reinforced_cycle", 0),
             last_seen=bk.get("last_seen", ""),
             first_seen=bk.get("first_seen", ""),
+            promoted=bk.get("promoted", False),
             allow_empty_speaker=(bk_speaker_id == ""),
         )
 
@@ -774,66 +930,48 @@ def _migrate_tier_simulate_to_train(
             )
         promote_staging_adapter(loop.model, name)
 
-    # Step 7a: atomic-save the slot. Manifest building can fail (e.g. base-model
-    # hash unavailable); we save without manifest in that case so the weights
-    # are durable even when the manifest sidecar isn't.
-    # Bind the slot to the tier registry exactly as consolidation._save_adapters
-    # does (hash registry bytes before writing and pass as registry_sha256_override).
-    # Without this the slot's meta.registry_sha256 is
-    # empty, find_live_slot can never match it on the next boot/reload, and the
-    # adapter silently fails to mount (recall then returns 0 keys → boot_degraded).
-    _tier_reg = loop.store.registry(name)
-    _reg_payload = _tier_reg.save_bytes()
-    _reg_sha = hashlib.sha256(_reg_payload).hexdigest()
-
-    fingerprint_cache = getattr(loop, "fingerprint_cache", None)
-    try:
-        manifest = build_manifest_for(
-            loop.model,
-            loop.tokenizer,
-            name,
-            # The active-key count of _tier_reg -- the SAME registry object
-            # whose bytes were just hashed into _reg_sha above -- not
-            # len(entries) (the graph-entry count after known_keys
-            # filtering, which is active-union-stale domain). The true
-            # active count can EXCEED len(entries): a key already active in
-            # the registry but with no corresponding edge in this
-            # migration's source graph.json never appears in entries, yet
-            # still counts toward the registry's active total.
-            key_count=len(_tier_reg),
-            base_model_hash_cache=fingerprint_cache,
-            registry_sha256_override=_reg_sha,
-            adapter_root=Path(config.adapter_dir),
-        )
-    except Exception:
-        logger.warning(
-            "active_store_migration: store %s manifest build failed — saving without manifest",
-            name,
-        )
-        manifest = None
-    slot_path = atomic_save_adapter(
-        loop.model,
-        slot_root,
-        name,
-        manifest=manifest,
+    # Step 7: commit through the one per-tier commit primitive — the same
+    # atomic write/registry-last/failure-cleanup sequence every other durable
+    # tier write (interim slots, main-tier folds, the trial-migration tree)
+    # uses.  This also durably persists bookkeeping via the commit
+    # primitive's own per-tier ``key_metadata.json`` write (ahead of the
+    # registry flush), prunes old
+    # slots via ``prune_old_slots`` (after the registry flush, keeping
+    # ``loop._keep_prior_slots`` prior slots), writes the debug-gated weight
+    # shadow (``on_main_adapters_saved``, a no-op when snapshots are off), and,
+    # on any failure before the registry flush lands, removes the orphan slot
+    # this call wrote — none of which the hand-rolled sequence this replaced
+    # did.  A manifest-build failure now propagates (loud, not swallowed):
+    # the slot would otherwise be unmountable on the next boot because
+    # find_live_slot can never match a slot with no manifest hash.
+    # ``stamp=""`` preserves this path's pre-existing behaviour of never
+    # stamping a cadence window on the manifest (``window_stamp`` is
+    # provenance-only, read by nothing else).
+    _written_slot = commit_tier_slot(
+        loop=loop,
+        tier=name,
+        adapter_name=name,
+        stamp="",
+        mode="train",
+        all_keyed=entries,
+        output_dir=Path(config.adapter_dir),
     )
 
-    # Step 7b: flush the exact registry bytes that were hashed into the manifest
-    # so find_live_slot matches meta.registry_sha256 against the tier registry on
-    # the next boot/reload (mirrors consolidation._save_adapters — registry written
-    # last as the commit signal, so its presence on disk means all preceding files are complete).
-    if _tier_reg is not None and _reg_payload is not None:
-        slot_root.mkdir(parents=True, exist_ok=True)
-        _tier_reg.save_from_bytes(
-            _reg_payload, slot_root / "indexed_key_registry.json", consolidating=True
-        )
-
-    # Step 7d: delete source (target is now authoritative + probe-confirmed).
-    source_graph.unlink()
+    # Step 8: delete the source simulate slot (target is now authoritative +
+    # probe-confirmed) — the whole timestamped directory, not merely its
+    # graph.json file. Guarded: commit_tier_slot's own prune_old_slots call
+    # (step 7, above) may already have retired this exact slot as a prior
+    # slot of the SAME tier root — at training_keep_prior_slots=0 always,
+    # and at the default (3) once more than 3 prior slots already exist —
+    # so a fully successful migration must not fail on an already-gone
+    # source slot; prune owns prior-slot retirement, this call is a no-op
+    # when it already ran.
+    if source_slot.exists():
+        shutil.rmtree(source_slot)
 
     logger.info(
         "active_store_migration: store %s migrated to train; slot=%s, %d keys",
         name,
-        slot_path,
+        _written_slot,
         len(entries),
     )

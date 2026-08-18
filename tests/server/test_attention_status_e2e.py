@@ -31,8 +31,6 @@ def _base_config(tmp_path: Path) -> MagicMock:
     cfg = MagicMock()
     cfg.model_name = "mistral"
     cfg.model_config.model_id = "mistralai/Mistral-7B-Instruct-v0.3"
-    cfg.registry_path = tmp_path / "registry.json"
-    cfg.registry_path.write_text("{}")
     cfg.adapter_dir = tmp_path / "adapters"
     cfg.adapter_dir.mkdir(parents=True, exist_ok=True)
     (cfg.adapter_dir / "indexed_key_registry.json").write_text("{}")
@@ -54,7 +52,6 @@ def _base_config(tmp_path: Path) -> MagicMock:
     cfg.paths.data = tmp_path / "data"
     cfg.paths.data.mkdir(parents=True, exist_ok=True)
     cfg.security.backups.max_total_disk_gb = 20.0
-    cfg.paths.key_metadata = tmp_path / "data" / "registry" / "key_metadata.json"
     return cfg
 
 
@@ -299,30 +296,6 @@ class TestAttentionAfterAcceptRecovery:
         assert item["level"] == "info"
 
 
-class TestAdapterFingerprintInStatus:
-    def test_status_fingerprint_primary_emits_in_items(self, client, state):
-        """adapter_manifest_status primary mismatch → attention item with level=failed."""
-        state["adapter_manifest_status"] = {
-            "episodic": {
-                "status": "mismatch",
-                "reason": "sha mismatch",
-                "field": "base_model.sha",
-                "severity": "red",
-                "slot_path": "/a",
-                "checked_at": "",
-            }
-        }
-        body = _get_status(client)
-        kinds = [it["kind"] for it in body["attention"]["items"]]
-        assert "adapter_fingerprint_mismatch_primary" in kinds
-        item = next(
-            it
-            for it in body["attention"]["items"]
-            if it["kind"] == "adapter_fingerprint_mismatch_primary"
-        )
-        assert item["level"] == "failed"
-
-
 class TestKeysCountSourceOfTruth:
     """keys_count in /status must come from the authoritative MemoryStore.
 
@@ -337,7 +310,7 @@ class TestKeysCountSourceOfTruth:
     def test_keys_count_reads_live_store_including_interim(self, client, state, tmp_path):
         """When _state["memory_store"] is a live store, keys_count equals
         all_active_keys() across main + interim tiers."""
-        live_store = MemoryStore(replay_enabled=True)
+        live_store = MemoryStore()
 
         # Main episodic tier: 5 keys.
         reg_episodic = KeyRegistry()
@@ -365,7 +338,11 @@ class TestKeysCountSourceOfTruth:
         # Write a small on-disk registry under adapter_dir/episodic/.
         episodic_dir = tmp_path / "adapters" / "episodic"
         episodic_dir.mkdir(parents=True)
-        reg_data = {"active_keys": ["cold_key_0", "cold_key_1", "cold_key_2"], "simhash": {}}
+        reg_data = {
+            "active_keys": ["cold_key_0", "cold_key_1", "cold_key_2"],
+            "stale": [],
+            "simhash": {},
+        }
         (episodic_dir / "indexed_key_registry.json").write_text(json.dumps(reg_data))
 
         # Build a minimal _state with no memory_store but a valid adapter_dir.
@@ -437,7 +414,7 @@ class TestKeysCountSourceOfTruth:
         episodic_dir = adapters_dir / "episodic"
         episodic_dir.mkdir(parents=True)
         (episodic_dir / "indexed_key_registry.json").write_text(
-            json.dumps({"active_keys": ["good_key_0"], "simhash": {}})
+            json.dumps({"active_keys": ["good_key_0"], "stale": [], "simhash": {}})
         )
         # Semantic is foreign-shaped: has active_keys but no simhash section.
         semantic_dir = adapters_dir / "semantic"

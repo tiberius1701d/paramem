@@ -688,7 +688,7 @@ def test_lifespan_teardown_data_persisted_before_gpu_release(tmp_path):
         with (
             patch.object(app_module, "predict_base_bytes", return_value=None),
             patch.object(app_module, "_gpu_occupied", return_value=False),
-            patch.object(app_module, "_build_config_derived_state"),
+            patch.object(app_module, "_build_runtime_components"),
             patch.object(app_module, "_arm_active_store_migration", return_value=False),
             patch.object(
                 app_module,

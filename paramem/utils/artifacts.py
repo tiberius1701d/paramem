@@ -53,10 +53,10 @@ leaf over :mod:`paramem.backup.encryption`.
 Purpose-keyed graph snapshot vocabulary (BINDING), each written by
 :func:`on_fold_graph` under ``<base>/fold/`` as ``graph_<label>_snapshot.json``:
 
-- ``reconstructed`` — the graph rebuilt from stored weights/disk at fold entry.
-- ``merged`` — after registry-true re-merge (resolve_contradictions per config).
-- ``enriched`` — after the graph-tier refine step.
-- ``keyed`` — after keyed-entry assembly.
+- ``merged`` — the merged graph state ``stage_event`` builds from its three
+  merges (recall, pending, dedup-target), emitted once per event, after the
+  third merge and before refinement — the same state
+  ``paramem.server.calibrate`` reads from an operator-supplied snapshot path.
 
 The root-level artifacts (relation lists, cycle summary) nest under
 ``interim_<stamp>/`` on an interim cycle because the caller's :func:`debug_run`
@@ -71,15 +71,11 @@ Layout::
         procedural_rels_snapshot.json            # on_extraction_end
         recall_probes/<phase>_<adapter>.json     # on_recall_probe
         fold/
-            graph_reconstructed_snapshot.json   # on_fold_graph reconstructed
             graph_merged_snapshot.json           # on_fold_graph merged (fold)
-            graph_enriched_snapshot.json         # on_fold_graph enriched (fold)
-            graph_keyed_snapshot.json            # on_fold_graph keyed
             removal_ledger.json                  # on_removal_ledger
             fold_assignments.json                # on_fold_assignments
-            tier_delta.json                      # on_tier_delta
             normalization_snapshot.json          # on_normalization
-        training/tiers/<tier>/adapter_weights/  # on_main_adapters_saved
+        training/tiers/<adapter_name>/adapter_weights/  # on_main_adapters_saved
         cycle_summary_snapshot.json              # on_cycle_end
         calibration_<stage>_<ts>.json            # on_calibration_result
 
@@ -241,16 +237,15 @@ def on_extraction_end(episodic_rels: list[dict], procedural_rels: list[dict]) ->
     lists are the per-cycle inputs to training; they are dumped verbatim so a
     calibration tool can compare extracted-vs-trained sets.
 
-    The cumulative graph is NOT written here — it is emitted as purpose-keyed
-    snapshots by :func:`on_fold_graph`: ``graph_merged_snapshot.json``
-    (pre-enrichment) and ``graph_enriched_snapshot.json`` (post-enrichment).
+    The cumulative graph is NOT written here — it is emitted by
+    :func:`on_fold_graph` as ``graph_merged_snapshot.json``.
 
     Skipped whenever ``run_consolidation_cycle`` short-circuits before
-    reaching the interim fold body: the ``noop`` guards (no registry / no
-    relations) and the ``cap_pending`` guard (interim ring full) all return
-    without calling this function.  Of those three, only ``cap_pending``
-    additionally calls :func:`on_cycle_end` with its own summary — the two
-    ``noop`` guards call neither.
+    reaching the interim fold body: the ``noop`` guard (no relations) and the
+    ``cap_pending`` guard (interim ring full) both return without calling
+    this function.  Of those two, only ``cap_pending`` additionally calls
+    :func:`on_cycle_end` with its own summary — the ``noop`` guard calls
+    neither.
     """
     for base in _active_bases():
         write_artifact(base / "episodic_rels_snapshot.json", episodic_rels)
@@ -272,9 +267,9 @@ def on_fold_graph(graph: "nx.MultiDiGraph", *, label: str) -> None:
 
     Args:
         graph: The cumulative graph to snapshot.
-        label: Purpose token — one of ``"reconstructed"``, ``"merged"``,
-            ``"enriched"``, ``"keyed"``.  The output is
-            ``<base>/fold/graph_<label>_snapshot.json``.
+        label: Purpose token.  ``"merged"`` (``stage_event``'s own merged
+            graph state) is the only label any production caller passes
+            today. The output is ``<base>/fold/graph_<label>_snapshot.json``.
     """
     payload = nx.node_link_data(graph)
     for base in _active_bases():
@@ -292,9 +287,10 @@ def on_removal_ledger(ledger: dict) -> None:
     :meth:`~paramem.graph.merger.GraphMerger.record_removal` rejects any
     other value) and per-reason detail fields.
 
-    Called once per fold AFTER the drift classifier has consumed the ledger
-    (the ledger is final — ``reset_graph`` cleared it before the fold's
-    re-merge populated it).
+    Called once per event, inside ``stage_event``, after
+    ``_apply_working_fate_decisions`` has read the ledger (the ledger is
+    final — ``reset_graph`` cleared it before the event's re-merge
+    populated it, and nothing else in this event mutates it further).
     """
     for base in _active_bases():
         write_artifact(base / "fold" / "removal_ledger.json", ledger)
@@ -308,8 +304,9 @@ def on_fold_assignments(tier_keyed: dict) -> None:
     full entry dicts — keys are the stable identifiers; SPO is recoverable
     from the registry and the keyed graph snapshot).
 
-    Called once the fold's per-tier assignment is final, before
-    ``_all_keyed`` is computed.
+    Called once per event, inside ``stage_event``, right after
+    ``_build_working_keyed_walk`` returns this event's final per-tier
+    assignment.
 
     Args:
         tier_keyed: Mapping of tier → list of entry dicts.
@@ -325,22 +322,28 @@ def on_fold_assignments(tier_keyed: dict) -> None:
         )
 
 
-def on_main_adapters_saved(model, tier_names: list[str]) -> None:
-    """Dump per-cycle adapter-weight shadows for inspection/diff.
+def on_main_adapters_saved(model, adapter_names: list[str]) -> None:
+    """Dump per-adapter weight shadows for inspection/diff.
 
     THE ONE EXCEPTION to "every artifact goes through :func:`write_artifact`"
-    — see the module docstring.  Each tier lands at
-    ``<base>/training/tiers/<tier>/adapter_weights/``.
+    — see the module docstring.  Each adapter lands at
+    ``<base>/training/tiers/<adapter_name>/adapter_weights/`` — despite the
+    ``tiers`` path segment, the leaf directory name is the adapter NAME, not
+    necessarily a main-tier name: :func:`~paramem.memory.persistence.commit_tier_slot`
+    passes it this way for every train-mode commit, including an interim
+    slot's (e.g. ``episodic_interim_<stamp>``), not only the three main
+    tiers.
 
-    Called from ``_save_adapters`` after the canonical slot writes in
-    ``paths.adapters/`` succeed.
+    Called from :func:`paramem.memory.persistence.commit_tier_slot` (train
+    mode), once per adapter, after that adapter's canonical slot write in
+    ``paths.adapters/`` succeeds.
     """
     from paramem.models.loader import save_adapter
 
     for base in _active_bases():
         tiers_root = base / "training" / "tiers"
-        for tier in tier_names:
-            save_adapter(model, tiers_root / tier / "adapter_weights", tier)
+        for adapter_name in adapter_names:
+            save_adapter(model, tiers_root / adapter_name / "adapter_weights", adapter_name)
 
 
 def on_recall_probe(per_key: list[dict] | None, *, phase: str, adapter_name: str) -> None:
@@ -352,32 +355,18 @@ def on_recall_probe(per_key: list[dict] | None, *, phase: str, adapter_name: str
     ``raw_output`` — exactly the shape produced by
     :func:`~paramem.training.recall_eval.evaluate_indexed_recall`.
 
+    Called once per payload-bearing tier, inside
+    ``ConsolidationLoop._train_gate_write``, on the staged weights
+    immediately before the write — the design's one-probe rule, so this is
+    the only recall verdict any tier ever produces per event.  ``phase`` is
+    ``"staged"`` for that call.
+
     No-op when *per_key* is ``None``.
     """
     if per_key is None:
         return
     for base in _active_bases():
         write_artifact(base / "recall_probes" / f"{phase}_{adapter_name}.json", per_key)
-
-
-def on_tier_delta(tier_delta: dict) -> None:
-    """Persist the per-tier before/after/staled/minted delta record.
-
-    Writes ``<base>/fold/tier_delta.json``.  The payload is the
-    ``"tier_delta"`` entry emitted in the fold result dict — a mapping of tier
-    name to ``{active_before, active_after, staled_by_reason, minted}``.
-
-    Called once per fold, after ``tier_keyed`` and ``minted_by_tier`` are
-    finalised.  Emitted for BOTH the train and simulate fold paths.
-    ``staled_by_reason`` is derived from ``merger.removal_ledger`` and includes
-    all removal reasons (dedup, enrichment_same_as, etc.).  For simulate mode,
-    store entries are absent so ``tier_of`` returns None for all removed keys,
-    making ``staled_by_reason`` effectively ``{}`` in practice — a
-    persistence-tail divergence, not a skipped grooming step.
-    """
-    for base in _active_bases():
-        write_artifact(base / "fold" / "tier_delta.json", tier_delta)
-        logger.info("Debug tier_delta written: %d tier(s)", len(tier_delta))
 
 
 def on_normalization(
@@ -431,13 +420,14 @@ def on_cycle_end(cycle_summary: dict[str, Any]) -> None:
 
     Called from exactly two sites in ``run_consolidation_cycle``: the
     ``cap_pending`` early return (interim ring full — no fold attempted) and
-    the interim fold's terminal return (``trained`` / ``simulated`` /
-    ``recall_failed``).  NOT called for the two ``noop`` early returns (no
-    registry / no relations) or the ``aborted`` return (training yielded to
-    an inference request before the commit window) — those short-circuit
-    before either call site is reached.  Schema is the
-    ``run_consolidation_cycle`` return dict, kept open-ended so callers can
-    extend without coordinating a writer change.
+    the interim fold's terminal return (``trained`` / ``simulated``).  NOT
+    called for the ``noop`` early return (no relations), the ``aborted``
+    return (training yielded to an inference request before the commit
+    window), or a recall-gate rejection (``RecallGateRejected`` propagates
+    out of the fold before its terminal return, so this is never reached
+    that cycle) — those all short-circuit before either call site is
+    reached.  Schema is the ``run_consolidation_cycle`` return dict, kept
+    open-ended so callers can extend without coordinating a writer change.
     """
     for base in _active_bases():
         write_artifact(base / "cycle_summary_snapshot.json", cycle_summary)

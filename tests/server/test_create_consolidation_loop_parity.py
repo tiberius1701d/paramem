@@ -42,7 +42,6 @@ SCENARIOS = [
         {
             "model_name": "mistral",
             "consolidation.training_seed": 20,
-            "consolidation.indexed_key_replay": True,
             "consolidation.extraction_enrichment_provider": "",
             "consolidation.extraction_plausibility_judge": "off",
             "adapters.procedural.enabled": False,
@@ -59,7 +58,6 @@ SCENARIOS = [
         {
             "model_name": "mistral",
             "consolidation.training_seed": 10,
-            "consolidation.indexed_key_replay": True,
             "consolidation.promotion_threshold": 3,
             "consolidation.extraction_enrichment_provider": "",
             "consolidation.extraction_plausibility_judge": "off",
@@ -86,7 +84,6 @@ SCENARIOS = [
         {
             "model_name": "mistral",
             "consolidation.training_seed": 10,
-            "consolidation.indexed_key_replay": True,
             "consolidation.promotion_threshold": 3,
             "consolidation.extraction_enrichment_provider": "anthropic",
             "consolidation.extraction_enrichment_provider_model": "claude-sonnet-4-6",
@@ -156,7 +153,7 @@ def test_factory_threads_every_config_knob(
         model=MagicMock(),
         tokenizer=MagicMock(),
         config=cfg,
-        memory_store=_MS(replay_enabled=False),
+        memory_store=_MS(),
         **kw,
     )
 
@@ -222,7 +219,7 @@ def test_factory_threads_every_config_knob(
     # --- Misc knobs ---
     assert captured["prompts_dir"] == cfg.prompts_dir
     assert captured["model_name"] == cfg.model_name
-    assert captured["state_provider"] is None
+    assert "state_provider" not in captured
     assert captured["extraction_temperature"] == 0.0
     assert captured["keep_prior_slots"] == cfg.consolidation.training_keep_prior_slots
     assert captured["telemetry_dir"] == cfg.telemetry_dir
@@ -262,11 +259,10 @@ def test_factory_skips_seeding_when_seed_state_from_disk_false(tmp_path, monkeyp
         model=MagicMock(),
         tokenizer=MagicMock(),
         config=cfg,
-        memory_store=_MS(replay_enabled=False),
+        memory_store=_MS(),
         seed_state_from_disk=False,
     )
 
-    loop_instance.seed_key_metadata.assert_not_called()
     loop_instance.seed_episodic_cache.assert_not_called()
     loop_instance.seed_semantic_cache.assert_not_called()
     loop_instance.seed_procedural_cache.assert_not_called()
@@ -305,7 +301,7 @@ def test_factory_simulate_mode_does_not_seed_cache(tmp_path, monkeypatch):
         model=MagicMock(),
         tokenizer=MagicMock(),
         config=cfg,
-        memory_store=_MS(replay_enabled=False),
+        memory_store=_MS(),
     )
 
     # No entry-cache seed calls — seeding is lifespan's responsibility.
@@ -353,7 +349,7 @@ class TestFactoryModelNamePassthrough:
             model=MagicMock(),
             tokenizer=MagicMock(),
             config=cfg,
-            memory_store=MemoryStore(replay_enabled=False),
+            memory_store=MemoryStore(),
             seed_state_from_disk=False,
         )
 
@@ -387,7 +383,7 @@ class TestFactoryModelNamePassthrough:
             model=MagicMock(),
             tokenizer=MagicMock(),
             config=cfg,
-            memory_store=MemoryStore(replay_enabled=False),
+            memory_store=MemoryStore(),
             seed_state_from_disk=False,
         )
 

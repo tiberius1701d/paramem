@@ -1,2081 +1,440 @@
-"""Tests for the active-store migration helper.
+"""Unit tests for paramem.server.active_store_migration's standalone helpers.
 
-Covers:
-- State-file model: round-trip, all_tiers_done, mode-switch validation.
-- Detection: state file precedence, fresh-detect from yaml mode + on-disk
-  store contents.
-- train_to_simulate per-tier: happy-path weight reconstruction + graph write;
-  rollback on sanity-check failure.
-- simulate_to_train per-tier: happy-path graph.json read + train + cleanup;
-  rollback on recall probe failure.
-- migrate(): per-tier success advances state; failure isolates to one
-  tier; all-tiers-done removes the state file.
+New file: the module previously had no dedicated test file, and this fix
+pass adds a new standalone function (``_delete_orphaned_simulate_slots``)
+whose logic (venue-blind manifest-kind classification, keep-slot exclusion,
+dot-dir exclusion) is directly unit-testable without a live model, GPU, or
+ConsolidationLoop -- unlike the migration functions that call it, which
+require the full fold/training surface and are exercised end-to-end via the
+scoped integration suites instead (``tests/server/test_migration_confirm.py``,
+``tests/test_consolidation.py``).
+
+No GPU required -- every slot here is written with stub payload bytes through
+the real :func:`~paramem.adapters.slot.write_slot` envelope.
 """
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
-import networkx as nx
 import pytest
 
-from paramem.memory.persistence import _IK_KEY_ATTR, save_memory_to_disk
+from paramem.adapters.manifest import tier_registry_sha256
+from paramem.adapters.slot import write_slot
 from paramem.server.active_store_migration import (
-    TIERS,
     MigrationState,
-    _has_tier_graph,
+    _delete_orphaned_simulate_slots,
     _migrate_tier_simulate_to_train,
-    _migrate_tier_train_to_simulate,
     _TierSkipped,
     clear_state,
     detect_mode_switch,
     load_state,
-    migrate,
     save_state,
     state_path,
 )
-from paramem.training.recall_eval import RecallProbe
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+from paramem.training.key_registry import KeyRegistry
+from tests._fold_fixtures import _make_loop, _wire_fakes, _write_graph
+from tests._manifest_fixtures import make_train_manifest, write_canonical_registry, write_slot_files
 
 
-def _recall_probe(rate: float, n: int = 100) -> RecallProbe:
-    """Build a ``RecallProbe`` whose distinct-key rate is exactly *rate*.
+def _write_simulate_slot(
+    tier_root: Path, *, name: str = "episodic", registry_sha256: str = ""
+) -> Path:
+    """Write a real simulate-payload slot under *tier_root*.
 
-    Stands in for ``loop._probe_recall(...)``'s return value across this
-    file's migration-gate tests — the migration gate reads only
-    ``probe.rate`` (threshold compare) and ``probe.failed`` (failed-key
-    names), never the individual key content.  ``n=100`` gives exact
-    decimal fractions for every rate this file uses (1.0, 0.9, 0.7, 0.66).
+    *registry_sha256* defaults to ``""`` -- unbound to any registry, since
+    most callers of this helper (the orphan-cleanup tests below) classify by
+    the slot's OWN manifest kind, not by binding. Passing the tier's live
+    registry digest (:func:`~paramem.adapters.manifest.tier_registry_sha256`)
+    produces a slot that :func:`~paramem.adapters.manifest.find_live_slot`
+    actually binds to -- what ``detect_mode_switch`` requires.
     """
-    n_passing = round(rate * n)
-    per_key = tuple(
-        {"key": f"k{i}", "exact_match": i < n_passing, "raw_output": ""} for i in range(n)
+    from paramem.adapters.manifest import graph_payload_manifest
+
+    manifest = graph_payload_manifest(
+        name=name, key_count=0, registry_sha256=registry_sha256, window_stamp=""
     )
-    return RecallProbe(per_key=per_key)
+    return write_slot(
+        tier_root,
+        manifest=manifest,
+        write_payload=lambda pending: (pending / "graph.json").write_bytes(b"{}"),
+    )
 
 
-def _make_config(tmp_path: Path, mode: str = "train") -> MagicMock:
+def _write_train_slot(
+    tier_root: Path, *, name: str = "episodic", registry_sha256: str = ""
+) -> Path:
+    manifest = make_train_manifest(name=name, registry_sha256=registry_sha256, key_count=0)
+    return write_slot(
+        tier_root, manifest=manifest, write_payload=lambda pending: write_slot_files(pending)
+    )
+
+
+def _cfg(adapter_dir: Path, *, mode: str) -> MagicMock:
+    """Minimal ``ServerConfig`` stand-in for ``detect_mode_switch``, which
+    reads only ``config.adapter_dir`` and ``config.consolidation.mode``."""
     cfg = MagicMock()
-    cfg.adapter_dir = tmp_path / "adapters"
-    cfg.simulate_dir = tmp_path / "simulate"
-    cfg.consolidation = MagicMock()
+    cfg.adapter_dir = adapter_dir
     cfg.consolidation.mode = mode
-    cfg.adapter_dir.mkdir(parents=True, exist_ok=True)
-    cfg.simulate_dir.mkdir(parents=True, exist_ok=True)
-    # A real Path (matching ServerConfig.key_metadata_path) -- the
-    # simulate_to_train hot-load loop resolves bookkeeping fallback rows
-    # from this file when the live store does not already carry them.
-    # Absent (the default here) means "no on-disk fallback available".
-    cfg.key_metadata_path = cfg.adapter_dir / "key_metadata.json"
     return cfg
 
 
-def _write_simulate_graph(simulate_dir: Path, tier: str, entries: list[dict]) -> Path:
-    """Write a graph.json in the simulate-store layout (plaintext for tests).
+class TestDeleteOrphanedSimulateSlots:
+    def test_deletes_simulate_slots_other_than_keep(self, tmp_path: Path) -> None:
+        """A stale simulate slot left behind by an interrupted step 8 is
+        removed; the freshly-committed train slot (``keep``) is untouched."""
+        tier_root = tmp_path / "episodic"
+        orphan = _write_simulate_slot(tier_root)
+        kept = _write_train_slot(tier_root)
 
-    Uses :func:`paramem.memory.persistence.save_memory_to_disk` with
-    No daily identity is loaded in tests, so the file is plaintext and
-    human-readable in the test filesystem.
-    """
-    tier_dir = simulate_dir / tier
-    tier_dir.mkdir(parents=True, exist_ok=True)
-    graph_path = tier_dir / "graph.json"
-    graph = nx.MultiDiGraph()
-    for entry in entries:
-        graph.add_edge(
-            entry.get("subject", "Subject"),
-            entry.get("object", "Object"),
-            **{
-                _IK_KEY_ATTR: entry["key"],
-                "predicate": entry.get("predicate", "related_to"),
-                "speaker_id": entry.get("speaker_id", "speaker0"),
-            },
+        deleted = _delete_orphaned_simulate_slots(tier_root, keep=kept)
+
+        assert deleted == 1
+        assert not orphan.exists()
+        assert kept.exists()
+
+    def test_never_deletes_the_keep_slot_even_if_simulate(self, tmp_path: Path) -> None:
+        """keep is never removed regardless of its own payload kind -- the
+        exclusion is by identity, not by kind."""
+        tier_root = tmp_path / "episodic"
+        kept = _write_simulate_slot(tier_root)
+
+        deleted = _delete_orphaned_simulate_slots(tier_root, keep=kept)
+
+        assert deleted == 0
+        assert kept.exists()
+
+    def test_skips_dot_prefixed_directories(self, tmp_path: Path) -> None:
+        """A .pending staging directory is never treated as an orphan slot,
+        matching iter_slot_candidates' dot-dir exclusion rule."""
+        tier_root = tmp_path / "episodic"
+        pending = tier_root / ".pending" / "20260101-000000"
+        pending.mkdir(parents=True)
+        (pending / "meta.json").write_bytes(b"{}")
+        (pending / "graph.json").write_bytes(b"{}")
+        kept = _write_train_slot(tier_root)
+
+        deleted = _delete_orphaned_simulate_slots(tier_root, keep=kept)
+
+        assert deleted == 0
+        assert pending.exists()
+
+    def test_skips_unreadable_manifest_best_effort(self, tmp_path: Path) -> None:
+        """A subdirectory whose meta.json is missing or unparseable is left
+        alone -- this is a best-effort orphan sweep, not
+        cleanup_partial_slots' scratch-removal contract."""
+        tier_root = tmp_path / "episodic"
+        no_manifest = tier_root / "20260101-000000"
+        no_manifest.mkdir(parents=True)
+        (no_manifest / "graph.json").write_bytes(b"{}")
+        kept = _write_train_slot(tier_root)
+
+        deleted = _delete_orphaned_simulate_slots(tier_root, keep=kept)
+
+        assert deleted == 0
+        assert no_manifest.exists()
+
+    def test_skips_interim_dir_family(self, tmp_path: Path) -> None:
+        """An interim_<stamp>/ container under the main tier's slot root
+        survives untouched even when it carries a simulate-payload slot --
+        it is a sibling tier owned by find_live_slot + the boot-time
+        keyless-tier sweep, never this main-tier orphan cleanup (mirrors
+        integrity.py's INTERIM_DIR_PREFIX skip in its own partial-slot
+        sweep)."""
+        tier_root = tmp_path / "episodic"
+        interim_root = tier_root / "interim_20260101T0000"
+        interim_simulate_slot = _write_simulate_slot(
+            interim_root, name="episodic_interim_20260101T0000"
         )
-    save_memory_to_disk(graph, graph_path)
-    return graph_path
+        kept = _write_train_slot(tier_root)
+
+        deleted = _delete_orphaned_simulate_slots(tier_root, keep=kept)
+
+        assert deleted == 0
+        assert interim_simulate_slot.exists()
+        assert kept.exists()
+
+    def test_absent_slot_root_returns_zero(self, tmp_path: Path) -> None:
+        """A tier root that does not exist on disk yields no deletions,
+        never an exception."""
+        tier_root = tmp_path / "episodic"
+        keep = tier_root / "20260101-000000"
+
+        deleted = _delete_orphaned_simulate_slots(tier_root, keep=keep)
+
+        assert deleted == 0
 
 
-def _write_adapter_registry(adapter_dir: Path, tier: str, keys: list[str]) -> Path:
-    """Write an ``indexed_key_registry.json`` at the canonical per-tier path:
-    ``<adapter_dir>/<tier>/indexed_key_registry.json``.
+class TestMigrateTierSimulateToTrainEntryFilter:
+    """Unit coverage for ``_migrate_tier_simulate_to_train``'s
+    registry-authoritative entry filter (``active_keys =
+    set(loop.store.registry(name).list_active())``) -- a
+    withheld key's graph.json edge must never reach the training funnel.
+    No GPU: ``create_adapter`` is faked the same way
+    ``tests/_fold_fixtures.py`` documents (a real ``get_peft_model()`` cold
+    wrap needs a real ``torch.nn.Module``, which the fake driver model is
+    not), and the training mock is forced to return ``(None, None)`` so the
+    function raises ``_TierSkipped`` immediately after the funnel call --
+    before ``staged_weights``/``promote_staging_adapter``/``commit_tier_slot``,
+    none of which this test needs to exercise."""
 
-    Used by ``_has_adapter_registry`` / ``detect_mode_switch`` to detect that
-    the train-mode adapter for *tier* exists.
-    """
-    tier_dir = adapter_dir / tier
-    tier_dir.mkdir(parents=True, exist_ok=True)
-    p = tier_dir / "indexed_key_registry.json"
-    # Write a minimal KeyRegistry-compatible JSON (flat dict of key→metadata).
-    registry = {k: {"status": "active"} for k in keys}
-    p.write_bytes(json.dumps(registry).encode("utf-8"))
-    return p
+    def test_a_withheld_keys_graph_entry_is_not_migrated_back_into_a_trained_tier(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        from paramem.models import loader as loader_mod
 
+        loop = _make_loop(tmp_path)
+        _wire_fakes(loop, monkeypatch, train_side_effect=lambda entries, **kwargs: (None, None))
 
-def _write_adapter_slot_dir(adapter_dir: Path, tier: str, slot_ts: str) -> Path:
-    """Create an empty slot subdir to simulate trained-but-not-yet-collected state."""
-    slot_dir = adapter_dir / tier / slot_ts
-    slot_dir.mkdir(parents=True, exist_ok=True)
-    return slot_dir
+        def _fake_create_adapter(model, adapter_config, adapter_name="default"):
+            # Mirrors _FakeDriverModel's own _seed_adapter contract instead
+            # of taking the real cold get_peft_model() path, which needs a
+            # real torch.nn.Module.
+            model._seed_adapter(adapter_name)
+            model.set_adapter(adapter_name)
+            return model
 
+        monkeypatch.setattr(loader_mod, "create_adapter", _fake_create_adapter)
 
-def _full_quad(key: str, predicate: str = "related_to") -> dict:
-    """Return a full 5-field entry dict for migration test fixtures."""
-    return {
-        "key": key,
-        "subject": "Subject",
-        "predicate": predicate,
-        "object": "Object",
-        "speaker_id": "speaker0",
-    }
+        tier_root = loop.output_dir / "episodic"
 
+        # graph1 active, graph2 withheld -- both on-disk (the registry
+        # authority) and mirrored on loop.store (the filter's own read
+        # site), exactly as a production caller hydrates before migrate().
+        disk_registry = KeyRegistry()
+        disk_registry.add("graph1")
+        disk_registry.add("graph2")
+        disk_registry.stale("graph2")
+        disk_registry.save(tier_root / "indexed_key_registry.json")
 
-# ---------------------------------------------------------------------------
-# State model
-# ---------------------------------------------------------------------------
+        store_registry = KeyRegistry()
+        store_registry.add("graph1")
+        store_registry.add("graph2")
+        store_registry.stale("graph2")
+        loop.store.load_registry("episodic", store_registry)
 
+        # The bound simulate slot's graph.json still carries BOTH edges --
+        # the withheld key's content lingers there (an operator erase
+        # stale-marks the registry, it never touches graph.json).
+        _write_graph(
+            tier_root,
+            [
+                {
+                    "key": "graph1",
+                    "subject": "alice",
+                    "predicate": "lives_in",
+                    "object": "berlin",
+                    "speaker_id": "speaker0",
+                },
+                {
+                    "key": "graph2",
+                    "subject": "bob",
+                    "predicate": "lives_in",
+                    "object": "paris",
+                    "speaker_id": "speaker0",
+                },
+            ],
+        )
 
-class TestMigrationState:
-    def test_for_mode_switch_simulate_to_train(self):
-        s = MigrationState.for_mode_switch(source_mode="simulate", target_mode="train")
-        assert s.direction == "simulate_to_train"
-        assert s.source_mode == "simulate"
-        assert s.target_mode == "train"
-        assert s.completed_tiers == []
-        assert s.failed_tiers == {}
-        assert s.started_at  # non-empty iso8601
+        cfg = MagicMock()
+        cfg.adapter_dir = loop.output_dir
 
-    def test_for_mode_switch_train_to_simulate(self):
-        s = MigrationState.for_mode_switch(source_mode="train", target_mode="simulate")
-        assert s.direction == "train_to_simulate"
+        with pytest.raises(_TierSkipped):
+            _migrate_tier_simulate_to_train(loop, cfg, "episodic")
 
-    def test_for_mode_switch_rejects_same_modes(self):
-        with pytest.raises(ValueError, match="both"):
-            MigrationState.for_mode_switch(source_mode="train", target_mode="train")
+        loop._train_tier_adapter.assert_called_once()
+        migrated_entries = loop._train_tier_adapter.call_args.args[0]
+        migrated_keys = {e["key"] for e in migrated_entries}
+        assert migrated_keys == {"graph1"}
 
-    def test_for_mode_switch_rejects_unknown_mode(self):
-        with pytest.raises(ValueError, match="must be 'simulate' or 'train'"):
-            MigrationState.for_mode_switch(source_mode="train", target_mode="bogus")
+        # The withheld key's marker survives untouched -- migration mutates
+        # nothing about it.
+        assert loop.store.registry("episodic").knows("graph2") is True
+        assert "graph2" not in loop.store.registry("episodic")
 
-    def test_all_tiers_done_when_complete(self):
-        s = MigrationState.for_mode_switch(source_mode="simulate", target_mode="train")
-        s.completed_tiers = list(TIERS)
-        assert s.all_tiers_done(list(TIERS)) is True
+    def test_a_marker_only_registry_skips_its_migration_without_calling_itself_empty(
+        self, tmp_path: Path
+    ) -> None:
+        """No ACTIVE key anywhere in the tier, but the registry file is
+        present (a marker-only registry, e.g. every key withheld) --
+        _TierSkipped names it "no active key", not "empty" (the "empty"
+        wording is reserved for the earlier, unrelated empty-graph.json
+        skip a few lines up in the same function)."""
+        loop = _make_loop(tmp_path)
+        tier_root = loop.output_dir / "episodic"
 
-    def test_all_tiers_done_with_failure(self):
-        s = MigrationState.for_mode_switch(source_mode="simulate", target_mode="train")
-        s.completed_tiers = list(TIERS)
-        s.failed_tiers = {"episodic": "boom"}
-        assert s.all_tiers_done(list(TIERS)) is False
+        disk_registry = KeyRegistry()
+        disk_registry.add("graph1")
+        disk_registry.stale("graph1")
+        disk_registry.save(tier_root / "indexed_key_registry.json")
 
-    def test_all_tiers_done_partial(self):
-        s = MigrationState.for_mode_switch(source_mode="simulate", target_mode="train")
-        s.completed_tiers = ["episodic", "semantic"]
-        assert s.all_tiers_done(list(TIERS)) is False
+        store_registry = KeyRegistry()
+        store_registry.add("graph1")
+        store_registry.stale("graph1")
+        loop.store.load_registry("episodic", store_registry)
 
+        # graph.json still carries the withheld key's leftover edge -- a
+        # non-empty graph is required to reach the "no active key" branch
+        # rather than the earlier "empty graph.json" skip.
+        _write_graph(
+            tier_root,
+            [
+                {
+                    "key": "graph1",
+                    "subject": "alice",
+                    "predicate": "lives_in",
+                    "object": "berlin",
+                    "speaker_id": "speaker0",
+                }
+            ],
+        )
 
-# ---------------------------------------------------------------------------
-# State file IO
-# ---------------------------------------------------------------------------
+        cfg = MagicMock()
+        cfg.adapter_dir = loop.output_dir
 
+        with pytest.raises(_TierSkipped) as exc_info:
+            _migrate_tier_simulate_to_train(loop, cfg, "episodic")
 
-class TestStateFileIO:
-    def test_load_returns_none_when_absent(self, tmp_path):
-        assert load_state(tmp_path) is None
-
-    def test_save_then_load_roundtrip(self, tmp_path):
-        original = MigrationState.for_mode_switch(source_mode="simulate", target_mode="train")
-        original.completed_tiers = ["episodic"]
-        original.failed_tiers = {"semantic": "rollback test"}
-        save_state(tmp_path, original)
-        loaded = load_state(tmp_path)
-        assert loaded is not None
-        assert loaded.direction == original.direction
-        assert loaded.completed_tiers == original.completed_tiers
-        assert loaded.failed_tiers == original.failed_tiers
-
-    def test_clear_state_removes_file(self, tmp_path):
-        s = MigrationState.for_mode_switch(source_mode="train", target_mode="simulate")
-        save_state(tmp_path, s)
-        assert state_path(tmp_path).exists()
-        clear_state(tmp_path)
-        assert not state_path(tmp_path).exists()
-
-    def test_clear_state_idempotent(self, tmp_path):
-        # Clearing when nothing exists must not raise.
-        clear_state(tmp_path)
-
-
-# ---------------------------------------------------------------------------
-# Detection
-# ---------------------------------------------------------------------------
+        message = str(exc_info.value)
+        assert "no active key" in message
+        assert "empty" not in message.lower()
 
 
 class TestDetectModeSwitch:
-    def test_fresh_install_no_migration(self, tmp_path):
-        cfg = _make_config(tmp_path, mode="train")
-        assert detect_mode_switch(cfg) is None
+    """Behavioral pins for ``detect_mode_switch``'s manifest-bound
+    classification (paramem/server/active_store_migration.py:189-254) --
+    the module's former filename-sniff-era coverage was dropped in a
+    rewrite and never re-homed; these pin the CURRENT bound-slot
+    discriminator, not the retired filename check."""
 
-    def test_existing_state_takes_precedence(self, tmp_path):
-        cfg = _make_config(tmp_path, mode="train")
-        prior = MigrationState.for_mode_switch(source_mode="simulate", target_mode="train")
-        prior.completed_tiers = ["episodic"]
-        save_state(cfg.adapter_dir, prior)
-        # Even with no on-disk source, the state file dictates resume.
-        result = detect_mode_switch(cfg)
-        assert result is not None
-        assert result.completed_tiers == ["episodic"]
+    def test_simulate_bound_tier_with_target_train_arms_simulate_to_train(
+        self, tmp_path: Path
+    ) -> None:
+        adapter_dir = tmp_path / "adapters"
+        tier_root = adapter_dir / "episodic"
+        write_canonical_registry(tier_root, ["k1"])
+        _write_simulate_slot(tier_root, registry_sha256=tier_registry_sha256(tier_root))
 
-    def test_simulate_to_train_detected_via_graph_json(self, tmp_path):
-        """graph.json present in adapter_dir triggers simulate→train detection.
+        result = detect_mode_switch(_cfg(adapter_dir, mode="train"))
 
-        Under the unified layout, graph.json lives at adapter_dir/<tier>/graph.json
-        in both train and simulate modes.  Detection fires when graph.json is present
-        but no indexed_key_registry.json exists (simulate → train transition needed).
-        """
-        cfg = _make_config(tmp_path, mode="train")
-        # Write graph to the unified layout location (adapter_dir), not simulate_dir.
-        _write_simulate_graph(cfg.adapter_dir, "episodic", [_full_quad("g1")])
-        result = detect_mode_switch(cfg)
         assert result is not None
         assert result.direction == "simulate_to_train"
         assert result.source_mode == "simulate"
+        assert result.target_mode == "train"
 
-    def test_train_to_simulate_detected(self, tmp_path):
-        cfg = _make_config(tmp_path, mode="simulate")
-        _write_adapter_registry(cfg.adapter_dir, "episodic", ["g1"])
-        result = detect_mode_switch(cfg)
+    def test_train_bound_tier_with_target_simulate_arms_train_to_simulate(
+        self, tmp_path: Path
+    ) -> None:
+        adapter_dir = tmp_path / "adapters"
+        tier_root = adapter_dir / "semantic"
+        write_canonical_registry(tier_root, ["k1"])
+        _write_train_slot(
+            tier_root, name="semantic", registry_sha256=tier_registry_sha256(tier_root)
+        )
+
+        result = detect_mode_switch(_cfg(adapter_dir, mode="simulate"))
+
         assert result is not None
         assert result.direction == "train_to_simulate"
         assert result.source_mode == "train"
+        assert result.target_mode == "simulate"
 
-    def test_active_state_consistent_no_migration(self, tmp_path):
-        # Both stores have content matching the operator's mode → no switch
-        cfg = _make_config(tmp_path, mode="train")
-        _write_adapter_registry(cfg.adapter_dir, "episodic", ["g1"])
-        # Stale simulate-store from prior mode IS present, but adapter is too —
-        # this is a "stale inactive store" case, not a mode switch.
-        _write_simulate_graph(cfg.simulate_dir, "episodic", [_full_quad("g1")])
-        assert detect_mode_switch(cfg) is None
+    def test_tier_already_bound_to_the_configured_mode_arms_nothing(self, tmp_path: Path) -> None:
+        """Both venues: a tier already carrying the configured mode's own
+        payload kind is not a mismatch -- detect_mode_switch arms nothing."""
+        train_dir = tmp_path / "train_adapters"
+        train_root = train_dir / "procedural"
+        write_canonical_registry(train_root, ["k1"])
+        _write_train_slot(
+            train_root, name="procedural", registry_sha256=tier_registry_sha256(train_root)
+        )
+        assert detect_mode_switch(_cfg(train_dir, mode="train")) is None
 
-    def test_unsupported_mode_returns_none(self, tmp_path):
-        cfg = _make_config(tmp_path, mode="cloud_only")
-        assert detect_mode_switch(cfg) is None
+        simulate_dir = tmp_path / "simulate_adapters"
+        simulate_root = simulate_dir / "episodic"
+        write_canonical_registry(simulate_root, ["k1"])
+        _write_simulate_slot(simulate_root, registry_sha256=tier_registry_sha256(simulate_root))
+        assert detect_mode_switch(_cfg(simulate_dir, mode="simulate")) is None
 
-
-class TestHasTierGraph:
-    """``_has_tier_graph`` must detect graph.json in both main-slot and interim subdirs.
-
-    Regression for C4: encryption.py and active_store_migration.py previously
-    looked only at ``<adapter_dir>/<tier>/graph.json``.  Simulate-mode interim
-    cycles write to ``<adapter_dir>/<tier>/interim_<stamp>/graph.json`` — those
-    must also be detected.
-    """
-
-    def test_main_slot_detected(self, tmp_path):
-        """graph.json at tier root is detected."""
+    def test_existing_state_file_takes_precedence_over_fresh_detection(
+        self, tmp_path: Path
+    ) -> None:
         adapter_dir = tmp_path / "adapters"
-        tier_dir = adapter_dir / "episodic"
-        tier_dir.mkdir(parents=True)
-        (tier_dir / "graph.json").write_text("{}")
-        assert _has_tier_graph(adapter_dir, "episodic") is True
+        tier_root = adapter_dir / "episodic"
+        write_canonical_registry(tier_root, ["k1"])
+        _write_simulate_slot(tier_root, registry_sha256=tier_registry_sha256(tier_root))
 
-    def test_interim_slot_detected(self, tmp_path):
-        """graph.json under <tier>/interim_<stamp>/ is detected.
+        prior = MigrationState.for_mode_switch(source_mode="train", target_mode="simulate")
+        prior.completed_tiers = ["procedural"]
+        save_state(adapter_dir, prior)
 
-        This is the layout written by commit_tier_slot in simulate mode
-        for interim cycles.  Prior to C4, _has_tier_graph only checked the
-        tier root and would return False here.
-        """
+        # Fresh detection against this tree (simulate-bound + mode=train)
+        # would arm simulate_to_train -- the state file wins instead.
+        result = detect_mode_switch(_cfg(adapter_dir, mode="train"))
+
+        assert result is not None
+        assert result.direction == "train_to_simulate"
+        assert result.completed_tiers == ["procedural"]
+
+    def test_unsupported_mode_returns_none(self, tmp_path: Path) -> None:
+        result = detect_mode_switch(_cfg(tmp_path / "adapters", mode="bogus"))
+        assert result is None
+
+    def test_unreadable_bound_manifest_is_treated_as_unbound_not_raised(
+        self, tmp_path: Path
+    ) -> None:
         adapter_dir = tmp_path / "adapters"
-        interim_dir = adapter_dir / "episodic" / "interim_20260101T0000"
-        interim_dir.mkdir(parents=True)
-        (interim_dir / "graph.json").write_text("{}")
-        assert _has_tier_graph(adapter_dir, "episodic") is True
+        tier_root = adapter_dir / "episodic"
+        write_canonical_registry(tier_root, ["k1"])
+        bound = _write_simulate_slot(tier_root, registry_sha256=tier_registry_sha256(tier_root))
+        (bound / "meta.json").write_bytes(b"not valid json")
 
-    def test_missing_returns_false(self, tmp_path):
-        """Absent tier dir → False."""
+        result = detect_mode_switch(_cfg(adapter_dir, mode="train"))
+
+        assert result is None
+
+    def test_interim_family_never_satisfies_a_main_tier(self, tmp_path: Path) -> None:
+        """A tier root holding ONLY an interim family (its manifests one
+        level deeper than a main-tier slot) plus a canonical registry arms
+        nothing -- iter_slot_candidates only yields direct children carrying
+        their OWN meta.json, and an interim_<stamp>/ family root has none
+        (its manifests live at interim_<stamp>/<ts>/meta.json)."""
         adapter_dir = tmp_path / "adapters"
-        assert _has_tier_graph(adapter_dir, "episodic") is False
+        tier_root = adapter_dir / "episodic"
+        interim_root = tier_root / "interim_20260101T000000"
+        _write_simulate_slot(interim_root, name="episodic_interim_20260101T000000")
+        write_canonical_registry(tier_root, ["k1"])
 
-    def test_tier_dir_exists_but_no_graph_returns_false(self, tmp_path):
-        """Tier dir present but no graph.json anywhere → False."""
-        adapter_dir = tmp_path / "adapters"
-        (adapter_dir / "episodic").mkdir(parents=True)
-        assert _has_tier_graph(adapter_dir, "episodic") is False
+        result = detect_mode_switch(_cfg(adapter_dir, mode="train"))
 
-
-# ---------------------------------------------------------------------------
-# Per-tier: train -> simulate
-# ---------------------------------------------------------------------------
+        assert result is None
 
 
-def _make_loop_train_to_simulate(
-    tmp_path: Path,
-    *,
-    tier: str = "episodic",
-    keys: list[str] | None = None,
-) -> MagicMock:
-    """Build a loop stub for train→simulate tests.
+class TestStateFileIO:
+    """Round-trip coverage for the state-file primitives (save_state /
+    load_state / clear_state) -- dropped in the same rewrite as
+    TestDetectModeSwitch and never re-homed."""
 
-    The loop has:
-    - An ``indexed_key_registry`` (dict[str, KeyRegistry]) with *keys*
-      registered in the *tier* entry.
-    - An ``indexed_key_cache`` pre-populated with matching entries.
-    - A model that will yield a successful ``reconstruct_graph`` result
-      (mocked).
-    """
-    from paramem.memory.store import MemoryStore as _MS
+    def test_save_then_load_round_trips_equal(self, tmp_path: Path) -> None:
+        original = MigrationState.for_mode_switch(source_mode="simulate", target_mode="train")
+        original.completed_tiers = ["episodic"]
+        original.failed_tiers = {"semantic": "boom"}
 
-    if keys is None:
-        keys = ["g0", "g1", "g2"]
+        save_state(tmp_path, original)
+        loaded = load_state(tmp_path)
 
-    loop = MagicMock()
-    store = _MS(replay_enabled=True)
-    for k in keys:
-        store.put(
-            tier,
-            k,
-            {
-                "subject": "Subject",
-                "predicate": "related_to",
-                "object": "Object",
-                "speaker_id": "speaker0",
-            },
-        )
-    loop.store = store
-    loop.model = MagicMock()
-    loop.tokenizer = MagicMock()
-    loop.training_config = SimpleNamespace(gradient_checkpointing=False)
+        assert loaded == original
 
-    return loop
-
-
-class TestMigrateTierTrainToSimulate:
-    """Train→simulate: reconstruct graph from weights, persist as graph.json."""
-
-    def _make_graph_result(self, tier: str, keys: list[str]) -> MagicMock:
-        """Build a mock ReconstructionResult whose graph has one edge per key."""
-        graph = nx.MultiDiGraph()
-        for key in keys:
-            eid = graph.add_edge("Subject", "Object", predicate="related_to")
-            graph["Subject"]["Object"][eid][_IK_KEY_ATTR] = key
-        result = MagicMock()
-        result.graph = graph
-        result.failures = []
-        return result
-
-    def test_no_active_keys_skipped(self, tmp_path):
-        """When registry has no active keys for the tier, raise _TierSkipped."""
-        cfg = _make_config(tmp_path, mode="simulate")
-        loop = _make_loop_train_to_simulate(tmp_path, keys=[])
-        with pytest.raises(_TierSkipped, match="no active registry keys"):
-            _migrate_tier_train_to_simulate(loop, cfg, "episodic")
-
-    def test_no_active_keys_deletes_stale_weight_slots(self, tmp_path):
-        """An empty tier must still have its stale weight slots DELETED — otherwise
-        on a base-swap an old-model slot survives Phase A + B and the next boot
-        reports a spurious fingerprint_mismatch instead of a clean 0-key tier.
-        """
-        cfg = _make_config(tmp_path, mode="simulate")
-        loop = _make_loop_train_to_simulate(tmp_path, keys=[])
-        # Plant a stale weight slot under the (empty) episodic tier.
-        stale = cfg.adapter_dir / "episodic" / "20260101-000000"
-        stale.mkdir(parents=True)
-        (stale / "adapter_model.safetensors").write_bytes(b"")
-        (cfg.adapter_dir / "episodic" / "indexed_key_registry.json").write_text("{}")
-
-        with pytest.raises(_TierSkipped, match="deleted 1 stale weight slot"):
-            _migrate_tier_train_to_simulate(loop, cfg, "episodic")
-
-        assert not stale.exists(), "stale weight slot must be deleted for an empty tier"
-        # Top-level registry is preserved (only the weight slot subdir is removed).
-        assert (cfg.adapter_dir / "episodic" / "indexed_key_registry.json").exists()
-
-    def test_none_registry_skipped(self, tmp_path):
-        """When loop's store has replay disabled, raise _TierSkipped."""
-        from paramem.memory.store import MemoryStore as _MS
-
-        cfg = _make_config(tmp_path, mode="simulate")
-        loop = MagicMock()
-        loop.store = _MS(replay_enabled=False)
-        with pytest.raises(_TierSkipped):
-            _migrate_tier_train_to_simulate(loop, cfg, "episodic")
-
-    def test_happy_path_writes_graph_and_removes_adapter_weight_slots(self, tmp_path):
-        """Happy path: graph.json written under adapter_dir; weight slot dirs removed.
-
-        Under the unified layout, graph.json lives at adapter_dir/<tier>/graph.json.
-        Migration to simulate deletes weight slot subdirectories (those containing
-        adapter_model.safetensors or adapter_config.json) but preserves graph.json
-        and registry files at the top of the tier directory.
-        """
-        cfg = _make_config(tmp_path, mode="simulate")
-        keys = ["g0", "g1"]
-        loop = _make_loop_train_to_simulate(tmp_path, keys=keys)
-        # Create an adapter slot dir so migration has something to remove.
-        slot_dir = _write_adapter_slot_dir(cfg.adapter_dir, "episodic", "20260430-180000")
-        # Create adapter_config.json so the slot is recognised as a weight slot.
-        (slot_dir / "adapter_config.json").write_text("{}")
-
-        reconstruction = self._make_graph_result("episodic", keys)
-
-        with patch(
-            "paramem.graph.reconstruct.reconstruct_graph",
-            return_value=reconstruction,
-        ):
-            _migrate_tier_train_to_simulate(loop, cfg, "episodic")
-
-        # Unified layout: graph.json lives under adapter_dir, not simulate_dir.
-        target = cfg.adapter_dir / "episodic" / "graph.json"
-        assert target.exists()
-
-        # Verify the written graph has all expected keys
-        from paramem.memory.persistence import iter_entries, load_memory_from_disk
-
-        loaded = load_memory_from_disk(target)
-        graph_keys = {q["key"] for q in iter_entries(loaded)}
-        assert graph_keys == set(keys)
-
-        # Weight slot subdirectory removed; tier dir still present (holds graph.json).
-        assert not slot_dir.exists()
-        assert (cfg.adapter_dir / "episodic").is_dir()
-
-    def test_reconstruction_error_propagates(self, tmp_path):
-        """ReconstructionError from reconstruct_graph → RuntimeError raised."""
-        from paramem.graph.reconstruct import ReconstructionError
-
-        cfg = _make_config(tmp_path, mode="simulate")
-        keys = ["g0"]
-        loop = _make_loop_train_to_simulate(tmp_path, keys=keys)
-
-        with (
-            patch(
-                "paramem.graph.reconstruct.reconstruct_graph",
-                side_effect=ReconstructionError("g0 recall failed"),
-            ),
-            pytest.raises(RuntimeError, match="weight reconstruction failed"),
-        ):
-            _migrate_tier_train_to_simulate(loop, cfg, "episodic")
-
-        # Rollback: graph.json was not written (unified layout: adapter_dir).
-        assert not (cfg.adapter_dir / "episodic" / "graph.json").exists()
-
-    def test_sanity_check_failure_rolls_back(self, tmp_path):
-        """When sanity check detects missing key in written graph, graph.json is unlinked."""
-        cfg = _make_config(tmp_path, mode="simulate")
-        keys = ["g0", "g1"]
-        loop = _make_loop_train_to_simulate(tmp_path, keys=keys)
-
-        # Return a graph that only has g0 (missing g1) — sanity check will fail.
-        graph = nx.MultiDiGraph()
-        eid = graph.add_edge("Subject", "Object", predicate="p")
-        graph["Subject"]["Object"][eid][_IK_KEY_ATTR] = "g0"  # g1 is absent
-        reconstruction = MagicMock()
-        reconstruction.graph = graph
-        reconstruction.failures = []
-
-        with (
-            patch(
-                "paramem.graph.reconstruct.reconstruct_graph",
-                return_value=reconstruction,
-            ),
-            pytest.raises(RuntimeError, match="sanity check failed"),
-        ):
-            _migrate_tier_train_to_simulate(loop, cfg, "episodic")
-
-        # Rolled back: graph.json removed (unified layout: adapter_dir).
-        assert not (cfg.adapter_dir / "episodic" / "graph.json").exists()
-
-    def test_edge_decoration_uses_indexed_key_cache(self, tmp_path):
-        """speaker_id from bookkeeping appears on graph edges after train→simulate."""
-        cfg = _make_config(tmp_path, mode="simulate")
-        keys = ["g0"]
-        loop = _make_loop_train_to_simulate(tmp_path, keys=keys)
-        loop.store.set_bookkeeping(
-            "g0", speaker_id="spk-alice", relation_type="factual", first_seen=""
-        )
-
-        reconstruction = self._make_graph_result("episodic", keys)
-
-        with patch(
-            "paramem.graph.reconstruct.reconstruct_graph",
-            return_value=reconstruction,
-        ):
-            _migrate_tier_train_to_simulate(loop, cfg, "episodic")
-
-        from paramem.memory.persistence import iter_entries, load_memory_from_disk
-
-        # Unified layout: graph written under adapter_dir, not simulate_dir.
-        loaded = load_memory_from_disk(cfg.adapter_dir / "episodic" / "graph.json")
-        entries = list(iter_entries(loaded))
-        assert len(entries) == 1
-        assert entries[0]["speaker_id"] == "spk-alice"
-
-    def test_extra_graph_key_triggers_reconstruction(self, tmp_path):
-        """graph.json holds a key the active registry does NOT — the old
-        superset test (``all(k in graph_keys for k in active_keys)``) let
-        this through unnoticed; the equality check must still fire
-        reconstruction so a stray/stale graph edge cannot survive the
-        train→simulate switch."""
-        from paramem.memory.persistence import iter_entries, load_memory_from_disk
-
-        cfg = _make_config(tmp_path, mode="simulate")
-        keys = ["g0", "g1"]
-        loop = _make_loop_train_to_simulate(tmp_path, keys=keys)
-
-        # Pre-write a graph.json that is a strict SUPERSET of the active keys:
-        # g0, g1, plus a stray "g_extra" the registry does not know.
-        target = cfg.adapter_dir / "episodic" / "graph.json"
-        target.parent.mkdir(parents=True, exist_ok=True)
-        graph = nx.MultiDiGraph()
-        for key in [*keys, "g_extra"]:
-            eid = graph.add_edge("Subject", "Object", predicate="related_to")
-            graph["Subject"]["Object"][eid][_IK_KEY_ATTR] = key
-        save_memory_to_disk(graph, target)
-
-        reconstruction = self._make_graph_result("episodic", keys)
-
-        with patch(
-            "paramem.graph.reconstruct.reconstruct_graph",
-            return_value=reconstruction,
-        ) as mock_reconstruct:
-            _migrate_tier_train_to_simulate(loop, cfg, "episodic")
-
-        mock_reconstruct.assert_called_once()
-
-        # Reconstruction rebuilds strictly from active keys — the stray key
-        # is gone from the rewritten graph.json.
-        loaded = load_memory_from_disk(target)
-        graph_keys = {q["key"] for q in iter_entries(loaded)}
-        assert graph_keys == set(keys)
-        assert "g_extra" not in graph_keys
-
-
-# ---------------------------------------------------------------------------
-# migrate() orchestrator
-# ---------------------------------------------------------------------------
-
-
-class TestMigrateOrchestrator:
-    def test_legitimately_empty_store_vacuous_done(self, tmp_path):
-        """A store with no registered tiers AND no on-disk content completes vacuously.
-
-        This covers a fresh install or a system with no knowledge: no
-        adapter registries, no graph.json files, no interim dirs under
-        adapter_dir.  ``all_tiers_done([])`` is vacuously True in this case
-        and ``clear_state`` is allowed to fire.  This is NOT the degraded
-        case (that requires on-disk content to exist alongside zero tiers).
-        """
-        cfg = _make_config(tmp_path, mode="simulate")
-        # adapter_dir is empty — no on-disk content.  The loop store has
-        # replay disabled so tiers_with_registry() returns [].
-        loop = MagicMock()
-        from paramem.memory.store import MemoryStore as _MS
-
-        loop.store = _MS(replay_enabled=False)
+    def test_clear_state_removes_the_file(self, tmp_path: Path) -> None:
         state = MigrationState.for_mode_switch(source_mode="train", target_mode="simulate")
-        result = migrate(loop, cfg, state)
-        # No stores registered → no stores iterated → completed_tiers stays empty.
-        assert result.completed_tiers == []
-        # State file removed because all_tiers_done([]) is vacuously True
-        # and the on-disk content check confirmed no content exists.
-        assert not state_path(cfg.adapter_dir).exists()
+        save_state(tmp_path, state)
+        assert state_path(tmp_path).exists()
 
-    def test_per_tier_failure_isolated(self, tmp_path):
-        cfg = _make_config(tmp_path, mode="train")
-        # Set up all three tiers with graph.json files under the unified layout.
-        for tier in TIERS:
-            _write_simulate_graph(cfg.adapter_dir, tier, [_full_quad(f"{tier}_g1")])
+        clear_state(tmp_path)
 
-        state = MigrationState.for_mode_switch(source_mode="simulate", target_mode="train")
+        assert not state_path(tmp_path).exists()
+        assert load_state(tmp_path) is None
 
-        loop = MagicMock()
-        from paramem.memory.store import MemoryStore as _MS
-        from paramem.training.key_registry import KeyRegistry
-
-        loop.store = _MS(replay_enabled=True)
-        # Pre-register the three main tiers so tiers_with_registry() returns them.
-        # In production this is done by load_registries_from_disk at boot.
-        for tier in TIERS:
-            loop.store.load_registry(tier, KeyRegistry())
-        loop.training_config = MagicMock(num_epochs=2)
-        # Real float so the migration gate's `recall < loop.config.recall_sanity_threshold`
-        # comparison does not raise TypeError against a MagicMock.
-        loop.config.recall_sanity_threshold = 1.0
-        # funnel (_train_tier_adapter); the per-tier pass/fail split below is
-        # driven entirely by _probe_recall, so the funnel always reports a
-        # clean (non-aborted) result.
-        loop._train_tier_adapter.return_value = ({"aborted": False}, None)
-        loop.wandb_config = None
-        loop.fingerprint_cache = None
-        loop._thermal_policy = None
-        loop.model = MagicMock()
-        loop.model.peft_config = {}
-
-        def _fake_cache_entry(**kwargs):
-            return dict(**kwargs)
-
-        loop._cache_entry.side_effect = _fake_cache_entry
-
-        slot_path = cfg.adapter_dir / "episodic" / "20260430-000000"
-
-        call_count = [0]
-
-        def probe_side_effect(adapter_name, entries):
-            call_count[0] += 1
-            if call_count[0] == 1:
-                return _recall_probe(0.0)  # episodic fails
-            return _recall_probe(1.0)  # semantic + procedural pass
-
-        loop._probe_recall.side_effect = probe_side_effect
-
-        with (
-            patch("paramem.memory.entry.build_registry", return_value={}),
-            patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
-            patch("paramem.models.loader.switch_adapter"),
-            patch("paramem.models.loader.copy_adapter_weights"),
-            patch("paramem.models.loader.atomic_save_adapter", return_value=slot_path),
-            patch("paramem.adapters.manifest.build_manifest_for", return_value=None),
-        ):
-            result = migrate(loop, cfg, state)
-
-        # Episodic failed; semantic and procedural completed
-        assert "episodic" in result.failed_tiers
-        assert "semantic" in result.completed_tiers
-        assert "procedural" in result.completed_tiers
-        # State file persists because not all_tiers_done
-        assert state_path(cfg.adapter_dir).exists()
-        # Source for failed tier still on disk (unified layout: adapter_dir).
-        assert (cfg.adapter_dir / "episodic" / "graph.json").exists()
-
-    def test_all_complete_clears_state_file(self, tmp_path):
-        cfg = _make_config(tmp_path, mode="train")
-        for tier in TIERS:
-            _write_simulate_graph(cfg.adapter_dir, tier, [_full_quad(f"{tier}_g1")])
-
-        state = MigrationState.for_mode_switch(source_mode="simulate", target_mode="train")
-
-        loop = MagicMock()
-        from paramem.memory.store import MemoryStore as _MS
-        from paramem.training.key_registry import KeyRegistry
-
-        loop.store = _MS(replay_enabled=True)
-        # Pre-register the three main tiers so tiers_with_registry() returns them.
-        for tier in TIERS:
-            loop.store.load_registry(tier, KeyRegistry())
-        loop.training_config = MagicMock(num_epochs=2)
-        # Real float so the migration gate's `recall < loop.config.recall_sanity_threshold`
-        # comparison does not raise TypeError against a MagicMock.
-        loop.config.recall_sanity_threshold = 1.0
-        loop._probe_recall.return_value = _recall_probe(1.0)
-        # funnel (_train_tier_adapter) rather than train_adapter directly.
-        loop._train_tier_adapter.return_value = ({"aborted": False}, None)
-        loop.wandb_config = None
-        loop.fingerprint_cache = None
-        loop._thermal_policy = None
-        loop.model = MagicMock()
-        loop.model.peft_config = {}
-
-        def _fake_cache_entry(**kwargs):
-            return dict(**kwargs)
-
-        loop._cache_entry.side_effect = _fake_cache_entry
-
-        slot_path = cfg.adapter_dir / "episodic" / "20260430-000000"
-
-        with (
-            patch("paramem.memory.entry.build_registry", return_value={}),
-            patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
-            patch("paramem.models.loader.switch_adapter"),
-            patch("paramem.models.loader.copy_adapter_weights"),
-            patch("paramem.models.loader.atomic_save_adapter", return_value=slot_path),
-            patch("paramem.adapters.manifest.build_manifest_for", return_value=None),
-        ):
-            result = migrate(loop, cfg, state)
-
-        registered = list(TIERS)
-        assert result.all_tiers_done(registered)
-        assert not state_path(cfg.adapter_dir).exists()
-
-    def test_resume_skips_completed_tiers(self, tmp_path):
-        cfg = _make_config(tmp_path, mode="simulate")
-        # Episodic was already done in a prior partial run.
-        # Semantic and procedural still need to run (train→simulate direction,
-        # no active registry keys → _TierSkipped → flagged complete).
-
-        loop = MagicMock()
-        from paramem.memory.store import MemoryStore as _MS
-        from paramem.training.key_registry import KeyRegistry
-
-        loop.store = _MS(replay_enabled=True)
-        # Pre-register semantic and procedural; episodic already completed.
-        for tier in ("semantic", "procedural"):
-            loop.store.load_registry(tier, KeyRegistry())
-
-        state = MigrationState.for_mode_switch(source_mode="train", target_mode="simulate")
-        state.completed_tiers = ["episodic"]  # already done from a prior partial run
-
-        result = migrate(loop, cfg, state)
-        # All registered tiers (semantic, procedural) complete now; episodic from prior.
-        assert "semantic" in result.completed_tiers
-        assert "procedural" in result.completed_tiers
-        assert "episodic" in result.completed_tiers
-
-    def test_raises_when_empty_tiers_but_disk_has_registry(self, tmp_path):
-        """migrate() raises RuntimeError when store has 0 tiers but an
-        indexed_key_registry.json exists on disk.
-
-        This is the regression guard for the silent data-loss bug: a failed
-        boot-time registry load leaves the in-memory store empty while
-        on-disk content is still present.  migrate() must REFUSE to proceed
-        (and must NOT call clear_state) so the migration stays pending.
-        """
-        cfg = _make_config(tmp_path, mode="simulate")
-        # Write an indexed_key_registry.json for episodic — on-disk content exists.
-        _write_adapter_registry(cfg.adapter_dir, "episodic", ["key1", "key2"])
-
-        loop = MagicMock()
-        from paramem.memory.store import MemoryStore as _MS
-
-        # Store has replay disabled → tiers_with_registry() == [].
-        # This simulates a failed boot-time load_registries_from_disk.
-        loop.store = _MS(replay_enabled=False)
-        state = MigrationState.for_mode_switch(source_mode="train", target_mode="simulate")
-        # Persist state file before calling migrate to simulate the armed state.
-        save_state(cfg.adapter_dir, state)
-
-        with pytest.raises(RuntimeError, match="on-disk content exists"):
-            migrate(loop, cfg, state)
-
-        # State file must persist — migration was NOT completed.
-        assert state_path(cfg.adapter_dir).exists(), (
-            "State file must remain after a refused migration; clear_state "
-            "must not fire on the degraded-store path"
-        )
-
-    def test_raises_when_empty_tiers_but_disk_has_graph(self, tmp_path):
-        """migrate() raises RuntimeError when store has 0 tiers but a
-        graph.json exists on disk.
-
-        Variant of the regression guard using a simulate-mode graph.json
-        rather than an indexed_key_registry.json as the on-disk signal.
-        """
-        cfg = _make_config(tmp_path, mode="train")
-        # Write a graph.json for semantic — on-disk content exists.
-        _write_simulate_graph(cfg.adapter_dir, "semantic", [_full_quad("g1")])
-
-        loop = MagicMock()
-        from paramem.memory.store import MemoryStore as _MS
-
-        loop.store = _MS(replay_enabled=False)
-        state = MigrationState.for_mode_switch(source_mode="simulate", target_mode="train")
-        save_state(cfg.adapter_dir, state)
-
-        with pytest.raises(RuntimeError, match="on-disk content exists"):
-            migrate(loop, cfg, state)
-
-        assert state_path(cfg.adapter_dir).exists()
-
-    def test_raises_when_empty_tiers_but_disk_has_interim_dir(self, tmp_path):
-        """migrate() raises RuntimeError when store has 0 tiers but an
-        interim directory exists under adapter_dir.
-
-        Variant of the regression guard using iter_interim_dirs to detect
-        on-disk content.
-        """
-        cfg = _make_config(tmp_path, mode="simulate")
-        # Create an interim directory under the episodic tier.
-        interim_dir = cfg.adapter_dir / "episodic" / "interim_20260101T0000"
-        interim_dir.mkdir(parents=True, exist_ok=True)
-        (interim_dir / "indexed_key_registry.json").write_text("{}")
-
-        loop = MagicMock()
-        from paramem.memory.store import MemoryStore as _MS
-
-        loop.store = _MS(replay_enabled=False)
-        state = MigrationState.for_mode_switch(source_mode="train", target_mode="simulate")
-        save_state(cfg.adapter_dir, state)
-
-        with pytest.raises(RuntimeError, match="on-disk content exists"):
-            migrate(loop, cfg, state)
-
-        assert state_path(cfg.adapter_dir).exists()
-
-
-# ---------------------------------------------------------------------------
-# Per-tier: simulate -> train
-# ---------------------------------------------------------------------------
-
-
-class TestMigrateTierSimulateToTrain:
-    """Simulate→train: reads graph.json, trains adapter, probes, cleans up.
-
-    All tests stub the GPU stack (train_adapter, create_adapter, etc.) and
-    verify orchestration + cleanup contracts only.  Simulate mode uses the
-    entry format; no legacy format dispatch is tested here (it was removed).
-    """
-
-    def _make_loop(self, *, tier_in_peft=False):
-        loop = MagicMock()
-        loop.episodic_config = MagicMock()
-        loop.semantic_config = MagicMock()
-        loop.procedural_config = MagicMock()
-        loop.training_config = MagicMock(num_epochs=2)
-        # Real float so `recall < loop.config.recall_sanity_threshold` does not
-        # raise TypeError when the migration gate compares against a MagicMock.
-        loop.config.recall_sanity_threshold = 1.0
-        from paramem.memory.store import MemoryStore as _MS
-
-        loop.store = _MS(replay_enabled=True)
-        loop.wandb_config = None
-        loop.fingerprint_cache = None
-        loop._thermal_policy = None
-        loop.model = MagicMock()
-        loop.model.peft_config = {"episodic": MagicMock()} if tier_in_peft else {}
-        # _migrate_tier_simulate_to_train routes training through the shared
-        # funnel (_train_tier_adapter) and unpacks a (metrics, recall_state)
-        # 2-tuple from it.  A bare MagicMock unpacks as an empty iterable ->
-        # "not enough values to unpack", so every test needs a real 2-tuple
-        # return.  The migration path ignores recall_state and gates on its
-        # own staged-weights probe (loop._probe_recall).  Tests exercising
-        # the aborted/empty branches override this return_value explicitly.
-        loop._train_tier_adapter.return_value = ({"aborted": False}, None)
-
-        def _fake_cache_entry(
-            *,
-            key,
-            subject,
-            predicate,
-            object,
-            speaker_id,
-            question=None,
-            answer=None,
-        ):
-            entry = {
-                "key": key,
-                "subject": subject,
-                "predicate": predicate,
-                "object": object,
-                "speaker_id": speaker_id,
-            }
-            if question is not None:
-                entry["question"] = question
-            if answer is not None:
-                entry["answer"] = answer
-            return entry
-
-        loop._cache_entry.side_effect = _fake_cache_entry
-        return loop
-
-    def test_no_source_skipped(self, tmp_path):
-        cfg = _make_config(tmp_path, mode="train")
-        with pytest.raises(_TierSkipped, match="no graph.json"):
-            _migrate_tier_simulate_to_train(self._make_loop(), cfg, "episodic")
-
-    def test_empty_source_skipped(self, tmp_path):
-        """Empty graph.json (no edges) → _TierSkipped."""
-        cfg = _make_config(tmp_path, mode="train")
-        # Unified layout: graph.json lives under adapter_dir.
-        _write_simulate_graph(cfg.adapter_dir, "episodic", [])
-        with pytest.raises(_TierSkipped, match="empty"):
-            _migrate_tier_simulate_to_train(self._make_loop(), cfg, "episodic")
-
-    def test_disabled_tier_skipped(self, tmp_path):
-        cfg = _make_config(tmp_path, mode="train")
-        # Unified layout: graph.json lives under adapter_dir.
-        _write_simulate_graph(cfg.adapter_dir, "procedural", [_full_quad("p1")])
-        loop = self._make_loop()
-        loop.procedural_config = None  # operator disabled procedural
-        with pytest.raises(_TierSkipped, match="not enabled"):
-            _migrate_tier_simulate_to_train(loop, cfg, "procedural")
-
-    def test_happy_path_orchestration(self, tmp_path):
-        cfg = _make_config(tmp_path, mode="train")
-        entries = [_full_quad(f"g{i}") for i in range(2)]
-        # Unified layout: graph.json lives under adapter_dir.
-        _write_simulate_graph(cfg.adapter_dir, "episodic", entries)
-        loop = self._make_loop()
-        loop._probe_recall.return_value = _recall_probe(1.0)
-
-        slot_path = cfg.adapter_dir / "episodic" / "20260430-000000"
-        with (
-            patch(
-                "paramem.memory.entry.build_registry",
-                return_value={"g0": 0, "g1": 0},
-            ),
-            patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
-            patch("paramem.models.loader.switch_adapter"),
-            patch("paramem.models.loader.copy_adapter_weights"),
-            patch("paramem.models.loader.atomic_save_adapter", return_value=slot_path),
-            patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
-        ):
-            _migrate_tier_simulate_to_train(loop, cfg, "episodic")
-
-        # _train_tier_adapter (the shared funnel) was called with adapter_name=tier
-        # and the migration's own training_config / output_dir / run_name --
-        # budget derivation and the recall callback are inherited from the
-        # funnel using these SAME values, not a migration-local copy.
-        assert loop._train_tier_adapter.call_count == 1
-        funnel_kwargs = loop._train_tier_adapter.call_args.kwargs
-        assert funnel_kwargs["adapter_name"] == "episodic"
-        assert funnel_kwargs["training_config"] is loop.training_config
-        assert (
-            funnel_kwargs["output_dir"] == cfg.adapter_dir / "active_store_migration" / "episodic"
-        )
-        assert funnel_kwargs["run_name"] == "migrate-simulate-to-train-episodic"
-        assert funnel_kwargs["phase_name"] == "migrate-episodic"
-        assert funnel_kwargs["adapter_config"] is loop.episodic_config
-        # Source graph deleted post-success (simulate_to_train always deletes source graph).
-        assert not (cfg.adapter_dir / "episodic" / "graph.json").exists()
-        # Per-tier registry (carrying unified simhash map) persisted at tier path.
-        assert (cfg.adapter_dir / "episodic" / "indexed_key_registry.json").exists()
-
-    def test_duplicate_graph_key_still_gates_correctly(self, tmp_path):
-        """A source graph carrying two edges under the SAME ik_key (the
-        pathological case the migration gate's distinct-key denominator must
-        tolerate) neither double-counts nor under-counts the gate: with both
-        occurrences passing, the tier still promotes; with the probe
-        reporting a genuine miss, it still refuses.
-
-        Migration's entries are unique per key by construction (one graph
-        edge per ik_key, assigned once per fact); this pins that the gate's
-        RecallProbe.rate — a distinct-key denominator — reads correctly even
-        if that invariant were ever violated, rather than silently passing
-        or failing on the duplicate.
-        """
-        cfg = _make_config(tmp_path, mode="train")
-        entries = [_full_quad("g0"), _full_quad("g0")]  # duplicate key, two edges
-        _write_simulate_graph(cfg.adapter_dir, "episodic", entries)
-        loop = self._make_loop()
-        loop._probe_recall.return_value = _recall_probe(1.0)
-
-        slot_path = cfg.adapter_dir / "episodic" / "20260430-000000"
-        with (
-            patch("paramem.memory.entry.build_registry", return_value={"g0": 0}),
-            patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
-            patch("paramem.models.loader.switch_adapter"),
-            patch("paramem.models.loader.copy_adapter_weights"),
-            patch("paramem.models.loader.atomic_save_adapter", return_value=slot_path),
-            patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
-        ):
-            _migrate_tier_simulate_to_train(loop, cfg, "episodic")
-
-        # A full pass still promotes and persists, regardless of the
-        # duplicate — the distinct-key rate is 1.0 either way.
-        assert (cfg.adapter_dir / "episodic" / "indexed_key_registry.json").exists()
-
-    def test_binds_slot_to_registry(self, tmp_path):
-        """Regression: the trained slot's manifest carries a NON-empty
-        registry_sha256 (== sha256 of the tier registry bytes) AND the tier
-        registry is flushed to <tier>/indexed_key_registry.json.
-
-        Without this binding meta.registry_sha256 is empty, find_live_slot can
-        never match it, the adapter silently fails to mount on the next
-        boot/reload, and recall returns 0 keys (boot_degraded).
-        """
-        import hashlib
-
-        cfg = _make_config(tmp_path, mode="train")
-        entries = [_full_quad(f"g{i}") for i in range(2)]
-        _write_simulate_graph(cfg.adapter_dir, "episodic", entries)
-        loop = self._make_loop()
-        loop._probe_recall.return_value = _recall_probe(1.0)
-
-        captured: dict = {}
-
-        def _capture_manifest(*args, **kwargs):
-            captured["registry_sha256_override"] = kwargs.get("registry_sha256_override")
-            return MagicMock()
-
-        slot_path = cfg.adapter_dir / "episodic" / "20260430-000000"
-        with (
-            patch("paramem.memory.entry.build_registry", return_value={"g0": 0, "g1": 0}),
-            patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
-            patch("paramem.models.loader.switch_adapter"),
-            patch("paramem.models.loader.copy_adapter_weights"),
-            patch("paramem.models.loader.atomic_save_adapter", return_value=slot_path),
-            patch(
-                "paramem.adapters.manifest.build_manifest_for",
-                side_effect=_capture_manifest,
-            ),
-        ):
-            _migrate_tier_simulate_to_train(loop, cfg, "episodic")
-
-        # Manifest is bound to the tier registry (non-empty hash matching the bytes).
-        expected_sha = hashlib.sha256(loop.store.registry("episodic").save_bytes()).hexdigest()
-        assert captured["registry_sha256_override"], "registry_sha256_override must be non-empty"
-        assert captured["registry_sha256_override"] == expected_sha
-
-        # Tier registry flushed so find_live_slot can match it on the next boot.
-        assert (cfg.adapter_dir / "episodic" / "indexed_key_registry.json").exists(), (
-            "tier registry must be written for slot binding"
-        )
-
-    def test_key_count_is_registry_active_count_not_entry_count(self, tmp_path):
-        """Stamp-domain pin: key_count must be the ACTIVE count of the same
-        registry whose bytes were hashed into registry_sha256_override -- not
-        len(entries) (the graph-entry count after known_keys filtering,
-        which is active-union-stale domain and can diverge from the true
-        active count when the store carries a leftover active key untouched
-        by this migration's entries).
-
-        Fixture: the tier registry already knows an extra ACTIVE key
-        ("g_extra", no graph edge) plus a STALE key ("g_stale", no graph
-        edge) before the migration runs. Neither is touched by the hot-load
-        loop (their keys never appear in entries), so they survive the call
-        unchanged -- g_extra inflates the true active count past
-        len(entries) while g_stale must NOT.
-        """
-        cfg = _make_config(tmp_path, mode="train")
-        entries = [_full_quad("g0"), _full_quad("g1")]
-        _write_simulate_graph(cfg.adapter_dir, "episodic", entries)
-        loop = self._make_loop()
-        loop._probe_recall.return_value = _recall_probe(1.0)
-
-        reg = loop.store.registry("episodic")
-        reg.add("g0")
-        reg.add("g1")
-        reg.add("g_extra")
-        reg.add("g_stale")
-        reg.stale("g_stale")
-
-        captured: dict = {}
-
-        def _capture_manifest(*args, **kwargs):
-            captured["key_count"] = kwargs.get("key_count")
-            return MagicMock()
-
-        slot_path = cfg.adapter_dir / "episodic" / "20260430-000000"
-        with (
-            patch(
-                "paramem.memory.entry.build_registry",
-                return_value={"g0": 0, "g1": 0},
-            ),
-            patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
-            patch("paramem.models.loader.switch_adapter"),
-            patch("paramem.models.loader.copy_adapter_weights"),
-            patch("paramem.models.loader.atomic_save_adapter", return_value=slot_path),
-            patch(
-                "paramem.adapters.manifest.build_manifest_for",
-                side_effect=_capture_manifest,
-            ),
-        ):
-            _migrate_tier_simulate_to_train(loop, cfg, "episodic")
-
-        # len(entries) after known_keys filtering is 2 (g0, g1) -- the buggy
-        # domain. The true active count is 3 (g0, g1, g_extra); g_stale must
-        # not be counted.
-        assert captured["key_count"] == 3, (
-            "key_count must be the registry's active count (g0, g1, g_extra), "
-            f"not len(entries); got {captured['key_count']!r}"
-        )
-        assert captured["key_count"] == len(loop.store.registry("episodic"))
-
-    def test_writes_fingerprints_in_unified_registry(self, tmp_path):
-        """The persisted registry carries exactly the fingerprints from Step 2.
-
-        After the SimHash unification refactor, fingerprints live in the
-        ``"simhash"`` key of ``indexed_key_registry.json`` rather than in a
-        separate ``simhash_registry.json`` sidecar.
-        """
-        cfg = _make_config(tmp_path, mode="train")
-        entries = [_full_quad(f"g{i}") for i in range(2)]
-        # Unified layout: graph.json lives under adapter_dir.
-        _write_simulate_graph(cfg.adapter_dir, "episodic", entries)
-        loop = self._make_loop()
-        loop._probe_recall.return_value = _recall_probe(1.0)
-
-        slot_path = cfg.adapter_dir / "episodic" / "20260430-000000"
-        built_registry = {"g0": 123, "g1": 456}
-        with (
-            patch(
-                "paramem.memory.entry.build_registry",
-                return_value=built_registry,
-            ),
-            patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
-            patch("paramem.models.loader.switch_adapter"),
-            patch("paramem.models.loader.copy_adapter_weights"),
-            patch("paramem.models.loader.atomic_save_adapter", return_value=slot_path),
-            patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
-        ):
-            _migrate_tier_simulate_to_train(loop, cfg, "episodic")
-
-        from paramem.training.key_registry import KeyRegistry
-
-        reg_path = cfg.adapter_dir / "episodic" / "indexed_key_registry.json"
-        assert reg_path.exists(), "indexed_key_registry.json must be written after migration"
-        reg = KeyRegistry.load(reg_path)
-        on_disk = reg._known_simhashes()
-        assert on_disk == built_registry
-
-    def test_probe_failure_never_promotes_and_never_re_resets_to_lora_zero(self, tmp_path):
-        """A below-threshold probe on the staged weights raises
-        RecallGateRejected, never promotes, and never touches the tier a
-        second time — the tier is left at exactly the LoRA-zero state Step 3
-        already put it in, with no compensating rollback needed.
-
-        Kills: keeping the old delete+recreate LoRA-zero rollback (which
-        would call create_adapter a second time for the same tier).
-        """
-        from paramem.training.consolidation import RecallGateRejected
-
-        cfg = _make_config(tmp_path, mode="train")
-        entries = [_full_quad(f"g{i}") for i in range(3)]
-        # Unified layout: graph.json lives under adapter_dir.
-        _write_simulate_graph(cfg.adapter_dir, "episodic", entries)
-        loop = self._make_loop()
-        loop._probe_recall.return_value = _recall_probe(0.66)
-
-        with (
-            patch("paramem.memory.entry.build_registry", return_value={}),
-            patch(
-                "paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m
-            ) as create_mock,
-            patch("paramem.models.loader.switch_adapter"),
-            patch("paramem.models.loader.copy_adapter_weights") as copy_mock,
-            patch("paramem.models.loader.atomic_save_adapter") as save_mock,
-            patch("paramem.adapters.manifest.build_manifest_for", return_value=None),
-        ):
-            with pytest.raises(RecallGateRejected, match=r"recall .* < 1.0"):
-                _migrate_tier_simulate_to_train(loop, cfg, "episodic")
-
-        # Step 3's single reset-to-LoRA-zero create_adapter call — never a
-        # second one for a rollback that no longer exists.
-        assert create_mock.call_count == 1
-        # No promote copy (in_training -> episodic) was ever attempted.
-        copy_mock.assert_not_called()
-        # No save was attempted (probe failed first)
-        save_mock.assert_not_called()
-        # Source preserved (unified layout: adapter_dir).
-        assert (cfg.adapter_dir / "episodic" / "graph.json").exists()
-        # No registry written (probe failed before write)
-        assert not (cfg.adapter_dir / "episodic" / "indexed_key_registry.json").exists()
-
-    def test_always_uses_entry_build_registry(self, tmp_path):
-        """simulate→train hot-loads via build_registry from entry_memory
-        (not a legacy format helper) at Step 2, before handing entries to the
-        shared training funnel.
-
-        format_entry_training is exercised inside the funnel
-        (_train_tier_adapter, mocked here via _make_loop) rather than
-        directly by migration -- covered by the funnel's own tests in
-        tests/test_consolidation.py, not here.
-        """
-        cfg = _make_config(tmp_path, mode="train")
-        entries = [_full_quad(f"g{i}") for i in range(2)]
-        # Unified layout: graph.json lives under adapter_dir.
-        _write_simulate_graph(cfg.adapter_dir, "episodic", entries)
-        loop = self._make_loop()
-        loop._probe_recall.return_value = _recall_probe(1.0)
-
-        slot_path = cfg.adapter_dir / "episodic" / "20260430-000000"
-        with (
-            patch(
-                "paramem.memory.entry.build_registry",
-                return_value={"g0": 0, "g1": 0},
-            ) as entry_reg,
-            patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
-            patch("paramem.models.loader.switch_adapter"),
-            patch("paramem.models.loader.copy_adapter_weights"),
-            patch("paramem.models.loader.atomic_save_adapter", return_value=slot_path),
-            patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
-        ):
-            _migrate_tier_simulate_to_train(loop, cfg, "episodic")
-
-        entry_reg.assert_called_once()
-
-    def test_recall_probe_is_uncapped(self, tmp_path):
-        """_migrate_tier_simulate_to_train probes the FULL entries list.
-
-        The Phase B gate must probe ALL entries (100 % requirement).  The
-        gate primitive (``loop._probe_recall``) is uncapped by
-        construction — no sampling parameter exists to pass — so this pins
-        that the full entries list (not a subset) reaches the probe call.
-        """
-        cfg = _make_config(tmp_path, mode="train")
-        entries = [_full_quad(f"g{i}") for i in range(5)]
-        _write_simulate_graph(cfg.adapter_dir, "episodic", entries)
-        loop = self._make_loop()
-        loop._probe_recall.return_value = _recall_probe(1.0)
-
-        slot_path = cfg.adapter_dir / "episodic" / "20260430-000000"
-        with (
-            patch(
-                "paramem.memory.entry.build_registry",
-                return_value={f"g{i}": i for i in range(5)},
-            ),
-            patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
-            patch("paramem.models.loader.switch_adapter"),
-            patch("paramem.models.loader.copy_adapter_weights"),
-            patch("paramem.models.loader.atomic_save_adapter", return_value=slot_path),
-            patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
-        ):
-            _migrate_tier_simulate_to_train(loop, cfg, "episodic")
-
-        assert loop._probe_recall.call_count == 1
-        call_args = loop._probe_recall.call_args
-        probed_entries = (
-            call_args.args[1] if len(call_args.args) > 1 else call_args.kwargs.get("entries")
-        )
-        assert len(probed_entries) == len(entries), (
-            f"Expected all {len(entries)} entries probed (uncapped); got {len(probed_entries)!r}."
-        )
-
-    def test_recall_sanity_threshold_config_knob(self, tmp_path):
-        """Migration gate honours loop.config.recall_sanity_threshold.
-
-        With threshold=0.8:
-        - probe recall 0.9 → migration completes (no rollback).
-        - probe recall 0.7 → migration rolls back and raises RuntimeError.
-
-        Without the config knob being read, the gate would compare against the
-        MagicMock default (TypeError) or a hardcoded 1.0 (both would reject 0.9).
-        """
-        from paramem.utils.config import ConsolidationConfig
-
-        # ---- probe=0.9, threshold=0.8 → must NOT raise ----
-        cfg = _make_config(tmp_path / "pass_case", mode="train")
-        entries = [_full_quad("g0"), _full_quad("g1")]
-        _write_simulate_graph(cfg.adapter_dir, "episodic", entries)
-        loop = self._make_loop()
-        loop.config = ConsolidationConfig(recall_sanity_threshold=0.8)
-        loop._probe_recall.return_value = _recall_probe(0.9)
-
-        slot_path = cfg.adapter_dir / "episodic" / "20260430-000000"
-        with (
-            patch("paramem.memory.entry.build_registry", return_value={"g0": 0, "g1": 0}),
-            patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
-            patch("paramem.models.loader.switch_adapter"),
-            patch("paramem.models.loader.copy_adapter_weights"),
-            patch("paramem.models.loader.atomic_save_adapter", return_value=slot_path),
-            patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
-        ):
-            # threshold=0.8, recall=0.9 → gate passes, no exception.
-            _migrate_tier_simulate_to_train(loop, cfg, "episodic")
-
-        # ---- probe=0.7, threshold=0.8 → must raise and roll back ----
-        cfg2 = _make_config(tmp_path / "fail_case", mode="train")
-        _write_simulate_graph(cfg2.adapter_dir, "episodic", entries)
-        loop2 = self._make_loop()
-        loop2.config = ConsolidationConfig(recall_sanity_threshold=0.8)
-        loop2._probe_recall.return_value = _recall_probe(0.7)
-
-        slot_path2 = cfg2.adapter_dir / "episodic" / "20260430-000000"
-        with (
-            patch("paramem.memory.entry.build_registry", return_value={"g0": 0, "g1": 0}),
-            patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
-            patch("paramem.models.loader.switch_adapter"),
-            patch("paramem.models.loader.copy_adapter_weights"),
-            patch("paramem.models.loader.atomic_save_adapter", return_value=slot_path2),
-            patch("paramem.adapters.manifest.build_manifest_for", return_value=None),
-        ):
-            with pytest.raises(RuntimeError, match=r"recall .* < 0\.8"):
-                _migrate_tier_simulate_to_train(loop2, cfg2, "episodic")
-
-    def test_registry_filters_stale_graph_entry_not_reregistered(self, tmp_path):
-        """The resurrection regression: graph.json holds g0 and g1, but the
-        tier registry (models a crash between forget's registry.save and its
-        graph erase) knows only g1.  The entries reaching
-        ``loop._train_tier_adapter`` must contain only g1, and g0 must not be
-        re-registered into the tier registry.  Fails on the pre-fix code
-        (:568-578 re-registers g0 wholesale from graph.json)."""
-        cfg = _make_config(tmp_path, mode="train")
-        entries = [_full_quad("g0"), _full_quad("g1")]
-        _write_simulate_graph(cfg.adapter_dir, "episodic", entries)
-        loop = self._make_loop()
-        # The tier registry only knows g1 — g0 was already erased (forget ran,
-        # registry.save completed) but its graph.json edge survived a crash.
-        loop.store.registry("episodic").add("g1")
-        loop._probe_recall.return_value = _recall_probe(1.0)
-
-        slot_path = cfg.adapter_dir / "episodic" / "20260430-000000"
-        with (
-            patch("paramem.memory.entry.build_registry", return_value={"g1": 0}),
-            patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
-            patch("paramem.models.loader.switch_adapter"),
-            patch("paramem.models.loader.copy_adapter_weights"),
-            patch("paramem.models.loader.atomic_save_adapter", return_value=slot_path),
-            patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
-        ):
-            _migrate_tier_simulate_to_train(loop, cfg, "episodic")
-
-        assert loop._train_tier_adapter.call_count == 1
-        trained_entries = loop._train_tier_adapter.call_args.args[0]
-        trained_keys = {e["key"] for e in trained_entries}
-        assert trained_keys == {"g1"}, f"g0 must be filtered out; got {trained_keys}"
-        assert not loop.store.registry("episodic").knows("g0"), (
-            "g0 must NOT be re-registered into the tier registry"
-        )
-
-    def test_absent_registry_file_migrates_all_entries_unfiltered(self, tmp_path):
-        """Registry file ABSENT (the commit_tier_slot torn-write case): an
-        empty in-memory registry with no on-disk file to corroborate it
-        cannot prove orphanhood, so every graph entry is still migrated
-        (matches test_happy_path_orchestration; TestMigrateTierSimulateToTrain
-        ._make_loop seeds an empty MemoryStore and writes no registry file at
-        the slot root, so this is the existing suite's normal case, pinned
-        explicitly here)."""
-        cfg = _make_config(tmp_path, mode="train")
-        entries = [_full_quad("g0"), _full_quad("g1")]
-        _write_simulate_graph(cfg.adapter_dir, "episodic", entries)
-        loop = self._make_loop()
-        assert loop.store.registry("episodic").list_known() == []
-        assert not (cfg.adapter_dir / "episodic" / "indexed_key_registry.json").exists()
-        loop._probe_recall.return_value = _recall_probe(1.0)
-
-        slot_path = cfg.adapter_dir / "episodic" / "20260430-000000"
-        with (
-            patch("paramem.memory.entry.build_registry", return_value={"g0": 0, "g1": 0}),
-            patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
-            patch("paramem.models.loader.switch_adapter"),
-            patch("paramem.models.loader.copy_adapter_weights"),
-            patch("paramem.models.loader.atomic_save_adapter", return_value=slot_path),
-            patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
-        ):
-            _migrate_tier_simulate_to_train(loop, cfg, "episodic")
-
-        trained_entries = loop._train_tier_adapter.call_args.args[0]
-        trained_keys = {e["key"] for e in trained_entries}
-        assert trained_keys == {"g0", "g1"}
-
-    def test_present_but_empty_registry_file_skips_tier(self, tmp_path):
-        """Registry file PRESENT and empty is authoritative: forget can erase
-        a tier's last key (registry.save lands durably) and then crash
-        before its graph erase runs.  On-disk presence with zero known keys
-        proves the tier really has none, so migrate must skip the tier
-        rather than resurrect the stale graph content as a freshly-keyed
-        fact."""
-        cfg = _make_config(tmp_path, mode="train")
-        entries = [_full_quad("g0"), _full_quad("g1")]
-        _write_simulate_graph(cfg.adapter_dir, "episodic", entries)
-        # An empty-but-present registry file at the canonical slot-root path.
-        _write_adapter_registry(cfg.adapter_dir, "episodic", [])
-        loop = self._make_loop()
-        assert loop.store.registry("episodic").list_known() == []
-
-        with pytest.raises(_TierSkipped, match="present and empty"):
-            _migrate_tier_simulate_to_train(loop, cfg, "episodic")
-
-        # Nothing was trained.
-        loop._train_tier_adapter.assert_not_called()
-
-    def test_hot_load_pairs_every_key_with_bookkeeping(self, tmp_path):
-        """Every key hot-loaded by the migration has a bookkeeping record
-        afterward -- an active key with no provenance row trips the
-        main-tiers fold's registry_bookkeeping_divergence integrity gate on
-        the next full consolidation.  No key_metadata.json and no
-        pre-existing live-store bookkeeping here, so the hot-load loop falls
-        back to the source graph entry's own speaker_id (``_full_quad``
-        writes ``"speaker0"`` onto the graph edge, and ``iter_entries``
-        carries it back out) rather than discarding it; relation_type has no
-        graph-carried counterpart, so it still defaults to ``"unknown"``."""
-        cfg = _make_config(tmp_path, mode="train")
-        entries = [_full_quad("g0"), _full_quad("g1")]
-        _write_simulate_graph(cfg.adapter_dir, "episodic", entries)
-        loop = self._make_loop()
-        loop._probe_recall.return_value = _recall_probe(1.0)
-
-        slot_path = cfg.adapter_dir / "episodic" / "20260430-000000"
-        with (
-            patch("paramem.memory.entry.build_registry", return_value={"g0": 0, "g1": 0}),
-            patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
-            patch("paramem.models.loader.switch_adapter"),
-            patch("paramem.models.loader.copy_adapter_weights"),
-            patch("paramem.models.loader.atomic_save_adapter", return_value=slot_path),
-            patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
-        ):
-            _migrate_tier_simulate_to_train(loop, cfg, "episodic")
-
-        for key in ("g0", "g1"):
-            bk = loop.store.bookkeeping_for_key(key)
-            assert bk is not None, f"key {key} has no bookkeeping record after migration"
-            assert bk["speaker_id"] == "speaker0"
-            assert bk["relation_type"] == "unknown"
-
-    def test_hot_load_falls_back_to_empty_when_graph_entry_also_unattributed(self, tmp_path):
-        """When the live store, on-disk key_metadata.json, AND the source
-        graph entry itself carry no speaker_id, the hot-load loop still
-        falls back to the empty-speaker default rather than raising -- the
-        last-resort arm of the priority chain (live store -> disk ->
-        graph entry -> empty)."""
-        cfg = _make_config(tmp_path, mode="train")
-        entries = [
-            {
-                "key": "g0",
-                "subject": "Subject",
-                "predicate": "related_to",
-                "object": "Object",
-                "speaker_id": "",
-            }
-        ]
-        _write_simulate_graph(cfg.adapter_dir, "episodic", entries)
-        loop = self._make_loop()
-        loop._probe_recall.return_value = _recall_probe(1.0)
-
-        slot_path = cfg.adapter_dir / "episodic" / "20260430-000000"
-        with (
-            patch("paramem.memory.entry.build_registry", return_value={"g0": 0}),
-            patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
-            patch("paramem.models.loader.switch_adapter"),
-            patch("paramem.models.loader.copy_adapter_weights"),
-            patch("paramem.models.loader.atomic_save_adapter", return_value=slot_path),
-            patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
-        ):
-            _migrate_tier_simulate_to_train(loop, cfg, "episodic")
-
-        bk = loop.store.bookkeeping_for_key("g0")
-        assert bk is not None, "key g0 has no bookkeeping record after migration"
-        assert bk["speaker_id"] == ""
-        assert bk["relation_type"] == "unknown"
-
-    def test_hot_load_reuses_disk_key_metadata_when_live_store_is_empty(self, tmp_path):
-        """When the live store carries no bookkeeping (the base-swap Phase B
-        shape: loop constructed against an empty store), the hot-load loop
-        reuses the on-disk key_metadata.json row for a migrated key rather
-        than falling back to an empty-speaker default."""
-        cfg = _make_config(tmp_path, mode="train")
-        entries = [_full_quad("g0")]
-        _write_simulate_graph(cfg.adapter_dir, "episodic", entries)
-        cfg.key_metadata_path.write_text(
-            json.dumps(
-                {
-                    "keys": {
-                        "g0": {
-                            "speaker_id": "speaker3",
-                            "relation_type": "preference",
-                            "reinforcement_count": 4,
-                            "last_reinforced_cycle": 2,
-                            "last_seen": "2026-01-01T00:00:00+00:00",
-                            "first_seen": "2025-12-01T00:00:00+00:00",
-                        }
-                    }
-                }
-            )
-        )
-        loop = self._make_loop()
-        loop._probe_recall.return_value = _recall_probe(1.0)
-
-        slot_path = cfg.adapter_dir / "episodic" / "20260430-000000"
-        with (
-            patch("paramem.memory.entry.build_registry", return_value={"g0": 0}),
-            patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
-            patch("paramem.models.loader.switch_adapter"),
-            patch("paramem.models.loader.copy_adapter_weights"),
-            patch("paramem.models.loader.atomic_save_adapter", return_value=slot_path),
-            patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
-        ):
-            _migrate_tier_simulate_to_train(loop, cfg, "episodic")
-
-        bk = loop.store.bookkeeping_for_key("g0")
-        assert bk is not None
-        assert bk["speaker_id"] == "speaker3"
-        assert bk["relation_type"] == "preference"
-        assert bk["reinforcement_count"] == 4
-
-    def test_hot_load_prefers_live_store_bookkeeping_over_disk(self, tmp_path):
-        """When the live store already carries a bookkeeping record for a
-        migrated key (the ordinary mode-switch path -- loop is the live
-        singleton, hydrated at boot), that record wins over an on-disk
-        key_metadata.json row for the same key."""
-        cfg = _make_config(tmp_path, mode="train")
-        entries = [_full_quad("g0")]
-        _write_simulate_graph(cfg.adapter_dir, "episodic", entries)
-        cfg.key_metadata_path.write_text(
-            json.dumps(
-                {
-                    "keys": {
-                        "g0": {
-                            "speaker_id": "speaker_disk",
-                            "relation_type": "unknown",
-                            "reinforcement_count": 1,
-                            "last_reinforced_cycle": 0,
-                            "last_seen": "",
-                            "first_seen": "",
-                        }
-                    }
-                }
-            )
-        )
-        loop = self._make_loop()
-        loop._probe_recall.return_value = _recall_probe(1.0)
-        loop.store.set_bookkeeping(
-            "g0",
-            speaker_id="speaker_live",
-            relation_type="factual",
-            reinforcement_count=9,
-            last_reinforced_cycle=5,
-            first_seen="",
-        )
-
-        slot_path = cfg.adapter_dir / "episodic" / "20260430-000000"
-        with (
-            patch("paramem.memory.entry.build_registry", return_value={"g0": 0}),
-            patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
-            patch("paramem.models.loader.switch_adapter"),
-            patch("paramem.models.loader.copy_adapter_weights"),
-            patch("paramem.models.loader.atomic_save_adapter", return_value=slot_path),
-            patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
-        ):
-            _migrate_tier_simulate_to_train(loop, cfg, "episodic")
-
-        bk = loop.store.bookkeeping_for_key("g0")
-        assert bk is not None
-        assert bk["speaker_id"] == "speaker_live"
-        assert bk["reinforcement_count"] == 9
-
-    def test_hot_load_store_entry_is_content_only(self, tmp_path):
-        """The hot-loaded store entry carries exactly the four content
-        fields (key, subject, predicate, object) -- no speaker_id or
-        relation_type.  A fatter entry here would leave a migrated key with
-        a different shape than every other store.put site in the fold
-        (the shared paramem.memory.entry.content_only_entry projection) and
-        would leak attribution fields through /debug/dump.  Attribution
-        lives only in the bookkeeping record (asserted separately by the
-        sibling priority-arm tests)."""
-        cfg = _make_config(tmp_path, mode="train")
-        entries = [_full_quad("g0")]
-        _write_simulate_graph(cfg.adapter_dir, "episodic", entries)
-        loop = self._make_loop()
-        loop._probe_recall.return_value = _recall_probe(1.0)
-
-        slot_path = cfg.adapter_dir / "episodic" / "20260430-000000"
-        with (
-            patch("paramem.memory.entry.build_registry", return_value={"g0": 0}),
-            patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
-            patch("paramem.models.loader.switch_adapter"),
-            patch("paramem.models.loader.copy_adapter_weights"),
-            patch("paramem.models.loader.atomic_save_adapter", return_value=slot_path),
-            patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
-        ):
-            _migrate_tier_simulate_to_train(loop, cfg, "episodic")
-
-        stored = loop.store.get("g0")
-        assert stored is not None
-        assert stored == {
-            "key": "g0",
-            "subject": "Subject",
-            "predicate": "related_to",
-            "object": "Object",
-        }
-
-
-# ---------------------------------------------------------------------------
-# Crash-window recovery via the real migrate() orchestrator
-# ---------------------------------------------------------------------------
-
-
-class TestForgetCrashWindowRecoveryViaMigrate:
-    """The registry is written durably before the graph erase in
-    ``POST /speaker/forget`` (``paramem/server/app.py::speaker_forget``); a
-    crash between the two leaves ``graph.json`` still holding the forgotten
-    key's edge while the on-disk registry already reports it gone.  The
-    real ``migrate()`` orchestrator must not resurrect that key."""
-
-    def test_migrate_skips_tier_left_in_crash_window_after_last_key_forgotten(self, tmp_path):
-        from paramem.training.key_registry import KeyRegistry
-
-        cfg = _make_config(tmp_path, mode="train")
-        key = "g0"
-        # graph.json still holds the "forgotten" key's edge — the forget
-        # handler's graph erase (persistence.erase_keys_from_graph_file)
-        # never ran before the crash.
-        _write_simulate_graph(cfg.adapter_dir, "episodic", [_full_quad(key)])
-        # The registry write landed durably and is now empty — the tier's
-        # last key was already dropped from it (forget's registry.save
-        # completed before the crash).
-        _write_adapter_registry(cfg.adapter_dir, "episodic", [])
-
-        loop = MagicMock()
-        from paramem.memory.store import MemoryStore as _MS
-
-        loop.store = _MS(replay_enabled=True)
-        loop.store.load_registry("episodic", KeyRegistry())  # matches on-disk: empty
-
-        state = MigrationState.for_mode_switch(source_mode="simulate", target_mode="train")
-        result = migrate(loop, cfg, state)
-
-        # Tier is skipped (not trained), and the key is never re-registered.
-        assert "episodic" in result.completed_tiers
-        assert "episodic" not in result.failed_tiers
-        assert not loop.store.registry("episodic").knows(key)
-        loop._train_tier_adapter.assert_not_called()
-        # The stale graph.json is left on disk for the operator to clean up
-        # via the next full fold/reconcile — migrate() does not delete it on
-        # a skip (only on a successful migration).
-        assert (cfg.adapter_dir / "episodic" / "graph.json").exists()
-
-
-# ---------------------------------------------------------------------------
-# New tests: interim store migration
-# ---------------------------------------------------------------------------
-
-
-INTERIM_NAME = "episodic_interim_20260101T0000"
-
-
-class TestMigrateEnumeration:
-    """migrate() dispatches all registered stores including interim ones."""
-
-    def test_dispatches_all_four_stores(self, tmp_path):
-        """Four registered stores (3 main + 1 interim) are all dispatched."""
-        from paramem.memory.store import MemoryStore as _MS
-        from paramem.training.key_registry import KeyRegistry
-
-        cfg = _make_config(tmp_path, mode="simulate")
-        loop = MagicMock()
-        store = _MS(replay_enabled=True)
-        registered = list(TIERS) + [INTERIM_NAME]
-        for name in registered:
-            store.load_registry(name, KeyRegistry())
-        loop.store = store
-
-        state = MigrationState.for_mode_switch(source_mode="train", target_mode="simulate")
-
-        dispatched: list[str] = []
-
-        def _fake_t2s(l, c, name):  # noqa: E741
-            dispatched.append(name)
-
-        with patch(
-            "paramem.server.active_store_migration._migrate_tier_train_to_simulate",
-            side_effect=_fake_t2s,
-        ):
-            result = migrate(loop, cfg, state)
-
-        assert set(dispatched) == set(registered)
-        assert set(result.completed_tiers) == set(registered)
-
-
-class TestAllTiersDoneCoupling:
-    """all_tiers_done(registered_tiers) coupling — regression guard."""
-
-    def test_false_while_interim_pending(self, tmp_path):
-        """all_tiers_done returns False when the interim is not yet complete."""
-        registered = list(TIERS) + [INTERIM_NAME]
-        state = MigrationState.for_mode_switch(source_mode="train", target_mode="simulate")
-        state.completed_tiers = list(TIERS)  # interim NOT yet done
-        assert state.all_tiers_done(registered) is False
-
-    def test_true_after_all_four_complete(self, tmp_path):
-        """all_tiers_done returns True only after all four stores complete."""
-        registered = list(TIERS) + [INTERIM_NAME]
-        state = MigrationState.for_mode_switch(source_mode="train", target_mode="simulate")
-        state.completed_tiers = registered[:]
-        assert state.all_tiers_done(registered) is True
-
-    def test_clear_state_not_called_while_interim_pending(self, tmp_path):
-        """migrate() does NOT clear the state file while the interim is pending."""
-        from paramem.memory.store import MemoryStore as _MS
-        from paramem.training.key_registry import KeyRegistry
-
-        cfg = _make_config(tmp_path, mode="simulate")
-        loop = MagicMock()
-        store = _MS(replay_enabled=True)
-        registered = list(TIERS) + [INTERIM_NAME]
-        for name in registered:
-            store.load_registry(name, KeyRegistry())
-        loop.store = store
-
-        state = MigrationState.for_mode_switch(source_mode="train", target_mode="simulate")
-
-        call_order: list[str] = []
-
-        def _fake_t2s(l, c, name):  # noqa: E741
-            call_order.append(name)
-            if name == INTERIM_NAME:
-                raise RuntimeError("interim blew up")
-
-        with patch(
-            "paramem.server.active_store_migration._migrate_tier_train_to_simulate",
-            side_effect=_fake_t2s,
-        ):
-            result = migrate(loop, cfg, state)
-
-        # All three main tiers succeeded; interim failed → state file MUST persist.
-        assert INTERIM_NAME in result.failed_tiers
-        assert state_path(cfg.adapter_dir).exists(), (
-            "State file must persist when interim store failed; "
-            "clear_state must NOT be called with an incomplete registered set"
-        )
-
-
-class TestSlotPathResolverInterim:
-    """Resolver wiring for interim stores in both migration directions."""
-
-    def test_train_to_simulate_resolves_interim_slot_root(self, tmp_path):
-        """train_to_simulate writes graph.json under episodic/interim_<stamp>/."""
-        from paramem.memory.interim_adapter import adapter_slot_root_for_name
-
-        cfg = _make_config(tmp_path, mode="simulate")
-        adapter_dir = cfg.adapter_dir
-
-        # Expected slot root under the hierarchy.
-        expected_slot_root = adapter_slot_root_for_name(adapter_dir, INTERIM_NAME)
-        assert str(expected_slot_root) == str(adapter_dir / "episodic" / "interim_20260101T0000")
-
-        # Create a weight slot under the resolved root so migration has something to delete.
-        slot_dir = expected_slot_root / "20260430-180000"
-        slot_dir.mkdir(parents=True, exist_ok=True)
-        (slot_dir / "adapter_config.json").write_text("{}")
-
-        # Write a graph.json at the slot root (simulating a reconstruct).
-        # We need active keys in the store so _TierSkipped is not raised.
-        loop = _make_loop_train_to_simulate(tmp_path, keys=["ik1"])
-        # Override the store's tier to the interim name.
-        from paramem.training.key_registry import KeyRegistry
-
-        loop.store.load_registry(INTERIM_NAME, KeyRegistry())
-        loop.store.put(INTERIM_NAME, "ik1", {"subject": "S", "predicate": "p", "object": "O"})
-
-        reconstruction_graph = nx.MultiDiGraph()
-        eid = reconstruction_graph.add_edge("S", "O", predicate="p")
-        reconstruction_graph["S"]["O"][eid][_IK_KEY_ATTR] = "ik1"
-        result_mock = MagicMock()
-        result_mock.graph = reconstruction_graph
-        result_mock.failures = []
-
-        with patch(
-            "paramem.graph.reconstruct.reconstruct_graph",
-            return_value=result_mock,
-        ):
-            _migrate_tier_train_to_simulate(loop, cfg, INTERIM_NAME)
-
-        # graph.json must exist under the interim slot root.
-        assert (expected_slot_root / "graph.json").exists()
-        # Weight slot directory must have been deleted.
-        assert not slot_dir.exists()
-
-    def test_simulate_to_train_resolves_interim_slot_root(self, tmp_path):
-        """simulate_to_train reads/saves under episodic/interim_<stamp>/."""
-        from paramem.memory.interim_adapter import adapter_slot_root_for_name
-
-        cfg = _make_config(tmp_path, mode="train")
-        adapter_dir = cfg.adapter_dir
-
-        expected_slot_root = adapter_slot_root_for_name(adapter_dir, INTERIM_NAME)
-
-        # Write the source graph.json at the interim slot root.
-        entries = [_full_quad("ik1")]
-        _write_simulate_graph_at(expected_slot_root, entries)
-
-        loop = TestMigrateTierSimulateToTrain()._make_loop()
-        loop._probe_recall.return_value = _recall_probe(1.0)
-
-        slot_path = expected_slot_root / "20260430-000000"
-        with (
-            patch("paramem.memory.entry.build_registry", return_value={"ik1": 99}),
-            patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
-            patch("paramem.models.loader.switch_adapter"),
-            patch("paramem.models.loader.copy_adapter_weights"),
-            patch(
-                "paramem.models.loader.atomic_save_adapter",
-                return_value=slot_path,
-            ),
-            patch("paramem.adapters.manifest.build_manifest_for", return_value=None),
-        ):
-            _migrate_tier_simulate_to_train(loop, cfg, INTERIM_NAME)
-
-        # Source graph.json at slot root must have been deleted after success.
-        assert not (expected_slot_root / "graph.json").exists()
-        # Registry (carrying unified simhash map) written at slot root.
-        assert (expected_slot_root / "indexed_key_registry.json").exists()
-
-
-class TestTierAdapterConfigInterim:
-    """_tier_adapter_config maps interim names to the episodic config."""
-
-    def test_interim_name_resolves_to_episodic_config(self):
-        from paramem.server.active_store_migration import _tier_adapter_config
-
-        loop = MagicMock()
-        expected = MagicMock(name="episodic_cfg")
-        loop.episodic_config = expected
-        loop.semantic_config = MagicMock(name="semantic_cfg")
-        loop.procedural_config = MagicMock(name="procedural_cfg")
-
-        result = _tier_adapter_config(loop, INTERIM_NAME)
-        assert result is expected, (
-            f"Interim name {INTERIM_NAME!r} must resolve to episodic_config; got {result!r}"
-        )
-
-    def test_main_tier_resolves_own_config(self):
-        from paramem.server.active_store_migration import _tier_adapter_config
-
-        loop = MagicMock()
-        loop.episodic_config = MagicMock(name="ep")
-        loop.semantic_config = MagicMock(name="sem")
-        loop.procedural_config = MagicMock(name="proc")
-
-        assert _tier_adapter_config(loop, "episodic") is loop.episodic_config
-        assert _tier_adapter_config(loop, "semantic") is loop.semantic_config
-        assert _tier_adapter_config(loop, "procedural") is loop.procedural_config
-
-    def test_interim_with_disabled_episodic_raises_skipped(self):
-        """When episodic_config is None, interim adapter raises _TierSkipped."""
-        from paramem.server.active_store_migration import _tier_adapter_config
-
-        loop = MagicMock()
-        loop.episodic_config = None
-        with pytest.raises(_TierSkipped, match="not enabled"):
-            _tier_adapter_config(loop, INTERIM_NAME)
-
-
-class TestNegativeCouplingGuard:
-    """Structural guard: active_store_migration must not import consolidation functions."""
-
-    def _module_source(self) -> str:
-        import importlib.util
-
-        spec = importlib.util.find_spec("paramem.server.active_store_migration")
-        assert spec is not None and spec.origin is not None
-        return Path(spec.origin).read_text(encoding="utf-8")
-
-    def test_no_partition_relations_import(self):
-        assert "partition_relations" not in self._module_source()
-
-    def test_no_graph_tier_refiner_import(self):
-        """Migration must never reach into the consolidation fold's tier refiner.
-
-        The enrichment/normalization surfaces used to be reachable as a
-        SHIM method directly on ``ConsolidationLoop`` (since deleted). They
-        now live in ``paramem.training.graph_tier`` (``GraphTierRefiner``)
-        and ``paramem.training.graph_enrich`` (its dispatch target), both
-        owned by the consolidation fold
-        (``ConsolidationLoop._refine_consolidation_graph``). The
-        predecessor of this test asserted on the deleted SHIM method's old
-        name as a substring, which no longer appears anywhere in the repo,
-        so it passed unconditionally and enforced nothing — migration
-        could import ``graph_tier.GraphTierRefiner`` directly and this
-        guard would still pass.
-
-        Checked as a substring scan (like its sibling
-        ``test_no_partition_relations_import``), not an ``ast`` import scan
-        (like ``test_no_fold_entry_call`` below): the banned names here are
-        two module names and one free-function name, and all three appear
-        literally in any import statement that would violate the invariant
-        — including an aliased import
-        (``from paramem.training import graph_tier as gt`` still contains
-        the substring ``"graph_tier"``) — so a substring check is
-        sufficient. An ``ast`` scan is reserved for guarding *call sites*
-        on an ambiguous bare word (``.consolidate(...)`` collides with this
-        module's own vocabulary), which is not the situation here.
-        """
-        src = self._module_source()
-        for banned in ("graph_tier", "graph_enrich", "enrich_graph"):
-            assert banned not in src, (
-                f"{banned!r} must not appear in active_store_migration.py — "
-                "migration must not reach into the consolidation fold's tier refiner"
-            )
-
-    def test_no_fold_entry_call(self):
-        """Migration must never reach into the consolidation fold.
-
-        The fold's single public entry is ``ConsolidationLoop.consolidate``.
-        Scanned via ``ast`` for any ``x.consolidate(...)`` method call,
-        regardless of the receiver name — this also catches an aliased
-        receiver (``l = loop; l.consolidate(...)``) that a literal
-        ``"loop.consolidate("`` substring check would miss.  Matching on the
-        attribute name rather than the bare word ``consolidate`` is required
-        because the bare word collides with this module's own vocabulary (it
-        names the loop, imports from ``paramem.training.consolidation``, and
-        talks about consolidation in prose).  The predecessor of this test
-        asserted on ``consolidate_interim_adapters``, a symbol that no longer
-        exists anywhere, so it passed unconditionally and enforced nothing.
-        """
-        import ast
-
-        tree = ast.parse(self._module_source())
-        call_sites = [
-            node
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "consolidate"
-        ]
-        assert not call_sites, (
-            f"active_store_migration.py must not call .consolidate(...) — found "
-            f"{[node.lineno for node in call_sites]}"
-        )
-
-    def test_no_merger_graph_access(self):
-        assert ".merger.graph" not in self._module_source()
-
-
-class TestTerminologyGuard:
-    """Terminology guard: 'fallback' and 'drift' must not appear in the module source."""
-
-    def _module_source(self) -> str:
-        import importlib.util
-
-        spec = importlib.util.find_spec("paramem.server.active_store_migration")
-        assert spec is not None and spec.origin is not None
-        return Path(spec.origin).read_text(encoding="utf-8")
-
-    def test_no_fallback_in_source(self):
-        """The 'source store is authoritative, not a fallback' narrative must
-        never reappear in this module's prose or identifiers.
-
-        The single recognized exception is ``fallback_adapter`` — the
-        staging lifecycle's own cross-module parameter name
-        (``paramem.training.trainer.staged_weights``/``drop_adapter_slot``,
-        naming which adapter a transient slot's disposal switches to before
-        deleting it).  That is an unrelated PEFT-lifecycle concept, not the
-        migration source-authority story this guard protects; every other
-        occurrence of 'fallback' is still banned.
-        """
-        import re
-
-        src = self._module_source()
-        stripped = re.sub(r"fallback_adapter", "", src, flags=re.IGNORECASE)
-        assert "fallback" not in stripped.lower(), (
-            "The word 'fallback' must not appear in active_store_migration.py "
-            "(the source store is authoritative, not a fallback) outside the "
-            "recognized 'fallback_adapter' staging-lifecycle parameter name"
-        )
-
-    def test_no_drift_in_source(self):
-        src = self._module_source()
-        assert "drift" not in src.lower(), (
-            "The word 'drift' must not appear in active_store_migration.py"
-        )
-
-
-# ---------------------------------------------------------------------------
-# Dispatch-guard: integrity_check_failed blocks migration dispatch
-# ---------------------------------------------------------------------------
-
-
-class TestIntegrityCheckFailedDispatchGuard:
-    """_dispatch_consolidation must not dispatch migration when
-    integrity_check_failed is True.
-
-    This is the second half of the fix for the silent data-loss bug: even if
-    pending_rehydration is set, a degraded store (failed boot registry load)
-    must prevent the migration from running.  The migration would see 0
-    registered tiers, all_tiers_done([]) would fire, clear_state would remove
-    the state file, and _finalize_migration would flip effective_mode —
-    completing a no-op migration.
-    """
-
-    def test_degraded_store_skips_migration_dispatch(self):
-        """With integrity_check_failed=True and pending_rehydration=True,
-        _dispatch_consolidation returns 'migration_skipped_degraded'
-        and does NOT call _run_active_store_migration_sync.
-        """
-        from paramem.server import app as app_module
-
-        run_migration_calls = []
-
-        with (
-            patch.dict(
-                app_module._state,
-                {
-                    "consolidating": False,
-                    "mode": "local",
-                    "background_trainer": None,
-                    "config": MagicMock(
-                        consolidation=MagicMock(consolidation_period_string=""),
-                        adapter_dir=Path("/tmp/fake"),
-                    ),
-                    "session_buffer": MagicMock(),
-                    "pending_rehydration": True,
-                    "integrity_check_failed": True,
-                },
-                clear=False,
-            ),
-            patch(
-                "paramem.server.app._retro_claim_orphan_sessions",
-                return_value=0,
-            ),
-            patch(
-                "paramem.server.app._run_active_store_migration_sync",
-                side_effect=lambda: run_migration_calls.append(1),
-            ),
-        ):
-            result, _action = app_module._dispatch_consolidation(
-                app_module.ConsolidationAction.AUTO
-            )
-
-        assert result == "migration_skipped_degraded", (
-            f"Expected 'migration_skipped_degraded' but got {result!r}; "
-            "migration must be blocked when the store failed to load at boot"
-        )
-        assert run_migration_calls == [], (
-            "_run_active_store_migration_sync must NOT be called when integrity_check_failed=True"
-        )
-
-    def test_healthy_store_dispatches_migration(self):
-        """With integrity_check_failed=False and pending_rehydration=True,
-        _dispatch_consolidation proceeds to dispatch the migration.
-
-        Verifies that the degraded guard does not block healthy stores.
-        """
-        from paramem.server import app as app_module
-
-        mock_future = MagicMock()
-        mock_future.add_done_callback = MagicMock()
-        mock_loop = MagicMock()
-        mock_loop.run_in_executor.return_value = mock_future
-
-        with (
-            patch.dict(
-                app_module._state,
-                {
-                    "consolidating": False,
-                    "mode": "local",
-                    "background_trainer": None,
-                    "config": MagicMock(
-                        consolidation=MagicMock(consolidation_period_string=""),
-                        adapter_dir=Path("/tmp/fake"),
-                    ),
-                    "session_buffer": MagicMock(),
-                    "pending_rehydration": True,
-                    "integrity_check_failed": False,
-                    "event_loop": mock_loop,
-                },
-                clear=False,
-            ),
-            patch(
-                "paramem.server.app._retro_claim_orphan_sessions",
-                return_value=0,
-            ),
-        ):
-            result, _action = app_module._dispatch_consolidation(
-                app_module.ConsolidationAction.AUTO
-            )
-
-        assert result == "started_migration", (
-            f"Expected 'started_migration' but got {result!r}; "
-            "migration must proceed when integrity_check_failed=False"
-        )
-        mock_loop.run_in_executor.assert_called_once()
-
-
-# ---------------------------------------------------------------------------
-# Helpers used by new tests (not already in the module-level helpers above)
-# ---------------------------------------------------------------------------
-
-
-def _write_simulate_graph_at(slot_root: Path, entries: list[dict]) -> Path:
-    """Write a graph.json directly at *slot_root* (for interim path tests)."""
-    slot_root.mkdir(parents=True, exist_ok=True)
-    graph_path = slot_root / "graph.json"
-    graph = nx.MultiDiGraph()
-    for entry in entries:
-        graph.add_edge(
-            entry.get("subject", "Subject"),
-            entry.get("object", "Object"),
-            **{
-                _IK_KEY_ATTR: entry["key"],
-                "predicate": entry.get("predicate", "related_to"),
-                "speaker_id": entry.get("speaker_id", "speaker0"),
-            },
-        )
-    save_memory_to_disk(graph, graph_path)
-    return graph_path
+    def test_load_state_returns_none_when_absent(self, tmp_path: Path) -> None:
+        assert load_state(tmp_path) is None

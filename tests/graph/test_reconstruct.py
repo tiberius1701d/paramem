@@ -64,8 +64,8 @@ def _make_loop(
 ) -> SimpleNamespace:
     """Return a minimal stub loop accepted by reconstruct_graph.
 
-    ``registry`` is a ``dict[str, KeyRegistry]`` (per-tier) or ``None``
-    (disabled).  The empty-dict case is used in tests that need no active keys.
+    ``registry`` is a ``dict[str, KeyRegistry]`` (per-tier).  The empty-dict
+    case is used in tests that need no active keys.
     """
     from paramem.memory.store import MemoryStore
 
@@ -76,7 +76,7 @@ def _make_loop(
         gradient_checkpointing=gradient_checkpointing, recall_probe_batch_size=16
     )
 
-    store = MemoryStore(replay_enabled=registry is not None)
+    store = MemoryStore()
     if registry is not None:
         for tier_name, reg in registry.items():
             store.load_registry(tier_name, reg)

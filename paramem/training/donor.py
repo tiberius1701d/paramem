@@ -92,7 +92,7 @@ Build timing (operational note)
 ---------------------------------
 Every (base model, LoRA topology) pair gets its OWN donor checkpoint,
 built lazily by the same single call site
-(``ConsolidationLoop._maybe_seed_from_donor``, inside
+(``ConsolidationLoop._resolve_donor_checkpoint``, inside
 ``_train_tier_adapter``): when the TARGET tier's store holds no valid
 checkpoint, :func:`build_donor` runs INLINE,
 synchronously, at that topology, before that fold's own training. The
@@ -146,8 +146,10 @@ logger = logging.getLogger(__name__)
 
 class DonorBuildIncomplete(RuntimeError):
     """Raised by :func:`build_donor` when ``_train_tier_adapter`` did not
-    complete training for the donor (thermal/pause abort, or an empty
-    example set) — no checkpoint is persisted. Callers (the seeding hook)
+    complete training for the donor (an inference request aborting
+    background training via ``BackgroundTrainer.abort_for_inference``,
+    server shutdown, or an empty example set) — no checkpoint is persisted.
+    Callers (the seeding hook)
     catch this specifically and treat the fold as "no checkpoint yet" —
     skip seeding this fold, log, and let the next measured-cold fold retry
     the build — rather than crash the fold or (worse) silently persist a
@@ -242,8 +244,9 @@ Excluded from the seeding hook by name (``paramem.training.consolidation``)
 so training the donor itself never recursively re-triggers donor seeding."""
 
 DONOR_LOAD_ADAPTER_NAME: str = "_donor_seed"
-"""Transient slot the seeding hook loads the donor checkpoint into before
-copying its weights into the real target and deleting the slot."""
+"""Transient slot ``train_adapter`` loads the donor checkpoint into before
+copying its weights into the transient staging slot (never the live tier)
+and deleting the slot."""
 
 _FIXTURE_PATH = Path(__file__).with_name("donor_fixture.json")
 
@@ -504,6 +507,14 @@ def _manifest_lora_shape(manifest) -> dict:
     :func:`~paramem.models.loader.lora_shape_fields` is the live one. Both
     feed the SAME :func:`donor_topology_id`, so there is one topology
     comparison, not two shape schemas.
+
+    A donor slot is always a train-payload slot, so ``manifest.lora`` is
+    never ``None`` in a valid call. A ``simulate``-payload manifest (never a
+    legitimate donor) raises ``AttributeError`` here, deliberately
+    uncaught locally — the sole caller (:func:`donor_slot_valid`) evaluates
+    this inside the same ``try`` as the regeneration check and treats any
+    of ``TypeError``/``KeyError``/``ValueError``/``AttributeError`` as an
+    invalid, rebuild-worthy checkpoint.
     """
     return {
         "r": manifest.lora.rank,
@@ -546,12 +557,19 @@ def donor_checkpoint_valid(store_dir: Path, base_model_id: "str | None", lora_sh
     logic, or either fixed hyperparameter) invalidates every existing
     checkpoint outright, regardless of how the other checks would score,
     so the next measured-cold fold rebuilds from the new recipe; (4) the
-    weights on disk hash to the recorded ``meta["weights_sha256"]`` -- the
+    weights on disk hash to the manifest's own ``payload.sha256`` -- the
     ONE check that reads the artifact this checkpoint exists to hand over
     rather than metadata about it, so a truncated or corrupt file is
-    rebuilt here instead of raising inside the caller's load; a checkpoint
-    recording no digest is unverifiable and therefore invalid; (5) the
-    manifest's recorded shape's topology id (:func:`donor_topology_id`)
+    rebuilt here instead of raising inside the caller's load. This is the
+    same plaintext digest the write envelope stamps
+    (:func:`~paramem.backup.hashing.plaintext_sha256`), so a
+    ``rotate-daily`` re-encrypt does not invalidate a checkpoint that has
+    not otherwise changed -- unlike a raw-ciphertext digest, which
+    ``rotate-daily`` invalidates on every rotation. The digest read is
+    inside this function's never-raises boundary: a raise while decrypting
+    (unloaded daily identity, foreign envelope) reads as invalid, same as
+    a mismatched digest; (5) the manifest's recorded shape's topology id
+    (:func:`donor_topology_id`)
     equals the current shape's topology id — order-insensitive on
     ``target_modules``;
     (6) regeneration -- ``donor_entries(meta["seed"], meta["n_requested"])``,
@@ -613,7 +631,10 @@ def donor_slot_valid(slot: Path, base_model_id: "str | None", lora_shape: dict) 
     Same never-raise contract and same checks as
     :func:`donor_checkpoint_valid` — see that function's docstring.
     """
+    import pyrage
+
     from paramem.adapters.manifest import ManifestError, read_manifest
+    from paramem.backup.hashing import plaintext_sha256
 
     if base_model_id is None:
         return False
@@ -626,7 +647,10 @@ def donor_slot_valid(slot: Path, base_model_id: "str | None", lora_shape: dict) 
         manifest = read_manifest(slot)
     except ManifestError:
         return False
-    if manifest.base_model.repo != base_model_id:
+    # A donor slot is always a train-payload slot (it exists to hand over
+    # LoRA weights); base_model is None only for a simulate-payload
+    # manifest, which is never a valid donor.
+    if manifest.base_model is None or manifest.base_model.repo != base_model_id:
         return False
     try:
         meta = json.loads(meta_path.read_text())
@@ -639,11 +663,16 @@ def donor_slot_valid(slot: Path, base_model_id: "str | None", lora_shape: dict) 
     # every check above reads metadata about them rather than the bytes
     # themselves. Without this, a truncated or corrupt safetensors file
     # validates, and the failure surfaces inside the caller's load — far past
-    # the point where "invalid -> rebuild" is still available.
-    recorded_weights_hash = meta.get("weights_sha256")
-    if recorded_weights_hash is None:
+    # the point where "invalid -> rebuild" is still available. The digest is
+    # the manifest's own plaintext payload digest (the same one the write
+    # envelope stamps), so a `rotate-daily` re-encrypt of the weights file
+    # does not invalidate a checkpoint that has not otherwise changed.
+    try:
+        weights_digest = plaintext_sha256(weights_path)
+    except (RuntimeError, pyrage.DecryptError, OSError) as exc:
+        logger.debug("donor_slot_valid: could not hash weights at %s: %s", weights_path, exc)
         return False
-    if hashlib.sha256(weights_path.read_bytes()).hexdigest() != recorded_weights_hash:
+    if weights_digest != manifest.payload.sha256:
         return False
 
     seed = meta.get("seed")
@@ -676,7 +705,7 @@ def donor_slot_valid(slot: Path, base_model_id: "str | None", lora_shape: dict) 
         # donor_entries itself). Every one of these must read as "cannot
         # verify" -> invalid, never propagate -- this function's contract
         # (documented above and relied on by both its callers,
-        # _maybe_seed_from_donor and the seeding-hook tests) is
+        # _resolve_donor_checkpoint and the resolver's own tests) is
         # False-never-raise; a corrupt meta
         # file must trigger a normal rebuild, not abort the calling fold.
         return False
@@ -1015,8 +1044,10 @@ def build_donor(
 
     If ``_train_tier_adapter`` returns ``(None, None)`` (no training
     examples — should not happen for a well-formed donor population, but
-    checked defensively) or its metrics carry ``aborted=True`` (thermal
-    throttle / operator pause), NO checkpoint is written and this function
+    checked defensively) or its metrics carry ``aborted=True`` (an
+    inference request aborting background training via
+    ``BackgroundTrainer.abort_for_inference``, or server shutdown), NO
+    checkpoint is written and this function
     raises :class:`DonorBuildIncomplete` instead — persisting a checkpoint
     from a run that never actually trained would seed every future
     measured-cold fold from LoRA-zero-equivalent weights forever, silently
@@ -1038,13 +1069,17 @@ def build_donor(
     ``registry_sha256`` is empty because a donor carries no key registry,
     which is what lets ``find_live_slot`` resolve the promoted slot.
     ``donor_meta.json`` alongside it carries only what is donor-specific
-    (seed, recipe, the resulting triple set, its canonical hash
+    (seed, recipe, the resulting triple set, and its canonical hash
     (:func:`triples_hash`, read back by :func:`donor_checkpoint_valid`'s
-    regeneration check), and the weights SHA-256 that same function
-    verifies the bytes against) — never a second copy of the base model or
-    shape. Every other slot within the SAME store is then pruned through
-    the shared ``ConsolidationLoop._prune_old_slots`` at ``keep=0`` (exactly
-    one donor artifact per (base model, topology) persists at a time), and
+    regeneration check)) — never a second copy of the base model, shape, or
+    weights digest: the manifest's own ``payload.sha256`` (stamped by the
+    write envelope from the payload's plaintext bytes) is what
+    :func:`donor_checkpoint_valid` verifies the weights against, so there is
+    one recorded digest, not two that can drift. Every other slot within
+    the SAME store is then pruned through
+    the shared ``paramem.memory.persistence.prune_old_slots`` at ``keep=0``
+    (exactly one donor artifact per (base model, topology) persists at a
+    time), and
     both the staging slot and the transient build slot are dropped in a
     ``finally`` regardless of outcome — each disposal individually guarded
     so the first failing one cannot skip the second or mask the original
@@ -1133,19 +1168,18 @@ def build_donor(
             adapter_root=Path(loop.donor_adapter_root),
         )
         final_slot = atomic_save_adapter(loop.model, store_dir, build_name, manifest=manifest)
-        weights_sha256 = hashlib.sha256(
-            (final_slot / "adapter_model.safetensors").read_bytes()
-        ).hexdigest()
-        # Donor-SPECIFIC content only: base model and LoRA shape live in the
-        # manifest above and are never copied here, so there is one recorded
-        # answer to "what is this checkpoint for", not two that can drift.
+        # Donor-SPECIFIC content only: base model, LoRA shape and the
+        # weights digest all live in the manifest above (write_slot stamps
+        # payload.sha256 from the payload's own plaintext bytes) and are
+        # never copied here, so there is one recorded answer to "what is
+        # this checkpoint for" and one recorded digest, not two that can
+        # drift.
         meta = {
             "seed": seed,
             "recipe": DONOR_RECIPE_ID,
             "n_requested": n,
             "triples": entries,
             "triples_hash": triples_hash(entries),
-            "weights_sha256": weights_sha256,
         }
         (final_slot / DONOR_META_FILENAME).write_text(json.dumps(meta))
         # Same retention routine every tier store uses; keep=0 because a donor
@@ -1153,7 +1187,9 @@ def build_donor(
         # be valid again (recipe bump, generator drift, corrupt weights) -- a
         # base or topology change resolves to a DIFFERENT store and leaves its
         # predecessor untouched.
-        loop._prune_old_slots(store_dir, final_slot, keep=0)
+        from paramem.memory.persistence import prune_old_slots as _prune_old_slots
+
+        _prune_old_slots(store_dir, final_slot, keep=0)
         logger.info(
             "build_donor: trained + persisted donor checkpoint at %s (n=%d, seed=%d, base=%s)",
             final_slot,
@@ -1182,14 +1218,15 @@ def build_donor(
 def load_donor_into_transient_slot(model, store_dir: Path, transient_name: str) -> None:
     """Load the donor checkpoint under *store_dir* onto *model* as *transient_name*.
 
-    Mirrors ``ConsolidationLoop._verify_saved_adapter_from_disk``'s PEFT
-    pitfall handling: ``model.load_adapter`` (never
-    ``PeftModel.from_pretrained``, which nests tensor names on a
-    multi-adapter model), the ``base_model_name_or_path`` patch PEFT skips
-    for second-and-later adapters, and
-    :func:`~paramem.models.loader._adapter_slot_for_load`'s transparent
-    decrypt-to-memfd for the age-encrypted safetensors
-    :func:`build_donor` writes.
+    Handles three PEFT/on-disk pitfalls when mounting a donor checkpoint:
+    loads via ``model.load_adapter`` rather than ``PeftModel.from_pretrained``
+    (which nests tensor names on a multi-adapter model and breaks reload),
+    patches ``base_model_name_or_path`` on the mounted adapter's PEFT config
+    when PEFT leaves it ``None`` (its behaviour for second-and-later
+    adapters), and transparently decrypts the age-encrypted safetensors
+    :func:`build_donor` writes via
+    :func:`~paramem.models.loader._adapter_slot_for_load`'s memfd-backed
+    context manager.
 
     Args:
         model: The live ``PeftModel``.

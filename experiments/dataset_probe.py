@@ -417,7 +417,7 @@ def _prepare_smoke_shim(run_dir: Path, loop) -> Path:
     if src_registry.exists():
         shutil.copy2(src_registry, dst_registry)
     else:
-        _atomic_json_write(loop.store.tier_simhashes("episodic", include_stale=False), dst_registry)
+        _atomic_json_write(loop.store.tier_simhashes("episodic"), dst_registry)
 
     # (c) adapter symlink at {shim}/adapter/episodic -> the *live slot* under
     # {run_dir}/episodic.  After the 2026-04-30 slot-management refactor
@@ -848,11 +848,9 @@ def main() -> None:
         if args.debug:
             cfg.debug = True
 
-        cfg.consolidation.indexed_key_replay = True
-
         from paramem.memory.store import MemoryStore
 
-        memory_store = MemoryStore(replay_enabled=cfg.consolidation.indexed_key_replay)
+        memory_store = MemoryStore()
 
         loop = create_consolidation_loop(
             model=model,

@@ -40,6 +40,12 @@ from paramem.memory.store import MemoryStore as _MS
 from paramem.server.config import ServerConfig
 from paramem.server.inference import ChatResult, _probe_and_reason, handle_chat
 from paramem.server.router import Intent, RoutingPlan, RoutingStep
+from tests._serving_door import (
+    forbid_both_read_doors,
+    live_door_config,
+    seed_live_door_fingerprints,
+    stub_live_door_probe,
+)
 
 # The diagnostics keys handle_chat guarantees on every non-relay result,
 # regardless of which branch produced it.
@@ -76,7 +82,7 @@ class TestServeTurnPhaseRecord:
                 model=MagicMock(),
                 tokenizer=MagicMock(),
                 config=config,
-                memory_store=_MS(replay_enabled=False),
+                memory_store=_MS(),
             )
             serve_records = [r for r in trace.records if r.name == "serve_turn"]
 
@@ -108,7 +114,7 @@ class TestServeTurnPhaseRecord:
                     tokenizer=MagicMock(),
                     config=config,
                     router=router,
-                    memory_store=_MS(replay_enabled=False),
+                    memory_store=_MS(),
                 )
             serve_records = [r for r in trace.records if r.name == "serve_turn"]
 
@@ -144,7 +150,7 @@ class TestIsResidualUnconditional:
                 tokenizer=MagicMock(),
                 config=config,
                 router=router,
-                memory_store=_MS(replay_enabled=False),
+                memory_store=_MS(),
             )
 
         assert result.diagnostics["is_residual"] is True
@@ -183,7 +189,7 @@ class TestRoutingBranchDiagnostics:
                 tokenizer=MagicMock(),
                 config=config,
                 router=router,
-                memory_store=_MS(replay_enabled=False),
+                memory_store=_MS(),
             )
 
         assert result.diagnostics["exit_via"] == "personal_probe"
@@ -210,7 +216,7 @@ class TestRoutingBranchDiagnostics:
             config=config,
             router=router,
             ha_client=ha_client,
-            memory_store=_MS(replay_enabled=False),
+            memory_store=_MS(),
         )
 
         assert result.diagnostics["exit_via"] == "general_ha"
@@ -239,7 +245,7 @@ class TestRoutingBranchDiagnostics:
                 config=config,
                 router=router,
                 cloud_agent=MagicMock(),
-                memory_store=_MS(replay_enabled=False),
+                memory_store=_MS(),
             )
 
         assert result.diagnostics["exit_via"] == "general_cloud"
@@ -273,7 +279,7 @@ class TestRoutingBranchDiagnostics:
                 tokenizer=MagicMock(),
                 config=config,
                 router=router,
-                memory_store=_MS(replay_enabled=False),
+                memory_store=_MS(),
             )
 
         mock_base_model.assert_not_called()
@@ -300,7 +306,7 @@ class TestRoutingBranchDiagnostics:
                 tokenizer=MagicMock(),
                 config=config,
                 router=None,
-                memory_store=_MS(replay_enabled=False),
+                memory_store=_MS(),
             )
 
         assert result.diagnostics["exit_via"] == "base_model"
@@ -312,7 +318,14 @@ class TestRoutingBranchDiagnostics:
 
 class _ProbeAndReasonHelpers:
     """Shared plan/model builders, mirroring
-    tests/test_inference_response_shaping.py::_PlanBuilder's pattern."""
+    tests/test_inference_response_shaping.py::_PlanBuilder's pattern.
+
+    The serving read door each probe test runs through is named per test
+    via ``tests._serving_door``: the probe/recall counts and the probed
+    key set are the observables here, so these tests take the live door
+    and register the fingerprints it demands.  The zero-survivor test is
+    the exception — nothing is probed there, so it pins the production
+    default and forbids both doors."""
 
     @staticmethod
     def make_plan(steps):
@@ -334,30 +347,8 @@ class TestProbeAndReasonProbeDiagnostics(_ProbeAndReasonHelpers):
     from the same values the existing log lines render — one derivation,
     two renderings."""
 
-    @staticmethod
-    def _stub_probe(monkeypatch, recalled_keys):
-        def fake_grouped(model, tokenizer, keys_by_adapter, **kwargs):
-            results = {}
-            for keys in keys_by_adapter.values():
-                for k in keys:
-                    if k in recalled_keys:
-                        results[k] = {"key": k, "fact_text": f"fact about {k}", "confidence": 1.0}
-                    else:
-                        results[k] = {"key": k, "failure_reason": "no_match"}
-            return results
-
-        monkeypatch.setattr("paramem.memory.probe.probe_keys_grouped_by_adapter", fake_grouped)
-        monkeypatch.setattr("paramem.models.loader.switch_adapter", lambda model, name: None)
-        monkeypatch.setattr(
-            "paramem.memory.store.MemoryStore.read_simhash_registry_from_disk",
-            staticmethod(lambda path, cached=False: {}),
-        )
-        monkeypatch.setattr(
-            "paramem.server.inference.is_self_referential", lambda text, **kwargs: False
-        )
-
     def test_probes_and_facts_recalled_match_the_probe_outcome(self, monkeypatch):
-        self._stub_probe(monkeypatch, recalled_keys={"e1"})
+        probed = stub_live_door_probe(monkeypatch, failing_keys={"e2"})
         monkeypatch.setattr(
             "paramem.server.inference.generate_answer", lambda *a, **kw: "final answer."
         )
@@ -366,21 +357,26 @@ class TestProbeAndReasonProbeDiagnostics(_ProbeAndReasonHelpers):
         tokenizer.apply_chat_template = lambda msgs, **kwargs: "prompt"
         model = self.make_model(["episodic"])
 
-        config = ServerConfig()
+        config = live_door_config()
         # Disabled — this test is about probe counts, not the date-group
         # selection stage (covered separately below).
         config.inference.temporal_selection_enabled = False
 
+        memory_store = _MS()
+        plan = self.make_plan([("episodic", ["e1", "e2"])])
+        seed_live_door_fingerprints(memory_store, plan)
+
         result = _probe_and_reason(
             text="What do I like?",
-            plan=self.make_plan([("episodic", ["e1", "e2"])]),
+            plan=plan,
             history=None,
             model=model,
             tokenizer=tokenizer,
             config=config,
-            memory_store=_MS(replay_enabled=False),
+            memory_store=memory_store,
         )
 
+        assert probed["keys_by_adapter"] == {"episodic": ["e1", "e2"]}
         assert result.diagnostics["probes"] == {"episodic": {"probed": 2, "recalled": 1}}
         assert result.diagnostics["facts_recalled"] == 1
         assert result.diagnostics["temporal"] is None
@@ -389,7 +385,7 @@ class TestProbeAndReasonProbeDiagnostics(_ProbeAndReasonHelpers):
         """Every probed key fails: the ``not layers`` fallback sets
         ``probes`` (probing did happen) but never reaches
         ``facts_recalled`` (no layer was ever assembled)."""
-        self._stub_probe(monkeypatch, recalled_keys=set())
+        probed = stub_live_door_probe(monkeypatch, failing_keys={"e1"})
         monkeypatch.setattr("paramem.server.inference._escalate_to_ha_agent", lambda *a, **kw: None)
         monkeypatch.setattr("paramem.server.inference.answer_via_cloud", lambda *a, **kw: None)
         monkeypatch.setattr(
@@ -400,20 +396,27 @@ class TestProbeAndReasonProbeDiagnostics(_ProbeAndReasonHelpers):
         tokenizer = MagicMock()
         model = self.make_model(["episodic"])
 
-        config = ServerConfig()
+        config = live_door_config()
         config.abstention.enabled = False
         config.inference.temporal_selection_enabled = False
 
+        memory_store = _MS()
+        plan = self.make_plan([("episodic", ["e1"])])
+        seed_live_door_fingerprints(memory_store, plan)
+
         result = _probe_and_reason(
             text="What do I like?",
-            plan=self.make_plan([("episodic", ["e1"])]),
+            plan=plan,
             history=None,
             model=model,
             tokenizer=tokenizer,
             config=config,
-            memory_store=_MS(replay_enabled=False),
+            memory_store=memory_store,
         )
 
+        # The key was probed and the source failed it — not "nothing was
+        # probed", which reports the same counts.
+        assert probed["keys_by_adapter"] == {"episodic": ["e1"]}
         assert result.diagnostics["probes"] == {"episodic": {"probed": 1, "recalled": 0}}
         assert "facts_recalled" not in result.diagnostics
         assert result.text == "base fallback"
@@ -426,28 +429,11 @@ class TestProbeAndReasonTemporalDiagnostics(_ProbeAndReasonHelpers):
     early return, which never reaches probing (so ``probes`` stays
     absent there)."""
 
-    @staticmethod
-    def _stub_probe_ok(monkeypatch):
-        monkeypatch.setattr(
-            "paramem.memory.probe.probe_keys_grouped_by_adapter",
-            lambda model, tokenizer, keys_by_adapter, **kw: {
-                k: {"key": k, "fact_text": f"fact about {k}"}
-                for keys in keys_by_adapter.values()
-                for k in keys
-            },
-        )
-        monkeypatch.setattr("paramem.models.loader.switch_adapter", lambda model, name: None)
-        monkeypatch.setattr(
-            "paramem.memory.store.MemoryStore.read_simhash_registry_from_disk",
-            staticmethod(lambda path, cached=False: {}),
-        )
+    def test_temporal_is_none_when_stage_disabled(self, monkeypatch):
+        probed = stub_live_door_probe(monkeypatch)
         monkeypatch.setattr(
             "paramem.server.inference.generate_answer", lambda *a, **kw: "final answer."
         )
-
-    def test_temporal_is_none_when_stage_disabled(self, monkeypatch):
-        self._stub_probe_ok(monkeypatch)
-        monkeypatch.setattr("paramem.server.inference.is_self_referential", lambda *a, **kw: False)
 
         def exploding_select(*args, **kwargs):
             raise AssertionError("select_date_groups must not be called when the stage is disabled")
@@ -458,25 +444,33 @@ class TestProbeAndReasonTemporalDiagnostics(_ProbeAndReasonHelpers):
         tokenizer.apply_chat_template = lambda msgs, **kwargs: "prompt"
         model = self.make_model(["episodic"])
 
-        config = ServerConfig()
+        config = live_door_config()
         config.inference.temporal_selection_enabled = False
+
+        memory_store = _MS()
+        plan = self.make_plan([("episodic", ["e1"])])
+        seed_live_door_fingerprints(memory_store, plan)
 
         result = _probe_and_reason(
             text="What do I like?",
-            plan=self.make_plan([("episodic", ["e1"])]),
+            plan=plan,
             history=None,
             model=model,
             tokenizer=tokenizer,
             config=config,
-            memory_store=_MS(replay_enabled=False),
+            memory_store=memory_store,
         )
 
+        assert probed["keys_by_adapter"] == {"episodic": ["e1"]}
         assert result.diagnostics["temporal"] is None
 
     def test_temporal_dict_populated_when_stage_runs(self, monkeypatch):
         from paramem.server.temporal_selection import DateSelection
 
-        self._stub_probe_ok(monkeypatch)
+        stub_live_door_probe(monkeypatch)
+        monkeypatch.setattr(
+            "paramem.server.inference.generate_answer", lambda *a, **kw: "final answer."
+        )
 
         def fake_select(text, date_by_key, *, model, tokenizer, config, today):
             return DateSelection(all=True, ranges=(), include_undated=True, fail_open=False)
@@ -487,20 +481,23 @@ class TestProbeAndReasonTemporalDiagnostics(_ProbeAndReasonHelpers):
         tokenizer.apply_chat_template = lambda msgs, **kwargs: "prompt"
         model = self.make_model(["episodic"])
 
-        config = ServerConfig()
+        config = live_door_config()
 
-        memory_store = _MS(replay_enabled=False)
+        memory_store = _MS()
         memory_store.set_bookkeeping(
             "e1",
             speaker_id="speaker0",
             relation_type="factual",
             first_seen="2026-08-01T09:00:00",
             last_seen="2026-08-01T09:00:00",
+            promoted=False,
         )
+        plan = self.make_plan([("episodic", ["e1"])])
+        seed_live_door_fingerprints(memory_store, plan)
 
         result = _probe_and_reason(
             text="What do you know about me?",
-            plan=self.make_plan([("episodic", ["e1"])]),
+            plan=plan,
             history=None,
             model=model,
             tokenizer=tokenizer,
@@ -523,10 +520,7 @@ class TestProbeAndReasonTemporalDiagnostics(_ProbeAndReasonHelpers):
         from paramem.server.temporal import DateWindow
         from paramem.server.temporal_selection import DateSelection
 
-        def exploding_probe(self, *args, **kwargs):
-            raise AssertionError("MemoryStore.probe must not be called when zero keys survive")
-
-        monkeypatch.setattr("paramem.memory.store.MemoryStore.probe", exploding_probe)
+        forbid_both_read_doors(monkeypatch)
         monkeypatch.setattr(
             "paramem.server.inference._generate_local_reply",
             lambda *a, **kw: ("Nothing to add.", False),
@@ -544,15 +538,20 @@ class TestProbeAndReasonTemporalDiagnostics(_ProbeAndReasonHelpers):
         tokenizer = MagicMock()
         model = self.make_model(["episodic"])
 
+        # The production default door — pinned to state that the path
+        # short-circuits ahead of the fork under the shipping
+        # configuration, not merely under the other arm.
         config = ServerConfig()
+        config.inference.preload_cache = True
 
-        memory_store = _MS(replay_enabled=False)
+        memory_store = _MS()
         memory_store.set_bookkeeping(
             "e1",
             speaker_id="speaker0",
             relation_type="factual",
             first_seen="2026-08-01T09:00:00",
             last_seen="2026-08-01T09:00:00",
+            promoted=False,
         )
 
         result = _probe_and_reason(

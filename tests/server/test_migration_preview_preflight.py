@@ -228,7 +228,7 @@ def _make_status_compatible_config(tmp_path: Path, max_total_disk_gb: float) -> 
     """Build a MagicMock config that satisfies both /migration/preview and /status.
 
     Uses MagicMock for all attributes that /status enumerates (adapters, consolidation,
-    registry_path, adapter_dir, etc.) but sets a *real* ServerBackupsConfig so
+    adapter_dir, etc.) but sets a *real* ServerBackupsConfig so
     compute_pre_flight_check activates its disk-pressure check.
     """
     cfg = MagicMock()
@@ -238,11 +238,7 @@ def _make_status_compatible_config(tmp_path: Path, max_total_disk_gb: float) -> 
     data_dir.mkdir(parents=True, exist_ok=True)
     cfg.paths.data = data_dir
 
-    # Registry and adapter dir — real files so /status doesn't error on open().
-    registry = tmp_path / "registry.json"
-    registry.write_text("{}")
-    cfg.registry_path = registry
-
+    # Adapter dir — real files so /status doesn't error on open().
     adapter_dir = tmp_path / "adapters"
     adapter_dir.mkdir(parents=True, exist_ok=True)
     (adapter_dir / "indexed_key_registry.json").write_text("{}")

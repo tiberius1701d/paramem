@@ -11,6 +11,7 @@ Covers:
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from paramem.backup.backup import write as backup_write
@@ -78,12 +79,12 @@ class TestEnumerateHappyPath:
     def test_enumerate_returns_backup_records(self, tmp_path):
         """Records have expected fields."""
         base = tmp_path / "backups"
-        _write_slot(base, ArtifactKind.REGISTRY, b"data", tier="scheduled")
-        records = enumerate_backups(base, kind=ArtifactKind.REGISTRY)
+        _write_slot(base, ArtifactKind.RESUME, b"data", tier="scheduled")
+        records = enumerate_backups(base, kind=ArtifactKind.RESUME)
         assert len(records) == 1
         rec = records[0]
         assert isinstance(rec, BackupRecord)
-        assert rec.kind == ArtifactKind.REGISTRY
+        assert rec.kind == ArtifactKind.RESUME
         assert rec.slot_dir.is_absolute()
         assert rec.content_sha256  # non-empty hex string
         assert rec.created_at is not None
@@ -109,12 +110,12 @@ class TestKindFilter:
         base = tmp_path / "backups"
         _write_slot(base, ArtifactKind.CONFIG, b"cfg")
         _write_slot(base, ArtifactKind.GRAPH, b"graph")
-        _write_slot(base, ArtifactKind.REGISTRY, b"reg")
+        _write_slot(base, ArtifactKind.RESUME, b"resume")
         all_records = enumerate_backups(base)
         kinds = {r.kind for r in all_records}
         assert ArtifactKind.CONFIG in kinds
         assert ArtifactKind.GRAPH in kinds
-        assert ArtifactKind.REGISTRY in kinds
+        assert ArtifactKind.RESUME in kinds
 
 
 # ---------------------------------------------------------------------------
@@ -156,6 +157,57 @@ class TestInvalidSidecar:
         # Only the good slot should appear.
         assert len(records) == 1
         assert records[0].kind == ArtifactKind.CONFIG
+
+
+# ---------------------------------------------------------------------------
+# Unknown-kind sidecar — a foreign on-disk artifact, skipped not deleted
+# ---------------------------------------------------------------------------
+
+
+class TestUnknownKindSidecarSkipped:
+    """A pre-existing on-disk sidecar naming a kind this build no longer
+    recognises (e.g. a slot written under a retired artifact kind) is a
+    foreign on-disk artifact: enumeration skips it with a WARNING rather
+    than raising or deleting it — the listing-boundary posture."""
+
+    def test_unknown_kind_sidecar_skipped_with_warning(self, tmp_path, caplog):
+        import logging
+
+        base = tmp_path / "backups"
+        # A real, currently-valid slot so the test can prove only the
+        # unknown-kind one is skipped.
+        _write_slot(base, ArtifactKind.CONFIG, b"real")
+
+        # A foreign on-disk slot naming a kind no longer in ArtifactKind
+        # (e.g. the retired "registry" artifact kind).
+        stray = base / "registry" / "20260101-000000"
+        stray.mkdir(parents=True)
+        (stray / "registry-20260101-000000.bin").write_bytes(b"legacy registry bytes")
+        (stray / "registry-20260101-000000.meta.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "kind": "registry",
+                    "timestamp": "20260101-000000",
+                    "content_sha256": "a" * 64,
+                    "size_bytes": 22,
+                    "encrypted": False,
+                    "tier": "scheduled",
+                    "label": None,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        caplog.set_level(logging.WARNING, logger="paramem.backup.enumerate")
+        records = enumerate_backups(base)
+
+        assert len(records) == 1, "the unknown-kind slot must be skipped, not enumerated"
+        assert records[0].kind == ArtifactKind.CONFIG
+        assert any("registry" in r.message.lower() for r in caplog.records), (
+            f"expected a WARNING log naming the unrecognised sidecar; got: "
+            f"{[(r.levelname, r.message) for r in caplog.records]}"
+        )
 
 
 # ---------------------------------------------------------------------------

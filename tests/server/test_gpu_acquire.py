@@ -912,10 +912,10 @@ def test_apply_config_live_real_hash_different_file_proceeds():
 
 def test_plain_reclaim_does_not_rebuild_stt_tts_or_ha_client():
     """Plain reclaim path (_live_reload_base_model with refresh_config_from_disk=False)
-    calls _build_config_derived_state(full_rebuild=False) — which must NOT call
+    calls _build_runtime_components(full_rebuild=False) — which must NOT call
     STT/TTS .load() or HAClient constructor / health_check.
 
-    The test captures the kwargs passed to _build_config_derived_state and
+    The test captures the kwargs passed to _build_runtime_components and
     verifies full_rebuild=False is forwarded.  It also asserts that WhisperSTT
     and HAClient are not instantiated on this path (same config, no delta).
     """
@@ -937,22 +937,21 @@ def test_plain_reclaim_does_not_rebuild_stt_tts_or_ha_client():
         "cloud_only_reason": "released",
         "config": _make_config(),
         "topology_assessment": None,
-        "boot_degraded": None,
     }
 
     with (
         patch.dict(app_module._state, state_patch, clear=False),
         patch.object(app_module, "_release_base_model_in_process"),
         patch.object(app_module, "_load_model_into_state"),
-        patch.object(app_module, "_build_config_derived_state", side_effect=fake_build),
+        patch.object(app_module, "_build_runtime_components", side_effect=fake_build),
     ):
         # topology_assessment=None → VRAM fit-check is skipped entirely.
         app_module._live_reload_base_model()  # refresh_config_from_disk=False (default)
 
-    assert build_kwargs_log, "_build_config_derived_state must be called on plain reclaim"
+    assert build_kwargs_log, "_build_runtime_components must be called on plain reclaim"
     kwargs = build_kwargs_log[0]
     assert kwargs["full_rebuild"] is False, (
-        "plain reclaim must pass full_rebuild=False to _build_config_derived_state "
+        "plain reclaim must pass full_rebuild=False to _build_runtime_components "
         "so STT/TTS/HA/cloud/exemplar rebuild is skipped (correction S1)"
     )
     assert kwargs["rebuild_session_buffer"] is False, (

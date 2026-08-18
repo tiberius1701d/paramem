@@ -15,10 +15,9 @@ Session turns are always written to a per-session JSONL file under
 :meth:`SessionBuffer._append_turn`'s 2026-05-14 invariant). After
 consolidation, ``retain_sessions``/``debug`` decide the JSONL's fate:
 moved under ``retention_dir`` when either is True, unlinked outright
-when both are False (see :meth:`SessionBuffer.mark_consolidated`).
-Sessions that retry-capped instead of consolidating cleanly move under
-``retention_dir/retired_recall_failed/`` (same rule, distinguishable
-subdirectory — see ``mark_consolidated``'s ``retired_session_ids``).
+when both are False (see :meth:`SessionBuffer.mark_consolidated`). A
+session is retired only at successful disposal — any outcome short of
+that leaves every contributing transcript pending for the next cycle.
 :meth:`SessionBuffer.get_conversation_turns` is a PRODUCTION serving read,
 called on every turn — not a debug-only inspection surface; it always
 serves in-memory ``_turns`` first. ``debug`` additionally lets it (and
@@ -40,7 +39,6 @@ import secrets
 import shutil
 import string
 from collections import defaultdict
-from collections.abc import Set
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -49,7 +47,6 @@ from paramem.backup.encryption import (
     envelope_decrypt_bytes,
     envelope_encrypt_bytes,
 )
-from paramem.server import retry_state as _retry_state
 from paramem.utils.tokens import (
     ANONYMIZE_ENVELOPE_TOKENS,
     ANONYMIZE_OUTPUT_RESERVE_TOKENS,
@@ -101,11 +98,6 @@ def _snapshots_enabled() -> bool:
 STATE_NEW = "new"
 STATE_IDENTIFIED = "identified"
 
-# Retention subdirectory (under a caller's retention_dir) for sessions that
-# retry-capped rather than consolidated cleanly — see
-# ``SessionBuffer.mark_consolidated``'s ``retired_session_ids`` parameter.
-RETIRED_RECALL_FAILED_SUBDIR = "retired_recall_failed"
-
 # Characters outside this set are filesystem-unsafe in a JSONL filename.
 # An allowlist, not a shape — membership testing expresses it directly.
 _SAFE_ID_CHARS = frozenset(string.ascii_letters + string.digits + "_-")
@@ -142,9 +134,8 @@ class SessionBuffer:
     Two in-memory maps, split by concept (each field has exactly one home):
 
     - ``_sessions`` — durable per-session metadata, keyed by ``session_id``
-      (doc_id, chunk_count, recall_retry_count). Read/written by the
-      consolidation-retirement machinery; survives cold restarts via
-      ``rehydrate_from_disk``.
+      (doc_id, chunk_count). Read/written by the consolidation-retirement
+      machinery; survives cold restarts via ``rehydrate_from_disk``.
     - ``_open`` — ephemeral routing state, keyed by the caller's
       ``conversation_id`` (the "conversation_key" role — one client/device
       handle may span several minted sessions over time). Holds
@@ -171,19 +162,14 @@ class SessionBuffer:
     def __init__(
         self,
         session_dir: Path,
-        state_dir: Path,
         retain_sessions: bool = True,
         debug: bool = False,
-        consolidation_retry_cap: int = 3,
         idle_timeout_minutes: int = 10,
     ):
         self.session_dir = Path(session_dir)
         self.session_dir.mkdir(parents=True, exist_ok=True)
-        self._state_dir = Path(state_dir)
-        self._state_dir.mkdir(parents=True, exist_ok=True)
         self.retain_sessions = retain_sessions
         self.debug = debug
-        self._consolidation_retry_cap = consolidation_retry_cap
         self._idle_timeout = timedelta(minutes=idle_timeout_minutes)
         self._snapshot_path = self.session_dir / "session_snapshot.enc"
 
@@ -199,7 +185,7 @@ class SessionBuffer:
             )
 
         # Durable per-session metadata: session_id → {doc_id, chunk_count,
-        # recall_retry_count, speaker tags for doc-ingest attribution}.
+        # speaker tags for doc-ingest attribution}.
         self._sessions: dict[str, dict] = {}
         # Ephemeral routing state: conversation_id → {session_id, started_at,
         # last_turn_at, speaker, speaker_id, state}.
@@ -328,10 +314,8 @@ class SessionBuffer:
 
         # Mirror the speaker tag onto the durable _sessions entry (creating
         # it if this is the session's first turn). retirable /
-        # mark_consolidated / discard_sessions / bump_retry_and_release all
-        # key off _sessions[session_id] — a session that never appears here
-        # would fail bump_retry_and_release's buffered-session guard (it
-        # silently skips ids that are not currently resident in _sessions).
+        # mark_consolidated / discard_sessions all key off
+        # _sessions[session_id].
         session_meta = self._sessions.setdefault(session_id, {"speaker": None, "state": STATE_NEW})
         if speaker_id is not None:
             session_meta["speaker"] = speaker
@@ -773,7 +757,7 @@ class SessionBuffer:
         Document chunk sessions retire ONLY when ALL chunks for the same
         ``doc_id`` are present in *completed_ids* AND the number of completed
         chunks matches the stored ``chunk_count``.  If any chunk is missing,
-        the entire document group is withheld from the result — all chunks
+        the entire document group is left out of the result — all chunks
         stay pending until the next consolidation cycle picks them up.
 
         This method does not mutate any state; it is a pure filter.
@@ -894,7 +878,6 @@ class SessionBuffer:
         session_ids: list[str],
         *,
         retention_dir: Path | None = None,
-        retired_session_ids: Set[str] = frozenset(),
     ) -> None:
         """Consume consolidated sessions and dispose of their JSONL.
 
@@ -918,26 +901,15 @@ class SessionBuffer:
         origdoc are unlinked.  Transcript sessions use the existing flat
         layout (``retention_dir/<session_id>.jsonl``).
 
-        ``retired_session_ids`` marks the subset of *session_ids* that
-        retry-capped (recall-gate rejected on every retry —
-        :meth:`bump_retry_and_release`) rather than consolidated cleanly.
-        Its production value is the interim scheduled-tick path's
-        ``_released_sids`` (``paramem/server/app.py`` around the
-        ``bump_retry_and_release`` call, threaded into the same function's
-        ``mark_consolidated`` call a few lines later). Retired sessions are
-        retained-or-deleted under the SAME ``retain``/*retention_dir* rule
-        as any other session — ``retain_sessions=False`` still means
-        unlink for them too. The only difference is the destination
-        subdirectory when retaining:
-        ``retention_dir/retired_recall_failed/<session_id>.jsonl``
-        (``RETIRED_RECALL_FAILED_SUBDIR``) instead of the flat layout, so
-        retry-capped transcripts are distinguishable from
-        successfully-consolidated ones without a second archive
-        mechanism. Doc-chunk atomicity extends to this distinction: if
-        any chunk of a ``doc_id`` group is retired, the whole group (the
-        chunks present in *this* call, plus the origdoc) is archived
-        under ``retention_dir/retired_recall_failed/<doc_id>/`` rather
-        than splitting one document across two locations.
+        A session reaches this method only via successful disposal —
+        retirement is event-based, never a counter or a cap. A recall-gate
+        rejection raises out of ``run_consolidation_cycle`` before the
+        caller's call to this method, so it is never invoked at all that
+        cycle; an abort or a full interim ring instead reaches the call but
+        with the affected sessions filtered out of *session_ids* upstream
+        (``extraction.completed_session_ids``). Either way the session
+        stays pending for the next cycle's attempt with nothing here to
+        configure.
         """
         retain = self.retain_sessions or self.debug
         if retain and retention_dir is not None:
@@ -963,15 +935,6 @@ class SessionBuffer:
             sid: doc_id for doc_id, sids in doc_id_to_chunk_sids.items() for sid in sids
         }
 
-        # A doc_id group with at least one retired chunk is archived whole
-        # under the retired subdir — a document is never split between the
-        # two destinations.
-        retired_doc_ids = {
-            sid_to_doc_id[sid]
-            for sid in session_ids
-            if sid in retired_session_ids and sid in sid_to_doc_id
-        }
-
         for session_id in session_ids:
             self._turns.pop(session_id, None)
             self._sessions.pop(session_id, None)
@@ -980,19 +943,15 @@ class SessionBuffer:
                 continue
             if retain and retention_dir is not None:
                 doc_id = sid_to_doc_id.get(session_id)
-                is_retired = session_id in retired_session_ids or doc_id in retired_doc_ids
-                dest_root = (
-                    retention_dir / RETIRED_RECALL_FAILED_SUBDIR if is_retired else retention_dir
-                )
                 if doc_id is not None:
                     # Chunk JSONL co-located with the origdoc under
-                    # dest_root/<doc_id>/<session_id>.jsonl.
-                    doc_ret_dir = dest_root / doc_id
+                    # retention_dir/<doc_id>/<session_id>.jsonl.
+                    doc_ret_dir = retention_dir / doc_id
                     doc_ret_dir.mkdir(parents=True, exist_ok=True)
                     dest = doc_ret_dir / f"{session_id}.jsonl"
                 else:
                     # Transcript sessions keep the flat layout.
-                    dest = dest_root / f"{session_id}.jsonl"
+                    dest = retention_dir / f"{session_id}.jsonl"
                     dest.parent.mkdir(parents=True, exist_ok=True)
                 shutil.move(str(source), str(dest))
                 logger.info("Retained session %s → %s", session_id, dest)
@@ -1006,15 +965,10 @@ class SessionBuffer:
             if not origdoc.exists():
                 continue
             if retain and retention_dir is not None:
-                # Archive origdoc under dest_root/<doc_id>/ renamed to the
-                # original filename collected in the first pass above.
+                # Archive origdoc under retention_dir/<doc_id>/ renamed to
+                # the original filename collected in the first pass above.
                 doc_filename = doc_id_to_filename.get(doc_id, f"{doc_id}.bin")
-                dest_root = (
-                    retention_dir / RETIRED_RECALL_FAILED_SUBDIR
-                    if doc_id in retired_doc_ids
-                    else retention_dir
-                )
-                doc_ret_dir = dest_root / doc_id
+                doc_ret_dir = retention_dir / doc_id
                 doc_ret_dir.mkdir(parents=True, exist_ok=True)
                 dest = doc_ret_dir / doc_filename
                 shutil.move(str(origdoc), str(dest))
@@ -1022,20 +976,6 @@ class SessionBuffer:
             else:
                 origdoc.unlink()
                 logger.info("Deleted origdoc: %s", doc_id)
-
-        # Clear durable retry-count rows for all retired sessions so stale
-        # entries do not accumulate and do not mis-count a future session that
-        # reuses an id.  Non-fatal: a failed clear is logged but does not roll
-        # back the retirement (the session is gone from _sessions/_turns already).
-        if session_ids:
-            try:
-                _retry_state.clear_retry_counts(self._state_dir, list(session_ids))
-            except Exception:
-                logger.exception(
-                    "SessionBuffer.mark_consolidated: failed to clear durable retry counts "
-                    "for %d session(s) (non-fatal)",
-                    len(session_ids),
-                )
 
         self._prune_open_for_retired_sessions(session_ids)
 
@@ -1087,146 +1027,7 @@ class SessionBuffer:
                 origdoc.unlink()
                 logger.info("Deleted origdoc for discarded doc: %s", doc_id)
 
-        # Clear durable retry-count rows for discarded sessions (same
-        # buffered-session guard as mark_consolidated; stale rows must not
-        # accumulate or mis-count).
-        if session_ids:
-            try:
-                _retry_state.clear_retry_counts(self._state_dir, list(session_ids))
-            except Exception:
-                logger.exception(
-                    "SessionBuffer.discard_sessions: failed to clear durable retry counts "
-                    "for %d session(s) (non-fatal)",
-                    len(session_ids),
-                )
-
         self._prune_open_for_retired_sessions(session_ids)
-
-    def hydrate_retry_counts(self) -> None:
-        """Seed in-memory retry counts from the durable ``consolidation_retry.json``.
-
-        Called at boot after :meth:`load_snapshot` so the durable store is the
-        authoritative source of truth.  Overwrites any ``recall_retry_count``
-        values that :meth:`load_snapshot` restored from the encrypted snapshot
-        — the durable file wins because it survives ungraceful restarts whereas
-        the encrypted snapshot does not.
-
-        Sessions that are in the durable file but not (yet) in ``_sessions`` are
-        silently skipped; they will be reconciled when their JSONL is rehydrated.
-
-        Non-fatal: a schema or I/O error is logged and hydration is skipped so
-        the server still starts.  A subsequent :meth:`bump_retry_and_release` call
-        on those sessions will re-read from disk atomically.
-        """
-        try:
-            durable = _retry_state.read_retry_counts(self._state_dir)
-        except Exception:
-            logger.exception(
-                "SessionBuffer.hydrate_retry_counts: failed to read durable retry counts "
-                "(non-fatal; counts will be re-read on next bump)"
-            )
-            return
-        for sid, count in durable.items():
-            if sid in self._sessions:
-                self._sessions[sid]["recall_retry_count"] = count
-
-    def bump_retry_and_release(self, failed_ids: set[str]) -> list[str]:
-        """Increment the durable retry counter for each failed session; release capped ones.
-
-        Called from ``_run_interim_training`` (``app.py``) after
-        ``run_consolidation_cycle`` returns for sessions whose facts were NOT
-        successfully encoded into adapter weights this cycle.  Each call covers
-        exactly the sessions from one cycle, so one-per-cycle cadence is
-        structural.
-
-        For each session id in *failed_ids* that is currently buffered:
-
-        - Atomically increment the durable ``recall_retry_count`` via
-          ``retry_state.bump_retry_count`` (crash-safe: count is on disk before
-          this method returns).
-        - Mirror the returned count into ``self._sessions[sid]["recall_retry_count"]``
-          so in-memory state stays consistent with the durable store.
-        - If the new count reaches :attr:`_consolidation_retry_cap`, add the
-          session id to the returned release list.
-
-        Released sessions are removed from the caller's ``failed_session_ids``
-        set so ``_completed_session_ids()`` retires them on the current cycle
-        (they are "un-pinned").  A WARNING is logged for each released session.
-        The corresponding incident is recorded by the caller (not here) so the
-        caller owns the per-session ``key`` for dedup.
-
-        Session ids absent from :attr:`_sessions` are silently skipped (the
-        buffered-session guard: only sessions currently resident in the
-        buffer take part in retry bookkeeping — synthetic ids are never
-        present in the buffer).
-
-        Reset-on-recall-success: when a previously-counted session passes recall
-        in a cycle, the caller calls :meth:`reset_retry_count_for` before
-        marking it consolidated, clearing the durable count so only consecutive
-        failures accrue toward the cap.
-
-        Restart semantics: the counter is durable — written atomically to
-        ``data/state/consolidation_retry.json`` on every increment via
-        ``fcntl.flock``-guarded RMW.  An ungraceful restart (TDR / host crash)
-        does NOT reset the budget.  On boot, :meth:`hydrate_retry_counts` seeds
-        in-memory counts from this durable file.
-
-        Raises:
-            retry_state.RetryStateCapacityError: when disk is full (ENOSPC /
-                EDQUOT) during the durable write.  The caller must record a
-                ``storage_capacity_reached`` incident and stop — do NOT retry or
-                spin.
-
-        Args:
-            failed_ids: Session ids whose facts were not encoded this cycle.
-
-        Returns:
-            List of session ids whose retry count reached the cap.  The caller
-            must remove them from its pending-failure set to un-pin them.
-        """
-        released: list[str] = []
-        for sid in failed_ids:
-            if sid not in self._sessions:
-                # Not a buffered session (already retired, or a synthetic id
-                # that slipped through).  Skip silently — do not mutate state.
-                continue
-            new_count = _retry_state.bump_retry_count(self._state_dir, sid)
-            self._sessions[sid]["recall_retry_count"] = new_count
-            if new_count >= self._consolidation_retry_cap:
-                logger.warning(
-                    "SessionBuffer.bump_retry_and_release: session %s hit "
-                    "consolidation-retry cap (%d) — releasing; facts could not be encoded",
-                    sid,
-                    self._consolidation_retry_cap,
-                )
-                released.append(sid)
-        return released
-
-    def reset_retry_count_for(self, session_id: str) -> None:
-        """Clear the durable retry count for a session that passed recall.
-
-        Called when a previously-counted session produces a clean recall result
-        in a cycle (reset-on-recall-success).  Clears both the durable store
-        entry and the in-memory cache so the session re-enters the retry budget
-        at 0 — only consecutive failures accrue toward the cap.
-
-        Idempotent: a no-op when the session has no durable entry.
-
-        Non-fatal: a failed reset is logged but does not block the caller.
-
-        Args:
-            session_id: Session identifier whose retry count should be cleared.
-        """
-        try:
-            _retry_state.reset_retry_count(self._state_dir, session_id)
-        except Exception:
-            logger.exception(
-                "SessionBuffer.reset_retry_count_for: failed to reset durable retry count "
-                "for session %s (non-fatal)",
-                session_id,
-            )
-        if session_id in self._sessions:
-            self._sessions[session_id].pop("recall_retry_count", None)
 
     def get_conversation_turns(self, conversation_id: str) -> list[dict]:
         """Read a conversation's serving tail — every session in its current chain.

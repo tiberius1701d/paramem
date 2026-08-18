@@ -46,8 +46,10 @@ def read_last_scheduled_run(state_dir: Path) -> float | None:
     Parameters
     ----------
     state_dir:
-        Directory containing ``consolidation_schedule.json``
-        (``config.paths.data / "state"``).
+        Directory containing ``consolidation_schedule.json`` — the data
+        root's state directory, e.g.
+        :func:`~paramem.training.stage_ledger.data_state_dir`
+        ``(config.paths.data)``.
     """
     raw = read_json_or_none(Path(state_dir), SCHEDULE_STATE_FILENAME)
     if raw is None:

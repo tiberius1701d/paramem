@@ -28,7 +28,7 @@ def _fake_config(tmp_path: Path, *, schedule: str = "daily 04:00", port: int = 8
     data.mkdir(parents=True, exist_ok=True)
     backups = types.SimpleNamespace(
         schedule=schedule,
-        artifacts=["config", "graph", "registry"],
+        artifacts=["snapshot_bundle"],
     )
     return types.SimpleNamespace(
         paths=types.SimpleNamespace(data=data),
@@ -59,7 +59,7 @@ def test_delegates_to_server_when_reachable(config_file, monkeypatch):
         return {
             "success": True,
             "tier": "daily",
-            "written_slots": {"config": "/x", "graph": "/y", "registry": "/z"},
+            "written_slots": {"snapshot_bundle": "/x"},
             "skipped_artifacts": [],
             "error": None,
         }
@@ -75,7 +75,7 @@ def test_delegates_to_server_when_reachable(config_file, monkeypatch):
     assert rc == 0
     assert calls["url"].endswith("/backup/create")
     assert calls["body"]["tier"] == "daily"
-    assert calls["body"]["kinds"] == ["config", "graph", "registry"]
+    assert calls["body"]["kinds"] == ["snapshot_bundle"]
 
 
 def test_falls_back_to_degraded_state_when_unreachable(config_file, monkeypatch):

@@ -18,6 +18,7 @@ import sys
 from pathlib import Path
 
 from paramem.cli import http_client
+from paramem.training.stage_ledger import data_state_dir
 
 
 def _resolve_data_dir(config: str) -> Path | None:
@@ -76,7 +77,7 @@ def _trial_json_path(server_url: str, config: str = "configs/server.yaml") -> Pa
     data_dir = _resolve_data_dir(config)
     if data_dir is None:
         return None
-    return Path(data_dir) / "state" / "trial.json"
+    return data_state_dir(data_dir) / "trial.json"
 
 
 def run(args: argparse.Namespace) -> int:

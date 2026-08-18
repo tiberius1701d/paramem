@@ -1,9 +1,12 @@
 """Tests for the key registry."""
 
+import hashlib
+import inspect
 import json as _json
 
 import pytest
 
+from paramem.memory.store import BookkeepingInvariantViolation, MemoryStore
 from paramem.training.key_registry import KeyRegistry
 
 
@@ -46,79 +49,7 @@ class TestKeyRegistry:
         assert len(reg) == 2
 
 
-class TestFidelityTracking:
-    def test_update_and_get_history(self):
-        reg = KeyRegistry()
-        reg.add("key_a")
-        reg.update_fidelity("key_a", 0.9)
-        reg.update_fidelity("key_a", 0.85)
-        assert reg.get_fidelity_history("key_a") == [0.9, 0.85]
-
-    def test_latest_fidelity(self):
-        reg = KeyRegistry()
-        reg.add("key_a")
-        assert reg.get_latest_fidelity("key_a") is None
-        reg.update_fidelity("key_a", 0.9)
-        reg.update_fidelity("key_a", 0.7)
-        assert reg.get_latest_fidelity("key_a") == 0.7
-
-    def test_empty_history(self):
-        reg = KeyRegistry()
-        assert reg.get_fidelity_history("unknown") == []
-
-    def test_remove_clears_fidelity(self):
-        reg = KeyRegistry()
-        reg.add("key_a")
-        reg.update_fidelity("key_a", 0.5)
-        reg.remove("key_a")
-        assert reg.get_fidelity_history("key_a") == []
-
-
-class TestRetirement:
-    def test_should_retire_sustained_low(self):
-        reg = KeyRegistry()
-        reg.add("key_a")
-        reg.update_fidelity("key_a", 0.05)
-        reg.update_fidelity("key_a", 0.08)
-        reg.update_fidelity("key_a", 0.03)
-        assert reg.should_retire("key_a", threshold=0.1, consecutive_cycles=3)
-
-    def test_should_not_retire_not_enough_cycles(self):
-        reg = KeyRegistry()
-        reg.add("key_a")
-        reg.update_fidelity("key_a", 0.05)
-        reg.update_fidelity("key_a", 0.08)
-        assert not reg.should_retire("key_a", threshold=0.1, consecutive_cycles=3)
-
-    def test_should_not_retire_recent_recovery(self):
-        reg = KeyRegistry()
-        reg.add("key_a")
-        reg.update_fidelity("key_a", 0.05)
-        reg.update_fidelity("key_a", 0.05)
-        reg.update_fidelity("key_a", 0.5)  # recovered
-        assert not reg.should_retire("key_a", threshold=0.1, consecutive_cycles=3)
-
-    def test_should_not_retire_unknown_key(self):
-        reg = KeyRegistry()
-        assert not reg.should_retire("unknown")
-
-
 class TestPersistence:
-    def test_save_and_load(self, tmp_path):
-        path = tmp_path / "registry.json"
-
-        reg = KeyRegistry()
-        reg.add("session_001")
-        reg.add("session_002")
-        reg.update_fidelity("session_001", 0.9)
-        reg.update_fidelity("session_001", 0.85)
-        reg.save(path)
-
-        loaded = KeyRegistry.load(path)
-        assert loaded.list_active() == ["session_001", "session_002"]
-        assert loaded.get_fidelity_history("session_001") == [0.9, 0.85]
-        assert loaded.get_fidelity_history("session_002") == []
-
     def test_load_missing_file(self, tmp_path):
         path = tmp_path / "nonexistent.json"
         loaded = KeyRegistry.load(path)
@@ -213,6 +144,64 @@ class TestStrictLoadShape:
             KeyRegistry.load_simhashes(path)
 
 
+class TestLoadFromBytes:
+    """``KeyRegistry.load_from_bytes`` is ``load``'s parse-and-shape-check
+    half, split out so a caller already holding a shadow file's decrypted
+    bytes (:func:`~paramem.memory.increment.build_tier_increment`) parses
+    them once instead of ``load`` re-reading and re-decrypting the file.
+    Same shape predicate, same error shape as ``load`` — no second gate.
+    """
+
+    def test_parses_valid_payload(self):
+        payload = _json.dumps(
+            {"active_keys": ["graph1", "graph2"], "stale": [], "simhash": {"graph1": 7}}
+        )
+        reg = KeyRegistry.load_from_bytes(payload.encode("utf-8"))
+        assert reg.list_active() == ["graph1", "graph2"]
+        assert len(reg) == 2
+
+    def test_no_file_io(self, tmp_path, monkeypatch):
+        """``load_from_bytes`` touches no filesystem at all — patching
+        ``read_maybe_encrypted`` to explode must not affect it."""
+        import paramem.backup.encryption as _enc
+
+        def _boom(*a, **kw):
+            raise AssertionError("load_from_bytes must not read from disk")
+
+        monkeypatch.setattr(_enc, "read_maybe_encrypted", _boom)
+        payload = _json.dumps({"active_keys": [], "stale": [], "simhash": {}})
+        reg = KeyRegistry.load_from_bytes(payload.encode("utf-8"))
+        assert len(reg) == 0
+
+    def test_refuses_non_dict_payload(self):
+        with pytest.raises(ValueError, match="not a JSON object"):
+            KeyRegistry.load_from_bytes(_json.dumps(["graph1"]).encode("utf-8"))
+
+    def test_refuses_missing_active_keys(self):
+        with pytest.raises(ValueError, match="active_keys"):
+            KeyRegistry.load_from_bytes(_json.dumps({"simhash": {}}).encode("utf-8"))
+
+    def test_refuses_missing_simhash(self):
+        with pytest.raises(ValueError, match="simhash"):
+            KeyRegistry.load_from_bytes(_json.dumps({"active_keys": []}).encode("utf-8"))
+
+    def test_error_names_path_when_given(self):
+        with pytest.raises(ValueError, match="registry.json"):
+            KeyRegistry.load_from_bytes(
+                _json.dumps({"simhash": {}}).encode("utf-8"), path="registry.json"
+            )
+
+    def test_load_delegates_to_load_from_bytes(self, tmp_path):
+        """``load`` reads the file once, then hands the bytes to
+        ``load_from_bytes`` for parsing — same outcome as before the split."""
+        path = tmp_path / "indexed_key_registry.json"
+        path.write_text(
+            _json.dumps({"active_keys": ["graph1"], "stale": [], "simhash": {"graph1": 3}})
+        )
+        reg = KeyRegistry.load(path)
+        assert reg.list_active() == ["graph1"]
+
+
 class TestPerTierSchema:
     """Per-tier KeyRegistry: each registry owns one tier's keys.
 
@@ -263,33 +252,18 @@ class TestPerTierSchema:
         assert "graph2" not in ep_reg
         assert "graph2" in sem_reg
 
-    def test_roundtrip_per_tier(self, tmp_path):
-        """Save + load preserves keys for a single-tier registry."""
-        path = tmp_path / "registry.json"
-        reg = KeyRegistry()
-        reg.add("graph1")
-        reg.add("graph2")
-        reg.update_fidelity("graph1", 0.95)
-        reg.save(path)
-
-        loaded = KeyRegistry.load(path)
-        assert loaded.list_active() == ["graph1", "graph2"]
-        assert loaded.get_fidelity_history("graph1") == [0.95]
-        assert "graph1" in loaded
-        assert "graph2" in loaded
-
     def test_load_tolerates_unknown_keys(self, tmp_path):
         """Load ignores any on-disk key outside the current schema.
 
         Forward-tolerant by construction — ``_from_payload`` only reads the
-        keys it knows about (``active_keys``, ``fidelity_history``, ``stale``,
-        ``simhash``); anything else on disk is silently dropped rather than
-        requiring an explicit migration whenever the schema changes.
+        keys it knows about (``active_keys``, ``stale``, ``simhash``);
+        anything else on disk is silently dropped rather than requiring an
+        explicit migration whenever the schema changes.
         """
         path = tmp_path / "registry_with_unknown_key.json"
         payload = {
             "active_keys": ["graph1", "graph2", "graph3"],
-            "fidelity_history": {"graph1": [0.9, 0.85]},
+            "stale": [],
             "simhash": {},
             "some_future_field": {"anything": True},
         }
@@ -297,377 +271,6 @@ class TestPerTierSchema:
 
         loaded = KeyRegistry.load(path)
         assert loaded.list_active() == ["graph1", "graph2", "graph3"]
-
-    def test_load_legacy_health_dict_is_dropped_on_next_save(self, tmp_path):
-        """A payload carrying the retired ``"health"`` dict loads without error,
-        and the next save_bytes() omits it — no attribute keeps it resident.
-
-        Regression for the adapter-health quarantine retirement: git history
-        shows the field never had a production writer, only earlier test code
-        exercised it directly. This proves a real on-disk survivor (from a
-        pre-retirement build, or hand-authored) is inert rather than round-
-        tripped forward forever.
-        """
-        path = tmp_path / "legacy_registry.json"
-        legacy = {
-            "active_keys": ["graph1", "graph2"],
-            "fidelity_history": {},
-            "health": {"status": "degenerated", "reason": "recall sanity check tripped"},
-            "stale": {},
-            "simhash": {},
-        }
-        path.write_text(_json.dumps(legacy))
-
-        loaded = KeyRegistry.load(path)
-        assert loaded.list_active() == ["graph1", "graph2"]
-
-        payload = set(_json.loads(loaded.save_bytes()))
-        assert payload == {"active_keys", "fidelity_history", "stale", "simhash"}
-
-
-class TestStaleSemantics:
-    """KeyRegistry stale partition semantics.
-
-    Covers: stale(key) moves a key from active to stale; list_active excludes
-    it; list_stale includes it; is_stale returns True; remove purges from BOTH
-    active and stale; save/load round-trips the "stale" field; loading a
-    pre-existing registry JSON with no "stale" key yields zero stale keys
-    (backward-compat).
-    """
-
-    def test_stale_moves_key_from_active_to_stale(self):
-        """stale(key) removes from active, adds to stale partition."""
-        reg = KeyRegistry()
-        reg.add("graph1")
-        reg.add("graph2")
-        reg.stale("graph1")
-        assert "graph1" not in reg.list_active()
-        assert "graph1" in reg.list_stale()
-        assert reg.is_stale("graph1")
-        # graph2 unchanged
-        assert "graph2" in reg.list_active()
-        assert "graph2" not in reg.list_stale()
-        assert not reg.is_stale("graph2")
-
-    def test_stale_excludes_from_len_and_contains(self):
-        """Staled keys are excluded from __len__ and __contains__."""
-        reg = KeyRegistry()
-        reg.add("graph1")
-        reg.add("graph2")
-        reg.stale("graph1")
-        assert len(reg) == 1
-        assert "graph1" not in reg  # __contains__ checks active only
-        assert "graph2" in reg
-
-    def test_stale_idempotent_on_already_stale(self):
-        """Calling stale() on an already-stale key is a no-op."""
-        reg = KeyRegistry()
-        reg.add("graph1")
-        reg.stale("graph1")
-        first_record = dict(reg._stale["graph1"])
-        reg.stale("graph1")  # second call — must not change stale_since
-        assert dict(reg._stale["graph1"]) == first_record
-
-    def test_stale_idempotent_on_absent_key(self):
-        """stale() on a key that was never added is a no-op."""
-        reg = KeyRegistry()
-        reg.stale("nonexistent")  # must not raise
-        assert reg.list_stale() == []
-
-    def test_stale_drops_fidelity_history(self):
-        """stale() removes the key from fidelity history."""
-        reg = KeyRegistry()
-        reg.add("graph1")
-        reg.update_fidelity("graph1", 0.9)
-        reg.stale("graph1")
-        assert reg.get_fidelity_history("graph1") == []
-
-    def test_remove_purges_from_both_active_and_stale(self):
-        """remove() hard-erases a stale key — gone from active and stale."""
-        reg = KeyRegistry()
-        reg.add("graph1")
-        reg.stale("graph1")
-        assert "graph1" in reg.list_stale()
-        reg.remove("graph1")
-        assert "graph1" not in reg.list_active()
-        assert "graph1" not in reg.list_stale()
-        assert not reg.is_stale("graph1")
-
-    def test_remove_active_key_also_pops_stale(self):
-        """remove() on an active key leaves stale clean too."""
-        reg = KeyRegistry()
-        reg.add("graph1")
-        reg.add("graph2")
-        reg.stale("graph2")  # graph2 is stale
-        reg.remove("graph1")
-        assert "graph1" not in reg.list_active()
-        assert "graph2" in reg.list_stale()
-
-    def test_save_load_roundtrip_stale_field(self, tmp_path):
-        """save_bytes / load round-trips the "stale" partition."""
-        reg = KeyRegistry()
-        reg.add("graph1")
-        reg.add("graph2")
-        reg.stale("graph2")
-        path = tmp_path / "registry.json"
-        reg.save(path)
-
-        loaded = KeyRegistry.load(path)
-        assert loaded.list_active() == ["graph1"]
-        assert loaded.list_stale() == ["graph2"]
-        assert loaded.is_stale("graph2")
-        assert not loaded.is_stale("graph1")
-
-    def test_load_legacy_file_no_stale_key_yields_empty_stale(self, tmp_path):
-        """Loading a pre-existing registry JSON with no "stale" key gives zero stale keys.
-
-        Backward-compat: old on-disk files lack the "stale" field; load must
-        default to {} (all keys active).
-        """
-        path = tmp_path / "legacy.json"
-        legacy = {
-            "active_keys": ["graph1", "graph2"],
-            "fidelity_history": {},
-            "simhash": {},
-            # no "stale" key
-        }
-        path.write_text(_json.dumps(legacy))
-        loaded = KeyRegistry.load(path)
-        assert loaded.list_active() == ["graph1", "graph2"]
-        assert loaded.list_stale() == []
-
-    def test_load_legacy_stale_record_with_stale_cycles_field(self, tmp_path):
-        """A stale record carrying a retired ``stale_cycles`` field loads cleanly.
-
-        Legacy-file tolerance: production registries written before the
-        stale-cycle mechanism was deleted may still have ``stale_cycles`` on
-        a stale record. ``_from_payload`` copies the record's fields
-        wholesale (``dict(v)``, no field allowlist), so the extra key is
-        carried into ``_stale`` inert — never read by anything — rather than
-        rejected. The next ``save_bytes()`` still round-trips it (nothing
-        strips it), which is fine: it is dead weight, not a correctness
-        hazard.
-        """
-        path = tmp_path / "legacy_stale_cycles.json"
-        legacy = {
-            "active_keys": ["graph1"],
-            "fidelity_history": {},
-            "stale": {
-                "graph2": {
-                    "stale_since": "2026-08-01T00:00:00Z",
-                    "stale_cycles": 3,
-                    "simhash": 0xCAFE,
-                }
-            },
-            "simhash": {"graph2": 0xCAFE},
-        }
-        path.write_text(_json.dumps(legacy))
-
-        loaded = KeyRegistry.load(path)
-        assert loaded.list_active() == ["graph1"]
-        assert loaded.is_stale("graph2")
-        assert loaded.simhash_for("graph2") == 0xCAFE
-
-    def test_stale_partition_round_trips_across_two_folds(self, tmp_path):
-        """The stale partition survives a two-fold save/load sequence unchanged.
-
-        Fold N stales a key and saves; fold N+1 loads that file and saves it
-        back unmodified (as a no-op fold would) — the stale record's content
-        (``stale_since``, and any simhash) round-trips intact both times.
-        """
-        reg = KeyRegistry()
-        reg.add("graph1")
-        reg.stale("graph1")
-        path = tmp_path / "registry.json"
-
-        # Fold N: durable write.
-        reg.save(path)
-        loaded_at_write = KeyRegistry.load(path)
-        assert "graph1" in loaded_at_write.list_stale()
-        assert (
-            loaded_at_write._stale["graph1"]["stale_since"] == reg._stale["graph1"]["stale_since"]
-        )
-
-        # Fold N+1: load from disk, save again — round-trip is stable.
-        loaded_at_write.save(path)
-        loaded_fold_n1 = KeyRegistry.load(path)
-        assert "graph1" in loaded_fold_n1.list_stale()
-        assert loaded_fold_n1._stale["graph1"]["stale_since"] == reg._stale["graph1"]["stale_since"]
-
-
-class TestReactivateSemantics:
-    """KeyRegistry.reactivate() — the encapsulated dual of stale().
-
-    Covers: reactivate(key) moves a stale key back to active and restores
-    its simhash; is a no-op on an already-active or entirely-unknown key
-    (mirroring stale()'s no-op when the key is not active); restores no
-    simhash when the stale record never carried one.
-    """
-
-    def test_reactivate_moves_key_from_stale_to_active(self):
-        """reactivate(key) removes from stale, adds back to active partition."""
-        reg = KeyRegistry()
-        reg.add("graph1")
-        reg.add("graph2")
-        reg.stale("graph1")
-        reg.reactivate("graph1")
-        assert "graph1" in reg.list_active()
-        assert "graph1" not in reg.list_stale()
-        assert not reg.is_stale("graph1")
-        # graph2 unchanged
-        assert "graph2" in reg.list_active()
-
-    def test_reactivate_restores_simhash_from_stale_record(self):
-        """reactivate(key) restores the simhash carried by the stale record."""
-        reg = KeyRegistry()
-        reg.add("graph1")
-        reg.set_simhash("graph1", 0xBEEF)
-        reg.stale("graph1")
-        assert reg.simhash_for("graph1") == 0xBEEF  # carried into the stale record
-        reg.reactivate("graph1")
-        assert reg._simhash["graph1"] == 0xBEEF
-        assert "simhash" not in reg._stale.get("graph1", {})
-
-    def test_reactivate_key_with_no_simhash(self):
-        """reactivate(key) on a stale key that never had a simhash — no fp restored."""
-        reg = KeyRegistry()
-        reg.add("graph1")
-        reg.stale("graph1")
-        assert "simhash" not in reg._stale["graph1"]
-        reg.reactivate("graph1")
-        assert "graph1" in reg.list_active()
-        assert "graph1" not in reg._simhash
-
-    def test_reactivate_idempotent_on_already_active(self):
-        """Calling reactivate() on an already-active key is a no-op."""
-        reg = KeyRegistry()
-        reg.add("graph1")
-        reg.reactivate("graph1")  # never staled — must not raise
-        assert reg.list_active() == ["graph1"]
-        assert reg.list_stale() == []
-
-    def test_reactivate_idempotent_on_absent_key(self):
-        """reactivate() on a key that was never added is a no-op."""
-        reg = KeyRegistry()
-        reg.reactivate("nonexistent")  # must not raise
-        assert reg.list_active() == []
-        assert reg.list_stale() == []
-
-    def test_reactivate_then_stale_round_trips(self):
-        """stale() → reactivate() → stale() leaves the key stale again, cleanly."""
-        reg = KeyRegistry()
-        reg.add("graph1")
-        reg.set_simhash("graph1", 42)
-        reg.stale("graph1")
-        reg.reactivate("graph1")
-        reg.stale("graph1")
-        assert "graph1" in reg.list_stale()
-        assert "graph1" not in reg.list_active()
-        assert reg.simhash_for("graph1") == 42
-
-
-class TestKnownPredicate:
-    """Unit tests for KeyRegistry.knows() and KeyRegistry.list_known().
-
-    Verifies the KNOWN-legitimacy predicates (active ∪ stale) introduced to
-    canonicalize orphan-check and bookkeeping-retention consumers.  Distinct
-    from __contains__ (active-only, SERVE semantics).
-    """
-
-    def test_knows_active_key(self):
-        """knows() returns True for an active key."""
-        reg = KeyRegistry()
-        reg.add("graph1")
-        assert reg.knows("graph1")
-
-    def test_knows_stale_key(self):
-        """knows() returns True for a key that has been staled."""
-        reg = KeyRegistry()
-        reg.add("graph1")
-        reg.stale("graph1")
-        # Active predicate no longer sees it.
-        assert "graph1" not in reg
-        # Known predicate does.
-        assert reg.knows("graph1")
-
-    def test_knows_false_for_absent_key(self):
-        """knows() returns False for a key never added."""
-        reg = KeyRegistry()
-        assert not reg.knows("unknown")
-
-    def test_knows_false_after_remove(self):
-        """knows() returns False after hard-remove (key purged from both partitions)."""
-        reg = KeyRegistry()
-        reg.add("graph1")
-        reg.stale("graph1")
-        reg.remove("graph1")
-        assert not reg.knows("graph1")
-
-    def test_list_known_active_and_stale(self):
-        """list_known() = active keys first, then stale keys."""
-        reg = KeyRegistry()
-        reg.add("graph1")
-        reg.add("graph2")
-        reg.add("graph3")
-        reg.stale("graph2")
-        result = reg.list_known()
-        # graph1 and graph3 are active (graph2 staled out of active).
-        assert result == ["graph1", "graph3", "graph2"]
-
-    def test_list_known_active_only(self):
-        """list_known() == list_active() when no stale keys."""
-        reg = KeyRegistry()
-        reg.add("a")
-        reg.add("b")
-        assert reg.list_known() == reg.list_active()
-
-    def test_list_known_stale_only(self):
-        """list_known() == list_stale() when all keys have been staled."""
-        reg = KeyRegistry()
-        reg.add("a")
-        reg.add("b")
-        reg.stale("a")
-        reg.stale("b")
-        assert reg.list_known() == reg.list_stale()
-
-    def test_staling_flips_contains_but_not_knows(self):
-        """Staling a key moves it from __contains__=True to knows()=True, __contains__=False.
-
-        This is the exact active/known divergence that the orphan-check bug relied on.
-        """
-        reg = KeyRegistry()
-        reg.add("proc52")
-        assert "proc52" in reg  # active
-        assert reg.knows("proc52")  # known
-
-        reg.stale("proc52")
-        assert "proc52" not in reg  # no longer active
-        assert reg.knows("proc52")  # still known
-
-
-class TestSaveBytesBoundary:
-    def test_save_bytes_payload_is_bookkeeping_free(self):
-        """HARD CONSTRAINT: KeyRegistry.save_bytes() must contain exactly
-        {active_keys, fidelity_history, stale, simhash} — no bookkeeping fields.
-
-        registry_sha256 hashes the save_bytes payload; bookkeeping must never
-        enter it or slot identity breaks on restart.  The ``"simhash"`` field
-        (unified SimHash storage, simhash-unification refactor) holds the
-        active∪stale fingerprint map.  The ``"stale"`` field was added in the
-        soft-stale extension.  The legacy ``"health"`` field (retired
-        adapter-health quarantine) has no backing attribute any more, so a
-        save never emits it — even after loading a legacy file that had one.
-        """
-        reg = KeyRegistry()
-        reg.add("graph1")
-        reg.add("graph2")
-        reg.update_fidelity("graph1", 0.9)
-        payload = set(_json.loads(reg.save_bytes()))
-        assert payload == {"active_keys", "fidelity_history", "stale", "simhash"}
-        assert "speaker_id" not in payload
-        assert "first_seen_cycle" not in payload
-        assert "bookkeeping" not in payload
-        assert "health" not in payload
 
 
 class TestLoadSimhashes:
@@ -683,45 +286,29 @@ class TestLoadSimhashes:
         """Absent file = fresh install / untrained tier, not an error."""
         assert KeyRegistry.load_simhashes(tmp_path / "missing.json") == {}
 
-    def test_returns_active_and_stale_superset(self, tmp_path):
-        """The map is the active∪stale superset, exactly what save_bytes writes."""
-        path = tmp_path / "indexed_key_registry.json"
-        reg = KeyRegistry()
-        reg.add("graph1")
-        reg.set_simhash("graph1", 111)
-        reg.add("graph2")
-        reg.set_simhash("graph2", 222)
-        reg.stale("graph2")
-        path.write_bytes(reg.save_bytes())
+    def test_non_integer_fingerprint_raises(self, tmp_path):
+        """A non-int fingerprint is corruption, not a variant — it must raise,
+        not be silently filtered.
 
-        assert KeyRegistry.load_simhashes(path) == {"graph1": 111, "graph2": 222}
-
-    def test_matches_load_plus_known_simhashes(self, tmp_path):
-        """No drift against the full loader: same file, same fingerprint map.
-
-        Both go through the same payload parse/deserialize, so this pins the
-        collapse — a second reader would show up here first.
+        Superseded tolerance: this used to silently drop a non-int
+        fingerprint and return the rest. Under the single-shape read
+        (``KeyRegistry.load_from_bytes``), a non-int ``"simhash"`` value
+        fails the whole file's shape check with a loud ``ValueError``
+        instead — see ``KeyRegistry._from_payload``'s "no filter" contract.
         """
-        path = tmp_path / "indexed_key_registry.json"
-        reg = KeyRegistry()
-        for i, fp in enumerate([11, 22, 33]):
-            reg.add(f"graph{i}")
-            reg.set_simhash(f"graph{i}", fp)
-        reg.stale("graph1")
-        path.write_bytes(reg.save_bytes())
-
-        assert KeyRegistry.load_simhashes(path) == KeyRegistry.load(path)._known_simhashes()
-
-    def test_non_integer_fingerprints_dropped(self, tmp_path):
-        """A non-int fingerprint is not a fingerprint — it is dropped, as in load()."""
         path = tmp_path / "indexed_key_registry.json"
         path.write_text(
             _json.dumps(
-                {"active_keys": ["graph1", "graph2"], "simhash": {"graph1": 1, "graph2": "x"}}
+                {
+                    "active_keys": ["graph1", "graph2"],
+                    "stale": [],
+                    "simhash": {"graph1": 1, "graph2": "x"},
+                }
             )
         )
 
-        assert KeyRegistry.load_simhashes(path) == {"graph1": 1}
+        with pytest.raises(ValueError, match="simhash"):
+            KeyRegistry.load_simhashes(path)
 
     def test_absent_simhash_section_raises(self, tmp_path):
         """A file with no ``"simhash"`` section cannot answer — it must raise.
@@ -735,8 +322,7 @@ class TestLoadSimhashes:
             _json.dumps(
                 {
                     "active_keys": ["graph1"],
-                    "fidelity_history": {},
-                    "stale": {},
+                    "stale": [],
                 }
             )
         )
@@ -774,3 +360,343 @@ class TestLoadSimhashes:
 
         with pytest.raises(ValueError, match="simhash"):
             KeyRegistry.load_simhashes(path)
+
+
+class TestSaveFromBytesSerializationBarrier:
+    """save_bytes() -> digest -> save_from_bytes(payload, path) is THE
+    serialization barrier a manifest's registry_sha256 binds against: the
+    bytes written to disk must be byte-identical to whatever was hashed.
+
+    Pinned WITHOUT the removed ``_require_consolidating``/``consolidating``
+    keyword pair -- collapsed out of the signature because the guard they
+    gated was unreachable in production (the ``RuntimeError`` check fired
+    only on an explicit falsy ``consolidating``, and no production caller
+    ever passed one) and the v5 slot-manifest migration script is a caller
+    that cannot answer either parameter honestly (it runs offline, outside
+    any consolidation window).
+    """
+
+    def test_registry_bytes_written_are_byte_identical_to_the_bytes_hashed(self, tmp_path):
+        reg = KeyRegistry()
+        reg.add("graph1")
+        reg.add("graph2")
+
+        payload = reg.save_bytes()
+        digest = hashlib.sha256(payload).hexdigest()
+
+        path = tmp_path / "indexed_key_registry.json"
+        reg.save_from_bytes(payload, path)  # positional call, no kwargs
+
+        on_disk = path.read_bytes()
+        assert on_disk == payload, "bytes on disk must be byte-identical to the hashed bytes"
+        assert hashlib.sha256(on_disk).hexdigest() == digest
+
+    def test_save_from_bytes_signature_has_no_consolidating_kwarg(self):
+        params = inspect.signature(KeyRegistry.save_from_bytes).parameters
+        assert set(params) == {"self", "payload", "path"}
+
+
+# ---------------------------------------------------------------------------
+# The marker record — a withheld id holds only its id: no timestamp, no
+# fingerprint, no other field. Excluded from active enumeration and the
+# fingerprint map; retained in list_known() so its bookkeeping row survives
+# beside it.
+# ---------------------------------------------------------------------------
+
+
+class TestMarkerRecord:
+    def test_marking_a_key_withholds_its_id_and_drops_its_fingerprint(self):
+        reg = KeyRegistry()
+        reg.add("graph1")
+        reg.set_simhash("graph1", 0xCAFE)
+
+        reg.stale("graph1")
+
+        assert "graph1" not in reg  # active-only __contains__
+        assert reg.simhash_for("graph1") is None
+        assert not reg.has_simhash("graph1")
+
+    def test_marking_an_already_withheld_key_changes_nothing(self):
+        reg = KeyRegistry()
+        reg.add("graph1")
+        reg.stale("graph1")
+        before_known = reg.list_known()
+        before_stale = reg.list_stale()
+
+        reg.stale("graph1")  # idempotent no-op
+
+        assert reg.list_known() == before_known
+        assert reg.list_stale() == before_stale
+
+    def test_marking_an_absent_key_is_a_noop(self):
+        reg = KeyRegistry()
+        reg.stale("never_added")  # must not raise
+        assert reg.list_known() == []
+
+    def test_a_withheld_id_is_known_but_not_active(self):
+        reg = KeyRegistry()
+        reg.add("graph1")
+        reg.stale("graph1")
+
+        assert reg.knows("graph1") is True
+        assert "graph1" not in reg
+        assert "graph1" not in reg.list_active()
+        assert "graph1" in reg.list_stale()
+
+    def test_registering_a_withheld_id_as_active_is_refused(self):
+        reg = KeyRegistry()
+        reg.add("graph1")
+        reg.stale("graph1")
+
+        with pytest.raises(BookkeepingInvariantViolation):
+            reg.add("graph1")
+
+        # The refusal must not have half-mutated anything.
+        assert "graph1" not in reg
+        assert reg.knows("graph1")
+
+    def test_attaching_a_fingerprint_to_a_withheld_id_is_refused(self):
+        reg = KeyRegistry()
+        reg.add("graph1")
+        reg.stale("graph1")
+
+        with pytest.raises(BookkeepingInvariantViolation):
+            reg.set_simhash("graph1", 0xBEEF)
+
+        assert reg.simhash_for("graph1") is None
+
+    def test_the_fingerprint_map_is_exactly_the_active_keys_fingerprints(self):
+        reg = KeyRegistry()
+        reg.add("with_fp")
+        reg.set_simhash("with_fp", 111)
+        reg.add("without_fp")  # active, never fingerprinted
+        reg.add("was_active_then_staled")
+        reg.set_simhash("was_active_then_staled", 222)
+        reg.stale("was_active_then_staled")  # fingerprint dropped on transition
+
+        store = MemoryStore()
+        store.load_registry("episodic", reg)
+
+        assert store.tier_simhashes("episodic") == {"with_fp": 111}
+
+    def test_known_keys_list_active_in_registration_order_then_withheld_ids_sorted(self):
+        reg = KeyRegistry()
+        reg.add("z_first_registered")
+        reg.add("a_second_registered")
+        reg.stale("z_first_registered")
+        reg.add("b_third_registered")
+        # Withheld ids appear sorted, independent of the order they were staled.
+        reg.add("m_to_be_staled")
+        reg.stale("m_to_be_staled")
+
+        assert reg.list_active() == ["a_second_registered", "b_third_registered"]
+        assert reg.list_stale() == ["m_to_be_staled", "z_first_registered"]
+        assert reg.list_known() == [
+            "a_second_registered",
+            "b_third_registered",
+            "m_to_be_staled",
+            "z_first_registered",
+        ]
+
+    def test_the_serialized_marker_section_is_a_sorted_id_list(self):
+        reg = KeyRegistry()
+        for key in ("graph9", "graph1", "graph5"):
+            reg.add(key)
+            reg.stale(key)
+
+        data = _json.loads(reg.save_bytes())
+
+        assert data["stale"] == ["graph1", "graph5", "graph9"]
+        assert isinstance(data["stale"], list)
+
+    def test_serialization_of_the_same_registry_is_byte_identical(self):
+        reg = KeyRegistry()
+        reg.add("graph1")
+        reg.set_simhash("graph1", 42)
+        reg.add("graph2")
+        reg.stale("graph2")
+
+        first = reg.save_bytes()
+        second = reg.save_bytes()
+
+        assert first == second
+
+
+class TestSingleShapeReadAndItsRaises:
+    """``KeyRegistry.load_from_bytes`` refuses any shape but the current one —
+    no coercion, no default, no second reading of a foreign schema."""
+
+    def test_an_old_shape_stale_section_fails_the_registry_parse(self):
+        """A pre-migration 'stale' section (a dict of per-id records) is
+        refused, not coerced into a marker-only set."""
+        payload = _json.dumps(
+            {
+                "active_keys": ["graph1"],
+                "stale": {"graph7": {"stale_since": "2026-01-01T00:00:00Z", "simhash": 999}},
+                "simhash": {"graph1": 1},
+            }
+        )
+        with pytest.raises(ValueError, match="graph7|stale"):
+            KeyRegistry.load_from_bytes(payload.encode("utf-8"))
+
+    def test_a_registry_missing_its_stale_section_fails_the_parse(self):
+        payload = _json.dumps({"active_keys": ["graph1"], "simhash": {"graph1": 1}})
+        with pytest.raises(ValueError, match="stale"):
+            KeyRegistry.load_from_bytes(payload.encode("utf-8"))
+
+    def test_a_fingerprint_naming_a_withheld_id_fails_the_parse(self):
+        """A 'simhash' entry naming a withheld id is the persisted form of
+        the in-memory refusal (add()/set_simhash() refuse a withheld id) —
+        the boundary that meets persisted data enforces the same invariant."""
+        payload = _json.dumps(
+            {
+                "active_keys": ["graph1"],
+                "stale": ["graph2"],
+                "simhash": {"graph1": 1, "graph2": 2},
+            }
+        )
+        with pytest.raises(ValueError, match="withheld"):
+            KeyRegistry.load_from_bytes(payload.encode("utf-8"))
+
+    def test_an_id_in_both_active_and_stale_fails_the_parse(self):
+        payload = _json.dumps({"active_keys": ["graph1"], "stale": ["graph1"], "simhash": {}})
+        with pytest.raises(ValueError, match="graph1"):
+            KeyRegistry.load_from_bytes(payload.encode("utf-8"))
+
+    def test_a_non_hashable_active_keys_member_fails_the_parse_not_a_bare_typeerror(self):
+        """A non-string 'active_keys' member (e.g. a dict) used to reach the
+        overlap check's `set(active_keys) & set(stale_ids)` unguarded and
+        raise a bare, uncaught TypeError -- the documented contract is a
+        ValueError naming the path, the same as every other shape defect."""
+        payload = _json.dumps({"active_keys": [{"k": 1}], "stale": [], "simhash": {}})
+        with pytest.raises(ValueError, match="active_keys"):
+            KeyRegistry.load_from_bytes(payload.encode("utf-8"))
+
+    def test_a_bool_fingerprint_is_refused_not_admitted_as_an_int(self):
+        """`bool` is a subtype of `int` in Python, so a bare `isinstance(fp,
+        int)` admits `True`/`False` as fingerprints -- excluded explicitly."""
+        payload = _json.dumps({"active_keys": ["graph1"], "stale": [], "simhash": {"graph1": True}})
+        with pytest.raises(ValueError, match="simhash"):
+            KeyRegistry.load_from_bytes(payload.encode("utf-8"))
+
+
+class TestAdoptKeyFrom:
+    """``adopt_key_from`` moves an ACTIVE key's membership and fingerprint out
+    of one tier's registry into another — the registry-layer half of a key
+    changing tier."""
+
+    def test_adopting_a_key_moves_it_active_with_its_fingerprint(self):
+        source = KeyRegistry()
+        source.add("graph1")
+        source.set_simhash("graph1", 0xCAFE)
+        dest = KeyRegistry()
+
+        dest.adopt_key_from(source, "graph1")
+
+        assert "graph1" in dest
+        assert dest.simhash_for("graph1") == 0xCAFE
+        assert not source.knows("graph1")
+
+    def test_adopting_a_key_with_no_fingerprint_moves_it_fingerprint_free(self):
+        source = KeyRegistry()
+        source.add("graph1")
+        dest = KeyRegistry()
+
+        dest.adopt_key_from(source, "graph1")
+
+        assert "graph1" in dest
+        assert dest.simhash_for("graph1") is None
+
+    def test_adopting_a_key_the_destination_already_knows_is_refused(self):
+        source = KeyRegistry()
+        source.add("graph1")
+        dest = KeyRegistry()
+        dest.add("graph1")  # dest already knows this id
+
+        with pytest.raises(BookkeepingInvariantViolation):
+            dest.adopt_key_from(source, "graph1")
+
+        # Neither registry mutated by the failed adoption.
+        assert "graph1" in source
+        assert "graph1" in dest
+
+    def test_adopting_a_key_the_source_does_not_know_is_refused(self):
+        source = KeyRegistry()
+        dest = KeyRegistry()
+
+        with pytest.raises(BookkeepingInvariantViolation):
+            dest.adopt_key_from(source, "graph1")
+
+        assert not dest.knows("graph1")
+
+
+class TestWorkingCopyIsolation:
+    """``KeyRegistry.working_copy`` -- the registry-layer seed for one
+    fold's working universe (``ConsolidationLoop._recall_working_tiers``).
+    Pinned directly at the ``KeyRegistry`` level, the exact mechanism the
+    fold uses: independence (no shared container, either direction) and the
+    ``active_only`` marker-retention contract."""
+
+    def test_a_working_copy_shares_no_container_with_the_live_registry(self):
+        live = KeyRegistry()
+        live.add("graph1")
+        live.set_simhash("graph1", 1)
+        live.add("graph2")
+        live.stale("graph2")
+
+        working = live.working_copy(active_only=False)
+
+        # Mutate every container on the working copy.
+        working.add("graph3")
+        working.stale("graph1")
+        working.add("graph4")
+        working.set_simhash("graph4", 999)
+
+        # The live registry must be untouched.
+        assert live.list_active() == ["graph1"]
+        assert live.list_stale() == ["graph2"]
+        assert live.simhash_for("graph1") == 1
+        assert "graph3" not in live
+        assert "graph4" not in live
+
+        # And the reverse direction: mutating the live registry after the
+        # copy was taken must not reach the working copy either.
+        live.add("graph5")
+        assert "graph5" not in working
+
+    def test_active_only_true_drops_every_marker(self):
+        """A rebuilt (primary) tier's working copy: markers end at this
+        tier's own rebuild, so `active_only=True` carries active keys and
+        their fingerprints only -- no stale ids survive into the copy at
+        all, not even as an empty-fingerprint marker."""
+        live = KeyRegistry()
+        live.add("graph1")
+        live.set_simhash("graph1", 1)
+        live.add("graph2")
+        live.stale("graph2")
+
+        working = live.working_copy(active_only=True)
+
+        assert working.list_active() == ["graph1"]
+        assert working.list_stale() == []
+        assert working.list_known() == ["graph1"]
+        assert working.simhash_for("graph1") == 1
+        assert not working.knows("graph2")
+
+        # And the live registry is untouched by taking the copy.
+        assert live.list_stale() == ["graph2"]
+
+    def test_active_only_false_carries_markers(self):
+        """A candidate (dedup-only) tier's working copy: this event does
+        not rebuild it, so its markers must survive into the working copy
+        -- `active_only=False` is the full active-union-stale universe."""
+        live = KeyRegistry()
+        live.add("graph1")
+        live.add("graph2")
+        live.stale("graph2")
+
+        working = live.working_copy(active_only=False)
+
+        assert working.list_active() == ["graph1"]
+        assert working.list_stale() == ["graph2"]
+        assert working.knows("graph2")

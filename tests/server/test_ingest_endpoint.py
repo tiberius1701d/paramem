@@ -7,50 +7,17 @@ use TestClient without lifespan (no model load, no GPU required).
 from __future__ import annotations
 
 import base64
-from pathlib import Path
-from unittest.mock import MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
 
 import paramem.server.app as app_module
 from paramem.server.session_buffer import SessionBuffer
+from tests.server._state_builders import _make_ingest_state as _make_state
 
 # ---------------------------------------------------------------------------
 # State factory
 # ---------------------------------------------------------------------------
-
-
-def _make_state(tmp_path: Path) -> dict:
-    """Build a minimal _state dict for ingest endpoint tests."""
-    sessions_dir = tmp_path / "sessions"
-    sessions_dir.mkdir(parents=True, exist_ok=True)
-
-    config = MagicMock()
-    config.paths.sessions = sessions_dir
-    config.debug = False
-
-    buffer = SessionBuffer(
-        session_dir=sessions_dir, state_dir=sessions_dir.parent / "state", debug=False
-    )
-
-    # Build a real SpeakerStore with one known speaker.
-    from paramem.server.speaker import SpeakerStore
-
-    store = SpeakerStore(tmp_path / "profiles.json")
-    known_speaker_id = store.enroll("Alice", [0.1, 0.2, 0.3])
-
-    return {
-        "model": None,
-        "config": config,
-        "consolidating": False,
-        "migration": {},  # no TRIAL
-        "server_started_at": "2026-04-26T00:00:00+00:00",
-        "session_buffer": buffer,
-        "speaker_store": store,
-        # Store the known speaker id for use in tests.
-        "_test_known_speaker_id": known_speaker_id,
-    }
 
 
 @pytest.fixture()
@@ -393,3 +360,61 @@ class TestTrialActive409:
 
         assert resp.status_code == 409
         assert resp.json()["detail"]["error"] == "trial_active"
+
+
+# ---------------------------------------------------------------------------
+# POST /ingest-sessions/cancel — the pending-record guard
+#
+# ``active_consolidation()``'s pending-record arm (``deferred_event_pending``
+# -> ``consolidation_pending``) had zero coverage for this door before this
+# pin (verified: the only guard exercised anywhere in this file is
+# trial_active, and only for ``/ingest-sessions``, never ``/cancel``).  See
+# also ``tests/server/test_consolidate_dispatch.py::TestFiveDoorPendingRecordGuard``,
+# which pins the same arm across the other four mutating doors.
+# ---------------------------------------------------------------------------
+
+
+class TestCancelPendingRecordGuard:
+    def test_cancel_refuses_with_a_pending_record(self, client, state):
+        """A pending stage ledger refuses the cancel with 409
+        ``consolidation_pending`` -- distinct from ``trial_active`` and the
+        other four busy-arm verdicts, and never reached before this pin."""
+        from tests.server._state_builders import _write_pending_ledger
+
+        _write_pending_ledger(state["config"].paths.data, event="interim")
+
+        resp = client.post("/ingest-sessions/cancel", json={"session_ids": []})
+
+        assert resp.status_code == 409
+        assert resp.json()["detail"]["error"] == "consolidation_pending"
+
+    def test_cancel_refuses_and_leaves_queued_jsonls_on_disk_under_a_pending_record(
+        self, client, state
+    ):
+        """The exact scenario the door's own docstring names: a pending
+        event's ledger has already extracted these sessions, so a 200 here
+        would report a cancellation that did not happen.  The queued
+        sessions' JSONLs are real files on disk (not mocked) and must
+        survive the refused call untouched -- proving the guard is checked
+        BEFORE ``discard_sessions`` runs, not merely that the response says
+        409."""
+        from tests.server._state_builders import _write_pending_ledger
+
+        spk = state["_test_known_speaker_id"]
+        resp = client.post("/ingest-sessions", json=_ingest_payload(spk, n=2))
+        queued = resp.json()["queued"]
+        buf: SessionBuffer = state["session_buffer"]
+        jsonls_before = {sid: (buf.session_dir / f"{sid}.jsonl").read_bytes() for sid in queued}
+        assert all(path_bytes for path_bytes in jsonls_before.values())
+
+        _write_pending_ledger(state["config"].paths.data, event="interim")
+
+        cancel_resp = client.post("/ingest-sessions/cancel", json={"session_ids": queued})
+
+        assert cancel_resp.status_code == 409
+        assert cancel_resp.json()["detail"]["error"] == "consolidation_pending"
+        for sid, before in jsonls_before.items():
+            path = buf.session_dir / f"{sid}.jsonl"
+            assert path.exists(), f"{sid} must not be discarded while a record is pending"
+            assert path.read_bytes() == before
+        assert len(buf.get_pending()) == 2, "the queued sessions must still be pending"

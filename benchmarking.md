@@ -1035,23 +1035,6 @@ repetition_penalty=1.1.
 3. **Test design note:** Fresh adapter per session doesn't match the production
    pattern. Test 2b (below) validates incremental training with a persistent adapter.
 
-### Infrastructure improvements from Test 2
-
-1. **Raw output preservation in `probe_key()`:** On failure, returns
-   `{"raw_output": ..., "failure_reason": ...}` instead of discarding.
-   Per-key recall data saved in results for diagnostics.
-
-2. **`--strategy` flag:** Run `--strategy graph` or `--strategy model`
-   individually. Default: both.
-
-3. **Enriched registry with temporal metadata:** `build_enriched_registry()`
-   adds per-key: `created_at`, `last_seen_at`, `session_id`, `status`
-   (active/stale), `stale_since`, `stale_cycles`. Backward compatible.
-
-4. **Stale key lifecycle:** A key moved to the stale partition is deregistered
-   (excluded from retrieval enumeration; the untrained-key layer rejects it).
-   Key-id recycling is not implemented.
-
 ---
 
 ## Test 2b: Incremental Contradiction Resolution
@@ -1426,7 +1409,9 @@ is ≈98% recoverable at ~3% of the full-fill compute cost.
   non-zero; at 550-key scale this would be ~9 keys per touch-up.
 - **Recovery was done with knowledge of which keys had failed.** In
   production this requires a SimHash-confidence-driven failure list
-  (`_run_recall_sanity_probe` already produces one).
+  (the staged-weights recall probe, `ConsolidationLoop._probe_recall`,
+  already produces one — its `RecallProbe` result carries a per-key
+  verdict including failures).
 
 **What this unlocks (gated on multi-round validation):**
 - **Touch-up-as-self-healing:** replay failing keys for 2 epochs at
@@ -1870,121 +1855,16 @@ ANALYSIS_POLICY window.
 | C1 | 50 epochs | `outputs/test13_journal_scaffold/mistral/20260420_231031/C1/C1_done.json` — scaffold has a slow early-epoch profile and converges in e25–e30; cap gives slow seeds margin |
 | C2 | 30 epochs | Test 13b `fill_stable_perfect = e14`; ANALYSIS_POLICY earliest stop e14; cap gives margin |
 
-### Pause / resume contract
+### Run management
 
-`tpause` / `tresume 15` / `tstatus` work via the training-control.sh
-registry (`TEST_SCRIPTS[15]`, `TEST_OUTPUT_DIRS[15]`, `TEST_PGREP[15]`).
-Three pause sites:
-
-1. **Between seeds** — top-level loop calls `_check_pause` before each
-   seed; writes `<run_dir>/paused.json` then `SystemExit`.
-2. **Between phases within a seed** — same primitive at A→B, B→C1,
-   C1→C2 boundaries.
-3. **Mid-phase, mid-epoch** — `RecallEarlyStopCallback` already
-   detects `~/.training_pause` inside `on_epoch_end`
-   (`paramem/training/early_stop.py`) and signals
-   `should_training_stop=True`. `_exit_if_paused_mid_phase` (mirror of
-   Test 14's helper) infers the paused-mid-phase state from
-   `stop_epoch is None AND last_epoch < num_epochs` and writes
-   `paused.json` *without* writing `<phase>_done.json`.
-
-On `tresume 15`, the script launches with `--resume`, finds the latest
-run dir, and per (seed, phase) either skips on `<phase>_done.json` or
-finds the latest checkpoint via `_find_latest_checkpoint` and resumes
-the trainer with `resume_from_checkpoint=...`. The callback's
-`_rehydrate_from_disk` (`paramem/training/early_stop.py`) restores
-`epoch_log`, `first_perfect_log`, `progress.json`'s `cycle_started_at`,
-and derives `_consecutive_perfect`, so accumulators do not restart on
-resume. `tstatus` renders the active phase's progress.json as a
-progress bar via `_show_epoch_progress` (`scripts/dev/training-control.sh:2043`).
-
-### Output layout
-
-```
-outputs/test15_retention_multiseed/<model>/<ts>/
-  run_config.json                # seeds, n_keys, scheduler, policy, code-version
-  paused.json                    # top-level marker (boundary pauses)
-  multiseed_aggregate.json       # written when all (seed, phase) markers exist
-  seed{42,7,1337,1,11}/
-    A/
-      A_train_done.json          # written after train_adapter
-      A_done.json                # written after train_adapter
-      episodic_adapter/
-        <YYMMDD-HHMMSS>/         # atomic-save timestamp dir (paramem.adapters.manifest)
-          adapter_model.safetensors
-          adapter_config.json
-        .pending                 # atomic-save sentinel
-      checkpoint-{step}/         # HF Trainer checkpoints (kept by CHECKPOINT_RETENTION=2)
-      epoch_log.json, progress.json, first_perfect_log.json
-      paused.json                # only if mid-phase pause
-    B/
-      B_train_done.json          # after train_adapter
-      B_repair_done.json         # after repair loop
-      B_done.json                # written only after both
-      episodic_adapter/          # RP2 state (untouched); same internal structure as A
-        <YYMMDD-HHMMSS>/
-          adapter_model.safetensors
-          adapter_config.json
-        .pending
-      episodic_adapter_repaired/ # RP3 state (post-repair); same internal structure
-        <YYMMDD-HHMMSS>/
-          adapter_model.safetensors
-          adapter_config.json
-        .pending
-      repair_log.json            # episode curve, RP2/RP3, alignment_delta, corruption_residual
-      repair_episodes/episode_{1..N}/  # HF Trainer output dirs (empty; save_strategy=no)
-      checkpoint-{step}/         # HF Trainer checkpoints (kept by CHECKPOINT_RETENTION=2)
-      epoch_log.json, progress.json, first_perfect_log.json
-    C1/
-      C1_done.json
-      journal_adapter/           # scaffold adapter at stop_epoch; same internal structure
-        <YYMMDD-HHMMSS>/
-          adapter_model.safetensors
-          adapter_config.json
-        .pending
-      checkpoint-{step}/         # HF Trainer checkpoints (kept by CHECKPOINT_RETENTION=2)
-      epoch_log.json, progress.json, first_perfect_log.json
-    C2/
-      C2_train_done.json, C2_repair_done.json, C2_done.json
-      journal_adapter/           # RP2 state (untouched); same internal structure
-        <YYMMDD-HHMMSS>/
-          adapter_model.safetensors
-          adapter_config.json
-        .pending
-      journal_adapter_repaired/  # RP3 state (post-repair); same internal structure
-        <YYMMDD-HHMMSS>/
-          adapter_model.safetensors
-          adapter_config.json
-        .pending
-      repair_log.json
-      repair_episodes/episode_{1..N}/  # HF Trainer output dirs (empty; save_strategy=no)
-      checkpoint-{step}/         # HF Trainer checkpoints (kept by CHECKPOINT_RETENTION=2)
-      epoch_log.json, progress.json, first_perfect_log.json
-```
-
-### Provenance
-
-- **Parent pattern:** Test 13 (Phase A/B/C1/C2 structure, `assign_keys`,
-  `load_qa_pool` with PerLTQA Q+A string-dedup).
-- **Implementation reference:** Test 14 (`archive/experiments/test14.py`) —
-  pause/resume primitives (`_check_pause`, `paused_requested`,
-  `_exit_if_paused_mid_phase`), `find_latest_run_dir`,
-  `load_or_write_run_config`, `marker_exists`,
-  `_find_latest_checkpoint`, training-control.sh
-  registry pattern.
-- **Early-stop primitive:** `paramem.training.early_stop.RecallEarlyStopCallback`
-  with `ANALYSIS_POLICY`. Same callback that production
-  `BackgroundTrainer` uses behind `consolidation.recall_early_stopping`.
-- **Retention metric:** `retention_unchanged_80.rate` — recall on the 80
-  keys whose answers were not swapped, evaluated per epoch via the
-  callback's `retention_keyed=` parameter; headline value sampled at
-  each phase's stop epoch.
-- **Scheduler:** apples-to-apples linear with `warmup_steps=10` and
-  `lr_decay_steps = n_keys × num_epochs / 2`, validated by Test 14's
-  multi-seed cells (2026-05-04).
-- **Adapter set:** two adapters across the seed loop — `episodic`
-  carries Phase A → B; `journal` is created fresh at C1 and continues
-  into C2.
+The test integrates with `scripts/dev/training-control.sh`
+(`tpause`/`tresume 15`/`tstatus`), pausing cleanly between seeds, between
+phases within a seed, and mid-phase at epoch boundaries. Resume restarts
+from per-phase completion markers plus the latest training checkpoint, so
+a crash never reruns completed work and per-seed accumulators are restored
+rather than reset. Each run writes to a unique timestamped, model-specific
+output directory, with the full adapter state, training curves, and raw
+model output preserved at every phase.
 
 ---
 
@@ -2053,14 +1933,15 @@ Every `depth_past_floor` arm runs cells 1–6. Cell 7 runs for the
 
 ### Metrics
 
-Two overwrite-integrity probes run after each repair cell (`_safe_probe`,
-`exact_match` requires all three triple fields):
+Two overwrite-integrity probes run after each repair cell (exact match
+requires all three triple fields):
 
 - **`overwrite_recall_after_repair`** (`over_ar`) — probes the *new* swap triple; < 0.95 ⇒ repair leaked into the swap.
 - **`original_answer_resurfaced_rate`** (`orig_rsr`) — probes the *original* triple; > 0.0 ⇒ active reversion.
 
-Per-arm metadata in `base_{D}_done.json`: `encoding_floor_epoch`,
-`depth_past_floor`, `total_epochs_trained`, `lr_decay_steps`.
+Per-arm, the encoding-floor epoch, the depth trained past that floor, the
+total epochs trained, and the resulting LR-decay step count are all
+recorded for diagnostics.
 
 **Cell count:** `5 seeds × (3 depths × 6 repair-grid cells + 1 spotcheck) = 95 cells`.
 Output tree: `outputs/test16_repair_sweep/mistral/<ts>/seed{N}/base_{D}/`, `corrupted_{D}/`, `repair_{D}_*/`.
@@ -2298,8 +2179,9 @@ this validation pass — see Remaining gap.
 
 ### N=3: the `<16` bucket alone fully binds
 
-The `min_tier_key_floor` retirement makes N < 16 a live production condition
-that every arm above left unmeasured. A dedicated pair of arms closes this
+Small folds are no longer parked behind a minimum key count — every tier
+with keys now trains its own adapter, which makes N < 16 a live production
+condition that every arm above left unmeasured. A dedicated pair of arms closes this
 cell: 3 real keys (`proc501`-`proc503`, remapped from the production 21-key
 fixture, zero overlap with the donor's own key population) at the `<16`
 bucket's derived budget (`paramem.utils.config.budget_for(3)`: 80 epochs,
@@ -2322,8 +2204,8 @@ norm (cold-init proof — Hard Assertion #3).
 
 At N=3, the derived `<16`-bucket budget alone fully binds — donor seeding is
 compatible but not required at tiny N. The previously-unmeasured cell that
-the `min_tier_key_floor` retirement makes load-bearing is now anchored at 4
-seeds for both init modes.
+training every tier with keys (rather than parking small folds) makes
+load-bearing is now anchored at 4 seeds for both init modes.
 
 ### Protocol notes
 
@@ -2362,69 +2244,51 @@ them as well.
 
 ### What these results validate
 
-- **Per-fold training-budget bucket for N in [16, 127) -> 50 epochs**
-  (`paramem.utils.config._BUDGET_TABLE`; at the time of this validation the
-  bucket was gated off by default via a `budget_derivation_enabled` flag and
-  documented in-code as "extrapolated, not anchored" for this bucket). The
-  cold-50ep arm (N=21, inside this bucket) reaching 1.000 on 4/4 seeds is
-  fold-scale evidence anchoring this bucket's epoch count, alongside the
-  existing 128-key-floor bucket's own anchoring. With this validation arm
-  passed, `budget_derivation_enabled` (and the paired `donor_seeding_enabled`)
-  were retired 2026-07-26: derived per-fold budgets and donor seeding are now
-  the unconditional standard mechanism, no config flag.
+- **Per-fold training-budget bucket for N in [16, 127) -> 50 epochs.** At the
+  time of this validation the bucket was gated off by default and documented
+  as "extrapolated, not anchored." The cold-50ep arm (N=21, inside this
+  bucket) reaching 1.000 on 4/4 seeds is fold-scale evidence anchoring this
+  bucket's epoch count, alongside the existing 128-key-floor bucket's own
+  anchoring. With this validation arm passed, the derivation was made
+  unconditional 2026-07-26: per-N training budgets are now derived
+  unconditionally in production, and donor seeding is likewise unconditional
+  — no config flag gates either.
 - **Donor seeding as a rescue at the 30-epoch (330-step) bucket boundary**,
   including the fresh-key regime (zero overlap with the donor's own
   memorized population) — the mechanism `paramem.training.donor` /
   `ConsolidationLoop._maybe_seed_from_donor` implements.
 
-### Donor build cost at the 7-module (attention+MLP) procedural topology
+### Donor build cost at the procedural topology
 
 This is a **cost/feasibility measurement, not a recall arm** — it measures
-what the inline donor build costs (wall time, VRAM) at the procedural
-tier's attention+MLP topology, plus a strict-copy seed-verification check
-at the matched topology. No recall numbers exist for this cell.
+what the inline donor build costs (wall time, VRAM) when applied to the
+procedural tier's full attention+MLP topology (all seven attention/MLP
+projections, rank 8), plus a strict-copy seed-verification check at the
+matched topology. No recall numbers exist for this cell.
 
-**Run:** `outputs/test20_smallN_cold_gate/donor_build_smoke_procedural/mistral/20260727_183637/`
-(`build_results.json` + `seed_results.json`).
+**Run:** `outputs/test20_smallN_cold_gate/donor_build_smoke_procedural/mistral/20260727_183637/`.
 
 The build trained the standard 147-entry donor population (30 epochs,
 gradient-accumulation 2, matching the anchored `>=128` bucket) through the
-procedural topology's 7 target modules (`q_proj`, `v_proj`, `k_proj`,
-`o_proj`, `gate_proj`, `up_proj`, `down_proj`, rank 8 / alpha 16, recipe
-LR=1e-4, dropout=0.0) on Mistral 7B NF4:
-
-- **2220 realized optimizer steps** (topology-independent step count, per
-  `paramem/training/donor.py`'s module docstring).
-- **wall_train_seconds = 2727.16** (≈45.5 min), **mean_seconds_per_step =
-  1.2285**.
-- **VRAM:** free 6999 MiB before load -> 2885 MiB after load (load delta
-  4114 MiB) -> 2151 MiB after build; **peak_allocated_build_mib = 4544.68**,
-  **peak_reserved_build_mib = 4802.0**.
+procedural topology's seven target modules at rank 8 / alpha 16 (LR=1e-4,
+dropout=0.0) on Mistral 7B NF4: 2220 realized optimizer steps (the same
+topology-independent step count as the attention-only build), wall time
+≈45.5 minutes (2727 s), averaging ≈1.23 s/step. Reserved VRAM peaked at
+≈4.7 GiB during the build, comfortably within the 7 GiB ceiling.
 
 Compared against the attention-only anchor already documented in
 `configs/server.yaml.example` (~1.0s/step, ~37 min total, also at 2220
-steps): the 7-module topology costs **~1.2285s/step, a +23% per-step
-increase** (`1.2285 / 1.0 - 1 ≈ 0.2285`) for **3.08x the trainable LoRA
-parameters** (rank 8 over 7 target modules vs. 4, computed from Mistral
-7B's module shapes: `r*(in+out)` summed per module gives 655,440 params at
-7 modules vs. 213,072 at 4 modules attention-only). A 3.08x parameter
-increase producing only a 1.23x per-step wall-time increase confirms the
-frozen base model's forward/backward dominates per-step cost, not the
-LoRA update itself — consistent with the prediction this note replaces in
-`paramem/training/donor.py` and `configs/server.yaml.example`.
+steps), the seven-module topology costs about 23% more per step, for
+roughly three times the trainable LoRA parameters — confirming the frozen
+base model's forward/backward pass dominates per-step cost, not the LoRA
+update itself.
 
-**VRAM feasibility:** the build's transient cost above the already-resident
-base model is `peak_reserved_build_mib (4802.0) - load_delta (4114) ≈ 688
-MiB` (≈690 MiB rounded) — within the live server's measured free headroom
-at the time a topology's first measured-cold fold triggers an inline
-build.
-
-**Strict-copy seed verification** (same run, `seed_results.json`): copying
-the built donor's full LoRA-B weights into a cold procedural adapter
-(matched topology) completed in **0.0093 s**, with LoRA-B Frobenius norm
-**0.0 before** the copy and **96.5032 after** — exactly equal to the
-donor's own `donor_lora_b_norm` (96.50319801270962), confirming the copy is
-a bit-identical seed, not a partial or corrupted one.
+**Strict-copy seed verification** (same run): copying the built donor's
+full LoRA-B weights into a cold procedural adapter (matched topology)
+completed in **0.0093 s**, with LoRA-B Frobenius norm **0.0 before** the
+copy and **96.5032 after** — exactly matching the donor's own trained
+norm, confirming the copy is a bit-identical seed, not a partial or
+corrupted one.
 
 ### Remaining gap
 
@@ -3260,7 +3124,7 @@ Outlines never worked in production — 0% success across all Tests 1-8 due to a
 
 ### Current privacy-aware pipeline
 
-Extract → anonymize → leak-guard + repair → cloud enrich (with `new_entity_bindings`) → state-machine deanonymize (residual-placeholder fact-drop) → plausibility filter. Each stage has one job and a clear failure mode. Prompts externalized to `configs/prompts/`. The May 2026 redesign replaced the prior LLM-based deanonymization step with deterministic state-machine substitution driven by cloud-declared bindings — eliminated the session-2 VRAM-crash class and the false-binding class that arose from token-diffing transcripts. The transcript-grounding gate was removed shortly after (post-hoc token-attestation against the original transcript was structurally incompatible with cloud's licensed enrichment surface; CV probe data showed it dropped reasonable enrichments at high recall cost without catching genuine fabrications). See "Extraction Probe Sweep (2026-04-17)" below for validated results at scale (recorded under the prior architecture; the current pipeline is structurally simpler but emits the same fact shape).
+Extract → anonymize → leak-guard + repair → cloud enrich → deanonymize → plausibility filter. Each stage has one job and a clear failure mode. Prompts externalized to `configs/prompts/`. Transcripts are anonymized locally before any cloud call; extraction and enrichment run on the anonymized text, and the placeholders are rebound to real names locally afterward, driven by the entity bindings the cloud call declares. The May 2026 redesign replaced the prior LLM-based deanonymization step with this deterministic, cloud-declared-binding substitution — eliminating the session-2 VRAM-crash class and the false-binding class that arose from token-diffing transcripts. The transcript-grounding gate was removed shortly after: probe data showed it dropped facts that were valid enrichments at high recall cost, without catching genuine fabrications, so the plausibility filter remains as the residual safety net. See "Extraction Probe Sweep (2026-04-17)" below for validated results at scale (recorded under the prior architecture; the current pipeline is structurally simpler but emits the same fact shape).
 
 ---
 
@@ -3520,24 +3384,17 @@ Same speaker, pyannote 512-dim embeddings:
 
 ### Cooperative Background Training (live)
 
-Consolidation is driven by a systemd user timer (`paramem-consolidate.timer`,
-`Persistent=true`) whose period derives from `consolidation.refresh_cadence`
-(default `12h`). The `BackgroundTrainer` releases the GPU lock per step so
-inference interleaves with training, and saves `staging_resume.json` +
-`bg_checkpoint_epoch/` at each epoch boundary — a crash or `SIGUSR1` mid-cycle
-resumes at the last completed epoch instead of restarting from zero
-(SHA-256 fingerprint gate on `keyed_pairs` + training config).
-
-Two adapter tiers share the GPU:
-
-- **Main adapters** (`episodic` / `semantic` / `procedural`) — rebuilt at the
-  full-consolidation boundary.
-- **Interim adapters** (`episodic_interim_<stamp>`) — minted at each
-  `refresh_cadence` tick, activity-gated, capped by `max_interim_count`
-  (default 7, VRAM-gated via pre-load validator). At the full boundary,
-  the full consolidation fold (`ConsolidationLoop.consolidate`) rebuilds the
-  mains from `keyed_pairs ∪ all_interim_keys`, sanity-checks recall, and
-  purges interim state atomically.
+Consolidation runs unattended on a systemd user timer whose period is
+derived from `consolidation.refresh_cadence`. Interim cycles train into
+their own adapter slots on that cadence; inference keeps interleaving with
+training rather than blocking on it. On the full-fold cadence
+(`max_interim_count`), the interim state is absorbed into the main
+episodic/semantic/procedural adapters, with each rebuilt tier's recall
+sanity-checked before it goes live. Training is crash-resumable — a crash
+or mid-cycle interruption resumes from the last completed checkpoint
+rather than restarting the fold from zero. A training failure leaves the
+previous adapters live rather than promoting a broken result. See
+architecture.md for the underlying mechanism.
 
 Operational invariant: every consolidation still retrains the full key set
 via replay. True incremental learning without replay remains unsolved
@@ -3617,6 +3474,11 @@ weights, where correctness matters and latency does not.
 
 Cache-off latency scales with the number of keys probed per query (here ~239 across 3
 tiers via `WeightMemorySource`); larger key sets widen the gap further.
+
+This measurement was taken against a store whose cache was cold at the start of the run,
+with `preload_cache: false` set from boot. It is the cost `false` now pays on **every**
+turn, since that mode never serves a cache hit — there is no fallback behind it to fall
+back on.
 
 ### Caveat: stub-masking bug (pre-fix readings are invalid)
 
@@ -3775,12 +3637,10 @@ Claude Sonnet extracts triples via API; Mistral generates QA from those triples.
   `RecallEarlyStopCallback` with the same `ANALYSIS_POLICY` for
   production-realistic retention measurement (per-seed step counts may
   differ; the headline retention is sampled at each seed's stop epoch).
-- **Shipped (production):** `ConsolidationLoop._maybe_make_recall_callback`
-  constructs the callback at every production-reachable `train_adapter`
-  call site (4 in `paramem/training/consolidation.py`: lines 1529, 1770,
-  2588, 3429; 1 in `paramem/server/active_store_migration.py:420`).
-  Gated by `consolidation.recall_early_stopping` in `server.yaml` —
-  default OFF in `configs/server.yaml.example`. Five YAML knobs:
+- **Shipped (production):** the recall-based early-stop callback is wired
+  at every production-reachable training call site. Gated by
+  `consolidation.recall_early_stopping` in `server.yaml` — default OFF in
+  `configs/server.yaml.example`. Five YAML knobs:
   `recall_early_stopping`, `recall_window` (default 2 — stop one probe past
   first_perfect), `recall_probe_every_n_epochs`, `recall_signal_from_epoch`,
   `recall_probe_batch_size` (probe-time generate batch width — default 16,
@@ -3788,11 +3648,7 @@ Claude Sonnet extracts triples via API; Mistral generates QA from those triples.
   and ~346 MiB peak delta on RTX 5070 8 GB; multi-cycle retention parity
   confirmed in production conditions). Validated by a live smoke on Mistral 7B
   with N=5 keys (stop fired at epoch 16, recall 5/5, gradient_checkpointing
-  state preserved, 4 min wall). A structural AST test
-  (`tests/test_consolidation_recall_early_stop.py:Class F`) scans both
-  production modules at PR-CI and asserts the helper appears in the
-  same `FunctionDef` body as every `train_adapter` call — the gate that
-  prevents architectural-mismatch regressions of the v1 class.
+  state preserved, 4 min wall).
 
 ---
 
@@ -3852,7 +3708,7 @@ with the adapter file + base model can extract facts through differential analys
 Open research directions include training format hardening, selective access control,
 and multi-adapter compartmentalization.
 
-**Accepted result (2026-07-13):** Wiring the anonymize → cloud → de-anonymize contract onto the graph-tier enrichment pass (`request_graph_enrichment`) closes the previously-unprotected second cloud call site, but under the production `{"person"}` cloud-egress scope it costs person-level `same_as` coreference — two surface forms of the same person (e.g. an honorific variant) collapse to opaque, unrelated tokens before the cloud model ever sees the text, so cross-session person-identity merging via that path no longer fires. Organization/place/thing `same_as` is unaffected. Shipped as-is; no local candidate generator was built to recover the lost signal. The cumulative fold graph carries no reliable entity types of its own, so this pass derives each real name's type from the SAME local-model anonymizer session-tier extraction uses, rather than from graph node attributes — coverage is therefore best-effort and depends on the local model's classification accuracy, matching the session tier's existing residual: a person the local model misclassifies as an out-of-scope type — or simply omits from its mapping, in whole or in part (the empty-mapping guard below catches only the total case, never a partial one) — is sent to the cloud verbatim, undetectable and unrepairable downstream. Owner-accepted; not engineered around (no independent cross-check model, no totality check). The local anonymizer's mapping keys are independent surface strings, not the fold graph's own canonical node text, so a re-cased or separator-varied key from the local model can fail to substitute even when the model correctly identified the name. `enrich_graph` (`paramem.training.graph_enrich`) reconciles the local anonymizer's mapping keys onto the chunk's actual node-key text via `canonical()` before building `chunk_entities`, dropping (and counting, `mapping_rekey_dropped`) any entry that names nothing in its chunk. `_substitute_whole_words` itself stays exact-match everywhere, including at the graph tier — identity reconciliation happens once, at this one call site, not inside the shared substitution primitive. Separately, a local mapping that comes back completely empty — or whose every entry this reconciliation drops — for a chunk with real (non-speaker) content is treated as a detected classification failure (fail-closed skip, counted in `privacy_skipped_chunks`), rather than silently sent unmasked.
+**Accepted result (2026-07-13):** Wiring the anonymize → cloud → de-anonymize contract onto the graph-tier enrichment pass closes the previously-unprotected second cloud call site, but under the production `{"person"}` cloud-egress scope it costs person-level `same_as` coreference — two surface forms of the same person (e.g. an honorific variant) collapse to opaque, unrelated tokens before the cloud model ever sees the text, so cross-session person-identity merging via that path no longer fires. Organization/place/thing `same_as` is unaffected. Shipped as-is; no local candidate generator was built to recover the lost signal. The cumulative fold graph carries no reliable entity types of its own, so this pass derives each real name's type from the same local-model anonymizer the session tier's extraction uses, rather than from graph node attributes — coverage is therefore best-effort and depends on the local model's classification accuracy, matching the session tier's existing residual: a person the local model misclassifies as an out-of-scope type — or simply omits from its mapping, in whole or in part — is sent to the cloud verbatim, undetectable and unrepairable downstream. Owner-accepted; not engineered around (no independent cross-check model, no totality check). The local anonymizer's mapping keys are independent surface strings, not the fold graph's own node text, so a re-cased or separator-varied key from the local model can fail to substitute even when the model correctly identified the name; the graph-tier enrichment pass reconciles those mapping keys against each chunk's actual node text before substitution runs, dropping and counting any entry that names nothing in its chunk — this reconciliation is scoped to the graph tier and does not change how substitution behaves elsewhere. Separately, a local mapping that comes back completely empty — or whose every entry this reconciliation drops — for a chunk with real (non-speaker) content is treated as a detected classification failure and fails closed: the chunk is skipped rather than sent unmasked.
 
 ---
 

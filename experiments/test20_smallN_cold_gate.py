@@ -503,6 +503,7 @@ from experiments.utils.production import (  # noqa: E402
     build_manifest_for,
     donor_slot_valid,
     lora_shape_fields,
+    read_manifest,
     triples_hash,
     wait_for_cooldown,
 )
@@ -1055,19 +1056,26 @@ def _build_donor_checkpoint(
         exactly as it already discards any previous seed's adapters.
         ``donor_summary`` carries the donor's own final recall
         (``exact_count``/``total``/``rate``/``mean_confidence``/``per_key``
-        with verbatim ``raw_output``), the realized weights SHA-256, the
-        realized optimizer-step count (asserted equal to the derived
-        expected count — mirrors the arm-side Hard Assertion #1), and the
-        pre/post LoRA-B Frobenius norms (cold-init proof for the build
-        itself). ``slot / DONOR_META_FILENAME`` (``"donor_meta.json"``) is
-        also written — ``{seed, n_entries, epochs,
-        gradient_accumulation_steps, realized_optimizer_steps,
-        weights_sha256, wall_train_seconds}`` — the single source of truth
-        ``_resolve_donor_source``/``_read_donor_meta`` read back later
-        (including from a DIFFERENT run's ``--donor-checkpoint`` reuse,
-        since it travels with the slot). ``_read_donor_meta`` tolerates the
-        absence of ``gradient_accumulation_steps``/``realized_optimizer_steps``/
-        ``wall_train_seconds`` on slots built before those fields were added.
+        with verbatim ``raw_output``), the realized weights SHA-256 (read
+        back from the manifest's own ``payload.sha256`` — see below, never
+        recomputed), the realized optimizer-step count (asserted equal to
+        the derived expected count — mirrors the arm-side Hard Assertion
+        #1), and the pre/post LoRA-B Frobenius norms (cold-init proof for
+        the build itself). ``slot / DONOR_META_FILENAME``
+        (``"donor_meta.json"``) is also written — ``{seed, recipe,
+        n_requested, triples, triples_hash}``, the production donor-identity
+        schema, with NO ``weights_sha256`` field: the manifest's own
+        ``payload.sha256`` (stamped by ``seal_slot`` from the plaintext
+        bytes it just wrote) is the one recorded weights digest, read back
+        directly by :func:`_read_donor_meta` and
+        ``paramem.training.donor.donor_slot_valid``, never duplicated into a
+        second field this rotate-daily would invalidate. This run's OWN
+        build measurements (``n_entries``/``epochs``/
+        ``gradient_accumulation_steps``/``realized_optimizer_steps``/
+        ``wall_train_seconds``) go into the separate
+        ``DONOR_BUILD_PROVENANCE_FILENAME`` sidecar instead — provenance
+        about how THIS run trained it, never donor identity, so the two
+        schemas cannot collide on one name.
     """
     entries = donor_entries(DONOR_DEFAULT_SEED, DONOR_MIN_ENTRIES)
     registry = build_registry(entries)
@@ -1177,18 +1185,25 @@ def _build_donor_checkpoint(
         adapter_root=checkpoint_root,
     )
     slot = atomic_save_adapter(model, checkpoint_root, DONOR_BUILD_ADAPTER_NAME, manifest=manifest)
-    weights_sha256 = hashlib.sha256((slot / "adapter_model.safetensors").read_bytes()).hexdigest()
+    # atomic_save_adapter's seal_slot already stamped the manifest's own
+    # payload.sha256 from the plaintext bytes it just wrote -- that is the
+    # ONE recorded weights digest (retired: a second, ciphertext-regime
+    # digest hand-computed here and duplicated into donor_meta.json, which
+    # `rotate-daily` would invalidate on every rotation). Read it back
+    # rather than recompute it, mirroring donor_slot_valid's own read.
+    weights_sha256 = read_manifest(slot).payload.sha256
 
     # Donor identity, in the production schema -- what this checkpoint IS.
     # seed + n_requested regenerate the exact entry list, so nothing about the
-    # donor's content needs a second recording.
+    # donor's content needs a second recording. weights_sha256 is NOT part of
+    # this schema -- the manifest's own payload.sha256 (read above) is the
+    # one recorded digest; donor_slot_valid verifies against it directly.
     donor_meta = {
         "seed": DONOR_DEFAULT_SEED,
         "recipe": DONOR_RECIPE_ID,
         "n_requested": DONOR_MIN_ENTRIES,
         "triples": entries,
         "triples_hash": triples_hash(entries),
-        "weights_sha256": weights_sha256,
     }
     (slot / DONOR_META_FILENAME).write_text(json.dumps(donor_meta, indent=2))
 
@@ -1269,7 +1284,11 @@ def _read_donor_meta(slot: Path, base_model_id: str, lora_shape: dict) -> dict:
 
     Returns:
         ``seed`` and ``n_entries`` (the donor's identity, from the production
-        meta -- ``n_entries`` is the length of the recorded triple set) plus
+        meta -- ``n_entries`` is the length of the recorded triple set),
+        ``weights_sha256`` (read back from the slot's own manifest --
+        ``read_manifest(slot).payload.sha256``, the SAME plaintext digest
+        ``donor_slot_valid`` above just verified against, never a second
+        field recorded in ``donor_meta.json``) plus
         ``epochs``/``gradient_accumulation_steps``/``realized_optimizer_steps``/
         ``wall_train_seconds`` when the slot carries this script's build
         provenance. A production-built donor carries none of the latter; they
@@ -1288,6 +1307,7 @@ def _read_donor_meta(slot: Path, base_model_id: str, lora_shape: dict) -> dict:
         )
     with open(slot / DONOR_META_FILENAME) as f:
         meta = json.load(f)
+    weights_sha256 = read_manifest(slot).payload.sha256
 
     provenance_path = slot / DONOR_BUILD_PROVENANCE_FILENAME
     provenance: dict = {}
@@ -1306,7 +1326,7 @@ def _read_donor_meta(slot: Path, base_model_id: str, lora_shape: dict) -> dict:
     return {
         "seed": meta["seed"],
         "n_entries": len(meta["triples"]),
-        "weights_sha256": meta["weights_sha256"],
+        "weights_sha256": weights_sha256,
         "epochs": provenance.get("epochs"),
         "gradient_accumulation_steps": provenance.get("gradient_accumulation_steps"),
         "realized_optimizer_steps": provenance.get("realized_optimizer_steps"),
@@ -1386,7 +1406,11 @@ def _build_or_reuse_own_donor_checkpoint(
         "seed": donor_summary["seed"],
         "n_entries": donor_summary["n_entries"],
         "epochs": donor_summary["epochs"],
-        "weights_sha256": donor_summary["weights_sha256"],
+        # Read back from the manifest directly (mirrors donor_slot_valid's
+        # own read) rather than trust the propagated donor_summary value --
+        # this function's contract is "what this run's own slot verifies
+        # to", and the manifest is that slot's single authority.
+        "weights_sha256": read_manifest(slot).payload.sha256,
     }
     marker = {"slot": str(slot), "timestamp": int(time.time())}
     with open(marker_path, "w") as f:

@@ -14,10 +14,14 @@ writes ``epoch_log.json`` incrementally, and fires
 ``control.should_training_stop = True`` when the aggregate-recall stop
 condition is met.
 
-``pause_file`` and ``first_perfect_log_path`` accept ``None`` (production
-default; production has its own pause flow + does not need per-key logs).
-``progress_path`` already accepts ``None``.  All three are guarded at every
-``.exists()`` / write site.
+``pause_file`` and ``first_perfect_log_path`` accept ``None`` — production
+(``ConsolidationLoop._maybe_make_recall_callback``) always passes
+``pause_file=None`` (no per-key log either); a training abort in production
+instead arrives through ``BackgroundTrainer.abort_for_inference`` (an
+inference request needing the GPU) or server shutdown, both external to
+this callback and neither driven by ``pause_file``.  ``progress_path``
+already accepts ``None``.  All three are guarded at every ``.exists()`` /
+write site.
 
 Stop-trigger semantics
 -----------------------

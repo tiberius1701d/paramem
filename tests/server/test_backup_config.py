@@ -170,12 +170,6 @@ class TestSecurityScheduleConfig:
 
 
 class TestSecurityArtifactsConfig:
-    def test_security_artifacts_default(self, tmp_path):
-        """Absent artifacts → ['config', 'graph', 'registry']."""
-        yaml_file = _write_yaml(tmp_path, "model: mistral\n")
-        config = load_server_config(yaml_file)
-        assert config.security.backups.artifacts == ["config", "graph", "registry"]
-
     def test_security_artifacts_subset(self, tmp_path):
         """artifacts: [config] → ['config']."""
         yaml_file = _write_yaml(
@@ -202,6 +196,22 @@ class TestSecurityArtifactsConfig:
             """,
         )
         with pytest.raises(ValueError, match="foo"):
+            load_server_config(yaml_file)
+
+    def test_security_artifacts_retired_registry_names_the_replacement(self, tmp_path):
+        """artifacts: [registry] -- the previous default's now-retired kind --
+        raises with targeted replacement guidance naming 'snapshot_bundle',
+        not the generic 'invalid entry' message."""
+        yaml_file = _write_yaml(
+            tmp_path,
+            """\
+            model: mistral
+            security:
+              backups:
+                artifacts: [registry]
+            """,
+        )
+        with pytest.raises(ValueError, match="snapshot_bundle"):
             load_server_config(yaml_file)
 
 

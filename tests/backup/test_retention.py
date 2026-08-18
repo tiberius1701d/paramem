@@ -21,6 +21,7 @@ from paramem.server.config import (
     RetentionTierConfig,
     ServerBackupsConfig,
 )
+from tests.backup._slot_fixtures import _ts, _write_slot
 
 # ---------------------------------------------------------------------------
 # Fixtures / helpers
@@ -43,7 +44,7 @@ def _make_config(
     return ServerBackupsConfig(
         max_total_disk_gb=max_total_disk_gb,
         schedule="daily 04:00",
-        artifacts=["config", "graph", "registry"],
+        artifacts=["snapshot_bundle"],
         retention=RetentionConfig(
             daily=RetentionTierConfig(keep=daily_keep, max_disk_gb=daily_max_disk_gb),
             weekly=RetentionTierConfig(keep=weekly_keep),
@@ -55,41 +56,6 @@ def _make_config(
             manual=RetentionTierConfig(keep=manual_keep, max_disk_gb=manual_max_disk_gb),
         ),
     )
-
-
-def _write_slot(backups_root: Path, kind: str, ts: str, tier: str, size_bytes: int = 1024) -> Path:
-    """Create a minimal backup slot directory with a sidecar and data file.
-
-    ``ts`` must be in ``YYYYMMDD-HHMMSSff`` format (the slot directory name).
-    Use ``_ts(i)`` to generate sequential test timestamps.
-    """
-    slot_dir = backups_root / kind / ts
-    slot_dir.mkdir(parents=True, exist_ok=True)
-    # Write meta.json
-    meta = {
-        "schema_version": 1,
-        "kind": kind,
-        "timestamp": ts,
-        "content_sha256": "abc",
-        "size_bytes": size_bytes,
-        "encrypted": False,
-        "tier": tier,
-        "label": None,
-    }
-    (slot_dir / f"{kind}-{ts}.meta.json").write_text(json.dumps(meta), encoding="utf-8")
-    # Write data file with the specified size.
-    (slot_dir / f"{kind}-{ts}.bin").write_bytes(b"x" * size_bytes)
-    return slot_dir
-
-
-def _ts(i: int) -> str:
-    """Generate a sequential YYYYMMDD-HHMMSSff timestamp for test slot dirs.
-
-    i=0 → oldest (2026-04-01), i=1 → one day later, etc.
-    """
-    base = datetime(2026, 4, 1, 4, 0, 0, tzinfo=timezone.utc)
-    dt = base + timedelta(days=i)
-    return dt.strftime("%Y%m%d-%H%M%S") + "00"
 
 
 def _write_trial_json(state_dir: Path, backup_paths: dict[str, str]) -> None:
@@ -126,7 +92,7 @@ class TestComputeDiskUsage:
         config = _make_config()
         _write_slot(tmp_path, "config", _ts(0), "daily", 100)
         _write_slot(tmp_path, "graph", _ts(1), "weekly", 200)
-        _write_slot(tmp_path, "registry", _ts(2), "manual", 300)
+        _write_slot(tmp_path, "resume", _ts(2), "manual", 300)
         usage = compute_disk_usage(tmp_path, config, bypass_cache=True)
         # Sizes include the meta.json file; assert tier keys present.
         assert "daily" in usage.by_tier
@@ -229,20 +195,20 @@ class TestCollectImmunePaths:
         root = tmp_path_factory.mktemp("backups")
         slot_config = _write_slot(root, "config", _ts(0), "pre_migration")
         slot_graph = _write_slot(root, "graph", _ts(1), "pre_migration")
-        slot_registry = _write_slot(root, "registry", _ts(2), "pre_migration")
+        slot_resume = _write_slot(root, "resume", _ts(2), "pre_migration")
         state_dir = tmp_path
         _write_trial_json(
             state_dir,
             {
                 "config": str(slot_config),
                 "graph": str(slot_graph),
-                "registry": str(slot_registry),
+                "resume": str(slot_resume),
             },
         )
         immune = collect_immune_paths(state_dir)
         assert slot_config.resolve() in immune
         assert slot_graph.resolve() in immune
-        assert slot_registry.resolve() in immune
+        assert slot_resume.resolve() in immune
 
     def test_collect_immune_paths_corrupt_trial(self, tmp_path):
         """Bad JSON in trial.json → empty set + WARN logged."""
@@ -523,8 +489,12 @@ class TestEnumeratedRecordTierInvariant:
         Pins the dependency that the dead legacy-tier branch in prune() relied
         on: read_meta requires 'tier' as a mandatory field (MetaSchemaError on
         absence), so enumerate_backups never emits a BackupRecord with an empty
-        tier.  This test creates one valid slot and one tier-less sidecar and
-        asserts that only the valid slot is returned, with a non-empty tier.
+        tier FOR A REGULAR (non-bundle) ARTIFACT.  This test creates one valid
+        slot and one tier-less sidecar and asserts that only the valid slot is
+        returned, with a non-empty tier.  An INCOMPATIBLE bundle is the one
+        deliberate exception to this invariant — see
+        ``TestPruneIncompatibleBundle`` below, where an unvalidated raw
+        manifest missing 'tier' legitimately produces an empty-tier record.
         """
         root = tmp_path / "backups"
 
@@ -637,3 +607,102 @@ class TestPruneRule4PreBaseSwap:
         )
         assert result.deleted == []
         assert len(result.preserved_migration_window) == 1
+
+
+# ---------------------------------------------------------------------------
+# prune — an incompatible bundle ages out under the same 5-rule policy
+# ---------------------------------------------------------------------------
+
+
+def _write_bundle_slot(
+    backups_root: Path, ts: str, *, tier: str | None = "daily", schema_version: int = 999
+) -> Path:
+    """Write a minimal ``snapshot_bundle`` slot whose ``bundle_schema_version``
+    does not match this build's — ``enumerate_backups`` enumerates it as
+    ``incompatible`` rather than hiding it (restore still refuses it).
+
+    ``tier=None`` omits the ``tier`` key entirely from the raw manifest —
+    the shape ``_read_incompatible_bundle_record`` reads via
+    ``raw.get("tier", "")`` when the version mismatch means the manifest
+    cannot be trusted to validate against the current schema.
+    """
+    slot = backups_root / "snapshot_bundle" / ts
+    slot.mkdir(parents=True, exist_ok=True)
+    manifest: dict = {
+        "bundle_schema_version": schema_version,
+        "created_at": "2026-05-20T20:55:00Z",
+        "label": None,
+        "base_model": {},
+        "files": [],
+        "adapters": {},
+        "excluded": [],
+    }
+    if tier is not None:
+        manifest["tier"] = tier
+    (slot / "bundle.meta.json").write_text(json.dumps(manifest), encoding="utf-8")
+    return slot
+
+
+class TestPruneIncompatibleBundle:
+    """An incompatible bundle (unrestorable by this build, but still
+    enumerated — see ``paramem.backup.enumerate``) is not given any special
+    immunity by ``prune()``: it competes for its tier's budget under the
+    identical 5-rule policy as any other slot, and ages out exactly the same
+    way once it is the oldest entry past the tier's keep count.  This is
+    deliberate design, not an oversight — the operator-visible signal for an
+    incompatible bundle is enumeration (``/backup/list`` marks it
+    ``incompatible``), not retention exemption; a stale unrestorable bundle
+    consuming budget forever would be worse than losing it to the same
+    rotation every other slot is subject to.
+    """
+
+    def test_an_incompatible_bundle_ages_out_like_any_other_slot(self, tmp_path) -> None:
+        config = _make_config(daily_keep=1)
+        root = tmp_path / "backups"
+        state_dir = tmp_path / "state"
+        state_dir.mkdir()
+        now = datetime(2026, 4, 22, 4, 0, 0, tzinfo=timezone.utc)
+
+        older_incompatible = _write_bundle_slot(root, _ts(0), tier="daily")
+        newer_compatible = _write_bundle_slot(
+            root, _ts(1), tier="daily", schema_version=1
+        )  # any schema — this slot's own version is irrelevant to pruning
+
+        result = prune(backups_root=root, state_dir=state_dir, config=config, now=now)
+
+        assert not older_incompatible.exists(), (
+            "an incompatible bundle must age out under the tier's own keep "
+            "count exactly like a compatible one — no retention exemption"
+        )
+        assert newer_compatible.exists()
+        assert result.deleted == [older_incompatible]
+
+    def test_a_bundle_with_no_tier_at_all_lands_in_the_daily_budget(self, tmp_path) -> None:
+        """A record whose raw (unvalidated, incompatible) manifest omits
+        'tier' entirely lands in the empty-string tier bucket
+        (``paramem.backup.retention.prune``'s ``by_tier.setdefault(record.
+        meta.tier, [])``), which resolves to the ``daily`` retention config
+        (``_tier_config``'s ``getattr(retention, tier_name, None) or
+        getattr(retention, "daily")`` fallback) — accepted behavior, not a
+        crash and not silent immunity: it is governed by whatever budget
+        the daily tier carries."""
+        config = _make_config(daily_keep=0)
+        root = tmp_path / "backups"
+        state_dir = tmp_path / "state"
+        state_dir.mkdir()
+        now = datetime(2026, 4, 22, 4, 0, 0, tzinfo=timezone.utc)
+
+        tierless = _write_bundle_slot(root, _ts(0), tier=None)
+
+        # Confirm it really is enumerated with an empty tier before pruning.
+        records = enumerate_backups(root, kind=None)
+        assert len(records) == 1
+        assert records[0].meta.tier == ""
+        assert records[0].incompatible is True
+
+        result = prune(backups_root=root, state_dir=state_dir, config=config, now=now)
+
+        # daily_keep=0 removes ALL non-immune slots in that tier -- the ""
+        # bucket is governed by the daily budget exactly as documented.
+        assert not tierless.exists()
+        assert result.deleted == [tierless]

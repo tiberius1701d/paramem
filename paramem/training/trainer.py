@@ -44,13 +44,10 @@ class TrainingHooks:
 
     The callable fields are converted internally into a single HF
     ``TrainerCallback`` (``_HooksAdapterCallback``) that runs BEFORE the
-    thermal throttle in the registered callback list, so inference yielding
-    pre-empts throttle waits within the same step.
+    thermal throttle in the registered callback list.
 
     All fields default to ``None`` — callers pass only the intents they need:
 
-    - ``on_step_yield(global_step)``: invoked at every step boundary (optional;
-      consolidation callers may supply one for yielding between steps).
     - ``on_epoch_persist(epoch, output_dir)``: invoked at every epoch end.
       Used by RAM-mode to copy the latest checkpoint from /dev/shm to the
       caller's output_dir at each epoch boundary.
@@ -66,7 +63,6 @@ class TrainingHooks:
       field.
     """
 
-    on_step_yield: Optional[Callable[[int], None]] = None
     on_epoch_persist: Optional[Callable[[int, str], None]] = None
     on_save_persist: Optional[Callable[[int, str], None]] = None
     on_shutdown_check: Optional[Callable[[], bool]] = None
@@ -75,9 +71,7 @@ class TrainingHooks:
 class _HooksAdapterCallback(TrainerCallback):
     """Routes ``TrainingHooks`` intents to HF callback events.
 
-    Registered before ``ThermalThrottleCallback`` so that inference yielding
-    (``on_step_yield``) runs before any potential throttle wait at the same
-    step. The epoch hook (``on_epoch_persist``) is used by the RAM-mode
+    The epoch hook (``on_epoch_persist``) is used by the RAM-mode
     epoch-mirror writer. Shutdown checks (``on_shutdown_check``) fire at
     both step and epoch boundaries for sub-epoch shutdown granularity.
     """
@@ -86,8 +80,6 @@ class _HooksAdapterCallback(TrainerCallback):
         self._hooks = hooks
 
     def on_step_end(self, args, state, control, **kwargs):
-        if self._hooks.on_step_yield is not None:
-            self._hooks.on_step_yield(state.global_step)
         if self._hooks.on_shutdown_check is not None and self._hooks.on_shutdown_check():
             logger.info(
                 "Graceful shutdown requested via TrainingHooks — stopping after step %d",
@@ -210,11 +202,11 @@ class ParamemTrainer(Trainer):
         self._lr_decay_steps = lr_decay_steps
         # Adapter to serialize on every _save. Captured as a literal at
         # construction time — NEVER derived from ``model.active_adapter``.
-        # A step-yield (``on_step_yield``) can hand VRAM to inference, which
-        # may ``switch_adapter`` to ``inference_fallback_adapter`` mid-run; if
-        # ``on_save`` fires while that fallback is active, deriving the
-        # target from ``model.active_adapter`` would serialize the wrong
-        # adapter into the checkpoint. The captured literal is immune.
+        # Saves are pinned to this trainer instance's own staging adapter
+        # (or the production tier name in compose/direct mode) by name,
+        # so ``_save`` always serializes exactly the adapter this instance
+        # is training regardless of what else is mounted on the shared
+        # ``model``.
         self._save_adapter_name = save_adapter_name
         super().__init__(*args, **kwargs)
 
@@ -705,7 +697,7 @@ def purge_partial_checkpoints(adapters_root: Path) -> list[Path]:
     :func:`_write_staging_resume` round-trip — this makes "nothing
     references a purged dir" reconciliation-enforced rather than merely
     inferred from callback ordering. Fully-encrypted checkpoints,
-    ``fold_resume.json``, and durable slot files are left untouched.
+    ``stage_ledger.json``, and durable slot files are left untouched.
 
     Args:
         adapters_root: The ``<data>/adapters`` root to scan (same root
@@ -863,6 +855,8 @@ def train_adapter(
     thermal_policy: Optional[ThermalPolicy] = None,
     hooks: Optional[TrainingHooks] = None,
     retain_scratch_until_external_commit: bool = False,
+    warm_start: bool = True,
+    donor_checkpoint_dir: "Optional[Path]" = None,
 ) -> dict:
     """Train a LoRA adapter on the given dataset with the staging contract.
 
@@ -880,9 +874,13 @@ def train_adapter(
     | compose mode | never created | as set by the caller |
 
     Scratch (``staging_resume.json``, ``checkpoint-N/``) is cleaned on both
-    the normal-completion and abort paths (unless
-    ``retain_scratch_until_external_commit=True`` on the normal path) and
-    preserved on the exception path for crash-resume.
+    the normal-completion and abort paths unless
+    ``retain_scratch_until_external_commit=True``, in which case both paths
+    retain it — for the normal path, for the external commit; for the abort
+    path, so a subsequent training call against the same dataset resumes from
+    the last epoch checkpoint via ``staging_resume.json`` rather than
+    restarting the tier from scratch.  Scratch is unconditionally preserved
+    on the exception path for crash-resume.
 
     Why the trainer still cleans the staging slot on abort and on exception:
     an abort produced no verdict-worthy weights — every caller already
@@ -901,10 +899,25 @@ def train_adapter(
        adapter from seeded LoRA initialisation.  If the slot is already
        present at entry, the prior training event's caller did not dispose of
        it — raises ``RuntimeError`` (:func:`assert_staging_absent`).
-    2. Copies production weights into the staging slot.  Consolidation:
-       production holds prior-cycle weights → staging starts there (incremental
-       learning).  Migration: caller force-resets production to LoRA-zero
-       before this call → staging starts at LoRA-zero (fresh start).
+    2. Decides the staging slot's starting weights — the ONE point in the
+       program where the slot exists and training has not begun, so *this*
+       is where a live tier's weights would be written if anything here
+       wrote them; nothing here does.  Four outcomes, keyed on
+       :func:`~paramem.models.loader.has_prior_trained_weights` and the two
+       arguments below:
+
+       | prior trained weights | event | staging starts from | ``init`` |
+       |---|---|---|---|
+       | yes | ``warm_start`` | copy of *adapter_name* (warm) | ``"warm"`` |
+       | yes | not ``warm_start`` | LoRA-zero (already the slot's own init) | ``"cold"`` |
+       | no | ``donor_checkpoint_dir`` set | copy of the donor checkpoint | ``"donor"`` |
+       | no | no valid donor | LoRA-zero (already the slot's own init) | ``"cold"`` |
+
+       The donor's load → copy → drop-transient triple runs here, in one
+       ``finally``, beside the transient slot it seeds — a load or copy
+       failure degrades to ``"cold"`` rather than propagating (seeding is an
+       optimisation over LoRA-zero, never a fold-blocking dependency).
+       Recorded on return as ``metrics["init"]``.
     3. Activates the staging slot so HF Trainer trains there exclusively.
     4. Checks for a prior crash-resume via ``staging_resume.json`` and
        resolves the best available checkpoint (RAM → disk epoch-mirror →
@@ -913,7 +926,8 @@ def train_adapter(
     6. On normal completion: leaves the staging slot resident and active,
        cleans scratch state (unless the caller retained it).
        On abort: restores the active adapter to *adapter_name* without
-       promoting, cleans scratch, deletes the staging slot.
+       promoting, deletes the staging slot, and cleans scratch state (unless
+       the caller retained it, mirroring the normal-completion path).
        On exception (crash): restores the active adapter to *adapter_name*
        (best-effort), deletes the staging slot (best-effort), leaves scratch
        intact for the next crash-resume.  PEFT state dies with the process;
@@ -923,8 +937,10 @@ def train_adapter(
     Caller responsibilities (post-return, on a non-aborted result):
 
     - Run its own uncapped per-key recall probe against ``STAGING_ADAPTER``
-      and apply its own verdict (main-tier: all-or-refuse; interim:
-      per-key registration).
+      and apply the one training-completeness verdict every fold shares —
+      strictly ``passing == total`` over the tier's full key set, with no
+      split between a main tier and an interim slot
+      (:meth:`~paramem.training.consolidation.ConsolidationLoop._assert_tier_recall`).
     - :func:`promote_staging_adapter` on pass, inside :func:`staged_weights`
       so the slot is disposed of on every exit — pass, refuse, or a raise
       from the probe itself.
@@ -968,18 +984,42 @@ def train_adapter(
         thermal_policy: When set, installs a ``ThermalThrottleCallback`` that
             pauses training when GPU temperature exceeds the policy limit.
             Default ``None`` skips the install.
-        hooks: Caller-supplied ``TrainingHooks`` (inference yielding, epoch
-            persist, shutdown predicate).  Installed before the thermal throttle
-            so yielding pre-empts throttle waits.
-        retain_scratch_until_external_commit: When ``True``, the normal-completion
-            path (Step 6) skips ``_clean_scratch`` and ``scratch_path.unlink``
-            so the durable ``checkpoint-N`` directory under *output_dir* and
-            the ``staging_resume.json`` marker survive after this function
-            returns.  The caller is then responsible for deleting these
-            scratch artefacts after its own external commit (e.g. the fold's
-            ``_save_adapters``).  Default ``False`` preserves the existing
-            clean-on-success behaviour for all current callers (BG trainer,
-            replay, migration, interim).
+        hooks: Caller-supplied ``TrainingHooks`` (epoch persist, save
+            persist, shutdown predicate).  Installed before the thermal
+            throttle in the registered callback list.
+        retain_scratch_until_external_commit: When ``True``, both the
+            normal-completion path and the abort path (Step 6) skip
+            ``_clean_scratch`` and ``scratch_path.unlink`` so the durable
+            ``checkpoint-N`` directory under *output_dir* and the
+            ``staging_resume.json`` marker survive after this function
+            returns.  On normal completion the caller is responsible for
+            deleting these scratch artefacts once the whole event is
+            disposed (:func:`~paramem.training.stage_ledger.dispose` — a
+            tier write does not itself delete scratch); on abort they remain
+            so a subsequent training call against the same dataset resumes
+            from the last epoch checkpoint instead of restarting the tier.
+            Default ``False`` preserves the existing clean-on-completion
+            behaviour for this function's other two production callers —
+            active-store migration (simulate→train) and donor-build; the
+            fold's own tier-training call
+            (:meth:`~paramem.training.consolidation.ConsolidationLoop._train_gate_write`)
+            passes ``True``.
+        warm_start: ``False`` starts the staging slot at LoRA-zero even when
+            *adapter_name* has prior trained weights, per the four-way table
+            above.  Every production caller (interim, the full-topology
+            fold via ``ConsolidationLoop._train_gate_write`` — a full fold
+            and a reconcile alike) trains at the default ``True``: warm
+            start is uniform, with no cold-start arm.
+        donor_checkpoint_dir: A validated donor store directory, or
+            ``None``.  Applied ONLY when *adapter_name* has no prior trained
+            weights (see the table above) — a tier with prior trained
+            weights never seeds from a donor.  In production this comes from
+            ``ConsolidationLoop._resolve_donor_checkpoint``, which MUST run
+            *before* this call: building a missing donor re-enters this
+            function (via ``loop._train_tier_adapter``), and
+            ``_ensure_staging_slot`` raises when a staging slot already
+            exists — so the donor build must complete before the seeking
+            tier's own staging slot is created.
 
     Returns:
         Training metrics dict with the following keys:
@@ -991,6 +1031,10 @@ def train_adapter(
           after ``trainer.train()`` returns — the poll is race-free because the
           abort holder's event remains set until the caller clears it.
           Callers that do not pass ``hooks`` always see ``aborted=False``.
+        - ``init`` (``"warm" | "donor" | "cold"``): the staging slot's
+          starting-weights outcome, decided at Step 2 above.  Absent when
+          ``active_adapters`` is set (compose-training mode never creates a
+          staging slot).
     """
     if output_dir is None:
         output_dir = Path("outputs") / "adapters" / adapter_name
@@ -1041,22 +1085,72 @@ def train_adapter(
         # Step 1: Create the transient staging slot for this training event.
         # ``_ensure_staging_slot`` never rebuilds an existing slot — it raises
         # RuntimeError when one is already present, which signals missing
-        # cleanup at the prior event's success (1213-1239), abort (1240-1259),
-        # or exception (1272-1293) path.
+        # cleanup at the prior event's normal-completion, abort, or exception
+        # path (Step 6 below).  It leaves the slot at LoRA-zero — the correct
+        # starting point for both "cold" outcomes below without any further
+        # action.
         _ensure_staging_slot(model, adapter_config)
 
-        # Step 2: Copy production → staging (best-effort; first-time tiers
-        # have no production weights yet and start from LoRA-zero).
-        if adapter_name in model.peft_config:
-            from paramem.models.loader import copy_adapter_weights
+        # Step 2: Decide the staging slot's starting weights.  This is the
+        # ONE point in the program where the slot exists and training has
+        # not begun -- see the four-way table in this function's own
+        # docstring.  Nothing in this block writes *adapter_name*: a live
+        # tier's weights change only at the go-live mount's
+        # promote_staging_adapter, never here.
+        from paramem.models.loader import copy_adapter_weights, has_prior_trained_weights
 
-            copy_adapter_weights(model, src=adapter_name, dst=STAGING_ADAPTER)
-            logger.debug(
-                "Staging: copied production weights %s → %s", adapter_name, STAGING_ADAPTER
+        _staging_init: str
+        if has_prior_trained_weights(model, adapter_name):
+            if warm_start:
+                copy_adapter_weights(model, src=adapter_name, dst=STAGING_ADAPTER)
+                _staging_init = "warm"
+                logger.debug(
+                    "Staging: copied production weights %s → %s", adapter_name, STAGING_ADAPTER
+                )
+            else:
+                _staging_init = "cold"
+                logger.info(
+                    "Staging: %s has prior trained weights but warm_start=False "
+                    "(reconcile) — staging starts from LoRA-zero",
+                    adapter_name,
+                )
+        elif donor_checkpoint_dir is not None:
+            from paramem.models.loader import drop_adapter_slot
+            from paramem.training.donor import (
+                DONOR_LOAD_ADAPTER_NAME,
+                load_donor_into_transient_slot,
             )
+
+            try:
+                load_donor_into_transient_slot(model, donor_checkpoint_dir, DONOR_LOAD_ADAPTER_NAME)
+                copy_adapter_weights(model, src=DONOR_LOAD_ADAPTER_NAME, dst=STAGING_ADAPTER)
+                _staging_init = "donor"
+                logger.info(
+                    "Staging: seeded %s from donor checkpoint %s",
+                    STAGING_ADAPTER,
+                    donor_checkpoint_dir,
+                )
+            except (OSError, RuntimeError, ValueError, KeyError) as exc:
+                # Boundary error handling for an on-disk artifact: the
+                # checkpoint validated at resolution time, but loading can
+                # still fail for reasons validation cannot see (chiefly an
+                # age-encrypted donor with no daily identity loaded).
+                # Seeding is an optimisation over LoRA-zero; nothing about
+                # the fold's correctness depends on it, so a failure here
+                # costs the seed, never the fold.
+                _staging_init = "cold"
+                logger.warning(
+                    "Staging: donor load/copy failed for %s (%s) -- staging starts from LoRA-zero",
+                    adapter_name,
+                    exc,
+                )
+            finally:
+                drop_adapter_slot(model, DONOR_LOAD_ADAPTER_NAME, fallback_adapter=adapter_name)
         else:
+            _staging_init = "cold"
             logger.info(
-                "Staging: no production adapter '%s' yet — staging starts from LoRA-zero",
+                "Staging: no prior trained weights and no donor checkpoint for '%s' "
+                "-- staging starts from LoRA-zero",
                 adapter_name,
             )
 
@@ -1184,10 +1278,8 @@ def train_adapter(
     # callback :class:`BackgroundTrainer` already uses for its own HF
     # Trainer; sharing it keeps both code paths posture-consistent.
     # Callback assembly order is load-bearing (HF iterates registrations in
-    # order at every event). _HooksAdapterCallback must run BEFORE
-    # ThermalThrottleCallback so on_step_yield (inference yielding) pre-empts
-    # throttle waits within the same step. callbacks_extra (call-bound, e.g.
-    # recall probe) trail.
+    # order at every event). callbacks_extra (call-bound, e.g. recall probe)
+    # trail every other registered callback.
     callbacks: list = [EncryptCheckpointCallback()]
     if training_config.early_stopping:
         callbacks.append(
@@ -1322,6 +1414,8 @@ def train_adapter(
             hooks is not None and hooks.on_shutdown_check is not None and hooks.on_shutdown_check()
         )
         metrics["aborted"] = aborted
+        if _use_staging:
+            metrics["init"] = _staging_init
 
         if _use_staging:
             if not aborted:
@@ -1333,38 +1427,56 @@ def train_adapter(
                     "Staging: training complete — %s resident and active for caller",
                     STAGING_ADAPTER,
                 )
-                # Clean scratch on success unless the caller owns cleanup.
-                # When retain_scratch_until_external_commit=True the caller (e.g.
-                # the fold's _run_fold) keeps the durable checkpoint-N dir and
-                # staging_resume.json alive until its own external commit
-                # (_save_adapters) succeeds, enabling completed-tier reload on
-                # crash-resume.  Default False: clean immediately (existing
-                # behaviour for BG, replay, migration, and interim callers).
-                if not retain_scratch_until_external_commit:
-                    _clean_scratch(output_dir, ram_dir)
-                    scratch_path.unlink(missing_ok=True)
-                else:
-                    logger.debug("Staging: scratch retained for external commit at %s", output_dir)
             else:
                 # Step 6b: ABORT — restore active adapter, do NOT promote.
                 from paramem.models.loader import drop_adapter_slot, switch_adapter
 
                 switch_adapter(model, adapter_name)
                 logger.info(
-                    "Staging: aborted — production %s unchanged; cleaning scratch",
+                    "Staging: aborted — production %s unchanged",
                     adapter_name,
                 )
-                _clean_scratch(output_dir, ram_dir)
-                scratch_path.unlink(missing_ok=True)
                 # Delete the staging slot on abort too.  The staging slot is
                 # transient and must not survive past this training event,
                 # otherwise the next event's assert_staging_absent will trip
-                # its lifecycle-invariant guard.
+                # its lifecycle-invariant guard.  This runs before the scratch
+                # decision below: if it raises, control lands in the ``except
+                # BaseException`` path, which preserves scratch for
+                # crash-resume — the consistent outcome either way.
                 drop_adapter_slot(model, STAGING_ADAPTER, fallback_adapter=adapter_name)
                 logger.info(
                     "Staging: deleted %s after abort (lifecycle: per-training-event)",
                     STAGING_ADAPTER,
                 )
+
+            # Scratch fate is the same decision on normal completion and on
+            # abort: honour retain_scratch_until_external_commit.  When True,
+            # normal completion keeps the durable checkpoint-N dir and
+            # staging_resume.json alive until the whole event is disposed
+            # (stage_ledger.dispose — writing a tier's slot does not itself
+            # delete its scratch), enabling a resumed event's already-written
+            # tier to be classified as reused-as-is rather than retrained;
+            # abort keeps the same scratch alive for a different reason —
+            # abort produces no verdict-worthy weights and the event is
+            # never disposed on that path, so a subsequent training call
+            # against the same dataset resumes from the last epoch
+            # checkpoint instead. Default False cleans immediately (existing
+            # behaviour for the active-store-migration and donor-build
+            # callers; the fold's own tier-training call passes True).
+            if not retain_scratch_until_external_commit:
+                if aborted:
+                    logger.info("Staging: aborted — cleaning scratch at %s", output_dir)
+                _clean_scratch(output_dir, ram_dir)
+                scratch_path.unlink(missing_ok=True)
+            elif aborted:
+                logger.info(
+                    "Staging: aborted — scratch retained for resume at %s; a "
+                    "subsequent training call against the same dataset resumes "
+                    "from the last epoch checkpoint",
+                    output_dir,
+                )
+            else:
+                logger.debug("Staging: scratch retained for external commit at %s", output_dir)
         else:
             # Compose-training path: clean up RAM dir on success.
             if not aborted and ram_dir is not None and ram_dir.exists():
@@ -1372,8 +1484,9 @@ def train_adapter(
 
         # No final save here.  ``train_adapter`` is responsible only for
         # training; the canonical encrypted slot-dir save is the
-        # orchestrator's job (``ConsolidationLoop._save_adapters`` →
-        # ``atomic_save_adapter`` → ``_encrypt_adapter_safetensors``).
+        # orchestrator's job (``paramem.memory.persistence.write_tier_slot`` →
+        # ``save_adapter`` → ``atomic_save_adapter`` →
+        # ``_encrypt_adapter_safetensors``).
         logger.info("Training complete: %s", metrics)
         return metrics
 

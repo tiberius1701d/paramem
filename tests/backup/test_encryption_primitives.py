@@ -90,6 +90,244 @@ class TestInfraPathsSkipsPendingDelete:
         assert stray / "staging_resume.json" not in paths
 
 
+class TestInfraPathsPerTierKeyMetadata:
+    """``infra_paths`` enumerates every per-tier ``key_metadata.json`` --
+    main tiers, interim slots, and the trial tree's own counterparts -- so a
+    ``rotate-daily`` re-wraps all of them, not just the main-tier files."""
+
+    def test_main_tier_key_metadata_enumerated_for_all_three_tiers(self, tmp_path: Path) -> None:
+        """Main-tier key_metadata.json candidates are listed unconditionally
+        (infra_paths does not filter by existence)."""
+        paths = infra_paths(tmp_path)
+        for tier in ("episodic", "semantic", "procedural"):
+            assert tmp_path / "adapters" / tier / "key_metadata.json" in paths
+
+    def test_interim_slot_key_metadata_enumerated_when_present(self, tmp_path: Path) -> None:
+        interim_dir = tmp_path / "adapters" / "episodic" / "interim_20260101T0000"
+        interim_dir.mkdir(parents=True)
+        (interim_dir / "key_metadata.json").write_bytes(b'{"tier_cycle": 0, "keys": {}}')
+
+        paths = infra_paths(tmp_path)
+
+        assert interim_dir / "key_metadata.json" in paths
+
+    def test_trial_tree_key_metadata_enumerated_for_all_three_tiers(self, tmp_path: Path) -> None:
+        paths = infra_paths(tmp_path)
+        for tier in ("episodic", "semantic", "procedural"):
+            assert tmp_path / "state" / "trial" / "adapters" / tier / "key_metadata.json" in paths
+
+    def test_trial_tree_interim_slot_key_metadata_enumerated_when_present(
+        self, tmp_path: Path
+    ) -> None:
+        """The trial fold writes its own episodic/interim_<stamp>/ slots --
+        infra_paths must enumerate them the same way it does for the live
+        tree, or a rotation leaves them permanently undecryptable."""
+        interim_dir = (
+            tmp_path / "state" / "trial" / "adapters" / "episodic" / "interim_20260101T0000"
+        )
+        interim_dir.mkdir(parents=True)
+        (interim_dir / "key_metadata.json").write_bytes(b'{"tier_cycle": 0, "keys": {}}')
+        (interim_dir / "indexed_key_registry.json").write_bytes(
+            b'{"active_keys": [], "stale": {}, "simhash": {}}'
+        )
+        (interim_dir / "graph.json").write_bytes(b"{}")
+
+        paths = infra_paths(tmp_path)
+
+        assert interim_dir / "key_metadata.json" in paths
+        assert interim_dir / "indexed_key_registry.json" in paths
+        assert interim_dir / "graph.json" in paths
+
+    def test_rotate_daily_re_wraps_every_per_tier_key_metadata_file(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """A key_metadata.json at a main tier AND an interim slot, both
+        age-encrypted, both round-trip through the daily identity -- the
+        shape a ``rotate-daily`` re-wrap depends on (unit-level: exercises
+        the primitives ``infra_paths``/``read_maybe_encrypted``/
+        ``write_infra_bytes`` build on, not the CLI command itself)."""
+        from paramem.backup.age_envelope import age_encrypt_bytes
+
+        ident = _setup_daily(tmp_path, monkeypatch)
+
+        main_path = tmp_path / "adapters" / "episodic" / "key_metadata.json"
+        main_path.parent.mkdir(parents=True)
+        main_payload = b'{"tier_cycle": 1, "keys": {"g0": {}}}'
+        main_path.write_bytes(age_encrypt_bytes(main_payload, [ident.to_public()]))
+
+        interim_path = (
+            tmp_path / "adapters" / "episodic" / "interim_20260101T0000" / "key_metadata.json"
+        )
+        interim_path.parent.mkdir(parents=True)
+        interim_payload = b'{"tier_cycle": 2, "keys": {"g1": {}}}'
+        interim_path.write_bytes(age_encrypt_bytes(interim_payload, [ident.to_public()]))
+
+        paths = infra_paths(tmp_path)
+        assert main_path in paths
+        assert interim_path in paths
+
+        assert read_maybe_encrypted(main_path) == main_payload
+        assert read_maybe_encrypted(interim_path) == interim_payload
+
+        # A fresh daily identity re-wraps both files in place -- the same
+        # read -> decrypt -> re-encrypt -> write cycle rotate-daily performs.
+        # write_infra_bytes takes PLAINTEXT and does its own envelope
+        # encryption under whichever daily identity is currently loaded.
+        _setup_daily(tmp_path, monkeypatch, passphrase="new-pw")
+        for path, payload in ((main_path, main_payload), (interim_path, interim_payload)):
+            write_infra_bytes(path, payload)
+
+        assert read_maybe_encrypted(main_path) == main_payload
+        assert read_maybe_encrypted(interim_path) == interim_payload
+        # Re-wrapped, not merely re-written identically: the on-disk bytes
+        # still carry the age magic (still encrypted), not plaintext.
+        age_magic = b"age-encryption.org/v1\n"
+        assert main_path.read_bytes().startswith(age_magic)
+        assert interim_path.read_bytes().startswith(age_magic)
+
+
+class TestInfraPathsStageLedgerAndExtractionTree:
+    """``infra_paths`` names the stage ledger and its per-event extraction
+    tree, plus their trial-root counterparts under ``state/trial/state/``,
+    so a rotation never leaves either permanently undecryptable and a
+    mid-event rotation degrades to "re-extract" rather than a decrypt
+    raise.
+
+    The extraction-tree half is filename-scoped to the exact three files
+    ``stage_event`` writes per tier (``key_metadata.json``, ``keyed.json``,
+    ``indexed_key_registry.json`` under ``extraction/<event>/shadow/<tier>/``)
+    — there is no event-root ``graph.json`` in production any more, and an
+    unbounded ``rglob("*")`` would pick up a crash-orphaned ``<name>.tmp``
+    staging file and misclassify it as plaintext."""
+
+    def test_live_stage_ledger_enumerated_unconditionally(self, tmp_path: Path) -> None:
+        paths = infra_paths(tmp_path)
+        assert tmp_path / "state" / "stage_ledger.json" in paths
+
+    def test_trial_stage_ledger_enumerated_unconditionally(self, tmp_path: Path) -> None:
+        paths = infra_paths(tmp_path)
+        assert tmp_path / "state" / "trial" / "state" / "stage_ledger.json" in paths
+
+    def test_live_extraction_tree_enumerated_when_present(self, tmp_path: Path) -> None:
+        shadow = tmp_path / "state" / "extraction" / "full" / "shadow" / "episodic" / "keyed.json"
+        shadow.parent.mkdir(parents=True)
+        shadow.write_bytes(b"[]")
+        stray_graph = tmp_path / "state" / "extraction" / "full" / "graph.json"
+        stray_graph.write_bytes(b"{}")
+
+        paths = infra_paths(tmp_path)
+
+        assert shadow in paths
+        assert stray_graph not in paths, (
+            "stage_event writes no event-root graph.json in production; "
+            "infra_paths is filename-scoped to the three shadow files it "
+            "does write and must not pick up an unrelated file"
+        )
+
+    def test_trial_extraction_tree_enumerated_when_present(self, tmp_path: Path) -> None:
+        shadow = (
+            tmp_path
+            / "state"
+            / "trial"
+            / "state"
+            / "extraction"
+            / "full"
+            / "shadow"
+            / "episodic"
+            / "keyed.json"
+        )
+        shadow.parent.mkdir(parents=True)
+        shadow.write_bytes(b"[]")
+
+        paths = infra_paths(tmp_path)
+
+        assert shadow in paths
+
+    def test_extraction_tree_absent_does_not_raise(self, tmp_path: Path) -> None:
+        """No event pending — no extraction/ tree on disk at all."""
+        paths = infra_paths(tmp_path)
+        assert tmp_path / "state" / "stage_ledger.json" in paths
+
+    def test_pending_delete_under_extraction_tree_excluded(self, tmp_path: Path) -> None:
+        stray = tmp_path / "state" / "extraction" / ".pending-delete" / "full" / "keyed.json"
+        stray.parent.mkdir(parents=True)
+        stray.write_bytes(b"[]")
+
+        paths = infra_paths(tmp_path)
+
+        assert stray not in paths
+
+    def test_extraction_tree_tmp_staging_file_excluded(self, tmp_path: Path) -> None:
+        """A crash-orphaned ``<name>.tmp`` staging file beside a shadow file
+        must not be picked up — the walk is filename-scoped, not
+        ``rglob("*")``, so it can never classify an in-flight atomic-write
+        temp file as a plaintext infra artifact."""
+        shadow_dir = tmp_path / "state" / "extraction" / "full" / "shadow" / "episodic"
+        shadow_dir.mkdir(parents=True)
+        (shadow_dir / "keyed.json").write_bytes(b"[]")
+        orphan_tmp = shadow_dir / "keyed.json.tmp"
+        orphan_tmp.write_bytes(b"[]")
+
+        paths = infra_paths(tmp_path)
+
+        assert shadow_dir / "keyed.json" in paths
+        assert orphan_tmp not in paths
+
+    def test_rotate_daily_re_wraps_ledger_registry_and_safetensors(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """The rotation flow re-wraps every enumerated infra file — the stage
+        ledger, a tier's ``indexed_key_registry.json``, and a slot's
+        ``adapter_model.safetensors`` — through the real
+        ``rotate_file_to_recipients``, and each stays readable under the
+        NEW daily identity afterwards (the rotation CLI walks exactly
+        ``infra_paths``, so a filename missing from that enumeration would
+        silently stay wrapped under the retired identity)."""
+        from paramem.backup.age_envelope import age_encrypt_bytes
+        from paramem.backup.rotation import rotate_file_to_recipients
+
+        ident_old = _setup_daily(tmp_path, monkeypatch)
+
+        ledger_path = tmp_path / "state" / "stage_ledger.json"
+        ledger_path.parent.mkdir(parents=True)
+        registry_path = tmp_path / "adapters" / "episodic" / "indexed_key_registry.json"
+        registry_path.parent.mkdir(parents=True)
+        weights_path = (
+            tmp_path / "adapters" / "episodic" / "20260101-000000" / "adapter_model.safetensors"
+        )
+        weights_path.parent.mkdir(parents=True)
+        (weights_path.parent / "meta.json").write_text("{}")
+
+        payloads = {
+            ledger_path: b'{"version": 1, "event": "interim"}',
+            registry_path: b'{"active_keys": [], "stale": {}, "simhash": {}}',
+            weights_path: b"stub-tensor-bytes",
+        }
+        for path, payload in payloads.items():
+            path.write_bytes(age_encrypt_bytes(payload, [ident_old.to_public()]))
+            assert path in infra_paths(tmp_path), f"{path} missing from infra_paths"
+            assert read_maybe_encrypted(path) == payload
+
+        ident_new = mint_daily_identity()
+        for path in payloads:
+            rotate_file_to_recipients(
+                path,
+                decrypt_identities=[ident_old, ident_new],
+                new_recipients=[ident_new.to_public()],
+            )
+
+        # Load the NEW identity as the daily; every file must read back.
+        new_key_path = tmp_path / "daily_key_new.age"
+        write_daily_key_file(wrap_daily_identity(ident_new, "new-pw"), new_key_path)
+        monkeypatch.setenv(DAILY_PASSPHRASE_ENV_VAR, "new-pw")
+        monkeypatch.setattr("paramem.backup.key_store.DAILY_KEY_PATH_DEFAULT", new_key_path)
+        _clear_daily_identity_cache()
+
+        for path, payload in payloads.items():
+            assert read_maybe_encrypted(path) == payload
+            assert path.read_bytes().startswith(b"age-encryption.org/v1\n")
+
+
 class TestEnvelopeEncryptBytesHelper:
     """``envelope_encrypt_bytes`` returns plaintext when no key is loaded,
     and an age envelope when the daily identity is loadable.

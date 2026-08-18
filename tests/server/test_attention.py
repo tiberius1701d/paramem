@@ -2,6 +2,11 @@
 
 Tests cover every populator's emit/no-emit branches, collection ordering,
 stub behaviour, and the AttentionItem dataclass contract.
+
+Also covers ``_collect_adapter_fingerprint_items`` (the
+adapter_manifest_status verdict → attention-item populator) and the
+local-recall-inactive emit/silence branches, both driven by hand-built
+``adapter_manifest_status``/state dicts rather than a real manifest tree.
 """
 
 from __future__ import annotations
@@ -17,11 +22,9 @@ from paramem.server.attention import (
     _age_seconds_from_iso,
     _collect_adapter_fingerprint_items,
     _collect_backup_items,
-    _collect_boot_degraded_items,
     _collect_config_drift_items,
     _collect_consolidation_items,
     _collect_encryption_items,
-    _collect_incident_items,
     _collect_integrity_cleanup_items,
     _collect_key_rotation_items,
     _collect_local_recall_inactive_items,
@@ -443,6 +446,78 @@ def test_consolidation_blocked_no_session_buffer():
 
 
 # ---------------------------------------------------------------------------
+# _collect_adapter_fingerprint_items
+# ---------------------------------------------------------------------------
+
+
+def test_a_withheld_tier_renders_a_visible_attention_item():
+    """A tier whose registry↔slot-manifest binding resolved no usable live
+    slot (UNBOUND_ROW_STATUSES) renders a visible, condition-specific
+    attention item -- built from the row's own ``reason`` -- rather than
+    staying silent. The primary tier (episodic) renders at failed level
+    with PA routing named as disabled."""
+    state = _live_state(
+        adapter_manifest_status={
+            "episodic": {
+                "status": "keys_without_slot",
+                "reason": "keys_without_slot",
+                "severity": "red",
+                "checked_at": "2026-08-16T00:00:00Z",
+            }
+        }
+    )
+    items = _collect_adapter_fingerprint_items(state)
+    assert len(items) == 1
+    item = items[0]
+    assert item.kind == "adapter_unbound_primary"
+    assert item.level == "failed"
+    assert "episodic" in item.summary
+    assert "PA routing DISABLED" in item.summary
+    assert "no written payload slot candidate" in item.summary
+
+
+def test_a_withheld_secondary_tier_renders_an_info_item_not_failed():
+    """An unpublishable SECONDARY tier (semantic/procedural) renders at info
+    level, never failed -- only the primary tier's PA routing disablement
+    is failed-level."""
+    state = _live_state(
+        adapter_manifest_status={
+            "semantic": {
+                "status": "payload_mismatch",
+                "reason": "payload_mismatch",
+                "severity": "yellow",
+                "checked_at": "2026-08-16T00:00:00Z",
+            }
+        }
+    )
+    items = _collect_adapter_fingerprint_items(state)
+    assert len(items) == 1
+    assert items[0].kind == "adapter_unbound_secondary"
+    assert items[0].level == "info"
+    assert "semantic" in items[0].summary
+
+
+def test_registry_unverified_and_key_count_mismatch_rows_render_nothing():
+    """registry_unverified / key_count_mismatch rows are DELIBERATELY not
+    rendered here -- the tier_registry_unverified incident is their sole
+    reporter (see the populator's own docstring)."""
+    state = _live_state(
+        adapter_manifest_status={
+            "episodic": {"status": "registry_unverified", "severity": "red"},
+            "semantic": {"status": "key_count_mismatch", "severity": "yellow"},
+        }
+    )
+    assert _collect_adapter_fingerprint_items(state) == []
+
+
+def test_healthy_manifest_status_renders_nothing():
+    """An empty adapter_manifest_status (every tier VERIFIED or
+    NO_CANDIDATES, both of which mint no row) renders no items."""
+    state = _live_state(adapter_manifest_status={})
+    assert _collect_adapter_fingerprint_items(state) == []
+
+
+# ---------------------------------------------------------------------------
 # _collect_sweeper_items
 # ---------------------------------------------------------------------------
 
@@ -510,54 +585,6 @@ def test_config_drift_missing_key_no_item():
 
 
 # ---------------------------------------------------------------------------
-# _collect_boot_degraded_items
-# ---------------------------------------------------------------------------
-
-
-def test_boot_degraded_set_emits_info():
-    """boot_degraded dict → 1 info item, kind=boot_degraded, hits/total in summary."""
-    state = _live_state(boot_degraded={"reason": "preload_partial", "hits": 3, "total": 5})
-    items = _collect_boot_degraded_items(state)
-    assert len(items) == 1
-    assert items[0].kind == "boot_degraded"
-    assert items[0].level == "info"
-    assert "3/5" in items[0].summary
-    assert items[0].action_hint is not None
-
-
-def test_boot_degraded_none_no_item():
-    """boot_degraded None → 0 items."""
-    state = _live_state(boot_degraded=None)
-    items = _collect_boot_degraded_items(state)
-    assert items == []
-
-
-def test_boot_degraded_missing_key_no_item():
-    """Missing boot_degraded key → 0 items (no exception)."""
-    state = _live_state()
-    assert "boot_degraded" not in state
-    items = _collect_boot_degraded_items(state)
-    assert items == []
-
-
-def test_boot_degraded_level_is_info_for_partial_miss():
-    """The boot_degraded item is level='info' for a recoverable partial cache miss.
-
-    Locks the level contract: a fatal CUDA context loss is handled by boot
-    fail-fast (os._exit or cloud-only degrade) and never reaches boot_degraded.
-    Only the recoverable cold-cache / partial-miss case produces this item, so
-    it must always be 'info', never 'warning' or 'error'.
-    """
-    state = _live_state(boot_degraded={"reason": "preload_partial", "hits": 10, "total": 20})
-    items = _collect_boot_degraded_items(state)
-    assert len(items) == 1
-    assert items[0].level == "info", (
-        "boot_degraded must be level='info' (recoverable partial miss only); "
-        f"got {items[0].level!r}"
-    )
-
-
-# ---------------------------------------------------------------------------
 # _collect_integrity_cleanup_items
 # ---------------------------------------------------------------------------
 
@@ -615,261 +642,6 @@ def test_integrity_cleanup_multi_tier_lists_each_once():
 
 
 # ---------------------------------------------------------------------------
-# _collect_adapter_fingerprint_items
-# ---------------------------------------------------------------------------
-
-
-def test_adapter_fingerprint_primary_emits_red():
-    """episodic adapter with severity=red + status=mismatch → 1 item, level=failed."""
-    state = _live_state(
-        adapter_manifest_status={
-            "episodic": {
-                "status": "mismatch",
-                "reason": "base_model.sha mismatch",
-                "field": "base_model.sha",
-                "severity": "red",
-                "slot_path": "/adapters/episodic",
-                "checked_at": "2026-04-22T00:00:00+00:00",
-            }
-        }
-    )
-    items = _collect_adapter_fingerprint_items(state)
-    assert len(items) == 1
-    assert items[0].kind == "adapter_fingerprint_mismatch_primary"
-    assert items[0].level == "failed"
-    assert "episodic" in items[0].summary
-    assert "DISABLED" in items[0].summary
-
-
-def test_adapter_fingerprint_secondary_emits_info():
-    """semantic adapter with severity=yellow → 1 item, kind=secondary, level=info."""
-    state = _live_state(
-        adapter_manifest_status={
-            "semantic": {
-                "status": "mismatch",
-                "reason": "tokenizer.sha mismatch",
-                "field": "tokenizer.sha",
-                "severity": "yellow",
-                "slot_path": "/adapters/semantic",
-                "checked_at": "2026-04-22T00:00:00+00:00",
-            }
-        }
-    )
-    items = _collect_adapter_fingerprint_items(state)
-    assert len(items) == 1
-    assert items[0].kind == "adapter_fingerprint_mismatch_secondary"
-    assert items[0].level == "info"
-    assert "semantic" in items[0].summary
-
-
-def test_adapter_fingerprint_primary_before_secondary():
-    """Both rows present → primary item appears before secondary."""
-    state = _live_state(
-        adapter_manifest_status={
-            "episodic": {
-                "status": "mismatch",
-                "reason": "sha mismatch",
-                "field": "base_model.sha",
-                "severity": "red",
-                "slot_path": "/adapters/episodic",
-                "checked_at": "",
-            },
-            "semantic": {
-                "status": "mismatch",
-                "reason": "vocab mismatch",
-                "field": "tokenizer.sha",
-                "severity": "yellow",
-                "slot_path": "/adapters/semantic",
-                "checked_at": "",
-            },
-        }
-    )
-    items = _collect_adapter_fingerprint_items(state)
-    assert len(items) == 2
-    assert items[0].kind == "adapter_fingerprint_mismatch_primary"
-    assert items[1].kind == "adapter_fingerprint_mismatch_secondary"
-
-
-def test_adapter_fingerprint_ok_no_item():
-    """status=ok → no item."""
-    state = _live_state(
-        adapter_manifest_status={
-            "episodic": {
-                "status": "ok",
-                "severity": "green",
-                "reason": None,
-                "field": None,
-                "slot_path": "/a",
-                "checked_at": "",
-            }
-        }
-    )
-    items = _collect_adapter_fingerprint_items(state)
-    assert items == []
-
-
-def test_adapter_fingerprint_manifest_missing():
-    """status=manifest_missing → item emitted (missing manifest is mismatch)."""
-    state = _live_state(
-        adapter_manifest_status={
-            "procedural": {
-                "status": "manifest_missing",
-                "reason": "no meta.json found",
-                "field": None,
-                "severity": "yellow",
-                "slot_path": "/adapters/procedural",
-                "checked_at": "",
-            }
-        }
-    )
-    items = _collect_adapter_fingerprint_items(state)
-    assert len(items) == 1
-    assert items[0].kind == "adapter_fingerprint_mismatch_secondary"
-
-
-def test_adapter_no_matching_slot_primary_emits_failed():
-    """no_matching_slot on episodic (red) → failed, kind=adapter_no_matching_slot_primary.
-
-    Surfaces a stale slot on a registry that read cleanly but found no
-    hash-matching slot — a corrupt/unreadable/absent registry now routes to
-    the distinct ``registry_unverified`` status instead.
-    """
-    state = _live_state(
-        adapter_manifest_status={
-            "episodic": {
-                "status": "no_matching_slot",
-                "reason": "no_matching_slot",
-                "field": None,
-                "severity": "red",
-                "slot_path": "/adapters/episodic",
-                "checked_at": "",
-            }
-        }
-    )
-    items = _collect_adapter_fingerprint_items(state)
-    assert len(items) == 1
-    assert items[0].kind == "adapter_no_matching_slot_primary"
-    assert items[0].level == "failed"
-    assert "NO MATCHING SLOT" in items[0].summary
-    assert "PA routing DISABLED" in items[0].summary
-    assert items[0].action_hint is not None
-
-
-def test_adapter_no_matching_slot_secondary_emits_info():
-    """no_matching_slot on semantic (yellow) → info, kind=adapter_no_matching_slot_secondary."""
-    state = _live_state(
-        adapter_manifest_status={
-            "semantic": {
-                "status": "no_matching_slot",
-                "reason": "no_matching_slot",
-                "field": None,
-                "severity": "yellow",
-                "slot_path": "/adapters/semantic",
-                "checked_at": "",
-            }
-        }
-    )
-    items = _collect_adapter_fingerprint_items(state)
-    assert len(items) == 1
-    assert items[0].kind == "adapter_no_matching_slot_secondary"
-    assert items[0].level == "info"
-    assert "NO MATCHING SLOT" in items[0].summary
-    assert "adapter unmounted" in items[0].summary
-    assert items[0].action_hint is None
-
-
-def test_adapter_registry_unverified_row_emits_no_fingerprint_item():
-    """registry_unverified rows are DELIBERATELY not rendered by
-    _collect_adapter_fingerprint_items — the tier_registry_unverified
-    incident (via _collect_incident_items) is the sole reporter, so this
-    populator must not ALSO emit an item for the same condition."""
-    state = _live_state(
-        adapter_manifest_status={
-            "episodic": {
-                "status": "registry_unverified",
-                "reason": "registry_unreadable",
-                "field": None,
-                "severity": "red",
-                "slot_path": None,
-                "checked_at": "",
-            }
-        }
-    )
-    items = _collect_adapter_fingerprint_items(state)
-    assert items == []
-
-
-def test_adapter_key_count_mismatch_row_emits_no_fingerprint_item():
-    """key_count_mismatch rows are likewise not rendered here — same
-    incident-driven reporter as registry_unverified."""
-    state = _live_state(
-        adapter_manifest_status={
-            "semantic": {
-                "status": "key_count_mismatch",
-                "reason": "key_count_mismatch",
-                "field": None,
-                "severity": "yellow",
-                "slot_path": "/adapters/semantic",
-                "checked_at": "",
-            }
-        }
-    )
-    items = _collect_adapter_fingerprint_items(state)
-    assert items == []
-
-
-def test_registry_unverified_incident_is_the_sole_reporter(tmp_path):
-    """The tier_registry_unverified incident renders via
-    _collect_incident_items (the durable, keyless-visible reporter) — and
-    an adapter_manifest_status row for the same tier/condition produces no
-    SECOND item from _collect_adapter_fingerprint_items, so /status shows
-    exactly one row for this condition, not two."""
-    from paramem.server.incidents import record_incident
-
-    state_dir = tmp_path / "state"
-    record_incident(
-        state_dir,
-        type="tier_registry_unverified",
-        key="episodic",
-        severity="failed",
-        summary="Tier 'episodic' registry could not be verified against its "
-        "slot manifests (registry_unreadable) — publishing nothing for this tier",
-        detail={
-            "tier": "episodic",
-            "status": "registry_unreadable",
-            "detail": "registry load failed: Expecting value: line 1 column 1 (char 0)",
-            "candidate_count": 0,
-            "action_hint": (
-                "restore this tier from a snapshot bundle via POST "
-                "/backup/restore and restart; see GET /integrity"
-            ),
-        },
-    )
-
-    cfg = SimpleNamespace(paths=SimpleNamespace(data=tmp_path))
-    incident_items = _collect_incident_items({}, cfg)
-    assert len(incident_items) == 1
-    assert incident_items[0].level == "failed"
-    assert "episodic" in incident_items[0].summary
-    assert "registry_unreadable" in incident_items[0].summary
-
-    # The row-driven populator stays silent for the same condition.
-    fingerprint_state = _live_state(
-        adapter_manifest_status={
-            "episodic": {
-                "status": "registry_unverified",
-                "reason": "registry_unreadable",
-                "field": None,
-                "severity": "red",
-                "slot_path": None,
-                "checked_at": "",
-            }
-        }
-    )
-    assert _collect_adapter_fingerprint_items(fingerprint_state) == []
-
-
-# ---------------------------------------------------------------------------
 # Stub populators
 # ---------------------------------------------------------------------------
 
@@ -920,54 +692,6 @@ def test_encryption_items_fires_on_security_off():
 # ---------------------------------------------------------------------------
 # collect_attention_items — ordering and integration
 # ---------------------------------------------------------------------------
-
-
-def test_collect_order_matches_spec():
-    """Items from all 5 active populators appear in spec order."""
-    buf = MagicMock()
-    buf.pending_count = 2
-    state = {
-        "migration": {
-            "state": "TRIAL",
-            "recovery_required": [],
-            "shape_changes": [],
-            "staged_at": None,
-            "trial": {
-                "started_at": "2026-04-22T00:00:00+00:00",
-                "gates": {"status": "pending", "details": [], "completed_at": None},
-            },
-        },
-        "config_drift": {
-            "detected": True,
-            "loaded_hash": "abc",
-            "disk_hash": "def",
-            "last_checked_at": "2026-04-22T00:00:00+00:00",
-        },
-        "boot_degraded": {"reason": "preload_partial", "hits": 3, "total": 5},
-        "consolidating": False,
-        "session_buffer": buf,
-        "adapter_manifest_status": {
-            "episodic": {
-                "status": "mismatch",
-                "reason": "sha mismatch",
-                "field": "base_model.sha",
-                "severity": "red",
-                "slot_path": "/adapters/episodic",
-                "checked_at": "",
-            }
-        },
-    }
-    items = collect_attention_items(state, None)
-    kinds = [it.kind for it in items]
-    # Expected order: migration → consolidation → sweeper → config_drift →
-    # boot_degraded → adapter_fingerprint
-    migration_idx = kinds.index("migration_trial_running")
-    consolidation_idx = kinds.index("consolidation_blocked")
-    sweeper_idx = kinds.index("sweeper_held")
-    config_idx = kinds.index("config_drift")
-    boot_idx = kinds.index("boot_degraded")
-    adapter_idx = kinds.index("adapter_fingerprint_mismatch_primary")
-    assert migration_idx < consolidation_idx < sweeper_idx < config_idx < boot_idx < adapter_idx
 
 
 def test_collect_empty_when_live_clean():
@@ -1099,69 +823,6 @@ def test_local_recall_inactive_silent_on_true_fresh_install():
     state = _live_state(
         memory_store=_mock_store(0),
         session_buffer=_mock_buffer(0),
-    )
-    items = _collect_local_recall_inactive_items(state)
-    assert items == []
-
-
-def test_local_recall_inactive_silent_when_no_matching_slot_present():
-    """keys_count==0 + pending>0 BUT adapter_manifest_status has no_matching_slot →
-    no item; the fingerprint collector already covers that case with a better hint."""
-    state = _live_state(
-        memory_store=_mock_store(0),
-        session_buffer=_mock_buffer(2),
-        adapter_manifest_status={
-            "episodic": {
-                "status": "no_matching_slot",
-                "reason": "no_matching_slot",
-                "field": None,
-                "severity": "red",
-                "slot_path": "/adapters/episodic",
-                "checked_at": "",
-            }
-        },
-    )
-    items = _collect_local_recall_inactive_items(state)
-    assert items == []
-
-
-def test_local_recall_inactive_silent_when_registry_unverified_present():
-    """keys_count==0 + pending>0 BUT adapter_manifest_status has
-    registry_unverified → no item; the fingerprint collector already covers
-    that case with a more specific hint."""
-    state = _live_state(
-        memory_store=_mock_store(0),
-        session_buffer=_mock_buffer(2),
-        adapter_manifest_status={
-            "episodic": {
-                "status": "registry_unverified",
-                "reason": "registry_unreadable",
-                "field": None,
-                "severity": "red",
-                "slot_path": None,
-                "checked_at": "",
-            }
-        },
-    )
-    items = _collect_local_recall_inactive_items(state)
-    assert items == []
-
-
-def test_local_recall_inactive_silent_when_mismatch_present():
-    """keys_count==0 + pending>0 BUT mismatch row exists → defer to fingerprint collector."""
-    state = _live_state(
-        memory_store=_mock_store(0),
-        session_buffer=_mock_buffer(4),
-        adapter_manifest_status={
-            "episodic": {
-                "status": "mismatch",
-                "reason": "sha mismatch",
-                "field": "base_model.sha",
-                "severity": "red",
-                "slot_path": "/adapters/episodic",
-                "checked_at": "",
-            }
-        },
     )
     items = _collect_local_recall_inactive_items(state)
     assert items == []

@@ -6,8 +6,13 @@ Covers:
 - Empty store → returns empty list, total=0 (correct read, not an error).
 - Happy path: every (tier, key, entry) from iter_entries() flows into the response.
 - Tier counts aggregate correctly.
-- Per-key ``speaker_id``/``relation_type`` and other bookkeeping fields are sourced
-  from ``bookkeeping_for_key`` (authoritative ``_bookkeeping``), not the entry payload.
+- Every registry-known key carries a full bookkeeping row by invariant
+  (``paramem.memory.store.MemoryStore``'s every-known-key-has-a-row
+  invariant) — the dump splats that row onto its row (``debug_dump``,
+  ``paramem/server/app.py``) directly, with no ``None``-tolerant default.
+  ``speaker_id``/``relation_type`` and every other bookkeeping field come
+  from ``bookkeeping_for_key`` (authoritative ``_bookkeeping``), overlaid
+  onto — and winning over — whatever the entry payload itself carries.
 
 Tests use FastAPI TestClient with monkeypatched ``_state``; no live server, no GPU.
 """
@@ -29,16 +34,53 @@ def _make_config(tmp_path: Path, debug: bool = True) -> MagicMock:
     return cfg
 
 
+def _default_bookkeeping_row(**overrides) -> dict:
+    """The canonical full bookkeeping row every registry-known key carries
+    by invariant (``paramem.memory.store.MemoryStore.bookkeeping_for_key``).
+    Tests that don't care about specific field values get this row
+    unmodified via ``_FakeStore``'s default; tests exercising the
+    bookkeeping-overlay behavior pass their own dict (or overrides here)."""
+    row = {
+        "speaker_id": "speaker0",
+        "relation_type": "factual",
+        "reinforcement_count": 0,
+        "last_reinforced_cycle": 0,
+        "last_seen": "",
+        "first_seen": "",
+        "promoted": False,
+    }
+    row.update(overrides)
+    return row
+
+
 class _FakeStore:
+    """Minimal ``MemoryStore`` stand-in for ``/debug/dump`` tests.
+
+    Every entry this fixture serves via ``iter_entries()`` carries a
+    bookkeeping row by default — matching the every-known-key-has-a-row
+    invariant every registry-known key carries in production
+    (``paramem.memory.store.MemoryStore``). A key with content but no row
+    is a fixture bug, not a state ``/debug/dump`` needs to tolerate: the
+    handler reads ``bookkeeping_for_key`` directly and splats it onto the
+    row, with no ``None``-tolerant default. Pass an explicit
+    ``bookkeeping`` dict to exercise the overlay behavior (bookkeeping
+    values winning over stale entry-payload values) or the cache-off shape
+    (bookkeeping present, no content entries).
+    """
+
     def __init__(self, items: list[tuple[str, str, dict]], bookkeeping: dict | None = None):
         self._items = items
-        self._bookkeeping = bookkeeping or {}
+        if bookkeeping is None:
+            self._bookkeeping = {key: _default_bookkeeping_row() for _tier, key, _entry in items}
+        else:
+            self._bookkeeping = bookkeeping
 
     def iter_entries(self):
         yield from self._items
 
     def bookkeeping_for_key(self, key: str) -> dict | None:
-        """Return the bookkeeping record for *key*, or ``None`` when absent."""
+        """Return the bookkeeping record for *key* — every key this
+        fixture serves via ``iter_entries()`` carries one by construction."""
         return self._bookkeeping.get(key)
 
     def bookkeeping_count(self) -> int:
@@ -86,8 +128,8 @@ class TestDebugDumpHappyPath:
         """Under preload_cache=False: entries is empty, bookkeeping_total is N."""
         # Bookkeeping present but no content entries (cache-off scenario).
         fake_bk = {
-            "k1": {"speaker_id": "alice"},
-            "k2": {"speaker_id": "alice"},
+            "k1": _default_bookkeeping_row(speaker_id="alice"),
+            "k2": _default_bookkeeping_row(speaker_id="alice"),
         }
         state = _make_state(tmp_path, store_items=[])
         state["memory_store"] = _FakeStore([], bookkeeping=fake_bk)
@@ -100,6 +142,10 @@ class TestDebugDumpHappyPath:
         assert body["bookkeeping_total"] == 2
 
     def test_dump_flattens_tier_key_entry(self, tmp_path, monkeypatch):
+        """Every (tier, key, entry) from iter_entries() flows into the
+        response, flattened, with its (fixture-default) bookkeeping row
+        overlaid — the every-known-key-has-a-row invariant means a cached
+        entry is never dumped without one."""
         items = [
             (
                 "episodic",
@@ -136,9 +182,11 @@ class TestDebugDumpHappyPath:
         """speaker_id and relation_type in the dump row come from bookkeeping_for_key,
         not from the entry payload.
 
-        This is the B3c regression guard: the entry payload may carry stale or
-        absent bookkeeping fields (store.py:53-58), so the handler must overlay
-        the authoritative _bookkeeping values.
+        This is the B3c regression guard: the entry payload may carry stale
+        bookkeeping-shaped fields (store.py:53-58), so the handler must
+        overlay the authoritative _bookkeeping values — read directly, with
+        no ``None``-tolerant default, since the every-known-key-has-a-row
+        invariant guarantees a row exists.
         """
         items = [
             (
@@ -156,14 +204,12 @@ class TestDebugDumpHappyPath:
             ),
         ]
         bk = {
-            "graph1": {
-                "speaker_id": "alice",
-                "relation_type": "factual",
-                "last_reinforced_cycle": 5,
-                "reinforcement_count": 2,
-                "last_seen": "",
-                "first_seen": "",
-            }
+            "graph1": _default_bookkeeping_row(
+                speaker_id="alice",
+                relation_type="factual",
+                last_reinforced_cycle=5,
+                reinforcement_count=2,
+            )
         }
         state = _make_state(tmp_path, store_items=items)
         state["memory_store"] = _FakeStore(items, bookkeeping=bk)
@@ -191,14 +237,14 @@ class TestDebugDumpHappyPath:
             ),
         ]
         bk = {
-            "graph1": {
-                "speaker_id": "alice",
-                "relation_type": "factual",
-                "last_reinforced_cycle": 5,
-                "reinforcement_count": 2,
-                "last_seen": "2026-06-30T12:00:00",
-                "first_seen": "2026-06-01T09:00:00",
-            }
+            "graph1": _default_bookkeeping_row(
+                speaker_id="alice",
+                relation_type="factual",
+                last_reinforced_cycle=5,
+                reinforcement_count=2,
+                last_seen="2026-06-30T12:00:00",
+                first_seen="2026-06-01T09:00:00",
+            )
         }
         state = _make_state(tmp_path, store_items=items)
         state["memory_store"] = _FakeStore(items, bookkeeping=bk)
@@ -209,25 +255,45 @@ class TestDebugDumpHappyPath:
         assert row["first_seen"] == "2026-06-01T09:00:00"
         assert row["last_seen"] == "2026-06-30T12:00:00"
 
-    def test_bookkeeping_fields_absent_when_no_bookkeeping_record(self, tmp_path, monkeypatch):
-        """When a key has no bookkeeping record, the row omits bookkeeping fields
-        rather than carrying stale payload values.
+    def test_full_bookkeeping_row_present_in_the_dump(self, tmp_path, monkeypatch):
+        """Every registry-known key carries a full seven-field bookkeeping
+        row by invariant (``paramem.memory.store.MemoryStore``) — the
+        handler splats the WHOLE record onto the row (not a hand-maintained
+        field subset), so every field surfaces, including ``promoted``
+        (never exercised by the other happy-path tests here).
         """
         items = [
             (
                 "episodic",
-                "graph_no_bk",
+                "graph1",
                 {"subject": "X", "predicate": "p", "object": "Y"},
             ),
         ]
-        # No bookkeeping for the key.
+        bk = {
+            "graph1": _default_bookkeeping_row(
+                speaker_id="alice",
+                relation_type="factual",
+                reinforcement_count=2,
+                last_reinforced_cycle=5,
+                last_seen="2026-06-30T12:00:00",
+                first_seen="2026-06-01T09:00:00",
+                promoted=True,
+            )
+        }
         state = _make_state(tmp_path, store_items=items)
-        state["memory_store"] = _FakeStore(items, bookkeeping={})
+        state["memory_store"] = _FakeStore(items, bookkeeping=bk)
         client = _make_client(monkeypatch, state)
         resp = client.get("/debug/dump")
         assert resp.status_code == 200, resp.text
         row = resp.json()["entries"][0]
-        assert "speaker_id" not in row
-        assert "relation_type" not in row
-        assert "first_seen" not in row
-        assert "first_seen_cycle" not in row
+        for field in (
+            "speaker_id",
+            "relation_type",
+            "reinforcement_count",
+            "last_reinforced_cycle",
+            "last_seen",
+            "first_seen",
+            "promoted",
+        ):
+            assert field in row, f"{field} must be present on every registry-known key's row"
+        assert row["promoted"] is True

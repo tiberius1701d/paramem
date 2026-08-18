@@ -273,7 +273,7 @@ class TestStatusBackupStaleDetection:
 class TestStatusBackupDiskUsage:
     def test_status_backup_disk_usage_populated(self, tmp_path):
         """Write some slots → disk_used_bytes > 0."""
-        from tests.backup.test_retention import _ts, _write_slot
+        from tests.backup._slot_fixtures import _ts, _write_slot
 
         config = _make_server_config(tmp_path)
         config.paths.data.mkdir(parents=True, exist_ok=True)

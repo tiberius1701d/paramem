@@ -42,7 +42,7 @@ SCHEMA_VERSION: int = 1
 # Bundle manifest schema version — independent of SCHEMA_VERSION.
 # ---------------------------------------------------------------------------
 
-BUNDLE_SCHEMA_VERSION: int = 2
+BUNDLE_SCHEMA_VERSION: int = 3
 
 
 # ---------------------------------------------------------------------------
@@ -59,7 +59,6 @@ class ArtifactKind(str, Enum):
 
     CONFIG = "config"
     GRAPH = "graph"
-    REGISTRY = "registry"
     RESUME = "resume"  # BG-trainer per-file artifacts
     SNAPSHOT = "snapshot"  # session snapshot, per-file
     SNAPSHOT_BUNDLE = "snapshot_bundle"  # self-contained recovery-set bundle
@@ -160,15 +159,6 @@ class BundleManifest:
         ``"pre_migration"``, etc.
     label : str | None
         Optional operator-supplied annotation.
-    key_metadata_sha256 : str
-        Plaintext SHA-256 hex of the ``key_metadata.json`` bytes captured
-        into this bundle, derived at write time by ``write_bundle`` (empty
-        string when no registry file was captured).  Provenance only — it
-        is not used to select any slot.  Slot selection is per-tier: each
-        captured slot is resolved with
-        ``find_live_slot(adapter_kind_dir, tier_registry_sha256(adapter_kind_dir))``
-        and its own hash is recorded at ``adapters.<name>.registry_sha256``;
-        a single global hash cannot address both main and interim tiers.
     base_model : dict
         Base-model identity copied from the first enabled adapter's
         ``meta.json``.  Expected keys: ``repo`` (str), ``sha`` (str),
@@ -180,22 +170,28 @@ class BundleManifest:
     adapters : dict
         Per-tier adapter capture record.  Keys are adapter names (e.g.
         ``"episodic"``).  Each value is a dict with:
-        ``slot_source`` (str, original slot path),
+        ``slot_source`` (str, original slot path — empty string when the
+        tier carries no live bound slot),
         ``registry_sha256`` (str),
         ``key_count`` (int | str),
-        ``simhash_present`` (bool),
+        ``indexed_key_registry_present`` (bool),
         ``keyed_pairs_present`` (bool, always False — keyed entries are
-        transient and regenerated from the graph on every cycle).
+        transient and regenerated from the graph on every cycle),
+        ``weightless_cause`` (str | None) — ``"torn_slot"`` (venue-blind)
+        when payload debris exists somewhere under the tier root but no
+        slot matched the live registry, so the capture completed WITHOUT
+        that payload rather than refusing or capturing silently; ``None``
+        for every ordinarily captured tier (a genuine bound slot was
+        found, in either venue).
     excluded : list[str]
         Human-readable list of artifact categories intentionally excluded
-        from this bundle (e.g. ``"graph (RAM-only by design)"``).
+        from this bundle.
     """
 
     bundle_schema_version: int
     created_at: str
     tier: str
     label: str | None
-    key_metadata_sha256: str
     base_model: dict
     files: list[dict]
     adapters: dict
@@ -238,7 +234,6 @@ class BundleManifest:
         required = (
             "created_at",
             "tier",
-            "key_metadata_sha256",
             "base_model",
             "files",
             "adapters",
@@ -252,7 +247,6 @@ class BundleManifest:
             created_at=data["created_at"],
             tier=data["tier"],
             label=data.get("label"),
-            key_metadata_sha256=data["key_metadata_sha256"],
             base_model=data["base_model"],
             files=data["files"],
             adapters=data["adapters"],
@@ -370,11 +364,6 @@ class RestoreResult:
         mutation occurred.  ``None`` when the target ``data_dir`` had no
         episodic slot (fresh / empty target) and the safety bundle write
         was skipped gracefully.
-    restart_required : bool
-        Always ``True`` — the in-VRAM adapters are stale after a restore.
-        A server restart re-mounts adapters from the freshly restored slots
-        via ``find_live_slot``.  No hot-swap is performed (8 GB VRAM
-        constraint; restart is the clean boundary).
     restored_config : bool
         ``True`` when the bundle's ``server.yaml`` was atomically written to
         ``config_path`` (only when ``restore_config=True`` was requested).
@@ -392,10 +381,19 @@ class RestoreResult:
         Routine within-tier stale-slot cleanup (old slot dirs inside a tier
         that IS in the bundle) is logged at INFO/DEBUG but NOT listed here.
         Empty when no orphan adapters were found.
+    weightless_adapters : dict[str, str]
+        Adapter name → ``weightless_cause`` for every restored adapter whose
+        bundle record carries a non-``None`` cause (e.g.
+        ``{"episodic": "torn_slot"}``).  Read verbatim from the bundle
+        manifest's ``adapters`` records — the capture path is the only
+        writer of the marking.  A restored tier listed here has a registry
+        with active keys but no bound slot, so it must not be served as-is;
+        callers keep the store offline instead of publishing it.  Empty when
+        the bundle carries no markings.
     """
 
     restored_adapters: list[str] = field(default_factory=list)
     safety_slot: Path | None = None
-    restart_required: bool = True
     restored_config: bool = False
     pruned_orphans: list[dict] = field(default_factory=list)
+    weightless_adapters: dict[str, str] = field(default_factory=dict)

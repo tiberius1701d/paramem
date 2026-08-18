@@ -4,11 +4,9 @@ Covers:
 
 - wait_for_cooldown helper (hot→cool, already-cool, None-sensor,
   bounded-timeout, disabled).
-- Order assertions that each GPU-burst head calls the gate BEFORE the
-  first GPU op and passes the correct per-site max-wait knob:
-    Boot preload (app._build_store_contents)
-    Fold workers (_run_interim_training / _run_full_cycle — source
-           structural assertions, since both are nested closures)
+- Order assertions that each GPU-burst fold-worker head calls the gate
+  BEFORE the first GPU op and passes the correct per-site max-wait knob
+  (source structural assertions, since the workers are nested closures).
 
 The inference path is deliberately NOT gated: STT pre-heats the GPU past
 any near-idle threshold and a per-request stall breaks voice-pipeline
@@ -20,67 +18,11 @@ All tests run CPU-only — no model loading or GPU required.
 from __future__ import annotations
 
 import inspect
-from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
 import paramem.server.app as app_module
-from paramem.adapters.registry_binding import VERIFIED, TierBinding
-from paramem.server.app import _build_store_contents
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def _verified_bindings(registry_map: dict) -> dict:
-    """Wrap a ``{tier: registry}`` map into the ``{tier: TierBinding}`` shape
-    ``verify_adapter_tree`` returns, with every tier VERIFIED."""
-    return {
-        tier: TierBinding(
-            tier=tier,
-            tier_root=Path(f"/fake/{tier}"),
-            status=VERIFIED,
-            registry=reg,
-            registry_present=True,
-            slot=None,
-            manifest=None,
-            candidate_count=0,
-            detail="",
-        )
-        for tier, reg in registry_map.items()
-    }
-
-
-def _make_config(tmp_path):
-    """Minimal ServerConfig with paths pointing at tmp_path."""
-    from paramem.server.config import PathsConfig, ServerConfig
-
-    config = ServerConfig()
-    ha = tmp_path / "ha"
-    config.paths = PathsConfig(
-        data=ha,
-        sessions=ha / "sessions",
-        debug=ha / "debug",
-    )
-    (ha / "adapters").mkdir(parents=True, exist_ok=True)
-    return config
-
-
-def _inject_config(config, *, model=None, tokenizer=None):
-    """Inject config (and optionally model/tokenizer) into _state; return restore."""
-    prior = {k: app_module._state.get(k) for k in ("config", "model", "tokenizer")}
-    app_module._state["config"] = config
-    app_module._state["model"] = model
-    app_module._state["tokenizer"] = tokenizer
-
-    def _restore():
-        for k, v in prior.items():
-            app_module._state[k] = v
-
-    return _restore
-
 
 # ---------------------------------------------------------------------------
 # wait_for_cooldown helper
@@ -190,83 +132,6 @@ class TestWaitForCooldown:
 
         temp_mock.assert_not_called()
         assert result is None
-
-
-# ---------------------------------------------------------------------------
-# Boot preload order assertion (_build_store_contents)
-# ---------------------------------------------------------------------------
-
-
-class TestPreloadCooldownOrder:
-    """wait_for_cooldown is called BEFORE _source.probe in _build_store_contents."""
-
-    @staticmethod
-    def _drive_build_store_contents(config, source_mock):
-        """Drive _build_store_contents via simulate mode with one active key."""
-        config.consolidation.mode = "simulate"
-        config.inference.preload_cache = True
-
-        fake_reg = MagicMock()
-        fake_reg.list_active.return_value = ["key_001"]
-
-        with (
-            patch(
-                "paramem.adapters.registry_binding.verify_adapter_tree",
-                return_value=_verified_bindings({"episodic": fake_reg}),
-            ),
-            patch("paramem.memory.source.DiskMemorySource", return_value=source_mock),
-        ):
-            return _build_store_contents(config, model=None, tokenizer=None)
-
-    def test_cooldown_called_before_probe(self, tmp_path):
-        """Cooldown gate fires before _source.probe in the preload burst."""
-        config = _make_config(tmp_path)
-        restore = _inject_config(config)
-        try:
-            call_order: list[str] = []
-
-            source_mock = MagicMock()
-            source_mock.probe.side_effect = lambda *a, **kw: call_order.append("probe") or {}
-
-            with patch(
-                "paramem.server.app.wait_for_cooldown",
-                side_effect=lambda *a, **kw: call_order.append("cooldown"),
-            ):
-                self._drive_build_store_contents(config, source_mock)
-
-            assert "cooldown" in call_order, "wait_for_cooldown must be called during preload"
-            assert "probe" in call_order, "probe must be called during preload"
-            assert call_order.index("cooldown") < call_order.index("probe"), (
-                f"cooldown must precede probe; got order: {call_order}"
-            )
-        finally:
-            restore()
-
-    def test_preload_passes_boot_max_wait(self, tmp_path):
-        """_build_store_contents passes cooldown_gate_max_wait_boot_s as max_wait_s."""
-        config = _make_config(tmp_path)
-        config.vram.cooldown_gate_max_wait_boot_s = 42  # sentinel value
-        restore = _inject_config(config)
-        try:
-            captured_kwargs: list[dict] = []
-
-            source_mock = MagicMock()
-            source_mock.probe.return_value = {}
-
-            def _capture_cooldown(*args, **kwargs):
-                captured_kwargs.append({"args": args, "kwargs": kwargs})
-
-            with patch("paramem.server.app.wait_for_cooldown", side_effect=_capture_cooldown):
-                self._drive_build_store_contents(config, source_mock)
-
-            assert captured_kwargs, "wait_for_cooldown must have been called"
-            # max_wait_s is the second positional arg
-            assert captured_kwargs[0]["args"][1] == 42, (
-                f"preload gate must pass cooldown_gate_max_wait_boot_s=42 as max_wait_s; "
-                f"got args={captured_kwargs[0]['args']}"
-            )
-        finally:
-            restore()
 
 
 # ---------------------------------------------------------------------------

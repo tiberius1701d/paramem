@@ -8,16 +8,12 @@ from paramem.utils.tokens import MEASURED_TOKENS_PER_WORD, estimate_tokens
 
 @pytest.fixture
 def buf(tmp_path):
-    return SessionBuffer(
-        session_dir=tmp_path / "sessions", state_dir=tmp_path / "state", debug=False
-    )
+    return SessionBuffer(session_dir=tmp_path / "sessions", debug=False)
 
 
 @pytest.fixture
 def buf_debug(tmp_path):
-    return SessionBuffer(
-        session_dir=tmp_path / "sessions", state_dir=tmp_path / "state", debug=True
-    )
+    return SessionBuffer(session_dir=tmp_path / "sessions", debug=True)
 
 
 def test_summary_empty(buf):
@@ -397,7 +393,6 @@ class TestMarkConsolidatedDocGroups:
         sessions_dir = tmp_path / "sessions"
         buf = SessionBuffer(
             session_dir=sessions_dir,
-            state_dir=sessions_dir.parent / "state",
             retain_sessions=True,
             debug=False,
         )
@@ -429,7 +424,6 @@ class TestMarkConsolidatedDocGroups:
         sessions_dir = tmp_path / "sessions"
         buf = SessionBuffer(
             session_dir=sessions_dir,
-            state_dir=sessions_dir.parent / "state",
             retain_sessions=False,
             debug=False,
         )
@@ -448,7 +442,6 @@ class TestMarkConsolidatedDocGroups:
         sessions_dir = tmp_path / "sessions"
         buf = SessionBuffer(
             session_dir=sessions_dir,
-            state_dir=sessions_dir.parent / "state",
             retain_sessions=True,
             debug=False,
         )
@@ -459,159 +452,6 @@ class TestMarkConsolidatedDocGroups:
         buf.mark_consolidated([session_id], retention_dir=retention_dir)
 
         assert (retention_dir / f"{session_id}.jsonl").exists()
-
-    def test_retired_doc_chunk_archives_group_under_retired_doc_subdir(self, tmp_path):
-        """A retired chunk pulls the whole doc_id group + origdoc into
-        retention_dir/retired_recall_failed/<doc_id>/ — doc-atomicity extends
-        to the retired distinction; a document is never split across the two
-        destinations.
-        """
-        sessions_dir = tmp_path / "sessions"
-        buf = SessionBuffer(
-            session_dir=sessions_dir,
-            state_dir=sessions_dir.parent / "state",
-            retain_sessions=True,
-            debug=False,
-        )
-
-        doc_id = "doc-retired1"
-        chunk_sid = f"{doc_id}-c000"
-        self._add_doc_chunk(buf, chunk_sid, doc_id, chunk_count=1, doc_filename="retired.md")
-        buf.write_origdoc(doc_id, b"retired original content")
-
-        retention_dir = tmp_path / "retention"
-        buf.mark_consolidated(
-            [chunk_sid],
-            retention_dir=retention_dir,
-            retired_session_ids={chunk_sid},
-        )
-
-        retired_doc_dir = retention_dir / "retired_recall_failed" / doc_id
-        assert (retired_doc_dir / f"{chunk_sid}.jsonl").exists()
-        assert (retired_doc_dir / "retired.md").exists()
-        assert (retired_doc_dir / "retired.md").read_bytes() == b"retired original content"
-        # Not archived under the plain (non-retired) doc location.
-        assert not (retention_dir / doc_id).exists()
-
-    def test_retired_doc_chunk_pulls_sibling_chunks_and_origdoc_too(self, tmp_path):
-        """Two-chunk document, only ONE chunk in retired_session_ids: BOTH chunk
-        JSONLs and the origdoc still land under the retired subdir together —
-        this is the case that would pass even if ``retired_doc_ids`` (the
-        doc-atomicity mechanism, session_buffer.py) were deleted, since a
-        single-chunk document can't distinguish "this chunk's own retired flag"
-        from "the group's retired flag". Two chunks force the distinction.
-        """
-        sessions_dir = tmp_path / "sessions"
-        buf = SessionBuffer(
-            session_dir=sessions_dir,
-            state_dir=sessions_dir.parent / "state",
-            retain_sessions=True,
-            debug=False,
-        )
-
-        doc_id = "doc-retired2"
-        chunk0_sid = f"{doc_id}-c000"
-        chunk1_sid = f"{doc_id}-c001"
-        self._add_doc_chunk(buf, chunk0_sid, doc_id, chunk_count=2, doc_filename="retired2.md")
-        self._add_doc_chunk(buf, chunk1_sid, doc_id, chunk_count=2, doc_filename="retired2.md")
-        buf.write_origdoc(doc_id, b"two-chunk retired content")
-
-        retention_dir = tmp_path / "retention"
-        # Only chunk0 is retired; chunk1 consolidated cleanly.
-        buf.mark_consolidated(
-            [chunk0_sid, chunk1_sid],
-            retention_dir=retention_dir,
-            retired_session_ids={chunk0_sid},
-        )
-
-        retired_doc_dir = retention_dir / "retired_recall_failed" / doc_id
-        # BOTH chunks — including the non-retired sibling — land under the
-        # retired subdir, since a document is never split across destinations.
-        assert (retired_doc_dir / f"{chunk0_sid}.jsonl").exists()
-        assert (retired_doc_dir / f"{chunk1_sid}.jsonl").exists()
-        assert (retired_doc_dir / "retired2.md").exists()
-        assert (retired_doc_dir / "retired2.md").read_bytes() == b"two-chunk retired content"
-        # The plain (non-retired) doc location must not exist at all.
-        assert not (retention_dir / doc_id).exists()
-
-
-class TestMarkConsolidatedRetiredSessions:
-    def test_retired_transcript_lands_under_retired_subdir(self, tmp_path):
-        """A retired (retry-capped) transcript session is archived under
-        retention_dir/retired_recall_failed/, not the flat layout.
-        """
-        sessions_dir = tmp_path / "sessions"
-        buf = SessionBuffer(
-            session_dir=sessions_dir,
-            state_dir=sessions_dir.parent / "state",
-            retain_sessions=True,
-            debug=False,
-        )
-        buf.append("conv-retired1", "user", "hello")
-        session_id = buf.get_pending()[0]["session_id"]
-
-        retention_dir = tmp_path / "retention"
-        buf.mark_consolidated(
-            [session_id],
-            retention_dir=retention_dir,
-            retired_session_ids={session_id},
-        )
-
-        assert (retention_dir / "retired_recall_failed" / f"{session_id}.jsonl").exists()
-        assert not (retention_dir / f"{session_id}.jsonl").exists()
-
-    def test_retired_transcript_unlinked_when_retain_false(self, tmp_path):
-        """retain_sessions=False (and debug=False) still means unlink for
-        retired sessions too — retention is the operator's choice, not a
-        second policy for the retired subset.
-        """
-        sessions_dir = tmp_path / "sessions"
-        buf = SessionBuffer(
-            session_dir=sessions_dir,
-            state_dir=sessions_dir.parent / "state",
-            retain_sessions=False,
-            debug=False,
-        )
-        buf.append("conv-retired2", "user", "hello")
-        session_id = buf.get_pending()[0]["session_id"]
-
-        buf.mark_consolidated(
-            [session_id],
-            retention_dir=None,
-            retired_session_ids={session_id},
-        )
-
-        assert not (sessions_dir / f"{session_id}.jsonl").exists()
-
-    def test_non_retired_sessions_in_mixed_batch_keep_flat_layout(self, tmp_path):
-        """A mixed mark_consolidated call (one retired, one clean) leaves the
-        clean session on today's flat layout — retired_session_ids does not
-        change behaviour for sessions outside it.
-        """
-        sessions_dir = tmp_path / "sessions"
-        buf = SessionBuffer(
-            session_dir=sessions_dir,
-            state_dir=sessions_dir.parent / "state",
-            retain_sessions=True,
-            debug=False,
-        )
-        buf.append("conv-retired3", "user", "hello")
-        retired_sid = buf.get_pending()[0]["session_id"]
-        buf.append("conv-clean3", "user", "hi")
-        clean_sid = [s["session_id"] for s in buf.get_pending() if s["session_id"] != retired_sid][
-            0
-        ]
-
-        retention_dir = tmp_path / "retention"
-        buf.mark_consolidated(
-            [retired_sid, clean_sid],
-            retention_dir=retention_dir,
-            retired_session_ids={retired_sid},
-        )
-
-        assert (retention_dir / "retired_recall_failed" / f"{retired_sid}.jsonl").exists()
-        assert (retention_dir / f"{clean_sid}.jsonl").exists()
-        assert not (retention_dir / f"{retired_sid}.jsonl").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -753,7 +593,6 @@ class TestSessionRotation:
         one session."""
         buf = SessionBuffer(
             session_dir=tmp_path / "sessions",
-            state_dir=tmp_path / "state",
             idle_timeout_minutes=10,
         )
         buf.append("conv-1", "user", "hello")
@@ -777,7 +616,6 @@ class TestSessionRotation:
 
         buf = SessionBuffer(
             session_dir=tmp_path / "sessions",
-            state_dir=tmp_path / "state",
             idle_timeout_minutes=10,
         )
         buf.append("conv-1", "user", "first turn")
@@ -798,12 +636,12 @@ class TestSessionRotation:
     def test_restart_split_new_session_after_rehydrate(self, tmp_path):
         """rehydrate_from_disk (cold start) does not restore _open — the next
         append on the same conversation_id opens a fresh session."""
-        buf1 = SessionBuffer(session_dir=tmp_path / "sessions", state_dir=tmp_path / "state")
+        buf1 = SessionBuffer(session_dir=tmp_path / "sessions")
         buf1.append("conv-1", "user", "before restart")
         session_id_before = buf1.get_pending()[0]["session_id"]
 
         # Cold restart: fresh buffer, rehydrate pending JSONL (no snapshot).
-        buf2 = SessionBuffer(session_dir=tmp_path / "sessions", state_dir=tmp_path / "state")
+        buf2 = SessionBuffer(session_dir=tmp_path / "sessions")
         buf2.rehydrate_from_disk()
         buf2.append("conv-1", "user", "after restart")
 
@@ -822,7 +660,6 @@ class TestSessionRotation:
 
         buf = SessionBuffer(
             session_dir=tmp_path / "sessions",
-            state_dir=tmp_path / "state",
             idle_timeout_minutes=10,
         )
         buf.set_speaker("doc-1-c000", "spk-a", "Alice")
@@ -856,45 +693,11 @@ class TestSessionRotation:
         # suffix.
         assert len(ids) == 50
 
-    def test_durable_unit_methods_resolve_after_two_map_split(self, tmp_path):
-        """retirable / mark_consolidated / discard_sessions / hydrate_retry_counts
-        / bump_retry_and_release / reset_retry_count_for all still operate on
-        minted session_ids — the highest-risk regression surface from the
-        _sessions/_open split."""
-        buf = SessionBuffer(
-            session_dir=tmp_path / "sessions",
-            state_dir=tmp_path / "state",
-            consolidation_retry_cap=2,
-        )
-        buf.append("conv-1", "user", "hello")
-        session_id = buf.get_pending()[0]["session_id"]
-
-        # retirable(): transcript sessions (no doc_id) always retire.
-        assert buf.retirable({session_id}) == [session_id]
-
-        # bump_retry_and_release / reset_retry_count_for operate on _sessions,
-        # keyed by the minted session_id (durable, unaffected by the _open split).
-        buf.hydrate_retry_counts()  # no durable file yet — non-fatal no-op
-        released = buf.bump_retry_and_release({session_id})
-        assert released == []  # cap is 2, first bump doesn't release
-        assert buf._sessions[session_id]["recall_retry_count"] == 1
-
-        buf.reset_retry_count_for(session_id)
-        assert "recall_retry_count" not in buf._sessions[session_id]
-
-        # discard_sessions / mark_consolidated resolve the minted id and clear it.
-        buf.append("conv-2", "user", "hello again")
-        sid2 = next(
-            p["session_id"] for p in buf.get_pending() if p["session_id"].startswith("conv-2-")
-        )
-        buf.mark_consolidated([sid2])
-        assert sid2 not in {p["session_id"] for p in buf.get_pending()}
-
     def test_mark_consolidated_evicts_open_and_next_append_mints_fresh(self, tmp_path):
         """After mark_consolidated retires a conversation's session, the next
         append on the SAME conversation_id mints a NEW session_id — it does
         not reuse the retired one, and _open no longer references it."""
-        buf = SessionBuffer(session_dir=tmp_path / "sessions", state_dir=tmp_path / "state")
+        buf = SessionBuffer(session_dir=tmp_path / "sessions")
         buf.append("conv-1", "user", "hello")
         retired_session_id = buf.get_pending()[0]["session_id"]
         assert buf._open["conv-1"]["session_id"] == retired_session_id
@@ -910,7 +713,7 @@ class TestSessionRotation:
     def test_discard_sessions_evicts_open_and_next_append_mints_fresh(self, tmp_path):
         """Same coherence guarantee as mark_consolidated, for discard_sessions
         (the cancel path)."""
-        buf = SessionBuffer(session_dir=tmp_path / "sessions", state_dir=tmp_path / "state")
+        buf = SessionBuffer(session_dir=tmp_path / "sessions")
         buf.append("conv-1", "user", "hello")
         discarded_session_id = buf.get_pending()[0]["session_id"]
 
@@ -932,7 +735,7 @@ class TestSessionRotation:
         evicts it uniformly with conversational sessions — no doc special
         case in the prune itself.
         """
-        buf = SessionBuffer(session_dir=tmp_path / "sessions", state_dir=tmp_path / "state")
+        buf = SessionBuffer(session_dir=tmp_path / "sessions")
         chunk_id = "doc-1-c000"
         buf.set_speaker(chunk_id, "spk-a", "Alice")
         buf.set_document_metadata(chunk_id, doc_id="doc-1", chunk_count=1)
@@ -992,7 +795,6 @@ class TestSessionRotation:
         land in two sessions."""
         buf = SessionBuffer(
             session_dir=tmp_path / "sessions",
-            state_dir=tmp_path / "state",
             idle_timeout_minutes=10,
         )
         turn_text = ("word " * 100).strip()
@@ -1007,7 +809,6 @@ class TestSessionRotation:
         always admitted)."""
         buf = SessionBuffer(
             session_dir=tmp_path / "sessions",
-            state_dir=tmp_path / "state",
             idle_timeout_minutes=10,
         )
         huge_text = ("word " * 5000).strip()
@@ -1023,7 +824,6 @@ class TestSessionRotation:
         total — so it accepts a full cap's worth again."""
         buf = SessionBuffer(
             session_dir=tmp_path / "sessions",
-            state_dir=tmp_path / "state",
             idle_timeout_minutes=10,
         )
         turn_text = ("word " * 100).strip()
@@ -1038,7 +838,6 @@ class TestSessionRotation:
 
         buf = SessionBuffer(
             session_dir=tmp_path / "sessions",
-            state_dir=tmp_path / "state",
             idle_timeout_minutes=10,
         )
         buf.append("conv-idle-acc", "user", "first turn with several words in it")
@@ -1059,7 +858,6 @@ class TestSessionRotation:
 
         buf = SessionBuffer(
             session_dir=tmp_path / "sessions",
-            state_dir=tmp_path / "state",
             idle_timeout_minutes=10,
         )
         turn_text = ("word " * 100).strip()
@@ -1084,7 +882,6 @@ class TestSessionRotation:
 
         buf = SessionBuffer(
             session_dir=tmp_path / "sessions",
-            state_dir=tmp_path / "state",
             idle_timeout_minutes=10,
         )
         turn_text = ("word " * 100).strip()
@@ -1127,7 +924,6 @@ class TestSessionRotation:
         end-to-end quantity."""
         buf = SessionBuffer(
             session_dir=tmp_path / "sessions",
-            state_dir=tmp_path / "state",
             idle_timeout_minutes=10,
         )
         turn_text = ("word " * 100).strip()
@@ -1146,7 +942,6 @@ class TestSessionRotation:
         invisible to a caller reading the conversation's served context."""
         buf = SessionBuffer(
             session_dir=tmp_path / "sessions",
-            state_dir=tmp_path / "state",
             idle_timeout_minutes=10,
         )
         turn_text_base = ("word " * 100).strip()
@@ -1170,7 +965,6 @@ class TestSessionRotation:
 
         buf = SessionBuffer(
             session_dir=tmp_path / "sessions",
-            state_dir=tmp_path / "state",
             idle_timeout_minutes=10,
         )
         buf.append("conv-idle-chain", "user", "before the idle gap")
@@ -1209,7 +1003,6 @@ class TestSessionRotation:
 
         buf1 = SessionBuffer(
             session_dir=tmp_path / "sessions",
-            state_dir=tmp_path / "state",
             idle_timeout_minutes=10,
         )
         turn_text = ("word " * 100).strip()
@@ -1222,7 +1015,6 @@ class TestSessionRotation:
 
         buf2 = SessionBuffer(
             session_dir=tmp_path / "sessions",
-            state_dir=tmp_path / "state",
             idle_timeout_minutes=10,
         )
         assert buf2.load_snapshot()
@@ -1239,7 +1031,6 @@ class TestSessionRotation:
 
         buf1 = SessionBuffer(
             session_dir=tmp_path / "sessions",
-            state_dir=tmp_path / "state",
             idle_timeout_minutes=10,
         )
         buf1.append("conv-legacy", "user", "hello")
@@ -1250,7 +1041,6 @@ class TestSessionRotation:
 
         buf2 = SessionBuffer(
             session_dir=tmp_path / "sessions",
-            state_dir=tmp_path / "state",
             idle_timeout_minutes=10,
         )
         assert buf2.load_snapshot()
@@ -1270,7 +1060,6 @@ class TestSessionRotation:
         evicts the whole entry (existing behaviour)."""
         buf = SessionBuffer(
             session_dir=tmp_path / "sessions",
-            state_dir=tmp_path / "state",
             idle_timeout_minutes=10,
         )
         turn_text = ("word " * 100).strip()
@@ -1296,7 +1085,6 @@ class TestSessionRotation:
         prior_session_ids chain ever forms for a doc-chunk session."""
         buf = SessionBuffer(
             session_dir=tmp_path / "sessions",
-            state_dir=tmp_path / "state",
             idle_timeout_minutes=10,
         )
         chunk_id = "doc-2-c000"
@@ -1326,7 +1114,6 @@ class TestSessionRotation:
         re-derived here (no duplicate invariant)."""
         buf = SessionBuffer(
             session_dir=tmp_path / "sessions",
-            state_dir=tmp_path / "state",
             idle_timeout_minutes=10,
         )
         cap_words = _TRANSCRIPT_MAX_TOKENS / MEASURED_TOKENS_PER_WORD
@@ -1357,7 +1144,7 @@ class TestClaimNotRevertedByNextAppend:
 
         from paramem.server.speaker import SpeakerStore
 
-        buf = SessionBuffer(session_dir=tmp_path / "sessions", state_dir=tmp_path / "state")
+        buf = SessionBuffer(session_dir=tmp_path / "sessions")
         v = [0.5, 0.3, 0.7, 0.1, 0.4, 0.6, 0.2, 0.8]
         norm = math.sqrt(sum(x * x for x in v))
         embedding = [x / norm for x in v]
@@ -1391,7 +1178,7 @@ class TestClaimNotRevertedByNextAppend:
 
 class TestStartedAtEndedAt:
     def test_get_pending_exposes_started_at_and_ended_at(self, tmp_path):
-        buf = SessionBuffer(session_dir=tmp_path / "sessions", state_dir=tmp_path / "state")
+        buf = SessionBuffer(session_dir=tmp_path / "sessions")
         buf.append("conv-1", "user", "first")
         buf.append("conv-1", "assistant", "second")
 
@@ -1419,7 +1206,7 @@ class TestAppendTurnFsync:
         loss, not just an ordinary process exit."""
         import os
 
-        buf = SessionBuffer(session_dir=tmp_path / "sessions", state_dir=tmp_path / "state")
+        buf = SessionBuffer(session_dir=tmp_path / "sessions")
 
         calls = []
         real_fsync = os.fsync
@@ -1437,10 +1224,10 @@ class TestAppendTurnFsync:
         SessionBuffer instance is readable by a fresh instance that
         rehydrates from the same session_dir (simulating a restart after
         the writing process exited)."""
-        buf1 = SessionBuffer(session_dir=tmp_path / "sessions", state_dir=tmp_path / "state")
+        buf1 = SessionBuffer(session_dir=tmp_path / "sessions")
         buf1.append("conv-1", "user", "hello durable world")
 
-        buf2 = SessionBuffer(session_dir=tmp_path / "sessions", state_dir=tmp_path / "state")
+        buf2 = SessionBuffer(session_dir=tmp_path / "sessions")
         buf2.rehydrate_from_disk()
 
         pending = buf2.get_pending()
@@ -1487,13 +1274,13 @@ class TestClaimSessionsAtomicRewrite:
         claim_sessions_for_speaker (session not yet loaded into RAM)."""
         store, speaker_id, embedding = self._enroll_and_embed(tmp_path)
 
-        buf1 = SessionBuffer(session_dir=tmp_path / "sessions", state_dir=tmp_path / "state")
+        buf1 = SessionBuffer(session_dir=tmp_path / "sessions")
         buf1.append("conv-orphan", "user", "hello there", embedding=embedding)
         session_id = buf1.get_pending()[0]["session_id"]
 
         # Fresh buffer that has NOT loaded this session into RAM — forces
         # the disk-only branch.
-        buf2 = SessionBuffer(session_dir=tmp_path / "sessions", state_dir=tmp_path / "state")
+        buf2 = SessionBuffer(session_dir=tmp_path / "sessions")
         claimed = buf2.claim_sessions_for_speaker(speaker_id, "Alex", store)
         assert claimed == 1
 

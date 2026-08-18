@@ -1,35 +1,44 @@
-"""Per-adapter meta.json schema and live-slot resolver.
+"""Per-slot meta.json schema and live-slot resolver.
 
-Schema version: MANIFEST_SCHEMA_VERSION = 4.
+Schema version: MANIFEST_SCHEMA_VERSION = 5.
 
-Schema history:
-  * v1: original schema (no ``window_stamp``).
-  * v2: adds ``window_stamp`` — the cadence-window the slot represents.
-    Set at write time by the producer (interim or full-cycle path).
-    Provenance only: no code reads it back to decide whether a fold is due
-    (the full-cycle gate, ``_is_full_cycle_due``, counts payload-bearing
-    interim slots and an oldest-interim-age deadline instead).
-  * v3: retired — the ``keyed_pairs_sha256`` field it added is dropped on load.
-  * v4 (current): ``window_stamp`` is the only evolving field since v2.
+A single record shape, :class:`AdapterManifest`, describes the slot that
+holds either a LoRA weight payload (``payload.kind == "train"``) or a
+projected knowledge-graph payload (``payload.kind == "simulate"``). Both
+venues carry every field except the three weight-compatibility
+fingerprints (``base_model``, ``tokenizer``, ``lora``), which only a
+weight payload has: a graph payload has no base-model compatibility to
+determine, so those three are ``None`` — absent, not ``UNKNOWN`` — for a
+``simulate`` payload.
 
-Forward-compat: ``_dict_to_manifest`` accepts v1–v3 manifests on read.
-Absent ``window_stamp`` defaults to ``""``.
-``synthesized`` retains the same forward-compat default of ``False`` when absent.
+Readers accept the current schema only: ``_dict_to_manifest`` raises
+``ManifestSchemaError`` for any ``schema_version`` other than
+``MANIFEST_SCHEMA_VERSION`` — older or newer alike. There is no read-side
+fork for an older shape, and ``window_stamp`` is a required field. A
+prior-shape ``meta.json`` is migrated once, offline, by
+``scripts/migrate/stamp_slot_manifests_v5.py``, before the first boot on
+this schema.
 
 On-disk layout
 --------------
-Every adapter save produces a timestamped slot directory::
+Every write produces a timestamped slot directory::
 
     data/ha/adapters/episodic/20260421-041237/
         meta.json
         adapter_config.json
-        adapter_model.safetensors
+        adapter_model.safetensors      # payload.kind == "train"
+
+    data/ha/adapters/semantic/20260421-041237/
+        meta.json
+        graph.json                     # payload.kind == "simulate"
 
 ``UNKNOWN`` sentinel
 --------------------
 Single module-level constant used on ``str | int`` union fields when the
-value cannot be determined (migration paths, unpinned loads).  Startup
-validator consults ``AdapterManifest.synthesized`` to pick severity:
+value cannot be determined (migration paths, unpinned loads). It never
+appears on ``payload.sha256`` — no writer, envelope or migration script,
+can produce an undetermined payload digest. Startup validator consults
+``AdapterManifest.synthesized`` to pick severity:
 
 * ``synthesized=True`` + UNKNOWN → yellow (acceptable transient state).
 * ``synthesized=False`` + UNKNOWN → red (build_manifest_for failed; surface
@@ -37,7 +46,7 @@ validator consults ``AdapterManifest.synthesized`` to pick severity:
 
 References
 ----------
-- Per-adapter manifest schema is distinct from ArtifactMeta (not a shared envelope).
+- Per-slot manifest schema is distinct from ArtifactMeta (not a shared envelope).
 - Live-slot resolution is by registry_sha256 hash match, not a pointer/symlink file.
 """
 
@@ -53,12 +62,31 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Final
 
+from paramem.backup.hashing import plaintext_sha256
+
 logger = logging.getLogger(__name__)
 
-MANIFEST_SCHEMA_VERSION: int = 4
+MANIFEST_SCHEMA_VERSION: int = 5
 UNKNOWN: Final[str] = "unknown"
 
 _MANIFEST_FILENAME = "meta.json"
+
+
+# ---------------------------------------------------------------------------
+# Errors
+# ---------------------------------------------------------------------------
+
+
+class ManifestError(Exception):
+    """Base class for all manifest errors."""
+
+
+class ManifestNotFoundError(ManifestError):
+    """``meta.json`` does not exist in the given slot directory."""
+
+
+class ManifestSchemaError(ManifestError):
+    """``meta.json`` could be read but failed schema validation."""
 
 
 # ---------------------------------------------------------------------------
@@ -117,79 +145,118 @@ class LoRAShape:
     target_modules: tuple[str, ...]
 
 
+_PAYLOAD_KINDS: Final[frozenset[str]] = frozenset({"train", "simulate"})
+
+
 @dataclass(frozen=True)
-class AdapterManifest:
-    """Immutable per-adapter manifest written alongside every saved adapter.
+class PayloadFingerprint:
+    """Content fingerprint of the slot's own payload file.
 
     Attributes:
-        schema_version: Always ``MANIFEST_SCHEMA_VERSION`` (currently 4).
-        name: Adapter name string (e.g. ``"episodic"``).
+        kind: ``"train"`` (a LoRA weight payload,
+            ``adapter_model.safetensors``) or ``"simulate"`` (a projected
+            knowledge-graph payload, ``graph.json``) — the ruled venue
+            vocabulary. Checked in ``__post_init__`` against
+            :data:`_PAYLOAD_KINDS`, the closed vocabulary, so no writer —
+            construction site or ``_dict_to_manifest``'s read boundary —
+            can produce or accept an out-of-vocabulary value.
+        sha256: Plaintext SHA-256 hex digest of the payload file (age
+            envelope unwrapped when encrypted, via
+            :func:`~paramem.backup.hashing.plaintext_sha256`) — always a
+            real digest, never ``UNKNOWN``: no writer can produce an
+            undetermined payload fingerprint.
+
+    Raises:
+        ManifestSchemaError: ``kind`` is not ``"train"`` or ``"simulate"``.
+    """
+
+    kind: str
+    sha256: str
+
+    def __post_init__(self) -> None:
+        if self.kind not in _PAYLOAD_KINDS:
+            raise ManifestSchemaError(
+                f"PayloadFingerprint.kind must be one of {sorted(_PAYLOAD_KINDS)!r}, "
+                f"got {self.kind!r}"
+            )
+
+
+@dataclass(frozen=True)
+class AdapterManifest:
+    """Immutable per-slot manifest written alongside every written payload.
+
+    Attributes:
+        schema_version: Always ``MANIFEST_SCHEMA_VERSION`` (currently 5).
+        name: Adapter/tier name string (e.g. ``"episodic"``).
         trained_at: ISO-8601 UTC timestamp (``"YYYY-MM-DDTHH:MM:SSZ"``).
+        payload: The slot's own content fingerprint (see
+            :class:`PayloadFingerprint`).
+        registry_sha256: SHA-256 hex of ``indexed_key_registry.json`` at
+            write time; empty string when none; ``UNKNOWN`` for migrated.
+        key_count: The active-key count of the registry whose bytes hash to
+            ``registry_sha256``, at the time this manifest was (re-)stamped —
+            not a count of keys encoded in the payload. ``UNKNOWN`` when no
+            such registry snapshot was available to count.
+        base_model: Base model fingerprint. Present iff
+            ``payload.kind == "train"``; ``None`` for a ``simulate``
+            payload, which has no base-model compatibility to determine.
+        tokenizer: Tokenizer fingerprint. Same presence rule as
+            ``base_model``.
+        lora: LoRA shape. Same presence rule as ``base_model``.
+        synthesized: ``True`` **only** for migration-script output.  Drives
+            UNKNOWN severity: synthesized + UNKNOWN → yellow; fresh +
+            UNKNOWN → red.  Defaults to ``False`` when absent from on-disk
+            JSON (forward-compat).
         window_stamp: ``"YYYYMMDDTHHMM"`` cadence-window this slot represents.
             For interim slots (``episodic_interim_<X>``) it is the
             refresh-cadence boundary stamp (same value as the adapter-name
             suffix). For main full-cycle slots it is the full-consolidation
             boundary stamp. The slot's training represents this window: two
             slots with the same ``window_stamp`` were produced by cycles in
-            the same cadence boundary. Empty string for legacy v1 manifests
-            (auto-upgraded on read) and synthesized fallbacks where the
-            window is unknown.
-        base_model: Base model fingerprint.
-        tokenizer: Tokenizer fingerprint.
-        lora: LoRA shape.
-        registry_sha256: SHA-256 hex of ``indexed_key_registry.json`` at
-            training time; empty string when none; ``UNKNOWN`` for migrated.
-        key_count: The active-key count of the registry whose bytes hash to
-            ``registry_sha256``, at the time this manifest was (re-)stamped —
-            not a count of keys encoded in the adapter weights. ``UNKNOWN``
-            when no such registry snapshot was available to count.
-        synthesized: ``True`` **only** for migration-script output.  Drives
-            UNKNOWN severity: synthesized + UNKNOWN → yellow; fresh +
-            UNKNOWN → red.  Defaults to ``False`` when absent from on-disk
-            JSON (forward-compat).
+            the same cadence boundary. Provenance only — no gate reads it
+            back to decide whether a fold is due.
+
+    Invariant: ``payload.kind == "train"`` requires ``base_model``,
+    ``tokenizer`` and ``lora`` all non-``None``; any other ``payload.kind``
+    requires all three ``None`` — not merely "not all three present". Both
+    directions are checked in ``__post_init__`` (raises
+    :class:`ManifestSchemaError`), not assumed, so no caller can construct a
+    manifest carrying a partial fingerprint set on either kind.
     """
 
     schema_version: int
     name: str
     trained_at: str
-    base_model: BaseModelFingerprint
-    tokenizer: TokenizerFingerprint
-    lora: LoRAShape
+    payload: PayloadFingerprint
     registry_sha256: str
-    key_count: int | str  # int or UNKNOWN
+    key_count: "int | str"  # int or UNKNOWN
+    base_model: "BaseModelFingerprint | None" = None
+    tokenizer: "TokenizerFingerprint | None" = None
+    lora: "LoRAShape | None" = None
     synthesized: bool = False
-    window_stamp: str = ""  # cadence-window stamp; "" = legacy / unknown
+    window_stamp: str = ""  # cadence-window stamp; "" = unknown
 
-
-# ---------------------------------------------------------------------------
-# Errors
-# ---------------------------------------------------------------------------
-
-
-class ManifestError(Exception):
-    """Base class for all manifest errors."""
-
-
-class ManifestNotFoundError(ManifestError):
-    """``meta.json`` does not exist in the given slot directory."""
-
-
-class ManifestSchemaError(ManifestError):
-    """``meta.json`` could be read but failed schema validation."""
-
-
-class ManifestFingerprintMismatchError(ManifestError):
-    """A manifest field value disagrees with the live runtime state.
-
-    Attributes:
-        reason: Human-readable explanation.
-        field: Name of the mismatching field, or ``None`` when unspecified.
-    """
-
-    def __init__(self, reason: str, field: str | None = None) -> None:
-        super().__init__(reason)
-        self.reason = reason
-        self.field = field
+    def __post_init__(self) -> None:
+        is_train = self.payload.kind == "train"
+        all_present = (
+            self.base_model is not None and self.tokenizer is not None and self.lora is not None
+        )
+        all_absent = self.base_model is None and self.tokenizer is None and self.lora is None
+        if is_train and not all_present:
+            raise ManifestSchemaError(
+                "AdapterManifest invariant violated: payload.kind == 'train' requires "
+                "base_model, tokenizer and lora all non-None "
+                f"(base_model={self.base_model!r}, tokenizer={self.tokenizer!r}, "
+                f"lora={self.lora!r})"
+            )
+        if not is_train and not all_absent:
+            raise ManifestSchemaError(
+                "AdapterManifest invariant violated: payload.kind != 'train' requires "
+                "base_model, tokenizer and lora all None -- a partial fingerprint set "
+                f"is not permitted (payload.kind={self.payload.kind!r}, "
+                f"base_model={self.base_model!r}, tokenizer={self.tokenizer!r}, "
+                f"lora={self.lora!r})"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -198,39 +265,60 @@ class ManifestFingerprintMismatchError(ManifestError):
 
 
 def _manifest_to_dict(manifest: AdapterManifest) -> dict:
-    """Convert a manifest to a JSON-serialisable dict."""
+    """Convert a manifest to a JSON-serialisable dict.
+
+    Kind-conditional: a ``train`` payload's ``lora.target_modules`` tuple is
+    converted to a JSON-serialisable list. A ``simulate`` payload carries
+    ``base_model``/``tokenizer``/``lora`` as ``None`` by the schema
+    invariant — those three keys are OMITTED from the serialised dict
+    entirely (not emitted as JSON ``null``), so a graph-payload manifest on
+    disk carries no weight-compatibility keys at all.
+    """
     d = asdict(manifest)
-    # tuple is not JSON-serialisable; convert to list
-    d["lora"]["target_modules"] = list(manifest.lora.target_modules)
+    if manifest.payload.kind == "train":
+        d["lora"]["target_modules"] = list(manifest.lora.target_modules)
+    else:
+        del d["base_model"]
+        del d["tokenizer"]
+        del d["lora"]
     return d
 
 
 def _dict_to_manifest(d: dict) -> AdapterManifest:
     """Parse a raw dict from JSON into an AdapterManifest.
 
-    Schema-version handling:
-      * v1 (legacy): auto-upgraded in-memory by defaulting ``window_stamp``
-        to ``""``. The on-disk file is left untouched until the next save.
-        ``window_stamp`` is manifest provenance only — no gate reads it back.
-      * v2: adds ``window_stamp``. v1 manifests have it absent; read back
-        with ``window_stamp`` defaulted to ``""``.
-      * v3: legacy ``keyed_pairs_sha256`` field silently dropped on load.
-      * v4 (current): canonical schema.
-      * Newer-than-current: rejected with ManifestSchemaError so callers
-        do not silently downgrade.
+    Reads the CURRENT schema only: any ``schema_version`` other than
+    :data:`MANIFEST_SCHEMA_VERSION` — older or newer alike — is rejected
+    with :class:`ManifestSchemaError`; there is no read-side fork for an
+    older shape. A prior-shape ``meta.json`` is migrated once, offline, by
+    ``scripts/migrate/stamp_slot_manifests_v5.py`` before the first boot on
+    this schema; this parser never reads that shape, and ``window_stamp``
+    is required (the v1 absent-``window_stamp`` default and the v3
+    ``keyed_pairs_sha256`` drop no longer apply — the migration is the only
+    reader of that shape).
 
-    Raises ManifestSchemaError for missing required fields or unsupported
-    schema versions.
+    ``payload.kind == "train"`` requires ``base_model``, ``tokenizer`` and
+    ``lora`` all present; any other ``payload.kind`` requires all three
+    ABSENT from the dict (not merely null) — a non-train payload dict
+    carrying any of the three non-null is refused here, at the read
+    boundary, rather than silently discarded. :class:`AdapterManifest`'s
+    own ``__post_init__`` is the final enforcement of that invariant, so a
+    shape that slips past this parser's own checks is still caught at
+    construction.
+
+    Raises:
+        ManifestSchemaError: A required field is missing, the schema
+            version is not current, or the payload/fingerprint shape
+            violates the train/simulate invariant.
     """
     required_top = [
         "schema_version",
         "name",
         "trained_at",
-        "base_model",
-        "tokenizer",
-        "lora",
+        "payload",
         "registry_sha256",
         "key_count",
+        "window_stamp",
     ]
     for field in required_top:
         if field not in d:
@@ -239,49 +327,109 @@ def _dict_to_manifest(d: dict) -> AdapterManifest:
     schema = d["schema_version"]
     if not isinstance(schema, int):
         raise ManifestSchemaError(f"schema_version must be int, got {type(schema)!r}")
-    if schema > MANIFEST_SCHEMA_VERSION:
+    if schema != MANIFEST_SCHEMA_VERSION:
         raise ManifestSchemaError(
-            f"schema_version={schema} is newer than supported "
-            f"({MANIFEST_SCHEMA_VERSION}); refusing to downgrade silently."
+            f"schema_version={schema} is not the supported schema version "
+            f"({MANIFEST_SCHEMA_VERSION})."
         )
 
-    bm = d["base_model"]
-    for f in ("repo", "sha", "hash"):
-        if f not in bm:
-            raise ManifestSchemaError(f"Missing base_model.{f}")
-    base_model = BaseModelFingerprint(repo=bm["repo"], sha=bm["sha"], hash=bm["hash"])
+    pl = d["payload"]
+    if not isinstance(pl, dict):
+        # A JSON-valid but wrongly-typed sub-object (e.g. "payload": 5) must
+        # never reach a bare `f not in pl` below -- that raises TypeError on
+        # a non-container, which is not in ManifestSchemaError's catch set
+        # anywhere up the call chain (find_live_slot, verify_tier_binding
+        # steps 5/6) and crashes the whole tree walk for one malformed
+        # manifest. Every wrongly-typed sub-object gets the same treatment
+        # below (base_model / tokenizer / lora).
+        raise ManifestSchemaError(f"payload must be a JSON object, got {type(pl).__name__!r}")
+    for f in ("kind", "sha256"):
+        if f not in pl:
+            raise ManifestSchemaError(f"Missing payload.{f}")
+    if not isinstance(pl["kind"], str):
+        # Same class of wrongly-typed-field defense as the sub-object checks
+        # below: PayloadFingerprint.__post_init__ tests `kind not in
+        # _PAYLOAD_KINDS`, a frozenset membership check that raises a bare
+        # (uncaught) TypeError on an unhashable value (e.g. a JSON list)
+        # instead of the intended ManifestSchemaError -- crashing the whole
+        # tree walk for one malformed manifest. Caught here, before
+        # construction.
+        raise ManifestSchemaError(
+            f"payload.kind must be a string, got {type(pl['kind']).__name__!r}"
+        )
+    payload = PayloadFingerprint(kind=pl["kind"], sha256=pl["sha256"])
 
-    tok = d["tokenizer"]
-    for f in ("name_or_path", "vocab_size", "merges_hash"):
-        if f not in tok:
-            raise ManifestSchemaError(f"Missing tokenizer.{f}")
-    tokenizer = TokenizerFingerprint(
-        name_or_path=tok["name_or_path"],
-        vocab_size=tok["vocab_size"],
-        merges_hash=tok["merges_hash"],
-    )
+    base_model: "BaseModelFingerprint | None" = None
+    tokenizer: "TokenizerFingerprint | None" = None
+    lora: "LoRAShape | None" = None
 
-    lo = d["lora"]
-    for f in ("rank", "alpha", "dropout", "target_modules"):
-        if f not in lo:
-            raise ManifestSchemaError(f"Missing lora.{f}")
-    lora = LoRAShape(
-        rank=lo["rank"],
-        alpha=lo["alpha"],
-        dropout=lo["dropout"],
-        target_modules=tuple(lo["target_modules"]),
-    )
+    bm = d.get("base_model")
+    tok = d.get("tokenizer")
+    lo = d.get("lora")
 
-    # v1 → v2 auto-upgrade: window_stamp absent in v1; default to "".
-    window_stamp = d.get("window_stamp", "")
+    if payload.kind == "train":
+        if bm is None or tok is None or lo is None:
+            raise ManifestSchemaError(
+                "payload.kind == 'train' requires base_model, tokenizer and lora"
+            )
+        if not isinstance(bm, dict):
+            raise ManifestSchemaError(
+                f"base_model must be a JSON object, got {type(bm).__name__!r}"
+            )
+        for f in ("repo", "sha", "hash"):
+            if f not in bm:
+                raise ManifestSchemaError(f"Missing base_model.{f}")
+        base_model = BaseModelFingerprint(repo=bm["repo"], sha=bm["sha"], hash=bm["hash"])
+
+        if not isinstance(tok, dict):
+            raise ManifestSchemaError(
+                f"tokenizer must be a JSON object, got {type(tok).__name__!r}"
+            )
+        for f in ("name_or_path", "vocab_size", "merges_hash"):
+            if f not in tok:
+                raise ManifestSchemaError(f"Missing tokenizer.{f}")
+        tokenizer = TokenizerFingerprint(
+            name_or_path=tok["name_or_path"],
+            vocab_size=tok["vocab_size"],
+            merges_hash=tok["merges_hash"],
+        )
+
+        if not isinstance(lo, dict):
+            raise ManifestSchemaError(f"lora must be a JSON object, got {type(lo).__name__!r}")
+        for f in ("rank", "alpha", "dropout", "target_modules"):
+            if f not in lo:
+                raise ManifestSchemaError(f"Missing lora.{f}")
+        if not isinstance(lo["target_modules"], list):
+            # `tuple(lo["target_modules"])` below raises a bare (uncaught)
+            # TypeError on a non-iterable value (e.g. a JSON number) instead
+            # of the intended ManifestSchemaError -- same defense as the
+            # payload.kind check above, caught here before construction.
+            raise ManifestSchemaError(
+                f"lora.target_modules must be a JSON array, got "
+                f"{type(lo['target_modules']).__name__!r}"
+            )
+        lora = LoRAShape(
+            rank=lo["rank"],
+            alpha=lo["alpha"],
+            dropout=lo["dropout"],
+            target_modules=tuple(lo["target_modules"]),
+        )
+    elif bm is not None or tok is not None or lo is not None:
+        raise ManifestSchemaError(
+            f"payload.kind={payload.kind!r} (non-train) must not carry a "
+            "base_model/tokenizer/lora fingerprint block -- got at least one non-null"
+        )
+
+    window_stamp = d["window_stamp"]
     if not isinstance(window_stamp, str):
         raise ManifestSchemaError(f"window_stamp must be str, got {type(window_stamp)!r}")
 
     return AdapterManifest(
-        schema_version=d["schema_version"],
+        schema_version=MANIFEST_SCHEMA_VERSION,
         name=d["name"],
         trained_at=d["trained_at"],
         window_stamp=window_stamp,
+        payload=payload,
         base_model=base_model,
         tokenizer=tokenizer,
         lora=lora,
@@ -330,13 +478,16 @@ def read_manifest(slot: Path) -> AdapterManifest:
 
     Raises:
         ManifestNotFoundError: ``meta.json`` absent from *slot*.
-        ManifestSchemaError: File present but fails JSON parse or schema.
+        ManifestSchemaError: File present but fails to decode as UTF-8,
+            fails JSON parse, or fails schema validation.
     """
     path = slot / _MANIFEST_FILENAME
     if not path.exists():
         raise ManifestNotFoundError(f"meta.json not found in slot: {slot}")
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_bytes().decode("utf-8"))
+    except UnicodeDecodeError as exc:
+        raise ManifestSchemaError(f"meta.json is not valid UTF-8: {path}: {exc}") from exc
     except json.JSONDecodeError as exc:
         raise ManifestSchemaError(f"Invalid JSON in {path}: {exc}") from exc
     if not isinstance(data, dict):
@@ -364,17 +515,19 @@ def _slot_mtime(slot: Path) -> float:
         return 0.0
 
 
-def _iter_slot_candidates(adapter_kind_dir: Path) -> Iterator[Path]:
+def iter_slot_candidates(adapter_kind_dir: Path) -> Iterator[Path]:
     """Yield every non-hidden subdirectory of *adapter_kind_dir* carrying a ``meta.json``.
 
-    Presence-only: a "candidate" is a subdirectory that looks like a weight
+    Presence-only: a "candidate" is a subdirectory that looks like a written
     slot because it has a ``meta.json`` file, regardless of whether that
-    manifest is actually readable or matches any particular registry hash.
-    ``.pending`` and all other dot-prefixed entries are skipped. This is the
-    single shared predicate behind :func:`find_live_slot` (which additionally
-    reads and validates each candidate's manifest) and
-    :func:`count_slot_candidates` (which only counts) — collapsed from
-    duplicated inline predicates at both.
+    manifest is actually readable, which venue it carries, or matches any
+    particular registry hash. ``.pending`` and all other dot-prefixed
+    entries are skipped. This is the single shared predicate behind
+    :func:`find_live_slot` (which additionally reads and validates each
+    candidate's manifest) and :func:`count_slot_candidates` (which only
+    counts) — collapsed from duplicated inline predicates at both. It is
+    also the walk ``scripts/migrate/stamp_slot_manifests_v5.py`` composes
+    unchanged, so migration and boot cannot disagree about what a slot is.
 
     Args:
         adapter_kind_dir: Directory scoped to a single adapter kind (e.g.
@@ -399,7 +552,7 @@ def _iter_slot_candidates(adapter_kind_dir: Path) -> Iterator[Path]:
 def find_live_slot(adapter_kind_dir: Path, live_registry_sha256: str) -> Path | None:
     """Return the slot whose ``meta.registry_sha256`` matches *live_registry_sha256*.
 
-    Scans *adapter_kind_dir* via :func:`_iter_slot_candidates` for candidate
+    Scans *adapter_kind_dir* via :func:`iter_slot_candidates` for candidate
     slot directories, then reads and validates each one's ``meta.json``.
     Unreadable manifests produce a WARN log and are skipped.
 
@@ -408,7 +561,8 @@ def find_live_slot(adapter_kind_dir: Path, live_registry_sha256: str) -> Path | 
 
     An empty *live_registry_sha256* matches slots whose
     ``meta.registry_sha256`` is also empty — this is the fresh-install /
-    experiment path where no registry exists yet.
+    experiment path where no registry exists yet (also the donor-store
+    convention: a donor carries no key registry).
 
     Args:
         adapter_kind_dir: Directory scoped to a single adapter kind (e.g.
@@ -420,7 +574,7 @@ def find_live_slot(adapter_kind_dir: Path, live_registry_sha256: str) -> Path | 
         Path to the best matching slot, or ``None`` when no match is found.
     """
     candidates: list[Path] = []
-    for entry in _iter_slot_candidates(adapter_kind_dir):
+    for entry in iter_slot_candidates(adapter_kind_dir):
         try:
             manifest = read_manifest(entry)
         except ManifestNotFoundError:
@@ -441,17 +595,17 @@ def find_live_slot(adapter_kind_dir: Path, live_registry_sha256: str) -> Path | 
 
 
 def count_slot_candidates(adapter_kind_dir: Path) -> int:
-    """Count weight-slot candidates in *adapter_kind_dir* (presence-only).
+    """Count slot candidates in *adapter_kind_dir* (presence-only).
 
-    Delegates to :func:`_iter_slot_candidates` — see its docstring for what
+    Delegates to :func:`iter_slot_candidates` — see its docstring for what
     counts as a candidate. This is the single implementation of the "does
-    this tier dir have any trained slot at all" check that used to be
+    this tier dir have any written slot at all" check that used to be
     duplicated at multiple call sites; it is now shared by the boot mount
     loop's one per-tier validator (``_validate_adapter_slot``, used
     identically for main and interim tiers), ``/speaker/forget``'s manifest
     re-stamp gate, and :func:`~paramem.server.migration.compute_shape_changes`'s
     never-trained-vs-all-corrupt distinction. It lets each caller tell "not
-    yet trained" (zero candidates — silent skip is correct) apart from "every
+    yet written" (zero candidates — silent skip is correct) apart from "every
     candidate slot is unreadable or doesn't match" (one or more candidates,
     but :func:`find_live_slot` still returned ``None`` — worth a WARNING).
 
@@ -463,7 +617,7 @@ def count_slot_candidates(adapter_kind_dir: Path) -> int:
         The number of matching subdirectories. ``0`` when *adapter_kind_dir*
         does not exist or is not a directory.
     """
-    return sum(1 for _ in _iter_slot_candidates(adapter_kind_dir))
+    return sum(1 for _ in iter_slot_candidates(adapter_kind_dir))
 
 
 def tier_registry_sha256(tier_root: Path) -> str:
@@ -480,11 +634,9 @@ def tier_registry_sha256(tier_root: Path) -> str:
 
     Absent-check plus delegate: this function itself only distinguishes "no
     registry file" (``""``) from "a registry file exists" (delegated to
-    :func:`~paramem.backup.hashing.plaintext_sha256`, imported lazily to keep
-    ``paramem.backup`` out of manifest consumers' import graph — there is no
-    import cycle, ``paramem.backup`` does not import this module at module
-    scope; the lazy import is a dependency-direction choice, not a cycle
-    workaround). A read/decrypt failure on an EXISTING file is not the same
+    :func:`~paramem.backup.hashing.plaintext_sha256`, imported at module
+    scope — :mod:`paramem.backup.hashing` is pure stdlib, so importing it
+    costs nothing here). A read/decrypt failure on an EXISTING file is not the same
     condition as an absent file and is NOT swallowed here — it propagates to
     the caller. Callers at a boot boundary that must degrade rather than fail
     the boot (e.g. ``app.py``'s startup mount/revalidate paths) catch locally
@@ -512,8 +664,6 @@ def tier_registry_sha256(tier_root: Path) -> str:
     registry_path = tier_root / "indexed_key_registry.json"
     if not registry_path.exists():
         return ""
-
-    from paramem.backup.hashing import plaintext_sha256
 
     return plaintext_sha256(registry_path)
 
@@ -687,7 +837,8 @@ def _lookup_hash_from_manifests(
     ``episodic``, ``semantic``, ``procedural``, ``episodic_interim_*``),
     then one more level for slot dirs, reading each ``meta.json``.  Slots
     inside ``.pending`` are skipped.  Unreadable manifests are skipped with
-    a debug log.
+    a debug log, and a ``simulate``-payload slot (``base_model is None`` —
+    a graph payload has no base-model to match) is skipped the same way.
 
     Slots whose ``base_model.hash == UNKNOWN`` are excluded — re-emitting
     ``UNKNOWN`` as a cache hit would permanently lock the cache to
@@ -729,6 +880,8 @@ def _lookup_hash_from_manifests(
                 logger.debug("_lookup_hash_from_manifests: skipping %s: %s", slot_dir, exc)
                 continue
             bm = manifest.base_model
+            if bm is None:
+                continue  # simulate-payload slot — no base_model to match
             if bm.repo != repo or bm.sha != commit_sha:
                 continue
             if bm.hash == UNKNOWN:
@@ -757,7 +910,7 @@ def _lookup_hash_from_manifests(
 
 
 # ---------------------------------------------------------------------------
-# Manifest builder
+# Manifest builders
 # ---------------------------------------------------------------------------
 
 
@@ -772,11 +925,18 @@ def build_manifest_for(
     window_stamp: str = "",
     adapter_root: "Path | None" = None,
 ) -> AdapterManifest:
-    """Build an :class:`AdapterManifest` for a live model/tokenizer.
+    """Build a ``train``-payload :class:`AdapterManifest` for a live model/tokenizer.
 
-    All fingerprinting happens here — single provider for every caller in
-    the training and server paths.  ``synthesized`` is always ``False``
-    (reserved for the migration script).
+    All weight-compatibility fingerprinting happens here — the single
+    provider for every TRAIN-payload caller in the training and server
+    paths. ``synthesized`` is always ``False`` (reserved for the migration
+    script). A ``simulate``-venue (projected knowledge graph) payload has no
+    model/tokenizer to fingerprint and is built by
+    :func:`graph_payload_manifest` instead. The returned manifest's
+    ``payload.sha256`` is a placeholder (``""``) — the caller hands the
+    manifest to :func:`~paramem.adapters.slot.write_slot`, which computes the
+    real plaintext digest of the payload file once it exists on disk and
+    substitutes it before writing ``meta.json``.
 
     The base-model weight hash is computed using three escalating strategies
     (cheapest first):
@@ -834,7 +994,8 @@ def build_manifest_for(
             read-back and get the file-hash speedup instead.
 
     Returns:
-        A fully-populated :class:`AdapterManifest` with ``synthesized=False``.
+        A fully-populated :class:`AdapterManifest` with
+        ``payload.kind == "train"`` and ``synthesized=False``.
     """
 
     # --- trained_at ---
@@ -994,10 +1155,62 @@ def build_manifest_for(
         name=adapter_name,
         trained_at=trained_at,
         window_stamp=window_stamp,
+        payload=PayloadFingerprint(kind="train", sha256=""),
         base_model=base_model_fp,
         tokenizer=tokenizer_fp,
         lora=lora,
         registry_sha256=registry_sha256,
         key_count=resolved_key_count,
+        synthesized=False,
+    )
+
+
+def graph_payload_manifest(
+    *,
+    name: str,
+    key_count: "int | str",
+    registry_sha256: str,
+    window_stamp: str,
+) -> AdapterManifest:
+    """Build a ``simulate``-payload :class:`AdapterManifest` for a graph slot.
+
+    Unlike :func:`build_manifest_for`, no live model or tokenizer is
+    consulted: a projected knowledge graph has no base-model compatibility
+    to fingerprint, so ``base_model``, ``tokenizer`` and ``lora`` stay
+    ``None`` by construction (the train/simulate invariant, enforced by
+    :meth:`AdapterManifest.__post_init__`). The returned manifest's
+    ``payload.sha256`` is a placeholder (``""``) — the caller hands it to
+    :func:`~paramem.adapters.slot.write_slot`, which computes the real
+    plaintext digest of ``graph.json`` once it exists on disk and
+    substitutes it before writing ``meta.json``.
+
+    Args:
+        name: Adapter/tier name this slot belongs to.
+        key_count: The active-key count of the registry snapshot whose
+            bytes hash to *registry_sha256* — same contract as
+            :func:`build_manifest_for`'s ``key_count``.
+        registry_sha256: The registry hash to record — same contract as
+            :func:`build_manifest_for`'s ``registry_sha256_override``.
+        window_stamp: Cadence-window stamp (see
+            :attr:`AdapterManifest.window_stamp`) — provenance-only, read by
+            nothing else. Keyword-required (no default): every caller must
+            state where its value comes from rather than silently omitting
+            provenance. Pass ``""`` explicitly when the call site records no
+            cadence window (e.g. the base-model-swap / trial-migration path,
+            which never stamps one).
+
+    Returns:
+        A fully-populated :class:`AdapterManifest` with
+        ``payload.kind == "simulate"`` and ``synthesized=False``.
+    """
+    trained_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return AdapterManifest(
+        schema_version=MANIFEST_SCHEMA_VERSION,
+        name=name,
+        trained_at=trained_at,
+        window_stamp=window_stamp,
+        payload=PayloadFingerprint(kind="simulate", sha256=""),
+        registry_sha256=registry_sha256,
+        key_count=key_count,
         synthesized=False,
     )

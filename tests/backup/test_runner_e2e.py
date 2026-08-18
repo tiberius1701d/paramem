@@ -40,7 +40,7 @@ def _make_config(
     config.security = SecurityConfig(
         backups=ServerBackupsConfig(
             schedule=schedule,
-            artifacts=["config", "graph", "registry"],
+            artifacts=["config", "graph"],
             max_total_disk_gb=max_total_disk_gb,
             retention=RetentionConfig(
                 daily=RetentionTierConfig(keep=daily_keep),
@@ -75,7 +75,7 @@ def _write_trial_json(state_dir: Path, backup_paths: dict[str, str]) -> None:
 
 class TestE2EBasicRun:
     def test_e2e_runs_against_tmp_tree(self, tmp_path):
-        """Run the full pipeline → 3 slots written, state/backup.json parseable."""
+        """Run the full pipeline → config+graph slots written, state/backup.json parseable."""
         config = _make_config(tmp_path)
         config.paths.data.mkdir(parents=True, exist_ok=True)
         state_dir = (config.paths.data / "state").resolve()
@@ -85,8 +85,6 @@ class TestE2EBasicRun:
 
         live_config = tmp_path / "server.yaml"
         live_config.write_bytes(b"model: mistral\n")
-        config.paths.key_metadata.parent.mkdir(parents=True, exist_ok=True)
-        config.paths.key_metadata.write_text('{"keys": {}}', encoding="utf-8")
 
         loop = _mock_loop()
         result = run_scheduled_backup(
@@ -98,7 +96,7 @@ class TestE2EBasicRun:
         )
 
         assert result.success
-        assert len(result.written_slots) == 3
+        assert len(result.written_slots) == 2
         for name, path_str in result.written_slots.items():
             assert Path(path_str).exists(), f"{name} slot dir missing"
 
@@ -122,7 +120,7 @@ class TestE2EPruningRespectImmunity:
         backups_root.mkdir(parents=True, exist_ok=True)
 
         # Pre-populate 12 daily config slots.
-        from tests.backup.test_retention import _ts, _write_slot
+        from tests.backup._slot_fixtures import _ts, _write_slot
 
         slots = []
         for i in range(12):
@@ -135,14 +133,12 @@ class TestE2EPruningRespectImmunity:
             {
                 "config": str(slots[0]),
                 "graph": str(slots[1]),
-                "registry": str(slots[2]),
+                "resume": str(slots[2]),
             },
         )
 
         live_config = tmp_path / "server.yaml"
         live_config.write_bytes(b"model: mistral\n")
-        config.paths.key_metadata.parent.mkdir(parents=True, exist_ok=True)
-        config.paths.key_metadata.write_text("{}", encoding="utf-8")
 
         # Run backup — this will also prune.
         result = run_scheduled_backup(
@@ -179,8 +175,6 @@ class TestE2EStateFileConsistency:
 
         live_config = tmp_path / "server.yaml"
         live_config.write_bytes(b"model: mistral\n")
-        config.paths.key_metadata.parent.mkdir(parents=True, exist_ok=True)
-        config.paths.key_metadata.write_text("{}", encoding="utf-8")
 
         # Run 1: success.
         result1 = run_scheduled_backup(

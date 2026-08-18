@@ -1,17 +1,24 @@
 """Operator-attention block for the ParaMem server.
 
-Pure-Python module — no torch, peft, or transformers imports at top level.
+No torch, peft, or transformers import anywhere in this module's transitive
+closure — measured, not merely absent at module scope. ``from
+paramem.server.config import DEFAULT_SERVER_CONFIG_PATH`` below reaches
+``config.py`` -> ``paramem.backup.types`` (pure stdlib: dataclasses, enum,
+pathlib), and :mod:`paramem.backup`'s own ``__init__`` carries no re-export
+surface (no code beyond its docstring) — it does NOT import
+``paramem.backup.backup``/``paramem.memory.interim_adapter``, so no torch/peft
+enters through that path. Importing this module (or any of it transitively)
+never constructs the application or touches the GPU — no FastAPI import and
+no live model load — so tests can call its populators directly against plain
+dicts/dataclasses without spinning a server or loading a model.
 Defines :class:`AttentionItem` (frozen dataclass) plus one populator function
 per alert category.  :func:`collect_attention_items` walks all active
 populators in display order and concatenates results.
 
-The module is intentionally isolated so tests can call populators directly
-without spinning a FastAPI server or loading a model.
-
 Display order (most actionable first):
 
     Migration → Consolidation → Sweeper → Backup → Config drift →
-    Boot degraded → Key rotation* → Encryption → Adapter fingerprint →
+    Key rotation* → Encryption → Adapter fingerprint →
     Local recall inactive → Voice degradation → Pre-flight
 
     (* stub returns [] — reserved for a future populator.)
@@ -27,6 +34,11 @@ from pathlib import Path
 from typing import Any
 
 from paramem.server.config import DEFAULT_SERVER_CONFIG_PATH
+from paramem.server.manifest_status import (
+    FINGERPRINT_ROW_STATUSES,
+    PROBLEM_ROW_STATUSES,
+    UNBOUND_ROW_STATUSES,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -417,53 +429,6 @@ def _collect_config_drift_items(state: dict) -> list[AttentionItem]:
     return []
 
 
-def _collect_boot_degraded_items(state: dict) -> list[AttentionItem]:
-    """Emit an item when the boot/reload preload could not materialise every active key.
-
-    ``boot_degraded`` is set by ``_preload_memory_store`` when
-    ``inference.preload_cache=True`` and the source cached fewer keys than are
-    active.  Recall is NOT affected — the inference path probes the adapter
-    weights on a cache miss (``MemoryStore.probe`` on-miss source delegation)
-    and memoises the result; the only cost is first-recall latency for the
-    un-cached keys until the cache re-warms.  Reported at ``info`` so the
-    operator can see the cold-cache state and trigger a re-warm if desired.
-
-    This item represents ONLY the recoverable partial-miss case.  A fatal
-    CUDA context loss (sticky ``AcceleratorError`` / ``cudaErrorIllegalAddress``)
-    is handled by boot fail-fast (``_fail_fast_cuda`` → ``os._exit(1)`` or
-    cloud-only degrade) and is never surfaced here — the probe catch re-raises
-    before ``boot_degraded`` can be set.
-
-    Parameters
-    ----------
-    state:
-        Server ``_state`` dict.  Read-only.
-
-    Returns
-    -------
-    list[AttentionItem]
-        Zero or one item.
-    """
-    degraded = state.get("boot_degraded")
-    if degraded is None:
-        return []
-    hits = degraded.get("hits")
-    total = degraded.get("total")
-    if hits is not None and total is not None:
-        summary = f"preload cached {hits}/{total} active keys — recall self-heals on demand"
-    else:
-        summary = "preload cache incomplete — recall self-heals on demand"
-    return [
-        AttentionItem(
-            kind="boot_degraded",
-            level="info",
-            summary=summary,
-            action_hint="re-warm the cache via a config apply or /gpu/acquire",
-            age_seconds=None,
-        )
-    ]
-
-
 def _collect_integrity_cleanup_items(state: dict) -> list[AttentionItem]:
     """Emit one item when boot-time cleanup removed partial training slots.
 
@@ -517,15 +482,23 @@ def _collect_adapter_fingerprint_items(state: dict) -> list[AttentionItem]:
     ``_mount_adapters_from_slots`` at startup).  Schema per row:
     ``{status, reason, field, severity, slot_path, checked_at}``.
 
-    Emits for two distinct problem classes:
+    Emits for two distinct problem classes, both single-sourced from
+    :mod:`paramem.server.manifest_status`:
 
-    * Fingerprint / manifest mismatch — ``status in {"mismatch",
-      "manifest_missing", "migrated_unverified"}``.  Slot exists but its
-      manifest doesn't match the loaded model.
-    * No matching slot — ``status == "no_matching_slot"``.  Slot dirs exist on
-      disk but none have a ``meta.registry_sha256`` matching the live,
-      readable registry — the slots are stale relative to a rebuilt
-      registry.
+    * Fingerprint / manifest mismatch —
+      ``status in FINGERPRINT_ROW_STATUSES`` (``"mismatch"``,
+      ``"manifest_missing"``, ``"migrated_unverified"``).  Slot exists but
+      its manifest doesn't match the loaded model.
+    * Unbound — ``status in UNBOUND_ROW_STATUSES`` (``"no_matching_slot"``,
+      ``"keys_without_slot"``, ``"payload_mismatch"``).  The tier's
+      registry↔slot-manifest binding resolved no usable live slot: slot
+      dirs exist on disk but none have a ``meta.registry_sha256`` matching
+      the live, readable registry (``no_matching_slot``); the registry
+      holds active keys and no slot candidate exists at all
+      (``keys_without_slot``); or a bound slot's payload bytes no longer
+      hash to the manifest's stamped digest (``payload_mismatch``). The
+      summary text is built from the row's ``reason`` field so an
+      unpublishable tier always renders a visible, condition-specific item.
 
     ``status in {"registry_unverified", "key_count_mismatch"}`` rows are
     DELIBERATELY not rendered here — the tier's registry↔slot-manifest
@@ -536,9 +509,10 @@ def _collect_adapter_fingerprint_items(state: dict) -> list[AttentionItem]:
     (``_record_unverified_tier_incidents``, app.py) surfaced by
     ``_collect_incident_items`` — the durable, keyless-visible reporter,
     unlike this populator which reads in-memory ``_state``. Both statuses
-    stay in ``_PROBLEMATIC_STATUSES`` below so
-    ``_collect_local_recall_inactive_items`` still defers to the
-    incident-driven item instead of double-reporting.
+    stay in :data:`~paramem.server.manifest_status.PROBLEM_ROW_STATUSES`
+    (consumed by ``_collect_local_recall_inactive_items`` below) so that
+    populator still defers to the incident-driven item instead of
+    double-reporting.
 
     Primary adapter (``"episodic"``) with severity ``"red"`` → level
     ``"failed"``.  Secondary adapters (``"semantic"``,
@@ -561,7 +535,16 @@ def _collect_adapter_fingerprint_items(state: dict) -> list[AttentionItem]:
     primary_items: list[AttentionItem] = []
     secondary_items: list[AttentionItem] = []
 
-    _MISMATCH_STATUSES = {"mismatch", "manifest_missing", "migrated_unverified"}
+    # Human-readable label per UNBOUND_ROW_STATUSES reason — the row's
+    # `reason` field is the same literal as its `status` (see
+    # _record_manifest_row's call sites in app.py), so this is what "summary
+    # built from the row's reason" means in practice: select and phrase a
+    # condition-specific sentence rather than rendering the raw status token.
+    _UNBOUND_REASON_LABEL = {
+        "no_matching_slot": "registry sha unresolved",
+        "keys_without_slot": "active keys but no written payload slot candidate exists",
+        "payload_mismatch": "bound slot's payload no longer matches its manifest digest",
+    }
 
     for name, row in sorted(manifest_status.items()):
         if not isinstance(row, dict):
@@ -571,7 +554,7 @@ def _collect_adapter_fingerprint_items(state: dict) -> list[AttentionItem]:
         reason = row.get("reason") or row_status
         age = _age_seconds_from_iso(row.get("checked_at", ""))
 
-        if row_status in _MISMATCH_STATUSES:
+        if row_status in FINGERPRINT_ROW_STATUSES:
             if severity == "red":
                 primary_items.append(
                     AttentionItem(
@@ -592,16 +575,14 @@ def _collect_adapter_fingerprint_items(state: dict) -> list[AttentionItem]:
                         age_seconds=age,
                     )
                 )
-        elif row_status == "no_matching_slot":
+        elif row_status in UNBOUND_ROW_STATUSES:
+            label = _UNBOUND_REASON_LABEL.get(reason, reason)
             if severity == "red":
                 primary_items.append(
                     AttentionItem(
-                        kind="adapter_no_matching_slot_primary",
+                        kind="adapter_unbound_primary",
                         level="failed",
-                        summary=(
-                            f"NO MATCHING SLOT ({name}) — registry sha unresolved — "
-                            "PA routing DISABLED"
-                        ),
+                        summary=f"ADAPTER UNBOUND ({name}) — {label} — PA routing DISABLED",
                         action_hint=(
                             "check registry integrity (journalctl -u paramem-server "
                             "-p err) and restore from backup if corrupt"
@@ -612,12 +593,9 @@ def _collect_adapter_fingerprint_items(state: dict) -> list[AttentionItem]:
             else:
                 secondary_items.append(
                     AttentionItem(
-                        kind="adapter_no_matching_slot_secondary",
+                        kind="adapter_unbound_secondary",
                         level="info",
-                        summary=(
-                            f"NO MATCHING SLOT ({name}) — registry sha unresolved — "
-                            "adapter unmounted"
-                        ),
+                        summary=f"ADAPTER UNBOUND ({name}) — {label} — adapter unmounted",
                         action_hint=None,
                         age_seconds=age,
                     )
@@ -655,9 +633,11 @@ def _collect_local_recall_inactive_items(state: dict) -> list[AttentionItem]:
        ``session_buffer.get_summary()["total"]`` so the count matches the
        ``/status pending_sessions`` field exactly.
     3. No existing problematic adapter-manifest entry (status in
-       ``{"no_matching_slot", "mismatch", "manifest_missing",
-       "migrated_unverified", "registry_unverified",
-       "key_count_mismatch"}``) — those rows carry their own, more specific
+       :data:`~paramem.server.manifest_status.PROBLEM_ROW_STATUSES` —
+       ``"no_matching_slot"``, ``"keys_without_slot"``,
+       ``"payload_mismatch"``, ``"mismatch"``, ``"manifest_missing"``,
+       ``"migrated_unverified"``, ``"registry_unverified"``,
+       ``"key_count_mismatch"``) — those rows carry their own, more specific
        action hints.  If any such entry is present, this item stays silent to
        avoid double-reporting.
 
@@ -680,17 +660,9 @@ def _collect_local_recall_inactive_items(state: dict) -> list[AttentionItem]:
     """
     # -- Guard: if any adapter-manifest row signals a slot-level problem,
     # defer to _collect_adapter_fingerprint_items which has the specific hint.
-    _PROBLEMATIC_STATUSES = {
-        "no_matching_slot",
-        "mismatch",
-        "manifest_missing",
-        "migrated_unverified",
-        "registry_unverified",
-        "key_count_mismatch",
-    }
     manifest_status: dict = state.get("adapter_manifest_status") or {}
     for row in manifest_status.values():
-        if isinstance(row, dict) and row.get("status") in _PROBLEMATIC_STATUSES:
+        if isinstance(row, dict) and row.get("status") in PROBLEM_ROW_STATUSES:
             return []
 
     # -- Derive keys_count from the live store (same source as /status).
@@ -978,13 +950,14 @@ def _collect_backup_items(state: dict, config) -> list[AttentionItem]:
             compute_schedule_period_seconds,
             parse_schedule_atom,
         )
+        from paramem.training.stage_ledger import data_state_dir
     except ImportError:
         return []
 
     items: list[AttentionItem] = []
 
     backups_cfg = config.security.backups
-    state_dir = (config.paths.data / "state").resolve()
+    state_dir = data_state_dir(config.paths.data).resolve()
     backups_root = (config.paths.data / "backups").resolve()
 
     # -- Read persisted backup state (None when no run has ever happened). --
@@ -1124,10 +1097,11 @@ def _collect_incident_items(state: dict, config) -> list[AttentionItem]:
 
     try:
         from paramem.server.incidents import IncidentStoreSchemaError, read_incidents
+        from paramem.training.stage_ledger import data_state_dir
     except ImportError:
         return []
 
-    state_dir = (config.paths.data / "state").resolve()
+    state_dir = data_state_dir(config.paths.data).resolve()
 
     try:
         incidents = read_incidents(state_dir)
@@ -1246,9 +1220,9 @@ def _collect_pre_flight_items(state: dict, config) -> list[AttentionItem]:
     )
 
     try:
-        registry_path = config.paths.key_metadata
+        adapter_dir_for_pf = config.adapter_dir
     except (AttributeError, TypeError):
-        registry_path = None
+        adapter_dir_for_pf = None
 
     try:
         pf = compute_pre_flight_check(
@@ -1256,7 +1230,7 @@ def _collect_pre_flight_items(state: dict, config) -> list[AttentionItem]:
             loop=loop,
             backups_root=backups_root,
             live_config_path=live_config_path,
-            registry_path=registry_path,
+            adapter_dir=adapter_dir_for_pf,
         )
     except Exception:
         logger.exception("pre-flight check could not be evaluated — surfacing as an attention item")
@@ -1367,7 +1341,7 @@ def collect_attention_items(
     Display order (most actionable first):
 
         Migration → Consolidation → Sweeper → Backup → Config drift →
-        Boot degraded → Key rotation* → Encryption → Adapter fingerprint →
+        Key rotation* → Encryption → Adapter fingerprint →
         Local recall inactive → Voice degradation → Pre-flight
 
         (* stub returns [] — reserved for a future populator.)
@@ -1399,7 +1373,6 @@ def collect_attention_items(
     items.extend(_collect_backup_items(state, config))
     items.extend(_collect_incident_items(state, config))
     items.extend(_collect_config_drift_items(state))
-    items.extend(_collect_boot_degraded_items(state))
     items.extend(_collect_integrity_cleanup_items(state))
     items.extend(_collect_key_rotation_items(state))  # stub
     items.extend(_collect_encryption_items(state))

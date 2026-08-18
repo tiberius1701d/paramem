@@ -2,7 +2,7 @@
 
 Covers:
 - ``ArtifactKind.SNAPSHOT_BUNDLE`` member present and has correct value.
-- ``BUNDLE_SCHEMA_VERSION`` constant present and equals 2.
+- ``BUNDLE_SCHEMA_VERSION`` constant present and equals 3.
 - ``BundleManifest`` round-trips through ``to_dict`` / ``from_dict``.
 - ``BundleManifest.from_dict`` raises ``BundleManifestError`` on schema-version
   mismatch and on missing required fields.
@@ -51,9 +51,9 @@ class TestBundleSchemaVersionConstant:
         """BUNDLE_SCHEMA_VERSION must be an integer."""
         assert isinstance(BUNDLE_SCHEMA_VERSION, int)
 
-    def test_bundle_schema_version_equals_two(self) -> None:
-        """BUNDLE_SCHEMA_VERSION must be 2."""
-        assert BUNDLE_SCHEMA_VERSION == 2
+    def test_bundle_schema_version_equals_three(self) -> None:
+        """BUNDLE_SCHEMA_VERSION must be 3."""
+        assert BUNDLE_SCHEMA_VERSION == 3
 
 
 # ---------------------------------------------------------------------------
@@ -84,7 +84,6 @@ def _make_manifest(**overrides) -> BundleManifest:
         created_at="2026-05-20T20:55:00Z",
         tier="manual",
         label=None,
-        key_metadata_sha256="a" * 64,
         base_model={
             "repo": "mistralai/Mistral-7B-Instruct-v0.3",
             "sha": "abc123",
@@ -103,7 +102,7 @@ def _make_manifest(**overrides) -> BundleManifest:
                 "slot_source": "/data/ha/adapters/episodic/20260520-123456",
                 "registry_sha256": "c" * 64,
                 "key_count": 550,
-                "simhash_present": True,
+                "indexed_key_registry_present": True,
                 "keyed_pairs_present": False,
             }
         },
@@ -114,23 +113,6 @@ def _make_manifest(**overrides) -> BundleManifest:
 
 
 class TestBundleManifestRoundTrip:
-    def test_to_dict_produces_expected_keys(self) -> None:
-        """to_dict() must contain all required manifest fields."""
-        bm = _make_manifest()
-        d = bm.to_dict()
-        expected_keys = {
-            "bundle_schema_version",
-            "created_at",
-            "tier",
-            "label",
-            "key_metadata_sha256",
-            "base_model",
-            "files",
-            "adapters",
-            "excluded",
-        }
-        assert expected_keys == set(d.keys())
-
     def test_from_dict_round_trip(self) -> None:
         """from_dict(to_dict(m)) must produce an equal manifest."""
         bm = _make_manifest(label="smoke")
@@ -159,7 +141,7 @@ class TestBundleManifestRoundTrip:
                 "size_bytes": 100,
             },
             {
-                "path": "registry/key_metadata.json",
+                "path": "adapters/episodic/key_metadata.json",
                 "content_sha256": "b" * 64,
                 "encrypted": True,
                 "size_bytes": 200,
@@ -246,14 +228,6 @@ class TestBundleManifestFromDictErrors:
         d = bm.to_dict()
         del d["tier"]
         with pytest.raises(BundleManifestError, match="tier"):
-            BundleManifest.from_dict(d)
-
-    def test_missing_key_metadata_sha256_raises(self) -> None:
-        """Missing 'key_metadata_sha256' raises BundleManifestError."""
-        bm = _make_manifest()
-        d = bm.to_dict()
-        del d["key_metadata_sha256"]
-        with pytest.raises(BundleManifestError, match="key_metadata_sha256"):
             BundleManifest.from_dict(d)
 
     def test_missing_files_raises(self) -> None:

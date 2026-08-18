@@ -63,6 +63,7 @@ from paramem.adapters.manifest import (  # noqa: E402  (sys.path setup above)
     AdapterManifest,
     BaseModelFingerprint,
     LoRAShape,
+    PayloadFingerprint,
     TokenizerFingerprint,
     write_manifest,
 )
@@ -204,6 +205,8 @@ def _synthesize_manifest(
     """
     from datetime import datetime
 
+    from paramem.backup.hashing import plaintext_sha256
+
     safetensors_path = adapter_dir / "adapter_model.safetensors"
     trained_at = (
         datetime.fromtimestamp(safetensors_path.stat().st_mtime, tz=timezone.utc).strftime(
@@ -260,10 +263,18 @@ def _synthesize_manifest(
 
     name = _adapter_name_from_dir(adapter_dir, name_from_config=name_from_config)
 
+    # --- payload digest ---
+    # Same primitive and regime the seal envelope stamps: plaintext SHA-256
+    # of the weight file, decrypting first when it is an age envelope.
+    # `_is_old_layout` (the only caller's caller) already guarantees this
+    # file exists at `adapter_dir` before this function runs.
+    payload_sha256 = plaintext_sha256(safetensors_path)
+
     return AdapterManifest(
         schema_version=MANIFEST_SCHEMA_VERSION,
         name=name,
         trained_at=trained_at,
+        payload=PayloadFingerprint(kind="train", sha256=payload_sha256),
         base_model=base_model_fp,
         tokenizer=tokenizer_fp,
         lora=lora_shape,

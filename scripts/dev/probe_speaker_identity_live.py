@@ -21,7 +21,7 @@ everywhere) and the render-boundary display-name substitution work end-to-end.
       * speaker0 contributes a fact where Dana is the object.
     After extraction and keyed-entry build, this verifies the CURRENT
     contract: every model-facing render (``entry_fact_text``,
-    ``MemoryStore.probe``'s ``fact_text``) carries the raw ``speaker{N}``
+    ``MemoryStore.probe_cache``'s ``fact_text``) carries the raw ``speaker{N}``
     token verbatim — there is no resolve-at-render path any more.  A
     display name is substituted only at the reply boundary, by the single
     resolver :func:`paramem.server.speaker.resolve_speaker_tokens`, applied
@@ -30,9 +30,9 @@ everywhere) and the render-boundary display-name substitution work end-to-end.
     (the THIRD-PARTY-DESCRIPTOR value) through that same resolver, never as
     the raw token.
 
-    For the MemoryStore.probe render path, directly pre-populate a
-    ``MemoryStore`` with SPO entries, call ``store.probe()`` with
-    ``source=None`` (cache-hit path — no resolver kwarg; probe never
+    For the MemoryStore cache-door render path, directly pre-populate a
+    ``MemoryStore`` with SPO entries, call ``store.probe_cache()`` (a plain
+    mirror lookup, no source, no resolver kwarg; the cache door never
     resolves), and assert the returned ``fact_text`` still carries the raw
     token; only after passing it through ``resolve_speaker_tokens`` does the
     display name appear.
@@ -48,7 +48,7 @@ import logging
 import os
 import sys
 import tempfile
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -128,7 +128,6 @@ def _build_buffer_and_store(tmp_dir: Path) -> tuple[SpeakerStore, SessionBuffer]
     )
     buffer = SessionBuffer(
         session_dir=tmp_dir / "sessions",
-        state_dir=tmp_dir / "state",
         retain_sessions=False,
         debug=False,
     )
@@ -291,7 +290,6 @@ def run_gpu_render_resolution(out_dir: Path) -> dict:
         warmup_steps=0,
     )
     consolidation_cfg = ConsolidationConfig(
-        indexed_key_replay=False,
         promotion_threshold=3,
     )
     loop = ConsolidationLoop(
@@ -302,7 +300,7 @@ def run_gpu_render_resolution(out_dir: Path) -> dict:
         episodic_adapter_config=_tier_cfg(),
         semantic_adapter_config=_tier_cfg(),
         procedural_adapter_config=_tier_cfg(),
-        memory_store=MemoryStore(replay_enabled=False),
+        memory_store=MemoryStore(),
         wandb_config=None,
         output_dir=out_dir,
         save_cycle_snapshots=False,
@@ -422,7 +420,7 @@ def run_gpu_render_resolution(out_dir: Path) -> dict:
         # display name only appears after passing fact_text through
         # resolve_speaker_tokens, exactly as the reply boundary does.
         # ---------------------------------------------------------------
-        mem_store = MemoryStore(replay_enabled=False)
+        mem_store = MemoryStore()
 
         # Case A — put entry_a into store, then probe (cache-hit path).
         mem_store.put("episodic", entry_a["key"], entry_a)
@@ -432,9 +430,11 @@ def run_gpu_render_resolution(out_dir: Path) -> dict:
             entry_a["key"],
             speaker_id=alex_id,
             relation_type="factual",
+            first_seen=datetime.now(timezone.utc).isoformat(),
+            promoted=False,
             allow_empty_speaker=False,
         )
-        probe_a = mem_store.probe({"episodic": [entry_a["key"]]})
+        probe_a = mem_store.probe_cache({"episodic": [entry_a["key"]]})
         hit_a = probe_a.get(entry_a["key"])
 
         # Case B — put entry_b into store, then probe.
@@ -443,9 +443,11 @@ def run_gpu_render_resolution(out_dir: Path) -> dict:
             entry_b["key"],
             speaker_id=alex_id,
             relation_type="social",
+            first_seen=datetime.now(timezone.utc).isoformat(),
+            promoted=False,
             allow_empty_speaker=False,
         )
-        probe_b = mem_store.probe({"episodic": [entry_b["key"]]})
+        probe_b = mem_store.probe_cache({"episodic": [entry_b["key"]]})
         hit_b = probe_b.get(entry_b["key"])
 
         cache_hit_a_fact_raw = hit_a.get("fact_text", "") if hit_a else ""
@@ -503,9 +505,11 @@ def run_gpu_render_resolution(out_dir: Path) -> dict:
             entry_anon["key"],
             speaker_id="",
             relation_type="factual",
+            first_seen=datetime.now(timezone.utc).isoformat(),
+            promoted=False,
             allow_empty_speaker=True,
         )
-        probe_anon = mem_store.probe({"episodic": [entry_anon["key"]]})
+        probe_anon = mem_store.probe_cache({"episodic": [entry_anon["key"]]})
         hit_anon = probe_anon.get(entry_anon["key"])
         cache_anon_fact_raw = hit_anon.get("fact_text", "") if hit_anon else ""
         cache_anon_fact = resolve_speaker_tokens(cache_anon_fact_raw, store)

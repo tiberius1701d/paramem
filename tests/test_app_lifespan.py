@@ -951,7 +951,7 @@ class TestBootCompletionTaskLifespan:
             with (
                 patch.object(app_module, "predict_base_bytes", return_value=None),
                 patch.object(app_module, "_gpu_occupied", return_value=False),
-                patch.object(app_module, "_build_config_derived_state"),
+                patch.object(app_module, "_build_runtime_components"),
                 patch.object(app_module, "_arm_active_store_migration", return_value=False),
                 patch.object(app_module, "_release_base_model_in_process"),
                 patch.object(app_module, "safe_empty_cache"),
@@ -1042,7 +1042,7 @@ class TestBootCompletionTaskLifespan:
             with (
                 patch.object(app_module, "predict_base_bytes", return_value=None),
                 patch.object(app_module, "_gpu_occupied", return_value=False),
-                patch.object(app_module, "_build_config_derived_state"),
+                patch.object(app_module, "_build_runtime_components"),
                 patch.object(app_module, "_arm_active_store_migration", return_value=False),
                 patch.object(app_module, "_release_base_model_in_process"),
                 patch.object(app_module, "safe_empty_cache"),
@@ -1106,7 +1106,7 @@ class TestBootCompletionTaskLifespan:
                 with (
                     patch.object(app_module, "predict_base_bytes", return_value=None),
                     patch.object(app_module, "_gpu_occupied", return_value=False),
-                    patch.object(app_module, "_build_config_derived_state"),
+                    patch.object(app_module, "_build_runtime_components"),
                     patch.object(app_module, "_arm_active_store_migration", return_value=False),
                     patch.object(app_module, "_release_base_model_in_process"),
                     patch.object(app_module, "safe_empty_cache"),
@@ -1192,7 +1192,7 @@ class TestEagerConsolidationLoopBootDegrade:
             with (
                 patch.object(app_module, "predict_base_bytes", return_value=None),
                 patch.object(app_module, "_gpu_occupied", return_value=False),
-                patch.object(app_module, "_build_config_derived_state"),
+                patch.object(app_module, "_build_runtime_components"),
                 patch.object(app_module, "_arm_active_store_migration", return_value=False),
                 patch.object(app_module, "_release_base_model_in_process"),
                 patch.object(app_module, "safe_empty_cache"),
@@ -1296,7 +1296,7 @@ class TestReclaimLoopPermanentDegradeGate:
                 patch.object(app_module, "predict_base_bytes", return_value=None),
                 patch.object(app_module, "_gpu_occupied", return_value=False),
                 patch("paramem.server.app.torch.cuda.is_available", return_value=True),
-                patch.object(app_module, "_build_config_derived_state"),
+                patch.object(app_module, "_build_runtime_components"),
                 patch.object(app_module, "_eager_create_consolidation_loop", side_effect=fatal_exc),
                 patch.object(app_module, "_cuda_crashloop_exhausted", return_value=True),
                 patch.object(app_module, "_release_base_model_in_process"),
@@ -1357,7 +1357,7 @@ class TestReclaimLoopPermanentDegradeGate:
                 patch.object(app_module, "predict_base_bytes", return_value=None),
                 patch.object(app_module, "_gpu_occupied", return_value=False),
                 patch("paramem.server.app.torch.cuda.is_available", return_value=True),
-                patch.object(app_module, "_build_config_derived_state"),
+                patch.object(app_module, "_build_runtime_components"),
                 patch.object(app_module, "_arm_active_store_migration", return_value=False),
                 patch.object(app_module, "_reconcile_scheduling_timers"),
                 patch.object(app_module, "_create_backup"),
@@ -1464,7 +1464,7 @@ class TestModeSlotHygiene:
                 patch.object(app_module, "_gpu_occupied", return_value=False),
                 patch("paramem.server.app.torch.cuda.is_available", return_value=True),
                 patch.object(app_module, "_load_model_into_state"),
-                patch.object(app_module, "_build_config_derived_state"),
+                patch.object(app_module, "_build_runtime_components"),
                 patch.object(app_module, "_arm_active_store_migration", return_value=False),
                 patch.object(app_module, "_release_base_model_in_process"),
                 patch.object(app_module, "safe_empty_cache"),
@@ -1559,7 +1559,7 @@ class TestShutdownGpuLockRelease:
             with (
                 patch.object(app_module, "predict_base_bytes", return_value=None),
                 patch.object(app_module, "_gpu_occupied", return_value=False),
-                patch.object(app_module, "_build_config_derived_state"),
+                patch.object(app_module, "_build_runtime_components"),
                 patch.object(app_module, "_arm_active_store_migration", return_value=False),
                 patch.object(
                     app_module,
@@ -1642,7 +1642,7 @@ class TestShutdownGpuLockRelease:
                 with (
                     patch.object(app_module, "predict_base_bytes", return_value=None),
                     patch.object(app_module, "_gpu_occupied", return_value=False),
-                    patch.object(app_module, "_build_config_derived_state"),
+                    patch.object(app_module, "_build_runtime_components"),
                     patch.object(app_module, "_arm_active_store_migration", return_value=False),
                     patch.object(
                         app_module,

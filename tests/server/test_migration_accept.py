@@ -54,7 +54,6 @@ def _make_state(tmp_path: Path, gates_status: str = "pass") -> dict:
     config.paths.data.mkdir(parents=True, exist_ok=True)
     config.adapter_dir = tmp_path / "data" / "ha" / "adapters"
     config.adapter_dir.mkdir(parents=True, exist_ok=True)
-    config.key_metadata_path = tmp_path / "data" / "ha" / "key_metadata.json"
 
     state_dir = config.paths.data / "state"
     state_dir.mkdir(parents=True, exist_ok=True)

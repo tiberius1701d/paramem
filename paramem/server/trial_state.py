@@ -84,10 +84,10 @@ class TrialMarker:
         absolute.
     trial_adapter_dir:
         Absolute path to the directory where the trial consolidation will
-        write adapter weights (``data/ha/state/trial_adapter/``).
+        write adapter weights (``data/ha/state/trial/adapters/``).
     trial_graph_dir:
         Absolute path to the directory where the trial consolidation will
-        persist the trial graph (``data/ha/state/trial_graph/``).
+        persist the trial graph (``data/ha/state/trial/graph/``).
     config_artifact_filename:
         Filename of the config artifact file inside the config backup slot
         (e.g. ``"config-20260421-040000.bin"``).  Used by the rollback handler
@@ -367,12 +367,10 @@ def trial_active(state: dict | None) -> bool:
     callers that carry no server state), and this checks its ephemeral
     ``state["migration"]["state"] == "TRIAL"`` field — not anything on disk.
 
-    The single predicate shared by every consolidation refusal that must
-    never drift apart: ``paramem.server.app._trial_active`` (the REST-boundary
-    dependency and the arbitrator's own in-process guard) and
-    ``paramem.training.consolidation.ConsolidationLoop.guard_trial_state``
-    (the training-layer refusal for callers, including experiment scripts,
-    that carry the server ``_state`` dict).
+    The single predicate every consolidation refusal reads so they never
+    drift apart: ``paramem.server.app._trial_active`` (the REST-boundary
+    dependency) and the arbitrator's own in-process guard both call this
+    function directly.
 
     Parameters
     ----------

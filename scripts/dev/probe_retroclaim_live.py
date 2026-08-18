@@ -101,7 +101,6 @@ def _build_buffer_and_store(tmp_dir: Path) -> tuple[SpeakerStore, SessionBuffer]
     )
     buffer = SessionBuffer(
         session_dir=tmp_dir / "sessions",
-        state_dir=tmp_dir / "state",
         retain_sessions=False,
         debug=False,
     )
@@ -232,7 +231,6 @@ def run_gpu_phases(out_dir: Path) -> dict:
         warmup_steps=0,
     )
     consolidation_cfg = ConsolidationConfig(
-        indexed_key_replay=False,
         promotion_threshold=3,
     )
     loop = ConsolidationLoop(
@@ -243,7 +241,7 @@ def run_gpu_phases(out_dir: Path) -> dict:
         episodic_adapter_config=_tier_cfg(),
         semantic_adapter_config=_tier_cfg(),
         procedural_adapter_config=_tier_cfg(),
-        memory_store=MemoryStore(replay_enabled=False),
+        memory_store=MemoryStore(),
         wandb_config=None,
         output_dir=out_dir,
         save_cycle_snapshots=False,

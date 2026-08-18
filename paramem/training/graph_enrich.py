@@ -291,7 +291,7 @@ def enrich_graph(
     the max (most recent) and ``first_seen`` the earliest non-empty
     (:func:`~paramem.graph.merger.min_nonempty`) across the chunk
     subgraph's edges, computed before same_as contraction mutates the
-    graph.  This mirrors ``ConsolidationLoop._build_registry_true_relations``
+    graph.  This mirrors ``ConsolidationLoop._working_registry_true_relations``
     stamping ``last_seen``/``first_seen`` from bookkeeping.
 
     Early-return conditions (all return ``skipped=True``):
@@ -388,7 +388,7 @@ def enrich_graph(
               slice failed); ``privacy_skipped_slices`` is the finer
               per-slice granularity and can be nonzero even when a
               chunk's OTHER slices succeeded and their facts egressed —
-              that partial-withholding case also logs a per-chunk
+              that partial-fail-closed-drop case also logs a per-chunk
               WARNING (``0 < slices_failed < slices``).
             - ``skipped`` (bool): ``True`` when enrichment was bypassed.
             - ``skip_reason`` (str | None): reason token when skipped —
@@ -407,10 +407,12 @@ def enrich_graph(
               call completes, so a fault mid-chunk discards only that
               chunk's own work) and returns normally rather than raising —
               the caller (:meth:`~paramem.training.consolidation.
-              ConsolidationLoop._refine_consolidation_graph`) records an
-              incident and the fold trains on the merged-but-unenriched
-              graph.  Enrichment self-heals next cycle: the pass runs over
-              the cumulative graph every fold.
+              ConsolidationLoop._record_enrichment_incident`, called from
+              inside :meth:`~paramem.training.consolidation.
+              ConsolidationLoop.stage_event`) records an incident and the
+              fold trains on the merged-but-unenriched graph.  Enrichment
+              self-heals next cycle: the pass runs over the cumulative
+              graph every fold.
     """
     _noop = lambda: None  # noqa: E731
     _gc_disable = gc_disable or _noop
@@ -591,8 +593,8 @@ def enrich_graph(
             # boundaries slice ``triples`` into token-envelope-bounded
             # pieces), NOT
             # necessarily the whole ``triples`` list, and NOT the same as
-            # what this chunk ultimately sends to cloud: under partial
-            # withholding ``payload.facts`` is ``triples`` MINUS every
+            # what this chunk ultimately sends to cloud: under a partial
+            # fail-closed drop ``payload.facts`` is ``triples`` MINUS every
             # fail-closed slice's facts (see ``AnonymizedContract``'s
             # ``facts`` field docstring) — never from ``identity_domain``
             # (see that function's docstring for why the two domains must
@@ -697,15 +699,15 @@ def enrich_graph(
                     )
                 continue
             if payload.slices_failed:
-                # status != "failed" here, so this is necessarily PARTIAL
-                # withholding (0 < slices_failed < slices): at least one
+                # status != "failed" here, so this is necessarily a PARTIAL
+                # fail-closed drop (0 < slices_failed < slices): at least one
                 # slice of this chunk dropped fail-closed while the rest
                 # survived and will egress below — the operator-visible
                 # signal the whole-chunk-only privacy_skipped_chunks
                 # counter cannot surface on its own.
                 logger.warning(
                     "graph_enrichment: %d/%d slice(s) dropped fail-closed for this "
-                    "chunk (partial withholding) — %d slice(s) still egress",
+                    "chunk (partial drop) — %d slice(s) still egress",
                     payload.slices_failed,
                     payload.slices,
                     payload.slices - payload.slices_failed,
@@ -752,9 +754,10 @@ def enrich_graph(
             # whole call completes).  Enrichment self-heals next cycle: this
             # pass runs over the cumulative graph every fold, so the skipped
             # chunk's relations are simply re-discovered later.  The caller
-            # (``ConsolidationLoop._refine_consolidation_graph``) records an
-            # operator-visible incident from ``aborted_reason`` and the fold
-            # proceeds to training on the merged-but-unenriched graph.
+            # (``ConsolidationLoop._record_enrichment_incident``, called from
+            # inside ``stage_event``) records an operator-visible incident
+            # from ``aborted_reason`` and the fold proceeds to training on
+            # the merged-but-unenriched graph.
             logger.warning(
                 "graph_enrichment: VRAM exhausted on chunk %d/%d — stopping "
                 "the enrichment pass, keeping %d already-merged chunk(s): %s",
@@ -979,10 +982,11 @@ def enrich_graph(
         privacy_skipped_slices,
         aborted_reason,
     )
-    # Write enrichment-collapsed ik_keys to the merger's removal ledger so the
-    # drift classifier can route them to drift_intended_removal rather than
-    # drift_genuine_loss.  Only keys from SUCCESSFUL contractions are written
-    # (failures were discarded from _pending before _collapsed_ik was updated).
+    # Enrichment-collapsed ik_keys are written to the merger's removal ledger
+    # so _apply_working_fate_decisions recognizes them as intentional
+    # removals rather than orphans.  Only keys from SUCCESSFUL contractions
+    # are written (failures were discarded from _pending before
+    # _collapsed_ik was updated).
     # No ``survivor_key``: a same_as contraction merges NODES, and the edges
     # recorded here are the ones that became self-loops and were dropped —
     # the fact does not carry forward under another indexed key, so there is

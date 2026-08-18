@@ -37,7 +37,7 @@ def _make_loop() -> ConsolidationLoop:
     loop.training_config = TrainingConfig()
     from paramem.memory.store import MemoryStore as _MS
 
-    loop.store = _MS(replay_enabled=False)
+    loop.store = _MS()
     loop.cycle_count = 1
     return loop
 

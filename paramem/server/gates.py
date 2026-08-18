@@ -16,7 +16,6 @@ Public entry point: :func:`evaluate_gates`.
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 import random
 import time
@@ -158,51 +157,71 @@ def _is_training_marker(exc: BaseException) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _registry_key_population(parsed: dict) -> list[str]:
-    """Return the indexed-key population from a parsed registry dict.
+def _live_key_population(adapter_dir: Path) -> tuple[bytes, list[str]]:
+    """Merge the three main tiers' on-disk ``indexed_key_registry.json``
+    files under *adapter_dir* into gate 4's sample population.
 
-    Two registry shapes exist on disk and both reach this function (via
-    :func:`_sample_registry_keys` and gate 4's registry-size precondition):
+    THE population + seed source for gate 4, replacing the single
+    ``key_metadata.json`` sample-population file that preceded the per-tier
+    ``key_metadata.json`` split. Reads via
+    :meth:`~paramem.memory.store.MemoryStore.read_registries_from_disk` — the
+    same per-tier reader every other adapter-tree walk in the codebase uses
+    — then narrows to :data:`_ADAPTER_KIND_SUBDIRS` (``episodic``,
+    ``semantic``, ``procedural``) before returning the concatenated
+    canonical registry bytes (for the deterministic sample seed) plus the
+    sorted union of active keys across those tiers (the sample population).
 
-    - KeyRegistry per-tier schema (:meth:`~paramem.training.key_registry.KeyRegistry.save_bytes`)::
+    The narrowing is what keeps every drawn key scorable: gate 4 verifies
+    recall against the trial adapter's own per-tier SimHash maps
+    (:func:`_gate_4_recall_check`'s ``trial_simhash``), and full-replay
+    training only ever writes those maps for the three main tiers — never
+    for an interim slot, which trains on its own working keys, not a
+    replay of the whole live population. A key drawn from an interim
+    tier's registry would have no fingerprint in ``trial_simhash`` to
+    verify against and would score as a spurious miss, so this function
+    never lets one into the population at all.
 
-          {"active_keys": [...], "fidelity_history": {...},
-           "stale": {...}, "simhash": {key: int}}
+    Args:
+        adapter_dir: Live adapter store root.
 
-    - ``key_metadata.json`` schema
-      (:meth:`~paramem.training.consolidation.ConsolidationLoop.write_key_metadata`)
-      — the file gate 4's ``live_registry_path`` actually points at
-      (:attr:`~paramem.server.config.PathsConfig.key_metadata`)::
+    Returns:
+        ``(registry_content, population)`` — ``registry_content`` is the
+        concatenation of each scorable tier's :meth:`KeyRegistry.save_bytes`
+        output in tier-walk order (stable regardless of which tier files
+        exist on disk); ``population`` is the sorted, deduplicated
+        active-key union over :data:`_ADAPTER_KIND_SUBDIRS` only.
 
-          {"cycle_count": int, "promoted_keys": [...], "keys": {key: bookkeeping}}
-
-      The indexed-key names are the KEYS of the nested ``"keys"`` dict —
-      the three top-level fields (``cycle_count``, ``promoted_keys``,
-      ``keys``) are bookkeeping, not key names.  Treating
-      ``len(parsed)``/``parsed.keys()`` directly against this shape counts
-      3 always, never the real key population.
-
-    Falls back to the dict's own top-level keys for legacy/flat
-    ``{key: simhash}`` registries.
-
-    Parameters
-    ----------
-    parsed:
-        A JSON-decoded registry dict (either schema above, or legacy flat).
-
-    Returns
-    -------
-    list[str]
-        Sorted list of indexed-key names.
+    Raises:
+        ValueError: Propagated from
+            :meth:`~paramem.memory.store.MemoryStore.read_registries_from_disk`
+            when a tier's registry file exists but is not KeyRegistry-shaped.
+        OSError: Propagated from the underlying file read (permission
+            denied, or a race against a concurrent delete).
+        RuntimeError: Propagated from
+            :func:`~paramem.backup.encryption.read_maybe_encrypted` when a
+            tier's registry is an age envelope and the daily identity is
+            not loaded.
+        pyrage.DecryptError: Propagated from the same decrypt layer when
+            the envelope is foreign or corrupt.  Gate 4's own caller
+            (:func:`_gate_4_recall_check`) treats every one of the above as
+            its own precondition failing, not an unattributed crash — see
+            its own broad catch.
     """
-    if "active_keys" in parsed:
-        return sorted(parsed["active_keys"])
-    if isinstance(parsed.get("keys"), dict):
-        return sorted(parsed["keys"].keys())
-    return sorted(parsed.keys())
+    from paramem.memory.store import MemoryStore
+
+    registries = MemoryStore.read_registries_from_disk(adapter_dir)
+    # registries preserves _iter_tier_registry_paths' own walk order (main
+    # tiers first, in fixed order, then interim) -- filtering to the main
+    # tiers here keeps that same relative order, never re-sorting it.
+    scorable = {tier: reg for tier, reg in registries.items() if tier in _ADAPTER_KIND_SUBDIRS}
+    content = b"".join(reg.save_bytes() for reg in scorable.values())
+    population = sorted({key for reg in scorable.values() for key in reg.list_active()})
+    return content, population
 
 
-def _sample_registry_keys(registry_content: bytes, *, seed_suffix: bytes = b"") -> list[str]:
+def _sample_registry_keys(
+    registry_content: bytes, population: list[str], *, seed_suffix: bytes = b""
+) -> list[str]:
     """Sample up to :data:`GATE_4_SAMPLE_SIZE` keys deterministically.
 
     The seed is derived from the first 16 hex chars of
@@ -215,7 +234,13 @@ def _sample_registry_keys(registry_content: bytes, *, seed_suffix: bytes = b"") 
     Parameters
     ----------
     registry_content:
-        Raw bytes of the registry JSON file.
+        Bytes to seed the deterministic sample from — the caller's own
+        :func:`_live_key_population` content, not re-derived here.
+    population:
+        The full active-key population to sample from — the caller's own
+        :func:`_live_key_population` result. This function performs no
+        parsing of its own; *population* and *registry_content* must come
+        from the same source read.
     seed_suffix:
         Bytes appended before hashing to produce an independent sample.
         Use ``b"|retry"`` for the re-roll (independent second sample).
@@ -229,8 +254,6 @@ def _sample_registry_keys(registry_content: bytes, *, seed_suffix: bytes = b"") 
     seed_hex = hashlib.sha256(payload).hexdigest()[:16]
     seed_int = int(seed_hex, 16)
     rng = random.Random(seed_int)
-    parsed = json.loads(registry_content)
-    population = _registry_key_population(parsed) if isinstance(parsed, dict) else []
     n = min(GATE_4_SAMPLE_SIZE, len(population))
     return rng.sample(population, n)
 
@@ -942,7 +965,7 @@ def _gate_4_recall_check(
     model: Any,
     tokenizer: Any,
     trial_adapter_dir: Path,
-    live_registry_path: Path,
+    live_adapter_dir: Path,
     mount_state: dict,
     recall_probe_batch_size: int,
 ) -> GateResult:
@@ -956,19 +979,21 @@ def _gate_4_recall_check(
     ``seed_suffix=b"|retry"`` and require both samples to fail.  First-fail /
     second-pass → PASS with a cluster-variance warning.
 
-    SKIPPED when the live registry has fewer than
-    :data:`GATE_4_MIN_REGISTRY_SIZE` keys, or when ``trial_adapter_dir`` has
-    no files (NO_NEW_SESSIONS — no trial adapter exists).
+    SKIPPED when the live adapter store has fewer than
+    :data:`GATE_4_MIN_REGISTRY_SIZE` active keys, or when ``trial_adapter_dir``
+    has no files (NO_NEW_SESSIONS — no trial adapter exists).
 
-    ``live_registry_path`` (``key_metadata.json``,
-    ``paramem/server/consolidation.py:436-440``) supplies only the SAMPLE
-    POPULATION — the set of indexed-key names to draw the 20-key sample
-    from. It carries per-key bookkeeping, never a SimHash fingerprint, so
-    it cannot verify recall content. Verification uses the trial adapter's
-    own per-tier ``indexed_key_registry.json`` SimHash maps instead (see
+    ``live_adapter_dir`` supplies only the SAMPLE POPULATION — the set of
+    indexed-key names to draw the 20-key sample from, merged across the
+    three main tiers' own ``indexed_key_registry.json`` files only, never
+    an interim slot's (see :func:`_live_key_population`). It cannot verify
+    recall content on its own; verification uses the TRIAL adapter's own
+    per-tier ``indexed_key_registry.json`` SimHash maps instead (see
     :meth:`KeyRegistry.load_simhashes`) — full-replay training means those
     files carry ground-truth fingerprints for the whole live key
-    population, not just newly-added keys.
+    population of the three main tiers, not just newly-added keys, and
+    never for an interim slot, which is why the sample population above
+    excludes one: a key the trial map cannot score must never be drawn.
 
     The ``"sampled_keys"`` field in ``metrics`` is the deciding sample list.
     The comparison report uses the same list so the same 20 keys appear in
@@ -982,9 +1007,11 @@ def _gate_4_recall_check(
         Tokenizer matching the loaded model.
     trial_adapter_dir:
         Directory containing the trial adapter files.
-    live_registry_path:
-        Path to the current live ``key_metadata.json`` — the sample
-        population source only (see class docstring).
+    live_adapter_dir:
+        The live adapter store root — the sample population and the
+        :data:`GATE_4_MIN_REGISTRY_SIZE` precondition are both drawn from
+        its per-tier ``indexed_key_registry.json`` files (see class
+        docstring).
     mount_state:
         Shared mount-state dict passed to mount/unmount helpers.
     recall_probe_batch_size:
@@ -998,50 +1025,28 @@ def _gate_4_recall_check(
     GateResult
         Gate 4 result with full metrics dict.
     """
-    # --- Precondition: live registry must exist and have enough keys ---
-    # SKIP on missing file (legitimate fresh-install OR a deployment that
-    # predates per-tier registry files). Trial registry writes are isolated
-    # to state/trial_registry/ (2026-04-23), so trial-induced corruption of
-    # the live file is no longer a concern.
-    if not live_registry_path.exists():
-        return GateResult(
-            gate=4,
-            name="live_registry_recall",
-            status="skipped",
-            reason=(
-                f"live registry file not found: {live_registry_path} "
-                "— treating as <20 keys (fresh install or legacy layout without per-tier registry)"
-            ),
-            metrics=None,
-        )
-
-    from paramem.backup.encryption import read_maybe_encrypted as _rme
-
-    registry_content = _rme(live_registry_path)
+    # --- Precondition: live adapter store must have enough active keys ---
+    # Broad catch, deliberately: a registry read/parse failure of any kind
+    # (KeyRegistry.load's own shape-check ValueError; an OSError from the
+    # underlying file read — permission denied, or a race against a
+    # concurrent delete; a decrypt-layer RuntimeError/pyrage.DecryptError
+    # from read_maybe_encrypted when the daily identity is not loaded or
+    # the envelope is foreign/corrupt) is this gate's own precondition
+    # failing, not an unattributed crash of the trial run — it must surface
+    # as a gate-4 `fail` result, never escape to the generic
+    # `trial_exception` path.
     try:
-        registry_parsed = json.loads(registry_content)
+        registry_content, population = _live_key_population(live_adapter_dir)
     except Exception as exc:  # noqa: BLE001
         return GateResult(
             gate=4,
             name="live_registry_recall",
             status="fail",
-            reason=f"failed to parse live registry: {exc}",
+            reason=f"failed to parse a live per-tier registry: {exc}",
             metrics=None,
         )
 
-    # ACTUAL key count, not the top-level field count. registry_parsed is
-    # key_metadata.json (consolidation.py:436-440): {"cycle_count",
-    # "promoted_keys", "keys": {key: bookkeeping}} — len(registry_parsed) is
-    # always 3 (the field count), which is permanently < GATE_4_MIN_REGISTRY_SIZE
-    # and made this gate skip on every deployment. GATE_4_MIN_REGISTRY_SIZE is
-    # meant to gate on "does the live store have enough historical keys to make
-    # a cross-adapter recall check meaningful" — that is the count of entries
-    # under "keys" (or "active_keys" / flat dict-keys for other registry shapes),
-    # via the same population extraction _sample_registry_keys uses below so the
-    # two never disagree.
-    n_keys = (
-        len(_registry_key_population(registry_parsed)) if isinstance(registry_parsed, dict) else 0
-    )
+    n_keys = len(population)
     if n_keys < GATE_4_MIN_REGISTRY_SIZE:
         return GateResult(
             gate=4,
@@ -1062,14 +1067,14 @@ def _gate_4_recall_check(
         )
 
     # --- Load the verification source: the TRIAL adapter's own SimHash fingerprints ---
-    # live_registry_path (key_metadata.json) supplies the SAMPLE POPULATION only —
-    # it carries per-key bookkeeping (paramem/memory/store.py::bookkeeping_for_key),
-    # never a SimHash fingerprint (see KeyRegistry.load_simhashes docstring). Indexed-key
-    # training is full-replay (old ∪ new keys retrained together every cycle — see
-    # CLAUDE.md), so the trial adapter's freshly-written per-tier
-    # indexed_key_registry.json files carry ground-truth fingerprints for every
-    # currently active key, including ones unchanged by this cycle. Merge across
-    # all three tiers since the live sample can draw a key from any of them.
+    # live_adapter_dir supplies the SAMPLE POPULATION only — a per-tier
+    # indexed_key_registry.json carries no bookkeeping to verify recall
+    # against. Indexed-key training is full-replay (old ∪ new keys
+    # retrained together every cycle — see CLAUDE.md), so the trial
+    # adapter's freshly-written per-tier indexed_key_registry.json files
+    # carry ground-truth fingerprints for every currently active key,
+    # including ones unchanged by this cycle. Merge across all three tiers
+    # since the live sample can draw a key from any of them.
     trial_simhash: dict[str, int] = {}
     try:
         for kind in _ADAPTER_KIND_SUBDIRS:
@@ -1110,7 +1115,7 @@ def _gate_4_recall_check(
     def _run_sample(suffix: bytes = b"") -> tuple[list[str], int, str]:
         """Return (sampled_keys, pass_count, seed_hex)."""
         seed_hex = hashlib.sha256(registry_content + suffix).hexdigest()[:16]
-        keys = _sample_registry_keys(registry_content, seed_suffix=suffix)
+        keys = _sample_registry_keys(registry_content, population, seed_suffix=suffix)
         passed = 0
         entries = [{"key": k} for k in keys]
         for _entry, recalled in _probe_entries(
@@ -1210,7 +1215,7 @@ def evaluate_gates(
     model: Any,
     tokenizer: Any,
     trial_adapter_dir: Path,
-    live_registry_path: Path,
+    live_adapter_dir: Path,
     session_buffer_empty: bool,
     consolidation_summary: dict | None,
     consolidation_exception: BaseException | None,
@@ -1238,9 +1243,10 @@ def evaluate_gates(
         ``_state["migration"]["trial"]["trial_adapter_dir"]`` — not resolved
         via ``find_live_slot``, so the trial path is never confused with a
         live slot.
-    live_registry_path:
-        Path to the current live ``registry.json`` (from pre-trial
-        ``config.registry_path``).
+    live_adapter_dir:
+        The live adapter store root (from pre-trial ``config.adapter_dir``)
+        — gate 4's sample-population and precondition source (see
+        :func:`_gate_4_recall_check`).
     session_buffer_empty:
         True when the pending session queue was empty before the trial run.
     consolidation_summary:
@@ -1286,7 +1292,7 @@ def evaluate_gates(
             model=model,
             tokenizer=tokenizer,
             trial_adapter_dir=trial_adapter_dir,
-            live_registry_path=live_registry_path,
+            live_adapter_dir=live_adapter_dir,
             mount_state=mount_state,
             recall_probe_batch_size=recall_probe_batch_size,
         )

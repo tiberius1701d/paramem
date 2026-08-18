@@ -1,8 +1,8 @@
 """Handler for ``paramem backup-restore``.
 
 POSTs to ``/backup/restore`` with a ``backup_id`` and renders the outcome.
-Handles 409 (STAGING/TRIAL/consolidating) and 400 (wrong kind) with
-operator-actionable messages.
+Handles 409 (STAGING/TRIAL/consolidating/training/base-swap/pending-event)
+and 400 (wrong kind) with operator-actionable messages.
 """
 
 from __future__ import annotations
@@ -21,8 +21,21 @@ def run(args: argparse.Namespace) -> int:
     ``/backup/restore`` and renders the outcome.  ``restore_config`` is a
     ``store_true`` flag and is always sent explicitly (never omitted) so
     the restore semantics never depend on a server-side default.  Provides
-    operator-actionable messages for 409 (active TRIAL/STAGING or
-    consolidation) and 400 (wrong artifact kind).
+    operator-actionable messages for 409 (active TRIAL/STAGING/
+    consolidation/background-training/base-swap/pending-event) and 400
+    (wrong artifact kind).
+
+    On 200, the non-JSON render distinguishes three outcomes from
+    ``BackupRestoreResponse``'s own fields plus what this call already knows
+    client-side: ``serving=True`` reports the server is live on the restored
+    artifacts, no restart needed; a config-kind restore (recognised by
+    ``backed_up_pre_restore`` keyed ``"config"``) or any restore where
+    ``--restore-config`` was passed advises an operator restart to converge
+    (both leave their existing restart posture deliberately unchanged,
+    since the base model may have changed); a ``snapshot_bundle`` restore
+    left non-serving with a ``quarantine_cause`` reports the memory store is
+    offline, naming the cause and the two ways out — retire the affected
+    keys via ``POST /debug/erase-keys``, or restore a healthy backup.
 
     Parameters
     ----------
@@ -80,6 +93,23 @@ def run(args: argparse.Namespace) -> int:
                     "Consolidation running; wait for completion before restoring.",
                     file=sys.stderr,
                 )
+            elif error_code == "training_active":
+                print(
+                    "Background training is active; wait for completion before restoring.",
+                    file=sys.stderr,
+                )
+            elif error_code == "base_swap_active":
+                print(
+                    "A base-swap migration is actively running; wait for it to complete "
+                    "(or fail) before restoring.",
+                    file=sys.stderr,
+                )
+            elif error_code == "consolidation_pending":
+                print(
+                    "A pending consolidation event is being resumed; wait before "
+                    "restoring, or run 'paramem consolidate'/'paramem reconsolidate' first.",
+                    file=sys.stderr,
+                )
             else:
                 print(
                     f"paramem backup-restore: server returned HTTP 409 from {exc.url}.\n"
@@ -106,13 +136,19 @@ def run(args: argparse.Namespace) -> int:
     # Non-JSON render.  Bundle-aware: renders only the fields the server sent
     # (guarded with .get) since a plain config-kind restore and a
     # snapshot_bundle restore populate different subsets of
-    # BackupRestoreResponse.
+    # BackupRestoreResponse.  Advice below is derived from BackupRestoreResponse's
+    # actual fields plus what this call already knows client-side (whether
+    # ``--restore-config`` was passed, and whether the response shape is a
+    # config-kind restore -- ``backed_up_pre_restore`` keyed ``"config"``
+    # rather than ``"bundle"``) -- never from fields the server does not send.
     restored = result.get("restored", {})
     restored_adapters = result.get("restored_adapters", [])
     pruned_orphans = result.get("pruned_orphans", [])
     backed_up = result.get("backed_up_pre_restore", {})
-    restart_required = result.get("restart_required", True)
-    restart_hint = result.get("restart_hint", "systemctl --user restart paramem-server")
+    serving = result.get("serving", False)
+    quarantine_cause = result.get("quarantine_cause")
+    is_config_kind_restore = "config" in backed_up
+    restore_config_requested = getattr(args, "restore_config", False)
 
     print(f"Restored backup {backup_id}.")
     for live_path in restored.values():
@@ -130,8 +166,23 @@ def run(args: argparse.Namespace) -> int:
             print(f"  orphan pruned:        {orphan}")
     for safety_path in backed_up.values():
         print(f"  safety backup:        {safety_path}")
-    print(f"  restart_required:     {'true' if restart_required else 'false'}")
     print()
-    print(f"Run '{restart_hint}' to load the restored config.")
+
+    if serving:
+        print("Server is serving the restored artifacts — no restart needed.")
+    elif is_config_kind_restore or restore_config_requested:
+        # A config-kind restore, or a snapshot_bundle restore that also
+        # restored config, deliberately leaves the store on its existing
+        # restart posture — the base model may have changed, so a same-base
+        # lift is never attempted. An operator restart is what converges it.
+        print("Restore complete on disk. Restart the server to converge onto the restored config.")
+    elif quarantine_cause:
+        cause_msg = quarantine_cause.get("message", "unknown cause")
+        print(
+            f"The memory store is offline ({cause_msg}). Retire the affected keys "
+            "via POST /debug/erase-keys, or restore a healthy backup."
+        )
+    else:
+        print("Restore did not report a serving state — check server logs.")
 
     return 0

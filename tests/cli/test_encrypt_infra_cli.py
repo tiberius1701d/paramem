@@ -124,7 +124,7 @@ class TestRefuseWithoutDailyIdentity:
     def test_dry_run_does_not_require_identity(self, tmp_path, capsys):
         """--dry-run must not gate on daily identity; it only lists files."""
         data_dir = tmp_path / "data"
-        _write_plaintext(data_dir / "graph.json")
+        _write_plaintext(data_dir / "vapid_keys.json")
         cfg = _make_config_yaml(tmp_path, data_dir)
 
         # No daily identity wired — but dry_run=True.
@@ -132,7 +132,7 @@ class TestRefuseWithoutDailyIdentity:
 
         assert rc == 0
         out = capsys.readouterr().out
-        assert "graph.json" in out or "would encrypt" in out
+        assert "vapid_keys.json" in out or "would encrypt" in out
 
 
 # ---------------------------------------------------------------------------
@@ -145,7 +145,7 @@ class TestDryRun:
         """--dry-run lists plaintext files; bytes and mtime are unchanged."""
         _setup_daily(tmp_path, monkeypatch)
         data_dir = tmp_path / "data"
-        target = _write_plaintext(data_dir / "graph.json", b"PLAIN")
+        target = _write_plaintext(data_dir / "vapid_keys.json", b"PLAIN")
 
         cfg = _make_config_yaml(tmp_path, data_dir)
         before_bytes = target.read_bytes()
@@ -160,14 +160,14 @@ class TestDryRun:
         assert target.read_bytes() == before_bytes, "dry-run must not mutate bytes"
         assert target.stat().st_mtime == before_mtime, "dry-run must not touch mtime"
         out = capsys.readouterr().out
-        assert "graph.json" in out
+        assert "vapid_keys.json" in out
 
     def test_dry_run_no_plaintext_summary_says_zero(self, tmp_path, monkeypatch, capsys):
         """When store is already encrypted, dry-run summary says 0 to encrypt."""
         _setup_daily(tmp_path, monkeypatch)
         data_dir = tmp_path / "data"
         # Write an age-encrypted file.
-        _write_age(data_dir / "graph.json")
+        _write_age(data_dir / "vapid_keys.json")
 
         cfg = _make_config_yaml(tmp_path, data_dir)
 
@@ -191,7 +191,7 @@ class TestMixedStore:
         _setup_daily(tmp_path, monkeypatch)
         data_dir = tmp_path / "data"
 
-        plaintext_path = _write_plaintext(data_dir / "graph.json", b'{"plain": true}')
+        plaintext_path = _write_plaintext(data_dir / "vapid_keys.json", b'{"plain": true}')
         age_path = _write_age(data_dir / "speaker_profiles.json")
         age_before = age_path.read_bytes()
 
@@ -217,7 +217,7 @@ class TestMixedStore:
         _setup_daily(tmp_path, monkeypatch)
         data_dir = tmp_path / "data"
         original = b'{"round_trip": "ok"}'
-        target = _write_plaintext(data_dir / "graph.json", original)
+        target = _write_plaintext(data_dir / "vapid_keys.json", original)
 
         cfg = _make_config_yaml(tmp_path, data_dir)
         encrypt_infra.run(_make_args(cfg))
@@ -237,7 +237,7 @@ class TestPureAgeStore:
         """When every file is already an age envelope, nothing is written."""
         _setup_daily(tmp_path, monkeypatch)
         data_dir = tmp_path / "data"
-        age_path = _write_age(data_dir / "graph.json")
+        age_path = _write_age(data_dir / "vapid_keys.json")
         mtime_before = age_path.stat().st_mtime
         bytes_before = age_path.read_bytes()
 
@@ -265,7 +265,7 @@ class TestContinueOnError:
         _setup_daily(tmp_path, monkeypatch)
         data_dir = tmp_path / "data"
 
-        good_path = _write_plaintext(data_dir / "graph.json", b'{"good": true}')
+        good_path = _write_plaintext(data_dir / "vapid_keys.json", b'{"good": true}')
         bad_path = _write_plaintext(data_dir / "registry.json", b'{"bad": true}')
 
         cfg = _make_config_yaml(tmp_path, data_dir)
@@ -292,7 +292,7 @@ class TestContinueOnError:
         _setup_daily(tmp_path, monkeypatch)
         data_dir = tmp_path / "data"
 
-        bad_path = _write_plaintext(data_dir / "graph.json", b'{"x": 1}')
+        bad_path = _write_plaintext(data_dir / "vapid_keys.json", b'{"x": 1}')
 
         cfg = _make_config_yaml(tmp_path, data_dir)
 
@@ -315,7 +315,7 @@ class TestIdempotency:
         """Running encrypt-infra twice on the same store leaves identical bytes."""
         _setup_daily(tmp_path, monkeypatch)
         data_dir = tmp_path / "data"
-        target = _write_plaintext(data_dir / "graph.json", b'{"idempotent": true}')
+        target = _write_plaintext(data_dir / "vapid_keys.json", b'{"idempotent": true}')
 
         cfg = _make_config_yaml(tmp_path, data_dir)
 
@@ -385,11 +385,11 @@ class TestVerboseFlag:
         """--verbose must log already-encrypted files as skipped."""
         _setup_daily(tmp_path, monkeypatch)
         data_dir = tmp_path / "data"
-        _write_age(data_dir / "graph.json")
+        _write_age(data_dir / "vapid_keys.json")
 
         cfg = _make_config_yaml(tmp_path, data_dir)
 
         encrypt_infra.run(_make_args(cfg, verbose=True))
 
         out = capsys.readouterr().out
-        assert "skip" in out.lower() or "graph.json" in out
+        assert "skip" in out.lower() or "vapid_keys.json" in out

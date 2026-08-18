@@ -1107,12 +1107,13 @@ class TestIkKeyProvenance:
 
 
 class TestCollapsedTracking:
-    """Tests for merger.collapsed (Case-1 duplicate-SPO collapse tracking)."""
+    """Tests for the Case-1 duplicate-SPO collapse's removal-ledger entry —
+    the fate authority for a collapsed key (``survivor_key``)."""
 
     def test_collapsed_populated_on_duplicate_spo_collapse(self):
         """Two recon edges with same (s,p,o) but different ik_keys: Case-1 fires and
-        the INCOMING (drifting) key appears in collapsed, while the surviving key is
-        named by the ledger entry written in the same branch.
+        the ledger entry named after the INCOMING (drifting) key names the
+        surviving key.
         """
         from paramem.graph.merger import GraphMerger
         from paramem.graph.schema import Relation, SessionGraph
@@ -1136,7 +1137,7 @@ class TestCollapsedTracking:
             ],
         )
         m.merge(s1, resolve_contradictions=False)
-        assert m.collapsed == [], "First merge is net-new — no collapse yet"
+        assert m.removal_ledger == {}, "First merge is net-new — no collapse yet"
 
         # Second merge: same (s,p,o), different ik_key → Case-1 → collapse.
         s2 = SessionGraph(
@@ -1157,29 +1158,13 @@ class TestCollapsedTracking:
         )
         m.merge(s2, resolve_contradictions=False)
 
-        # The incoming (drifting) key must appear in collapsed.
-        assert len(m.collapsed) == 1, (
-            f"Duplicate-SPO collapse must produce 1 collapsed entry; got {m.collapsed}"
-        )
-        assert m.collapsed[0] == "graph2", (
-            f"Collapsed key must be graph2 (the incoming key); got {m.collapsed[0]!r}"
-        )
         # The ledger entry written in the same branch names the survivor.
         assert m.removal_ledger["graph2"]["survivor_key"] == "graph1", (
             f"Surviving key must be graph1 (existing edge); got {m.removal_ledger['graph2']!r}"
         )
 
-    def test_collapsed_reset_graph_clears_collapsed(self):
-        """reset_graph() clears collapsed from the prior fold."""
-        from paramem.graph.merger import GraphMerger
-
-        m = GraphMerger()
-        m.collapsed = ["graph_stale"]
-        m.reset_graph()
-        assert m.collapsed == [], "reset_graph must clear collapsed"
-
     def test_reset_graph_clears_all_per_fold_caches(self):
-        """reset_graph() clears graph, caches, collapsed, contradictions, and
+        """reset_graph() clears graph, caches, contradictions, and
         removal_ledger."""
 
         from paramem.graph.merger import GraphMerger
@@ -1189,7 +1174,6 @@ class TestCollapsedTracking:
         m.graph.add_node("Alice")
         m._predicate_cardinality["foo"] = True
         m.contradictions_resolved.append({"method": "model"})
-        m.collapsed.append("k3")
         m.removal_ledger["k3"] = {"reason": "dedup", "survivor_key": "k2"}
 
         m.reset_graph()
@@ -1197,7 +1181,6 @@ class TestCollapsedTracking:
         assert m.graph.number_of_nodes() == 0, "reset_graph must empty the graph"
         assert m._predicate_cardinality == {}, "reset_graph must clear cardinality cache"
         assert m.contradictions_resolved == [], "reset_graph must clear contradictions_resolved"
-        assert m.collapsed == [], "reset_graph must clear collapsed"
         assert m.removal_ledger == {}, "reset_graph must clear removal_ledger"
 
     def test_case1_adopt_does_not_produce_reinforcement(self):
@@ -1595,11 +1578,9 @@ class TestRemovalLedger:
     """
 
     def test_dedup_collapse_writes_to_ledger(self):
-        """Case-1 duplicate-SPO collapse writes the drifting key to removal_ledger
-        with reason='dedup' and survivor_key set to the existing key.
-
-        Regression guard: merged.collapsed assertion still holds alongside the
-        new ledger assertion.
+        """Case-1 duplicate-SPO collapse writes the superseded (collapsed-away)
+        key to removal_ledger with reason='dedup' and survivor_key set to the
+        existing key that absorbed it.
         """
         from paramem.graph.merger import GraphMerger
         from paramem.graph.schema import Relation, SessionGraph
@@ -1641,11 +1622,6 @@ class TestRemovalLedger:
         )
         m.merge(s2, resolve_contradictions=False)
 
-        # Existing collapsed assertion must still hold.
-        assert m.collapsed == ["key_drifter"], (
-            f"Collapsed must contain key_drifter; got {m.collapsed}"
-        )
-        # New ledger assertion.
         assert "key_drifter" in m.removal_ledger, (
             f"Drifting key must be in removal_ledger; got {list(m.removal_ledger.keys())}"
         )
@@ -1826,7 +1802,7 @@ class TestRemovalLedger:
         assert "key_munich" not in m.removal_ledger, "Winner key must NOT be ledgered"
 
     def test_reset_graph_clears_removal_ledger(self):
-        """reset_graph() clears removal_ledger alongside collapsed."""
+        """reset_graph() clears removal_ledger."""
         from paramem.graph.merger import GraphMerger
 
         m = GraphMerger()
@@ -2035,8 +2011,7 @@ class TestRemovalLedger:
         :meth:`GraphMerger.record_removal` (and the whole-object reset in
         :meth:`GraphMerger.reset_graph`) anywhere under ``paramem/``.
         Guards against a new inline writer drifting the entry shape or the
-        survivor rule apart from the shared method.  Pattern mirrors
-        ``tests/test_persist_fold_guard.py``.
+        survivor rule apart from the shared method.
 
         Catches three shapes of mutation on any attribute chain ending in
         ``removal_ledger`` (``self.removal_ledger``, ``self._merger
@@ -3166,7 +3141,7 @@ class TestLastSeenTimestampFlow:
 
     No ``datetime.now()`` is ever fabricated: only the real
     ``session_graph.timestamp`` at ingest or the carry-slot populated by
-    ``_build_registry_true_relations`` reaches the edge.
+    ``_working_registry_true_relations`` reaches the edge.
     """
 
     def _make_rel(self, last_seen: str = "") -> Relation:

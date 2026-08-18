@@ -13,18 +13,28 @@ Coverage:
   (``/consolidate``, ``/consolidate/interim``, ``/reconsolidate``) as well as
   ``FULL``/``INTERIM`` via ``AUTO``'s resolution, and the content gate applies
   to every one of them — a manual door drops only the TIME condition, never
-  the CONTENT condition.  ``RECONCILE``'s content is any active key already
-  held by a main tier, so it is turned away only by an empty store, never by
-  the absence of new interim/pending material.  Also covers the executor
-  submission ritual and the concurrency guard.
+  the CONTENT condition.  ``RECONCILE`` is a full consolidation whose input
+  excludes pending sessions; its content is any active key already held by
+  any tier, main or interim, so it is turned away only by an empty store,
+  never by the absence of new interim/pending material.  Also covers the
+  executor submission ritual and the concurrency guard.
 - ``_run_full_consolidation_sync`` noop terminal: an empty ``tiers_rebuilt``
   ends the cycle as a noop, and the sessions consumed by the pre-stage are
   still retired so they cannot accumulate unboundedly.
 
 The fold itself carries no caller intent: the arbitrator decides whether a
 dispatch has anything to consolidate, and
-``loop.consolidate(mode=..., keys_from=...)`` then does what it is told with
-the venue and key source it was handed.
+``loop.consolidate(mode=..., event=...)`` then does what it is told with the
+venue and door name it was handed — a full fold and a reconcile run the
+identical fold topology.
+
+The adapter_manifest_status-driven ``deferred_tier_unverified`` gate is
+covered in ``tests/server/test_startup_validator.py``, not here.
+``_finish_resumed_event``'s ``run_build_and_publish``-summary threading has
+no dedicated suite currently. Every pending-record test in this file builds
+its ``StageLedger`` through the shared
+``tests.server._state_builders._write_pending_ledger`` fixture, never
+inline.
 """
 
 from __future__ import annotations
@@ -33,6 +43,8 @@ import time
 from unittest.mock import MagicMock, patch
 
 import pytest
+
+from tests.server._state_builders import _write_pending_ledger
 
 # ---------------------------------------------------------------------------
 # Fixtures / helpers
@@ -73,8 +85,7 @@ def _make_dispatch_state(
         store: Override for ``loop.store`` — a real ``MemoryStore`` (for a
             test that needs real entry content) or a purpose-built
             ``MagicMock`` (e.g. a spy-able ``.swap()``).  Defaults to a bare
-            ``MagicMock`` with ``replay_enabled=False`` (today's behaviour —
-            the post-fold refill block never runs).
+            unconfigured ``MagicMock``.
         consolidate_return: Override for ``loop.consolidate.return_value``.
             Defaults to a successful noop-ish result with ``tiers_rebuilt=[]``.
     """
@@ -95,22 +106,14 @@ def _make_dispatch_state(
     mock_loop.shutdown_requested = False
     if store is not None:
         mock_loop.store = store
-    else:
-        mock_loop.store.replay_enabled = False
     # Default fold return: successful noop-ish result with tiers_rebuilt=[].
     mock_loop.consolidate.return_value = (
         consolidate_return
         if consolidate_return is not None
         else {
             "tiers_rebuilt": [],
-            "graph_drift_count": 0,
-            "drift_deduplicated": 0,
-            "drift_orphan": 0,
-            "drift_genuine_loss": 0,
-            "keys_per_tier": {},
-            "rolled_back": False,
-            "rollback_tier": None,
-            "tier_delta": {},
+            "completed": False,
+            "aborted": False,
         }
     )
 
@@ -136,6 +139,164 @@ def _make_dispatch_state(
         "event_loop": None,
         "migration": {},
     }
+
+
+# ---------------------------------------------------------------------------
+# TestConsolidationLoopStoreOverride — the store-independent-resume seam:
+# _get_or_create_consolidation_loop(config, store=...) and
+# _run_stage_b_cycle(..., store=...) thread an optional store override
+# through to loop construction, reachable in production ONLY from the
+# pending-event resume (paramem/server/app.py::_run_pending_event_resume).
+# Every other caller passes no override and is provably unaffected.
+# ---------------------------------------------------------------------------
+
+
+class TestConsolidationLoopStoreOverride:
+    def test_store_override_used_only_on_a_fresh_construction(self, monkeypatch) -> None:
+        """No cached loop -> a fresh construction reads the override, not
+        ``_state["memory_store"]``."""
+        import paramem.server.app as app_module
+
+        sentinel_store = object()
+        default_store = object()
+        seen: list = []
+
+        def _fake_create(model, tokenizer, config, store, **kwargs):
+            seen.append(store)
+            return MagicMock()
+
+        state = {
+            "consolidation_loop": None,
+            "model": MagicMock(),
+            "tokenizer": MagicMock(),
+            "memory_store": default_store,
+        }
+        monkeypatch.setattr(app_module, "_state", state)
+        monkeypatch.setattr(app_module, "create_consolidation_loop", _fake_create)
+
+        loop = app_module._get_or_create_consolidation_loop(MagicMock(), store=sentinel_store)
+
+        assert seen == [sentinel_store]
+        assert state["consolidation_loop"] is loop
+
+    def test_no_override_falls_through_to_state_memory_store(self, monkeypatch) -> None:
+        """Every ordinary caller (no ``store=`` kwarg) sees unchanged
+        behaviour — ``_state["memory_store"]`` is what a fresh loop is
+        built against."""
+        import paramem.server.app as app_module
+
+        default_store = object()
+        seen: list = []
+
+        def _fake_create(model, tokenizer, config, store, **kwargs):
+            seen.append(store)
+            return MagicMock()
+
+        state = {
+            "consolidation_loop": None,
+            "model": MagicMock(),
+            "tokenizer": MagicMock(),
+            "memory_store": default_store,
+        }
+        monkeypatch.setattr(app_module, "_state", state)
+        monkeypatch.setattr(app_module, "create_consolidation_loop", _fake_create)
+
+        app_module._get_or_create_consolidation_loop(MagicMock())
+
+        assert seen == [default_store]
+
+    def test_a_cached_loop_ignores_the_override(self, monkeypatch) -> None:
+        """A second call — the idempotent get-or-create path — returns the
+        already-cached loop unchanged; the override is a no-op, since only a
+        first-time construction ever reads it."""
+        import paramem.server.app as app_module
+
+        cached_loop = MagicMock()
+        create_calls: list = []
+
+        def _fake_create(*args, **kwargs):
+            create_calls.append((args, kwargs))
+            return MagicMock()
+
+        state = {"consolidation_loop": cached_loop}
+        monkeypatch.setattr(app_module, "_state", state)
+        monkeypatch.setattr(app_module, "create_consolidation_loop", _fake_create)
+
+        loop = app_module._get_or_create_consolidation_loop(MagicMock(), store=object())
+
+        assert loop is cached_loop
+        assert create_calls == []
+
+    def test_run_stage_b_cycle_threads_its_store_kwarg_through(self, monkeypatch) -> None:
+        """``_run_stage_b_cycle``'s own ``store=`` kwarg reaches
+        ``_get_or_create_consolidation_loop`` unchanged — the seam the
+        weights-venue pending-event resume uses
+        (``_run_pending_event_resume`` -> ``_run_stage_b_cycle``)."""
+        import paramem.server.app as app_module
+
+        sentinel_store = object()
+        seen_stores: list = []
+
+        def _fake_get_or_create(config, *, store=None):
+            seen_stores.append(store)
+            loop = MagicMock()
+            loop._bg_trainer = None
+            return loop
+
+        state = {
+            "config": MagicMock(),
+        }
+        monkeypatch.setattr(app_module, "_state", state)
+        monkeypatch.setattr(app_module, "_get_or_create_consolidation_loop", _fake_get_or_create)
+        monkeypatch.setattr(app_module, "_active_bg_trainer", lambda config: MagicMock())
+
+        def _body(loop, bt):
+            return "noop", None
+
+        app_module._run_stage_b_cycle(
+            kind="training_crash",
+            incident_key="interim",
+            failure_summary="unused",
+            failure_detail={},
+            body=_body,
+            store=sentinel_store,
+        )
+
+        assert seen_stores == [sentinel_store]
+
+    def test_run_stage_b_cycle_default_store_is_none(self, monkeypatch) -> None:
+        """The three ordinary Stage-B entry points never pass ``store=`` —
+        the default ``None`` reaches ``_get_or_create_consolidation_loop``
+        unchanged, preserving today's behaviour."""
+        import paramem.server.app as app_module
+
+        seen_stores: list = []
+
+        def _fake_get_or_create(config, *, store=None):
+            seen_stores.append(store)
+            loop = MagicMock()
+            loop._bg_trainer = None
+            return loop
+
+        state = {
+            "config": MagicMock(),
+        }
+        monkeypatch.setattr(app_module, "_state", state)
+        monkeypatch.setattr(app_module, "_get_or_create_consolidation_loop", _fake_get_or_create)
+        monkeypatch.setattr(app_module, "_active_bg_trainer", lambda config: MagicMock())
+
+        def _body(loop, bt):
+            return "noop", None
+
+        app_module._run_stage_b_cycle(
+            kind="training_crash",
+            incident_key="interim",
+            failure_summary="unused",
+            failure_detail={},
+            body=_body,
+        )
+
+        assert seen_stores == [None]
 
 
 # ---------------------------------------------------------------------------
@@ -238,6 +399,114 @@ class TestConsolidationDispatchGuards:
 
 
 # ---------------------------------------------------------------------------
+# TestActiveConsolidationPendingRecordVerdict — the pending-record arm, a
+# distinct verdict from the five in-flight busy arms.
+# ---------------------------------------------------------------------------
+
+
+class TestActiveConsolidationPendingRecordVerdict:
+    """A pending stage ledger with ``consolidating`` clear is a distinct
+    verdict (``deferred_event_pending``) from every in-flight busy arm, and
+    ``refusal_for`` maps it to its own error code (``consolidation_pending``)
+    rather than any of the five busy-arm codes."""
+
+    def test_no_pending_ledger_and_no_busy_guard_is_clear(self, tmp_path, monkeypatch) -> None:
+        import paramem.server.app as app_module
+
+        state = _make_dispatch_state(tmp_path=tmp_path)
+        monkeypatch.setattr(app_module, "_state", state)
+        assert app_module.active_consolidation() is None
+
+    def test_pending_ledger_with_consolidating_clear_is_a_distinct_verdict(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        import paramem.server.app as app_module
+
+        _write_pending_ledger(tmp_path, event="interim")
+        state = _make_dispatch_state(tmp_path=tmp_path, consolidating=False)
+        monkeypatch.setattr(app_module, "_state", state)
+
+        assert app_module.active_consolidation() == "deferred_event_pending"
+
+    def test_busy_arm_answers_before_the_pending_record_even_when_both_hold(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """A running event past phase 1 holds both arms — ``consolidating``
+        was set at dispatch and its ledger already exists on disk — and the
+        busy arm answers first."""
+        import paramem.server.app as app_module
+
+        _write_pending_ledger(tmp_path, event="interim")
+        state = _make_dispatch_state(tmp_path=tmp_path, consolidating=True)
+        monkeypatch.setattr(app_module, "_state", state)
+
+        assert app_module.active_consolidation() == "deferred_already_running"
+
+    @pytest.mark.parametrize(
+        "event,expected_action",
+        [
+            ("interim", "interim"),
+            ("full", "full"),
+            ("reconcile", "reconcile"),
+        ],
+    )
+    def test_refusal_for_names_the_pending_action(
+        self, tmp_path, monkeypatch, event, expected_action
+    ) -> None:
+        import paramem.server.app as app_module
+
+        _write_pending_ledger(tmp_path, event=event)
+        state = _make_dispatch_state(tmp_path=tmp_path, consolidating=False)
+        monkeypatch.setattr(app_module, "_state", state)
+
+        verdict = app_module.active_consolidation()
+        assert verdict == "deferred_event_pending"
+
+        error, message = app_module.refusal_for(
+            verdict, doing="forgetting a speaker", then="forget"
+        )
+        assert error == "consolidation_pending"
+        assert error not in {
+            "already_running",
+            "cloud_only",
+            "bg_training",
+            "trial_active",
+            "base_swap_active",
+        }
+        assert expected_action in message
+        assert "before forgetting a speaker" in message
+        # The pending record clears by finishing the run, or is superseded
+        # by restoring a healthy backup when it keeps failing to resume.
+        assert "POST /consolidate" in message
+        assert "POST /backup/restore" in message
+
+    def test_refusal_for_pending_record_message_differs_only_in_the_doing_clause(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """Two doors sharing the same pending-record verdict differ only in
+        the ``doing`` clause the caller supplies — same error code, same
+        clearing-mechanism prose."""
+        import paramem.server.app as app_module
+
+        _write_pending_ledger(tmp_path, event="interim")
+        state = _make_dispatch_state(tmp_path=tmp_path, consolidating=False)
+        monkeypatch.setattr(app_module, "_state", state)
+
+        error1, message1 = app_module.refusal_for(
+            "deferred_event_pending", doing="forgetting a speaker", then="forget"
+        )
+        error2, message2 = app_module.refusal_for(
+            "deferred_event_pending", doing="discarding the interim ring", then="discard"
+        )
+        assert error1 == error2 == "consolidation_pending"
+        assert "before forgetting a speaker" in message1
+        assert "before discarding the interim ring" in message2
+        # Same clearing-mechanism prose in both.
+        common_tail = message1.split("wait before", 1)[0]
+        assert message2.startswith(common_tail)
+
+
+# ---------------------------------------------------------------------------
 # TestConsolidationArbitrator — action resolution + the ONE content gate
 # ---------------------------------------------------------------------------
 
@@ -316,7 +585,7 @@ def _make_arbitrator_state(
     if _atom is not None and _atom.kind != "off":
         write_last_scheduled_run(tmp_path / "state", time.time() - 86400)
 
-    buffer = SessionBuffer(tmp_path / "sessions", state_dir=tmp_path / "state", debug=False)
+    buffer = SessionBuffer(tmp_path / "sessions", debug=False)
     for i in range(named_sessions):
         buffer.append(f"conv-named-{i}", "user", "Hello", speaker_id=f"speaker{i + 1}")
         buffer.append(f"conv-named-{i}", "assistant", "Hi")
@@ -347,6 +616,11 @@ def _make_arbitrator_state(
 def _make_interim_slot(adapter_dir, stamp: str, *, payload: str | None) -> None:
     """Create ``episodic/interim_<stamp>/`` with (or without) a venue payload.
 
+    Both venues now write into a timestamped slot SUBDIRECTORY carrying its
+    own ``meta.json`` (the uniform slot-candidate shape ``count_slot_candidates``
+    checks) -- a bare payload file at the interim dir root, or a payload
+    directory with no ``meta.json``, is invisible to the content gate.
+
     Args:
         adapter_dir: Adapter root.
         stamp: ``YYYYMMDDTHHMM`` interim stamp.
@@ -357,10 +631,14 @@ def _make_interim_slot(adapter_dir, stamp: str, *, payload: str | None) -> None:
     d = adapter_dir / "episodic" / f"interim_{stamp}"
     d.mkdir(parents=True, exist_ok=True)
     if payload == "graph":
-        (d / "graph.json").write_text("{}")
+        slot = d / f"{stamp}-slot"
+        slot.mkdir(parents=True, exist_ok=True)
+        (slot / "meta.json").write_text("{}")
+        (slot / "graph.json").write_text("{}")
     elif payload == "weights":
         slot = d / f"{stamp}-slot"
         slot.mkdir(parents=True, exist_ok=True)
+        (slot / "meta.json").write_text("{}")
         (slot / "adapter_model.safetensors").write_bytes(b"")
 
 
@@ -411,13 +689,14 @@ def _dispatch(state, action, *, monkeypatch=None):
     return status, resolved, spy, due_calls
 
 
-def _submitted_full_fold_key_sources(spy) -> list[str]:
-    """The ``keys_from`` each submitted full fold was bound to.
+def _submitted_full_fold_events(spy) -> list[str]:
+    """The ``event`` door name each submitted full-topology fold was bound to.
 
     The arbitrator submits ``functools.partial(_run_full_consolidation_sync,
-    keys_from)``, so the key source it chose for the fold is readable off the
-    partial's bound arguments — which is what distinguishes a FULL dispatch
-    from a RECONCILE one below the arbitrator.
+    event)``, so the door name it chose for the fold is readable off the
+    partial's bound arguments — ``"full"`` for a FULL dispatch, ``"reconcile"``
+    for a RECONCILE one, both below the arbitrator running the identical fold
+    topology.
     """
     import paramem.server.app as app_module
 
@@ -428,6 +707,60 @@ def _submitted_full_fold_key_sources(spy) -> list[str]:
         )
         sources.append(fn.args[0])
     return sources
+
+
+class TestTierUnverifiedDeferral:
+    """A main tier's registry↔slot-manifest binding failing verification --
+    ``adapter_manifest_status[tier]["status"] in BINDING_ROW_STATUSES`` --
+    defers every consolidation action, before the idle debounce and the
+    content gate. Distinct from the store-quarantine check
+    (``tests/server/test_store_quarantine.py``): this is drift a fold's own
+    post-cycle revalidation observed AFTER the last successful boot/lift
+    store step, not (yet) caught by a fresh one."""
+
+    @pytest.mark.parametrize("action_name", ["AUTO", "FULL", "INTERIM", "RECONCILE"])
+    @pytest.mark.parametrize(
+        "row_status",
+        [
+            "no_matching_slot",
+            "keys_without_slot",
+            "payload_mismatch",
+            "key_count_mismatch",
+            "registry_unverified",
+        ],
+    )
+    def test_a_withheld_main_tier_defers_every_consolidation_action(
+        self, monkeypatch, action_name, row_status
+    ) -> None:
+        import paramem.server.app as app_module
+        from paramem.server.app import ConsolidationAction
+
+        state = _make_dispatch_state()
+        state["adapter_manifest_status"] = {"episodic": {"status": row_status}}
+        monkeypatch.setattr(app_module, "_state", state)
+
+        status, resolved = app_module._dispatch_consolidation(
+            getattr(ConsolidationAction, action_name)
+        )
+
+        assert status == "deferred_tier_unverified"
+        assert resolved is getattr(ConsolidationAction, action_name)
+
+    def test_a_healthy_manifest_status_does_not_defer(self, monkeypatch) -> None:
+        """An empty adapter_manifest_status (every tier VERIFIED or
+        NO_CANDIDATES) never trips this arm -- proven directly against the
+        guard function so this pin does not depend on which later gate
+        answers next."""
+        import paramem.server.app as app_module
+        from paramem.server.app import ConsolidationAction
+
+        state = _make_dispatch_state()
+        state["adapter_manifest_status"] = {}
+        monkeypatch.setattr(app_module, "_state", state)
+
+        status, _resolved = app_module._dispatch_consolidation(ConsolidationAction.FULL)
+
+        assert status != "deferred_tier_unverified"
 
 
 class TestConsolidationArbitrator:
@@ -498,7 +831,7 @@ class TestConsolidationArbitrator:
 
         assert status == "started_full"
         assert resolved is ConsolidationAction.FULL
-        assert _submitted_full_fold_key_sources(spy) == ["all_tiers"]
+        assert _submitted_full_fold_events(spy) == ["full"]
         assert state["consolidating"] is True
 
     def test_full_due_with_content_bearing_interims_dispatches(self, tmp_path, monkeypatch) -> None:
@@ -517,7 +850,7 @@ class TestConsolidationArbitrator:
 
         assert status == "started_full"
         assert resolved is ConsolidationAction.FULL
-        assert _submitted_full_fold_key_sources(spy) == ["all_tiers"]
+        assert _submitted_full_fold_events(spy) == ["full"]
         assert due_calls == [True]
 
     def test_full_door_noops_with_no_interims_and_no_pending(self, tmp_path, monkeypatch) -> None:
@@ -580,7 +913,7 @@ class TestConsolidationArbitrator:
 
         assert status == "started_full"
         assert resolved is ConsolidationAction.FULL
-        assert _submitted_full_fold_key_sources(spy) == ["all_tiers"]
+        assert _submitted_full_fold_events(spy) == ["full"]
         assert due_calls == []
 
     def test_full_door_at_count_zero_dispatches_on_pending_named_session_alone(
@@ -601,7 +934,7 @@ class TestConsolidationArbitrator:
 
         assert status == "started_full"
         assert resolved is ConsolidationAction.FULL
-        assert _submitted_full_fold_key_sources(spy) == ["all_tiers"]
+        assert _submitted_full_fold_events(spy) == ["full"]
         assert due_calls == []
 
     def test_full_door_at_count_zero_absorbs_a_leftover_interim_slot(
@@ -613,8 +946,8 @@ class TestConsolidationArbitrator:
         after a slot was already minted: the slot is still on disk, still
         payload-bearing, and must not be stranded.  The interim-slot check
         runs unconditionally (not gated on the CURRENT count), so it is
-        absorbed and reaped via ``keys_from="all_tiers"`` even though no
-        pending session exists at all.
+        absorbed and reaped (every full-topology fold absorbs its interim
+        ring unconditionally) even though no pending session exists at all.
         """
         from paramem.server.app import ConsolidationAction
 
@@ -627,30 +960,8 @@ class TestConsolidationArbitrator:
 
         assert status == "started_full"
         assert resolved is ConsolidationAction.FULL
-        assert _submitted_full_fold_key_sources(spy) == ["all_tiers"]
+        assert _submitted_full_fold_events(spy) == ["full"]
         assert due_calls == []
-
-    def test_reconcile_dispatches_the_fold_over_the_main_tiers_only(
-        self, tmp_path, monkeypatch
-    ) -> None:
-        """RECONCILE reaches the fold with the narrowed key source.
-
-        This is the whole difference between the two full-fold doors below the
-        arbitrator: same entry point, same status, ``keys_from="main_tiers"``.
-        """
-        from paramem.server.app import ConsolidationAction
-
-        state = _make_arbitrator_state(tmp_path, max_interim_count=7)
-        _make_interim_slot(state["config"].adapter_dir, "20260701T0000", payload="weights")
-
-        status, resolved, spy, due_calls = _dispatch(
-            state, ConsolidationAction.RECONCILE, monkeypatch=monkeypatch
-        )
-
-        assert status == "started_full"
-        assert resolved is ConsolidationAction.RECONCILE
-        assert _submitted_full_fold_key_sources(spy) == ["main_tiers"]
-        assert due_calls == [], "_is_full_cycle_due must not be consulted for an explicit RECONCILE"
 
     def test_reconcile_noops_on_an_empty_store(self, tmp_path, monkeypatch) -> None:
         """RECONCILE reaches the content gate too — a store with no active key noops.
@@ -665,7 +976,7 @@ class TestConsolidationArbitrator:
         from paramem.memory.store import MemoryStore
         from paramem.server.app import ConsolidationAction
 
-        fresh_store = MemoryStore(replay_enabled=True)
+        fresh_store = MemoryStore()
         assert fresh_store.tiers_with_registry() == [], "fixture sanity: a fresh store has none"
 
         state = _make_arbitrator_state(tmp_path, max_interim_count=7, store=fresh_store)
@@ -694,7 +1005,6 @@ class TestConsolidationArbitrator:
 
         assert status == "started_full"
         assert resolved is ConsolidationAction.RECONCILE
-        assert _submitted_full_fold_key_sources(spy) == ["main_tiers"]
         assert due_calls == []
 
     def test_reconcile_dispatches_when_a_main_tier_holds_one_active_key(
@@ -704,7 +1014,7 @@ class TestConsolidationArbitrator:
         from paramem.memory.store import MemoryStore
         from paramem.server.app import ConsolidationAction
 
-        store = MemoryStore(replay_enabled=True)
+        store = MemoryStore()
         store.put(
             "semantic", "graph1", {"key": "graph1", "subject": "a", "predicate": "b", "object": "c"}
         )
@@ -716,17 +1026,19 @@ class TestConsolidationArbitrator:
 
         assert status == "started_full"
         assert resolved is ConsolidationAction.RECONCILE
-        assert _submitted_full_fold_key_sources(spy) == ["main_tiers"]
         assert due_calls == []
 
-    def test_reconcile_noops_when_only_an_interim_tier_holds_keys(
+    def test_reconcile_dispatches_when_only_an_interim_tier_holds_an_active_key(
         self, tmp_path, monkeypatch
     ) -> None:
-        """A key parked in an interim tier is not RECONCILE's content — main tiers only."""
+        """A RECONCILE is a full consolidation whose input excludes pending
+        sessions: it recalls and absorbs the interim ring exactly like any
+        full fold, so an active key living ONLY in an interim tier -- no
+        main tier holds one -- is still content, not a noop."""
         from paramem.memory.store import MemoryStore
         from paramem.server.app import ConsolidationAction
 
-        store = MemoryStore(replay_enabled=True)
+        store = MemoryStore()
         store.put(
             "episodic_interim_20260101T0000",
             "graph1",
@@ -738,26 +1050,8 @@ class TestConsolidationArbitrator:
             state, ConsolidationAction.RECONCILE, monkeypatch=monkeypatch
         )
 
-        assert status == "noop_no_stored_keys"
-        assert resolved is ConsolidationAction.RECONCILE
-        assert spy.call_count == 0
-        assert due_calls == []
-
-    def test_reconcile_dispatches_when_replay_is_disabled(self, tmp_path, monkeypatch) -> None:
-        """``replay_enabled=False`` is unprovable too — the gate does not read the registry."""
-        from paramem.memory.store import MemoryStore
-        from paramem.server.app import ConsolidationAction
-
-        state = _make_arbitrator_state(
-            tmp_path, max_interim_count=7, store=MemoryStore(replay_enabled=False)
-        )
-        status, resolved, spy, due_calls = _dispatch(
-            state, ConsolidationAction.RECONCILE, monkeypatch=monkeypatch
-        )
-
         assert status == "started_full"
         assert resolved is ConsolidationAction.RECONCILE
-        assert _submitted_full_fold_key_sources(spy) == ["main_tiers"]
         assert due_calls == []
 
     def test_reconcile_noop_does_not_move_the_cadence_stamp(self, tmp_path, monkeypatch) -> None:
@@ -776,9 +1070,7 @@ class TestConsolidationArbitrator:
         from paramem.server.app import ConsolidationAction
         from paramem.server.schedule_state import read_last_scheduled_run, write_last_scheduled_run
 
-        state = _make_arbitrator_state(
-            tmp_path, max_interim_count=7, store=MemoryStore(replay_enabled=True)
-        )
+        state = _make_arbitrator_state(tmp_path, max_interim_count=7, store=MemoryStore())
         state_dir = state["config"].paths.data / "state"
         seeded_stamp = time.time() - 86400
         write_last_scheduled_run(state_dir, seeded_stamp)
@@ -791,28 +1083,6 @@ class TestConsolidationArbitrator:
         assert resolved is ConsolidationAction.RECONCILE
         assert spy.call_count == 0
         assert read_last_scheduled_run(state_dir) == seeded_stamp
-
-    def test_fold_entry_takes_venue_key_source_and_fold_inputs_only(self, tmp_path) -> None:
-        """The arbitrator's intent stays in the arbitrator.
-
-        The fold entry's parameter set is pinned by exact set equality, so any
-        caller-intent parameter leaking down from the dispatch layer fails here.
-        ``keys_from`` is not caller intent: it names the fold's key source, and
-        two different doors map onto the same two values.
-        """
-        import inspect
-
-        from paramem.training.consolidation import ConsolidationLoop
-
-        params = inspect.signature(ConsolidationLoop.consolidate).parameters
-        assert set(params) == {
-            "self",
-            "mode",
-            "keys_from",
-            "consume_pending",
-            "trainer",
-            "router",
-        }, f"unexpected fold-entry parameters: {sorted(params)}"
 
     def test_interim_door_noops_with_no_pending_sessions(self, tmp_path, monkeypatch) -> None:
         """An explicitly requested INTERIM with zero pending sessions noops.
@@ -1200,37 +1470,6 @@ class TestStampPredicate:
         assert resolved is ConsolidationAction.INTERIM
         assert stamp_calls == 1
 
-    def test_unverified_tier_defers_before_the_stamp_and_does_not_advance_it(
-        self, tmp_path, monkeypatch
-    ) -> None:
-        """A ``deferred_tier_unverified`` AUTO tick must not consume the
-        cadence window — the tier problem persists across ticks (it is
-        resolved by an operator restore, not by time passing), so the next
-        scheduled tick must still see the cycle as due.
-        """
-        from paramem.server.app import ConsolidationAction
-        from paramem.server.schedule_state import read_last_scheduled_run, write_last_scheduled_run
-
-        state = _make_arbitrator_state(
-            tmp_path, max_interim_count=2, refresh_cadence="every 5h", period_seconds=1
-        )
-        for i in range(3):
-            _make_interim_slot(
-                state["config"].adapter_dir, f"2020010{i + 1}T0000", payload="weights"
-            )
-        seeded_stamp = time.time() - 6 * 3600
-        write_last_scheduled_run(state["config"].paths.data / "state", seeded_stamp)
-        state["adapter_manifest_status"] = {"procedural": {"status": "no_matching_slot"}}
-
-        status, resolved, stamp_calls = self._dispatch_and_track_stamp(
-            state, ConsolidationAction.AUTO, monkeypatch=monkeypatch
-        )
-
-        assert status == "deferred_tier_unverified"
-        assert resolved is ConsolidationAction.AUTO
-        assert stamp_calls == 0
-        assert read_last_scheduled_run(state["config"].paths.data / "state") == seeded_stamp
-
 
 # ---------------------------------------------------------------------------
 # TestUniversalCatchUpGate — the durable-stamp catch-up gate
@@ -1441,8 +1680,8 @@ def _route_client(state, monkeypatch) -> "tuple[object, list[tuple[object, str]]
     return TestClient(app_module.app, raise_server_exceptions=False), submitted
 
 
-def _route_key_sources(submitted) -> list[str]:
-    """The ``keys_from`` bound to each full fold that reached the executor ritual."""
+def _route_events(submitted) -> list[str]:
+    """The ``event`` door name bound to each full fold that reached the executor ritual."""
     import paramem.server.app as app_module
 
     sources = []
@@ -1476,7 +1715,7 @@ class TestConsolidationRoutes:
 
         assert resp.status_code == 200
         assert resp.json() == {"status": "started_full", "action": "full"}
-        assert _route_key_sources(submitted) == ["all_tiers"]
+        assert _route_events(submitted) == ["full"]
 
     def test_consolidate_noops_with_nothing_new_to_consume(self, tmp_path, monkeypatch) -> None:
         """Nothing on disk, nothing pending → ``/consolidate`` noops.
@@ -1510,7 +1749,7 @@ class TestConsolidationRoutes:
         resp = client.post("/consolidate")
 
         assert resp.json() == {"status": "started_full", "action": "full"}
-        assert _route_key_sources(submitted) == ["all_tiers"]
+        assert _route_events(submitted) == ["full"]
 
     def test_consolidate_noops_on_an_empty_ring_in_manual_only_mode(
         self, tmp_path, monkeypatch
@@ -1538,26 +1777,7 @@ class TestConsolidationRoutes:
         resp = client.post("/consolidate")
 
         assert resp.json() == {"status": "started_full", "action": "full"}
-        assert _route_key_sources(submitted) == ["all_tiers"]
-
-    def test_reconsolidate_reports_reconcile_and_narrows_the_key_source(
-        self, tmp_path, monkeypatch
-    ) -> None:
-        """``/reconsolidate`` is its own action, and the fold is told so.
-
-        Same entry point and same status as ``/consolidate`` — the difference
-        is the key source it binds, which is what leaves the interim slots
-        alone.
-        """
-        state = _make_arbitrator_state(tmp_path, max_interim_count=7)
-        _make_interim_slot(state["config"].adapter_dir, "20260701T0000", payload="weights")
-
-        client, submitted = _route_client(state, monkeypatch)
-        resp = client.post("/reconsolidate")
-
-        assert resp.status_code == 200
-        assert resp.json() == {"status": "started_full", "action": "reconcile"}
-        assert _route_key_sources(submitted) == ["main_tiers"]
+        assert _route_events(submitted) == ["full"]
 
     def test_reconsolidate_runs_with_nothing_new_to_consume(self, tmp_path, monkeypatch) -> None:
         """Nothing on disk, nothing pending → ``/reconsolidate`` still dispatches.
@@ -1573,10 +1793,10 @@ class TestConsolidationRoutes:
         resp = client.post("/reconsolidate")
 
         assert resp.json() == {"status": "started_full", "action": "reconcile"}
-        assert _route_key_sources(submitted) == ["main_tiers"]
+        assert len(submitted) == 1
 
     def test_reconsolidate_noops_on_an_empty_store(self, tmp_path, monkeypatch) -> None:
-        """A resident store with no active key in any main tier → ``noop_no_stored_keys``.
+        """A resident store with no active key in any tier → ``noop_no_stored_keys``.
 
         Route-level pin of the empty-store outcome, distinct from "nothing
         new" above — an operator calling ``POST /reconsolidate`` before any
@@ -1584,9 +1804,7 @@ class TestConsolidationRoutes:
         """
         from paramem.memory.store import MemoryStore
 
-        state = _make_arbitrator_state(
-            tmp_path, max_interim_count=7, store=MemoryStore(replay_enabled=True)
-        )
+        state = _make_arbitrator_state(tmp_path, max_interim_count=7, store=MemoryStore())
 
         client, submitted = _route_client(state, monkeypatch)
         resp = client.post("/reconsolidate")
@@ -1595,27 +1813,14 @@ class TestConsolidationRoutes:
         assert resp.json() == {"status": "noop_no_stored_keys", "action": "reconcile"}
         assert submitted == []
 
-    def test_the_two_full_fold_doors_differ_only_in_the_key_source(
-        self, tmp_path, monkeypatch
-    ) -> None:
-        """There is no manual flavour of a fold: same status, same entry point.
 
-        The only thing that differs below the arbitrator is which keys the fold
-        owns — and, following from that, whether the interim slots are reaped.
-        """
-        state = _make_arbitrator_state(tmp_path, max_interim_count=7)
-        for i in range(8):
-            _make_interim_slot(
-                state["config"].adapter_dir, f"202607{i + 1:02d}T0000", payload="weights"
-            )
-
-        client, submitted = _route_client(state, monkeypatch)
-        collapse = client.post("/consolidate").json()
-        rebuild = client.post("/reconsolidate").json()
-
-        assert collapse["status"] == rebuild["status"] == "started_full"
-        assert (collapse["action"], rebuild["action"]) == ("full", "reconcile")
-        assert _route_key_sources(submitted) == ["all_tiers", "main_tiers"]
+class TestReconsolidatePendingRecordResume:
+    """``/reconsolidate`` has no special relationship to a pending
+    consolidation event's record: it never discards one, and it is not a
+    recovery or abandon door.  A pending record is resumed and finished
+    first, exactly like the other three consolidation endpoints -- the
+    identical resume-pending-first contract, never a RECONCILE-only
+    carve-out."""
 
     def test_interim_route_absorbs_conversations_at_the_full_due_boundary(
         self, tmp_path, monkeypatch
@@ -1674,11 +1879,12 @@ class TestConsolidationRoutes:
         lack of a content-bearing interim slot — a DIFFERENT status, because
         it is a different action with a different input.
         ``/consolidate/interim`` requests ``INTERIM`` directly and noops the
-        same way the tick did.  ``/reconsolidate`` requests ``RECONCILE``, whose
-        content is the main tiers' own active keys, not the interim/pending
-        material the other three check — with no ``memory_store`` resident
-        (this fixture's default) that question is unprovable, so the gate
-        lets it proceed rather than reading it as empty.
+        same way the tick did.  ``/reconsolidate`` requests ``RECONCILE``, a
+        full consolidation whose content is any tier's own stored active
+        keys (main or interim) rather than the pending material the other
+        three check — with no ``memory_store`` resident (this fixture's
+        default) that question is unprovable, so the gate lets it proceed
+        rather than reading it as empty.
         """
         import paramem.server.app as app_module
 
@@ -1698,7 +1904,6 @@ class TestConsolidationRoutes:
         assert len(submitted) == 1, "only /reconsolidate may have dispatched"
         fn, status = submitted[0]
         assert fn.func is app_module._run_full_consolidation_sync
-        assert fn.args == ("main_tiers",)
         assert status == "started_full"
 
     def test_consolidate_route_ignores_a_stray_body(self, tmp_path, monkeypatch) -> None:
@@ -1875,122 +2080,22 @@ class TestConsolidationRoutes:
 # ---------------------------------------------------------------------------
 
 
-def _run_sync(state: dict, monkeypatch, keys_from: str = "all_tiers") -> None:
-    """Run _run_full_consolidation_sync with an inlined BackgroundTrainer.
-
-    Module-level so other test modules driving the same fold-entry wiring
-    (e.g. ``tests/server/test_post_fold_hydration.py``) import this instead
-    of re-implementing it.
-    """
+def _run_sync(state: dict, monkeypatch, event: str = "full") -> None:
+    """Run _run_full_consolidation_sync with an inlined BackgroundTrainer."""
     import paramem.server.app as app_module
 
     monkeypatch.setattr(app_module, "_state", state)
     mock_bt = MagicMock()
-    mock_bt.abort_requested = False
     # submit() calls the closure synchronously so state can be inspected after.
     mock_bt.submit.side_effect = lambda fn, **kw: fn()
 
     with patch("paramem.server.app.BackgroundTrainer", return_value=mock_bt):
-        app_module._run_full_consolidation_sync(keys_from)
+        app_module._run_full_consolidation_sync(event)
 
 
 class TestFullConsolidationFoldEntry:
-    """_run_full_consolidation_sync drives the fold entry with its venue, key source
-    and fold inputs."""
-
-    def test_fold_called_with_venue_key_source_and_fold_inputs_only(
-        self, monkeypatch, tmp_path
-    ) -> None:
-        """The fold receives the configured venue, its key source and its collaborators.
-
-        The kwarg set is pinned by exact equality — the mode, the key source,
-        the config-derived ``consume_pending`` decision and the two
-        collaborators the fold runs on.
-        """
-        state = _make_dispatch_state(consolidation_mode="train", tmp_path=tmp_path)
-
-        with patch("paramem.server.app._revalidate_adapter_manifests"):
-            _run_sync(state, monkeypatch)
-
-        loop = state["consolidation_loop"]
-        loop.consolidate.assert_called_once()
-        args, kwargs = loop.consolidate.call_args
-        assert args == (), "the fold entry is keyword-only"
-        assert set(kwargs) == {"mode", "keys_from", "trainer", "router", "consume_pending"}, (
-            f"unexpected fold-entry kwargs: {sorted(kwargs)}"
-        )
-        assert kwargs["mode"] == "train"
-        assert kwargs["keys_from"] == "all_tiers"
-        assert kwargs["consume_pending"] is False, (
-            "max_interim_count=7 → the fold must not consume pending sessions"
-        )
-
-    def test_main_tiers_fold_forwards_its_key_source(self, monkeypatch, tmp_path) -> None:
-        """A reconcile reaches the fold as ``keys_from="main_tiers"``."""
-        state = _make_dispatch_state(consolidation_mode="train", tmp_path=tmp_path)
-
-        with patch("paramem.server.app._revalidate_adapter_manifests"):
-            _run_sync(state, monkeypatch, keys_from="main_tiers")
-
-        _, kwargs = state["consolidation_loop"].consolidate.call_args
-        assert kwargs["keys_from"] == "main_tiers"
-
-    def test_main_tiers_fold_never_consumes_pending_sessions(self, monkeypatch, tmp_path) -> None:
-        """At ``max_interim_count == 0`` the absorbing fold consumes pending sessions.
-
-        A main-tiers fold must not, whatever the count says: it leaves the
-        pending conversations pending, so it must not run the extraction
-        pre-stage either.
-        """
-        import paramem.server.app as app_module
-
-        extract_calls: list[object] = []
-
-        def _record_extract(loop, *, lock_held):
-            extract_calls.append(loop)
-            raise AssertionError("the extraction pre-stage must not run for a main-tiers fold")
-
-        absorbing = _make_dispatch_state(
-            consolidation_mode="train", max_interim_count=0, tmp_path=tmp_path
-        )
-        reconciling = _make_dispatch_state(
-            consolidation_mode="train", max_interim_count=0, tmp_path=tmp_path
-        )
-
-        with (
-            patch("paramem.server.app._revalidate_adapter_manifests"),
-            patch.object(app_module, "_extract_pending_sessions", _record_extract),
-        ):
-            _run_sync(reconciling, monkeypatch, keys_from="main_tiers")
-
-        _, kwargs = reconciling["consolidation_loop"].consolidate.call_args
-        assert kwargs["consume_pending"] is False
-        assert extract_calls == []
-
-        # Same config, absorbing fold: consume_pending is back on, so the
-        # False above is the key source's doing and not the config's.
-        with (
-            patch("paramem.server.app._revalidate_adapter_manifests"),
-            patch.object(
-                app_module,
-                "_extract_pending_sessions",
-                MagicMock(
-                    return_value=app_module._PendingExtraction(
-                        episodic_rels=[],
-                        procedural_rels=[],
-                        session_ids=[],
-                        failed_session_ids=set(),
-                        speaker_ids=[],
-                        evicted_voice=False,
-                        aborted=None,
-                    )
-                ),
-            ),
-        ):
-            _run_sync(absorbing, monkeypatch, keys_from="all_tiers")
-
-        _, kwargs = absorbing["consolidation_loop"].consolidate.call_args
-        assert kwargs["consume_pending"] is True
+    """_run_full_consolidation_sync drives the fold entry with its venue, its
+    resolved door name (event), and fold inputs."""
 
     def test_simulate_mode_uses_the_same_entry(self, monkeypatch, tmp_path) -> None:
         """Simulate mode routes through the identical call — only ``mode`` differs."""
@@ -2022,179 +2127,761 @@ class TestFullConsolidationFoldEntry:
             "_state['consolidating'] must be cleared after the fold completes"
         )
 
+    def test_reconcile_event_never_consumes_pending_sessions(self, monkeypatch, tmp_path) -> None:
+        """A reconcile event is a full consolidation whose input excludes
+        pending sessions: at ``max_interim_count == 0`` (where an ordinary
+        full fold's pre-stage would extract pending sessions directly) a
+        reconcile event still passes ``consume_pending=False`` and never
+        runs the extraction pre-stage -- pending sessions stay pending."""
+        import paramem.server.app as app_module
 
-# ---------------------------------------------------------------------------
-# TestTierUnverifiedDeferral — a MAIN tier's registry<->manifest binding
-# unverified (``no_matching_slot`` / ``registry_unverified`` /
-# ``key_count_mismatch``) makes the fold's cross-tier key identity space
-# unknowable and both persist branches would overwrite the very
-# manifest/registry pair preserved for recovery, so every action defers with
-# ``deferred_tier_unverified`` — including RECONCILE, which rebuilds all
-# three main registries.  A fingerprint ``mismatch`` and any interim-tier row
-# do not carry this hazard and must not defer.  The erase/discard doors
-# (``/speaker/forget``, ``/interim/discard``, ``/debug/erase-keys``) consult
-# only the shared guard predicate, never this arm, so they stay open.
-# ---------------------------------------------------------------------------
+        state = _make_dispatch_state(
+            consolidation_mode="train", max_interim_count=0, tmp_path=tmp_path
+        )
+        extract_spy = MagicMock()
+        monkeypatch.setattr(app_module, "_extract_pending_sessions", extract_spy)
 
+        with patch("paramem.server.app._revalidate_adapter_manifests"):
+            _run_sync(state, monkeypatch, event="reconcile")
 
-class TestTierUnverifiedDeferral:
-    @pytest.mark.parametrize(
-        "unverified_status",
-        ["registry_unverified", "key_count_mismatch", "no_matching_slot"],
-    )
-    @pytest.mark.parametrize("action_name", ["FULL", "INTERIM", "RECONCILE"])
-    def test_fold_deferred_while_a_main_tier_is_unverified(
-        self, tmp_path, monkeypatch, unverified_status, action_name
+        loop = state["consolidation_loop"]
+        loop.consolidate.assert_called_once()
+        _, kwargs = loop.consolidate.call_args
+        assert kwargs["event"] == "reconcile"
+        assert kwargs["consume_pending"] is False
+        extract_spy.assert_not_called()
+
+    def test_full_trained_run_status_detail_has_no_extra_fields(
+        self, monkeypatch, tmp_path
     ) -> None:
-        """Any of the three unverified statuses, on any of the three main
-        tiers, defers every action — FULL, INTERIM, and RECONCILE alike —
-        and nothing reaches the executor.
-        """
-        from paramem.server.app import ConsolidationAction
+        """``_finalize_full`` records exactly this detail key set.
 
-        state = _make_arbitrator_state(tmp_path, max_interim_count=7, named_sessions=1)
-        _make_interim_slot(state["config"].adapter_dir, "20260701T0000", payload="weights")
-        state["adapter_manifest_status"] = {
-            "episodic": {"status": unverified_status, "reason": unverified_status}
+        A rebuilt tier drives the cycle to the ``full_trained`` terminal,
+        which persists a run-status record via ``record_last_run``. The
+        recorded detail must carry exactly ``tiers_rebuilt`` and
+        ``total_keys`` — no more, no fewer — so a writer recording any extra
+        field fails this pin even though the renderer would tolerate it
+        silently.
+        """
+        from paramem.server.run_status import read_last_runs
+
+        state = _make_dispatch_state(
+            consolidation_mode="train",
+            tmp_path=tmp_path,
+            consolidate_return={
+                "tiers_rebuilt": ["episodic"],
+                "completed": True,
+                "aborted": False,
+            },
+        )
+
+        with patch("paramem.server.app._revalidate_adapter_manifests"):
+            _run_sync(state, monkeypatch)
+
+        last_runs = read_last_runs(tmp_path / "state")
+        record = last_runs["consolidation"]
+        assert record.outcome == "full_trained"
+        assert set(record.detail) == {"tiers_rebuilt", "total_keys"}
+
+
+class TestFinalizeFullAbortedResume:
+    """``_finalize_full`` must not report success or clear crash incidents
+    for an aborted/incomplete resumed-full result (``result["aborted"]`` or
+    ``result["completed"] is False``) -- the shape ``_finish_resumed_event``
+    produces when a resume's bundle yields mid-publish."""
+
+    def _aborted_result(self) -> dict:
+        return {
+            "tiers_rebuilt": [],
+            "consumed_session_ids": [],
+            "consumed_episodic_rels": 0,
+            "consumed_procedural_rels": 0,
+            "completed": False,
+            "aborted": True,
         }
 
-        status, resolved, spy, _ = _dispatch(
-            state, getattr(ConsolidationAction, action_name), monkeypatch=monkeypatch
-        )
+    def test_aborted_resume_records_aborted_not_full_trained(self, monkeypatch, tmp_path) -> None:
+        import paramem.server.app as app_module
+        from paramem.server.run_status import read_last_runs
 
-        assert status == "deferred_tier_unverified"
-        assert resolved is getattr(ConsolidationAction, action_name)
-        assert spy.call_count == 0
+        state = _make_dispatch_state(tmp_path=tmp_path)
+        monkeypatch.setattr(app_module, "_state", state)
+        loop = MagicMock()
+        loop.store.all_active_keys.return_value = []
 
-    def test_a_fingerprint_mismatch_row_does_not_defer(self, tmp_path, monkeypatch) -> None:
-        """A ``mismatch`` (fingerprint) row is a provenance problem, not a
-        key-set-unknowable problem — it must not trigger the deferral.
-        """
-        from paramem.server.app import ConsolidationAction
+        app_module._finalize_full(loop, self._aborted_result())
 
-        state = _make_arbitrator_state(tmp_path, max_interim_count=7, named_sessions=1)
-        state["adapter_manifest_status"] = {
-            "episodic": {"status": "mismatch", "field": "base_model"}
-        }
+        record = read_last_runs(tmp_path / "state")["consolidation"]
+        assert record.outcome == "aborted"
 
-        status, resolved, spy, _ = _dispatch(
-            state, ConsolidationAction.INTERIM, monkeypatch=monkeypatch
-        )
-
-        assert status == "started"
-        assert resolved is ConsolidationAction.INTERIM
-        assert spy.call_count == 1
-
-    @pytest.mark.parametrize(
-        "unverified_status",
-        ["registry_unverified", "key_count_mismatch", "no_matching_slot"],
-    )
-    def test_an_interim_tier_row_does_not_defer(
-        self, tmp_path, monkeypatch, unverified_status
-    ) -> None:
-        """The same three unverified statuses on an INTERIM-shaped row
-        (``episodic_interim_<stamp>``) are out of scope — the deferral is
-        MAIN-tier only, matched by exact tier name.
-        """
-        from paramem.server.app import ConsolidationAction
-
-        state = _make_arbitrator_state(tmp_path, max_interim_count=7, named_sessions=1)
-        state["adapter_manifest_status"] = {
-            "episodic_interim_20260101T0000": {"status": unverified_status}
-        }
-
-        status, resolved, spy, _ = _dispatch(
-            state, ConsolidationAction.INTERIM, monkeypatch=monkeypatch
-        )
-
-        assert status == "started"
-        assert resolved is ConsolidationAction.INTERIM
-        assert spy.call_count == 1
-
-    def test_unverified_tier_defers_the_active_store_migration_branch(
-        self, tmp_path, monkeypatch
-    ) -> None:
-        """The arm fires before the ``pending_rehydration`` pre-empt: that
-        branch re-saves tier adapters and restamps ``key_count``, exactly
-        the artifact pair under suspicion while a tier is unverified.
-        """
-        from paramem.server.app import ConsolidationAction
-
-        state = _make_arbitrator_state(tmp_path, max_interim_count=7)
-        state["pending_rehydration"] = True
-        state["adapter_manifest_status"] = {"semantic": {"status": "key_count_mismatch"}}
-
-        status, resolved, spy, _ = _dispatch(
-            state, ConsolidationAction.FULL, monkeypatch=monkeypatch
-        )
-
-        assert status == "deferred_tier_unverified"
-        assert resolved is ConsolidationAction.FULL
-        assert spy.call_count == 0, "the migration branch must never have been reached"
-
-    def test_unverified_tier_defers_before_the_idle_debounce(self, tmp_path, monkeypatch) -> None:
-        """A live chat turn inside the debounce window would defer with
-        ``deferred_idle`` on its own — but the tier-unverified deferral must
-        win first, since the arm sits above the debounce in dispatch order.
-        """
-        import time as _time
-
-        from paramem.server.app import ConsolidationAction
-
-        state = _make_arbitrator_state(tmp_path, max_interim_count=7)
-        state["last_chat_monotonic"] = _time.monotonic() - 5  # debounce is 30s
-        state["adapter_manifest_status"] = {"episodic": {"status": "registry_unverified"}}
-
-        status, resolved, spy, _ = _dispatch(
-            state, ConsolidationAction.FULL, monkeypatch=monkeypatch
-        )
-
-        assert status == "deferred_tier_unverified"
-        assert resolved is ConsolidationAction.FULL
-        assert spy.call_count == 0
-
-    def test_shared_guard_predicate_is_unaffected(self, tmp_path, monkeypatch) -> None:
-        """``_consolidation_dispatch_guards()`` — the predicate the three
-        erase/discard doors consult directly — is untouched by this arm: it
-        still returns ``None`` while a main tier carries an unverified row.
-        """
+    def test_aborted_resume_does_not_stamp_last_consolidation(self, monkeypatch, tmp_path) -> None:
         import paramem.server.app as app_module
 
         state = _make_dispatch_state(tmp_path=tmp_path)
-        state["adapter_manifest_status"] = {"episodic": {"status": "registry_unverified"}}
+        state["last_consolidation"] = None
         monkeypatch.setattr(app_module, "_state", state)
+        loop = MagicMock()
+        loop.store.all_active_keys.return_value = []
 
-        assert app_module._consolidation_dispatch_guards() is None
+        app_module._finalize_full(loop, self._aborted_result())
 
-    def test_speaker_forget_still_succeeds_while_a_tier_is_unverified(
+        assert state["last_consolidation"] is None
+        assert state["consolidating"] is False
+
+    def test_aborted_resume_leaves_consolidation_crash_incident_unresolved(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        import paramem.server.app as app_module
+        from paramem.server.incidents import read_incidents, record_incident
+
+        state = _make_dispatch_state(tmp_path=tmp_path)
+        monkeypatch.setattr(app_module, "_state", state)
+        state_dir = tmp_path / "state"
+        record_incident(
+            state_dir,
+            type="consolidation_crash",
+            key="full",
+            severity="failed",
+            summary="Full consolidation crashed unexpectedly",
+            detail={},
+        )
+        loop = MagicMock()
+        loop.store.all_active_keys.return_value = []
+
+        app_module._finalize_full(loop, self._aborted_result())
+
+        active = [inc for inc in read_incidents(state_dir) if inc.status == "active"]
+        assert any(inc.type == "consolidation_crash" for inc in active), (
+            "an aborted resumed full event must not clear a pre-recorded "
+            "consolidation_crash incident"
+        )
+
+    def test_completed_full_still_records_full_trained_and_resolves(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """Control: a completed (non-aborted) result keeps the pre-fix
+        behavior -- outcome ``full_trained``, ``last_consolidation`` stamped,
+        incidents resolved."""
+        import paramem.server.app as app_module
+        from paramem.server.incidents import read_incidents, record_incident
+        from paramem.server.run_status import read_last_runs
+
+        state = _make_dispatch_state(tmp_path=tmp_path)
+        state["last_consolidation"] = None
+        monkeypatch.setattr(app_module, "_state", state)
+        state_dir = tmp_path / "state"
+        record_incident(
+            state_dir,
+            type="consolidation_crash",
+            key="full",
+            severity="failed",
+            summary="Full consolidation crashed unexpectedly",
+            detail={},
+        )
+        loop = MagicMock()
+        loop.store.all_active_keys.return_value = ["k1"]
+
+        completed_result = {
+            "tiers_rebuilt": ["episodic"],
+            "consumed_session_ids": [],
+            "consumed_episodic_rels": 0,
+            "consumed_procedural_rels": 0,
+            "completed": True,
+            "aborted": False,
+        }
+        app_module._finalize_full(loop, completed_result)
+
+        record = read_last_runs(state_dir)["consolidation"]
+        assert record.outcome == "full_trained"
+        assert state["last_consolidation"] is not None
+        active = [inc for inc in read_incidents(state_dir) if inc.status == "active"]
+        assert not any(inc.type == "consolidation_crash" for inc in active)
+
+
+class TestFinalizeInterimDetailCarriesProceduralCount:
+    """``_finalize_interim``'s durable run-status detail reports the event's
+    procedural-relation count from ``result["consumed_procedural_rels"]``
+    (the ledger's own extraction stage) — a cycle that captured preference-
+    typed relations must not record ``procedural_rels: 0`` in the operator-
+    visible run record."""
+
+    def test_nonzero_procedural_count_reaches_the_run_status_detail(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        import paramem.server.app as app_module
+        from paramem.server.run_status import read_last_runs
+
+        state = _make_dispatch_state(tmp_path=tmp_path)
+        monkeypatch.setattr(app_module, "_state", state)
+        state_dir = tmp_path / "state"
+
+        loop = MagicMock()
+        loop.store.all_active_keys.return_value = ["k1", "k2"]
+        loop._fold_state_dir = state_dir
+
+        result = {
+            "tiers_rebuilt": ["episodic_interim_20260101T0000"],
+            "consumed_session_ids": ["s1"],
+            "consumed_episodic_rels": 2,
+            "consumed_procedural_rels": 3,
+            "completed": True,
+            "aborted": False,
+            "adapter_name": "episodic_interim_20260101T0000",
+            "mode": "trained",
+            "new_keys": [],
+            "triples_extracted": 5,
+        }
+        app_module._finalize_interim(loop, result)
+
+        record = read_last_runs(state_dir)["consolidation"]
+        assert record.detail["procedural_rels"] == 3, (
+            f"the run-status detail must carry the event's own procedural count; "
+            f"got {record.detail}"
+        )
+        assert record.detail["episodic_rels"] == 2
+
+
+class TestFinalizeInterimAbortedGating:
+    """``_finalize_interim``'s ``training_crash``/``vram_exhausted``
+    auto-resolve must gate on ``result["completed"]`` -- this finalizer is
+    the terminal for every non-crash interim outcome (``trained`` /
+    ``simulated`` / ``cap_pending`` / ``aborted``), not only a clean
+    success."""
+
+    def test_aborted_interim_leaves_training_crash_incident_unresolved(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        import paramem.server.app as app_module
+        from paramem.server.incidents import read_incidents, record_incident
+
+        state = _make_dispatch_state(tmp_path=tmp_path)
+        monkeypatch.setattr(app_module, "_state", state)
+        state_dir = tmp_path / "state"
+        record_incident(
+            state_dir,
+            type="training_crash",
+            key="interim",
+            severity="failed",
+            summary="Interim training crashed unexpectedly",
+            detail={},
+        )
+        loop = MagicMock()
+        loop.store.all_active_keys.return_value = []
+        loop._fold_state_dir = state_dir
+
+        result = {
+            "tiers_rebuilt": [],
+            "consumed_session_ids": [],
+            "consumed_episodic_rels": 0,
+            "consumed_procedural_rels": 0,
+            "completed": False,
+            "aborted": True,
+            "adapter_name": "episodic_interim_20260101T0000",
+            "mode": "aborted",
+            "new_keys": [],
+            "triples_extracted": 0,
+        }
+        app_module._finalize_interim(loop, result)
+
+        active = [inc for inc in read_incidents(state_dir) if inc.status == "active"]
+        assert any(inc.type == "training_crash" for inc in active), (
+            "an aborted interim cycle must not clear a pre-recorded training_crash incident"
+        )
+
+    def test_completed_interim_still_resolves_training_crash(self, monkeypatch, tmp_path) -> None:
+        """Control: a completed interim result keeps the pre-fix behavior."""
+        import paramem.server.app as app_module
+        from paramem.server.incidents import read_incidents, record_incident
+
+        state = _make_dispatch_state(tmp_path=tmp_path)
+        monkeypatch.setattr(app_module, "_state", state)
+        state_dir = tmp_path / "state"
+        record_incident(
+            state_dir,
+            type="training_crash",
+            key="interim",
+            severity="failed",
+            summary="Interim training crashed unexpectedly",
+            detail={},
+        )
+        loop = MagicMock()
+        loop.store.all_active_keys.return_value = ["k1"]
+        loop._fold_state_dir = state_dir
+
+        result = {
+            "tiers_rebuilt": ["episodic_interim_20260101T0000"],
+            "consumed_session_ids": [],
+            "consumed_episodic_rels": 0,
+            "consumed_procedural_rels": 0,
+            "completed": True,
+            "aborted": False,
+            "adapter_name": "episodic_interim_20260101T0000",
+            "mode": "trained",
+            "new_keys": [],
+            "triples_extracted": 0,
+        }
+        app_module._finalize_interim(loop, result)
+
+        active = [inc for inc in read_incidents(state_dir) if inc.status == "active"]
+        assert not any(inc.type == "training_crash" for inc in active)
+
+
+# ---------------------------------------------------------------------------
+# TestResumeArbitrationMatrix — the resume-pending-first arm of
+# _dispatch_consolidation / _dispatch_resume.  Every dispatch that finds a
+# pending ledger resumes and finishes THAT event before any new one starts,
+# regardless of which action was requested; the resumed action is read off
+# the ledger head, never the request.  _dispatch_resume itself carried zero
+# test references before this class (verified: only _run_pending_event_resume
+# -- reached through it -- was exercised, by tests/test_fold_crash_resume.py,
+# and only by calling it directly, never through the arbitrator).
+# ---------------------------------------------------------------------------
+
+
+class TestResumeArbitrationMatrix:
+    """``_dispatch_consolidation`` resumes a pending event ahead of starting
+    a fresh one, for every requested action -- the no-re-staging
+    invariant's sole test home.  Uses the executor spy (nothing the resume
+    submits is ever actually run), so these pins are about WHICH function
+    gets submitted and WHAT status/action is reported, not the resume's own
+    mechanics (covered end-to-end by ``tests/test_fold_crash_resume.py``)."""
+
+    def test_pending_full_event_resumes_ahead_of_a_direct_interim_request(
         self, tmp_path, monkeypatch
     ) -> None:
-        """One erase door driven end-to-end: ``POST /speaker/forget`` answers
-        200 with the same unverified row present that defers every
-        consolidation action — the privacy door stays open.
+        """A pending FULL-event ledger pre-empts a direct ``/consolidate/interim``
+        request: the fold that resumes is the one already on disk, not a
+        fresh interim absorb."""
+        import paramem.server.app as app_module
+        from paramem.server.app import ConsolidationAction
+
+        _write_pending_ledger(tmp_path, event="full")
+        state = _make_arbitrator_state(tmp_path, max_interim_count=7, named_sessions=1)
+
+        status, resolved, spy, _ = _dispatch(
+            state, ConsolidationAction.INTERIM, monkeypatch=monkeypatch
+        )
+
+        assert status == "started_resume"
+        assert resolved is ConsolidationAction.FULL
+        assert spy.submitted == [app_module._run_pending_event_resume]
+
+    def test_pending_reconcile_event_resumes_and_reports_reconcile(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """A pending RECONCILE-event ledger resumes and reports action
+        ``RECONCILE`` -- reporting reads the ledger head's ``event`` field
+        directly, so a resumed reconcile is never folded into the generic
+        ``FULL`` action a plain ``event == "full"`` comparison would."""
+        import paramem.server.app as app_module
+        from paramem.server.app import ConsolidationAction
+
+        _write_pending_ledger(tmp_path, event="reconcile")
+        state = _make_arbitrator_state(tmp_path, max_interim_count=7)
+
+        status, resolved, spy, _ = _dispatch(
+            state, ConsolidationAction.FULL, monkeypatch=monkeypatch
+        )
+
+        assert status == "started_resume"
+        assert resolved is ConsolidationAction.RECONCILE
+        assert spy.submitted == [app_module._run_pending_event_resume]
+
+    def test_pending_full_event_resumes_ahead_of_auto(self, tmp_path, monkeypatch) -> None:
+        """A scheduled tick over a pending FULL-event ledger resumes it
+        rather than resolving its own FULL/INTERIM deadline decision.
+
+        Resume-pending-first is unconditional, grouped with the safety
+        gates ahead of the schedule's own catch-up/due-check business
+        (never gated by whether a tick is due), so ``_is_full_cycle_due``
+        -- AUTO's own FULL-vs-INTERIM resolution -- is never even reached:
+        the reported action comes from the ledger, never from that
+        resolution.
         """
+        import paramem.server.app as app_module
+        from paramem.server.app import ConsolidationAction
+        from paramem.server.schedule_state import write_last_scheduled_run
+
+        _write_pending_ledger(tmp_path, event="full")
+        state = _make_arbitrator_state(tmp_path, max_interim_count=7, refresh_cadence="every 5h")
+        write_last_scheduled_run(tmp_path / "state", time.time() - 6 * 3600)  # DUE
+
+        status, resolved, spy, due_calls = _dispatch(
+            state, ConsolidationAction.AUTO, monkeypatch=monkeypatch
+        )
+
+        assert status == "started_resume"
+        assert resolved is ConsolidationAction.FULL
+        assert spy.submitted == [app_module._run_pending_event_resume]
+        assert due_calls == [], (
+            "resume-pending-first pre-empts AUTO's own deadline resolution entirely"
+        )
+
+    def test_pending_interim_event_resumes_ahead_of_a_direct_full_request(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """A pending INTERIM-event ledger pre-empts a direct ``/consolidate``
+        (FULL) request."""
+        import paramem.server.app as app_module
+        from paramem.server.app import ConsolidationAction
+
+        _write_pending_ledger(tmp_path, event="interim")
+        state = _make_arbitrator_state(tmp_path, max_interim_count=7)
+        _make_interim_slot(state["config"].adapter_dir, "20260701T0000", payload="weights")
+
+        status, resolved, spy, _ = _dispatch(
+            state, ConsolidationAction.FULL, monkeypatch=monkeypatch
+        )
+
+        assert status == "started_resume"
+        assert resolved is ConsolidationAction.INTERIM
+        assert spy.submitted == [app_module._run_pending_event_resume]
+
+    def test_pending_record_resumes_ahead_of_an_armed_active_store_migration(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """A dispatch that finds BOTH a pending consolidation ledger AND an
+        armed mode switch (``pending_rehydration=True``) resumes the ledger
+        and reports that run -- the migration pre-empt is never reached.
+        The store migration is content-preserving and needs a coherent,
+        record-free tree, so it only ever runs on a LATER dispatch, once
+        the pending event has resumed to completion."""
+        import paramem.server.app as app_module
+        from paramem.server.app import ConsolidationAction
+
+        _write_pending_ledger(tmp_path, event="interim")
+        state = _make_arbitrator_state(tmp_path, max_interim_count=7)
+        state["pending_rehydration"] = True
+
+        status, resolved, spy, _ = _dispatch(
+            state, ConsolidationAction.FULL, monkeypatch=monkeypatch
+        )
+
+        assert status == "started_resume"
+        assert resolved is ConsolidationAction.INTERIM
+        assert spy.submitted == [app_module._run_pending_event_resume], (
+            "the migration pre-empt must not run while a consolidation record is still pending"
+        )
+
+    def test_not_due_auto_tick_still_resumes_a_pending_record(self, tmp_path, monkeypatch) -> None:
+        """The resume arm is checked BEFORE the catch-up gate on a scheduled
+        tick: a tick still inside its cadence window still resumes a
+        pending ledger -- resume-pending-first is unconditional, grouped
+        with the safety gates ahead of the schedule's own due-check
+        business, because a pending event is in-flight state that must
+        finish before an explicit request or a scheduled tick walks past
+        it.  The schedule's dueness governs starting NEW work, never
+        finishing what is already in flight."""
+        from paramem.server.app import ConsolidationAction
+        from paramem.server.schedule_grammar import scheduled_run_stamp_value
+        from paramem.server.schedule_state import write_last_scheduled_run
+
+        _write_pending_ledger(tmp_path, event="interim")
+        state = _make_arbitrator_state(tmp_path, max_interim_count=7, refresh_cadence="12h")
+        write_last_scheduled_run(tmp_path / "state", scheduled_run_stamp_value("12h", time.time()))
+
+        status, resolved, spy, due_calls = _dispatch(
+            state, ConsolidationAction.AUTO, monkeypatch=monkeypatch
+        )
+
+        assert status == "started_resume"
+        assert resolved is ConsolidationAction.INTERIM
+        assert spy.call_count == 1, "a not-due tick must still resume the pending event"
+        assert due_calls == [], "the resume pre-empts AUTO's own due-check entirely"
+
+    def test_max_interim_count_zero_still_resumes_a_pending_interim_record(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """A pending INTERIM ledger resumes even at ``max_interim_count=0``
+        (no interim tier exists any more) -- the resume-pending-first arm
+        sits ahead of the N==0 ``noop_no_interim_tier`` tier check, so an
+        operator who lowered the count mid-event still gets the in-flight
+        event finished rather than a meaningless tier-not-found refusal."""
+        import paramem.server.app as app_module
+        from paramem.server.app import ConsolidationAction
+
+        _write_pending_ledger(tmp_path, event="interim")
+        state = _make_arbitrator_state(tmp_path, max_interim_count=0)
+
+        status, resolved, spy, _ = _dispatch(
+            state, ConsolidationAction.INTERIM, monkeypatch=monkeypatch
+        )
+
+        assert status == "started_resume"
+        assert resolved is ConsolidationAction.INTERIM
+        assert spy.submitted == [app_module._run_pending_event_resume]
+
+    def test_auto_resume_stamps_the_cadence_so_a_later_record_free_tick_reads_not_due(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """A scheduled tick that resumes a pending event still consumes its
+        cadence window.  While the record stays pending, resume-pending-
+        first is unconditional and ignores the stamp entirely -- the very
+        next tick resumes it again regardless of the freshly stamped
+        window, since the schedule's dueness governs starting NEW work,
+        never finishing what is already in flight.  Only once the event
+        actually finishes (its record disposed) does a later tick inside
+        the same stamped window read NOT_DUE off the stamp the resumed
+        tick advanced, exactly like any other scheduled tick -- proving
+        the stamp still does its ordinary job once nothing is pending."""
+        from paramem.server.app import ConsolidationAction
+        from paramem.server.schedule_state import read_last_scheduled_run, write_last_scheduled_run
+        from paramem.training import stage_ledger as sl
+
+        _write_pending_ledger(tmp_path, event="interim")
+        state = _make_arbitrator_state(tmp_path, max_interim_count=7, refresh_cadence="every 5h")
+        state_dir = tmp_path / "state"
+        seeded_stamp = time.time() - 6 * 3600  # due
+        write_last_scheduled_run(state_dir, seeded_stamp)
+
+        status, resolved, spy, _ = _dispatch(
+            state, ConsolidationAction.AUTO, monkeypatch=monkeypatch
+        )
+        assert status == "started_resume"
+        assert spy.call_count == 1
+        stamped = read_last_scheduled_run(state_dir)
+        assert stamped != seeded_stamp, "the resumed tick must advance the cadence stamp"
+
+        # The resumed job (never actually run here -- the executor is a
+        # spy) completes and clears the busy flag, the way the real
+        # executor's finalizer eventually would; isolates the cadence-stamp
+        # behaviour under test from the unrelated "already running" guard.
+        state["consolidating"] = False
+
+        # The record is STILL pending (the spy never actually disposed it)
+        # -- the very next tick resumes it again, unconditionally, inside
+        # the freshly stamped window.
+        status2, _resolved2, spy2, due_calls2 = _dispatch(
+            state, ConsolidationAction.AUTO, monkeypatch=monkeypatch
+        )
+        assert status2 == "started_resume"
+        assert spy2.call_count == 1
+        assert due_calls2 == []
+
+        # Now the event actually finishes -- record disposed.  A later
+        # tick inside the same stamped window reads NOT_DUE, same as any
+        # other scheduled tick with nothing pending.
+        sl.dispose(state_dir)
+        state["consolidating"] = False
+        status3, _resolved3, spy3, due_calls3 = _dispatch(
+            state, ConsolidationAction.AUTO, monkeypatch=monkeypatch
+        )
+        assert status3 == "noop_not_due"
+        assert spy3.call_count == 0
+        assert due_calls3 == []
+        assert read_last_scheduled_run(state_dir) == stamped
+
+    @pytest.mark.parametrize(
+        "event,requested,expected_resolved",
+        [
+            ("interim", "FULL", "INTERIM"),
+            ("full", "INTERIM", "FULL"),
+            ("reconcile", "INTERIM", "RECONCILE"),
+        ],
+    )
+    def test_resumed_action_name_derives_from_the_ledger_head_not_the_request(
+        self, tmp_path, monkeypatch, event, requested, expected_resolved
+    ) -> None:
+        """The resolved action ``_dispatch_consolidation`` returns for a
+        resume is read off the ledger head's ``event`` field directly --
+        never the action the caller actually requested, which the docstring
+        says "waits for the next tick"."""
+        from paramem.server.app import ConsolidationAction
+
+        _write_pending_ledger(tmp_path, event=event)
+        state = _make_arbitrator_state(tmp_path, max_interim_count=7)
+
+        status, resolved, _spy, _ = _dispatch(
+            state, getattr(ConsolidationAction, requested), monkeypatch=monkeypatch
+        )
+
+        assert status == "started_resume"
+        assert resolved is getattr(ConsolidationAction, expected_resolved)
+
+    def test_resume_leaves_exactly_one_ledger_untouched_on_disk(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """Dispatching over a pending record never mints a second ledger --
+        the file on disk is byte-identical before and after the arbitrator
+        hands the resume to the executor (the executor itself is a spy here
+        and never actually runs the resume job, so this isolates the
+        arbitrator's own behaviour from the resume's)."""
+        from paramem.server.app import ConsolidationAction
+        from paramem.training import stage_ledger as sl
+
+        _write_pending_ledger(tmp_path, event="full")
+        state_dir = tmp_path / "state"
+        ledger_bytes_before = sl.ledger_path(state_dir).read_bytes()
+        state = _make_arbitrator_state(tmp_path, max_interim_count=7)
+
+        status, _resolved, _spy, _ = _dispatch(
+            state, ConsolidationAction.FULL, monkeypatch=monkeypatch
+        )
+
+        assert status == "started_resume"
+        assert sl.ledger_path(state_dir).read_bytes() == ledger_bytes_before
+        assert sl.ledger_path(state_dir).exists()
+        # Exactly one ledger file, not a second one alongside it.
+        assert list(state_dir.glob("*ledger*")) == [sl.ledger_path(state_dir)]
+
+    def test_only_the_resume_job_is_ever_submitted_while_a_record_is_pending(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """For EVERY action, including ``RECONCILE``, the ONLY function the
+        arbitrator ever hands to the executor while a record is pending is
+        ``_run_pending_event_resume`` -- never ``_extract_and_start_training``
+        nor a ``functools.partial(_run_full_consolidation_sync, ...)``, which
+        are the only two call sites that ever reach ``stage_event``.  This
+        is the structural half of the no-re-staging invariant: a fresh
+        staging pass is provably unreachable through any door while a
+        record is pending, because the function that could reach it is
+        never even submitted.  ``RECONCILE`` (``/reconsolidate``) has no
+        carve-out here: it never discards a pending record, so it resumes
+        exactly like the other three doors.
+        """
+        import paramem.server.app as app_module
+        from paramem.server.app import ConsolidationAction
+
+        for action in (
+            ConsolidationAction.AUTO,
+            ConsolidationAction.FULL,
+            ConsolidationAction.INTERIM,
+            ConsolidationAction.RECONCILE,
+        ):
+            sub = tmp_path / action.value
+            _write_pending_ledger(sub, event="interim")
+            state = _make_arbitrator_state(sub, max_interim_count=7, refresh_cadence="")
+
+            _status, _resolved, spy, _ = _dispatch(state, action, monkeypatch=monkeypatch)
+
+            assert spy.submitted == [app_module._run_pending_event_resume], (
+                f"{action.value}: stage_event's only reachable callers must never be "
+                f"submitted while a record is pending; got {spy.submitted!r}"
+            )
+
+
+# ---------------------------------------------------------------------------
+# TestFiveDoorPendingRecordGuard — the pending-record verdict
+# (``deferred_event_pending`` -> ``consolidation_pending``) answered
+# identically by every mutating door that reads ``active_consolidation()``.
+# Each door's own five BUSY arms (consolidating / bg-training / cloud-only /
+# trial-active / base-swap-active) live with that door's own test file; this
+# class pins the SIXTH, pending-record arm across all five doors in one
+# place, since ``/admin/assign-orphans`` had no behavioural test at all
+# before this (verified: only route-table/auth introspection exists in
+# ``tests/server/test_require_admin.py``) and neither
+# ``tests/server/test_speaker_forget.py`` nor
+# ``tests/server/test_debug_erase_keys_endpoint.py`` exercised this arm
+# (verified: no ``deferred_event_pending`` / ``consolidation_pending``
+# reference in either file).
+# ---------------------------------------------------------------------------
+
+
+class TestFiveDoorPendingRecordGuard:
+    def test_admin_assign_orphans_refuses_with_a_pending_record(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        import paramem.server.app as app_module
+
+        _write_pending_ledger(tmp_path, event="interim")
+        state = _make_arbitrator_state(tmp_path, max_interim_count=7)
+        state["speaker_store"].list_profiles.return_value = [{"id": "speaker0", "name": "Speaker0"}]
+        monkeypatch.setattr(app_module, "_state", state)
+        monkeypatch.setattr(app_module, "_retro_claim_orphan_sessions", lambda: 0)
+
         from fastapi.testclient import TestClient
 
+        client = TestClient(app_module.app, raise_server_exceptions=False)
+        resp = client.post("/admin/assign-orphans")
+
+        assert resp.status_code == 409
+        assert resp.json()["detail"]["error"] == "consolidation_pending"
+
+    def test_speaker_forget_refuses_with_a_pending_record(self, tmp_path, monkeypatch) -> None:
         import paramem.server.app as app_module
-        from tests.server.test_speaker_forget import (
-            _make_buffer,
-            _make_loop,
-            _make_speaker_store,
+        from tests.server._state_builders import (
+            _make_forget_buffer as _make_buffer,
         )
-        from tests.server.test_speaker_forget import _make_state as _make_forget_state
+        from tests.server._state_builders import (
+            _make_forget_loop as _make_loop,
+        )
+        from tests.server._state_builders import (
+            _make_forget_speaker_store as _make_speaker_store,
+        )
+        from tests.server._state_builders import _make_forget_state
 
         speaker_id = "speaker0"
+        _write_pending_ledger(tmp_path / "data", event="interim")
         loop = _make_loop(speaker_id, [])
         state = _make_forget_state(
             tmp_path,
             loop=loop,
             speaker_store=_make_speaker_store(speaker_id),
             buffer=_make_buffer(speaker_id, []),
-            adapter_manifest_status={"episodic": {"status": "registry_unverified"}},
         )
-
         monkeypatch.setattr(app_module, "_state", state)
+
+        from fastapi.testclient import TestClient
+
         client = TestClient(app_module.app, raise_server_exceptions=False)
         resp = client.post("/speaker/forget", json={"speaker_id": speaker_id})
 
-        assert resp.status_code == 200
+        assert resp.status_code == 409
+        assert resp.json()["detail"]["error"] == "consolidation_pending"
+
+    def test_debug_erase_keys_refuses_with_a_pending_record(self, tmp_path, monkeypatch) -> None:
+        import paramem.server.app as app_module
+        from tests.server._state_builders import _make_erase_state
+
+        _write_pending_ledger(tmp_path / "data", event="interim")
+        state = _make_erase_state(tmp_path)
+        state["config"].debug = True
+        monkeypatch.setattr(app_module, "_state", state)
+
+        from fastapi.testclient import TestClient
+
+        client = TestClient(app_module.app, raise_server_exceptions=False)
+        resp = client.post("/debug/erase-keys", json={"keys": ["graph1"], "confirm": True})
+
+        assert resp.status_code == 409
+        assert resp.json()["detail"]["error"] == "consolidation_pending"
+
+    def test_interim_discard_refuses_with_a_pending_record(self, tmp_path, monkeypatch) -> None:
+        """See also ``tests/server/test_interim_discard.py::TestGuardMatrix``,
+        which owns this door's other five (busy) arms; this pin adds the
+        sixth, pending-record arm alongside them there too."""
+        import paramem.server.app as app_module
+        from tests.server._state_builders import _make_discard_state
+
+        _write_pending_ledger(tmp_path / "data", event="interim")
+        state = _make_discard_state(tmp_path)
+        monkeypatch.setattr(app_module, "_state", state)
+
+        from fastapi.testclient import TestClient
+
+        client = TestClient(app_module.app, raise_server_exceptions=False)
+        resp = client.post("/interim/discard", json={"confirm": True})
+
+        assert resp.status_code == 409
+        assert resp.json()["detail"]["error"] == "consolidation_pending"
+
+    def test_ingest_sessions_cancel_refuses_with_a_pending_record(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """See also ``tests/server/test_ingest_endpoint.py``, which owns this
+        door's happy-path and not-found behaviour and adds the
+        JSONLs-still-present variant of this same arm."""
+        import paramem.server.app as app_module
+        from tests.server._state_builders import _make_ingest_state
+
+        _write_pending_ledger(tmp_path / "data", event="interim")
+        state = _make_ingest_state(tmp_path)
+        monkeypatch.setattr(app_module, "_state", state)
+
+        from fastapi.testclient import TestClient
+
+        client = TestClient(app_module.app, raise_server_exceptions=False)
+        resp = client.post("/ingest-sessions/cancel", json={"session_ids": []})
+
+        assert resp.status_code == 409
+        assert resp.json()["detail"]["error"] == "consolidation_pending"

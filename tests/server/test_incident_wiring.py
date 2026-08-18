@@ -18,7 +18,7 @@ Covers:
 - resolve_incident idempotency fix: already-resolved returns False
 - Ack endpoint: acknowledged incident omitted from attention items
 - _run_stage_b_cycle's crash envelope: a raised exception's own structured
-  fields (RegistryBookkeepingDivergence's divergent_keys,
+  fields (BookkeepingInvariantViolation's divergent_keys,
   ActiveKeyHydrationFailure's dropped_keys/venue) merged into the recorded
   incident detail; any other exception keeps the plain detail
 """
@@ -52,8 +52,6 @@ def _base_config(tmp_path: Path) -> MagicMock:
     cfg = MagicMock()
     cfg.model_name = "mistral"
     cfg.model_config.model_id = "mistralai/Mistral-7B-Instruct-v0.3"
-    cfg.registry_path = tmp_path / "registry.json"
-    cfg.registry_path.write_text("{}")
     cfg.adapter_dir = tmp_path / "adapters"
     cfg.adapter_dir.mkdir(parents=True, exist_ok=True)
     (cfg.adapter_dir / "indexed_key_registry.json").write_text("{}")
@@ -75,7 +73,6 @@ def _base_config(tmp_path: Path) -> MagicMock:
     cfg.paths.data = tmp_path / "data"
     cfg.paths.data.mkdir(parents=True, exist_ok=True)
     cfg.security.backups.max_total_disk_gb = 20.0
-    cfg.paths.key_metadata = tmp_path / "data" / "registry" / "key_metadata.json"
     return cfg
 
 
@@ -252,7 +249,6 @@ class TestPopulatorRegistration:
             "migration": None,
             "consolidating": False,
             "last_consolidation": None,
-            "boot_degraded": None,
             "integrity_check_failed": None,
             "integrity_cleanup": None,
             "adapter_fingerprints_ok": True,
@@ -584,441 +580,6 @@ class TestAutoResolve:
 
 
 # ---------------------------------------------------------------------------
-# Regression coverage: an exception in the interim post-cycle bookkeeping
-# region (not just the run_consolidation_cycle call itself) must still
-# clear _state["consolidating"] and record a training_crash incident.  Before
-# the Stage-B cycle-lifecycle primitive, only the run_consolidation_cycle
-# call was try/except-wrapped; a crash anywhere in the unwrapped bookkeeping
-# region below it (session-buffer retry bump, incident recording, etc.)
-# left the flag stuck forever.  _run_stage_b_cycle's envelope now wraps the
-# ENTIRE interim body, closing that leak structurally.
-# ---------------------------------------------------------------------------
-
-
-class TestInterimBookkeepingRegionCrash:
-    def _drive_extract_and_start_training(self, state, tmp_path, *, bump_retry_error):
-        """Run _extract_and_start_training end to end with a mocked BG trainer.
-
-        The extraction pass and run_consolidation_cycle are mocked (no GPU);
-        the crash is injected into session_buffer.bump_retry_and_release,
-        which lives in the interim body's post-cycle bookkeeping region —
-        outside any try/except that wraps run_consolidation_cycle alone.
-        """
-        cfg = state["config"]
-        cfg.vram.cooldown_gate_threshold_c = 0
-        cfg.vram.vram_cache_headroom_gib = 0.5
-        cfg.consolidation.mode = "train"
-        cfg.consolidation.refresh_cadence = ""
-        cfg.consolidation.interim_overflow_slack = 0
-
-        loop = MagicMock()
-        loop.model = MagicMock(name="model")
-        loop.config.indexed_key_replay = True
-        loop.shutdown_requested = False
-        loop.extract_session.return_value = (
-            [
-                {
-                    "subject": "Alex",
-                    "predicate": "lives_in",
-                    "object": "Millfield",
-                    "relation_type": "factual",
-                }
-            ],
-            [],
-        )
-        # Recall-failed session forces the _count_sids branch, which calls
-        # session_buffer.bump_retry_and_release — the crash injection site.
-        loop.run_consolidation_cycle.return_value = {
-            "mode": "trained",
-            "adapter_name": "episodic_interim_20260417T0000",
-            "new_keys": [],
-            "recall_failed_session_ids": ["sess-1"],
-            "overflow_slot": False,
-        }
-        state["consolidation_loop"] = loop
-
-        sb = state["session_buffer"]
-        sb.pending_facts.return_value = [
-            {"session_id": "sess-1", "speaker_id": "speaker0", "has_voice_embedding": False}
-        ]
-        sb.get_pending.return_value = [
-            {
-                "session_id": "sess-1",
-                "speaker_id": "speaker0",
-                "transcript": "hi",
-                "source_type": "transcript",
-                "started_at": "2026-01-01T00:00:00Z",
-            }
-        ]
-        sb._consolidation_retry_cap = 3
-        sb._sessions = {}
-        sb.bump_retry_and_release.side_effect = bump_retry_error
-
-        mock_bt = MagicMock()
-        mock_bt.submit.side_effect = lambda fn, **kw: fn()
-
-        with (
-            patch("paramem.server.app.BackgroundTrainer", return_value=mock_bt),
-            patch("paramem.server.app.check_vram_headroom"),
-            patch("paramem.server.app.vram_scope"),
-            patch("paramem.server.app._set_voice_pipeline_profile"),
-            patch("paramem.server.consolidation.session_retention_dir", return_value=None),
-        ):
-            app_module._extract_and_start_training()
-
-    def test_bookkeeping_crash_clears_consolidating_flag(self, state, tmp_path):
-        """An uncaught exception in the bookkeeping region still clears the flag."""
-        state["consolidating"] = True
-        self._drive_extract_and_start_training(
-            state, tmp_path, bump_retry_error=RuntimeError("disk io error")
-        )
-        assert state["consolidating"] is False, (
-            "_state['consolidating'] must be cleared even when the interim body "
-            "raises outside the run_consolidation_cycle call itself"
-        )
-
-    def test_bookkeeping_crash_records_training_crash_incident(self, state, tmp_path):
-        """The crash records a training_crash/interim incident via the shared envelope."""
-        state["consolidating"] = True
-        self._drive_extract_and_start_training(
-            state, tmp_path, bump_retry_error=RuntimeError("disk io error")
-        )
-        incidents = read_incidents(_state_dir(state))
-        training_crashes = [i for i in incidents if i.type == "training_crash"]
-        assert len(training_crashes) == 1, (
-            f"expected exactly one training_crash incident; got {incidents}"
-        )
-        assert training_crashes[0].id == "training_crash:interim"
-        assert training_crashes[0].status == "active"
-
-
-# ---------------------------------------------------------------------------
-# A session-retirement (mark_consolidated) failure is a transcript-retirement
-# I/O problem, not a training crash — by the time it can fire, commit_tier_slot
-# has already durably committed the interim slot inside run_consolidation_cycle.
-# It must be caught locally, recorded as its own incident, and the cycle must
-# still finalize as a committed success (router reload, run-status row).
-# ---------------------------------------------------------------------------
-
-
-class TestInterimSessionRetirementFailure:
-    def _drive(self, state, tmp_path, *, mark_consolidated_error):
-        """Run _extract_and_start_training end to end with a mocked BG trainer.
-
-        Mirrors TestInterimBookkeepingRegionCrash._drive_extract_and_start_training
-        but injects the failure into session_buffer.mark_consolidated — the
-        interim body's post-train retirement call — instead of
-        bump_retry_and_release.
-        """
-        cfg = state["config"]
-        cfg.vram.cooldown_gate_threshold_c = 0
-        cfg.vram.vram_cache_headroom_gib = 0.5
-        cfg.consolidation.mode = "train"
-        cfg.consolidation.refresh_cadence = ""
-        cfg.consolidation.interim_overflow_slack = 0
-
-        state["router"] = MagicMock()
-
-        loop = MagicMock()
-        loop.model = MagicMock(name="model")
-        loop.config.indexed_key_replay = True
-        loop.shutdown_requested = False
-        # replay disabled on the finalize-time store read so the success
-        # finalizer (_finalize_interim) does not need all_active_keys() wired.
-        loop.store.replay_enabled = False
-        loop.extract_session.return_value = (
-            [
-                {
-                    "subject": "Alex",
-                    "predicate": "lives_in",
-                    "object": "Millfield",
-                    "relation_type": "factual",
-                }
-            ],
-            [],
-        )
-        # Clean recall (no recall-failed sessions) -- isolates the injected
-        # failure to mark_consolidated alone, not the retry-bump branch.
-        loop.run_consolidation_cycle.return_value = {
-            "mode": "trained",
-            "adapter_name": "episodic_interim_20260417T0000",
-            "new_keys": [],
-            "recall_failed_session_ids": [],
-            "overflow_slot": False,
-        }
-        state["consolidation_loop"] = loop
-
-        sb = state["session_buffer"]
-        sb.pending_facts.return_value = [
-            {"session_id": "sess-1", "speaker_id": "speaker0", "has_voice_embedding": False}
-        ]
-        sb.get_pending.return_value = [
-            {
-                "session_id": "sess-1",
-                "speaker_id": "speaker0",
-                "transcript": "hi",
-                "source_type": "transcript",
-                "started_at": "2026-01-01T00:00:00Z",
-            }
-        ]
-        sb._consolidation_retry_cap = 3
-        sb._sessions = {}
-        sb.mark_consolidated.side_effect = mark_consolidated_error
-
-        mock_bt = MagicMock()
-        mock_bt.submit.side_effect = lambda fn, **kw: fn()
-
-        with (
-            patch("paramem.server.app.BackgroundTrainer", return_value=mock_bt),
-            patch("paramem.server.app.check_vram_headroom"),
-            patch("paramem.server.app.vram_scope"),
-            patch("paramem.server.app._set_voice_pipeline_profile"),
-            patch("paramem.server.consolidation.session_retention_dir", return_value=None),
-        ):
-            app_module._extract_and_start_training()
-
-    def test_mark_consolidated_failure_still_finalizes_as_committed(self, state, tmp_path):
-        """The cycle finalizes normally (consolidating cleared, router reloaded)
-        despite the retirement failure -- the interim slot was already
-        committed by commit_tier_slot before mark_consolidated ran."""
-        state["consolidating"] = True
-        self._drive(state, tmp_path, mark_consolidated_error=OSError("disk full"))
-
-        assert state["consolidating"] is False, (
-            "a session-retirement failure must not leave the cycle stuck as "
-            "'consolidating' — the fold itself already committed"
-        )
-        state["router"].reload.assert_called_once_with()
-
-    def test_mark_consolidated_failure_records_retirement_incident_not_training_crash(
-        self, state, tmp_path
-    ):
-        """Records a session_retirement_failed incident, never training_crash --
-        the cycle succeeded; only the retirement I/O step failed."""
-        state["consolidating"] = True
-        self._drive(state, tmp_path, mark_consolidated_error=OSError("disk full"))
-
-        incidents = read_incidents(_state_dir(state))
-        training_crashes = [i for i in incidents if i.type == "training_crash"]
-        assert training_crashes == [], (
-            f"a committed cycle's retirement failure must NOT surface as a "
-            f"training_crash incident; got {incidents}"
-        )
-        retirement_incidents = [i for i in incidents if i.type == "session_retirement_failed"]
-        assert len(retirement_incidents) == 1, (
-            f"expected exactly one session_retirement_failed incident; got {incidents}"
-        )
-        assert retirement_incidents[0].status == "active"
-
-
-# ---------------------------------------------------------------------------
-# _finalize_interim's run-status detail carries relation counts for every
-# outcome — one outcome label, one detail contract, so
-# scripts/dev/paramem-status.sh's "simulated" render (which reads
-# detail["episodic_rels"]/detail["procedural_rels"]) is populated regardless
-# of which finalizer wrote the record.
-# ---------------------------------------------------------------------------
-
-
-class TestFinalizeInterimDetailShape:
-    def _make_loop(self, state):
-        state["router"] = MagicMock()
-        loop = MagicMock()
-        loop.model = MagicMock()
-        loop.store.replay_enabled = True
-        loop.store.all_active_keys.return_value = {"k1", "k2"}
-        return loop
-
-    def test_simulated_outcome_carries_rel_counts(self, state):
-        """A ``result["mode"] == "simulated"`` cycle's run record carries
-        both relation counts — the exact shape
-        ``scripts/dev/paramem-status.sh``'s simulated branch renders."""
-        loop = self._make_loop(state)
-        result = {"mode": "simulated", "adapter_name": "episodic_interim_x"}
-
-        app_module._finalize_interim(
-            loop,
-            result,
-            session_ids=["sess-1"],
-            released_sids=[],
-            episodic_rels=3,
-            procedural_rels=2,
-        )
-
-        record = read_last_runs(_state_dir(state))["consolidation"]
-        assert record.outcome == "simulated"
-        assert record.detail["episodic_rels"] == 3
-        assert record.detail["procedural_rels"] == 2
-
-    def test_trained_outcome_carries_rel_counts_and_existing_keys_unchanged(self, state):
-        """The ``trained`` outcome's existing detail keys (sessions,
-        total_keys, adapter) are unchanged by adding the new counts."""
-        loop = self._make_loop(state)
-        result = {"mode": "trained", "adapter_name": "episodic_interim_x"}
-
-        app_module._finalize_interim(
-            loop,
-            result,
-            session_ids=["sess-1"],
-            released_sids=[],
-            episodic_rels=1,
-            procedural_rels=0,
-        )
-
-        record = read_last_runs(_state_dir(state))["consolidation"]
-        assert record.outcome == "trained"
-        assert record.detail["episodic_rels"] == 1
-        assert record.detail["procedural_rels"] == 0
-        assert record.detail["sessions"] == 1
-        assert record.detail["total_keys"] == 2
-        assert record.detail["adapter"] == "episodic_interim_x"
-
-    def test_rel_counts_default_to_zero_when_omitted(self, state):
-        """Callers that do not pass the new kwargs still get a valid,
-        zero-filled detail — no KeyError on the render side."""
-        loop = self._make_loop(state)
-        result = {"mode": "trained", "adapter_name": "episodic_interim_x"}
-
-        app_module._finalize_interim(
-            loop,
-            result,
-            session_ids=["sess-1"],
-            released_sids=[],
-        )
-
-        record = read_last_runs(_state_dir(state))["consolidation"]
-        assert record.detail["episodic_rels"] == 0
-        assert record.detail["procedural_rels"] == 0
-
-
-# ---------------------------------------------------------------------------
-# _finalize_interim records tier_registry_unverified incidents too — the
-# interim-fold blind-window fix: an interim fold is often the FIRST observer
-# of a tier whose binding breaks after boot, and the incident is the SOLE
-# operator-visible reporter for that condition.
-# ---------------------------------------------------------------------------
-
-
-class TestFinalizeInterimTierIncident:
-    def _make_loop(self, state):
-        state["router"] = MagicMock()
-        loop = MagicMock()
-        loop.model = MagicMock()
-        loop.store.replay_enabled = True
-        loop.store.all_active_keys.return_value = set()
-        return loop
-
-    def test_broken_tier_records_incident_and_stays_sole_reporter(self, state):
-        """A tier whose registry binding breaks and is FIRST observed by an
-        interim fold (not boot, not a full cycle) still gets its incident
-        recorded — closing the blind window. The row-driven attention
-        populator stays silent for the same condition (the sole-reporter
-        property holds on the interim path too, mirroring the full-cycle
-        path)."""
-        from paramem.server.attention import _collect_adapter_fingerprint_items
-        from paramem.server.incidents import read_incidents
-
-        episodic_dir = state["config"].adapter_dir / "episodic"
-        episodic_dir.mkdir(parents=True, exist_ok=True)
-        (episodic_dir / "indexed_key_registry.json").write_bytes(b"not json at all")
-
-        loop = self._make_loop(state)
-        result = {"mode": "trained", "adapter_name": "episodic_interim_x"}
-
-        app_module._finalize_interim(
-            loop,
-            result,
-            session_ids=["sess-1"],
-            released_sids=[],
-        )
-
-        incidents = read_incidents(_state_dir(state))
-        matching = [i for i in incidents if i.id == "tier_registry_unverified:episodic"]
-        assert len(matching) == 1
-        assert matching[0].status == "active"
-        assert matching[0].severity == "failed"
-
-        # Sole reporter: the row-driven populator stays silent for the same
-        # condition (_revalidate_adapter_manifests, called earlier in the
-        # same finalizer, already minted the adapter_manifest_status row).
-        assert _collect_adapter_fingerprint_items(state) == []
-
-    def test_raising_incident_store_does_not_prevent_consolidating_clear(self, state, caplog):
-        """A raising incident store (record/resolve/read) must not wedge
-        the finalizer — _state['consolidating'] must still clear, and the
-        fault must be logged as an ERROR, never silently swallowed."""
-        import logging
-
-        episodic_dir = state["config"].adapter_dir / "episodic"
-        episodic_dir.mkdir(parents=True, exist_ok=True)
-        (episodic_dir / "indexed_key_registry.json").write_bytes(b"not json at all")
-
-        state["consolidating"] = True
-        loop = self._make_loop(state)
-        result = {"mode": "trained", "adapter_name": "episodic_interim_x"}
-
-        with (
-            patch.object(
-                app_module,
-                "_record_unverified_tier_incidents",
-                side_effect=RuntimeError("simulated incident store fault"),
-            ),
-            caplog.at_level(logging.ERROR, logger="paramem.server.app"),
-        ):
-            app_module._finalize_interim(
-                loop,
-                result,
-                session_ids=["sess-1"],
-                released_sids=[],
-            )
-
-        assert state["consolidating"] is False, (
-            "a raising incident store must not wedge the finalizer before consolidating clears"
-        )
-        error_messages = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
-        assert any("tier-incident" in msg for msg in error_messages), (
-            f"expected the fault logged as an ERROR, got: {error_messages}"
-        )
-
-
-class TestS4Ordering:
-    def test_recall_failure_incident_not_resolved_by_pass_b_success_paths(self, tmp_path):
-        """consolidation_retry_exhausted is not resolved by this module's
-        incident-wiring resolve-by-type calls.
-
-        _finalize_interim's clean-success guard (app._is_interim_clean_success)
-        owns the conditional resolve for consolidation_retry_exhausted.
-        These success paths must NOT resolve it — only by_type resolution of
-        the types owned here (vram_exhausted, training_crash,
-        consolidation_crash, extraction_failed, migration_error,
-        migration_phase_failed).
-        """
-        state_dir = tmp_path / "state"
-        _record(state_dir, type="consolidation_retry_exhausted", key="session_abc")
-
-        # Simulate the incident-wiring success paths (resolve all types owned here).
-        for t in (
-            "training_crash",
-            "vram_exhausted",
-            "consolidation_crash",
-            "extraction_failed",
-            "migration_error",
-            "migration_phase_failed",
-        ):
-            resolve_incidents_by_type(state_dir, t)
-
-        # The retry_exhausted incident must remain ACTIVE.
-        incidents = read_incidents(state_dir)
-        recall_failures = [i for i in incidents if i.type == "consolidation_retry_exhausted"]
-        assert len(recall_failures) == 1
-        assert recall_failures[0].status == "active", (
-            "consolidation_retry_exhausted must remain active — "
-            "_finalize_interim's clean-success guard owns its conditional resolve — "
-            "Pass B must not touch it"
-        )
-
-
-# ---------------------------------------------------------------------------
 # resolve_incident idempotency fix: already-resolved returns False
 # ---------------------------------------------------------------------------
 
@@ -1251,7 +812,7 @@ class TestSameTypeDifferentKeysStaySeparate:
 
 # ---------------------------------------------------------------------------
 # _run_stage_b_cycle's crash envelope: a raised exception's own structured
-# fields (RegistryBookkeepingDivergence's divergent_keys,
+# fields (BookkeepingInvariantViolation's divergent_keys,
 # ActiveKeyHydrationFailure's dropped_keys/venue) must survive into the
 # recorded incident's detail; any other exception keeps the caller-supplied
 # detail unchanged.
@@ -1289,19 +850,19 @@ def _drive_stage_b_cycle_crash(state, *, exc):
 class TestStageBCycleDivergentKeysIncidentDetail:
     """``_run_stage_b_cycle``'s crash envelope (``paramem/server/app.py``,
     the ``except Exception`` block inside its ``_worker`` closure) merges a
-    ``RegistryBookkeepingDivergence``'s ``divergent_keys`` into the incident
+    ``BookkeepingInvariantViolation``'s ``divergent_keys`` into the incident
     detail it records, so the incident names exactly what diverged instead
     of leaving that only in the log traceback.  Any other exception type
     records the caller-supplied ``failure_detail`` verbatim."""
 
     def test_divergent_keys_merged_into_incident_detail(self, state):
-        """A RegistryBookkeepingDivergence's divergent_keys is folded into
+        """A BookkeepingInvariantViolation's divergent_keys is folded into
         the incident detail alongside the caller-supplied fields."""
-        from paramem.training.consolidation import RegistryBookkeepingDivergence
+        from paramem.memory.store import BookkeepingInvariantViolation
 
         divergent = {"episodic": ["g0", "g1"]}
-        exc = RegistryBookkeepingDivergence(
-            "registry/bookkeeping divergence", divergent_keys=divergent
+        exc = BookkeepingInvariantViolation(
+            "pre-write parity: tier 'episodic', key(s) ['g0', 'g1']", divergent_keys=divergent
         )
         _drive_stage_b_cycle_crash(state, exc=exc)
 
@@ -1360,16 +921,17 @@ class TestStageBCycleDivergentKeysIncidentDetail:
         )
 
     def test_recall_gate_rejected_empty_failed_keys_omitted_from_incident_detail(self, state):
-        """A RecallGateRejected with no per-key data (the disk-verify raise
-        site never populates failed_keys) omits the field entirely rather
-        than publishing an empty list next to a failing recall_rate -- an
-        empty ``failed_keys: []`` reads as "no keys failed", which is wrong
-        when the tier plainly did fail (recall_rate < threshold).
+        """A RecallGateRejected constructed with no per-key data
+        (``failed_keys`` defaults to ``()``) omits the field entirely from
+        the incident detail rather than publishing an empty list next to a
+        failing recall_rate -- an empty ``failed_keys: []`` reads as "no
+        keys failed", which is wrong when the tier plainly did fail
+        (recall_rate < threshold).
         """
         from paramem.training.consolidation import RecallGateRejected
 
         exc = RecallGateRejected(
-            "post-save disk-integrity probe failed for adapter 'episodic'",
+            "recall gate rejected adapter 'episodic'",
             adapter_name="episodic",
             recall_rate=0.5,
             threshold=1.0,
@@ -1416,10 +978,13 @@ class TestStageBCycleHydrationFailureIncidentDetail:
 class TestStageBCycleRecallGateIncidentDetail:
     """``_run_stage_b_cycle``'s crash envelope merges a
     ``RecallGateRejected``'s ``adapter_name``/``recall_rate``/``threshold``
-    into the incident detail it records — a main-tiers fold refusal reaches
-    here uncaught (the interim fold catches this type itself and returns a
-    normal ``recall_failed`` outcome instead), so the incident names the
-    tier that fell short."""
+    into the incident detail it records — a fold refusal reaches here
+    uncaught for BOTH fold kinds, main-tiers and interim: the gate
+    (``ConsolidationLoop._assert_tier_recall``) is the same all-or-nothing
+    verdict for either, and each fold's own ``except RecallGateRejected``
+    only rolls back its in-flight store mutations before re-raising
+    unchanged onto this same crash path, so the incident names the tier
+    that fell short regardless of which fold raised it."""
 
     def test_abort_reaches_the_incident_detail(self, state):
         """A RecallGateRejected's adapter_name/recall_rate/threshold are
@@ -1448,27 +1013,63 @@ class TestStageBCycleRecallGateIncidentDetail:
         )
 
 
-class TestStageBCycleFoldAccountingRefusalIncidentDetail:
-    """``_run_stage_b_cycle``'s crash envelope merges a
-    ``FoldAccountingRefusal``'s ``unexplained_keys`` into the incident
-    detail it records — a main-tiers fold that could not account for a
-    genuine_loss key reaches here uncaught, so the incident names exactly
-    what could not be accounted for."""
+class TestStageBCycleInterimRecallGateKeepsSessionsPending:
+    """An interim cycle's ``run_consolidation_cycle`` call applies the same
+    all-or-nothing gate as a main-tiers fold — a shortfall raises
+    ``RecallGateRejected`` directly, with no soft ``recall_failed`` return
+    value to inspect.  The interim body's own session-retirement step
+    (``session_buffer.mark_consolidated``), reached only after a
+    successful ``run_consolidation_cycle`` return, is therefore never
+    executed, so every session the cycle was consuming stays pending
+    alongside the recorded incident."""
 
-    def test_unexplained_keys_reach_the_incident_detail(self, state):
-        """A FoldAccountingRefusal's unexplained_keys is folded into the
-        incident detail alongside the caller-supplied fields."""
-        from paramem.training.consolidation import FoldAccountingRefusal
+    def test_recall_gate_rejection_records_incident_and_never_retires_sessions(self, state):
+        """A RecallGateRejected from run_consolidation_cycle is recorded
+        with the gate's detail and leaves session retirement unreached."""
+        from paramem.training.consolidation import RecallGateRejected
 
-        exc = FoldAccountingRefusal(unexplained_keys=["graph_lost", "graph_gone"])
-        _drive_stage_b_cycle_crash(state, exc=exc)
+        exc = RecallGateRejected(
+            "_assert_tier_recall: tier 'episodic_interim_20260417T0000' "
+            "reached 1/2 keys (0.500) on its own trained weights",
+            adapter_name="episodic_interim_20260417T0000",
+            recall_rate=0.5,
+            threshold=1.0,
+            failed_keys=("graph_bad",),
+        )
+
+        state["consolidation_loop"] = MagicMock()
+        mock_bt = MagicMock()
+        mock_bt.submit.side_effect = lambda fn, **kw: fn()
+        state["background_trainer"] = mock_bt
+        session_buffer = state["session_buffer"]
+
+        def _body(loop, bt):
+            # Mirrors the interim body's real shape (paramem/server/app.py's
+            # _run_interim_training): session retirement runs only after
+            # run_consolidation_cycle returns successfully, so a raise here
+            # means the mark_consolidated call below is never reached.
+            loop.run_consolidation_cycle.side_effect = exc
+            loop.run_consolidation_cycle(
+                [], [], speaker_id="speaker0", mode="train", run_label="tick"
+            )
+            session_buffer.mark_consolidated(["session-a"], retention_dir=None)
+            return "trained", None
+
+        with patch("paramem.server.app._set_voice_pipeline_profile"):
+            app_module._run_stage_b_cycle(
+                kind="training_crash",
+                incident_key="interim",
+                failure_summary="Interim training crashed — 1 session(s) still pending",
+                failure_detail={"sessions": 1},
+                body=_body,
+            )
 
         incidents = read_incidents(_state_dir(state))
-        crashes = [i for i in incidents if i.type == "consolidation_crash"]
-        assert len(crashes) == 1, (
-            f"expected exactly one consolidation_crash incident; got {incidents}"
-        )
-        assert crashes[0].detail["unexplained_keys"] == ["graph_gone", "graph_lost"]
-        assert crashes[0].detail["phase"] == "fold", (
-            "caller-supplied detail fields must survive the merge"
-        )
+        crashes = [i for i in incidents if i.type == "training_crash"]
+        assert len(crashes) == 1, f"expected exactly one training_crash incident; got {incidents}"
+        assert crashes[0].detail["adapter_name"] == "episodic_interim_20260417T0000"
+        assert crashes[0].detail["recall_rate"] == 0.5
+        assert crashes[0].detail["threshold"] == 1.0
+        assert crashes[0].detail["failed_keys"] == ["graph_bad"]
+
+        session_buffer.mark_consolidated.assert_not_called()

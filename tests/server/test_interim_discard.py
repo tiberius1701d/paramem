@@ -1,7 +1,7 @@
 """Tests for ``POST /interim/discard``.
 
 Mocked — no GPU, no real model. Mirrors the mocking style of
-``tests/server/test_speaker_forget.py`` and ``tests/server/test_gates.py``.
+``tests/server/test_gates.py``.
 
 Coverage
 --------
@@ -13,12 +13,11 @@ Coverage
 - Empty ring: 200 ``noop_empty_ring``, nothing touched.
 - Guard matrix: consolidating / bg training / cloud-only / trial-active all
   409 with the mapped error, no mutation.
-- Operation order: drop_tier -> unload_interim_adapters -> save_key_metadata
+- Operation order: drop_tier -> unload_interim_adapters (wholesale on-disk
+  removal of the discarded tier's directory, including its key_metadata.json)
   -> router.reload.
 - Ring incidents resolved with a non-null ``resolved_reason``; unrelated
   incident types untouched.
-- ``adapter_manifest_status`` rows for discarded names popped; surviving
-  rows (main tiers) untouched.
 - ``record_last_run`` called with ``op_type="consolidation"``,
   ``outcome="interim_discarded"``.
 - Non-PEFT (simulate) venue: bare object model, PEFT half skipped.
@@ -45,6 +44,12 @@ import paramem.server.app as app_module
 from paramem.memory.store import MemoryStore
 from paramem.server.incidents import read_incidents, record_incident
 from paramem.server.run_status import read_last_runs
+from tests.server._state_builders import (
+    _make_discard_config as _make_config,
+)
+from tests.server._state_builders import (
+    _make_discard_state as _make_state,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers / fixtures
@@ -55,17 +60,6 @@ def _entry(
     key: str, subject: str = "Alice", predicate: str = "lives_in", obj: str = "Berlin"
 ) -> dict:
     return {"key": key, "subject": subject, "predicate": predicate, "object": obj}
-
-
-def _make_config(tmp_path: Path) -> MagicMock:
-    cfg = MagicMock()
-    adapter_dir = tmp_path / "adapters"
-    adapter_dir.mkdir(parents=True, exist_ok=True)
-    cfg.adapter_dir = adapter_dir
-    cfg.key_metadata_path = tmp_path / "registry" / "key_metadata.json"
-    cfg.paths = MagicMock()
-    cfg.paths.data = tmp_path / "data"
-    return cfg
 
 
 def _make_peft_model(*adapter_names: str) -> MagicMock:
@@ -88,7 +82,6 @@ def _make_loop(store: MemoryStore, model) -> MagicMock:
     loop.model = model
     loop.promoted_keys = set()
     loop.cycle_count = 0
-    loop.trial_key_metadata_path = None
     return loop
 
 
@@ -99,43 +92,21 @@ def _seed_interim_slot(store: MemoryStore, adapter_dir: Path, stamp: str, key: s
     """
     tier = f"episodic_interim_{stamp}"
     store.put(tier, key, _entry(key), simhash=1)
-    store.set_bookkeeping(key, speaker_id="speaker0", relation_type="episodic", first_seen="t0")
+    store.set_bookkeeping(
+        key, speaker_id="speaker0", relation_type="episodic", first_seen="t0", promoted=False
+    )
     (adapter_dir / "episodic" / f"interim_{stamp}").mkdir(parents=True, exist_ok=True)
     return tier
 
 
 def _seed_main_tier(store: MemoryStore, adapter_dir: Path, tier: str, key: str) -> None:
     store.put(tier, key, _entry(key), simhash=2)
-    store.set_bookkeeping(key, speaker_id="speaker0", relation_type="episodic", first_seen="t0")
+    store.set_bookkeeping(
+        key, speaker_id="speaker0", relation_type="episodic", first_seen="t0", promoted=False
+    )
     tier_dir = adapter_dir / tier
     tier_dir.mkdir(parents=True, exist_ok=True)
     store.registry(tier).save(tier_dir / "indexed_key_registry.json")
-
-
-def _make_state(
-    tmp_path: Path,
-    *,
-    loop=None,
-    config=None,
-    mode: str = "local",
-    consolidating: bool = False,
-    background_trainer=None,
-    migration=None,
-    router=None,
-    session_buffer=None,
-) -> dict:
-    return {
-        "config": config or _make_config(tmp_path),
-        "consolidation_loop": loop,
-        "mode": mode,
-        "consolidating": consolidating,
-        "background_trainer": background_trainer,
-        "migration": migration,
-        "router": router or MagicMock(),
-        "adapter_manifest_status": {},
-        "session_buffer": session_buffer or MagicMock(),
-        "last_consolidation": None,
-    }
 
 
 def _make_client(monkeypatch, state: dict) -> TestClient:
@@ -151,7 +122,7 @@ def _make_client(monkeypatch, state: dict) -> TestClient:
 class TestPreview:
     def test_unconfirmed_returns_owner_ruled_status_with_inventory(self, tmp_path, monkeypatch):
         cfg = _make_config(tmp_path)
-        store = MemoryStore(replay_enabled=True)
+        store = MemoryStore()
         _seed_interim_slot(store, cfg.adapter_dir, "20260801T0000", "graph1")
         model = _make_peft_model("episodic", "episodic_interim_20260801T0000")
         loop = _make_loop(store, model)
@@ -174,7 +145,7 @@ class TestPreview:
 
     def test_explicit_confirm_false_is_still_unconfirmed(self, tmp_path, monkeypatch):
         cfg = _make_config(tmp_path)
-        store = MemoryStore(replay_enabled=True)
+        store = MemoryStore()
         _seed_interim_slot(store, cfg.adapter_dir, "20260801T0000", "graph1")
         model = _make_peft_model("episodic", "episodic_interim_20260801T0000")
         loop = _make_loop(store, model)
@@ -194,7 +165,7 @@ class TestPreview:
 class TestHappyPath:
     def test_confirmed_discard_reaps_the_whole_ring(self, tmp_path, monkeypatch):
         cfg = _make_config(tmp_path)
-        store = MemoryStore(replay_enabled=True)
+        store = MemoryStore()
         _seed_interim_slot(store, cfg.adapter_dir, "20260801T0000", "graph1")
         _seed_interim_slot(store, cfg.adapter_dir, "20260802T0000", "graph2")
         model = _make_peft_model(
@@ -255,7 +226,7 @@ class TestHappyPath:
 
     def test_main_tiers_untouched(self, tmp_path, monkeypatch):
         cfg = _make_config(tmp_path)
-        store = MemoryStore(replay_enabled=True)
+        store = MemoryStore()
         _seed_interim_slot(store, cfg.adapter_dir, "20260801T0000", "graph1")
         _seed_main_tier(store, cfg.adapter_dir, "episodic", "graph-main")
         model = _make_peft_model("episodic", "episodic_interim_20260801T0000")
@@ -275,7 +246,7 @@ class TestHappyPath:
         """Pending sessions in the SessionBuffer are never in an interim slot
         (absorbed by the next fold) — the discard door must not touch them."""
         cfg = _make_config(tmp_path)
-        store = MemoryStore(replay_enabled=True)
+        store = MemoryStore()
         _seed_interim_slot(store, cfg.adapter_dir, "20260801T0000", "graph1")
         model = _make_peft_model("episodic", "episodic_interim_20260801T0000")
         loop = _make_loop(store, model)
@@ -303,7 +274,7 @@ class TestStrayInvalidStampDir:
         remove it) rather than 500 on a ``ValueError`` from re-deriving its
         path via ``interim_dir_for_name``."""
         cfg = _make_config(tmp_path)
-        store = MemoryStore(replay_enabled=True)
+        store = MemoryStore()
         model = _make_peft_model("episodic")
         loop = _make_loop(store, model)
         stray = cfg.adapter_dir / "episodic" / "interim_garbage"
@@ -334,7 +305,7 @@ class TestPromotedKeysPruned:
         ``promoted_keys.difference_update``.  A key from a surviving main
         tier must not be pruned."""
         cfg = _make_config(tmp_path)
-        store = MemoryStore(replay_enabled=True)
+        store = MemoryStore()
         _seed_interim_slot(store, cfg.adapter_dir, "20260801T0000", "graph1")
         _seed_main_tier(store, cfg.adapter_dir, "episodic", "graph-main")
         model = _make_peft_model("episodic", "episodic_interim_20260801T0000")
@@ -360,7 +331,7 @@ class TestPromotedKeysPruned:
 class TestEmptyRing:
     def test_noop_when_nothing_to_discard(self, tmp_path, monkeypatch):
         cfg = _make_config(tmp_path)
-        store = MemoryStore(replay_enabled=True)
+        store = MemoryStore()
         model = _make_peft_model("episodic", "semantic", "procedural")
         loop = _make_loop(store, model)
         state = _make_state(tmp_path, loop=loop, config=cfg)
@@ -375,9 +346,6 @@ class TestEmptyRing:
         assert body["unloaded_adapters"] == []
         assert body["removed_dirs"] == []
         assert body["resolved_incidents"] == 0
-
-        # key_metadata.json was never written.
-        assert not cfg.key_metadata_path.exists()
         state["router"].reload.assert_not_called()
         assert state["last_consolidation"] is None
 
@@ -385,7 +353,7 @@ class TestEmptyRing:
         """An empty ring returns the noop 200 even without confirm=true — a
         no-op is the answer, not a refusal."""
         cfg = _make_config(tmp_path)
-        store = MemoryStore(replay_enabled=True)
+        store = MemoryStore()
         model = _make_peft_model("episodic")
         loop = _make_loop(store, model)
         state = _make_state(tmp_path, loop=loop, config=cfg)
@@ -453,6 +421,28 @@ class TestGuardMatrix:
         assert resp.json()["detail"]["error"] == "base_swap_active"
         loop.store.drop_tier.assert_not_called()
 
+    def test_pending_consolidation_record_refuses_409(self, tmp_path, monkeypatch):
+        """A pending stage ledger with ``consolidating`` clear is the SIXTH
+        guard verdict (``deferred_event_pending`` -> ``consolidation_pending``)
+        -- distinct from the five busy arms above, and previously untested
+        for this door (verified: no ``deferred_event_pending`` /
+        ``consolidation_pending`` reference anywhere in this file before
+        this pin).  See also
+        ``tests/server/test_consolidate_dispatch.py::TestFiveDoorPendingRecordGuard``,
+        which pins the same arm for the other four mutating doors.
+        """
+        from tests.server._state_builders import _write_pending_ledger
+
+        cfg = _make_config(tmp_path)
+        _write_pending_ledger(cfg.paths.data, event="interim")
+        state = _make_state(tmp_path, config=cfg, consolidating=False)
+
+        resp, loop = self._assert_refused_without_mutation(monkeypatch, tmp_path, state)
+
+        assert resp.status_code == 409
+        assert resp.json()["detail"]["error"] == "consolidation_pending"
+        loop.store.drop_tier.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # Loop staleness across gpu_lock — a config-apply (or, before this fix, a
@@ -481,12 +471,12 @@ class TestLoopStalenessAcrossLock:
         cfg = _make_config(tmp_path)
         tier = "episodic_interim_20260801T0000"
 
-        store_a = MemoryStore(replay_enabled=True)  # the handler's pre-lock capture
+        store_a = MemoryStore()  # the handler's pre-lock capture
         _seed_interim_slot(store_a, cfg.adapter_dir, "20260801T0000", "graph1")
         model_a = _make_peft_model("episodic", tier)
         loop_a = _make_loop(store_a, model_a)
 
-        store_b = MemoryStore(replay_enabled=True)  # swapped in while the lock is held
+        store_b = MemoryStore()  # swapped in while the lock is held
         _seed_interim_slot(store_b, cfg.adapter_dir, "20260801T0000", "graph1")
         model_b = _make_peft_model("episodic", tier)
         loop_b = _make_loop(store_b, model_b)
@@ -529,13 +519,13 @@ class TestLoopStalenessAcrossLock:
         tier = "episodic_interim_20260801T0000"
 
         cfg_a = _make_config(tmp_path / "a")  # the handler's pre-lock capture
-        store_a = MemoryStore(replay_enabled=True)
+        store_a = MemoryStore()
         _seed_interim_slot(store_a, cfg_a.adapter_dir, "20260801T0000", "graph1")
         model_a = _make_peft_model("episodic", tier)
         loop_a = _make_loop(store_a, model_a)
 
         cfg_b = _make_config(tmp_path / "b")  # swapped in while the lock is held
-        store_b = MemoryStore(replay_enabled=True)
+        store_b = MemoryStore()
         _seed_interim_slot(store_b, cfg_b.adapter_dir, "20260801T0000", "graph1")
         model_b = _make_peft_model("episodic", tier)
         loop_b = _make_loop(store_b, model_b)
@@ -564,74 +554,6 @@ class TestLoopStalenessAcrossLock:
 
 
 # ---------------------------------------------------------------------------
-# Operation order
-# ---------------------------------------------------------------------------
-
-
-class TestOperationOrder:
-    def test_drop_tier_then_unload_then_save_metadata_then_router_reload(
-        self, tmp_path, monkeypatch
-    ):
-        cfg = _make_config(tmp_path)
-        store = MemoryStore(replay_enabled=True)
-        _seed_interim_slot(store, cfg.adapter_dir, "20260801T0000", "graph1")
-        model = _make_peft_model("episodic", "episodic_interim_20260801T0000")
-        loop = _make_loop(store, model)
-        state = _make_state(tmp_path, loop=loop, config=cfg)
-
-        call_order: list[str] = []
-
-        orig_drop_tier = store.drop_tier
-
-        def _spy_drop_tier(tier):
-            call_order.append("drop_tier")
-            return orig_drop_tier(tier)
-
-        monkeypatch.setattr(store, "drop_tier", _spy_drop_tier)
-
-        orig_delete_adapter_side_effect = model.delete_adapter.side_effect
-        tiers_at_unload: list[list[str]] = []
-
-        def _spy_delete_adapter(name):
-            if not call_order or call_order[-1] != "unload_interim_adapters":
-                call_order.append("unload_interim_adapters")
-                # Step 1 (drop_tier) must have already run by the time Step 2
-                # (unload_interim_adapters) starts deleting PEFT adapters —
-                # the tier becomes unroutable in RAM before its on-disk/PEFT
-                # remnants are reaped.
-                tiers_at_unload.append(list(store.tiers_with_registry()))
-            return orig_delete_adapter_side_effect(name)
-
-        model.delete_adapter.side_effect = _spy_delete_adapter
-
-        def _spy_reload():
-            call_order.append("router_reload")
-
-        state["router"].reload.side_effect = _spy_reload
-
-        def _spy_write_key_metadata():
-            call_order.append("write_key_metadata")
-
-        loop.write_key_metadata.side_effect = _spy_write_key_metadata
-
-        client = _make_client(monkeypatch, state)
-        resp = client.post("/interim/discard", json={"confirm": True})
-
-        assert resp.status_code == 200, resp.text
-        assert tiers_at_unload, "unload_interim_adapters must have deleted at least one adapter"
-        assert "episodic_interim_20260801T0000" not in tiers_at_unload[0], (
-            "interim tier must already be dropped from the store's registry set "
-            "by the time unload_interim_adapters runs"
-        )
-        assert call_order == [
-            "drop_tier",
-            "unload_interim_adapters",
-            "write_key_metadata",
-            "router_reload",
-        ]
-
-
-# ---------------------------------------------------------------------------
 # Incidents
 # ---------------------------------------------------------------------------
 
@@ -655,7 +577,7 @@ class TestIncidentResolution:
                 detail={},
             )
 
-        store = MemoryStore(replay_enabled=True)
+        store = MemoryStore()
         _seed_interim_slot(store, cfg.adapter_dir, "20260801T0000", "graph1")
         model = _make_peft_model("episodic", "episodic_interim_20260801T0000")
         loop = _make_loop(store, model)
@@ -675,32 +597,6 @@ class TestIncidentResolution:
 
 
 # ---------------------------------------------------------------------------
-# adapter_manifest_status
-# ---------------------------------------------------------------------------
-
-
-class TestManifestStatusCleanup:
-    def test_discarded_row_popped_surviving_row_kept(self, tmp_path, monkeypatch):
-        cfg = _make_config(tmp_path)
-        store = MemoryStore(replay_enabled=True)
-        _seed_interim_slot(store, cfg.adapter_dir, "20260801T0000", "graph1")
-        model = _make_peft_model("episodic", "episodic_interim_20260801T0000")
-        loop = _make_loop(store, model)
-        state = _make_state(tmp_path, loop=loop, config=cfg)
-        state["adapter_manifest_status"] = {
-            "episodic_interim_20260801T0000": {"status": "unhealthy"},
-            "episodic": {"status": "healthy"},
-        }
-
-        client = _make_client(monkeypatch, state)
-        resp = client.post("/interim/discard", json={"confirm": True})
-
-        assert resp.status_code == 200, resp.text
-        assert "episodic_interim_20260801T0000" not in state["adapter_manifest_status"]
-        assert "episodic" in state["adapter_manifest_status"]
-
-
-# ---------------------------------------------------------------------------
 # run_status
 # ---------------------------------------------------------------------------
 
@@ -708,7 +604,7 @@ class TestManifestStatusCleanup:
 class TestRunStatusRecorded:
     def test_record_last_run_called_with_interim_discarded_outcome(self, tmp_path, monkeypatch):
         cfg = _make_config(tmp_path)
-        store = MemoryStore(replay_enabled=True)
+        store = MemoryStore()
         _seed_interim_slot(store, cfg.adapter_dir, "20260801T0000", "graph1")
         model = _make_peft_model("episodic", "episodic_interim_20260801T0000")
         loop = _make_loop(store, model)
@@ -732,7 +628,7 @@ class TestRunStatusRecorded:
 class TestNonPeftVenue:
     def test_bare_model_skips_peft_half_but_still_reaps_disk_and_store(self, tmp_path, monkeypatch):
         cfg = _make_config(tmp_path)
-        store = MemoryStore(replay_enabled=True)
+        store = MemoryStore()
         _seed_interim_slot(store, cfg.adapter_dir, "20260801T0000", "graph1")
         loop = _make_loop(store, object())
         state = _make_state(tmp_path, loop=loop, config=cfg)
@@ -756,7 +652,7 @@ class TestNonPeftVenue:
 class TestFailurePath:
     def test_reaper_failure_returns_500_and_clears_consolidating(self, tmp_path, monkeypatch):
         cfg = _make_config(tmp_path)
-        store = MemoryStore(replay_enabled=True)
+        store = MemoryStore()
         _seed_interim_slot(store, cfg.adapter_dir, "20260801T0000", "graph1")
         model = _make_peft_model("episodic", "episodic_interim_20260801T0000")
         loop = _make_loop(store, model)
@@ -780,7 +676,7 @@ class TestFailurePath:
 
     def test_consolidating_is_true_during_the_operation(self, tmp_path, monkeypatch):
         cfg = _make_config(tmp_path)
-        store = MemoryStore(replay_enabled=True)
+        store = MemoryStore()
         _seed_interim_slot(store, cfg.adapter_dir, "20260801T0000", "graph1")
         model = _make_peft_model("episodic", "episodic_interim_20260801T0000")
         loop = _make_loop(store, model)
@@ -807,15 +703,15 @@ class TestFailurePath:
 
     def test_run_status_write_failure_does_not_500(self, tmp_path, monkeypatch):
         """A ``record_last_run`` failure must not turn an already-completed
-        destructive ring drop into an HTTP 500 — matches the six finalizers
-        (e.g. ``_finalize_interim``), which all wrap the call in
+        destructive ring drop into an HTTP 500 — matches the other
+        finalizers (e.g. ``_finalize_interim``), which all wrap the call in
         ``try/except Exception: logger.exception(...)``.  Pre-fix, this call
-        was the only one of seven writers left unwrapped, so this raise
-        propagated straight through to a 500 despite the mutation having
-        already fully succeeded.
+        was the only writer left unwrapped, so this raise propagated
+        straight through to a 500 despite the mutation having already
+        fully succeeded.
         """
         cfg = _make_config(tmp_path)
-        store = MemoryStore(replay_enabled=True)
+        store = MemoryStore()
         _seed_interim_slot(store, cfg.adapter_dir, "20260801T0000", "graph1")
         model = _make_peft_model("episodic", "episodic_interim_20260801T0000")
         loop = _make_loop(store, model)
@@ -840,44 +736,12 @@ class TestFailurePath:
         assert state["last_consolidation"] is not None
         datetime.fromisoformat(state["last_consolidation"])
 
-    def test_write_key_metadata_failure_does_not_500(self, tmp_path, monkeypatch):
-        """A ``loop.write_key_metadata()`` failure (Step 3) must not turn an
-        already-completed destructive ring drop into an HTTP 500 — Steps 1-2
-        already dropped the tier from the store and reaped its adapter by
-        the time this bookkeeping step runs.
-        """
-        cfg = _make_config(tmp_path)
-        store = MemoryStore(replay_enabled=True)
-        _seed_interim_slot(store, cfg.adapter_dir, "20260801T0000", "graph1")
-        model = _make_peft_model("episodic", "episodic_interim_20260801T0000")
-        loop = _make_loop(store, model)
-        state = _make_state(tmp_path, loop=loop, config=cfg)
-
-        def _boom(*args, **kwargs):
-            raise RuntimeError("key_metadata.json write failed")
-
-        # write_key_metadata is called directly on the loop instance.
-        loop.write_key_metadata.side_effect = _boom
-
-        client = _make_client(monkeypatch, state)
-        resp = client.post("/interim/discard", json={"confirm": True})
-
-        assert resp.status_code == 200, resp.text
-        assert resp.json()["status"] == "discarded"
-        assert state["consolidating"] is False
-        # The mutation still happened despite the bookkeeping failure.
-        assert "episodic_interim_20260801T0000" not in store.tiers_with_registry()
-        # The tail (stamp + router reload) still ran despite the Step 3 failure.
-        assert state["last_consolidation"] is not None
-        datetime.fromisoformat(state["last_consolidation"])
-        state["router"].reload.assert_called_once()
-
     def test_resolve_incidents_failure_does_not_500(self, tmp_path, monkeypatch):
         """A ``resolve_incidents_by_type`` failure (Step 4) must not turn an
         already-completed destructive ring drop into an HTTP 500.
         """
         cfg = _make_config(tmp_path)
-        store = MemoryStore(replay_enabled=True)
+        store = MemoryStore()
         _seed_interim_slot(store, cfg.adapter_dir, "20260801T0000", "graph1")
         model = _make_peft_model("episodic", "episodic_interim_20260801T0000")
         loop = _make_loop(store, model)

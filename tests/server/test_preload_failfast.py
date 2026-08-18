@@ -2,13 +2,18 @@
 
 Covers:
 
-- probe re-raise vs benign-swallow in _build_store_contents.
 - _fail_fast_cuda patches os._exit; the "ready" log is NOT emitted
   on the fatal path; _release_base_model_in_process is never called.
 - crash-loop counter (_record_cuda_fatal_exit / _cuda_crashloop_exhausted);
   exhausted counter → _degrade_to_cloud_only, NOT os._exit;
   _degrade_to_cloud_only("cuda_fault_persistent") sets state correctly and
   is in permanent_cloud_only.
+
+``_build_store_contents``'s probe re-raise/benign-swallow, per-tier boot
+fill isolation, content-only projection, preload_cache=false, and
+train-venue-no-model-defers behavior — all gated on real
+verify_adapter_tree / TierBinding fixtures — are covered in
+``tests/test_mode_fork_guard.py`` and ``tests/test_server.py``, not here.
 
 All tests run CPU-only — no model loading or GPU required.
 """
@@ -24,7 +29,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 import paramem.server.app as app_module
-from paramem.adapters.registry_binding import VERIFIED, TierBinding
 from paramem.server.app import (
     _cuda_crashloop_exhausted,
     _cuda_liveness_canary,
@@ -32,30 +36,10 @@ from paramem.server.app import (
     _fail_fast_cuda,
     _record_cuda_fatal_exit,
 )
-from paramem.utils.vram_guard import is_fatal_cuda_fault
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-def _verified_bindings(registry_map: dict) -> dict:
-    """Wrap a ``{tier: registry}`` map into the ``{tier: TierBinding}`` shape
-    ``verify_adapter_tree`` returns, with every tier VERIFIED."""
-    return {
-        tier: TierBinding(
-            tier=tier,
-            tier_root=Path(f"/fake/{tier}"),
-            status=VERIFIED,
-            registry=reg,
-            registry_present=True,
-            slot=None,
-            manifest=None,
-            candidate_count=0,
-            detail="",
-        )
-        for tier, reg in registry_map.items()
-    }
 
 
 def _make_config(tmp_path: Path):
@@ -86,133 +70,6 @@ def _inject_config(config, *, model=None, tokenizer=None):
             app_module._state[k] = v
 
     return _restore
-
-
-# ---------------------------------------------------------------------------
-# Probe re-raise vs benign-swallow
-# ---------------------------------------------------------------------------
-
-
-class TestProbeReraise:
-    """_build_store_contents must re-raise a fatal CUDA fault and swallow a benign one."""
-
-    @staticmethod
-    def _run_build_store_contents_with_source(config, source_mock):
-        """Drive _build_store_contents with a mock _source injected at the simulate path.
-
-        Uses mode='simulate' so the DiskMemorySource constructor path is taken,
-        then replaces the constructed source with source_mock by patching the
-        class.  The registry is stubbed with one active key so _source.probe()
-        is reached.
-        """
-        from paramem.server.app import _build_store_contents
-
-        config.consolidation.mode = "simulate"
-        config.inference.preload_cache = True
-
-        # A fake KeyRegistry that has one active key.
-        fake_reg = MagicMock()
-        fake_reg.list_active.return_value = ["key_001"]
-
-        with (
-            patch(
-                "paramem.adapters.registry_binding.verify_adapter_tree",
-                return_value=_verified_bindings({"episodic": fake_reg}),
-            ),
-            patch("paramem.memory.source.DiskMemorySource", return_value=source_mock),
-        ):
-            return _build_store_contents(config, model=None, tokenizer=None)
-
-    def test_fatal_probe_raises(self, tmp_path):
-        """Fatal CUDA fault from probe propagates — not swallowed to boot_degraded."""
-        config = _make_config(tmp_path)
-        restore = _inject_config(config)
-        try:
-            fatal_exc = RuntimeError("CUDA error: an illegal memory access was encountered")
-            assert is_fatal_cuda_fault(fatal_exc)
-
-            source_mock = MagicMock()
-            source_mock.probe.side_effect = fatal_exc
-
-            with pytest.raises(RuntimeError, match="illegal memory access"):
-                self._run_build_store_contents_with_source(config, source_mock)
-        finally:
-            restore()
-
-    def test_benign_probe_failure_sets_boot_degraded(self, tmp_path):
-        """Benign RuntimeError from probe → _results={}, boot_degraded set, no raise."""
-        config = _make_config(tmp_path)
-        restore = _inject_config(config)
-        try:
-            benign_exc = RuntimeError("simulated transient network error")
-            assert not is_fatal_cuda_fault(benign_exc)
-
-            source_mock = MagicMock()
-            source_mock.probe.side_effect = benign_exc
-
-            _, _, _, stats = self._run_build_store_contents_with_source(config, source_mock)
-            # With _results={} and one active key, hits == 0 < total == 1
-            # → boot_degraded set.
-            assert stats["boot_degraded"] is not None
-            assert stats["boot_degraded"]["reason"] == "preload_partial"
-            assert stats["boot_degraded"]["hits"] == 0
-        finally:
-            restore()
-
-    def test_fatal_probe_does_not_set_boot_degraded(self, tmp_path):
-        """Fatal CUDA fault re-raises before boot_degraded can be set."""
-        config = _make_config(tmp_path)
-        restore = _inject_config(config)
-        try:
-            fatal_exc = RuntimeError("CUDA error: an illegal memory access was encountered")
-            source_mock = MagicMock()
-            source_mock.probe.side_effect = fatal_exc
-
-            with pytest.raises(RuntimeError):
-                self._run_build_store_contents_with_source(config, source_mock)
-            # boot_degraded never set because the function raised before reaching that line
-        finally:
-            restore()
-
-
-class TestPreloadContentOnlyProjection:
-    """_build_store_contents must project every staged entry to the
-    content-only shape before it enters ``new_entries`` — the source result
-    may carry provenance/derived fields (confidence, fact_text, raw_output,
-    and historically speaker_id), but the store's entry cache holds SPO
-    content only, exactly as the probe-time memoize path writes it."""
-
-    def test_source_result_extra_fields_stripped_at_staging(self, tmp_path):
-        """A source result carrying extra fields (speaker_id, confidence,
-        fact_text, raw_output) is projected down to {key, subject,
-        predicate, object} before it reaches new_entries."""
-        config = _make_config(tmp_path)
-        restore = _inject_config(config)
-        try:
-            source_mock = MagicMock()
-            source_mock.probe.return_value = {
-                "key_001": {
-                    "key": "key_001",
-                    "subject": "Alice",
-                    "predicate": "lives_in",
-                    "object": "Berlin",
-                    "speaker_id": "speaker0",
-                    "confidence": 0.97,
-                    "fact_text": "Alice lives_in Berlin",
-                    "raw_output": "{}",
-                }
-            }
-            new_entries, _, _, _ = TestProbeReraise._run_build_store_contents_with_source(
-                config, source_mock
-            )
-            assert new_entries["episodic"]["key_001"] == {
-                "key": "key_001",
-                "subject": "Alice",
-                "predicate": "lives_in",
-                "object": "Berlin",
-            }
-        finally:
-            restore()
 
 
 # ---------------------------------------------------------------------------

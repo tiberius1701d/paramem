@@ -12,26 +12,19 @@ from paramem.cloud.providers.registry import get_cloud_agent
 from paramem.memory.store import MemoryStore as _MS
 
 
-def _stub_grouped_recall(fact_text: str):
-    """Build a probe_keys_grouped_by_adapter side_effect that returns the same
-    canned fact for every queried key. Used by tests that want to short-circuit
-    recall (skip real generate) and assert on the routing layer alone."""
+def _full_probe_selection():
+    """The date-group selection stage's "probe every key" verdict.
 
-    def _stub(model, tokenizer, keys_by_adapter, *args, **kwargs):
-        return {
-            k: {
-                "key": k,
-                "subject": "x",
-                "predicate": "p",
-                "object": "y",
-                "confidence": 1.0,
-                "fact_text": fact_text,
-            }
-            for keys in keys_by_adapter.values()
-            for k in keys
-        }
+    Tests whose subject is routing stub
+    ``paramem.server.inference.select_date_groups`` with this — the stage
+    is on by default and would otherwise run a real generate against a
+    ``MagicMock`` model, parse nothing, and fail open with a logged
+    traceback. Same shape as the deterministic ``all=True`` stub used by
+    the stage's own wiring tests in ``test_inference_response_shaping.py``.
+    """
+    from paramem.server.temporal_selection import DateSelection
 
-    return _stub
+    return DateSelection(all=True, ranges=(), include_undated=True)
 
 
 class TestCloudResponse:
@@ -366,6 +359,39 @@ class TestPrivacyRouting:
         agent.call.return_value = CloudResponse(text="cloud answer")
         return agent
 
+    def _seeded_memory_store(self, tier: str, key: str, triple: tuple[str, str, str]) -> _MS:
+        """A real ``MemoryStore`` that answers *key* under *tier* with *triple*.
+
+        The serving read path forks once on ``inference.preload_cache``
+        (``paramem.server.inference._probe_and_reason``); at its production
+        default ``True`` a probed key is served from the store's own RAM
+        mirror by ``MemoryStore.probe_cache``, which answers a fact only
+        when *tier*'s registry calls the key active AND the mirror holds
+        its triple — ``MemoryStore.put`` establishes both.
+
+        The bookkeeping row is the every-known-key-has-a-row invariant
+        (``paramem.memory.store.BookkeepingInvariantViolation``): a store
+        with a registry-known key and no row is a state production never
+        reaches. The date-group selection stage reads that row for every
+        key a plan probes.
+        """
+        subject, predicate, obj = triple
+        store = _MS()
+        store.put(
+            tier,
+            key,
+            {"key": key, "subject": subject, "predicate": predicate, "object": obj},
+        )
+        store.set_bookkeeping(
+            key,
+            speaker_id="spk-test",
+            relation_type="factual",
+            first_seen="2026-08-01T09:00:00",
+            last_seen="2026-08-01T09:00:00",
+            promoted=False,
+        )
+        return store
+
     def _make_mock_router(self, known_entities=None):
         """Create a mock router that emits a PERSONAL plan when *known_entities*
         appear in the query (or the speaker name), and a GENERAL plan
@@ -472,27 +498,23 @@ class TestPrivacyRouting:
         cloud_agent = self._make_mock_cloud_agent()
         router = self._make_mock_router(known_entities=["Jordan", "Berlin"])
 
-        # Mock model and tokenizer — _probe_and_reason will be called
-        # but we mock probe_key to return a fact
+        # Mock model and tokenizer — the recalled fact comes from the seeded
+        # store below, so only the reasoning generate needs stubbing.
         model = MagicMock()
         model.gradient_checkpointing_disable = MagicMock()
-        model.peft_config = {"episodic": MagicMock()}
         tokenizer = MagicMock()
 
         config = MagicMock()
-        config.registry_path = MagicMock()
-        config.registry_path.exists.return_value = False
-        # cooldown_gate_threshold_c <= 0 disables the wait_for_cooldown inference gate.
-        config.vram.cooldown_gate_threshold_c = 0
         # _generate_local_reply's cap-hit arithmetic needs a real int here.
         config.inference.max_response_tokens = 512
+        # The serving read fork — True is the production default and selects
+        # the cache door over the store seeded below.  Pinned because a bare
+        # MagicMock attribute is truthy by accident, not by intent.
+        config.inference.preload_cache = True
         with (
             patch(
-                "paramem.memory.probe.probe_keys_grouped_by_adapter",
-                side_effect=_stub_grouped_recall("Jordan lives in Berlin"),
-            ),
-            patch(
-                "paramem.models.loader.switch_adapter",
+                "paramem.server.inference.select_date_groups",
+                return_value=_full_probe_selection(),
             ),
             patch(
                 "paramem.server.inference.generate_answer",
@@ -522,12 +544,20 @@ class TestPrivacyRouting:
                 tokenizer=tokenizer,
                 config=config,
                 router=router,
-                memory_store=_MS(replay_enabled=False),
+                cloud_agent=cloud_agent,
+                memory_store=self._seeded_memory_store(
+                    "episodic", "graph1", ("Jordan", "lives in", "Berlin")
+                ),
             )
 
-        # Cloud agent must NOT have been called
+        # Cloud agent was wired in and must still NOT have been called
         cloud_agent.call.assert_not_called()
         assert "Berlin" in result.text
+        # ...and the reply came from a fact the local probe actually recalled:
+        # ``facts_recalled`` is set only when the probe-assembly path completes
+        # (ChatResult's key-presence contract), so this fails loudly if the turn
+        # silently degrades to abstention or a bare base-model answer instead.
+        assert result.diagnostics["facts_recalled"] == 1
 
     def test_non_personal_query_goes_to_cloud(self):
         """Query with no entity match → HA first (None) → cloud fallback."""
@@ -558,7 +588,7 @@ class TestPrivacyRouting:
             router=router,
             ha_client=ha_client,
             cloud_agent=cloud_agent,
-            memory_store=_MS(replay_enabled=False),
+            memory_store=_MS(),
         )
 
         # HA was attempted first and returned None
@@ -656,7 +686,7 @@ class TestPrivacyRouting:
             router=router,
             ha_client=ha_client,
             cloud_agent=cloud_agent,
-            memory_store=_MS(replay_enabled=False),
+            memory_store=_MS(),
         )
 
         cloud_agent.call.assert_called_once()
@@ -702,7 +732,7 @@ class TestPrivacyRouting:
             router=router,
             ha_client=ha_client,
             cloud_agent=cloud_agent,
-            memory_store=_MS(replay_enabled=False),
+            memory_store=_MS(),
         )
 
         # HA attempted first...
@@ -723,7 +753,6 @@ class TestPrivacyRouting:
         tokenizer = MagicMock()
 
         config = MagicMock()
-        config.registry_path = MagicMock()
         # _generate_local_reply's cap-hit arithmetic needs a real int here.
         config.inference.max_response_tokens = 512
 
@@ -756,7 +785,7 @@ class TestPrivacyRouting:
                 tokenizer=tokenizer,
                 config=config,
                 router=router,
-                memory_store=_MS(replay_enabled=False),
+                memory_store=_MS(),
             )
 
         assert result.escalated is False
@@ -789,7 +818,7 @@ class TestPrivacyRouting:
             router=router,
             ha_client=ha_client,
             cloud_agent=cloud_agent,
-            memory_store=_MS(replay_enabled=False),
+            memory_store=_MS(),
         )
 
         ha_client.conversation_process.assert_called_once()
@@ -825,7 +854,7 @@ class TestPrivacyRouting:
             router=router,
             ha_client=ha_client,
             cloud_agent=cloud_agent,
-            memory_store=_MS(replay_enabled=False),
+            memory_store=_MS(),
         )
 
         ha_client.conversation_process.assert_called_once()
@@ -848,26 +877,23 @@ class TestPrivacyRouting:
 
         model = MagicMock()
         model.gradient_checkpointing_disable = MagicMock()
-        model.peft_config = {"episodic": MagicMock()}
         tokenizer = MagicMock()
 
         config = MagicMock()
-        config.registry_path = MagicMock()
-        config.registry_path.exists.return_value = False
-        # cooldown_gate_threshold_c <= 0 disables the wait_for_cooldown inference gate.
-        config.vram.cooldown_gate_threshold_c = 0
         # _generate_local_reply's cap-hit arithmetic needs a real int here.
         config.inference.max_response_tokens = 512
+        # Production default: the PA probe reads the cache door over the
+        # store seeded below.
+        config.inference.preload_cache = True
 
         ha_client = MagicMock()
         ha_client.conversation_process.return_value = None  # HA would fail if called
 
         with (
             patch(
-                "paramem.memory.probe.probe_keys_grouped_by_adapter",
-                side_effect=_stub_grouped_recall("Alex prefers dim lights"),
+                "paramem.server.inference.select_date_groups",
+                return_value=_full_probe_selection(),
             ),
-            patch("paramem.models.loader.switch_adapter"),
             patch(
                 "paramem.server.inference.generate_answer",
                 return_value="Noted: Alex prefers dim lights.",
@@ -888,7 +914,9 @@ class TestPrivacyRouting:
                 router=router,
                 ha_client=ha_client,
                 cloud_agent=cloud_agent,
-                memory_store=_MS(replay_enabled=False),
+                memory_store=self._seeded_memory_store(
+                    "episodic", "graph1", ("Alex", "prefers", "dim lights")
+                ),
             )
 
         # HA was NOT pre-flighted (intent=PERSONAL → PA probe direct).
@@ -912,26 +940,23 @@ class TestPrivacyRouting:
 
         model = MagicMock()
         model.gradient_checkpointing_disable = MagicMock()
-        model.peft_config = {"episodic": MagicMock()}
         tokenizer = MagicMock()
 
         config = MagicMock()
-        config.registry_path = MagicMock()
-        config.registry_path.exists.return_value = False
-        # cooldown_gate_threshold_c <= 0 disables the wait_for_cooldown inference gate.
-        config.vram.cooldown_gate_threshold_c = 0
         # _generate_local_reply's cap-hit arithmetic needs a real int here.
         config.inference.max_response_tokens = 512
+        # Production default: the PA probe reads the cache door over the
+        # store seeded below.
+        config.inference.preload_cache = True
 
         ha_client = MagicMock()
         ha_client.conversation_process.return_value = None  # HA fallback fails
 
         with (
             patch(
-                "paramem.memory.probe.probe_keys_grouped_by_adapter",
-                side_effect=_stub_grouped_recall("Jordan lives somewhere"),
+                "paramem.server.inference.select_date_groups",
+                return_value=_full_probe_selection(),
             ),
-            patch("paramem.models.loader.switch_adapter"),
             patch(
                 "paramem.server.inference.generate_answer",
                 return_value="I'm not sure. [ESCALATE] Where does Jordan live?",
@@ -956,10 +981,14 @@ class TestPrivacyRouting:
                 router=router,
                 ha_client=ha_client,
                 cloud_agent=cloud_agent,
-                memory_store=_MS(replay_enabled=False),
+                # A fact the probe recalls that does not answer the question —
+                # which is why the local model escalates.
+                memory_store=self._seeded_memory_store(
+                    "episodic", "graph1", ("Jordan", "has hobby", "sailing")
+                ),
             )
 
-        # HA was tried as a tool fallback (allowed for PERSONAL).
+        # HA was tried as the [ESCALATE] tool fallback (allowed for PERSONAL).
         ha_client.conversation_process.assert_called_once()
         # cloud blocked by the privacy invariant — this is the new guarantee.
         cloud_agent.call.assert_not_called()
@@ -1109,7 +1138,7 @@ class TestCloudModePolicy:
                 router=router,
                 ha_client=ha_client,
                 cloud_agent=cloud_agent,
-                memory_store=_MS(replay_enabled=False),
+                memory_store=_MS(),
             )
 
     # ---- block mode ----

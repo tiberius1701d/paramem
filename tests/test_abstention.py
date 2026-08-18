@@ -18,6 +18,7 @@ from paramem.server.config import (
     ServerConfig,
     load_server_config,
 )
+from tests._serving_door import live_door_config, stub_live_door_probe
 
 
 class TestAbstentionConfig:
@@ -200,7 +201,7 @@ class TestAbstentionShortCircuit:
                 config=config,
                 router=self._make_router_with_facts("spk-abc123"),
                 speaker_id="spk-abc123",
-                memory_store=_MS(replay_enabled=False),
+                memory_store=_MS(),
             )
 
         assert result.text == config.abstention.load_response()
@@ -231,7 +232,7 @@ class TestAbstentionShortCircuit:
                 config=config,
                 router=self._make_none_match_router(),
                 speaker_id="spk-anon-42",
-                memory_store=_MS(replay_enabled=False),
+                memory_store=_MS(),
             )
 
         assert result.text == config.abstention.load_cold_start_response()
@@ -265,7 +266,7 @@ class TestAbstentionShortCircuit:
                 config=config,
                 router=self._make_none_match_router(),  # empty _speaker_key_index
                 speaker_id="spk-fresh-1",
-                memory_store=_MS(replay_enabled=False),
+                memory_store=_MS(),
             )
 
         assert result.text == config.abstention.load_cold_start_response()
@@ -305,7 +306,7 @@ class TestAbstentionShortCircuit:
                 config=config,
                 router=self._make_none_match_router(),
                 speaker_id="spk-anon-1",
-                memory_store=_MS(replay_enabled=False),
+                memory_store=_MS(),
             )
 
         mock_base_model.assert_called_once()
@@ -339,7 +340,7 @@ class TestAbstentionShortCircuit:
                 config=config,
                 router=self._make_none_match_router(),
                 speaker_id="spk-abc123",
-                memory_store=_MS(replay_enabled=False),
+                memory_store=_MS(),
             )
 
         mock_base_model.assert_called_once()
@@ -374,7 +375,7 @@ class TestAbstentionShortCircuit:
                 config=config,
                 router=self._make_none_match_router(intent=Intent.GENERAL),
                 speaker_id="spk-abc123",
-                memory_store=_MS(replay_enabled=False),
+                memory_store=_MS(),
             )
 
         mock_ha.assert_called_once()
@@ -416,13 +417,13 @@ class TestAbstentionShortCircuit:
                 router=self._make_none_match_router(intent=Intent.GENERAL),
                 cloud_agent=None,  # no cloud available either
                 speaker_id="spk-abc123",
-                memory_store=_MS(replay_enabled=False),
+                memory_store=_MS(),
             )
 
         mock_base_model.assert_called_once()
         assert result.text == "base fallback"
 
-    def test_fires_in_probe_and_reason_when_probes_fail_and_sanitizer_blocks(self):
+    def test_fires_in_probe_and_reason_when_probes_fail_and_sanitizer_blocks(self, monkeypatch):
         """Speaker has keys (router builds plan.steps), the query routes
         through ``_probe_and_reason``, every probe misses, sanitizer blocks
         cloud egress.  The previous fallthrough went to ``_base_model_answer``
@@ -437,20 +438,35 @@ class TestAbstentionShortCircuit:
         """
         from paramem.server.inference import handle_chat
 
-        config = ServerConfig()
+        config = live_door_config()
         assert config.abstention.enabled is True
+
+        # A known key always carries a full bookkeeping row -- the
+        # temporal-selection stage (on by default) reads it for every key
+        # the router's plan probes, "graph0001" here.
+        memory_store = _MS()
+        memory_store.set_bookkeeping(
+            "graph0001",
+            speaker_id="spk-abc123",
+            relation_type="factual",
+            first_seen="2026-08-01T09:00:00",
+            last_seen="2026-08-01T09:00:00",
+            promoted=False,
+        )
 
         # Make every probe miss so ``layers`` stays empty in _probe_and_reason.
         # Sanitizer blocks (returns None) which prevents HA / cloud escalation
         # and previously dropped through to _base_model_answer.
+        stub_live_door_probe(monkeypatch, failing_keys={"graph0001"})
+        import paramem.memory.probe as _probe_mod
+
+        mock_probe = MagicMock(wraps=_probe_mod.probe_keys_grouped_by_adapter)
+        monkeypatch.setattr("paramem.memory.probe.probe_keys_grouped_by_adapter", mock_probe)
+
         with (
             patch(
                 "paramem.server.inference.is_self_referential",
                 return_value=True,
-            ),
-            patch(
-                "paramem.memory.probe.probe_keys_grouped_by_adapter",
-                return_value={"graph0001": None},
             ),
             patch("paramem.server.inference._base_model_answer") as mock_base_model,
         ):
@@ -464,13 +480,16 @@ class TestAbstentionShortCircuit:
                 config=config,
                 router=self._make_router_with_steps("spk-abc123"),
                 speaker_id="spk-abc123",
-                memory_store=_MS(replay_enabled=False),
+                memory_store=memory_store,
             )
 
         assert result.text == config.abstention.load_response()
+        # The probe really ran and missed — not "no door was ever
+        # consulted", which reaches the same fallback for another reason.
+        mock_probe.assert_called_once()
         mock_base_model.assert_not_called()
 
-    def test_ha_tool_answer_preferred_over_abstention_in_probe_and_reason(self):
+    def test_ha_tool_answer_preferred_over_abstention_in_probe_and_reason(self, monkeypatch):
         """Inside ``_probe_and_reason``, when probes fail but HA returns a
         tool answer (calendar, sensors, etc.), use the HA answer rather
         than abstain.  HA tool answers are factual, not hallucinated, so
@@ -480,20 +499,28 @@ class TestAbstentionShortCircuit:
         """
         from paramem.server.inference import ChatResult, handle_chat
 
-        config = ServerConfig()
+        config = live_door_config()
+
+        memory_store = _MS()
+        memory_store.set_bookkeeping(
+            "graph0001",
+            speaker_id="spk-abc123",
+            relation_type="factual",
+            first_seen="2026-08-01T09:00:00",
+            last_seen="2026-08-01T09:00:00",
+            promoted=False,
+        )
+
+        # Sanitizer ALLOWS the query (``stub_live_door_probe`` pins
+        # ``is_self_referential`` False) — a personal-flavored query that
+        # doesn't trip the self-referential blocker, so HA can be attempted.
+        stub_live_door_probe(monkeypatch, failing_keys={"graph0001"})
+        import paramem.memory.probe as _probe_mod
+
+        mock_probe = MagicMock(wraps=_probe_mod.probe_keys_grouped_by_adapter)
+        monkeypatch.setattr("paramem.memory.probe.probe_keys_grouped_by_adapter", mock_probe)
 
         with (
-            # Sanitizer ALLOWS the query (returns sanitized text, not None).
-            # This represents a personal-flavored query that doesn't trip
-            # the self-referential blocker — HA can be attempted.
-            patch(
-                "paramem.server.inference.is_self_referential",
-                return_value=False,
-            ),
-            patch(
-                "paramem.memory.probe.probe_keys_grouped_by_adapter",
-                return_value={"graph0001": None},
-            ),
             patch(
                 "paramem.server.inference._escalate_to_ha_agent",
                 return_value=ChatResult(text="Your 3pm with Pat.", escalated=True),
@@ -510,9 +537,12 @@ class TestAbstentionShortCircuit:
                 config=config,
                 router=self._make_router_with_steps("spk-abc123"),
                 speaker_id="spk-abc123",
-                memory_store=_MS(replay_enabled=False),
+                memory_store=memory_store,
             )
 
+        # The probe really ran and missed — not "no door was ever
+        # consulted", which reaches the same fallback for another reason.
+        mock_probe.assert_called_once()
         mock_ha.assert_called_once()
         assert result.text == "Your 3pm with Pat."
         # Neither abstention nor base model were used — HA answered.
@@ -540,27 +570,39 @@ class TestAbstentionShortCircuit:
                 config=config,
                 router=self._make_none_match_router(),
                 speaker_id=None,
-                memory_store=_MS(replay_enabled=False),
+                memory_store=_MS(),
             )
 
-    def test_probe_and_reason_disabled_falls_through_to_base_model(self):
+    def test_probe_and_reason_disabled_falls_through_to_base_model(self, monkeypatch):
         """With abstention.enabled=False, ``_probe_and_reason`` retains the
         old behavior: sanitizer-blocked + no probes + no HA → base model.
         Locks the toggle as a real opt-out for both abstention sites
         (handle_chat AND _probe_and_reason)."""
         from paramem.server.inference import ChatResult, handle_chat
 
-        config = ServerConfig()
+        config = live_door_config()
         config.abstention.enabled = False
+
+        memory_store = _MS()
+        memory_store.set_bookkeeping(
+            "graph0001",
+            speaker_id="spk-abc123",
+            relation_type="factual",
+            first_seen="2026-08-01T09:00:00",
+            last_seen="2026-08-01T09:00:00",
+            promoted=False,
+        )
+
+        stub_live_door_probe(monkeypatch, failing_keys={"graph0001"})
+        import paramem.memory.probe as _probe_mod
+
+        mock_probe = MagicMock(wraps=_probe_mod.probe_keys_grouped_by_adapter)
+        monkeypatch.setattr("paramem.memory.probe.probe_keys_grouped_by_adapter", mock_probe)
 
         with (
             patch(
                 "paramem.server.inference.is_self_referential",
                 return_value=True,
-            ),
-            patch(
-                "paramem.memory.probe.probe_keys_grouped_by_adapter",
-                return_value={"graph0001": None},
             ),
             patch(
                 "paramem.server.inference._base_model_answer",
@@ -577,9 +619,12 @@ class TestAbstentionShortCircuit:
                 config=config,
                 router=self._make_router_with_steps("spk-abc123"),
                 speaker_id="spk-abc123",
-                memory_store=_MS(replay_enabled=False),
+                memory_store=memory_store,
             )
 
+        # The probe really ran and missed — not "no door was ever
+        # consulted", which reaches the same fallback for another reason.
+        mock_probe.assert_called_once()
         mock_base_model.assert_called_once()
         assert result.text == "base model answer"
 

@@ -1058,3 +1058,52 @@ class TestMigrateRollbackSubcommandRendering:
         assert "not migrated" in captured.err.lower(), (
             f"Expected data-not-migrated warning in stderr: {captured.err!r}"
         )
+
+
+class TestPollUntilHealthyPredicate:
+    """``_poll_until_healthy``'s health predicate reads the REAL signals:
+    mode set AND not quarantined (``StatusResponse.store_quarantined``)."""
+
+    def test_healthy_when_mode_set_and_not_quarantined(self, monkeypatch):
+        from paramem.cli import migrate as migrate_module
+
+        monkeypatch.setattr(
+            migrate_module.http_client,
+            "get_json",
+            lambda url: {"mode": "local", "store_quarantined": None},
+        )
+        assert migrate_module._poll_until_healthy("http://example.invalid") is True
+
+    def test_quarantined_but_answering_server_passes_the_poll(self, monkeypatch):
+        """The predicate is exactly ``mode`` answering — a quarantined but
+        otherwise-responsive server (``store_quarantined`` set) still
+        satisfies it; quarantine is an operator-visible condition, not a
+        restart-poll failure."""
+        from paramem.cli import migrate as migrate_module
+
+        monkeypatch.setattr(
+            migrate_module.http_client,
+            "get_json",
+            lambda url: {
+                "mode": "local",
+                "store_quarantined": {
+                    "cause": {"exception_type": "TierBindingUnpublishable", "message": "x"}
+                },
+            },
+        )
+        assert migrate_module._poll_until_healthy("http://example.invalid") is True
+
+    def test_no_mode_in_response_times_out(self, monkeypatch):
+        """A status payload with no ``mode`` never satisfies the predicate —
+        the poll runs out its (shrunk, for this test) deadline and returns
+        ``False``."""
+        from paramem.cli import migrate as migrate_module
+
+        monkeypatch.setattr(migrate_module, "_RESTART_POLL_TIMEOUT_S", 0.05)
+        monkeypatch.setattr(migrate_module, "_RESTART_POLL_INTERVAL_S", 0.01)
+        monkeypatch.setattr(
+            migrate_module.http_client,
+            "get_json",
+            lambda url: {"mode": None},
+        )
+        assert migrate_module._poll_until_healthy("http://example.invalid") is False

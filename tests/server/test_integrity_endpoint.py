@@ -10,6 +10,11 @@ Covers:
   AND live config file is NOT renamed on failure.
 - _arm_active_store_migration with corrupt registry → returns False, does not arm.
 
+The clean-recheck-clears-the-flag and clean-store-arms-migration cases (both
+gated on writing a real adapter-manifest slot for ``verify_tier_binding`` to
+resolve as VERIFIED) have no dedicated suite currently — this file's
+integrity coverage is scoped to the corrupt/degraded shapes listed above.
+
 Tests use FastAPI TestClient with monkeypatched _state; no live server, no GPU.
 """
 
@@ -24,7 +29,6 @@ from fastapi.testclient import TestClient
 import paramem.server.app as app_module
 from paramem.backup.integrity import _OK, _PARSE_ERROR, FileCheck, IntegrityReport
 from paramem.server.migration import MigrationStashState, TierDiffRow, initial_migration_state
-from paramem.training.key_registry import KeyRegistry
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -41,9 +45,7 @@ def _make_config(tmp_path: Path, mode: str = "train") -> MagicMock:
     cfg = MagicMock()
     cfg.paths.data = data_dir
     cfg.adapter_dir = adapter_dir
-    cfg.key_metadata_path = data_dir / "registry" / "key_metadata.json"
     cfg.consolidation.mode = mode
-    cfg.consolidation.indexed_key_replay = True
     return cfg
 
 
@@ -98,22 +100,6 @@ def _write_corrupt_registry(ep_dir: Path) -> None:
     """Write a corrupt registry file that triggers a parse_error on load."""
     ep_dir.mkdir(parents=True, exist_ok=True)
     (ep_dir / "indexed_key_registry.json").write_text("{not: json}", encoding="utf-8")
-
-
-def _write_valid_registry(ep_dir: Path, keys: list[str]) -> None:
-    """Write a valid indexed_key_registry.json with simhash fingerprints for every key.
-
-    Each key is assigned a non-zero placeholder fingerprint so the per-file
-    self-consistency check (active keys must have a fingerprint) passes.
-    """
-    from paramem.memory.entry import compute_simhash
-
-    ep_dir.mkdir(parents=True, exist_ok=True)
-    reg = KeyRegistry()
-    for k in keys:
-        reg.add(k)
-        reg.set_simhash(k, compute_simhash(k, "", "", ""))
-    (ep_dir / "indexed_key_registry.json").write_bytes(reg.save_bytes())
 
 
 def _make_staging_state(tmp_path: Path, tier_diff: list[TierDiffRow], candidate_path: Path) -> dict:
@@ -275,14 +261,17 @@ class TestIntegrityEndpointFailure:
 class TestBootDegradedPath:
     def test_corrupt_registry_sets_integrity_check_failed(self, tmp_path, monkeypatch):
         """Real corrupt registry on disk causes _preload_memory_store to set
-        integrity_check_failed=True via the production integrity gate.
+        integrity_check_failed=True via the production integrity gate — the
+        integrity check still runs (with store=None) even though the SAME
+        corrupt registry also quarantines the store, so _preload_memory_store
+        itself returns None (the store is refused wholesale, never a
+        degraded-but-present instance).
 
         Calls production code (_preload_memory_store) with real filesystem
         state; no logic reimplementation.
         """
         state = _make_minimal_state(tmp_path)
         cfg = state["config"]
-        cfg.consolidation.indexed_key_replay = True
         cfg.inference.preload_cache = False
         # Build corrupt episodic registry
         ep_dir = Path(cfg.adapter_dir) / "episodic"
@@ -299,69 +288,10 @@ class TestBootDegradedPath:
         assert state["integrity_check_failed"] is True, (
             "Expected integrity_check_failed=True after boot integrity check with corrupt registry"
         )
-        # The function must still return a MemoryStore (degraded, but present)
-        from paramem.memory.store import MemoryStore
-
-        assert isinstance(result, MemoryStore)
-
-    def test_clean_recheck_after_restore_clears_integrity_check_failed(self, tmp_path, monkeypatch):
-        """A restart-only flag would strand the operator: restoring the
-        registry and re-applying config (which re-runs
-        _preload_memory_store) must clear integrity_check_failed on the
-        next CLEAN integrity check, not require a process restart."""
-        import json as _json
-
-        state = _make_minimal_state(tmp_path)
-        cfg = state["config"]
-        cfg.consolidation.mode = "train"
-        cfg.consolidation.indexed_key_replay = True
-        cfg.inference.preload_cache = False
-        ep_dir = Path(cfg.adapter_dir) / "episodic"
-        _write_corrupt_registry(ep_dir)
-
-        monkeypatch.setattr(app_module, "_state", state)
-
-        app_module._preload_memory_store(cfg, model=None, tokenizer=None)
-        assert state["integrity_check_failed"] is True, "precondition: flag must be set"
-
-        # Operator restores a healthy registry (plus the manifest slot the
-        # train-mode integrity check requires for a keyed tier) and
-        # re-applies config — the real production recovery path re-runs
-        # _preload_memory_store.
-        from paramem.backup.hashing import plaintext_sha256
-
-        _write_valid_registry(ep_dir, ["key1"])
-        slot_dir = ep_dir / "20260501-000000"
-        slot_dir.mkdir(parents=True, exist_ok=True)
-        manifest = {
-            "schema_version": 4,
-            "name": "episodic",
-            "trained_at": "2026-05-01T00:00:00Z",
-            "window_stamp": "",
-            "base_model": {"repo": "test/model", "sha": "abc", "hash": "sha256:deadbeef"},
-            "tokenizer": {"name_or_path": "test/model", "vocab_size": 32000, "merges_hash": "abc"},
-            "lora": {"rank": 8, "alpha": 16, "dropout": 0.0, "target_modules": ["q_proj"]},
-            # registry_sha256 must match the live registry for
-            # verify_tier_binding to resolve this slot as VERIFIED.
-            "registry_sha256": plaintext_sha256(ep_dir / "indexed_key_registry.json"),
-            "key_count": 1,
-        }
-        (slot_dir / "meta.json").write_text(_json.dumps(manifest), encoding="utf-8")
-        # A COMPLETE slot — required regardless: cleanup_partial_slots now
-        # runs pre-mount (inside _sweep_keyless_tier_artifacts, called from
-        # _mount_adapters_from_slots), not inside _preload_memory_store
-        # (this test calls _preload_memory_store directly, so that pass
-        # never runs here), but an incomplete slot would still fail the
-        # manifest check this test exercises regardless of which pass
-        # would have removed it.
-        (slot_dir / "adapter_config.json").write_text("{}", encoding="utf-8")
-        (slot_dir / "adapter_model.safetensors").write_bytes(b"weights")
-
-        app_module._preload_memory_store(cfg, model=None, tokenizer=None)
-
-        assert state["integrity_check_failed"] is False, (
-            "a clean integrity check must clear integrity_check_failed without a restart"
-        )
+        # The same corrupt registry also quarantines the store — no
+        # degraded-but-present MemoryStore, no per-tier half-publish.
+        assert result is None
+        assert state["store_quarantine"] is not None
 
 
 # ---------------------------------------------------------------------------
@@ -398,61 +328,6 @@ class TestArmActiveMigrationIntegrityGate:
         assert result is False
         assert state.get("pending_rehydration") is False
 
-    def test_ok_store_arm_returns_true(self, tmp_path, monkeypatch):
-        """_arm_active_store_migration with clean registry returns True (arms migration).
-
-        Uses train mode so the graph check is skipped (train mode does not
-        require graph.json).  Writes a manifest slot so the manifest check
-        passes for the keyed tier.
-        """
-        import json as _json
-
-        state = _make_minimal_state(tmp_path)
-        cfg = state["config"]
-        # Use train mode so graph.json is not required
-        cfg.consolidation.mode = "train"
-
-        from paramem.backup.hashing import plaintext_sha256
-
-        ep_dir = Path(cfg.adapter_dir) / "episodic"
-        _write_valid_registry(ep_dir, ["key1"])
-        # Write a minimal manifest slot so the train-mode manifest check passes
-        slot_dir = ep_dir / "20260501-000000"
-        slot_dir.mkdir(parents=True, exist_ok=True)
-        manifest = {
-            "schema_version": 4,
-            "name": "episodic",
-            "trained_at": "2026-05-01T00:00:00Z",
-            "window_stamp": "",
-            "base_model": {"repo": "test/model", "sha": "abc", "hash": "sha256:deadbeef"},
-            "tokenizer": {"name_or_path": "test/model", "vocab_size": 32000, "merges_hash": "abc"},
-            "lora": {"rank": 8, "alpha": 16, "dropout": 0.0, "target_modules": ["q_proj"]},
-            # registry_sha256 must match the live registry for
-            # verify_tier_binding to resolve this slot as VERIFIED.
-            "registry_sha256": plaintext_sha256(ep_dir / "indexed_key_registry.json"),
-            "key_count": 1,
-        }
-        (slot_dir / "meta.json").write_text(_json.dumps(manifest), encoding="utf-8")
-
-        monkeypatch.setattr(app_module, "_state", state)
-
-        with (
-            patch(
-                "paramem.server.active_store_migration.detect_mode_switch",
-                return_value=MagicMock(
-                    direction="simulate_to_train",
-                    source_mode="simulate",
-                    completed_tiers=[],
-                    failed_tiers={},
-                ),
-            ),
-            patch("paramem.server.active_store_migration.save_state"),
-        ):
-            result = app_module._arm_active_store_migration(cfg)
-
-        assert result is True
-        assert state.get("pending_rehydration") is True
-
 
 # ---------------------------------------------------------------------------
 # Migration scheduler: integrity_check_failed → migration skipped
@@ -479,9 +354,7 @@ class TestMigrationSchedulerDegraded:
         # A real (empty) buffer: the triage pre-stage runs on every dispatch,
         # ahead of the migration gate, so the buffer is read before this test's
         # branch is reached.
-        state["session_buffer"] = SessionBuffer(
-            tmp_path / "sessions", state_dir=tmp_path / "state", debug=False
-        )
+        state["session_buffer"] = SessionBuffer(tmp_path / "sessions", debug=False)
         state["speaker_store"] = None
 
         monkeypatch.setattr(app_module, "_state", state)

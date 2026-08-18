@@ -111,12 +111,11 @@ def reconstruct_graph(
     """
     # Build the keys_by_adapter map directly from the store's per-tier registries.
     keys_by_adapter: dict[str, list[str]] = {}
-    if loop.store.replay_enabled:
-        for tier_name in loop.store.tiers_with_registry():
-            if tier is not None and tier_name != tier:
-                continue
-            for key in loop.store.active_keys_in_tier(tier_name):
-                keys_by_adapter.setdefault(tier_name, []).append(key)
+    for tier_name in loop.store.tiers_with_registry():
+        if tier is not None and tier_name != tier:
+            continue
+        for key in loop.store.active_keys_in_tier(tier_name):
+            keys_by_adapter.setdefault(tier_name, []).append(key)
 
     active_keys: list[str] = [k for keys in keys_by_adapter.values() for k in keys]
 
@@ -149,12 +148,10 @@ def reconstruct_graph(
         for adapter_id, keys in keys_by_adapter.items():
             # Per-adapter SimHash registry: read active-only fingerprints from
             # the store.  Interim adapter IDs have their own registry after the
-            # SimHash unification; fall back to None (→ confidence 1.0) when
-            # the tier has no registry (e.g. first-ever init before any commit).
-            if loop.store.has_registry(adapter_id):
-                simhash_registry = loop.store.tier_simhashes(adapter_id, include_stale=False)
-            else:
-                simhash_registry = None
+            # SimHash unification.  adapter_id is drawn from
+            # loop.store.tiers_with_registry() above, so the tier is
+            # guaranteed to have a registry here.
+            simhash_registry = loop.store.tier_simhashes(adapter_id)
 
             logger.debug(
                 "reconstruct_graph: switching to adapter %r, probing %d keys",

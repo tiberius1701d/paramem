@@ -13,6 +13,7 @@ from paramem.server.router import (
     RoutingStep,
     _is_interrogative,
 )
+from tests._router_stub import _stub_intent
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -58,7 +59,7 @@ def _make_router_from_entries(
     source ``reload()`` reads to build the speaker index).  ``_adapter_id``
     controls the tier.
     """
-    store = MemoryStore(replay_enabled=True)
+    store = MemoryStore()
     for entry in entries:
         key = entry["key"]
         adapter_id = entry.get("_adapter_id", "episodic")
@@ -75,6 +76,7 @@ def _make_router_from_entries(
                 relation_type=rtype,
                 allow_empty_speaker=(spk == ""),
                 first_seen="",
+                promoted=False,
             )
 
     kwargs: dict = {
@@ -113,18 +115,6 @@ def _make_ha_graph(match_result: MagicMock | None) -> MagicMock:
     g = MagicMock()
     g.match.return_value = match_result
     return g
-
-
-def _stub_intent(monkeypatch, verdict: Intent) -> MagicMock:
-    """Stub ``paramem.server.intent.classify_intent`` to always return *verdict*.
-
-    The router imports ``classify_intent`` lazily inside ``route()``, so
-    patching the attribute on the intent module is sufficient.  Returns
-    the mock so tests can assert on call args.
-    """
-    stub = MagicMock(return_value=verdict)
-    monkeypatch.setattr("paramem.server.intent.classify_intent", stub)
-    return stub
 
 
 # ---------------------------------------------------------------------------
@@ -294,10 +284,48 @@ class TestRouterLoad:
         assert "alice" in router._speaker_key_index
 
         # Swap the store for an empty one; reload must clear stale state.
-        router._memory_store = MemoryStore(replay_enabled=True)
+        router._memory_store = MemoryStore()
         router.reload()
 
         assert router._speaker_key_index == {}
+
+
+class TestReloadAtomicSwap:
+    """reload() builds the new index fully, off to the side, then publishes
+    it with a single attribute-reference swap -- never clear-then-fill.  A
+    reader mid-rebuild must observe either the complete old index or the
+    complete new one, never a cleared/partial one."""
+
+    def test_index_observed_mid_rebuild_is_the_old_full_index_never_cleared(self):
+        store = MemoryStore()
+        store.set_bookkeeping(
+            "k1", speaker_id="alice", relation_type="factual", first_seen="", promoted=False
+        )
+        router = QueryRouter(adapter_dir=Path("/nonexistent"), memory_store=store)
+        assert router._speaker_key_index == {"alice": {"k1"}}
+
+        store.set_bookkeeping(
+            "k2", speaker_id="bob", relation_type="factual", first_seen="", promoted=False
+        )
+
+        observed: dict = {}
+        real_iter_bookkeeping = store.iter_bookkeeping
+
+        def _spy_iter_bookkeeping():
+            # Called by reload() while building the new index off to the
+            # side -- the live attribute must still be the OLD full index
+            # at this point, never an intermediate cleared dict.
+            observed["mid_rebuild"] = dict(router._speaker_key_index)
+            yield from real_iter_bookkeeping()
+
+        store.iter_bookkeeping = _spy_iter_bookkeeping
+        router.reload()
+
+        assert observed["mid_rebuild"] == {"alice": {"k1"}}, (
+            "the index observed during rebuild must be the OLD full index, "
+            f"never cleared; got {observed['mid_rebuild']}"
+        )
+        assert router._speaker_key_index == {"alice": {"k1"}, "bob": {"k2"}}
 
 
 # ---------------------------------------------------------------------------
@@ -830,10 +858,14 @@ class TestPreloadIndependence:
     """
 
     def test_metadata_only_entries_populate_speaker_index(self):
-        store = MemoryStore(replay_enabled=True)
+        store = MemoryStore()
         # Simulate load_bookkeeping_from_disk: no SPO in _entries, just bookkeeping.
         store.set_bookkeeping(
-            "k_meta_only", speaker_id="alice", relation_type="factual", first_seen=""
+            "k_meta_only",
+            speaker_id="alice",
+            relation_type="factual",
+            first_seen="",
+            promoted=False,
         )
         # Register the key so _tier_keys resolves it.
         from paramem.training.key_registry import KeyRegistry
@@ -847,10 +879,10 @@ class TestPreloadIndependence:
 
     def test_metadata_only_routes_produce_steps(self, monkeypatch):
         _stub_intent(monkeypatch, Intent.PERSONAL)
-        store = MemoryStore(replay_enabled=True)
+        store = MemoryStore()
         # Seed bookkeeping only — no content entry.
         store.set_bookkeeping(
-            "k_pref", speaker_id="alice", relation_type="preference", first_seen=""
+            "k_pref", speaker_id="alice", relation_type="preference", first_seen="", promoted=False
         )
         from paramem.training.key_registry import KeyRegistry
 
@@ -865,10 +897,12 @@ class TestPreloadIndependence:
 
     def test_router_index_built_under_empty_entries(self):
         """Even with no content entries, router must index speakers from bookkeeping."""
-        store = MemoryStore(replay_enabled=True)
+        store = MemoryStore()
         for i in range(3):
             key = f"graph{i}"
-            store.set_bookkeeping(key, speaker_id="charlie", relation_type="factual", first_seen="")
+            store.set_bookkeeping(
+                key, speaker_id="charlie", relation_type="factual", first_seen="", promoted=False
+            )
         assert len(store) == 0  # _entries empty
         router = QueryRouter(adapter_dir=Path("/nonexistent"), memory_store=store)
         assert "charlie" in router._speaker_key_index

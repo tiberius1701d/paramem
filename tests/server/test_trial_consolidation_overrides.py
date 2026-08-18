@@ -2,7 +2,7 @@
 
 Verifies that the trial consolidation loop is configured with:
 - mode="train" regardless of the candidate config's consolidation.mode
-- output paths pointing to state/trial_adapter/ and state/trial_graph/
+- output paths pointing to state/trial/adapters/ and state/trial/graph/
 - gates set to "no_new_sessions" on empty queue
 - gates set to "trial_exception" when the trainer raises
 
@@ -14,6 +14,8 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 import paramem.server.app as app_module
 
@@ -28,12 +30,11 @@ def _make_state(tmp_path: Path) -> dict:
     config.paths.data.mkdir(parents=True, exist_ok=True)
     config.adapter_dir = tmp_path / "data" / "adapters"
     config.adapter_dir.mkdir(parents=True, exist_ok=True)
-    config.key_metadata_path = tmp_path / "data" / "registry" / "key_metadata.json"
 
     state_dir = tmp_path / "data" / "ha" / "state"
     state_dir.mkdir(parents=True, exist_ok=True)
-    trial_adapter_dir = str((tmp_path / "data" / "ha" / "trial_adapter").resolve())
-    trial_graph_dir = str((tmp_path / "data" / "ha" / "trial_graph").resolve())
+    trial_adapter_dir = str((tmp_path / "data" / "ha" / "state" / "trial" / "adapters").resolve())
+    trial_graph_dir = str((tmp_path / "data" / "ha" / "state" / "trial" / "graph").resolve())
 
     trial_stash = {
         "started_at": "2026-04-22T01:00:00+00:00",
@@ -145,6 +146,51 @@ class TestBuildTrialLoop:
         # persist_graph and graph_path must NOT be assigned to the loop.
         assert "persist_graph" not in assigned
         assert "graph_path" not in assigned
+
+    def test_trial_loop_raises_on_malformed_tier_registry(self, tmp_path):
+        """A malformed tier registry under trial_adapter_dir propagates loudly.
+
+        _build_trial_loop must NOT swallow a registry load failure and fall
+        back to an empty store: a tier's ``indexed_key_registry.json`` that
+        exists but is not KeyRegistry-shaped (foreign schema, matching the
+        pattern in test_erase_doors.py's
+        TestUnreadableTierRegistryAbortsBeforeAnyMutation) must raise
+        ValueError naming the offending path, propagated unmodified from
+        KeyRegistry.load via MemoryStore.load_registries_from_disk.
+        """
+        import json
+
+        state = _make_state(tmp_path)
+        trial_adapter_dir = Path(state["migration"]["trial"]["trial_adapter_dir"])
+        trial_graph_dir = Path(state["migration"]["trial"]["trial_graph_dir"])
+
+        # episodic exists but is not KeyRegistry-shaped (foreign schema:
+        # missing 'stale' and 'simhash').
+        episodic_dir = trial_adapter_dir / "episodic"
+        episodic_dir.mkdir(parents=True, exist_ok=True)
+        malformed_registry_path = episodic_dir / "indexed_key_registry.json"
+        malformed_registry_path.write_text(json.dumps({"active_keys": ["ghost_key_0"]}))
+
+        with patch("paramem.server.consolidation.create_consolidation_loop") as mock_create:
+            from paramem.server.app import _build_trial_loop
+            from paramem.server.config import load_server_config
+
+            trial_config = load_server_config(Path(state["config_path"]))
+
+            with pytest.raises(ValueError, match=r"is not a KeyRegistry-shaped") as exc_info:
+                _build_trial_loop(
+                    state["model"],
+                    state["tokenizer"],
+                    trial_config,
+                    trial_adapter_dir,
+                    trial_graph_dir,
+                )
+
+        # The raised message names the offending path.
+        assert str(malformed_registry_path) in str(exc_info.value)
+        # create_consolidation_loop must never be reached — the registry
+        # load failure aborts before the loop is constructed.
+        mock_create.assert_not_called()
 
 
 class TestRunTrialConsolidation:
@@ -763,92 +809,3 @@ class TestRunTrialConsolidationMissingConfig:
         assert gates["status"] == "trial_exception"
         assert "exception" in gates
         assert "_state['config'] is missing" in gates["exception"]
-
-
-# ---------------------------------------------------------------------------
-# Regression — live_registry_path uses data/registry/key_metadata.json
-# ---------------------------------------------------------------------------
-
-
-class TestRunTrialConsolidationRegistryPath:
-    """Verify _run_trial_consolidation passes the correct registry path to evaluate_gates.
-
-    The handler must use ``live_config.paths.key_metadata`` — the canonical
-    property resolving to ``config.paths.data / "registry" /
-    "key_metadata.json"``.  ``live_config.registry_path`` resolves instead to
-    ``config.paths.data / "registry.json"``, missing both the ``registry/``
-    subdirectory and the filename, so gate 4 would FAIL on every real trial
-    because that path never exists.
-    """
-
-    def test_gate4_receives_canonical_registry_path(self, tmp_path, monkeypatch):
-        """evaluate_gates is called with live_registry_path == data/registry/key_metadata.json.
-
-        Captures the kwarg passed to evaluate_gates and asserts that it ends with
-        ``registry/key_metadata.json``, not the incorrect ``registry.json``.
-        """
-        from paramem.server.gates import GateResult
-
-        state = _make_state(tmp_path)
-        # Provide a real config mock so paths.data is deterministic.
-        data_dir = tmp_path / "data" / "ha"
-        data_dir.mkdir(parents=True, exist_ok=True)
-        state["config"].paths.data = data_dir
-        # app.py derives live_registry_path for evaluate_gates from
-        # live_config.paths.key_metadata (the canonical property).  MagicMock does
-        # not evaluate PathsConfig properties, so set it explicitly.
-        state["config"].paths.key_metadata = data_dir / "registry" / "key_metadata.json"
-
-        monkeypatch.setattr(app_module, "_state", state)
-
-        captured_kwargs: dict = {}
-        skipped_gates = [
-            GateResult(gate=i, name=n, status="skipped", reason="no_new_sessions", metrics=None)
-            for i, n in enumerate(
-                ["extraction", "training", "adapter_reload", "live_registry_recall"], start=1
-            )
-        ]
-
-        def _capture_evaluate_gates(**kwargs):
-            captured_kwargs.update(kwargs)
-            return skipped_gates
-
-        async def _run():
-            with patch("paramem.server.config.load_server_config") as mock_load:
-                cfg = MagicMock()
-                cfg.consolidation.mode = "simulate"
-                # Make sure paths.data is consistent with the outer config mock.
-                cfg.paths.data = data_dir
-                # app.py uses cfg.paths.key_metadata (the canonical property)
-                # rather than hand-building paths.data / "registry" /
-                # "key_metadata.json".  MagicMock does not evaluate PathsConfig
-                # properties, so set it explicitly.
-                cfg.paths.key_metadata = data_dir / "registry" / "key_metadata.json"
-                mock_load.return_value = cfg
-
-                with patch(
-                    "paramem.server.gates.evaluate_gates",
-                    side_effect=_capture_evaluate_gates,
-                ):
-                    await app_module._run_trial_consolidation()
-
-        asyncio.run(_run())
-
-        assert "live_registry_path" in captured_kwargs, (
-            "evaluate_gates was not called or did not receive live_registry_path kwarg"
-        )
-        registry_path = captured_kwargs["live_registry_path"]
-        path_str = str(registry_path)
-
-        # Must end with registry/key_metadata.json (canonical path), NOT registry.json.
-        assert path_str.endswith("registry/key_metadata.json"), (
-            f"live_registry_path {path_str!r} must end with 'registry/key_metadata.json'.  "
-            "old code used config.registry_path which resolves to "
-            "'data/ha/registry.json' (missing the registry/ subdirectory)."
-        )
-        assert not path_str.endswith("registry.json") or path_str.endswith(
-            "registry/key_metadata.json"
-        ), (
-            f"live_registry_path {path_str!r} must NOT be the bare 'registry.json' path.  "
-            "This was the registry-path bug."
-        )

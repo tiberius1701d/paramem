@@ -10,18 +10,17 @@ the previous mixed-shape state on :class:`ConsolidationLoop`:
   was recovered indirectly by scanning every registry.
 * ``episodic_simhash``, ``semantic_simhash``, ``procedural_simhash`` — three
   separate flat dicts; now folded into the per-tier :class:`KeyRegistry` (each
-  registry carries ``_simhash: dict[str, int]`` for active keys; stale
-  fingerprints live in the stale record ``_stale[key]["simhash"]``).
+  registry carries ``_simhash: dict[str, int]`` — the tier's one fingerprint
+  map, active keys only; a withheld id carries no fingerprint).
 * ``indexed_key_registry: Optional[dict[str, KeyRegistry]]`` — the only
   structure that was already per-tier; folded in here for symmetry.
 
 The unified shape is ``tier → key → value`` for all three concerns:
 
 * :attr:`MemoryStore.entries_in_tier` returns ``dict[key, entry_payload]``.
-* :meth:`MemoryStore.tier_simhashes` returns ``dict[key, int]`` with a mandatory
-  ``include_stale`` keyword — the **only** public accessor for a fingerprint set.
-  The mandatory keyword makes the active-vs-known distinction impossible to
-  forget, preventing the enumeration bug that caused spurious fold aborts.
+* :meth:`MemoryStore.tier_simhashes` returns ``dict[key, int]`` — the tier's
+  one fingerprint map, active keys only — the **only** public accessor for a
+  fingerprint set.
 * :meth:`MemoryStore.registry` returns the tier's :class:`KeyRegistry`.
 
 Tier ownership of a key is the single source of truth; an indexed key
@@ -29,30 +28,51 @@ belongs to exactly one tier.  Cross-tier lookups (``get``, ``has``,
 ``tier_of``) scan tier-first then key — O(tier_count); the tier count is
 small (3 main + N interim slots, typically ≤ 10).
 
-The ``_registry`` dict is ALWAYS present (never ``None``).  ``replay_enabled``
-is a BEHAVIOUR flag only — it governs whether key lifecycle (add/stale/remove)
-is recorded and whether replay-training is run.  Callers needing that gate
-check ``store.replay_enabled`` directly; ``registry()`` never returns ``None``.
+The ``_registry`` dict is ALWAYS present (never ``None``) and lifecycle
+recording is unconditional — the memory-key lifecycle registry has no
+disabled state; a trained tier must always be provable.  ``registry()``
+never returns ``None``.
 
 **Content cache vs. bookkeeping — read before editing:**
 
-:attr:`MemoryStore._entries` is a PURE INFERENCE CONTENT CACHE.  An entry
-slot exists in ``_entries`` only when SPO content is materialised in RAM —
-written by :meth:`put` (boot preload or on-miss memoize).  Missing entry =
-cache miss.  Under ``inference.preload_cache=False`` the entries are empty by
-design → every key is a clean miss → the source is always probed → restores
-the documented contract.
+:attr:`MemoryStore._entries` IS A NON-AUTHORITATIVE MIRROR of what the
+venue serves — never validated for completeness, never a veto over go-live
+or a turn.  On the SERVING path it has exactly two writers — the boot fill
+(``app._build_store_contents``, gated on ``inference.preload_cache=True``)
+and go-live adoption (:meth:`adopt_increments`, which installs a rebuilt
+member's entries regardless of the setting) — and one reader,
+:meth:`probe_cache`.  Outside serving, one sanctioned non-serving writer
+survives on its own evidence — the active-store migration's own
+``loop.store.put`` (``paramem.server.active_store_migration``), which
+projects a converted tier's content straight into the mirror it is
+migrating — and two read-only, non-serving consumers:
+``GET /debug/dump`` (a zero-GPU operator inspection of whatever the mirror
+currently holds) and
+:func:`~paramem.memory.persistence.build_tier_graph_from_store` (re-projects
+a tier's mirror content into a graph for persistence, not for a turn).
+Neither adds a THIRD serving-path writer or reader; the two-writer,
+one-reader count above is scoped to the doors.  A missing entry answers
+``None`` at the cache door, the same no-fact shape as a live-door miss;
+nothing treats a gap in it as a fault.  ``inference.preload_cache=False``
+means the cache is plain off at serving — every serving read goes through
+:meth:`probe_source` instead, and the mirror is neither read nor written on
+that path.  The serving boundary
+(:func:`paramem.server.inference._probe_and_reason`) forks once on
+``inference.preload_cache`` and calls exactly one of :meth:`probe_cache` /
+:meth:`probe_source` — never both, never layered.
 
 The per-key bookkeeping fields live in :attr:`MemoryStore._bookkeeping` — a flat
 ``{key → {speaker_id, relation_type, reinforcement_count, last_reinforced_cycle,
-last_seen, first_seen}}`` dict SEPARATE from ``_entries``.  Populated by
-:meth:`load_bookkeeping_from_disk` at boot (unconditionally; entry-independent).
-Never enters :meth:`KeyRegistry.save_bytes` or any hash path.
+last_seen, first_seen, promoted}}`` dict SEPARATE from ``_entries``.  Populated by
+:meth:`load_bookkeeping_from_disk` at boot (unconditionally; entry-independent),
+which merges each tier's own ``key_metadata.json`` — bookkeeping rows are a
+per-tier file now, not a single global one.  Never enters
+:meth:`KeyRegistry.save_bytes` or any hash path.
 
 **Content-only invariant:**
-Every ``_entries`` slot — whether written by the INFERENCE cache (boot
-preload + on-miss memoize) or by consolidation's own mint/resume/promotion
-writes — carries exactly ``{key, subject, predicate, object}``, projected via
+Every ``_entries`` slot — whether written by the boot fill or by go-live
+adoption (:meth:`adopt_increments`) — carries exactly
+``{key, subject, predicate, object}``, projected via
 :func:`~paramem.memory.entry.content_only_entry` at every ``store.put`` call
 site.  Per-key provenance (``speaker_id``, ``relation_type``, ...) lives
 exclusively in :attr:`MemoryStore._bookkeeping`:
@@ -64,13 +84,13 @@ bookkeeping sites; a fresh fold and a resumed fold write the identical entry
 shape.
 
 **SimHash storage:**
-SimHash fingerprints live exclusively in :class:`KeyRegistry` (one per tier).
-Active fingerprints are in ``registry._simhash``; stale fingerprints are carried
-in the stale record (``registry._stale[key]["simhash"]``).  Both partitions are
-serialised to ``indexed_key_registry.json`` under the ``"simhash"`` key so the
-on-disk file is the single source of truth.  The separate ``simhash_registry.json``
-sidecar has been eliminated.  Use :meth:`tier_simhashes` (mandatory
-``include_stale`` keyword) as the only public path to a fingerprint set.
+SimHash fingerprints live exclusively in :class:`KeyRegistry` (one per tier),
+one fingerprint map (``registry._simhash``) for the tier's active keys — a
+withheld id carries no fingerprint.  Serialised to
+``indexed_key_registry.json`` under the ``"simhash"`` key so the on-disk file
+is the single source of truth.  The separate ``simhash_registry.json``
+sidecar has been eliminated.  Use :meth:`tier_simhashes` as the only public
+path to a fingerprint set.
 
 **Thread-safety concurrency contract:**
 
@@ -90,14 +110,14 @@ Rules for callers and maintainers:
 
 1. Every method that reads or writes any of the three structures holds
    ``self._lock`` for the duration of its in-RAM access.  RLock (not plain Lock)
-   is used because compound mutators (``move``, ``delete``, ``discard_keys``,
-   compound ``put``) call other wrapped leaf methods reentrantly.
+   is used because compound mutators (``discard_keys``, compound ``put``)
+   call other wrapped leaf methods reentrantly.
 
 2. ``iter_entries()`` and ``iter_bookkeeping()`` materialise a snapshot list
    under the lock, then yield from the snapshot outside the lock.  Callers
    iterate lock-free without risk of observing a concurrent structural mutation.
 
-3. Compound mutators (``delete``, ``move``, ``discard_keys``,
+3. Compound mutators (``discard_keys``,
    ``put`` when writing entry + simhash + registry) hold the lock ONCE around
    the whole compound so a reader never sees a half-updated multi-structure state.
    Nested leaf-method calls succeed via RLock reentrancy.
@@ -105,24 +125,37 @@ Rules for callers and maintainers:
 4. ``entries_in_tier()`` returns a shallow copy of the internal tier dict so
    callers that iterate the result outside the lock cannot observe a concurrent
    structural mutation.  Callers must not write to the returned dict; use
-   :meth:`put` / :meth:`delete` for writes.
+   :meth:`put` for writes.
 
-5. :meth:`probe` is deliberately NOT wrapped in the lock.  It calls
+5. :meth:`probe_source` is deliberately NOT wrapped in the lock.  It calls
    ``source.probe(...)``, which is a GPU ``model.generate()`` call that may
    block for seconds.  Holding the store lock across GPU work would deadlock
-   the event loop.  All reads inside ``probe`` — including ``_bookkeeping``
-   and ``_registry``/simhash reads — go through individually locked leaf
-   methods (``self.get``, ``self.bookkeeping_for_key``, ``self.simhash``,
-   ``self._tier_for_simhash``, ``self.put``, ``self.set_bookkeeping``).
-   Each read is a single locked acquisition; no lock is held across the GPU
-   call.  This is sufficient for probe's single-key read-then-conditional-
-   write pattern.
+   the event loop.  Its one read inside the loop — the confidence gate's
+   fingerprint lookup — goes through individually locked leaf methods
+   (``self.simhash``, ``self._tier_for_simhash``).  Each read is a single
+   locked acquisition; no lock is held across the GPU call, and the door
+   writes nothing (the cache is neither read nor written on this path).
+   :meth:`probe_cache` is a registry-scoped lookup: one locked,
+   NON-CREATING ``self._registry.get(tier)`` read per requested tier (never
+   :meth:`registry`'s ``setdefault`` — a door must not phantom-register an
+   unknown tier), then the already-locked :meth:`get` per key.  It holds no
+   lock across multiple keys, matching :meth:`entries_in_tier`'s per-key
+   locking rather than a single compound acquisition.
 
-6. :meth:`swap` is the atomic-publish primitive for phase-2 consolidation.
-   Callers build new structures off-store, then publish in one locked rebind so
-   no reader ever sees a torn/half-rebuilt store.
+6. :meth:`swap` is the atomic whole-store rebind used by boot hydration
+   (and its quarantine-lift retry, the identical re-runnable primitive):
+   the caller builds the replacement ``_entries``/``_registry``/
+   ``_bookkeeping`` fully off-store, then publishes them in one locked
+   rebind so no reader ever sees a torn/half-rebuilt store.
 
-7. :meth:`read_simhash_registry_from_disk` (a ``@staticmethod``, no
+7. :meth:`adopt_increments` is the atomic whole-bundle go-live: ONE lock
+   acquisition covers the written bundle's increments and any absorbed
+   interim tiers together, across its own three internal passes (check,
+   drop, install) — no reader ever observes a fact live in both a
+   bundle's destination tier and the not-yet-reaped interim tier it
+   moved out of.
+
+8. :meth:`read_simhash_registry_from_disk` (a ``@staticmethod``, no
    ``self._lock`` involved) reads ``_SIMHASH_REGISTRY_CACHE`` under
    ``_SIMHASH_REGISTRY_CACHE_LOCK`` for its cache-hit check, then performs
    its disk walk lock-free (the walk is not an in-RAM structure access).
@@ -140,12 +173,164 @@ from __future__ import annotations
 import logging
 import threading
 from collections.abc import Iterable, Iterator
+from typing import TYPE_CHECKING, NoReturn
 
-from paramem.graph.merger import min_nonempty
+from paramem.memory.bookkeeping import credit_reinforcement
 from paramem.training.key_registry import KeyRegistry
 from paramem.utils.identity import canonical, is_speaker_id
 
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from paramem.memory.increment import TierIncrement
+
 logger = logging.getLogger(__name__)
+
+
+class BookkeepingInvariantViolation(RuntimeError):
+    """A key known to a tier's registry — active or stale — has no
+    bookkeeping row, two registries contradict each other about which one
+    owns a key, or a withheld (stale) id is asked to re-enter a registry's
+    active set or fingerprint map.
+
+    Every known key carries a full bookkeeping row from the moment it is
+    formed, through every artifact (working copy, shadow files, increment,
+    live store, persisted per-tier files, bundles) and through retirement.
+    A registry-known key without a row, or a key two registries both claim,
+    is never tolerated and never repaired in code — it is raised here, at
+    the boundary that meets it.  A withheld id is likewise never tolerated
+    back into active standing: :meth:`~paramem.training.key_registry.KeyRegistry.add`
+    and :meth:`~paramem.training.key_registry.KeyRegistry.set_simhash` refuse
+    a withheld id through the shared
+    :meth:`~paramem.training.key_registry.KeyRegistry._refuse_withheld`
+    guard, which raises here too.
+    :meth:`~paramem.training.key_registry.KeyRegistry.replace_simhashes`
+    refuses a whole map naming any withheld id through this same raise
+    helper directly — a set-level check rather than a per-key
+    ``_refuse_withheld`` call, so one raise names every offending id. The
+    one raise site is
+    :func:`raise_bookkeeping_invariant_violation`; every boundary that
+    enforces this invariant raises through it rather than constructing this
+    exception directly — including the pre-write parity gate
+    (:meth:`~paramem.training.consolidation.ConsolidationLoop._assert_increment_registry_bookkeeping_parity`),
+    which is this same invariant, checked against an increment's shadow
+    artifacts rather than the live store.
+
+    Attributes:
+        divergent_keys: The offending tier → key-list map, as raised.  A
+            crash-envelope caller (e.g.
+            ``paramem.server.app._run_stage_b_cycle``) folds this into a
+            recorded incident's detail so the incident names exactly what
+            diverged, not just the log traceback.
+    """
+
+    def __init__(self, message: str, *, divergent_keys: "dict[str, list[str]]"):
+        super().__init__(message)
+        self.divergent_keys = divergent_keys
+
+
+def raise_bookkeeping_invariant_violation(
+    tier: "str | None", keys: "Iterable[str]", context: str
+) -> NoReturn:
+    """Raise :class:`BookkeepingInvariantViolation` naming *tier* and *keys*.
+
+    THE one formatting/raise helper for the every-known-key-has-a-row
+    invariant.  Every boundary that establishes or preserves the invariant
+    — mint, promotion, fold recall, fold write, bundle capture, boot load,
+    reinforcement credit, registry key adoption, withheld-id refusal (a
+    withheld id asked to re-enter a registry's active set or fingerprint
+    map), pre-write parity — raises
+    through this helper instead of hand-rolling its own message, so every
+    violation names the same three things: which boundary caught it, which
+    tier (when one applies), and which key(s); and carries the same
+    structured ``divergent_keys`` payload (``{tier_desc: key_list}``) on the
+    raised exception for a crash-envelope caller to fold into an incident.
+
+    Args:
+        tier: The tier the violation was found under, or ``None`` when the
+            boundary has no single owning tier to name (e.g. a
+            cross-registry key-adoption contradiction, or a reinforcement
+            credit applied to a row set with no tier of its own) — the
+            exception's ``divergent_keys`` then keys on the literal string
+            ``"an unnamed tier"`` rather than a real tier name.
+        keys: The offending key or keys — always rendered as a list in the
+            message and in ``divergent_keys``, even when there is exactly
+            one.
+        context: A short phrase naming the boundary/check that raised
+            (e.g. ``"fold recall"``, ``"boot bookkeeping load"``,
+            ``"pre-write parity"``).
+
+    Raises:
+        BookkeepingInvariantViolation: Always — this function never returns.
+    """
+    key_list = list(keys)
+    tier_desc = f"tier {tier!r}" if tier is not None else "an unnamed tier"
+    raise BookkeepingInvariantViolation(
+        f"{context}: {tier_desc}, key(s) {key_list!r}",
+        divergent_keys={(tier if tier is not None else "an unnamed tier"): key_list},
+    )
+
+
+class EntryCacheInvariantViolation(RuntimeError):
+    """A written increment's own registry calls a key active but its own
+    ``entries`` (the materialized keyed-list projection) carries no payload
+    for it.
+
+    Increment-internal only: :func:`~paramem.memory.increment.build_tier_increment`
+    reads a rebuilt member's ``indexed_key_registry.json`` and ``keyed.json``
+    as two independent files, so this catches a genuine divergence between
+    them before that increment's entries would install into the live
+    mirror — never a claim about the live store's current ``_entries``,
+    which :meth:`~paramem.memory.store.MemoryStore.adopt_increments` never
+    reads.
+
+    A SEPARATE invariant from :class:`BookkeepingInvariantViolation` — an
+    active key without a bookkeeping row and an active key without a
+    materialized entry are two different completeness checks, and can fail
+    independently.  The one raise site is
+    :func:`raise_entry_cache_invariant_violation`; every boundary that
+    enforces this invariant raises through it rather than constructing this
+    exception directly.
+
+    Attributes:
+        tier: The tier the violation was found under.
+        missing_keys: The active key(s) with no entry-cache payload.
+    """
+
+    def __init__(self, message: str, *, tier: str, missing_keys: "list[str]"):
+        super().__init__(message)
+        self.tier = tier
+        self.missing_keys = missing_keys
+
+
+def raise_entry_cache_invariant_violation(
+    tier: str, keys: "Iterable[str]", context: str
+) -> NoReturn:
+    """Raise :class:`EntryCacheInvariantViolation` naming *tier* and *keys*.
+
+    THE one formatting/raise helper for the active-key-has-an-entry
+    invariant — the entry-cache counterpart to
+    :func:`raise_bookkeeping_invariant_violation`.
+
+    Args:
+        tier: The tier the violation was found under.
+        keys: The active key(s) missing an entry-cache payload — always
+            rendered as a list in the message, even when there is exactly
+            one.
+        context: A short phrase naming the boundary/check that raised
+            (e.g. ``"adopt_increments"``).
+
+    Raises:
+        EntryCacheInvariantViolation: Always — this function never returns.
+    """
+    key_list = list(keys)
+    raise EntryCacheInvariantViolation(
+        f"{context}: tier {tier!r} would violate entry-cache completeness — "
+        f"active key(s) with no entry: {key_list!r}",
+        tier=tier,
+        missing_keys=key_list,
+    )
+
 
 # Process-wide cache for the merged simhash registry produced by
 # ``MemoryStore.read_simhash_registry_from_disk(..., cached=True)``.  Keyed
@@ -193,30 +378,30 @@ def invalidate_simhash_registry_cache() -> None:
 class MemoryStore:
     """Per-tier {entries, simhash, registry} for the indexed-key memory layer.
 
-    ``_registry`` is always a ``dict[str, KeyRegistry]`` (never ``None``).
-    The ``replay_enabled`` flag governs training behaviour only.
+    ``_registry`` is always a ``dict[str, KeyRegistry]`` (never ``None``);
+    lifecycle recording is unconditional.
 
     Thread-safety: a single ``threading.RLock`` (``self._lock``) guards all
     in-RAM access to ``_entries``, ``_registry``, and ``_bookkeeping``.  See
     the module-level concurrency contract in the module docstring for the
-    complete rules including the deliberately unwrapped :meth:`probe` and the
-    atomic :meth:`swap` publish primitive.
+    complete rules including the deliberately unwrapped :meth:`probe_source`
+    and the atomic :meth:`swap` publish primitive.
     """
 
-    def __init__(self, *, replay_enabled: bool = True) -> None:
-        self._replay_enabled = replay_enabled
+    def __init__(self) -> None:
         # Single RLock guards _entries, _registry, and _bookkeeping.  RLock
         # (not plain Lock) is required because compound mutators call wrapped
-        # leaf methods reentrantly (move→tier_of, delete→leaf readers, etc.).
+        # leaf methods reentrantly (discard_keys→tiers_with_registry,
+        # adopt_increments's own check/drop/install passes, etc.).
         self._lock = threading.RLock()
         # tier -> key -> entry payload dict.  PURE CONTENT CACHE — an entry
         # slot exists only when SPO is materialised, and it is always
         # content-only ({key, subject, predicate, object}).  See the module
         # docstring's "Content-only invariant" section.
         self._entries: dict[str, dict[str, dict]] = {}
-        # tier -> KeyRegistry — ALWAYS present (never None).  replay_enabled
-        # controls whether key lifecycle is recorded, not whether the structure
-        # exists.  SimHash fingerprints live ON the registry (not on MemoryStore).
+        # tier -> KeyRegistry — ALWAYS present (never None); key lifecycle
+        # recording is unconditional.  SimHash fingerprints live ON the
+        # registry (not on MemoryStore).
         self._registry: dict[str, KeyRegistry] = {}
         # Per-key provenance bookkeeping — SEPARATE from _entries.
         # key -> {"speaker_id": str, "relation_type": str,
@@ -226,17 +411,6 @@ class MemoryStore:
         # KeyRegistry.save_bytes — stays out of the hash-frozen slot-identity
         # path.
         self._bookkeeping: dict[str, dict] = {}
-
-    # ------------------------------------------------------------------
-    # Replay-enabled gate
-    # ------------------------------------------------------------------
-    @property
-    def replay_enabled(self) -> bool:
-        """True when the lifecycle registry is active.
-
-        When ``False``, :meth:`load_registry` raises and recall-gating paths
-        that require a registry are bypassed."""
-        return self._replay_enabled
 
     # ------------------------------------------------------------------
     # Entry payload — read
@@ -275,8 +449,8 @@ class MemoryStore:
 
         Returns an empty dict when *tier* is absent.  The returned dict is a
         snapshot taken under the lock — it is safe to iterate after the method
-        returns even if concurrent mutations occur.  Use :meth:`put` /
-        :meth:`delete` for writes; do not mutate the returned dict."""
+        returns even if concurrent mutations occur.  Use :meth:`put` for
+        writes; do not mutate the returned dict."""
         with self._lock:
             return dict(self._entries.get(tier, {}))
 
@@ -319,12 +493,14 @@ class MemoryStore:
 
         If *simhash* is supplied, the per-tier fingerprint is written to the
         tier's :class:`KeyRegistry` in the same call.
-        When *register* is True and replay is enabled, the key is added to the
-        tier's lifecycle registry.
+        When *register* is True, the key is added to the tier's lifecycle
+        registry.
 
-        Caller is responsible for ensuring *key* is unique across tiers — if
-        the key currently belongs to a different tier, call :meth:`move`
-        rather than ``put`` to keep entries, registry, and simhash in agreement.
+        Caller is responsible for ensuring *key* is unique across tiers —
+        cross-tier key movement (e.g. promotion) goes through
+        :meth:`adopt_increments`, which converges a whole bundle atomically,
+        not through calling ``put`` on the new tier while the key is still
+        registered on the old one.
 
         All three writes (entry, simhash, registry) are performed under a
         single lock acquisition so a reader never observes a half-updated state.
@@ -333,23 +509,8 @@ class MemoryStore:
             self._entries.setdefault(tier, {})[key] = entry
             if simhash is not None:
                 self._registry.setdefault(tier, KeyRegistry()).set_simhash(key, simhash)
-            if register and self._replay_enabled:
+            if register:
                 self._registry.setdefault(tier, KeyRegistry()).add(key)
-
-    def drop_entry(self, tier: str, key: str) -> None:
-        """Remove *key*'s entry-cache slot under *tier* only.
-
-        Touches ``_entries`` exclusively — no registry, simhash, or
-        bookkeeping change.  No-op when *tier* has no entries bucket or
-        *key* is absent from it.  Used by a caller reassigning *key* to a
-        DIFFERENT tier via its own ``put`` (rather than :meth:`move`) so the
-        stale copy left behind in the key's former tier does not linger as
-        a duplicate.
-        """
-        with self._lock:
-            tier_entries = self._entries.get(tier)
-            if tier_entries is not None:
-                tier_entries.pop(key, None)
 
     # ------------------------------------------------------------------
     # Per-key bookkeeping — speaker_id / relation_type / reinforcement_count
@@ -363,6 +524,7 @@ class MemoryStore:
         speaker_id: str,
         relation_type: str,
         first_seen: str,
+        promoted: bool,
         reinforcement_count: int = 1,
         last_reinforced_cycle: int = 0,
         last_seen: str = "",
@@ -370,20 +532,17 @@ class MemoryStore:
     ) -> None:
         """Store or update the bookkeeping record for *key*.
 
-        All six fields are mandatory in the persisted schema (one mandatory
-        tier, zero optional buckets).  ``first_seen`` carries no Python
-        default — every call site must pass it explicitly.  The
+        All seven fields are mandatory in the persisted schema (one mandatory
+        tier, zero optional buckets).  ``first_seen`` and ``promoted`` carry
+        no Python default — every call site must pass them explicitly.  The
         ``reinforcement_count``, ``last_reinforced_cycle``, and ``last_seen``
         params carry Python defaults solely as a legacy-fill convenience for
         new-key sites and boot-reload callers that do not yet know the
-        values.  The stored dict always contains all six keys.
+        values.  The stored dict always contains all seven keys.
 
         ``speaker_id``: the speaker who first introduced this key.
         ``relation_type``: the model-assigned relation type from extraction
         (e.g. ``"factual"``, ``"preference"``, ``"temporal"``, ``"social"``).
-        Legacy keys that pre-date this field are upgraded in-memory to
-        ``"unknown"`` by :meth:`load_bookkeeping_from_disk`; the correct value
-        is stamped at ingestion on the next consolidation cycle.
         ``first_seen``: ISO 8601 wall-clock timestamp of the earliest session
         that contained this fact.  Paired with ``last_seen`` to give each fact
         its true assertion window ``[first_seen, last_seen]``.  Mandatory —
@@ -399,12 +558,24 @@ class MemoryStore:
         ``last_seen``: ISO 8601 wall-clock timestamp of the most recent session
         that contained this fact.  Drives contradiction detection and temporal
         reasoning.  Default ``""`` (unknown).
+        ``promoted``: whether this key has already been promoted from episodic
+        to semantic.  Mandatory, no default — the flag replaces the former
+        event-level ``promoted_keys`` array: it sits on the key's own row, so
+        the promotion cannot exist without the registry move it describes
+        having been published with the same tier state.  Every new-key call
+        site passes ``promoted=False``; the live writer that flips it to
+        ``True`` is ``ConsolidationLoop._promote_working_keys`` (via the
+        working row it hands to :meth:`adopt_increments` at go-live) at the
+        point it moves a key from episodic to semantic.
         ``allow_empty_speaker``: when ``True``, suppresses the empty-speaker_id
-        guard and allows ``speaker_id=""`` to be stored.  Required for reload
-        paths (legacy keys on disk may not carry a speaker) and for keyless
+        guard and allows ``speaker_id=""`` to be stored.  Required for keyless
         concept-node edges whose subject has no speaker attribution.  Default
         ``False``; omit this flag for all new-key production writes where a
         real speaker_id must be present (no-unattributed-keys invariant).
+        Boot reload (:meth:`load_bookkeeping_from_disk`) does NOT pass this
+        flag — a persisted row with an empty ``speaker_id`` fails the same
+        guard at boot as it would at mint time; there is no reload-time
+        carve-out for legacy unattributed keys.
 
         Raises:
             ValueError: when ``speaker_id`` is empty and ``allow_empty_speaker``
@@ -412,8 +583,13 @@ class MemoryStore:
 
         **Callers that need to update ONE field on an existing key must use
         :meth:`reinforce` (for reinforcement/last_seen/first_seen updates)
-        rather than calling this method, which overwrites ALL six fields and
-        would silently reset the counters the caller did not supply.**
+        rather than calling this method, which overwrites ALL seven fields
+        and would silently reset the counters the caller did not supply.
+        The promotion flag has no store-level setter of its own — the live
+        promotion path (``ConsolidationLoop._promote_working_keys``) sets
+        ``row["promoted"] = True`` directly on the working tier's row dict,
+        and the flag reaches the live store's own bookkeeping only via the
+        increment's install at go-live (:meth:`adopt_increments`).**
 
         Does NOT touch ``_entries`` — bookkeeping presence MUST NOT
         manufacture a content cache hit.
@@ -424,8 +600,8 @@ class MemoryStore:
         runtime-set data both match the casing the router's
         ``_speaker_key_index`` (:meth:`~paramem.server.router.QueryRouter.reload`,
         the sole privacy boundary) is built from: legacy cased ``Speaker0``
-        from ``key_metadata.json`` is silently coerced to ``speaker0`` at
-        boot via the :meth:`load_bookkeeping_from_disk` →
+        from a tier's ``key_metadata.json`` is silently coerced to
+        ``speaker0`` at boot via the :meth:`load_bookkeeping_from_disk` →
         :meth:`set_bookkeeping` path, self-healing on the next save.  Empty
         strings and non-speaker values pass through unchanged."""
         if is_speaker_id(speaker_id):
@@ -444,6 +620,7 @@ class MemoryStore:
                 "last_reinforced_cycle": last_reinforced_cycle,
                 "last_seen": last_seen,
                 "first_seen": first_seen,
+                "promoted": promoted,
             }
 
     def reinforce(
@@ -483,12 +660,12 @@ class MemoryStore:
         is multiplicity, not reinforcement.  An empty *timestamp* is "unknown",
         never evidence of a temporal gap, so it never earns.
 
-        When *key* has no bookkeeping record yet the call creates a minimal one
-        — a defensive no-op for callers that may race with a first
-        registration; normal flow is that :meth:`set_bookkeeping` is called
-        first.  An absent record counts as ``0`` prior sightings, so a plain
-        first ``reobserved`` credit lands at 1 and an inherited count lands
-        intact rather than being flattened to 1.
+        Every known key already carries a bookkeeping record by the time
+        this is called — :meth:`set_bookkeeping` (or a mint site's direct
+        row write) always runs first.  ``key`` absent from
+        ``self._bookkeeping`` is a violation of that invariant and raises
+        :class:`BookkeepingInvariantViolation` (via
+        :func:`credit_reinforcement`), never a fabricated placeholder.
 
         Args:
             key: The indexed-key string (e.g. ``"graph42"``) — the survivor.
@@ -511,54 +688,58 @@ class MemoryStore:
                 the boundary that has it; do NOT fabricate a ``now()`` here.
                 Also the temporal-order evidence for ``reobserved``.
             absorbing: Keys whose durable counts *key* inherits — the keys
-                being merged into it.  Read from this store, never passed in as
-                a number.  Unknown keys contribute nothing.
+                being merged into it.  Resolved against this store's own
+                bookkeeping dict, under this store's own lock, before the
+                credit is applied.  Unknown keys contribute nothing.
             reobserved: ``True`` when this credit accompanies an independent
                 sighting of the fact (a duplicate-SPO collapse across sessions,
                 or a recited fact adopting an existing key).  ``False`` for a
                 normalization merge such as a predicate-synonym collapse, which
                 rewrites how a fact is spelled without observing it again.
+
+        Raises:
+            BookkeepingInvariantViolation: *key* has no bookkeeping record —
+                see above.
         """
         with self._lock:
-            existing = self._bookkeeping.get(key)
-            prior = 0 if existing is None else existing.get("reinforcement_count", 1)
-            inherited = max(
-                (
-                    self._bookkeeping[k].get("reinforcement_count", 1)
-                    for k in absorbing
-                    if k in self._bookkeeping
-                ),
-                default=0,
+            absorbed_counts = [
+                self._bookkeeping[k].get("reinforcement_count", 1)
+                for k in absorbing
+                if k in self._bookkeeping
+            ]
+            credit_reinforcement(
+                self._bookkeeping,
+                key,
+                cycle=cycle,
+                first_seen=first_seen,
+                timestamp=timestamp,
+                absorbed_counts=absorbed_counts,
+                reobserved=reobserved,
             )
-            prior_last_seen = "" if existing is None else existing.get("last_seen", "")
-            earned = 1 if (reobserved and timestamp and timestamp != prior_last_seen) else 0
-            count = max(prior, inherited) + earned
-
-            if existing is None:
-                self._bookkeeping[key] = {
-                    "speaker_id": "",
-                    "relation_type": "unknown",
-                    "reinforcement_count": count,
-                    "last_reinforced_cycle": cycle,
-                    "last_seen": timestamp,
-                    "first_seen": first_seen,
-                }
-                return
-            existing["reinforcement_count"] = count
-            existing["last_reinforced_cycle"] = cycle
-            if timestamp:
-                existing["last_seen"] = max(existing.get("last_seen", ""), timestamp)
-            existing["first_seen"] = min_nonempty(existing.get("first_seen", ""), first_seen)
 
     def bookkeeping_for_key(self, key: str) -> dict | None:
-        """Return the bookkeeping record for *key*, or ``None`` when absent.
+        """Return the bookkeeping record for *key*.
 
-        Returns a plain dict with six fields:
+        Returns a plain dict with seven fields:
         ``{"speaker_id", "relation_type", "reinforcement_count",
-        "last_reinforced_cycle", "last_seen", "first_seen"}``
-        when present, ``None`` when the key has never been bookkept.
-        Callers may use ``bk = store.bookkeeping_for_key(k) or {}`` as a
-        boundary default (compliant with the is-None / empty-is-valid rule)."""
+        "last_reinforced_cycle", "last_seen", "first_seen", "promoted"}``.
+
+        Every registry-known key carries a bookkeeping row from the moment
+        it is formed (the every-known-key-has-a-row invariant enforced at
+        the store boundaries via ``BookkeepingInvariantViolation`` —
+        see :func:`raise_bookkeeping_invariant_violation`), so a call for
+        any key drawn from this store's own registry or entry cache
+        (``iter_entries()``, ``registry(tier).list_known()``, ...) always
+        returns the dict, never ``None``.  Read sites access the return
+        value directly (splatting it, indexing a field) without an
+        ``or {}`` default.
+
+        ``None`` is reserved for a key that was never bookkept at all —
+        e.g. an arbitrary string a caller did not first resolve against
+        this store's own known-key set.  For any key that DID come from
+        this store, a ``None`` here means the invariant has already been
+        violated upstream; it is not a state a caller should tolerate or
+        silently default around."""
         with self._lock:
             return self._bookkeeping.get(key)
 
@@ -577,94 +758,23 @@ class MemoryStore:
             snap = list(self._bookkeeping.items())
         yield from snap
 
-    def drop_bookkeeping(self, key: str) -> None:
-        """Remove the bookkeeping record for *key* (retirement parity).
-
-        Called automatically by :meth:`delete` — callers that retire a key
-        via ``delete`` need not call this separately."""
-        with self._lock:
-            self._bookkeeping.pop(key, None)
-
     def bookkeeping_count(self) -> int:
         """Number of keys that have a bookkeeping record."""
         with self._lock:
             return len(self._bookkeeping)
-
-    def delete(self, key: str) -> str | None:
-        """Drop *key* from every tier in every sub-structure.
-
-        Cleans entries, simhash (via registry), and registry across all tiers
-        in one call.  The return value is the *first* tier that held the key
-        in any structure, or ``None`` when the key was completely absent.
-
-        The entire compound mutation (entries + registry/simhash + bookkeeping)
-        is performed under a single lock acquisition so a concurrent reader
-        never observes a half-deleted state across the three structures.
-        Nested leaf calls succeed via RLock reentrancy."""
-        with self._lock:
-            former: str | None = None
-            for tier in list(self._entries.keys()):
-                if key in self._entries[tier]:
-                    del self._entries[tier][key]
-                    if former is None:
-                        former = tier
-            # Drop from registry (removes from active, stale, and _simhash).
-            for tier, reg in list(self._registry.items()):
-                if reg.knows(key):
-                    reg.remove(key)
-                    if former is None:
-                        former = tier
-            # Retire bookkeeping in lockstep so _bookkeeping never drifts.
-            self._bookkeeping.pop(key, None)
-            return former
-
-    def move(self, key: str, new_tier: str) -> None:
-        """Move *key* from its current tier to *new_tier* atomically.
-
-        Moves the entry payload, simhash fingerprint, and registry entry in one
-        operation.  No-op if *key* is already in *new_tier*.
-
-        The entire compound mutation across all three structures is performed
-        under a single lock acquisition.  Nested calls to :meth:`tier_of`
-        succeed via RLock reentrancy."""
-        with self._lock:
-            old_tier = self.tier_of(key)
-            if old_tier == new_tier:
-                if new_tier in self._registry:
-                    # Ensure registry entry is present even when entries already are.
-                    self._registry[new_tier].add(key)
-                return
-            # Move entry
-            if old_tier is not None and key in self._entries.get(old_tier, {}):
-                self._entries.setdefault(new_tier, {})[key] = self._entries[old_tier].pop(key)
-            # Move simhash: read from the old tier's registry (covers active + stale).
-            fp: int | None = None
-            old_reg = self._registry.get(old_tier) if old_tier else None
-            if old_reg is not None:
-                fp = old_reg.simhash_for(key)
-                old_reg.drop_simhash(key)
-            if fp is not None:
-                self._registry.setdefault(new_tier, KeyRegistry()).set_simhash(key, fp)
-            # Move registry entry: remove from old, add to new.
-            for tier, reg in list(self._registry.items()):
-                if key in reg:
-                    if tier != new_tier:
-                        reg.remove(key)
-            self._registry.setdefault(new_tier, KeyRegistry()).add(key)
 
     def drop_tier(self, tier: str) -> None:
         """Remove *tier* wholesale: its entries, registry (incl. simhash), and
         the bookkeeping records for every key it held, active or stale.
 
         Compensates a failed interim commit whose tier registration must be
-        rolled back atomically — the tier-granularity peer of :meth:`delete`
-        (single-key, all tiers) and :meth:`move` (single-key, cross-tier).
+        rolled back atomically.
         Bookkeeping has no tier index of its own (it is a flat ``key ->
         record`` dict), so :meth:`active_keys_in_tier` and
         :meth:`stale_keys_in_tier` are used to enumerate which records to
-        drop before the registry itself is removed — a stale key's
+        drop before the registry itself is removed — a withheld id's
         bookkeeping record must not survive the tier that carried it (a
-        discarded tier's stale-key rows would otherwise be re-indexed by
+        discarded tier's withheld-id rows would otherwise be re-indexed by
         :meth:`~paramem.server.router.QueryRouter.reload` against a tier that
         no longer exists).
 
@@ -684,9 +794,9 @@ class MemoryStore:
     def simhash(self, tier: str, key: str) -> int | None:
         """Return the simhash fingerprint for ``(tier, key)``, or ``None``.
 
-        Reads from the registry (covers active AND stale partitions — the
-        unified storage design).  Returns ``None`` when the tier has no
-        registry or the key has no fingerprint."""
+        Reads from the registry's one fingerprint map.  Returns ``None`` when
+        the tier has no registry or the key has no fingerprint — including
+        every withheld id, which carries none by design."""
         with self._lock:
             reg = self._registry.get(tier)
             if reg is None:
@@ -694,7 +804,7 @@ class MemoryStore:
             return reg.simhash_for(key)
 
     def has_simhash(self, tier: str, key: str) -> bool:
-        """True when *key* has a stored fingerprint in *tier* (active or stale)."""
+        """True when *key* has a stored fingerprint in *tier*."""
         with self._lock:
             reg = self._registry.get(tier)
             if reg is None:
@@ -705,7 +815,7 @@ class MemoryStore:
         """Return the tier whose registry holds *key*'s fingerprint, or ``None``.
 
         Used by the legacy flat-view setter and the probe confidence gate.
-        Scans registry active+stale partitions."""
+        Scans every registry's one fingerprint map."""
         with self._lock:
             for tier, reg in self._registry.items():
                 if reg.has_simhash(key):
@@ -729,56 +839,43 @@ class MemoryStore:
             if reg is not None:
                 reg.drop_simhash(key)
 
-    def tier_simhashes(self, tier: str, *, include_stale: bool) -> dict[str, int]:
-        """Return the fingerprint map for *tier*.
-
-        The mandatory ``include_stale`` keyword makes the active-vs-known
-        distinction impossible to forget — the original enumeration bug was
-        caused by callers using the old ``simhashes_in_tier`` without
-        remembering to filter stale keys.
+    def tier_simhashes(self, tier: str) -> dict[str, int]:
+        """Return *tier*'s one fingerprint map — its active keys' fingerprints.
 
         Args:
             tier: Tier name (e.g. ``"episodic"``).
-            include_stale: When ``True``, returns active∪stale fingerprints.
-                When ``False``, returns active-only fingerprints.
 
         Returns:
-            A fresh ``dict[str, int]`` (not a live view).  Callers that need
-            a mutable live backing dict are using a deprecated pattern —
-            use :meth:`put_simhash` for writes.
+            A fresh ``dict[str, int]`` (not a live view), empty when *tier*
+            has no registry.  Callers that need a mutable live backing dict
+            are using a deprecated pattern — use :meth:`put_simhash` for
+            writes.
         """
         with self._lock:
             reg = self._registry.get(tier)
             if reg is None:
                 return {}
-            return reg._known_simhashes() if include_stale else reg._active_simhashes()
+            return reg._simhashes()
 
     def replace_simhashes_in_tier(self, tier: str, new_simhashes: dict[str, int]) -> None:
-        """Bulk-replace the active simhash fingerprints for *tier*.
+        """Bulk-replace the simhash fingerprints for *tier*'s active keys.
 
-        Writes the new active fingerprints directly to the tier's registry.
-        Stale fingerprints in the registry are not touched — they are managed
-        by :meth:`KeyRegistry.stale`.
+        Thin per-tier dispatch: resolves *tier*'s registry (creating one on
+        first access, the same as every other per-tier accessor on this
+        class) and delegates the validate-then-swap primitive to
+        :meth:`~paramem.training.key_registry.KeyRegistry.replace_simhashes`
+        — the tier's registry owns its one fingerprint map and its own
+        withheld-id refusal; this method does not read or write
+        ``KeyRegistry``'s private state.
+
+        Raises:
+            ~paramem.memory.store.BookkeepingInvariantViolation: *new_simhashes*
+                names a withheld id in *tier*'s registry.  Neither the old
+                map nor a partial new one is left in place.
         """
         with self._lock:
             reg = self._registry.setdefault(tier, KeyRegistry())
-            # Drop all active simhashes from the registry by clearing _simhash
-            # directly.  (Only active simhashes are being replaced; stale
-            # records stay intact.)
-            reg._simhash.clear()
-            for key, fp in new_simhashes.items():
-                reg.set_simhash(key, fp)
-
-    def simhash_count_in_tier(self, tier: str) -> int:
-        """Return the total number of known (active∪stale) fingerprints for *tier*.
-
-        Reads from the registry's ``_known_simhashes()`` — the authoritative
-        source for both active and stale fingerprints."""
-        with self._lock:
-            reg = self._registry.get(tier)
-            if reg is None:
-                return 0
-            return len(reg._known_simhashes())
+            reg.replace_simhashes(new_simhashes)
 
     # ------------------------------------------------------------------
     # Lifecycle registry
@@ -786,11 +883,8 @@ class MemoryStore:
     def registry(self, tier: str) -> KeyRegistry:
         """Return the per-tier :class:`KeyRegistry`, creating it on first access.
 
-        Always returns a :class:`KeyRegistry` — never ``None``.  The
-        ``_replay_enabled`` flag governs training behaviour only (whether key
-        lifecycle add/stale/remove is recorded); it does not gate registry
-        existence.  Callers that need to know whether replay is active should
-        check :attr:`replay_enabled` directly.
+        Always returns a :class:`KeyRegistry` — never ``None``.  Key
+        lifecycle (add/stale/remove) recording is unconditional.
         """
         with self._lock:
             return self._registry.setdefault(tier, KeyRegistry())
@@ -798,14 +892,8 @@ class MemoryStore:
     def load_registry(self, tier: str, registry: KeyRegistry) -> None:
         """Install a pre-loaded :class:`KeyRegistry` for *tier* at boot.
 
-        Raises :class:`RuntimeError` when called on a replay-disabled store —
-        loading a registry into a disabled store would silently break the
-        gate that downstream paths rely on.  Simhashes are carried inside the
-        registry; no separate sync is needed."""
-        if not self._replay_enabled:
-            raise RuntimeError(
-                "MemoryStore: replay is disabled; cannot install registry for tier %r" % tier
-            )
+        Simhashes are carried inside the registry; no separate sync is
+        needed."""
         with self._lock:
             self._registry[tier] = registry
 
@@ -819,33 +907,6 @@ class MemoryStore:
         with self._lock:
             return list(self._registry.keys())
 
-    def drop_registry_and_entries(self, tier: str) -> KeyRegistry | None:
-        """Remove *tier*'s registry AND its ``_entries`` bucket; return the registry.
-
-        Used at end-of-full-cycle to retire an interim slot after its keys
-        have been adopted into a main tier.  By the time this runs,
-        ``ConsolidationLoop._rebuild_main_tier_state`` has already
-        re-written every adopted key's content into its NEW main tier via
-        ``put(..., register=False)`` — so whatever is left in the interim
-        tier's own ``_entries`` bucket belongs to no active key (drift/dedup
-        casualties the fold did not adopt), and popping it here cannot
-        orphan a live key's content.  Popping the two together also closes
-        the window where the tier's registry is gone but its ``_entries``
-        bucket lingers, still holding stale content no registry claims.
-
-        Deliberately narrower than :meth:`drop_tier`: this primitive does
-        NOT touch ``_bookkeeping``.  ``drop_tier`` is the wrong primitive
-        for interim retirement — by the time retirement runs, an adopted
-        key is already registered (and bookkept) under a MAIN tier, so
-        popping bookkeeping keyed off the INTERIM tier's own
-        ``active_keys_in_tier``/``stale_keys_in_tier`` would delete live
-        main-tier provenance out from under a key that still exists.
-
-        Returns ``None`` when *tier* had no registry."""
-        with self._lock:
-            self._entries.pop(tier, None)
-            return self._registry.pop(tier, None)
-
     def active_keys_in_tier(self, tier: str) -> list[str]:
         """Return the active keys for *tier* from the registry."""
         with self._lock:
@@ -856,10 +917,14 @@ class MemoryStore:
         """Return the stale keys for *tier* from the registry.
 
         Per-tier analogue of :meth:`active_keys_in_tier` for the stale
-        partition. A key that has been fully erased via
-        ``discard_keys(mode="erase")`` (rather than soft-staled) is removed
-        from the registry entirely and is therefore invisible to this count,
-        by design (the registry has nothing left to report).
+        partition. A key an acting site's fate decision removed outright
+        (:meth:`~paramem.training.key_registry.KeyRegistry.remove` — reached
+        when the OWNING TIER is REBUILT by the event, already re-deriving its
+        content from a key set the retired id is not in, vs. withheld behind
+        a marker when the owning tier is not rebuilt; see
+        :meth:`~paramem.training.consolidation.ConsolidationLoop._apply_working_fate_decisions`)
+        is neither active nor stale and is therefore invisible to this
+        count, by design (the registry has nothing left to report).
         """
         with self._lock:
             reg = self._registry.get(tier)
@@ -870,28 +935,14 @@ class MemoryStore:
         with self._lock:
             return [k for reg in self._registry.values() for k in reg.list_active()]
 
-    def tier_for_active_key(self, key: str) -> str | None:
-        """Return the tier that holds *key* in its registry as active, or ``None``.
-
-        Kept distinct from :meth:`tier_of` because the registry and entry
-        cache can briefly disagree during a put/move sequence."""
-        with self._lock:
-            for tier, reg in self._registry.items():
-                if key in reg:
-                    return tier
-            return None
-
     def is_known(self, key: str) -> bool:
         """True when *key* is active OR stale in any tier's registry.
 
         KNOWN-legitimacy analogue of ``key in reg`` (active-only).  Returns
-        False when replay is disabled (no registries) or the key is absent from
-        both partitions of every tier.  Use for orphan checks and bookkeeping
-        retention; use :meth:`tier_for_active_key` / :meth:`all_active_keys` for
-        serving/enumeration.
+        False when the key is absent from both partitions of every tier.
+        Use for orphan checks and bookkeeping retention; use
+        :meth:`all_active_keys` for serving/enumeration.
         """
-        if not self._replay_enabled:
-            return False
         with self._lock:
             for reg in self._registry.values():
                 if reg.knows(key):
@@ -901,12 +952,15 @@ class MemoryStore:
     def tier_for_known_key(self, key: str) -> str | None:
         """Return the tier whose registry tracks *key* as active OR stale.
 
-        KNOWN-legitimacy analogue of :meth:`tier_for_active_key`.  Returns
-        ``None`` when replay is disabled or no tier knows *key* in either
-        partition.
+        KNOWN-legitimacy analogue of ``key in reg`` (active-only tier
+        lookup).  Returns ``None`` when no tier knows *key* in either
+        partition.  Under the single-tier-ownership invariant a key is
+        known by exactly one
+        tier's registry at a time, so the first match found while walking
+        ``_registry`` is the only match — the walk order is irrelevant to
+        the result by that invariant, not by construction of the order
+        itself.
         """
-        if not self._replay_enabled:
-            return None
         with self._lock:
             for tier, reg in self._registry.items():
                 if reg.knows(key):
@@ -914,328 +968,294 @@ class MemoryStore:
             return None
 
     def all_known_keys(self) -> list[str]:
-        """Every active ∪ stale key across every registered tier.
+        """Every active ∪ withheld key across every registered tier.
 
-        Equivalent to ``all_active_keys() + all_stale_keys()`` but expressed
-        via :meth:`KeyRegistry.list_known` so the union logic has a single
-        definition.  Returns an empty list when replay is disabled.
+        Expressed via :meth:`KeyRegistry.list_known` so the union logic has
+        a single definition.
         """
-        if not self._replay_enabled:
-            return []
         with self._lock:
             return [k for reg in self._registry.values() for k in reg.list_known()]
 
-    def is_stale(self, key: str) -> bool:
-        """Return True when *key* is stale in any tier's registry.
+    def discard_keys(self, keys: list[str]) -> None:
+        """Soft-remove *keys*: withhold each in its owning tier's registry.
 
-        Delegates to :meth:`KeyRegistry.is_stale` on the owning tier.
-        Returns False when replay is disabled (no registries) or the key
-        is not found in any tier's stale partition.
-        """
-        if not self._replay_enabled:
-            return False
-        with self._lock:
-            for reg in self._registry.values():
-                if reg.is_stale(key):
-                    return True
-            return False
+        One meaning only — the former ``mode="erase"`` hard-removal branch
+        and its ``mode`` parameter are retired with their last caller (the
+        operator doors, which now narrow to a stale-mark + registry restamp;
+        see :func:`~paramem.memory.persistence.erase_keys_and_restamp_manifest`).
+        Full retirement of a key still exists — an acting site's fate
+        decision on a tier the event REBUILDS removes it outright via
+        :meth:`~paramem.training.key_registry.KeyRegistry.remove` — it is
+        just no longer reachable through this method.
 
-    def all_stale_keys(self) -> list[str]:
-        """Every stale key across every registered tier."""
-        if not self._replay_enabled:
-            return []
-        with self._lock:
-            return [k for reg in self._registry.values() for k in reg.list_stale()]
-
-    def discard_keys(self, keys: list[str], *, mode: str) -> None:
-        """Mutate the in-memory registry (and its simhash map) for *keys*.
-
-        Supports two modes:
-
-        ``mode="erase"`` (hard removal, used by ``/forget``):
-            Full retirement — delegates to :meth:`delete` per key, so
-            entries, registry (active + stale + simhash) and bookkeeping are
-            dropped in lockstep across every tier, exactly as :meth:`delete`
-            and :meth:`drop_tier` do.  This is the same compound retirement
-            those two primitives perform; ``discard_keys`` no longer walks
-            the registries itself, which would otherwise be a second
-            implementation of :meth:`delete`'s registry walk.
-
-        ``mode="stale"`` (soft removal, used by the fold dedup write-back):
-            For each key, call :meth:`KeyRegistry.stale` on the owning tier.
-            The stale transition automatically carries the active simhash into
-            the stale record (encapsulated in :meth:`KeyRegistry.stale`), so
-            the fingerprint is retained on the stale record.  Entries
-            and bookkeeping are untouched — only the erase branch retires
-            those.
-
-        Guards ``replay_enabled``: when replay is disabled, all mutations are
-        no-ops and this method returns without raising.
+        For each key, calls :meth:`KeyRegistry.stale` on the owning tier,
+        which mints a marker holding only the id — the active fingerprint
+        does not survive the transition.  Entries and bookkeeping are
+        untouched — the row leaves with the rest of the key at the tier's
+        own rebuild, not here.
 
         This is an **in-memory** mutation only.  Callers are responsible for
-        their own disk saves (the registry files carry the unified simhash now).
+        their own disk saves.
 
         The entire mutation is performed under a single lock acquisition.
-        Nested calls to :meth:`delete` / :meth:`tiers_with_registry` succeed
-        via RLock reentrancy.
+        Nested calls to :meth:`tiers_with_registry` succeed via RLock
+        reentrancy.
         """
-        if not self._replay_enabled:
-            return
         with self._lock:
-            if mode == "erase":
-                for key in keys:
-                    self.delete(key)
-            elif mode == "stale":
-                for key in keys:
-                    for tier_name in self.tiers_with_registry():
-                        reg = self._registry.get(tier_name)
-                        if reg is not None and key in reg:
-                            reg.stale(key)
-                            # The stale transition moved the active simhash into
-                            # the stale record inside the registry — single
-                            # encapsulated call.
-                            break  # single-tier-ownership invariant
-            else:
-                raise ValueError(
-                    f"MemoryStore.discard_keys: unknown mode {mode!r}; expected 'erase' or 'stale'"
-                )
-
-    def reactivate(self, tier: str, key: str) -> None:
-        """Reverse a soft-stale transition for *key* in *tier* (rollback primitive).
-
-        The dual of ``discard_keys(mode="stale")`` — delegates to
-        :meth:`KeyRegistry.reactivate` on *tier*'s registry (mirroring how
-        ``discard_keys(mode="stale")`` delegates to ``reg.stale()``), moving
-        *key* back from the stale partition to active and restoring its
-        simhash fingerprint from the stale record.  Used to compensate a
-        failed interim commit: the shared soft-stale stage
-        (:meth:`~paramem.training.consolidation.ConsolidationLoop._apply_subtractive_removals_to_store`)
-        soft-stales pre-existing keys before the commit is durable; on
-        failure those keys must return to active exactly as before the fold
-        ran.
-
-        Guards ``replay_enabled`` (matching :meth:`discard_keys`): when
-        replay is disabled, this is a no-op.  Also a no-op when the tier has
-        no registry, or *key* is not in that tier's stale partition —
-        idempotent, safe to call from a compensation loop that does not
-        track whether it already ran.
-
-        The entire compound mutation (registry active-set + simhash) is
-        performed under a single lock acquisition."""
-        if not self._replay_enabled:
-            return
-        with self._lock:
-            reg = self._registry.get(tier)
-            if reg is None:
-                return
-            reg.reactivate(key)
+            for key in keys:
+                for tier_name in self.tiers_with_registry():
+                    reg = self._registry.get(tier_name)
+                    if reg is not None and key in reg:
+                        reg.stale(key)
+                        break  # single-tier-ownership invariant
 
     # ------------------------------------------------------------------
-    # Probe — resolve {key → entry} for inference, with optional source fallback
+    # Serving read doors — selected once, at the serving boundary
+    # (paramem.server.inference._probe_and_reason), by
+    # inference.preload_cache.  No layering between them: no
+    # cache-check-then-probe, no on-miss fallback, no write-back at
+    # serving.  See the module docstring's mirror statement.
     # ------------------------------------------------------------------
-    def probe(
-        self,
-        keys_by_adapter: dict[str, list[str]],
-        *,
-        source=None,
-        memoize: bool = True,
+    def _confidence_gate(self, key: str, entry: dict) -> float | None:
+        """Return the SimHash confidence for *key* against *entry*, or None
+        when *key* has no registered fingerprint.
+
+        THE fingerprint gate for content crossing a source boundary into a
+        turn — used by :meth:`probe_source` only; the cache door performs no
+        fingerprint work (its content was gated once at admission).  Returns
+        the computed confidence float when a fingerprint is on record (which
+        may be below threshold), or ``None`` when *key* has no owning simhash
+        tier or the owning tier carries no fingerprint for it (e.g. a fresh
+        tier before first consolidation) — callers MUST treat ``None`` as a
+        failed gate, never as pass-through: a trained tier must always be
+        provable.
+
+        The fingerprint is looked up by scanning all registry tiers via
+        :meth:`_tier_for_simhash` so a key whose simhash was stored under
+        a different tier from the one it was requested under (e.g. an
+        interim slot promoted to main) is still verified correctly.
+
+        Invariant: never uses truthiness on registry or sub-dicts —
+        all presence checks use explicit ``in`` / ``is None``."""
+        from paramem.memory.entry import verify_confidence
+
+        owning_simhash_tier = self._tier_for_simhash(key)
+        if owning_simhash_tier is None:
+            return None
+        # Use the locked accessor self.simhash() instead of raw
+        # self._registry.get() so a concurrent swap cannot rebind
+        # _registry between the _tier_for_simhash call above and the
+        # fingerprint read here.
+        fp = self.simhash(owning_simhash_tier, key)
+        if fp is None:
+            return None
+        # Build the minimal entry shape verify_confidence expects.
+        candidate = {
+            "key": key,
+            "subject": entry.get("subject", ""),
+            "predicate": entry.get("predicate", ""),
+            "object": entry.get("object", ""),
+        }
+        return verify_confidence(candidate, {key: fp})
+
+    @staticmethod
+    def _render_cache_entry(key: str, entry: dict) -> dict:
+        """Render a content-only mirror entry into the probe result contract.
+
+        THE one renderer for the cache door's per-key shape: entries hold
+        SPO only (the mirror's content-only invariant), so no speaker field
+        is rendered — speaker attribution lives in bookkeeping, never in a
+        probe result.  No fingerprint work here — the content was gated once
+        at admission (the boot fill or go-live adoption); re-gating
+        already-admitted content would be a second invocation of an
+        admission-owned transformation.  ``confidence`` is always ``1.0``
+        (pass-through — the mirror carries no per-read confidence signal).
+
+        ``fact_text`` renders raw ``speaker{N}`` tokens verbatim — there is
+        no resolver here; a token is substituted for a display name exactly
+        once, at the reply boundary, by
+        :func:`~paramem.server.speaker.resolve_speaker_tokens`.
+        """
+        import json as _json
+
+        from paramem.memory.entry import entry_fact_text
+
+        base = {
+            "key": key,
+            "subject": entry.get("subject", ""),
+            "predicate": entry.get("predicate", ""),
+            "object": entry.get("object", ""),
+        }
+        return {
+            **base,
+            "confidence": 1.0,
+            "fact_text": entry_fact_text(base),
+            "raw_output": _json.dumps(base),
+        }
+
+    def probe_cache(self, keys_by_adapter: dict[str, list[str]]) -> dict[str, dict | None]:
+        """THE CACHE DOOR — a plain, registry-scoped lookup against the RAM mirror.
+
+        Scoped by the requested tier's own registry: a key that tier's
+        registry does not call ACTIVE right now — stale (soft-removed by
+        :meth:`discard_keys`) or simply unknown — answers ``None`` without
+        ever consulting ``_entries``.  This is load-bearing, not incidental:
+        entries deliberately survive both :meth:`discard_keys` (the row
+        leaves only at that tier's own next rebuild) and a rows-only
+        member's :meth:`adopt_increments` install, so an un-scoped lookup
+        would serve a fact the registry no longer calls active.  An ACTIVE
+        key with no entry ALSO answers ``None`` — the same no-fact shape as
+        a live-door miss, never a fault.  Reading the registry here is a
+        plain, NON-CREATING lookup (``self._registry.get(tier)``, never
+        :meth:`registry`'s ``setdefault`` — a door must not phantom-register
+        an unknown tier into ``_registry``, which would leak it into
+        :meth:`tiers_with_registry` and the interim-slot enumeration) plus
+        :meth:`KeyRegistry.__contains__` — no registry SIDE EFFECT, no
+        fingerprint re-check, no integrity signal, no write-back.
+        Production value of the caller: ``inference.preload_cache=True`` at
+        the serving boundary (:func:`paramem.server.inference._probe_and_reason`)
+        — the one caller.
+
+        Contract: probe is a pure lookup — it does not scope by speaker.
+        Callers pass already speaker-scoped keys; the router's per-speaker
+        key intersection
+        (:attr:`~paramem.server.router.QueryRouter._speaker_key_index`) is
+        the single privacy boundary.
+        """
+        results: dict[str, dict | None] = {}
+        for tier, keys in keys_by_adapter.items():
+            with self._lock:
+                reg = self._registry.get(tier)
+            for key in keys:
+                if reg is None or key not in reg:
+                    # Not active in this tier's registry right now — stale,
+                    # unknown, or the tier has no registry at all.  Same
+                    # no-fact shape as a missing entry.
+                    results[key] = None
+                    continue
+                entry = self.get(key)
+                results[key] = None if entry is None else self._render_cache_entry(key, entry)
+        return results
+
+    def probe_source(
+        self, keys_by_adapter: dict[str, list[str]], *, source
     ) -> dict[str, dict | None]:
-        """Resolve *keys_by_adapter* to flat ``{key → result | None}``.
+        """THE LIVE DOOR — one grouped probe against *source*, no cache contact.
 
         NOTE — this method is deliberately NOT wrapped in ``self._lock``.
         It calls ``source.probe(...)``, which is a GPU ``model.generate()``
         call that may block for seconds.  Holding the store lock across GPU
-        work would stall every concurrent store reader for the duration of the
-        GPU call.  All reads inside probe go through individually locked leaf
-        methods — ``self.get``, ``self.bookkeeping_for_key``, ``self.simhash``,
-        ``self._tier_for_simhash``, ``self.put`` — so no raw access to
-        ``_entries``, ``_registry``, or ``_bookkeeping`` is made.  Each read
-        acquires and releases the lock independently; the lock is never held
-        across the GPU call.
+        work would stall every concurrent store reader for the duration of
+        the GPU call.  The one read inside this method — the confidence
+        gate's fingerprint lookup — goes through individually locked leaf
+        methods (:meth:`simhash`, :meth:`_tier_for_simhash`); no raw access
+        to ``_entries``, ``_registry``, or ``_bookkeeping`` is made, and the
+        cache is neither read nor written.
 
-        Cache hits are served directly from the store.  Misses are delegated
-        to *source* (a :class:`paramem.memory.source.MemorySource`)
-        when supplied; the source result is memoized back into the store unless
-        *memoize* is False (typically when ``inference.preload_cache`` is off
-        and the operator wants the cache to stay empty).
+        ``source`` is REQUIRED — there is no default and no fallback to the
+        cache.  Every requested key is probed against the venue in one
+        grouped call; :meth:`_confidence_gate` is applied to the results
+        verbatim (``verify_confidence`` against the tier's stored
+        fingerprint) — a key with no registered fingerprint, or a hit
+        scoring below :data:`~paramem.memory.entry.DEFAULT_CONFIDENCE_THRESHOLD`,
+        both answer ``None``: a trained tier must always be provable, so a
+        fingerprint-less result is treated the same as a failed gate, never
+        served pass-through.  A miss or a gate-drop answers ``None`` for that
+        key.
+        Production value of *source*: ``build_memory_source(mode=...)``,
+        constructed only in the ``inference.preload_cache=False`` arm of the
+        serving boundary (:func:`paramem.server.inference._probe_and_reason`)
+        — the one caller.  The fold never calls this door: it builds and
+        probes its own :class:`~paramem.memory.source.MemorySource` into
+        fold-local working state and never touches the store mid-event.
 
-        Contract: probe is a pure latency memo — it does not scope by
+        Contract: probe is a pure latency read — it does not scope by
         speaker.  Callers pass already speaker-scoped keys; the router's
         per-speaker key intersection
         (:attr:`~paramem.server.router.QueryRouter._speaker_key_index`) is
         the single privacy boundary.  No memory source emits ``speaker_id``
         — a source result is content only (plus its own derived fields), so
-        no dict probe returns carries one either.  Speaker attribution lives
-        exclusively in ``_bookkeeping``, written by consolidation at fold
-        time; probe never writes it.  Cache hits render to exactly ``{key,
-        subject, predicate, object, confidence, fact_text, raw_output}``;
-        source-served hits pass through the source's own dict (which may
-        carry other fields the source attached, e.g. ``answer``, see
-        ``inference.py``).  Misses (or source-failure dicts carrying
-        ``failure_reason``) pass through unrendered.
+        no dict probe returns carries one either.  Source-served hits pass
+        through the source's own dict verbatim (which may carry other
+        fields the source attached, e.g. ``answer``, see ``inference.py``)
+        with ``confidence`` patched to the gate's computed value.  A source
+        result carrying ``failure_reason`` (parse failure, key mismatch, or
+        the source's OWN internal gate drop — :class:`WeightMemorySource`
+        and :class:`DiskMemorySource` both gate before returning) is
+        NORMALIZED to ``None`` here, same as an absent result: the door
+        contract is "a miss or a gate-drop answers ``None`` for that key",
+        never a differently-shaped failure dict.  A debug-level log line
+        names the key and the source's own ``failure_reason`` as the trace
+        — the source already warned once at its own boundary.  A source
+        result that is not even a dict (a source violating its own return
+        contract) is likewise normalized to ``None`` here, with a
+        warning-level log line naming the key and the received type — loud,
+        since nothing upstream of this door has warned about it yet.  This
+        normalization is door-only: the fold's drop-scan and the boot fill
+        call the source directly (never through this door) and keep
+        consuming the failure shape unchanged.
 
-        ``fact_text`` renders raw ``speaker{N}`` tokens verbatim in both
-        render paths (cache-hit via ``entry_fact_text`` + source passthrough).
-        There is no resolver here — every model-facing surface stays in
-        token space; a token is substituted for a display name exactly once,
-        at the reply boundary, by
+        ``fact_text`` renders raw ``speaker{N}`` tokens verbatim — there is
+        no resolver here; a token is substituted for a display name exactly
+        once, at the reply boundary, by
         :func:`~paramem.server.speaker.resolve_speaker_tokens`.
         """
-        import json as _json
+        from paramem.memory.entry import DEFAULT_CONFIDENCE_THRESHOLD
 
-        from paramem.memory.entry import (
-            DEFAULT_CONFIDENCE_THRESHOLD,
-            entry_fact_text,
-            verify_confidence,
-        )
-
-        def _confidence_gate(key: str, entry: dict) -> float | None:
-            """Return the SimHash confidence for *key* against *entry*, or None
-            when no gate applies (replay disabled or key has no fingerprint).
-
-            Called on both cache-hit and source-result branches so the gate is
-            applied at exactly one place regardless of which read path served
-            the entry.  Returns the computed confidence float when the gate
-            applies (which may be below threshold), or ``None`` to signal
-            pass-through (no verification needed — replay-off or no fingerprint).
-
-            The fingerprint is looked up by scanning all registry tiers via
-            :meth:`_tier_for_simhash` so a key whose simhash was stored under
-            a different tier from the one it was requested under (e.g. an
-            interim slot promoted to main) is still verified correctly.
-
-            Invariant: never uses truthiness on registry or sub-dicts —
-            all presence checks use explicit ``in`` / ``is None``."""
-            if not self._replay_enabled:
-                return None
-            owning_simhash_tier = self._tier_for_simhash(key)
-            if owning_simhash_tier is None:
-                # Key has no fingerprint — replay enabled but no hash stored
-                # (e.g. fresh tier before first consolidation).  Pass through.
-                return None
-            # Use the locked accessor self.simhash() instead of raw
-            # self._registry.get() so a concurrent swap cannot rebind
-            # _registry between the _tier_for_simhash call above and the
-            # fingerprint read here.
-            fp = self.simhash(owning_simhash_tier, key)
-            if fp is None:
-                return None
-            # Build the minimal entry shape verify_confidence expects.
-            candidate = {
-                "key": key,
-                "subject": entry.get("subject", ""),
-                "predicate": entry.get("predicate", ""),
-                "object": entry.get("object", ""),
-            }
-            return verify_confidence(candidate, {key: fp})
-
-        def _render(key: str, entry: dict) -> dict | None:
-            # Entries hold SPO only (inference cache contract); no speaker
-            # field is rendered — speaker attribution lives in bookkeeping
-            # (the registry), never in a probe result.
-            #
-            # SimHash confidence gate: when replay is enabled and the key has a
-            # stored fingerprint, compute the real confidence and drop entries
-            # that fall below DEFAULT_CONFIDENCE_THRESHOLD.  This makes the
-            # cache-hit path identical in gate semantics to the source path
-            # (WeightMemorySource / finalize_recalled).  Returns None on fail
-            # so the caller treats the key as a miss — same as source drop.
-            confidence = _confidence_gate(key, entry)
-            if confidence is not None and confidence < DEFAULT_CONFIDENCE_THRESHOLD:
-                logger.debug(
-                    "MemoryStore.probe: cache-hit key %r dropped by confidence gate "
-                    "(%.3f < %.3f threshold)",
-                    key,
-                    confidence,
-                    DEFAULT_CONFIDENCE_THRESHOLD,
-                )
-                return None
-            # Use the computed confidence when the gate applied; fall back to
-            # 1.0 when replay is off or no fingerprint exists (pass-through).
-            rendered_confidence = confidence if confidence is not None else 1.0
-            base = {
-                "key": key,
-                "subject": entry.get("subject", ""),
-                "predicate": entry.get("predicate", ""),
-                "object": entry.get("object", ""),
-            }
-            return {
-                **base,
-                "confidence": rendered_confidence,
-                "fact_text": entry_fact_text(base),
-                "raw_output": _json.dumps(base),
-            }
-
+        source_results = source.probe(keys_by_adapter)
         results: dict[str, dict | None] = {}
-        misses: dict[str, list[str]] = {}
-
-        for tier, keys in keys_by_adapter.items():
+        for _tier, keys in keys_by_adapter.items():
             for key in keys:
-                entry = self.get(key)
-                if entry is None:
-                    misses.setdefault(tier, []).append(key)
+                src = source_results.get(key)
+                if src is None:
+                    results[key] = None
                     continue
-                results[key] = _render(key, entry)
-
-        if misses:
-            if source is None:
-                for tier_keys in misses.values():
-                    for key in tier_keys:
-                        results.setdefault(key, None)
-                return results
-
-            source_results = source.probe(misses)
-            for tier, keys in misses.items():
-                for key in keys:
-                    src = source_results.get(key)
-                    if src is None:
-                        results[key] = None
-                        continue
-                    if not isinstance(src, dict):
-                        results[key] = src
-                        continue
-                    if "failure_reason" in src:
-                        results[key] = src
-                        continue
-                    # SOURCE-RESULT confidence gate — mirrors the cache-hit gate
-                    # so that entries admitted through the source path are also
-                    # confidence-verified against the store's fingerprints before
-                    # being memoized or returned.  This covers the boot-preload
-                    # path where WeightMemorySource is constructed without a
-                    # registry (app.py belt-and-suspenders fix adds one, but the
-                    # store-boundary gate is the hermetic authority).
-                    src_confidence = _confidence_gate(key, src)
-                    if src_confidence is not None and src_confidence < DEFAULT_CONFIDENCE_THRESHOLD:
-                        logger.debug(
-                            "MemoryStore.probe: source-result key %r dropped by "
-                            "confidence gate (%.3f < %.3f threshold)",
-                            key,
-                            src_confidence,
-                            DEFAULT_CONFIDENCE_THRESHOLD,
-                        )
-                        results[key] = None
-                        continue
-                    # Patch the rendered confidence onto the source result so
-                    # callers always see the real score (not a stale 1.0 from
-                    # WeightMemorySource when it ran without a registry).
-                    if src_confidence is not None:
-                        src = dict(src)
-                        src["confidence"] = src_confidence
-                    # No source emits speaker_id (content-only contract, see
-                    # MemorySource docstring), so no denylist strip is needed
-                    # here — the source result passes through as-is.
-                    results[key] = dict(src)
-                    if memoize:
-                        # Stash the raw SPO entry back into the cache (content only).
-                        # Register=False — the registry was established at boot.
-                        raw_entry = {
-                            "key": key,
-                            "subject": src.get("subject", ""),
-                            "predicate": src.get("predicate", ""),
-                            "object": src.get("object", ""),
-                        }
-                        self.put(tier, key, raw_entry, register=False)
-
+                if not isinstance(src, dict):
+                    logger.warning(
+                        "MemoryStore.probe_source: off-contract source result for key %r "
+                        "(%s) -- answering None",
+                        key,
+                        type(src).__name__,
+                    )
+                    results[key] = None
+                    continue
+                if "failure_reason" in src:
+                    # Normalize at the door: a miss or a gate-drop answers
+                    # None for that key, never the source's own differently-
+                    # shaped failure dict.  The source already logged its
+                    # own warning; this is the door-side trace.
+                    logger.debug(
+                        "MemoryStore.probe_source: key %r answers None (source failure: %s)",
+                        key,
+                        src.get("failure_reason"),
+                    )
+                    results[key] = None
+                    continue
+                confidence = self._confidence_gate(key, src)
+                if confidence is None:
+                    logger.debug(
+                        "MemoryStore.probe_source: key %r dropped by confidence gate "
+                        "(no registered fingerprint)",
+                        key,
+                    )
+                    results[key] = None
+                    continue
+                if confidence < DEFAULT_CONFIDENCE_THRESHOLD:
+                    logger.debug(
+                        "MemoryStore.probe_source: key %r dropped by confidence gate "
+                        "(%.3f < %.3f threshold)",
+                        key,
+                        confidence,
+                        DEFAULT_CONFIDENCE_THRESHOLD,
+                    )
+                    results[key] = None
+                    continue
+                # Patch the rendered confidence onto the source result so
+                # callers always see the real score (not a stale 1.0 from
+                # a source that ran without a registry).
+                rendered = dict(src)
+                rendered["confidence"] = confidence
+                results[key] = rendered
         return results
 
     # ------------------------------------------------------------------
@@ -1294,8 +1314,8 @@ class MemoryStore:
         * ``<adapter_dir>/<tier>/indexed_key_registry.json`` for each main tier
           and every ``episodic_interim_<stamp>`` slot.
 
-        The registry file carries the unified simhash map (active∪stale
-        fingerprints) in the ``"simhash"`` key.
+        The registry file carries the tier's one fingerprint map — active
+        keys only — in the ``"simhash"`` key.
 
         Entry payloads (subject/predicate/object/speaker_id) are NOT loaded
         here — that is the responsibility of the mode-specific
@@ -1332,10 +1352,11 @@ class MemoryStore:
         the fingerprint-file shape is known in exactly one place — the same
         leaf the trial-consolidation gates use on a single path.
 
-        The map carries the active∪stale fingerprint superset, exactly as
-        serialised under the ``"simhash"`` key of each registry file.  When a
-        key appears in more than one tier file (transient during promotion) the
-        later read wins — the fingerprint content is identical either way.
+        The map carries each tier's one fingerprint map — active keys only —
+        exactly as serialised under the ``"simhash"`` key of each registry
+        file.  When a key appears in more than one tier file (transient
+        during promotion) the later read wins — the fingerprint content is
+        identical either way.
 
         Args:
             adapter_dir: Path to the adapter root directory.
@@ -1403,8 +1424,8 @@ class MemoryStore:
         * ``<adapter_dir>/<tier>/indexed_key_registry.json`` for each main tier
           and every ``episodic_interim_<stamp>`` slot.
 
-        The registry file now carries the unified simhash map (active∪stale
-        fingerprints) in the ``"simhash"`` key.  The separate
+        The registry file now carries the tier's one fingerprint map — active
+        keys only — in the ``"simhash"`` key.  The separate
         ``simhash_registry.json`` file is no longer read — it has been
         eliminated.
 
@@ -1413,29 +1434,35 @@ class MemoryStore:
         :class:`paramem.memory.source.MemorySource` (weight probe in
         train mode; encrypted graph.json read in simulate mode).
 
-        No-op when the store has ``replay_enabled=False`` (registries are not
-        tracked).
-
         Delegates disk reads to :meth:`read_registries_from_disk` — batch,
         all-or-nothing, no per-tier verification (see that method's
         docstring for the callers this is and is not for).
         """
-        if not self._replay_enabled:
-            return
-
         registries = MemoryStore.read_registries_from_disk(adapter_dir)
         for tier, reg in registries.items():
             self.load_registry(tier, reg)
 
-    def load_bookkeeping_from_disk(self, key_metadata_path) -> dict:
-        """Load per-key bookkeeping into ``_bookkeeping`` from ``key_metadata.json``.
+    def load_bookkeeping_from_disk(self, adapter_dir) -> dict:
+        """Load per-key bookkeeping into ``_bookkeeping`` from every tier's
+        ``key_metadata.json``.
 
-        Sole boot loader for the per-key bookkeeping section of
-        ``key_metadata.json``.  Runs unconditionally at lifespan boot (after
-        ``load_registries_from_disk``) via ``app.py:4449`` — entry-independent,
-        so it no longer requires entries to already exist.  Under
+        Sole boot loader for the per-key bookkeeping rows.  Walks
+        :func:`~paramem.memory.interim_adapter.iter_tier_roots` (main tiers,
+        then interim slots) and reads ``<tier_root>/key_metadata.json`` where
+        present.  Runs unconditionally at lifespan boot (after
+        ``load_registries_from_disk``) — entry-independent, so it no longer
+        requires entries to already exist.  Under
         ``inference.preload_cache=False`` this is the ONLY write to provenance
         state at boot, and is sufficient for the router's speaker index.
+
+        Conflict rule (stated once, applied here): when a key's row appears
+        in more than one tier's file — a stale leftover from a tier the key
+        no longer belongs to — the row from the tier whose registry CURRENTLY
+        owns the key (:meth:`tier_for_known_key`) wins.  Under the
+        single-tier-ownership invariant a key is owned by exactly one tier's
+        registry at a time, so exactly one tier's file can match; the walk
+        order :meth:`tier_for_known_key` uses is irrelevant to the outcome,
+        not load-bearing.
 
         Populates ``_bookkeeping`` only (via :meth:`set_bookkeeping`).  DOES
         NOT touch ``_entries`` — the old ``setdefault_entry`` parasitic write
@@ -1443,61 +1470,74 @@ class MemoryStore:
         presence MUST NOT manufacture a content cache hit.
 
         Each persisted record is splatted whole into :meth:`set_bookkeeping`
-        (``self.set_bookkeeping(key, **key_meta, allow_empty_speaker=True)``).
-        The write side (``ConsolidationLoop.write_key_metadata``) persists ``dict(bk)`` from
-        :meth:`bookkeeping_for_key` verbatim, so the on-disk record always
-        carries exactly the fields :meth:`set_bookkeeping` requires — there
-        is no hand-listed field projection or legacy-fill tolerance on either
-        side.  No backward compatibility: a record missing a mandatory field
-        (or carrying an unexpected one) raises ``TypeError`` from the splat,
-        not a silent default fill.  The deploy procedure for an incompatible
-        on-disk shape is to start fresh (wipe adapters and registry).
+        (``self.set_bookkeeping(key, **key_meta)`` — no
+        ``allow_empty_speaker``; a persisted row with an empty ``speaker_id``
+        fails :meth:`set_bookkeeping`'s guard here exactly as it would at
+        mint time).  The write side (the per-tier commit primitive,
+        :func:`~paramem.memory.persistence.commit_tier_slot`) persists
+        ``dict(bk)`` from :meth:`bookkeeping_for_key` verbatim, so the
+        on-disk record always carries exactly the fields
+        :meth:`set_bookkeeping` requires — there is no hand-listed field
+        projection or legacy-fill tolerance on either side.  No backward
+        compatibility: a record missing a mandatory field (or carrying an
+        unexpected one) raises ``TypeError`` from the splat, not a silent
+        default fill.  The deploy procedure for an incompatible on-disk shape
+        is to start fresh (wipe adapters and registry).
+
+        A tier whose registry (already loaded by the preceding
+        ``load_registries_from_disk`` call) reports known keys (active ∪
+        stale) but has NO ``key_metadata.json`` at all is a violation of the
+        every-known-key-has-a-row invariant, raised via
+        :func:`raise_bookkeeping_invariant_violation` naming the tier and its
+        known keys — never tolerated, never silently continued past.  A tier
+        with a registry and ZERO known keys and no row file is the ordinary
+        empty case, not a violation.
 
         Keys absent from every tier registry (orphans — slot wiped or never
         existed) are skipped but counted in the return dict.
 
         Returns ``{loaded, orphaned}`` for ``/status`` and diagnostics.
-        Missing file → all zeros, no-op (fresh install).
+        No per-tier files found → all zeros, no-op (fresh install).
+
+        Raises:
+            BookkeepingInvariantViolation: A tier's registry has known keys
+                but no ``key_metadata.json`` file exists to bookkeep them.
         """
+        import json
         from pathlib import Path
 
-        path = Path(key_metadata_path)
-        if not path.exists():
-            return {"loaded": 0, "orphaned": 0}
-
-        import json
-
         from paramem.backup.encryption import read_maybe_encrypted
+        from paramem.memory.interim_adapter import iter_tier_roots
 
-        metadata = json.loads(read_maybe_encrypted(path).decode("utf-8"))
         loaded = 0
         orphaned = 0
-        for key, key_meta in metadata.get("keys", {}).items():
-            tier = self.tier_for_known_key(key)
-            if tier is None:
-                orphaned += 1
-                continue
-            self.set_bookkeeping(key, **key_meta, allow_empty_speaker=True)
-            loaded += 1
-        return {"loaded": loaded, "orphaned": orphaned}
-
-    # ------------------------------------------------------------------
-    # Diagnostic helpers
-    # ------------------------------------------------------------------
-    def stats(self) -> dict:
-        """Per-tier ``{key_count, simhash_count, registry_active}`` map."""
-        with self._lock:
-            out: dict[str, dict] = {}
-            for tier in self._entries:
-                out.setdefault(tier, {})["key_count"] = len(self._entries[tier])
-            for tier, reg in self._registry.items():
-                known = reg._known_simhashes()
+        seen_orphan_keys: set[str] = set()
+        for tier_name, tier_root in iter_tier_roots(Path(adapter_dir)):
+            path = tier_root / "key_metadata.json"
+            if not path.exists():
+                known = self.registry(tier_name).list_known()
                 if known:
-                    out.setdefault(tier, {})["simhash_count"] = len(known)
-                active = len(reg.list_active())
-                if self._replay_enabled:
-                    out.setdefault(tier, {})["registry_active"] = active
-            return out
+                    raise_bookkeeping_invariant_violation(
+                        tier_name, known, "boot bookkeeping load: key_metadata.json missing"
+                    )
+                continue
+            metadata = json.loads(read_maybe_encrypted(path).decode("utf-8"))
+            for key, key_meta in metadata.get("keys", {}).items():
+                owner = self.tier_for_known_key(key)
+                if owner is None:
+                    if key not in seen_orphan_keys:
+                        orphaned += 1
+                        seen_orphan_keys.add(key)
+                    continue
+                if owner != tier_name:
+                    # Not the current owner's row — a stale leftover from a
+                    # tier the key has since moved off of.  Skip it; the
+                    # owning tier's own file (walked separately, in any
+                    # order) carries the authoritative row.
+                    continue
+                self.set_bookkeeping(key, **key_meta)
+                loaded += 1
+        return {"loaded": loaded, "orphaned": orphaned}
 
     def swap(
         self,
@@ -1507,10 +1547,13 @@ class MemoryStore:
     ) -> None:
         """Atomically rebind all three mutable structures in a single locked operation.
 
-        This is the atomic-publish primitive for phase-2 consolidation.
-        Callers build the three new structures entirely off-store, then call
-        ``swap`` to publish them in one locked rebind.  No reader ever observes
-        a torn or half-rebuilt state across ``_entries``, ``_registry``, and
+        This is the boot-hydration primitive: the lifespan hydration path
+        (and the quarantine-lift retry that re-runs the identical hydration
+        without a restart) builds ``new_entries``/``new_registry``/
+        ``new_bookkeeping`` entirely off-store (disk reads, weight probes,
+        verification) and calls ``swap`` once to publish the result, never
+        clearing the live store first.  No reader ever observes a torn or
+        half-rebuilt state across ``_entries``, ``_registry``, and
         ``_bookkeeping``.
 
         Args:
@@ -1530,3 +1573,126 @@ class MemoryStore:
             self._entries = new_entries
             self._registry = new_registry
             self._bookkeeping = new_bookkeeping
+
+    def adopt_increments(
+        self, increments: "Sequence[TierIncrement]", *, absorbed_tiers: "Sequence[str]" = ()
+    ) -> None:
+        """Take a written bundle live: converge each member tier onto its increment.
+
+        Adoption refreshes the mirror and validates NOTHING against it: a
+        rebuilt member's entries land in ``_entries`` from the increment's
+        own keyed list; a rows-only member carries no entries and changes
+        none.  The live cache is never read here — go-live's correctness
+        lives in the authoritative published artifacts (``registry_bytes``
+        / ``rows_bytes``), not in what the mirror happened to hold going in.
+
+        The one completeness check this method still runs is
+        INCREMENT-INTERNAL: :func:`~paramem.memory.increment.build_tier_increment`
+        reads a rebuilt member's ``indexed_key_registry.json`` and
+        ``keyed.json`` as two independent files, so a gap between what the
+        registry calls active and what the keyed list actually produced is a
+        genuine cross-artifact divergence within that ONE increment — not a
+        claim about the live store.  Checked BEFORE any mutation runs, so the
+        check either passes with the store exactly as it is about to become,
+        or raises with the store exactly as it already was — never a
+        postcondition caught only after the store has already been mutated.
+
+        ONE lock acquisition for the whole bundle AND the absorbed ring
+        together, in three passes — check, drop, install:
+
+        0. **Check.** For every REBUILT member, confirm every key its own
+           registry calls active is in its own ``increment.entries``.  A
+           violation raises
+           :class:`~paramem.memory.store.EntryCacheInvariantViolation` via
+           :func:`raise_entry_cache_invariant_violation` before the drop
+           pass below runs, so the store is left byte-for-byte as it was.  A
+           rows-only member has nothing of its own to check here (its
+           entries are empty by design) and the live store's existing
+           ``_entries`` bucket for that tier is never read.  The same pass
+           also confirms bookkeeping completeness: every key in the
+           increment's OWN ``registry.list_known()`` (active ∪ stale —
+           rows-only members included) must appear in
+           ``increment.bookkeeping``.  A gap raises
+           :class:`~paramem.memory.store.BookkeepingInvariantViolation` via
+           :func:`raise_bookkeeping_invariant_violation`, before any
+           mutation, same as the entry-cache check above.
+        1. **Drop.** For every member tier, read its OUTGOING registry's
+           ``list_known()`` (active ∪ stale) BEFORE any rebind, and drop
+           every one of those keys' bookkeeping rows.  Same for every
+           *absorbed_tiers* member: its own ``list_known()``, read before its
+           registry is dropped, drops its bookkeeping rows too — a key that
+           lived ONLY in an absorbed interim slot (never routed into any
+           primary tier's increment; a genuine reap casualty) would otherwise
+           leave an orphan bookkeeping row with no registry membership
+           anywhere, forever (nothing else ever revisits it).  The full drop
+           set is computed and applied for the WHOLE call before any install
+           — bookkeeping is a flat ``key -> row`` dict with no tier index, so
+           installing tier A's row before dropping tier B's outgoing set
+           could otherwise delete a key that just moved from B into A (a
+           promotion, or an adopted interim key) the moment B's drop ran.
+        2. **Install.** For every member tier: rebind ``self._registry[tier]``
+           to the increment's registry object; when ``increment.rebuilt``,
+           rebind ``self._entries[tier]`` to the increment's entries
+           (untouched for a rows-only member); install every row in
+           ``increment.bookkeeping``.  Then drop each *absorbed_tiers*
+           member's own ``_registry``/``_entries`` buckets whole (the former
+           ``MemoryStore.drop_registry_and_entries`` primitive, now inlined
+           here so the ring reap converges in the SAME locked act as the
+           bundle's own install — no window in which a reader can observe a
+           key active in both the bundle's destination tier and the
+           not-yet-reaped interim tier it moved out of).
+
+        A retired key is gone by absence: it is not in the increment's
+        registry, entries, or bookkeeping, so after convergence the store
+        does not hold it — there is no separate deletion step.
+
+        Args:
+            increments: The bundle's written increments — every member goes
+                live together. Order is irrelevant here (unlike the on-disk
+                publish, which is destination-first for a promotion bundle);
+                this method only rebinds RAM state.
+            absorbed_tiers: Interim tier names this bundle's go-live reaps
+                whole (a full fold's ring absorption) — every key any of
+                them still owns at this point was never routed into a
+                primary tier's increment while the event was staging, so it is a
+                genuine reap casualty, not a live fact losing its home.
+                Empty for every other call, including every interim event's
+                own go-live.
+        """
+        with self._lock:
+            # --- 0. Check: every member, before any mutation ---
+            for inc in increments:
+                if inc.rebuilt:
+                    missing = [k for k in inc.registry.list_active() if k not in inc.entries]
+                    if missing:
+                        raise_entry_cache_invariant_violation(inc.tier, missing, "adopt_increments")
+                missing_rows = [k for k in inc.registry.list_known() if k not in inc.bookkeeping]
+                if missing_rows:
+                    raise_bookkeeping_invariant_violation(
+                        inc.tier, missing_rows, "adopt_increments bookkeeping completeness"
+                    )
+
+            # --- 1. Drop ---
+            drop_keys: set[str] = set()
+            for inc in increments:
+                outgoing = self._registry.get(inc.tier)
+                if outgoing is not None:
+                    drop_keys.update(outgoing.list_known())
+            for tier in absorbed_tiers:
+                outgoing = self._registry.get(tier)
+                if outgoing is not None:
+                    drop_keys.update(outgoing.list_known())
+            for key in drop_keys:
+                self._bookkeeping.pop(key, None)
+
+            # --- 2. Install ---
+            for inc in increments:
+                self._registry[inc.tier] = inc.registry
+                if inc.rebuilt:
+                    self._entries[inc.tier] = dict(inc.entries)
+                for key, row in inc.bookkeeping.items():
+                    self._bookkeeping[key] = dict(row)
+
+            for tier in absorbed_tiers:
+                self._entries.pop(tier, None)
+                self._registry.pop(tier, None)

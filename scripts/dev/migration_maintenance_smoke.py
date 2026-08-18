@@ -90,6 +90,7 @@ from paramem.server.trial_state import (  # noqa: E402
     TrialMarker,
     write_trial_marker,
 )
+from paramem.training.stage_ledger import data_state_dir  # noqa: E402
 from paramem.utils.vram_guard import safe_empty_cache  # noqa: E402
 
 logging.basicConfig(
@@ -443,14 +444,13 @@ def _seed_cycle(model: Any, tokenizer: Any, config: Any) -> dict:
     from paramem.memory.store import MemoryStore
     from paramem.server.consolidation import create_consolidation_loop
 
-    # Build a minimal _state for the seed cycle.  MemoryStore takes a single
-    # keyword-only ``replay_enabled`` flag (paramem/memory/store.py:62) — NOT a
-    # path.  ``create_consolidation_loop`` requires a store (it forwards it to
-    # ConsolidationLoop), so the seed cycle DOES need one; but it starts empty
-    # (the cycle populates it), so no ``load_registries_from_disk`` here — that
-    # is a boot/apply concern, mirrored later in the apply path.  Match the
-    # server's construction at app.py:3123.
-    memory_store = MemoryStore(replay_enabled=config.consolidation.indexed_key_replay)
+    # Build a minimal _state for the seed cycle.  ``create_consolidation_loop``
+    # requires a store (it forwards it to ConsolidationLoop), so the seed
+    # cycle DOES need one; but it starts empty (the cycle populates it), so no
+    # ``load_registries_from_disk`` here — that is a boot/apply concern,
+    # mirrored later in the apply path.  Match the server's construction at
+    # app.py:3123.
+    memory_store = MemoryStore()
     session_buffer = SessionBuffer(
         session_dir=config.paths.sessions,
         retain_sessions=config.consolidation.retain_sessions,
@@ -501,31 +501,26 @@ def _seed_cycle(model: Any, tokenizer: Any, config: Any) -> dict:
 def _registry_key_count(config: Any) -> int:
     """Return the number of indexed keys in the sandbox registry.
 
-    Reads ``key_metadata.json`` (written by
-    ``ConsolidationLoop.write_key_metadata``) from
-    ``config.key_metadata_path``.  The on-disk schema is
-    ``{"cycle_count", "promoted_keys", "keys": {<key>: {...}}}`` — the indexed
-    key count is ``len(data["keys"])``, NOT ``len(data)`` (which is the number
-    of top-level metadata fields).  ``read_maybe_encrypted`` returns bytes;
-    ``json.loads`` accepts them directly.  Returns 0 when the file is absent or
-    unreadable.
+    Hydrates a throwaway :class:`~paramem.memory.store.MemoryStore` via
+    :meth:`~paramem.memory.store.MemoryStore.load_registries_from_disk` then
+    :meth:`~paramem.memory.store.MemoryStore.load_bookkeeping_from_disk` —
+    the same per-tier walk (main tiers, then interim slots) boot seeding
+    uses, and the ONE canonical implementation of the cross-tier key-
+    ownership conflict rule (a key's row is attributed to whichever tier's
+    registry currently owns it).  The indexed key count is the number of
+    bookkeeping rows the store ends up with.  Returns 0 when no tier has a
+    file, or on any read failure.
     """
-    from paramem.backup.encryption import read_maybe_encrypted
+    from paramem.memory.store import MemoryStore
 
-    # config.key_metadata_path is <data>/registry/key_metadata.json — the exact
-    # path write_key_metadata writes (config.py:393).
-    key_metadata_path = config.key_metadata_path
-    if not key_metadata_path.exists():
-        return 0
     try:
-        raw = read_maybe_encrypted(key_metadata_path)
-        data = json.loads(raw)
-        if not isinstance(data, dict):
-            return 0
-        return len(data.get("keys", {}))
+        store = MemoryStore()
+        store.load_registries_from_disk(config.adapter_dir)
+        store.load_bookkeeping_from_disk(config.adapter_dir)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Could not read registry key count: %s", exc)
         return 0
+    return sum(1 for _ in store.iter_bookkeeping())
 
 
 # ---------------------------------------------------------------------------
@@ -577,16 +572,18 @@ def _seed_trial_state(
     from paramem.server.migration import TrialStash, initial_migration_state
 
     data_dir = config.paths.data
-    state_dir = (data_dir / "state").resolve()
+    state_dir = data_state_dir(data_dir).resolve()
     state_dir.mkdir(parents=True, exist_ok=True)
     backups_root = (data_dir / "backups").resolve()
 
-    # Trial adapter + graph dirs.
-    trial_adapter_dir = state_dir / "trial_adapter"
-    trial_adapter_dir.mkdir(exist_ok=True)
+    # Trial adapter + graph dirs, mirroring the production trial root layout
+    # (<data>/state/trial/{adapters,graph}).
+    trial_root = state_dir / "trial"
+    trial_adapter_dir = trial_root / "adapters"
+    trial_adapter_dir.mkdir(parents=True, exist_ok=True)
     (trial_adapter_dir / "adapter_config.json").write_text("{}", encoding="utf-8")
-    trial_graph_dir = state_dir / "trial_graph"
-    trial_graph_dir.mkdir(exist_ok=True)
+    trial_graph_dir = trial_root / "graph"
+    trial_graph_dir.mkdir(parents=True, exist_ok=True)
 
     # Config A backup slot.
     live_config_path = tmp_root / "server.yaml"
@@ -706,14 +703,14 @@ def _drive_apply_and_probe(
     live_config_path.write_bytes(live_yaml_bytes)
 
     # Build a MemoryStore mirroring the server's boot construction
-    # (app.py:3123): keyword-only ``replay_enabled`` flag, then hydrate
-    # registries from the sandbox adapter dir.  ``_apply_config_live`` ->
-    # ``_live_reload_base_model`` -> ``_build_config_derived_state`` REPLACES
-    # ``_state["memory_store"]`` with a freshly-probed store (the apply path sets
-    # ``_apply_config_in_progress=True`` so the D6 re-probe gate fires), so this
-    # instance is the pre-apply store; hydrating it here keeps the early-return
-    # carve paths from observing an empty store.
-    memory_store = MemoryStore(replay_enabled=config.consolidation.indexed_key_replay)
+    # (app.py:3123), then hydrate registries from the sandbox adapter dir.
+    # ``_apply_config_live`` -> ``_live_reload_base_model`` ->
+    # ``_build_runtime_components`` REPLACES ``_state["memory_store"]`` with
+    # a freshly-probed store (the apply path sets
+    # ``_apply_config_in_progress=True`` so the memory-store re-probe gate
+    # fires), so this instance is the pre-apply store; hydrating it here
+    # keeps the early-return carve paths from observing an empty store.
+    memory_store = MemoryStore()
     memory_store.load_registries_from_disk(config.adapter_dir)
 
     # Build a session buffer pointing at the tmp sessions dir.
@@ -752,7 +749,7 @@ def _drive_apply_and_probe(
         "migration": initial_migration_state(),
         "migration_lock": asyncio.Lock(),
         "_apply_config_in_progress": False,
-        "boot_degraded": None,
+        "store_preload_complete": True,
         "server_started_at": "2026-03-10T00:00:00+00:00",
     }
 

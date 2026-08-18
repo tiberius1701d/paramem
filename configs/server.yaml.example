@@ -79,7 +79,7 @@ debug: false  # ship-safe default — true writes plaintext fact copies to data/
 
 # --- Paths (mount points) ---
 paths:
-  data: data/ha                 # persistent artifacts (adapters, registry, key_metadata)
+  data: data/ha                 # persistent artifacts (per-tier adapter registry + key_metadata under adapters/<tier>/)
   sessions: data/ha/sessions    # conversation transcripts pending consolidation
   debug: data/ha/debug          # cycle snapshots, diagnostic output (only when debug=true)
   prompts: configs/prompts      # extraction prompt templates
@@ -114,19 +114,21 @@ adapters:
     target_modules: ["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
     dropout: 0.0
 
-# EDITING rank / alpha / target_modules ON A LIVE STORE — a routine
-# (non-RECONCILE) fold trains warm: it keeps a resident tier's existing
-# weights rather than recreating the adapter. `ensure_adapter_matching`
-# (paramem/models/loader.py) compares these three SHAPE-relevant fields
-# against the resident adapter on every fold and recreates cold on a
-# mismatch, so a rank/alpha/target_modules edit here takes effect on the
-# NEXT fold automatically. `dropout` is NOT one of the three: it changes
-# training regularization, not tensor shape, so `ensure_adapter_matching`
-# never compares it — a warm-kept resident adapter keeps whatever dropout
-# it was created with. An edit to `dropout` here therefore takes effect
-# only the next time the adapter is actually (re)created (RECONCILE, first
-# boot, or a rank/alpha/target_modules mismatch), never on a routine
-# warm-kept fold.
+# EDITING rank / alpha / target_modules ON A LIVE STORE — every fold (an
+# ordinary full fold and the `/reconsolidate` reconcile door alike) trains
+# warm: it keeps a resident tier's existing weights rather than recreating
+# the adapter. `ensure_adapter_matching` (paramem/models/loader.py) compares
+# these three SHAPE-relevant fields against the resident adapter on every
+# fold and recreates it cold ONLY on a mismatch, so a rank/alpha/
+# target_modules edit here takes effect on the NEXT fold automatically.
+# `dropout` is NOT one of the three: it changes training regularization, not
+# tensor shape, so `ensure_adapter_matching` never compares it — a
+# warm-kept resident adapter keeps whatever dropout it was created with. An
+# edit to `dropout` here therefore takes effect only the next time the
+# adapter is actually (re)created — first boot, or a rank/alpha/
+# target_modules mismatch — never on a routine warm-kept fold, and running
+# `/reconsolidate` does not by itself recreate the adapter or apply a
+# dropout edit.
 
 # ============================================================================
 # CONSOLIDATION — MEMORY TIER LIFECYCLE
@@ -223,18 +225,16 @@ consolidation:
   refresh_cadence: "12h"       # "every Nh" / "every Nm" / "HH:MM" / "daily" / "" (manual)
                                # 12h + max_interim_count=7 → full cycle every 84h (derived).
                                # At max_interim_count=0: full cycle every refresh_cadence itself.
-  mode: train                  # "train" persists to LoRA weights; "simulate" persists graph.json under adapter_dir/<tier>/ (no weight training)
+  mode: train                  # "train" writes LoRA weights into the tier's slot; "simulate" writes graph.json into the tier's slot (no weight training)
                                # Closed vocabulary: any other value is rejected at config load.
                                # "simulate" + max_interim_count: 0 is also rejected (no training venue at all).
   promotion_threshold: 3       # reinforcement_count threshold for key promotion to semantic
   retain_sessions: true        # archive transcripts after consolidation (false = delete)
-  indexed_key_replay: true     # indexed key training mechanism
   decay_window: 10             # cycles before unreinforced keys decay
   refinement_enrichment: "off"  # graph-stage cloud enrichment pass, full-fold only. off|on. Requires the top-level `cloud.enabled: true` master switch to fire. Same cloud-egress risk described there — this is the flag that actually triggers the graph-content cloud call.
   refinement_normalization: "on"  # full-fold predicate-synonym collapse (one model call per candidate (s,o) group). off|on.
   refinement_contradiction: "off"  # Case-2 recency-backed contradiction: freshest last_seen wins; empty/tied → coexist. Applied at ingest, interim, and fold. off|on.
-  recall_sanity_threshold: 1.0  # minimum recall fraction (0, 1] for all recall gates; 1.0 = sharp (all keys must be recalled)
-  consolidation_retry_cap: 3    # cycles a session stays pending on recall-gate failure before being released; ABORT/CAP_PENDING do not count
+  recall_sanity_threshold: 1.0  # minimum recall fraction (0, 1] for the simulate->train active-store migration's recall gate; 1.0 = sharp (all keys must be recalled). Fold gates require exact recall and do not read this.
   # Per-fold training-budget derivation (standard mechanism, unconditional --
   # validated via Test 20). epochs/gradient-accumulation/lr_decay_steps are
   # ALWAYS derived from the fold's key-triple count at the training funnel
@@ -898,19 +898,22 @@ process:
 # ============================================================================
 # Inference path
 # ============================================================================
-# preload_cache: at boot, populate the lifespan-owned MemoryStore by
-# probing every active key through the mode-appropriate MemorySource
-# (WeightMemorySource in train mode, DiskMemorySource in simulate mode).
-# Inference then serves cache hits in O(1) and delegates to the source
-# only on miss.
+# preload_cache: selects, once, which of the two serving read doors every
+# query uses — never layered, no cache-check-then-probe, no on-miss
+# fallback.
 #
-# true  → fast: O(N) cache lookups per query + one model.generate for
-#         reasoning, regardless of how many keys the speaker owns.
-# false → keep the cache empty; every miss pays the source latency
-#         (weight probe is ~0.3 s/key on Mistral 7B Q4, unverified;
-#         disk read is faster).  Switching off works — it just adds
-#         latency on probing.  This is a temporary toggle while
-#         per-key probing is slow.
+# true  → the cache door: an opt-in latency shortcut over the RAM entry
+#         mirror populated at boot (O(N) lookups + one model.generate for
+#         reasoning, regardless of how many keys the speaker owns).  The
+#         mirror is non-authoritative — kept warm by the boot fill and by
+#         each fold's own go-live, never validated for completeness.
+# false → the live door: every query probes the mode-appropriate
+#         MemorySource directly (WeightMemorySource in train mode,
+#         DiskMemorySource in simulate mode) at its real per-key latency
+#         (the weight probe pays one generate per key, so it is far slower
+#         than cache serving; the disk read is faster).  The mirror is
+#         neither read nor written on this path.  This is a temporary
+#         toggle while per-key probing is slow.
 inference:
   preload_cache: true
   max_response_tokens: 512   # ceiling on tokens generated per local conversational reply; sized so a worst-case reply still returns inside the 30s Home Assistant conversation timeout. A reply that reaches the ceiling is trimmed to its last complete sentence rather than delivered mid-word. See DEPLOYMENT.md's inference section for the full derivation.
@@ -997,8 +1000,10 @@ vram:
 # consolidation.refresh_cadence. "off" disables the scheduled backup timer
 # (manual backups via the CLI still work).
 #
-# artifacts: subset of [config, graph, registry]. Each element becomes a
-# slot directory under data/ha/backups/<artifact>/<ts>/.
+# artifacts: subset of [snapshot_bundle, config, graph]. Each element becomes
+# a slot directory under data/ha/backups/<artifact>/<ts>/. snapshot_bundle is
+# the one comprehensive, restorable artifact and the default; config/graph
+# are independently selectable extras.
 #
 # max_total_disk_gb: global cap. The retention engine enforces rules 2+3+4+5
 # against this; rule 1 (write refusal once the store is at/over cap) is
@@ -1022,5 +1027,5 @@ security:
 #       trial_adapter: { keep: 5 }
 #       manual:        { keep: "unlimited", max_disk_gb: 5 }
 #     schedule: "daily 04:00"
-#     artifacts: [config, graph, registry]
+#     artifacts: [snapshot_bundle]
 #     max_total_disk_gb: 20

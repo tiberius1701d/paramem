@@ -161,6 +161,132 @@ class TestResolve:
 
 
 # ---------------------------------------------------------------------------
+# Locked hooks (fields_for_existing / skip_if) — decide-under-the-lock,
+# no separate pre-lock read that could race a concurrent writer.
+# ---------------------------------------------------------------------------
+
+
+class TestRecordIncidentFieldsForExisting:
+    def test_fields_for_existing_overrides_literal_arguments(self, tmp_path):
+        """When given, fields_for_existing's return value replaces the
+        literal severity/summary/detail for that write."""
+        record_incident(
+            tmp_path,
+            type="tier_registry_unverified",
+            key="episodic",
+            severity="ignored",
+            summary="ignored",
+            detail={"ignored": True},
+            fields_for_existing=lambda existing: (
+                "failed",
+                "computed summary",
+                {"status": "payload_mismatch"},
+            ),
+        )
+        inc = read_incidents(tmp_path)[0]
+        assert inc.severity == "failed"
+        assert inc.summary == "computed summary"
+        assert inc.detail == {"status": "payload_mismatch"}
+
+    def test_fields_for_existing_receives_none_when_no_prior_row(self, tmp_path):
+        """First write for an id — the callback observes existing=None."""
+        seen: list = []
+
+        def _fields(existing):
+            seen.append(existing)
+            return "failed", "s", {}
+
+        record_incident(
+            tmp_path,
+            type="tier_registry_unverified",
+            key="episodic",
+            severity="failed",
+            summary="s",
+            detail={},
+            fields_for_existing=_fields,
+        )
+        assert seen == [None]
+
+    def test_fields_for_existing_receives_the_current_row_on_a_bump(self, tmp_path):
+        """A second write for the same id observes the row as it stood on
+        disk BEFORE this write — the sticky-marker read the caller needs."""
+        record_incident(
+            tmp_path,
+            type="tier_registry_unverified",
+            key="episodic",
+            severity="failed",
+            summary="first",
+            detail={"status": "payload_mismatch"},
+        )
+        seen: list = []
+
+        def _fields(existing):
+            seen.append(existing)
+            return "failed", "second", {"status": "payload_mismatch"}
+
+        record_incident(
+            tmp_path,
+            type="tier_registry_unverified",
+            key="episodic",
+            severity="failed",
+            summary="second (literal, overridden)",
+            detail={"status": "key_count_mismatch"},
+            fields_for_existing=_fields,
+        )
+        assert len(seen) == 1
+        assert seen[0]["detail"] == {"status": "payload_mismatch"}
+        inc = read_incidents(tmp_path)[0]
+        assert inc.detail == {"status": "payload_mismatch"}
+        assert inc.summary == "second"
+
+
+class TestResolveIncidentSkipIf:
+    def test_skip_if_true_leaves_the_row_untouched_and_returns_false(self, tmp_path):
+        """A veto from skip_if leaves the row exactly as it was and reports
+        no transition occurred."""
+        _record(tmp_path)
+        ok = resolve_incident(tmp_path, "vram_exhausted", "phase1", skip_if=lambda row: True)
+        assert ok is False
+        inc = read_incidents(tmp_path)[0]
+        assert inc.status == "active"
+
+    def test_skip_if_false_resolves_normally(self, tmp_path):
+        """skip_if returning False does not block the ordinary resolve."""
+        _record(tmp_path)
+        ok = resolve_incident(tmp_path, "vram_exhausted", "phase1", skip_if=lambda row: False)
+        assert ok is True
+        inc = read_incidents(tmp_path)[0]
+        assert inc.status == "resolved"
+
+    def test_skip_if_is_not_called_when_no_matching_incident_exists(self, tmp_path):
+        """No row for this (type, key) at all -- skip_if is never invoked,
+        and the call is the ordinary no-match no-op."""
+        calls: list = []
+
+        def _skip_if(row):
+            calls.append(row)
+            return False
+
+        ok = resolve_incident(tmp_path, "vram_exhausted", "nonexistent", skip_if=_skip_if)
+        assert ok is False
+        assert calls == []
+
+    def test_skip_if_receives_the_current_raw_row(self, tmp_path):
+        """skip_if is handed the row as it stands under the lock, so a
+        caller can inspect its detail without a separate pre-lock read."""
+        _record(tmp_path, detail={"status": "payload_mismatch"})
+        seen: list = []
+
+        def _skip_if(row):
+            seen.append(row)
+            return False
+
+        resolve_incident(tmp_path, "vram_exhausted", "phase1", skip_if=_skip_if)
+        assert len(seen) == 1
+        assert seen[0]["detail"] == {"status": "payload_mismatch"}
+
+
+# ---------------------------------------------------------------------------
 # resolved_reason
 # ---------------------------------------------------------------------------
 

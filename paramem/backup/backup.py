@@ -51,10 +51,7 @@ from paramem.backup.encryption import (
     envelope_encrypt_bytes,
     read_maybe_encrypted,
 )
-from paramem.backup.hashing import (
-    content_sha256_bytes,
-    plaintext_sha256,
-)
+from paramem.backup.hashing import content_sha256_bytes
 from paramem.backup.meta import read_meta, verify_fingerprint, write_meta
 from paramem.backup.types import (
     BUNDLE_SCHEMA_VERSION,
@@ -75,7 +72,11 @@ if TYPE_CHECKING:
 
 # iter_interim_dirs is imported at module level (no cycle: interim_adapter
 # does not import from paramem.backup.backup).
-from paramem.memory.interim_adapter import INTERIM_NAME_PREFIX, iter_interim_dirs
+from paramem.memory.interim_adapter import (
+    INTERIM_NAME_PREFIX,
+    has_unbound_payload,
+    iter_interim_dirs,
+)
 from paramem.training.donor import DONOR_STORE_PREFIX, iter_donor_stores
 
 # The durable files a slot directory can hold — ONE list, read by both
@@ -89,11 +90,30 @@ from paramem.training.donor import DONOR_STORE_PREFIX, iter_donor_stores
 # slots and carries the recipe/seed/triples/weights-digest that
 # paramem.training.donor.donor_checkpoint_valid needs — a donor restored
 # without it validates as invalid and is rebuilt at 37-45 min of GPU.
+# graph.json is the simulate venue's payload file — written inside the same
+# timestamped slot a train payload occupies (paramem.adapters.slot.write_slot),
+# never at the tier root, so it is a SLOT file like the other four here.
 SLOT_DURABLE_FILES: tuple[str, ...] = (
     "adapter_model.safetensors",
     "adapter_config.json",
     "meta.json",
     "donor_meta.json",
+    "graph.json",
+)
+
+# The tier-root file set — files written directly at <adapter_dir>/<tier>/
+# (main tier) or <adapter_dir>/episodic/interim_<stamp>/ (interim family),
+# never inside a timestamped slot.  Registry last: the same commit-signal
+# ordering every per-tier writer (commit_tier_slot, publish_tier_registry,
+# this module's own restore write loop) shares.  THE one definition for the
+# whole module — consumed by the restore write loop and both clean-slate-
+# sweep keep-lists, so a filename can never be claimed by two of those three
+# sites, or dropped from one without the others noticing.
+TIER_ROOT_FILES_ORDERED: tuple[str, ...] = ("key_metadata.json", "indexed_key_registry.json")
+
+assert not set(SLOT_DURABLE_FILES) & set(TIER_ROOT_FILES_ORDERED), (
+    "SLOT_DURABLE_FILES and TIER_ROOT_FILES_ORDERED must be disjoint — a filename "
+    "claimed by both would be ambiguous between a slot payload and a tier-root file"
 )
 
 logger = logging.getLogger(__name__)
@@ -567,10 +587,17 @@ def _find_artifact(slot_dir: Path, meta: ArtifactMeta) -> Path:
 
 _BUNDLE_MANIFEST_FILENAME = "bundle.meta.json"
 _BUNDLE_EXCLUDED_DEFAULTS = [
-    "graph (RAM-only by design; not required for recall recovery)",
     "interim/checkpoint weights (regenerable from training; excluded by adapter_scope)",
     "keyed_pairs (transient; regenerated from graph on every cycle; not on disk)",
 ]
+
+# Incident type recorded (and resolved) by write_bundle's _capture_adapter_slot
+# when a tier's capture lands in the torn shape: no live slot matched the
+# registry, but unbound payload debris exists somewhere under the tier root
+# (has_unbound_payload(tier_root) is True — venue-blind: a simulate tier with
+# unbound debris is exactly as torn as a train one). Dedup key is the
+# bundle_key (adapter name).
+_WEIGHTLESS_CAPTURE_INCIDENT_TYPE = "backup_weightless_capture"
 
 # Files inside an adapter slot that are always excluded from bundles — these are
 # transient training scaffolding that must not be captured.
@@ -648,7 +675,6 @@ _BUNDLE_DIR_NAME = "snapshot"  # bundles share the kind dir with per-file sessio
 def write_bundle(
     *,
     config_path: Path,
-    registry_path: Path,
     adapter_dirs: dict[str, Path],
     backups_root: Path,
     backups_cfg: "ServerBackupsConfig | None",
@@ -660,38 +686,50 @@ def write_bundle(
     """Capture a self-contained recovery-set bundle into a single slot directory.
 
     A bundle slot contains every artifact required to restore a working ParaMem
-    instance: live server config, key-metadata registry, per-adapter weights,
-    per-tier indexed-key registries, per-tier SimHash registries, interim adapter
-    slots (when ``adapter_scope="live"``), and speaker profiles.  The bundle
-    manifest (``bundle.meta.json``) indexes all captured files with their content
-    hashes.
+    instance: live server config, per-tier key-metadata bookkeeping, per-adapter
+    weights or the simulate venue's projected graph, per-tier indexed-key
+    registries, interim adapter slots (when ``adapter_scope="live"``), and
+    speaker profiles.  The bundle manifest (``bundle.meta.json``) indexes all
+    captured files with their content hashes.
 
     The capture set mirrors exactly what ``MemoryStore.load_registries_from_disk``
     mounts for recall:
 
     - **Per enabled MAIN tier** (``episodic`` / ``semantic`` / ``procedural``):
-      live weight slot via ``find_live_slot(<tier_dir>, hash)``, then the
-      tier-root ``indexed_key_registry.json`` (fingerprints are stored inside
-      this file's ``"simhash"`` map; ``simhash_registry.json`` no longer exists).
+      the live slot via ``find_live_slot(<tier_dir>, hash)`` when one exists
+      — venue-blind: the slot may carry either a weight payload or a
+      projected ``graph.json`` (:data:`SLOT_DURABLE_FILES` copies whichever
+      is present) — then the tier-root's own files unconditionally —
+      ``indexed_key_registry.json`` (fingerprints are stored inside this
+      file's ``"simhash"`` map) and ``key_metadata.json``. The tier-root half
+      runs EITHER WAY: a tier with no live slot is still captured under the
+      same ``bundle_key``. When no live slot binds but
+      :func:`~paramem.memory.interim_adapter.has_unbound_payload` finds
+      payload debris under the tier root (a torn or stale slot, either
+      venue), the capture still completes WITHOUT that payload, marked via
+      the adapter entry's ``weightless_cause`` field (``"torn_slot"``), a
+      WARNING log, and a ``backup_weightless_capture`` incident — never
+      refused, never silent.
     - **Per INTERIM family** (``iter_interim_dirs(<adapter_base>)``), only when
-      ``adapter_scope="live"``: live inner weight slot via
-      ``find_live_slot(<interim_dir>, hash)`` (the ``<ts>/`` slot;
+      ``adapter_scope="live"``: the same slot-optional + tier-root-always
+      capture as a main tier, rooted at the interim family dir.
       ``checkpoint-*/`` scaffolding is naturally excluded because those dirs
-      carry no matching ``meta.registry_sha256``), then the interim-dir
-      ``indexed_key_registry.json``.
-    - Shared: ``key_metadata.json``, ``speaker_profiles.json``, ``server.yaml``.
+      carry no matching ``meta.registry_sha256``.
+    - Shared: ``speaker_profiles.json``, ``server.yaml``.
     - Optional (base-swap only): ``server.yaml.candidate`` — the candidate
       (new-target) config sidecar, included when ``candidate_config_path`` is
       supplied.  Captured only to serve as an operator retry-anchor after a
       rollback; **never restored** by ``restore_bundle`` (the
       ``startswith("config/")`` filter excludes it by construction).
-    - Excluded: ``graph.json`` (RAM-only), ``checkpoint-*/``, ``in_training/``,
-      ``bg_checkpoint/``, ``staging_resume.json`` (training scaffolding),
-      ``keyed_pairs.json`` (transient; regenerated from graph).
+    - Excluded: ``checkpoint-*/``, ``in_training/``, ``bg_checkpoint/``,
+      ``staging_resume.json`` (training scaffolding), ``keyed_pairs.json``
+      (transient; regenerated from graph).
 
     Per-slot hashes: each captured adapter entry records the slot's **own**
-    ``meta.registry_sha256``.  Main and interim slots carry different hashes;
-    a single global hash cannot address both.
+    ``meta.registry_sha256`` when a slot was captured, venue-blind — either a
+    weight slot or a graph slot (empty string when no slot was captured at
+    all).  Main and interim slots carry different hashes; a single global
+    hash cannot address both.
 
     Crash safety follows the same pattern as ``write()``:
 
@@ -710,11 +748,6 @@ def write_bundle(
     ----------
     config_path:
         Path to the live ``server.yaml`` (or ``server.yaml.enc``).
-    registry_path:
-        Path to ``key_metadata.json`` (the ESSENTIAL registry that ties
-        weights to indexed keys).  Its plaintext SHA-256 is computed here
-        and recorded in the manifest as ``key_metadata_sha256`` (provenance
-        only — it is not used to select any slot).
     adapter_dirs:
         Mapping of adapter name → adapter-kind directory (e.g.
         ``{"episodic": Path("data/ha/adapters/episodic")}``) for every
@@ -784,17 +817,23 @@ def write_bundle(
         The store is at/over ``backups_cfg.max_total_disk_gb``; nothing was
         written.  Never raised when ``backups_cfg`` is ``None``.
     BackupError
-        If the chosen ``adapter_scope`` resolves no weight slot for the primary
-        ``episodic`` recall.  For ``adapter_scope="main"`` this happens when
-        episodic has only an interim slot (use ``"live"`` or run a full
-        consolidation).  For ``adapter_scope="live"`` this happens when no main
-        or interim slot exists at all.  Non-episodic tiers with no slot are
+        If the chosen ``adapter_scope`` resolves nothing at all for the primary
+        ``episodic`` recall — no bound slot at all, main or interim, in
+        either venue (a bound simulate slot satisfies the requirement
+        regardless of scope, same as a bound train slot). For
+        ``adapter_scope="main"`` this also fails when episodic has only an
+        interim slot and no main-tier slot of its own (use ``"live"`` or run
+        a full consolidation). Non-episodic tiers with nothing at all are
         recorded as absent in the manifest; they do not trigger a failure.
     BackupError
         If a unique pending slot could not be allocated after 10 collision
         retries.
     BackupError
         If ``candidate_config_path`` is supplied but does not exist.
+    ~paramem.memory.store.BookkeepingInvariantViolation
+        A tier (main, interim, or donor) has a registry with known keys but
+        no ``key_metadata.json`` — a bundle captured from that state could
+        only restore into a store that refuses to boot.
     OSError
         On any filesystem error.
     """
@@ -809,6 +848,16 @@ def write_bundle(
     base_dir = Path(backups_root) / _BUNDLE_DIR_NAME
     tier = meta_fields.get("tier", "manual")
     label = meta_fields.get("label")
+
+    # Incident state dir for the weightless-capture marker (see
+    # _capture_adapter_slot below) — derived from backups_root, never a
+    # separate parameter: production always derives backups_root as
+    # <data_dir>/backups (the scheduled runner, the base-swap orchestration,
+    # and this function's own restore_bundle safety-bundle call site all
+    # construct it that way), so backups_root.parent IS the data dir.
+    from paramem.training.stage_ledger import data_state_dir as _data_state_dir
+
+    incidents_state_dir = _data_state_dir(Path(backups_root).parent)
 
     # Validate a requested candidate exists BEFORE allocating the pending slot,
     # so a set-but-missing candidate fails with zero on-disk residue (no orphan
@@ -835,17 +884,6 @@ def write_bundle(
         entry["path"] = f"config/{config_path.name}"
         files_inventory.append(entry)
 
-    # --- capture registry (key_metadata.json) ---
-    key_metadata_sha256 = ""
-    if registry_path.exists():
-        dst = pending_slot / "registry" / registry_path.name
-        entry = _copy_artifact(registry_path, dst)
-        entry["path"] = f"registry/{registry_path.name}"
-        files_inventory.append(entry)
-        # Provenance hash for the manifest — plaintext content, independent of
-        # on-disk encryption state (see plaintext_sha256's rationale).
-        key_metadata_sha256 = plaintext_sha256(registry_path)
-
     # --- capture speaker_profiles.json ---
     if speaker_profiles_path is not None and speaker_profiles_path.exists():
         dst = pending_slot / "speaker_profiles.json"
@@ -868,22 +906,30 @@ def write_bundle(
         entry["path"] = "server.yaml.candidate"
         files_inventory.append(entry)
 
-    # --- helper: capture one adapter slot (main or interim) ---
+    # --- helper: capture one tier root (main or interim), slot optional ---
     def _capture_adapter_slot(
         bundle_key: str,
-        slot_path: Path,
+        slot_path: "Path | None",
         tier_root: Path,
         dst_prefix: str,
+        weightless_cause: "str | None" = None,
     ) -> None:
-        """Capture one adapter slot (main or interim) into the pending directory.
+        """Capture one tier root into the pending directory.
 
-        Reads the slot's own ``meta.json`` to record the slot's
-        ``registry_sha256`` in the bundle manifest (main and interim slots
-        carry different hashes).  Captures the per-tier
-        ``indexed_key_registry.json`` from *tier_root* (the parent directory
-        of the slot for main tiers, or the interim-family directory for
-        interim slots).  Fingerprints live inside that file's ``"simhash"``
-        map; ``simhash_registry.json`` no longer exists.
+        The slot half runs only when *slot_path* is not ``None`` (a live
+        bound slot — venue-blind, train or simulate alike): reads the
+        slot's own ``meta.json`` to record the slot's ``registry_sha256``
+        and ``payload.kind`` in the bundle manifest, then copies
+        :data:`SLOT_DURABLE_FILES` (whichever of them exist — weights and
+        ``adapter_config.json`` for a train slot, ``graph.json`` for a
+        simulate slot).
+
+        The tier-root half runs UNCONDITIONALLY — mirrors
+        ``MemoryStore.load_registries_from_disk``, which reads a tier's
+        ``indexed_key_registry.json`` at the tier root regardless of venue:
+        ``indexed_key_registry.json`` (fingerprints live inside its
+        ``"simhash"`` map; ``simhash_registry.json`` no longer exists) and
+        ``key_metadata.json``.
 
         Parameters
         ----------
@@ -892,50 +938,69 @@ def write_bundle(
             ``"episodic_interim_20260517T1200"``).
         slot_path:
             The timestamped slot directory (e.g. ``episodic/20260517-180431/``
-            or ``episodic/interim_20260517T1200/20260517-180430/``).
+            or ``episodic/interim_20260517T1200/20260517-180430/``), or
+            ``None`` when this tier carries no live bound slot.
         tier_root:
-            Directory that holds the registries at its root — the
-            adapter-kind dir for main tiers (``episodic/``), or the interim
-            family dir (``interim_20260517T1200/``) for interim slots.
+            Directory that holds the registry/bookkeeping files at its
+            root — the adapter-kind dir for main tiers (``episodic/``), or
+            the interim family dir (``interim_20260517T1200/``) for interim
+            slots.
         dst_prefix:
             Relative path prefix inside the bundle slot directory for this
             adapter's files (e.g. ``"adapters/episodic"``).
+        weightless_cause:
+            ``None`` for every ordinarily captured tier (a live bound slot
+            was found, in either venue).  ``"torn_slot"`` when the caller
+            detected the torn shape — ``slot_path is None`` yet
+            :func:`~paramem.memory.interim_adapter.has_unbound_payload`
+            finds payload debris somewhere under *tier_root* — so this
+            capture completes WITHOUT that payload rather than refusing or
+            capturing silently.  Recorded verbatim into the
+            ``adapters_record`` entry and drives the
+            ``backup_weightless_capture`` incident: recorded (with a WARNING
+            log) when set, resolved when not — the incident is per
+            *bundle_key*, so a later clean capture of the same tier clears
+            it.
         """
-        # Read this slot's own meta.json for its registry_sha256 and key_count.
         slot_meta: dict = {}
-        meta_src = slot_path / "meta.json"
-        if meta_src.exists():
-            try:
-                slot_meta = _json.loads(meta_src.read_text(encoding="utf-8"))
-            except (OSError, ValueError) as exc:
-                raise BackupError(
-                    f"write_bundle: failed to read meta.json from {meta_src}: {exc}"
-                ) from exc
-
-        nonlocal base_model_info
-        if not base_model_info and slot_meta.get("base_model"):
-            bm = slot_meta["base_model"]
-            base_model_info = {
-                "repo": bm.get("repo", ""),
-                "sha": bm.get("sha", ""),
-                "hash": bm.get("hash", ""),
-            }
-
         adapter_dst_dir = pending_slot / dst_prefix
-        for fname in SLOT_DURABLE_FILES:
-            src = slot_path / fname
-            if not src.exists():
-                continue
-            dst = adapter_dst_dir / fname
-            entry = _copy_artifact(src, dst)
-            entry["path"] = f"{dst_prefix}/{fname}"
-            files_inventory.append(entry)
 
-        # Capture per-tier indexed_key_registry.json (mirrors
-        # MemoryStore.load_registries_from_disk which reads this file at
-        # <tier_root>/indexed_key_registry.json for both main and interim tiers).
-        indexed_key_src = tier_root / "indexed_key_registry.json"
+        if slot_path is not None:
+            # Read this slot's own meta.json for its registry_sha256 and key_count.
+            meta_src = slot_path / "meta.json"
+            if meta_src.exists():
+                try:
+                    slot_meta = _json.loads(meta_src.read_text(encoding="utf-8"))
+                except (OSError, ValueError) as exc:
+                    raise BackupError(
+                        f"write_bundle: failed to read meta.json from {meta_src}: {exc}"
+                    ) from exc
+
+            nonlocal base_model_info
+            # slot_meta is the raw meta.json dict (never the parsed
+            # AdapterManifest), so a simulate-payload slot's "base_model"
+            # key is either absent or JSON null — .get() returns None
+            # either way and the falsy check below skips it cleanly.
+            if not base_model_info and slot_meta.get("base_model"):
+                bm = slot_meta["base_model"]
+                base_model_info = {
+                    "repo": bm.get("repo", ""),
+                    "sha": bm.get("sha", ""),
+                    "hash": bm.get("hash", ""),
+                }
+
+            for fname in SLOT_DURABLE_FILES:
+                src = slot_path / fname
+                if not src.exists():
+                    continue
+                dst = adapter_dst_dir / fname
+                entry = _copy_artifact(src, dst)
+                entry["path"] = f"{dst_prefix}/{fname}"
+                files_inventory.append(entry)
+
+        # Tier-root files — always attempted, regardless of slot_path.
         indexed_key_present = False
+        indexed_key_src = tier_root / "indexed_key_registry.json"
         if indexed_key_src.exists():
             dst = adapter_dst_dir / "indexed_key_registry.json"
             entry = _copy_artifact(indexed_key_src, dst)
@@ -943,60 +1008,130 @@ def write_bundle(
             files_inventory.append(entry)
             indexed_key_present = True
 
+        key_metadata_present = False
+        key_metadata_src = tier_root / "key_metadata.json"
+        if key_metadata_src.exists():
+            dst = adapter_dst_dir / "key_metadata.json"
+            entry = _copy_artifact(key_metadata_src, dst)
+            entry["path"] = f"{dst_prefix}/key_metadata.json"
+            files_inventory.append(entry)
+            key_metadata_present = True
+
+        # A tier carrying a registry with known keys but no key_metadata.json
+        # can only restore into a store that refuses to boot (the
+        # every-known-key-has-a-row invariant) — never capture that bundle.
+        if indexed_key_present and not key_metadata_present:
+            from paramem.memory.store import raise_bookkeeping_invariant_violation
+            from paramem.training.key_registry import KeyRegistry
+
+            known = KeyRegistry.load(indexed_key_src).list_known()
+            if known:
+                raise_bookkeeping_invariant_violation(
+                    bundle_key, known, "bundle capture: key_metadata.json missing"
+                )
+
         # simhash_registry.json has been eliminated; simhashes now live in
         # indexed_key_registry.json under the "simhash" key.  No separate
         # simhash file to capture.
 
         adapters_record[bundle_key] = {
-            "slot_source": str(slot_path),
-            # Each slot's OWN registry_sha256 — main and interim hashes differ;
-            # a single global key_metadata_sha256 cannot address both.
+            "slot_source": str(slot_path) if slot_path is not None else "",
+            # Each slot's OWN registry_sha256 — main and interim hashes
+            # differ; a single global hash cannot address both. Empty when
+            # this tier has no live weight slot.
             "registry_sha256": slot_meta.get("registry_sha256", ""),
             "key_count": slot_meta.get("key_count", "unknown"),
             "indexed_key_registry_present": indexed_key_present,
             "keyed_pairs_present": False,  # transient; regenerated from graph
+            "weightless_cause": weightless_cause,
         }
+
+        from paramem.server.incidents import record_incident, resolve_incident
+
+        if weightless_cause is not None:
+            # Venue-blind wording: a torn tier is exactly as torn whether its
+            # unbound payload is adapter weights (train) or a graph.json
+            # (simulate) — "adapter weights" would be false for a simulate
+            # tier. The incident type stays _WEIGHTLESS_CAPTURE_INCIDENT_TYPE
+            # (an unrelated rename, not part of this wording fix).
+            logger.warning(
+                "write_bundle: %s captured WITHOUT a bound payload (%s) — on-disk "
+                "written payload(s) exist under %s but none match the live registry",
+                bundle_key,
+                weightless_cause,
+                tier_root,
+            )
+            record_incident(
+                incidents_state_dir,
+                type=_WEIGHTLESS_CAPTURE_INCIDENT_TYPE,
+                key=bundle_key,
+                severity="warning",
+                summary=(
+                    f"Backup captured {bundle_key!r} without a bound payload "
+                    f"({weightless_cause}) — on-disk written payload(s) exist but "
+                    "none match the live registry"
+                ),
+                detail={
+                    "tier": bundle_key,
+                    "tier_root": str(tier_root),
+                    "cause": weightless_cause,
+                },
+            )
+        else:
+            resolve_incident(incidents_state_dir, _WEIGHTLESS_CAPTURE_INCIDENT_TYPE, bundle_key)
 
     # --- capture main tiers ---
     for adapter_name, adapter_kind_dir in adapter_dirs.items():
         adapter_kind_dir = Path(adapter_kind_dir)
         main_slot = find_live_slot(adapter_kind_dir, tier_registry_sha256(adapter_kind_dir))
 
+        main_weightless_cause: "str | None" = None
         if main_slot is None:
-            if adapter_name == "episodic":
-                # Episodic is the PRIMARY recall tier.  Under adapter_scope="main"
-                # an interim-only episodic is a hard error (the caller must use
-                # "live" or run a full consolidation first).  Under "live" we defer
-                # the failure check until after the interim pass below — an interim
-                # slot may satisfy the episodic requirement.
-                if adapter_scope == "main":
-                    raise BackupError(
-                        "write_bundle: adapter_scope='main' but episodic has no finalized "
-                        f"main slot in {adapter_kind_dir}. "
-                        "Use adapter_scope='live' to capture the interim slot, or run a "
-                        "full consolidation first."
+            if not has_unbound_payload(adapter_kind_dir):
+                if adapter_name == "episodic":
+                    # Episodic is the PRIMARY recall tier.  Under
+                    # adapter_scope="main" an interim-only episodic with no
+                    # main slot of its own is a hard error (the caller must
+                    # use "live" or run a full consolidation first).  Under
+                    # "live" we defer the failure check until after the
+                    # interim pass below — an interim slot may satisfy the
+                    # episodic requirement.
+                    if adapter_scope == "main":
+                        raise BackupError(
+                            "write_bundle: adapter_scope='main' but episodic has no finalized "
+                            f"main slot in {adapter_kind_dir}. "
+                            "Use adapter_scope='live' to capture the interim slot, or run a "
+                            "full consolidation first."
+                        )
+                    # Under "live": defer — interim pass will capture episodic interims.
+                    logger.debug(
+                        "write_bundle: no main slot for episodic in %s; "
+                        "will attempt interim capture (adapter_scope='live')",
+                        adapter_kind_dir,
                     )
-                # Under "live": defer — interim pass will capture episodic interims.
-                logger.debug(
-                    "write_bundle: no main slot for episodic in %s; "
-                    "will attempt interim capture (adapter_scope='live')",
-                    adapter_kind_dir,
-                )
-            else:
-                # Non-episodic tiers with no main slot are recorded as absent;
-                # they do not fail the bundle.
-                logger.debug(
-                    "write_bundle: no main slot for %r in %s; recording absent",
-                    adapter_name,
-                    adapter_kind_dir,
-                )
-            continue
+                else:
+                    # Non-episodic tiers with nothing at all are recorded as
+                    # absent; they do not fail the bundle.
+                    logger.debug(
+                        "write_bundle: no main slot for %r in %s; recording absent",
+                        adapter_name,
+                        adapter_kind_dir,
+                    )
+                continue
+            # Torn shape: payload debris exists on disk somewhere under this
+            # tier (either venue) but no slot matched the live registry — a
+            # corrupt or quarantined registry, or a stale slot find_live_slot
+            # could not bind.  Never refused, never captured silently: the
+            # capture completes without that payload, loud and marked (see
+            # _capture_adapter_slot's weightless_cause docstring).
+            main_weightless_cause = "torn_slot"
 
         _capture_adapter_slot(
             bundle_key=adapter_name,
             slot_path=main_slot,
             tier_root=adapter_kind_dir,  # registries live at the tier-kind dir root
             dst_prefix=f"adapters/{adapter_name}",
+            weightless_cause=main_weightless_cause,
         )
 
     # --- capture interim families (only under adapter_scope="live") ---
@@ -1014,19 +1149,24 @@ def write_bundle(
 
         for interim_name, interim_dir in iter_interim_dirs(adapter_base_dir):
             interim_slot = find_live_slot(interim_dir, tier_registry_sha256(interim_dir))
+            interim_weightless_cause: "str | None" = None
             if interim_slot is None:
-                logger.debug(
-                    "write_bundle: no live slot in interim family %s "
-                    "(registry hash mismatch or empty family); skipping",
-                    interim_dir,
-                )
-                continue
+                if not has_unbound_payload(interim_dir):
+                    logger.debug(
+                        "write_bundle: no live slot in interim family %s "
+                        "(registry hash mismatch or empty family); skipping",
+                        interim_dir,
+                    )
+                    continue
+                # Torn shape — see the main-tier arm's identical branch above.
+                interim_weightless_cause = "torn_slot"
 
             _capture_adapter_slot(
                 bundle_key=interim_name,
                 slot_path=interim_slot,
                 tier_root=interim_dir,  # interim registries live at the interim-family dir root
                 dst_prefix=f"adapters/{interim_name}",
+                weightless_cause=interim_weightless_cause,
             )
 
     # --- capture donor stores ---
@@ -1056,17 +1196,18 @@ def write_bundle(
             )
 
     # --- fail-loud check for episodic primary recall ---
-    # Episodic must be captured (as main OR as interim) when it is in adapter_dirs.
-    # A bundle without episodic is not a valid recall-recovery set.
+    # Episodic must be captured — a bound slot for the main episodic tier OR
+    # an interim slot, in either venue — when it is in adapter_dirs. A
+    # bundle without episodic is not a valid recall-recovery set.
     if "episodic" in adapter_dirs:
         episodic_keys = {
             k for k in adapters_record if k == "episodic" or k.startswith(INTERIM_NAME_PREFIX)
         }
         if not episodic_keys:
             raise BackupError(
-                "write_bundle: no live slot found for the primary episodic recall "
-                f"(adapter_scope={adapter_scope!r}). "
-                "Cannot write a self-contained recovery bundle without episodic weights. "
+                "write_bundle: no bound slot found for the primary "
+                f"episodic recall (adapter_scope={adapter_scope!r}). "
+                "Cannot write a self-contained recovery bundle without episodic content. "
                 "If consolidation has not run yet, use adapter_scope='live' so interim "
                 "slots are included."
             )
@@ -1077,7 +1218,6 @@ def write_bundle(
         created_at=created_at,
         tier=tier,
         label=label,
-        key_metadata_sha256=key_metadata_sha256,
         base_model=base_model_info,
         files=files_inventory,
         adapters=adapters_record,
@@ -1195,6 +1335,52 @@ def _atomic_write_file(src_bytes: bytes, dst: Path, mode: int = 0o600) -> None:
         os.close(parent_fd)
 
 
+def read_bundle_manifest(bundle_slot_dir: Path) -> BundleManifest:
+    """Read and validate ``bundle.meta.json`` from a bundle slot directory.
+
+    The single canonical strict reader for a bundle slot's manifest — used
+    by :func:`restore_bundle`'s step 1 and by the base-swap orchestration's
+    pre-mutation weightless-capture gate (``paramem/server/app.py``), so a
+    bundle's ``adapters`` record (including per-adapter ``weightless_cause``)
+    is read the same validated way everywhere a caller needs more than
+    ``enumerate_backups``'s listing-oriented ``BackupRecord`` exposes.
+    Unlike ``enumerate_backups``'s internal reader (which tolerates a
+    malformed or version-incompatible manifest by skipping the slot with a
+    warning, because listing must not fail on one bad slot), this raises —
+    every caller here needs the manifest to proceed and a missing/invalid
+    manifest is a hard error.
+
+    Parameters
+    ----------
+    bundle_slot_dir:
+        Bundle slot directory (e.g. ``data/ha/backups/snapshot/<ts>/``).
+        Must contain a valid ``bundle.meta.json``.
+
+    Returns
+    -------
+    BundleManifest
+        The validated manifest.
+
+    Raises
+    ------
+    BundleManifestError
+        If ``bundle.meta.json`` is missing, unreadable, or not at the
+        current schema version (forward or legacy).
+    """
+    manifest_path = Path(bundle_slot_dir) / _BUNDLE_MANIFEST_FILENAME
+    if not manifest_path.exists():
+        raise BundleManifestError(
+            f"read_bundle_manifest: bundle.meta.json not found in {bundle_slot_dir}"
+        )
+    try:
+        raw = _json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise BundleManifestError(
+            f"read_bundle_manifest: cannot read bundle.meta.json from {bundle_slot_dir}: {exc}"
+        ) from exc
+    return BundleManifest.from_dict(raw)  # raises BundleManifestError on schema mismatch
+
+
 def restore_bundle(
     bundle_slot_dir: Path,
     *,
@@ -1224,39 +1410,47 @@ def restore_bundle(
        caught, logged, and restore continues.  All other errors abort.  This
        write passes ``backups_cfg=None`` — the safety bundle is deliberately
        exempt from the global disk cap so a recovery is never blocked by it.
-    5. **Atomic restore** (adapter slots written; registry written LAST):
+    5. **Atomic restore** (adapter slots written; each tier's own registry
+       written LAST):
 
        - For each adapter in ``manifest.adapters``: create a fresh slot dir
          via ``_promote_slot`` (NOT the bundle's original timestamp) under the
-         tier-root resolved by ``adapter_slot_root_for_name``.  Copy
-         ``adapter_model.safetensors``, ``adapter_config.json``, ``meta.json``
-         AS-IS.  Write the per-tier ``indexed_key_registry.json`` to the
-         tier-root (where ``MemoryStore.load_registries_from_disk`` reads them;
-         simhashes now live inside this file under the ``"simhash"`` key).
+         tier-root resolved by ``adapter_slot_root_for_name``.  Copy whichever
+         of :data:`SLOT_DURABLE_FILES` the bundle captured for this slot
+         AS-IS — ``adapter_model.safetensors`` + ``adapter_config.json`` +
+         ``meta.json`` for a train slot, ``graph.json`` + ``meta.json`` for a
+         simulate slot.  Then write ``key_metadata.json``, then
+         ``indexed_key_registry.json`` LAST — :data:`TIER_ROOT_FILES_ORDERED`
+         — to the tier-root (where ``MemoryStore.load_registries_from_disk``
+         reads them; simhashes live inside ``indexed_key_registry.json``
+         under the ``"simhash"`` key). This ordering repeats independently
+         per tier — there is no single global registry file.
        - ``speaker_profiles.json`` → ``data_dir/speaker_profiles.json``
          (atomic temp+rename).
        - ``server.yaml`` → ONLY if ``restore_config=True``: atomic temp+rename
          to ``config_path``.
-       - **LAST**: ``registry/key_metadata.json`` → ``data_dir/registry/
-         key_metadata.json`` (atomic temp+rename).
 
-       Registry-last crash invariant: a crash before the registry swap leaves
-       the OLD registry live.  ``find_live_slot`` resolves the OLD slots →
-       graceful (no half-restored live set).  The safety bundle is the
-       documented rollback target when the operator wants to undo.
+       Registry-last crash invariant (per tier): a crash before a given
+       tier's ``indexed_key_registry.json`` write leaves that tier's OLD
+       registry live.  ``find_live_slot`` resolves the OLD slots → graceful
+       (no half-restored live set).  The safety bundle is the documented
+       rollback target when the operator wants to undo.
 
-    5e. **Clean-slate sweep** (after 5d, inside the step-5 try): make
-        ``data_dir/adapters/`` contain EXACTLY the bundle's adapters.  Removes
-        orphan main tiers (whole tier absent from bundle), orphan interim
-        families, orphan donor stores, stale slot dirs inside kept tiers and
-        kept donor stores, stale registries in episodic-as-interim tiers, and
-        legacy top-level entries.  Orphan adapter removals are recorded in
-        ``RestoreResult.pruned_orphans`` (``kind`` is ``"main"``,
-        ``"interim"`` or ``"donor"``); within-store stale-slot cleanup is
-        logged at INFO/DEBUG.
+    5d. **Clean-slate sweep** (after every tier's per-tier restore above,
+        inside the step-5 try): make ``data_dir/adapters/`` contain EXACTLY
+        the bundle's adapters.  Removes orphan main tiers (whole tier absent
+        from bundle), orphan interim families, orphan donor stores, stale
+        slot dirs inside kept tiers and kept donor stores, stale registries
+        in episodic-as-interim tiers, and legacy top-level entries.  Orphan
+        adapter removals are recorded in ``RestoreResult.pruned_orphans``
+        (``kind`` is ``"main"``, ``"interim"`` or ``"donor"``); within-store
+        stale-slot cleanup is logged at INFO/DEBUG.
 
-    6. Return :class:`RestoreResult` with ``restart_required=True`` — no hot
-       VRAM swap (8 GB; mounted adapters are stale until restart).
+    6. Return :class:`RestoreResult`. This function only rewrites the
+       on-disk tree — it mounts no adapter and touches no in-VRAM state;
+       the caller (``POST /backup/restore``, the base-swap branch of
+       ``POST /migration/rollback``) owns re-mounting adapters and lifting
+       the memory store onto the freshly written slots.
 
     Parameters
     ----------
@@ -1309,18 +1503,7 @@ def restore_bundle(
     # -------------------------------------------------------------------------
     # Step 1: Read + validate bundle.meta.json
     # -------------------------------------------------------------------------
-    manifest_path = bundle_slot_dir / _BUNDLE_MANIFEST_FILENAME
-    if not manifest_path.exists():
-        raise BundleManifestError(
-            f"restore_bundle: bundle.meta.json not found in {bundle_slot_dir}"
-        )
-    try:
-        raw = _json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        raise BundleManifestError(
-            f"restore_bundle: cannot read bundle.meta.json from {bundle_slot_dir}: {exc}"
-        ) from exc
-    manifest = BundleManifest.from_dict(raw)  # raises BundleManifestError on schema mismatch
+    manifest = read_bundle_manifest(bundle_slot_dir)
 
     # -------------------------------------------------------------------------
     # Step 2: Verify file hashes — BEFORE any mutation
@@ -1355,7 +1538,8 @@ def restore_bundle(
         if not entry.get("encrypted", False):
             continue
         # Skip weight blobs — copied verbatim; decrypt-validity for weights is
-        # deferred to restart-time mount (server loads adapter from disk).
+        # deferred to mount time (the caller's on-demand re-mount, or the
+        # next boot — either way the server loads the adapter from disk).
         rel_path = entry["path"]
         if rel_path.endswith(".safetensors"):
             continue
@@ -1382,8 +1566,6 @@ def restore_bundle(
         if tier_dir.is_dir():
             safety_adapter_dirs[tier_name] = tier_dir
 
-    # Registry path in the LIVE data_dir (not the bundle's registry).
-    live_registry_path = data_dir / "registry" / "key_metadata.json"
     live_config_path_for_safety = config_path
     live_speaker_profiles = data_dir / "speaker_profiles.json"
 
@@ -1391,7 +1573,6 @@ def restore_bundle(
         try:
             safety_slot = write_bundle(
                 config_path=live_config_path_for_safety,
-                registry_path=live_registry_path,
                 adapter_dirs=safety_adapter_dirs,
                 backups_root=data_dir / "backups",
                 backups_cfg=None,  # undo anchor — exempt from the disk cap
@@ -1415,17 +1596,19 @@ def restore_bundle(
         )
 
     # -------------------------------------------------------------------------
-    # Step 5: Atomic restore — adapter slots + registries + speaker_profiles
-    #         registry (key_metadata.json) written LAST (crash-safety invariant)
+    # Step 5: Atomic restore — adapter slots + speaker_profiles; each tier's
+    #         own indexed_key_registry.json written LAST within that tier's
+    #         restore (crash-safety invariant, see step 5a below)
     # -------------------------------------------------------------------------
     #
-    # Registry-last crash invariant:
-    #   A crash before the registry swap leaves the OLD registry live.
-    #   find_live_slot resolves the OLD slots → graceful (no half-restored live
-    #   set).  The NEW adapter slots are latent + harmless (no slot meta matches
-    #   the old registry hash; they will be swept or ignored on next prune).
-    #   A crash AFTER the registry swap but before banner leaves the restored
-    #   set fully live — the desired end state; only the banner is missing.
+    # Registry-last crash invariant (per tier):
+    #   A crash before a given tier's indexed_key_registry.json write leaves
+    #   that tier's OLD registry live.  find_live_slot resolves the OLD slots
+    #   → graceful (no half-restored live set).  The NEW adapter slots are
+    #   latent + harmless (no slot meta matches the old registry hash; they
+    #   will be swept or ignored on next prune).  A crash AFTER a tier's
+    #   registry swap but before banner leaves that tier's restored set fully
+    #   live — the desired end state; only the banner is missing.
     #
     # Safety-slot surface: the entire step-5 write phase is wrapped so that
     # any exception logs the safety_slot path at ERROR before propagating.
@@ -1434,15 +1617,23 @@ def restore_bundle(
     restored_adapters: list[str] = []
     restored_config = False
     pruned_orphans: list[dict] = []
+    weightless_adapters: dict[str, str] = {}
 
     # Tracks precisely what step 5a writes so the sweep can keep only those
     # paths and remove everything else.
     #
-    # restored_main_slots: tier name → new slot dir (for main-tier adapters:
-    #     episodic / semantic / procedural that are finalized in the bundle).
-    # restored_interim_slots: interim adapter name → (interim_family_dir, new_slot_dir).
-    restored_main_slots: dict[str, Path] = {}
-    restored_interim_slots: dict[str, tuple[Path, Path]] = {}
+    # restored_main_slots: tier name → new slot dir, or None when this tier
+    #     carried no bound slot at all (a torn/weightless capture — venue-
+    #     blind, since both train and simulate payloads are SLOT_DURABLE_FILES
+    #     now).
+    # restored_interim_slots: interim adapter name → (interim_family_dir, new_slot_dir | None).
+    # restored_tier_names: every adapter name step 5a actually wrote
+    #     SOMETHING for (slot, tier-root files, or both) — the widened
+    #     "was anything restored for this tier" predicate the sweep uses,
+    #     as distinct from "did a NEW slot dir get created".
+    restored_main_slots: dict[str, "Path | None"] = {}
+    restored_interim_slots: dict[str, tuple[Path, "Path | None"]] = {}
+    restored_tier_names: set[str] = set()
 
     try:
         # 5a. Adapter slots — each gets a NEW timestamped dir (not the bundle's ts)
@@ -1450,7 +1641,8 @@ def restore_bundle(
             adapter_bundle_prefix = f"adapters/{adapter_name}"
 
             # Determine which files belong to this adapter in the bundle.
-            # Weight files live under adapters/<name>/; registries also under adapters/<name>/.
+            # Weight files live under adapters/<name>/; tier-root files also
+            # under adapters/<name>/.
             adapter_files = [
                 entry
                 for entry in manifest.files
@@ -1465,61 +1657,69 @@ def restore_bundle(
             # Resolve the tier-root for this adapter name.
             tier_root = adapter_slot_root_for_name(data_dir / "adapters", adapter_name)
 
-            # Allocate a fresh slot dir under the tier-root (registry-last constraint:
-            # the new slot carries the bundle's meta.json with its registry_sha256;
-            # find_live_slot will resolve it as live once the registry is swapped).
-            new_slot_pending, new_ts = _promote_slot(tier_root)
+            # A tier with no captured slot files allocates no slot dir.
+            slot_files = [
+                entry for entry in adapter_files if Path(entry["path"]).name in SLOT_DURABLE_FILES
+            ]
+            new_slot_dir: "Path | None" = None
+            if slot_files:
+                # Allocate a fresh slot dir under the tier-root (registry-last
+                # constraint: the new slot carries the bundle's meta.json with
+                # its registry_sha256; find_live_slot will resolve it as live
+                # once the registry is swapped).
+                new_slot_pending, new_ts = _promote_slot(tier_root)
 
-            # Copy the slot's durable files into the new slot — the same
-            # list write_bundle captured them with (SLOT_DURABLE_FILES).
-            for entry in adapter_files:
-                fname = Path(entry["path"]).name
-                if fname not in SLOT_DURABLE_FILES:
-                    continue
-                src = bundle_slot_dir / entry["path"]
-                dst = new_slot_pending / fname
-                dst.write_bytes(src.read_bytes())
+                # Copy the slot's durable files into the new slot.
+                for entry in slot_files:
+                    fname = Path(entry["path"]).name
+                    src = bundle_slot_dir / entry["path"]
+                    dst = new_slot_pending / fname
+                    dst.write_bytes(src.read_bytes())
 
-            # fsync slot files and the pending dir, then promote.
-            for fpath in new_slot_pending.iterdir():
-                if fpath.is_file():
-                    with open(fpath, "rb") as fh:
-                        os.fsync(fh.fileno())
-            slot_fd = os.open(str(new_slot_pending), os.O_RDONLY)
-            try:
-                os.fsync(slot_fd)
-            finally:
-                os.close(slot_fd)
+                # fsync slot files and the pending dir, then promote.
+                for fpath in new_slot_pending.iterdir():
+                    if fpath.is_file():
+                        with open(fpath, "rb") as fh:
+                            os.fsync(fh.fileno())
+                slot_fd = os.open(str(new_slot_pending), os.O_RDONLY)
+                try:
+                    os.fsync(slot_fd)
+                finally:
+                    os.close(slot_fd)
 
-            new_slot_dir = tier_root / new_ts
-            rename_pending_to_slot(new_slot_pending, new_slot_dir)
-            _fsync_dir(tier_root)
+                new_slot_dir = tier_root / new_ts
+                rename_pending_to_slot(new_slot_pending, new_slot_dir)
+                _fsync_dir(tier_root)
 
-            # Write per-tier registries to the tier-root (where MemoryStore reads them).
-            # simhash_registry.json has been eliminated — simhashes now live inside
-            # indexed_key_registry.json under the "simhash" key.
-            _TIER_REGISTRY_FILES = {"indexed_key_registry.json"}
-            for entry in adapter_files:
-                fname = Path(entry["path"]).name
-                if fname not in _TIER_REGISTRY_FILES:
+            # Write tier-root files to the tier-root (where MemoryStore reads
+            # them), in commit order — key_metadata.json, then
+            # indexed_key_registry.json LAST as the commit signal.
+            by_name = {Path(entry["path"]).name: entry for entry in adapter_files}
+            for fname in TIER_ROOT_FILES_ORDERED:
+                entry = by_name.get(fname)
+                if entry is None:
                     continue
                 src = bundle_slot_dir / entry["path"]
                 src_bytes = src.read_bytes()
                 dst = tier_root / fname
                 _atomic_write_file(src_bytes, dst)
 
-            # Record the new slot dir for the clean-slate sweep (part A).
+            # Record what was restored for the clean-slate sweep (part A).
             if adapter_name.startswith(INTERIM_NAME_PREFIX):
                 # Interim adapters: tier_root IS the interim family dir
                 # (adapter_slot_root_for_name returns <adapters>/episodic/interim_<stamp>/).
                 restored_interim_slots[adapter_name] = (tier_root, new_slot_dir)
             else:
                 restored_main_slots[adapter_name] = new_slot_dir
+            restored_tier_names.add(adapter_name)
 
             logger.debug(
-                "restore_bundle: adapter %r restored to new slot %s", adapter_name, new_slot_dir
+                "restore_bundle: adapter %r restored (slot=%s)", adapter_name, new_slot_dir
             )
             restored_adapters.append(adapter_name)
+            _wl_cause = adapter_record["weightless_cause"]
+            if _wl_cause is not None:
+                weightless_adapters[adapter_name] = _wl_cause
 
         # 5b. speaker_profiles.json
         speaker_file_entries = [
@@ -1548,41 +1748,18 @@ def restore_bundle(
                 restored_config = True
                 logger.debug("restore_bundle: server.yaml restored to %s", config_path)
 
-        # 5d. LAST: registry/key_metadata.json
-        # This is the crash-safety sentinel.  Writing this last ensures
-        # find_live_slot resolves the restored adapter slots as live by construction.
-        # A crash before this step leaves the old registry live — old slots remain
-        # authoritative; the new (latent) slots are harmless.
-        registry_entries = [
-            entry for entry in manifest.files if entry["path"].startswith("registry/")
-        ]
-        if registry_entries:
-            registry_src = bundle_slot_dir / registry_entries[0]["path"]
-            # Byte-faithful copy — preserve the registry's on-disk encryption state
-            # (key_metadata.json is in infra_paths and is age-encrypted under
-            # Security ON).  Do NOT decrypt-then-write: writing it plaintext while
-            # the per-tier registries / weights / speaker_profiles stay encrypted
-            # produces a mixed infra state that assert_mode_consistency refuses to
-            # boot, and leaks speaker_id at rest.  Decryptability was already
-            # validated by the Step 3 decrypt-probe; the live reader
-            # (_load_key_metadata) uses read_maybe_encrypted so an encrypted file
-            # loads fine.
-            registry_bytes = registry_src.read_bytes()
-            dst_registry = data_dir / "registry" / "key_metadata.json"
-            dst_registry.parent.mkdir(parents=True, exist_ok=True)
-            _atomic_write_file(registry_bytes, dst_registry)
-            logger.debug(
-                "restore_bundle: key_metadata.json written (registry-last invariant satisfied)"
-            )
-
-        # 5e. Clean-slate sweep — make adapters/ contain EXACTLY the bundle set.
+        # 5d. Clean-slate sweep — make adapters/ contain EXACTLY the bundle set.
         #
-        # Placement: AFTER the registry-last swap (5d).  A crash BEFORE the registry
-        # swap must leave the fully-old graceful state — this sweep must not have run
-        # yet (preserves the registry-last invariant documented at backup.py:1466-1473).
-        # After the swap, the new registry references only bundle adapters, so removing
-        # stale on-disk content cannot create a registry-references-missing-slot
-        # inconsistency.
+        # Placement: AFTER step 5a, which already wrote each tier's own
+        # registry-last commit (indexed_key_registry.json is the last of
+        # TIER_ROOT_FILES_ORDERED, written per adapter as that tier's commit
+        # signal — see the Step 5 header comment above). A crash BEFORE a
+        # given tier's registry write must leave that tier's fully-old
+        # graceful state — this sweep must not have run yet for that tier's
+        # content to still be intact. Once a tier's registry write has landed,
+        # that tier's registry references only its own bundle content, so
+        # removing stale on-disk content within it cannot create a
+        # registry-references-missing-slot inconsistency.
         #
         # The sweep makes <data_dir>/adapters/ exactly equal to the restored set by:
         #  1. Removing whole main tiers absent from the bundle (orphan main tiers).
@@ -1652,7 +1829,13 @@ def restore_bundle(
                 if top_entry.name in ("episodic", "semantic", "procedural"):
                     tier = top_entry.name
                     tier_dir = top_entry
-                    keep_main = tier in restored_main_slots
+                    # Widened predicate: a bound slot (either venue) OR
+                    # tier-root files (key_metadata.json /
+                    # indexed_key_registry.json) restored for this tier — not
+                    # merely "a new slot dir was created". A tier restored
+                    # with a simulate slot alone (no weights) must be kept,
+                    # not deleted whole.
+                    keep_main = tier in restored_tier_names
                     interims_here = _kept_interim_family_dirs.get(tier, set())
 
                     if not keep_main and not interims_here:
@@ -1686,9 +1869,14 @@ def restore_bundle(
 
                         # A restored interim family dir is always kept.
                         if child in interims_here:
-                            # Recurse one level into the interim family: keep only its
-                            # new slot dir and indexed_key_registry.json; remove everything
-                            # else (stale slots, scratch, stale registry).
+                            # Recurse one level into the interim family: keep
+                            # only its new slot dir (when one exists) and the
+                            # freshly-written tier-root files (registry,
+                            # key_metadata); remove everything else (stale
+                            # slots — including any legacy tier-root
+                            # graph.json, which is stale debris now that
+                            # graph.json lives inside a slot — scratch, stale
+                            # tier-root files).
                             _islot_for_fam = next(
                                 slot
                                 for (_ifam2, slot) in restored_interim_slots.values()
@@ -1699,8 +1887,8 @@ def restore_bundle(
                                     continue
                                 if fam_child == _islot_for_fam:
                                     continue  # the freshly-written slot: keep
-                                if fam_child.name == "indexed_key_registry.json":
-                                    continue  # freshly-written registry: keep
+                                if fam_child.name in TIER_ROOT_FILES_ORDERED:
+                                    continue  # freshly-written tier-root file: keep
                                 if fam_child.is_dir():
                                     logger.info(
                                         "restore_bundle: removing stale child %s "
@@ -1747,19 +1935,26 @@ def restore_bundle(
                             )
                             continue
 
-                        # indexed_key_registry.json at the tier root is kept
-                        # ONLY when this tier has a finalized main adapter in the bundle
-                        # (keep_main=True).  When keep_main is False (episodic-as-interim
-                        # case: bundle has episodic_interim_* but no main episodic), a
-                        # stale tier-level registry must be removed — otherwise it would
-                        # be mounted as a stale main-episodic at boot.
-                        if child.name == "indexed_key_registry.json" and not child.is_dir():
+                        # The tier-root files (registry, key_metadata) are
+                        # kept ONLY when this tier has SOMETHING restored in
+                        # the bundle (keep_main=True — a bound slot, either
+                        # venue).  When keep_main is False (episodic-as-interim
+                        # case: bundle has episodic_interim_* but no main
+                        # episodic content of its own), stale tier-level files
+                        # must be removed — otherwise a stale registry would
+                        # be mounted as a stale main-episodic at boot. A
+                        # legacy tier-root graph.json (pre-unification debris
+                        # — graph.json lives inside a slot now) is NOT in
+                        # TIER_ROOT_FILES_ORDERED, so it falls through to the
+                        # stale-tier-child branch below and is swept
+                        # regardless of keep_main.
+                        if child.name in TIER_ROOT_FILES_ORDERED and not child.is_dir():
                             if keep_main:
-                                continue  # freshly-written tier registry: keep
-                            # Episodic-as-interim: stale main registry — remove.
+                                continue  # freshly-written tier-root file: keep
+                            # Episodic-as-interim: stale main-tier file — remove.
                             logger.info(
-                                "restore_bundle: removing stale main-tier registry %s "
-                                "(tier %r has no finalized main adapter in bundle)",
+                                "restore_bundle: removing stale main-tier file %s "
+                                "(tier %r has no restored content in bundle)",
                                 child,
                                 tier,
                             )
@@ -1883,7 +2078,7 @@ def restore_bundle(
     return RestoreResult(
         restored_adapters=restored_adapters,
         safety_slot=safety_slot,
-        restart_required=True,
         restored_config=restored_config,
         pruned_orphans=pruned_orphans,
+        weightless_adapters=weightless_adapters,
     )

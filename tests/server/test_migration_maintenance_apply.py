@@ -20,7 +20,7 @@ Three isolation assertions:
 
 2. **Apply path (accept case):** when disk hash ≠ memory hash, ``_apply_config_live``
    calls ``_live_reload_base_model(refresh_config_from_disk=True)`` (mocked)
-   and then ``_build_config_derived_state`` (mocked).  The test asserts that
+   and then ``_build_runtime_components`` (mocked).  The test asserts that
    the live ``data/ha`` directory is untouched after the call.
 
 3. **Accept handler path:** drive the full ``/migration/accept`` handler with
@@ -99,7 +99,6 @@ def _make_isolated_state(tmp_path: Path) -> dict:
     config.paths.sessions.mkdir(parents=True, exist_ok=True)
     config.adapter_dir = tmp_path / "data" / "ha" / "adapters"
     config.adapter_dir.mkdir(parents=True, exist_ok=True)
-    config.key_metadata_path = tmp_path / "data" / "ha" / "key_metadata.json"
 
     live_hash = _sha256(_LIVE_CONFIG_YAML)
 
@@ -124,7 +123,6 @@ def _make_isolated_state(tmp_path: Path) -> dict:
         "session_buffer": None,
         "memory_store": None,
         "router": None,
-        "boot_degraded": None,
         "server_started_at": "2026-03-10T00:00:00+00:00",
         "_apply_config_in_progress": False,
     }

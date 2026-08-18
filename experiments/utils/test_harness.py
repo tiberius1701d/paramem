@@ -6,8 +6,9 @@ for consistent experiment setup across all 7 tests.
 Environment loading is a per-script concern — call
 :func:`load_test_env` from a script's main() / argparse entrypoint
 when you need ``.env`` populated. Module-level ``load_dotenv`` was
-removed on 2026-04-28 because importing this module from production
-code paths (``ConsolidationLoop._run_recall_sanity_probe``) re-set
+removed on 2026-04-28 because importing this module from a production
+consolidation code path (a staged-weights recall probe — the
+surviving equivalent is ``ConsolidationLoop._probe_recall``) re-set
 operator env vars on first import, defeating any caller that had
 explicitly cleared a key — e.g. the smoke harness running under
 Security OFF saw ``PARAMEM_DAILY_PASSPHRASE`` snap back from disk

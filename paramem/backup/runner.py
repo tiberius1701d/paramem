@@ -143,9 +143,6 @@ def run_scheduled_backup(
          (RAM-only), so the standalone runner cannot capture it — the systemd
          timer delegates to the running server (which holds the loop) when
          reachable; see ``__main__``.
-       - ``"registry"`` → ``server_config.paths.key_metadata.read_bytes()``.
-         Skip with reason ``"registry empty (no keys yet)"`` when the file
-         does not exist.  Write even when the file is empty (0 bytes).
 
        Each artifact's write door (``backup.write`` / ``backup.write_bundle``)
        enforces the global disk cap (rule 1) itself.  A ``DiskCapExceeded``
@@ -157,9 +154,9 @@ def run_scheduled_backup(
        still aborts the remaining loop: record it in ``error`` and mark the
        rest ``"aborted after prior failure"``.
 
-       Note: ``security.backups.artifacts`` still accepts the deprecated
-       ``["config", "graph", "registry"]`` list for backward compatibility.
-       New installations should use ``["snapshot_bundle"]``.
+       Note: ``"snapshot_bundle"`` is the one comprehensive, restorable
+       artifact and the scheduled default; ``"config"`` and ``"graph"``
+       remain independently selectable extras.
 
     3. **Pruning** — runs when ``first_error is None`` AND (at least one
        artifact was written this run OR a disk-cap refusal occurred this
@@ -291,15 +288,15 @@ def run_scheduled_backup(
                         if _tier_dir is not None:
                             adapter_dirs[_tier_name] = Path(_tier_dir) / _tier_name
 
-            # Resolve key_metadata (global registry) and speaker_profiles paths.
-            registry_path = Path(server_config.paths.key_metadata)
+            # Resolve speaker_profiles path.  key_metadata is per-tier now —
+            # write_bundle's own per-tier capture reads it directly from
+            # each adapter_dirs entry; there is no global path to resolve.
             data_dir = Path(server_config.paths.data)
             speaker_profiles_path = data_dir / "speaker_profiles.json"
 
             try:
                 bundle_slot = backup_write_bundle(
                     config_path=Path(live_config_path),
-                    registry_path=registry_path,
                     adapter_dirs=adapter_dirs,
                     backups_root=backups_root,
                     backups_cfg=backups_cfg,
@@ -355,18 +352,6 @@ def run_scheduled_backup(
                     skipped_artifacts.append((artifact_name, f"graph save error: {exc}"))
                     continue
 
-        elif artifact_name == "registry":
-            registry_path = server_config.paths.key_metadata
-            if not Path(registry_path).exists():
-                skip_reason = "registry empty (no keys yet)"
-            else:
-                try:
-                    artifact_bytes = Path(registry_path).read_bytes()
-                    # Write even when 0 bytes — operator may want to capture empty state.
-                except OSError as exc:
-                    first_error = repr(exc)
-                    skipped_artifacts.append((artifact_name, f"read error: {exc}"))
-                    continue
         else:
             skip_reason = f"unknown artifact kind: {artifact_name!r}"
 

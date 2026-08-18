@@ -704,10 +704,12 @@ def test_headroom_1_5_gib_fits_within_drain_time_free():
       main adapters (real per-tier shapes): 26 + 26 + 38 = 90 MiB
       7 interims × 26 MiB (episodic-shaped) = 182 MiB
       staging slot (worst-case tier shape, procedural) = 38 MiB
-      transient full-fold backup reserve = 90 MiB
+      transient full-fold backup reserve = 38 MiB (at most one tier's backup
+        is co-resident at a time — the worst-case tier's own shape, not a
+        sum across tiers)
       headroom = 1.5 × 1024 = 1536 MiB
       safety margin = 256 MiB
-      total = 4597 + 90 + 182 + 38 + 90 + 1536 + 256 = 6789 MiB = 6.630 GiB < 6.83 GiB ✓
+      total = 4597 + 90 + 182 + 38 + 38 + 1536 + 256 = 6737 MiB = 6.579 GiB < 6.83 GiB ✓
     """
     _MiB = 1024 * 1024
 
@@ -733,8 +735,8 @@ def test_headroom_1_5_gib_fits_within_drain_time_free():
         f"With headroom=1.5 GiB, required_bytes should be < 6.83 GiB (drain-time free), "
         f"got {result.required_bytes / _GiB:.3f} GiB ({result.required_bytes // _MiB} MiB)"
     )
-    # Concrete sanity: must be ≈ 6789 MiB ± 10 MiB (rounding from float GiB).
-    expected_mib = 6789
+    # Concrete sanity: must be ≈ 6737 MiB ± 10 MiB (rounding from float GiB).
+    expected_mib = 6737
     actual_mib = result.required_bytes // _MiB
     assert abs(actual_mib - expected_mib) <= 15, (
         f"required_bytes with headroom=1.5 GiB expected ~{expected_mib} MiB, got {actual_mib} MiB"
@@ -1239,9 +1241,11 @@ def test_assess_topology_dropping_a_tier_reduces_bytes_by_exactly_that_tiers_sha
 
     Dropping procedural (the worst-case 38 MiB tier) from the real 3-tier config:
       main total:    90 MiB -> 52 MiB  (-38 MiB, procedural's own shape)
-      backup total:  90 MiB -> 52 MiB  (-38 MiB, mirrors main)
+      backup total:  38 MiB -> 26 MiB  (-12 MiB — at most one tier's backup is
+        co-resident at a time, so this is the worst-case tier's own shape,
+        which shifts to episodic/semantic once procedural drops out)
       staging term:  38 MiB -> 26 MiB  (-12 MiB, worst case shifts to episodic/semantic)
-      combined delta: 38 + 38 + 12 = 88 MiB
+      combined delta: 38 + 12 + 12 = 62 MiB
     """
     _MiB = 1024 * 1024
     kwargs = dict(
@@ -1261,7 +1265,7 @@ def test_assess_topology_dropping_a_tier_reduces_bytes_by_exactly_that_tiers_sha
     )
 
     delta = full.required_bytes - procedural_dropped.required_bytes
-    assert delta == 88 * _MiB, f"expected -88 MiB when dropping procedural, got {delta / _MiB} MiB"
+    assert delta == 62 * _MiB, f"expected -62 MiB when dropping procedural, got {delta / _MiB} MiB"
 
     assert "3 main adapters" in full.breakdown
     assert "2 main adapters" in procedural_dropped.breakdown

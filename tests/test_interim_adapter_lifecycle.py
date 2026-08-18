@@ -2,9 +2,6 @@
 
 Covers:
   - create_interim_adapter is idempotent for the same stamp.
-  - unload_interim_adapters removes interim adapters from PEFT and on-disk,
-    leaving main adapters intact.
-  - unload_interim_adapters with no interim adapters present returns empty list.
   - current_interim_stamp returns a correctly formatted timestamp.
   - compute_schedule_period_seconds parses all supported schedule grammars.
   - current_interim_stamp(refresh_cadence) floors to the correct cadence boundary.
@@ -22,20 +19,20 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from paramem.adapters.slot import payload_filename
 from paramem.memory.interim_adapter import (
     INTERIM_NAME_PREFIX,
     MAIN_TIERS,
     create_interim_adapter,
     current_interim_stamp,
     detect_legacy_adapter_layout,
+    has_unbound_payload,
     interim_dir_for_name,
     interim_stamp_from_name,
     interim_tiers_newest_first,
+    iter_interim_dirs,
     iter_tier_roots,
-    unload_interim_adapters,
 )
-from paramem.memory.store import MemoryStore
-from paramem.models.loader import main_tier_backup_scope
 from paramem.server.schedule_grammar import compute_schedule_period_seconds
 from paramem.training.donor import DONOR_STORE_PREFIX, iter_donor_stores
 from paramem.training.key_registry import KeyRegistry
@@ -157,8 +154,8 @@ class _FakeStore:
 
 class TestInterimTiersNewestFirst:
     def test_none_store_yields_empty(self) -> None:
-        """Replay-disabled store — the branch that makes interim slots
-        silently unreachable."""
+        """No ``MemoryStore`` constructed (e.g. cloud-only mode) — the branch
+        that makes interim slots silently unreachable."""
         assert interim_tiers_newest_first(None) == []
 
     def test_malformed_interim_names_are_filtered_out(self) -> None:
@@ -240,7 +237,7 @@ class TestEnsureAdapterMatching:
     config-mismatch guard called from both warm-init preambles (main-tier
     fold, interim-slot mint).  Reuses ``_make_stub_peft_model`` (the same
     ``spec=PeftModel`` + real-dict ``peft_config`` double used above for
-    ``main_tier_backup_scope``/``create_interim_adapter``).
+    ``tier_backup_scope``/``create_interim_adapter``).
     """
 
     @staticmethod
@@ -455,229 +452,146 @@ class TestDetachAdapters:
 
 
 # ---------------------------------------------------------------------------
-# Test 4 — unload_interim_adapters removes interims, leaves mains intact
+# Test 3c — unload_interim_adapters (paramem.memory.interim_adapter)
 # ---------------------------------------------------------------------------
 
 
-class TestUnloadInterimAdapters:
-    def test_interim_adapters_removed_from_peft(self, tmp_path: Path) -> None:
-        """delete_adapter is called for every episodic_interim_* adapter."""
+def _seed_interim_dir(adapter_dir: Path, stamp: str) -> Path:
+    """Write a minimal on-disk interim slot dir with a stub payload file —
+    ``reap_tier_artifacts`` removes the whole directory by name shape, so the
+    contents only need to exist, never match a real weight/graph schema."""
+    path = adapter_dir / "episodic" / f"interim_{stamp}"
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "stub.txt").write_text("x")
+    return path
+
+
+class TestUnloadInterimAdaptersBothVenueReap:
+    """Both fold venues call ``unload_interim_adapters`` and both get the
+    identical on-disk reap — the PEFT half is the only part that varies."""
+
+    def test_weights_venue_reaps_disk_and_peft_and_returns_the_deleted_names(
+        self, tmp_path: Path
+    ) -> None:
+        from paramem.memory.interim_adapter import unload_interim_adapters
+
+        adapter_dir = tmp_path / "adapters"
+        dir_a = _seed_interim_dir(adapter_dir, "20260101T0000")
+        dir_b = _seed_interim_dir(adapter_dir, "20260102T0000")
         model = _make_stub_peft_model(
             "episodic",
-            "semantic",
-            "procedural",
-            "episodic_interim_20260417T0000",
-            "episodic_interim_20260418T0000",
+            "episodic_interim_20260101T0000",
+            "episodic_interim_20260102T0000",
         )
-        for name in ["episodic_interim_20260417T0000", "episodic_interim_20260418T0000"]:
-            (tmp_path / name).mkdir()
 
-        unloaded = unload_interim_adapters(model, tmp_path)
+        deleted = unload_interim_adapters(model, adapter_dir)
 
-        assert sorted(unloaded) == [
-            "episodic_interim_20260417T0000",
-            "episodic_interim_20260418T0000",
-        ]
-
-    def test_main_adapters_remain_in_peft_config(self, tmp_path: Path) -> None:
-        """After unload, episodic / semantic / procedural are still in peft_config."""
-        model = _make_stub_peft_model(
-            "episodic",
-            "semantic",
-            "procedural",
-            "episodic_interim_20260417T0000",
-            "episodic_interim_20260418T0000",
-        )
-        for name in ["episodic_interim_20260417T0000", "episodic_interim_20260418T0000"]:
-            (tmp_path / name).mkdir()
-
-        unload_interim_adapters(model, tmp_path)
-
+        assert deleted == ["episodic_interim_20260101T0000", "episodic_interim_20260102T0000"]
+        assert "episodic_interim_20260101T0000" not in model.peft_config
+        assert "episodic_interim_20260102T0000" not in model.peft_config
         assert "episodic" in model.peft_config
-        assert "semantic" in model.peft_config
-        assert "procedural" in model.peft_config
+        assert not dir_a.exists()
+        assert not dir_b.exists()
 
-    def test_interim_names_absent_from_peft_config_after_unload(self, tmp_path: Path) -> None:
-        """After unload, no episodic_interim_* key remains in peft_config."""
+    def test_disk_venue_reaps_the_identical_directories_with_a_bare_model(
+        self, tmp_path: Path
+    ) -> None:
+        """The disk venue's ``self.model`` is a bare base model, not a
+        PeftModel — the on-disk reap is unconditional and untouched by that
+        difference: the same directories disappear, only the returned
+        (PEFT) name list is empty."""
+        from paramem.memory.interim_adapter import unload_interim_adapters
+
+        adapter_dir = tmp_path / "adapters"
+        dir_a = _seed_interim_dir(adapter_dir, "20260101T0000")
+        dir_b = _seed_interim_dir(adapter_dir, "20260102T0000")
+
+        deleted = unload_interim_adapters(object(), adapter_dir)
+
+        assert deleted == []
+        assert not dir_a.exists()
+        assert not dir_b.exists()
+
+
+class TestUnloadInterimAdaptersPeftHalfSkip:
+    """A non-``PeftModel`` model (bare base model, or ``None``) skips the
+    PEFT half entirely — never touches ``peft_config``/``delete_adapter``,
+    which a bare object does not even carry."""
+
+    def test_bare_object_model_never_raises_and_returns_no_names(self, tmp_path: Path) -> None:
+        from paramem.memory.interim_adapter import unload_interim_adapters
+
+        adapter_dir = tmp_path / "adapters"
+        _seed_interim_dir(adapter_dir, "20260101T0000")
+
+        deleted = unload_interim_adapters(object(), adapter_dir)
+
+        assert deleted == []
+
+    def test_none_model_never_raises_and_returns_no_names(self, tmp_path: Path) -> None:
+        from paramem.memory.interim_adapter import unload_interim_adapters
+
+        adapter_dir = tmp_path / "adapters"
+        _seed_interim_dir(adapter_dir, "20260101T0000")
+
+        deleted = unload_interim_adapters(None, adapter_dir)
+
+        assert deleted == []
+
+
+class TestUnloadInterimAdaptersSwitchBeforeDeleteDeterminism:
+    """The active adapter moves onto a resident survivor before any interim
+    adapter is deleted — pinned here at ``unload_interim_adapters``'s own
+    call boundary (its interim-name filter feeding ``detach_adapters``),
+    distinct from ``TestDetachAdapters`` above, which pins the survivor
+    selection logic itself."""
+
+    def test_set_adapter_precedes_every_delete_adapter_call(self, tmp_path: Path) -> None:
+        from paramem.memory.interim_adapter import unload_interim_adapters
+
+        adapter_dir = tmp_path / "adapters"
+        _seed_interim_dir(adapter_dir, "20260101T0000")
+        _seed_interim_dir(adapter_dir, "20260102T0000")
         model = _make_stub_peft_model(
             "episodic",
             "semantic",
-            "procedural",
-            "episodic_interim_20260417T0000",
-            "episodic_interim_20260418T0000",
-        )
-        for name in ["episodic_interim_20260417T0000", "episodic_interim_20260418T0000"]:
-            (tmp_path / name).mkdir()
-
-        unload_interim_adapters(model, tmp_path)
-
-        remaining_interim_keys = [k for k in model.peft_config if k.startswith("episodic_interim_")]
-        assert remaining_interim_keys == []
-
-    def test_on_disk_interim_dirs_removed(self, tmp_path: Path) -> None:
-        """On-disk interim dirs (under episodic/) are deleted by unload."""
-        model = _make_stub_peft_model(
-            "episodic",
-            "semantic",
-            "procedural",
-            "episodic_interim_20260417T0000",
-            "episodic_interim_20260418T0000",
-        )
-        # 2026-05-14 hierarchy: interim dirs live under episodic/interim_<stamp>/.
-        interim_dirs = []
-        episodic_root = tmp_path / "episodic"
-        episodic_root.mkdir()
-        for stamp in ("20260417T0000", "20260418T0000"):
-            d = episodic_root / f"interim_{stamp}"
-            d.mkdir()
-            interim_dirs.append(d)
-
-        unload_interim_adapters(model, tmp_path)
-
-        for d in interim_dirs:
-            assert not d.exists(), f"Expected {d} to be deleted but it still exists"
-
-    def test_main_adapter_dirs_not_removed(self, tmp_path: Path) -> None:
-        """Directories named episodic / semantic / procedural are left on disk."""
-        model = _make_stub_peft_model(
-            "episodic",
-            "semantic",
-            "procedural",
-            "episodic_interim_20260417T0000",
-        )
-        (tmp_path / "episodic").mkdir()
-        (tmp_path / "semantic").mkdir()
-        (tmp_path / "procedural").mkdir()
-        (tmp_path / "episodic_interim_20260417T0000").mkdir()
-
-        unload_interim_adapters(model, tmp_path)
-
-        assert (tmp_path / "episodic").exists()
-        assert (tmp_path / "semantic").exists()
-        assert (tmp_path / "procedural").exists()
-
-    def test_delete_adapter_called_for_each_interim(self, tmp_path: Path) -> None:
-        """model.delete_adapter is invoked once per interim adapter name."""
-        model = _make_stub_peft_model(
-            "episodic",
-            "semantic",
-            "procedural",
-            "episodic_interim_20260417T0000",
-            "episodic_interim_20260418T0000",
-        )
-        for name in ["episodic_interim_20260417T0000", "episodic_interim_20260418T0000"]:
-            (tmp_path / name).mkdir()
-
-        unload_interim_adapters(model, tmp_path)
-
-        deleted_names = [c.args[0] for c in model.delete_adapter.call_args_list]
-        assert sorted(deleted_names) == [
-            "episodic_interim_20260417T0000",
-            "episodic_interim_20260418T0000",
-        ]
-
-    def test_switches_to_episodic_before_first_delete(self, tmp_path: Path) -> None:
-        """set_adapter("episodic") is called BEFORE any delete_adapter call —
-        the post-delete active adapter must be deterministic (PEFT silently
-        reassigns the active adapter to whatever it meets first when the
-        deleted one was active)."""
-        model = _make_stub_peft_model(
-            "episodic",
-            "semantic",
-            "procedural",
-            "episodic_interim_20260417T0000",
-            "episodic_interim_20260418T0000",
-        )
-        for name in ["episodic_interim_20260417T0000", "episodic_interim_20260418T0000"]:
-            (tmp_path / name).mkdir()
-
-        call_order: list[str] = []
-        model.set_adapter.side_effect = lambda name: call_order.append(f"set_adapter:{name}")
-        model.delete_adapter.side_effect = lambda name: call_order.append(f"delete_adapter:{name}")
-
-        unload_interim_adapters(model, tmp_path)
-
-        assert call_order[0] == "set_adapter:episodic"
-        assert call_order.count("set_adapter:episodic") == 1
-        delete_calls = [c for c in call_order if c.startswith("delete_adapter:")]
-        assert len(delete_calls) == 2
-        # The switch precedes every delete, not just the first.
-        assert call_order.index("set_adapter:episodic") < min(
-            call_order.index(c) for c in delete_calls
+            "episodic_interim_20260101T0000",
+            "episodic_interim_20260102T0000",
         )
 
-    def test_falls_through_to_semantic_when_episodic_absent(self, tmp_path: Path) -> None:
-        """When "episodic" is not resident, the survivor search (delegated to
-        detach_adapters) falls through to the next main tier ("semantic")
-        rather than skipping the switch — the deletes still run."""
-        model = _make_stub_peft_model(
-            "semantic",
-            "procedural",
-            "episodic_interim_20260417T0000",
-        )
-        (tmp_path / "episodic_interim_20260417T0000").mkdir()
+        unload_interim_adapters(model, adapter_dir)
 
-        unload_interim_adapters(model, tmp_path)
+        call_names = [c[0] for c in model.mock_calls]
+        switch_index = call_names.index("set_adapter")
+        delete_indices = [i for i, name in enumerate(call_names) if name == "delete_adapter"]
+        assert delete_indices, "delete_adapter must have been called at least once"
+        assert switch_index < min(delete_indices)
+        model.set_adapter.assert_called_once_with("episodic")
 
-        model.set_adapter.assert_called_once_with("semantic")
-        model.delete_adapter.assert_called_once_with("episodic_interim_20260417T0000")
+    def test_post_reap_active_adapter_is_deterministic_regardless_of_prior_active(
+        self, tmp_path: Path
+    ) -> None:
+        """The switch runs unconditionally whenever a survivor exists, not
+        only when the pre-call active adapter happens to be an interim one —
+        so two calls starting from different active adapters converge on the
+        identical survivor."""
+        from paramem.memory.interim_adapter import unload_interim_adapters
 
-    def test_whole_ring_reap_removes_stray_malformed_stamp_dir(self, tmp_path: Path) -> None:
-        """A stray ``interim_*`` directory whose stamp suffix isn't a
-        well-formed stamp (e.g. ``interim_garbage/``) is still removed by the
-        whole-ring reap — ``iter_interim_dirs`` yields it regardless of stamp
-        validity, and the delegated reap (``reap_tier_artifacts``) must
-        consume that exact path rather than re-deriving it via
-        ``interim_dir_for_name``, which raises on a malformed stamp."""
-        model = _make_stub_peft_model(
-            "episodic",
-            "semantic",
-            "procedural",
-            "episodic_interim_20260417T0000",
-        )
-        episodic_root = tmp_path / "episodic"
-        episodic_root.mkdir()
-        valid_dir = episodic_root / "interim_20260417T0000"
-        valid_dir.mkdir()
-        malformed_dir = episodic_root / "interim_garbage"
-        malformed_dir.mkdir()
-        (malformed_dir / "adapter_config.json").write_text("{}")
+        adapter_dir_a = tmp_path / "adapters_a"
+        _seed_interim_dir(adapter_dir_a, "20260101T0000")
+        model_a = _make_stub_peft_model("episodic", "semantic", "episodic_interim_20260101T0000")
+        model_a.active_adapter = "episodic_interim_20260101T0000"
 
-        unloaded = unload_interim_adapters(model, tmp_path)
+        adapter_dir_b = tmp_path / "adapters_b"
+        _seed_interim_dir(adapter_dir_b, "20260101T0000")
+        model_b = _make_stub_peft_model("episodic", "semantic", "episodic_interim_20260101T0000")
+        model_b.active_adapter = "semantic"
 
-        assert unloaded == ["episodic_interim_20260417T0000"]
-        assert not valid_dir.exists()
-        assert not malformed_dir.exists()
+        unload_interim_adapters(model_a, adapter_dir_a)
+        unload_interim_adapters(model_b, adapter_dir_b)
 
-
-# ---------------------------------------------------------------------------
-# Test 5 — unload_interim_adapters when no interim adapters present
-# ---------------------------------------------------------------------------
-
-
-class TestUnloadInterimAdaptersWhenNonePresent:
-    def test_returns_empty_list(self, tmp_path: Path) -> None:
-        """When no interim adapters exist, unload returns an empty list."""
-        model = _make_stub_peft_model("episodic", "semantic", "procedural")
-        result = unload_interim_adapters(model, tmp_path)
-        assert result == []
-
-    def test_delete_adapter_not_called(self, tmp_path: Path) -> None:
-        """When no interim adapters are present, delete_adapter is never called."""
-        model = _make_stub_peft_model("episodic", "semantic", "procedural")
-        unload_interim_adapters(model, tmp_path)
-        model.delete_adapter.assert_not_called()
-
-    def test_no_error_on_empty_adapter_dir(self, tmp_path: Path) -> None:
-        """An empty adapter_dir must not raise any exception."""
-        model = _make_stub_peft_model("episodic", "semantic", "procedural")
-        unload_interim_adapters(model, tmp_path)
-
-    def test_peft_config_unchanged_when_no_interims(self, tmp_path: Path) -> None:
-        """peft_config retains all main adapters when there is nothing to unload."""
-        model = _make_stub_peft_model("episodic", "semantic", "procedural")
-        unload_interim_adapters(model, tmp_path)
-        assert set(model.peft_config.keys()) == {"episodic", "semantic", "procedural"}
+        model_a.set_adapter.assert_called_once_with("episodic")
+        model_b.set_adapter.assert_called_once_with("episodic")
 
 
 # ---------------------------------------------------------------------------
@@ -834,361 +748,6 @@ class TestCurrentInterimStampWithCadence:
 
 
 # ---------------------------------------------------------------------------
-# Test 8 — main_tier_backup_scope (paramem.models.loader)
-# ---------------------------------------------------------------------------
-
-
-def _configure_backup_mock(
-    model: MagicMock, *adapter_names: str, weights: dict | None = None
-) -> None:
-    """Configure a MagicMock as a minimal PeftModel-like stub in place.
-
-    ``peft_config``/``weights`` are plain dicts so the patched
-    create_adapter/copy_adapter_weights fakes below can mutate them
-    directly.  ``delete_adapter`` raises if asked to delete the currently
-    active adapter, mirroring PEFT's real hazard — the CM must always
-    switch active off a backup before deleting it.
-    """
-    model.peft_config = {name: MagicMock() for name in adapter_names}
-    model.weights = dict(weights) if weights is not None else dict.fromkeys(adapter_names, "orig")
-    model.active_adapter = adapter_names[0] if adapter_names else None
-    model.set_adapter_calls: list[str] = []
-    model.delete_adapter_calls: list[str] = []
-
-    def _set_adapter(name: str) -> None:
-        if name not in model.peft_config:
-            raise KeyError(name)
-        model.active_adapter = name
-        model.set_adapter_calls.append(name)
-
-    def _delete_adapter(name: str) -> None:
-        if name == model.active_adapter:
-            raise RuntimeError(f"cannot delete active adapter {name!r} without switching first")
-        del model.peft_config[name]
-        model.weights.pop(name, None)
-        model.delete_adapter_calls.append(name)
-
-    model.set_adapter.side_effect = _set_adapter
-    model.delete_adapter.side_effect = _delete_adapter
-
-
-def _make_backup_model(*adapter_names: str, weights: dict | None = None) -> MagicMock:
-    """Build a MagicMock configured as a PeftModel-like stub.
-
-    ``__class__`` is reassigned to PeftModel so ``isinstance(model,
-    PeftModel)`` passes — the same pattern used across this test suite
-    (e.g. ``test_procedural.py``).  Mock's own permissive attribute
-    machinery (not PeftModel's ``peft_config`` property descriptor) still
-    handles every read/write, since ``type(model)`` stays ``MagicMock``;
-    only ``isinstance`` is fooled.
-    """
-    from peft import PeftModel
-
-    model = MagicMock()
-    _configure_backup_mock(model, *adapter_names, weights=weights)
-    model.__class__ = PeftModel  # satisfies main_tier_backup_scope's runtime contract check
-    return model
-
-
-def _fake_create_adapter(model, config, name):  # noqa: ANN001
-    """Fake paramem.models.loader.create_adapter — mints a zero-init slot."""
-    model.peft_config[name] = config
-    model.weights[name] = "zero-init"
-    model.set_adapter(name)
-    return model
-
-
-def _fake_copy_adapter_weights(model, src, dst):  # noqa: ANN001
-    """Fake paramem.models.loader.copy_adapter_weights — copies the weight marker."""
-    model.weights[dst] = model.weights[src]
-
-
-class TestMainTierBackupScope:
-    """Unit tests for main_tier_backup_scope (paramem.models.loader).
-
-    Fake PeftModel (dict-like peft_config, stub delete_adapter/set_adapter),
-    monkeypatched create_adapter/copy_adapter_weights — no GPU.  Mirrors the
-    production caller: consolidation.py's _run_fold main_tiers branch.
-    """
-
-    def _configs(self) -> dict:
-        return {"episodic": MagicMock(), "semantic": MagicMock(), "procedural": MagicMock()}
-
-    def test_cleanup_on_success(self) -> None:
-        """A clean exit leaves no *_backup adapter resident."""
-        model = _make_backup_model("episodic", "semantic", "procedural")
-        with (
-            patch("paramem.models.loader.create_adapter", side_effect=_fake_create_adapter),
-            patch(
-                "paramem.models.loader.copy_adapter_weights",
-                side_effect=_fake_copy_adapter_weights,
-            ),
-        ):
-            with main_tier_backup_scope(model, self._configs()) as scope:
-                assert "episodic_backup" in scope.model.peft_config
-                assert "semantic_backup" in scope.model.peft_config
-                assert "procedural_backup" in scope.model.peft_config
-
-        assert [k for k in model.peft_config if k.endswith("_backup")] == []
-
-    def test_cleanup_on_aborted_during_consolidation(self) -> None:
-        """AbortedDuringConsolidation propagates unchanged; backups are freed."""
-        from paramem.training.consolidation import AbortedDuringConsolidation
-
-        model = _make_backup_model("episodic", "semantic", "procedural")
-        with (
-            patch("paramem.models.loader.create_adapter", side_effect=_fake_create_adapter),
-            patch(
-                "paramem.models.loader.copy_adapter_weights",
-                side_effect=_fake_copy_adapter_weights,
-            ),
-        ):
-            with pytest.raises(AbortedDuringConsolidation):
-                with main_tier_backup_scope(model, self._configs()):
-                    raise AbortedDuringConsolidation("training aborted on tier 'episodic'")
-
-        assert [k for k in model.peft_config if k.endswith("_backup")] == []
-
-    def test_finally_teardown_failure_does_not_mask_in_flight_exception(self) -> None:
-        """A delete_adapter failure during the finally teardown must not
-        replace the in-flight exception — AbortedDuringConsolidation still
-        propagates unchanged (not the teardown RuntimeError), and every
-        OTHER backup is still cleaned up despite one delete failing."""
-        from paramem.training.consolidation import AbortedDuringConsolidation
-
-        model = _make_backup_model("episodic", "semantic", "procedural")
-        real_delete_fn = model.delete_adapter.side_effect
-
-        def _delete(name):
-            if name == "semantic_backup":
-                raise RuntimeError("delete_adapter exploded for semantic_backup")
-            real_delete_fn(name)
-
-        model.delete_adapter = _delete
-
-        with (
-            patch("paramem.models.loader.create_adapter", side_effect=_fake_create_adapter),
-            patch(
-                "paramem.models.loader.copy_adapter_weights",
-                side_effect=_fake_copy_adapter_weights,
-            ),
-        ):
-            with pytest.raises(AbortedDuringConsolidation):
-                with main_tier_backup_scope(model, self._configs()):
-                    raise AbortedDuringConsolidation("training aborted on tier 'episodic'")
-
-        # episodic_backup and procedural_backup deleted fine; semantic_backup's
-        # delete failure is logged and swallowed, never raised — a leaked
-        # backup is preferable to a misrouted abort.
-        assert "episodic_backup" not in model.peft_config
-        assert "procedural_backup" not in model.peft_config
-        assert "semantic_backup" in model.peft_config
-
-    def test_cleanup_on_generic_runtime_error(self) -> None:
-        """A generic RuntimeError also propagates unchanged; backups are freed."""
-        model = _make_backup_model("episodic", "semantic", "procedural")
-        with (
-            patch("paramem.models.loader.create_adapter", side_effect=_fake_create_adapter),
-            patch(
-                "paramem.models.loader.copy_adapter_weights",
-                side_effect=_fake_copy_adapter_weights,
-            ),
-        ):
-            with pytest.raises(RuntimeError, match="boom"):
-                with main_tier_backup_scope(model, self._configs()):
-                    raise RuntimeError("boom")
-
-        assert [k for k in model.peft_config if k.endswith("_backup")] == []
-
-    def test_restore_fires_before_delete_for_both_exception_kinds(self) -> None:
-        """Restore (backup→tier copy) happens for every snapshotted tier BEFORE
-        the backup-delete loop, for both AbortedDuringConsolidation and a
-        generic exception."""
-        from paramem.training.consolidation import AbortedDuringConsolidation
-
-        for exc_cls in (AbortedDuringConsolidation, RuntimeError):
-            model = _make_backup_model("episodic", "semantic", "procedural")
-            call_order: list[tuple] = []
-
-            def _create(m, config, name, _order=call_order):  # noqa: ANN001
-                m.peft_config[name] = config
-                m.weights[name] = "zero-init"
-                m.set_adapter(name)
-                return m
-
-            def _copy(m, src, dst, _order=call_order):  # noqa: ANN001
-                _order.append(("copy", src, dst))
-                m.weights[dst] = m.weights[src]
-
-            real_delete = model.delete_adapter
-
-            def _delete(name, _order=call_order, _real=real_delete):  # noqa: ANN001
-                _order.append(("delete", name))
-                _real(name)
-
-            model.delete_adapter = _delete
-
-            with (
-                patch("paramem.models.loader.create_adapter", side_effect=_create),
-                patch("paramem.models.loader.copy_adapter_weights", side_effect=_copy),
-            ):
-                with pytest.raises(exc_cls):
-                    with main_tier_backup_scope(model, self._configs()):
-                        raise exc_cls("boom")
-
-            restore_calls = [c for c in call_order if c[0] == "copy" and c[1].endswith("_backup")]
-            delete_calls = [c for c in call_order if c[0] == "delete"]
-            assert restore_calls, f"no restore fired for {exc_cls}"
-            assert delete_calls, f"no delete fired for {exc_cls}"
-            last_restore_index = max(call_order.index(c) for c in restore_calls)
-            first_delete_index = min(call_order.index(c) for c in delete_calls)
-            assert last_restore_index < first_delete_index, (
-                f"restore must complete before any backup delete for {exc_cls}: {call_order}"
-            )
-
-    def test_no_restore_on_success(self) -> None:
-        """A clean exit performs no backup→tier restore copy."""
-        model = _make_backup_model("episodic", "semantic", "procedural")
-        copy_calls: list[tuple] = []
-
-        def _copy(m, src, dst):  # noqa: ANN001
-            copy_calls.append((src, dst))
-            m.weights[dst] = m.weights[src]
-
-        with (
-            patch("paramem.models.loader.create_adapter", side_effect=_fake_create_adapter),
-            patch("paramem.models.loader.copy_adapter_weights", side_effect=_copy),
-        ):
-            with main_tier_backup_scope(model, self._configs()):
-                pass
-
-        restore_calls = [c for c in copy_calls if c[0].endswith("_backup")]
-        assert restore_calls == []
-
-    def test_stale_backup_discarded_and_resnapshotted(self) -> None:
-        """A leaked pre-existing backup is deleted and re-created from the
-        CURRENT tier weights on entry — never left stale to clobber a later
-        restore."""
-        model = _make_backup_model(
-            "episodic",
-            "semantic",
-            "procedural",
-            "episodic_backup",
-            weights={
-                "episodic": "current",
-                "semantic": "current",
-                "procedural": "current",
-                "episodic_backup": "STALE",
-            },
-        )
-        model.active_adapter = "episodic"
-
-        with (
-            patch("paramem.models.loader.create_adapter", side_effect=_fake_create_adapter),
-            patch(
-                "paramem.models.loader.copy_adapter_weights",
-                side_effect=_fake_copy_adapter_weights,
-            ),
-        ):
-            with main_tier_backup_scope(model, self._configs()) as scope:
-                assert scope.model.weights["episodic_backup"] == "current", (
-                    "stale backup must be discarded and re-snapshotted from the live tier"
-                )
-
-    def test_never_deletes_active_adapter_and_never_empties_peft_config(self) -> None:
-        """Active is always switched to a main tier before any backup delete;
-        peft_config never drops below the 3 main tiers."""
-        model = _make_backup_model("episodic", "semantic", "procedural")
-        min_size: list[int] = []
-        real_delete = model.delete_adapter
-
-        def _delete(name, _real=real_delete):  # noqa: ANN001
-            _real(name)  # raises if name is still active — the invariant under test
-            min_size.append(len(model.peft_config))
-
-        model.delete_adapter = _delete
-
-        with (
-            patch("paramem.models.loader.create_adapter", side_effect=_fake_create_adapter),
-            patch(
-                "paramem.models.loader.copy_adapter_weights",
-                side_effect=_fake_copy_adapter_weights,
-            ),
-        ):
-            with main_tier_backup_scope(model, self._configs()) as scope:
-                # Leave active on a backup right before exit — the CM's finally
-                # must move it back to a main tier before deleting anything.
-                scope.model.set_adapter("procedural_backup")
-
-        assert min_size, "expected at least one backup delete"
-        assert all(size >= 3 for size in min_size), (
-            "peft_config must never drop below the 3 main tiers"
-        )
-        assert model.active_adapter in ("episodic", "semantic", "procedural")
-
-    def test_partial_enter_double_fault_preserves_original_exception(self) -> None:
-        """tier-2's enter copy_adapter_weights raises: tier-1's backup is
-        cleaned up, tier-2's half-populated backup is cleaned up (never
-        restored — it was never snapshotted), the with body never runs, and
-        the ORIGINAL exception type propagates unchanged."""
-        model = _make_backup_model("episodic", "semantic", "procedural")
-        restore_calls: list[tuple] = []
-
-        def _copy(m, src, dst):  # noqa: ANN001
-            restore_calls.append((src, dst))
-            if dst == "semantic_backup":
-                raise RuntimeError("copy failed for semantic_backup")
-            m.weights[dst] = m.weights.get(src, "orig")
-
-        body_ran = False
-
-        with (
-            patch("paramem.models.loader.create_adapter", side_effect=_fake_create_adapter),
-            patch("paramem.models.loader.copy_adapter_weights", side_effect=_copy),
-        ):
-            with pytest.raises(RuntimeError, match="copy failed for semantic_backup"):
-                with main_tier_backup_scope(model, self._configs()):
-                    body_ran = True
-
-        assert not body_ran, "the with body must not run when __enter__ itself fails"
-        # tier-2 (semantic) was never snapshotted — no restore copy targeting
-        # "semantic" (dst) with src="semantic_backup" may have fired.
-        assert ("semantic_backup", "semantic") not in restore_calls
-        # Both the tier-1 backup and the half-populated tier-2 backup are freed.
-        assert [k for k in model.peft_config if k.endswith("_backup")] == []
-
-    def test_create_adapter_return_value_captured(self) -> None:
-        """scope.model reflects whatever create_adapter returns, even a new object.
-
-        ``replacement`` is a plain (non-PeftModel-classed) MagicMock — the CM
-        never re-checks isinstance after entry, only reads/writes attributes
-        on whatever ``create_adapter`` hands back.
-        """
-        model = _make_backup_model("episodic")
-        replacement = MagicMock()
-        _configure_backup_mock(replacement, "episodic")
-        replacement.peft_config = model.peft_config
-        replacement.weights = model.weights
-
-        def _create_new_object(m, config, name):  # noqa: ANN001
-            m.peft_config[name] = config
-            m.weights[name] = "zero-init"
-            replacement.set_adapter(name)
-            return replacement
-
-        with (
-            patch("paramem.models.loader.create_adapter", side_effect=_create_new_object),
-            patch(
-                "paramem.models.loader.copy_adapter_weights",
-                side_effect=_fake_copy_adapter_weights,
-            ),
-        ):
-            with main_tier_backup_scope(model, self._configs(), tiers=("episodic",)) as scope:
-                assert scope.model is replacement
-                assert scope.model is not model
-
-
-# ---------------------------------------------------------------------------
 # detect_legacy_adapter_layout
 # ---------------------------------------------------------------------------
 
@@ -1320,83 +879,97 @@ class TestIterTierRoots:
         assert donor_name in donor_names
         assert donor_name not in tier_names
 
-    def test_every_tier_walk_agrees(self, tmp_path: Path) -> None:
-        """iter_tier_roots, MemoryStore's registry-path walk, and the
-        integrity checker's tier enumeration all name the same tier set —
-        and none of them ever names the donor store.
 
-        iter_tier_roots and MemoryStore._iter_tier_registry_paths are
-        compared as ORDERED lists — MemoryStore delegates straight to
-        iter_tier_roots, so mains-before-interims (and interim stamp order)
-        must match exactly, not just as a set. The integrity checker builds
-        its own tiers_to_check from the same walk but also folds in store
-        tiers and cross-consistency checks, so its surface is compared as a
-        set.
-        """
-        built = _build_sample_adapter_tree(tmp_path)
-        donor_name = built["donor_dir"].name
+class TestIterInterimDirsPayloadOnlyVenueParity:
+    """``payload_only=True`` is venue-blind: a candidate slot is "a
+    subdirectory carrying its own meta.json" (``count_slot_candidates``),
+    checked identically for a train payload or a simulate payload -- the
+    schedule gate never asks which venue it is in."""
 
-        expected_order = [
-            *MAIN_TIERS,
-            "episodic_interim_20260417T0000",
-            "episodic_interim_20260418T0000",
-        ]
+    def _write_slot(self, adapter_dir: Path, stamp: str, *, payload_filename: str) -> None:
+        family = adapter_dir / "episodic" / f"interim_{stamp}"
+        slot = family / f"{stamp}-slot"
+        slot.mkdir(parents=True, exist_ok=True)
+        (slot / "meta.json").write_text("{}")
+        (slot / payload_filename).write_bytes(b"")
 
-        iter_tier_names = [name for name, _ in iter_tier_roots(tmp_path)]
-        store_tier_names = [name for name, _ in MemoryStore._iter_tier_registry_paths(tmp_path)]
+    def test_interim_payload_count_is_the_same_in_both_venues(self, tmp_path: Path) -> None:
+        train_dir = tmp_path / "train"
+        simulate_dir = tmp_path / "simulate"
+        payload_stamps = ["20260101T0000", "20260102T0000", "20260103T0000"]
+        for stamp in payload_stamps:
+            self._write_slot(train_dir, stamp, payload_filename="adapter_model.safetensors")
+            self._write_slot(simulate_dir, stamp, payload_filename="graph.json")
 
-        from paramem.backup.integrity import verify_infrastructure_integrity
+        # An extra empty-shell family (crashed between mkdir and the payload
+        # write) in BOTH trees, excluded identically by either venue.
+        empty_stamp = "20260104T0000"
+        (train_dir / "episodic" / f"interim_{empty_stamp}").mkdir(parents=True)
+        (simulate_dir / "episodic" / f"interim_{empty_stamp}").mkdir(parents=True)
 
-        cfg = MagicMock()
-        cfg.adapter_dir = tmp_path
-        cfg.consolidation.mode = "train"
-        cfg.key_metadata_path = tmp_path / "registry" / "key_metadata.json"
-        cfg.paths.data = tmp_path / "data"
-        report = verify_infrastructure_integrity(cfg, daily_loadable=False)
-        integrity_tier_names = {c.tier for c in report.checks if c.category == "registry"}
+        train_payload_bearing = list(iter_interim_dirs(train_dir, payload_only=True))
+        simulate_payload_bearing = list(iter_interim_dirs(simulate_dir, payload_only=True))
 
-        assert iter_tier_names == expected_order
-        assert store_tier_names == expected_order
-        assert integrity_tier_names == set(expected_order)
+        assert len(train_payload_bearing) == len(simulate_payload_bearing) == len(payload_stamps)
+        assert {name for name, _ in train_payload_bearing} == {
+            name for name, _ in simulate_payload_bearing
+        }
 
-        assert donor_name not in iter_tier_names
-        assert donor_name not in store_tier_names
-        assert donor_name not in integrity_tier_names
 
-    def test_absent_main_tier_dir_still_named_everywhere(self, tmp_path: Path) -> None:
-        """A main tier with no on-disk directory (never trained) is still
-        named by every walk — main tiers are named literally by
-        iter_tier_roots regardless of existence, and
-        verify_infrastructure_integrity records a ``skipped`` registry check
-        for it rather than omitting it (``paramem/backup/integrity.py``:
-        ``if not tier_root.exists(): checks.append(FileCheck(..., _SKIPPED,
-        ""))`` — the tier name is still recorded, only the status differs
-        from a present tier)."""
-        built = _build_sample_adapter_tree(tmp_path, main_tiers=("episodic", "semantic"))
-        donor_name = built["donor_dir"].name
+class TestHasUnboundPayloadSkipsDotDirs:
+    """An interrupted write's mid-write staging directory (``.pending/<ts>/<payload>``)
+    is scratch, not a torn slot -- ``has_unbound_payload`` must never read it
+    as unbound debris (a false ``torn_slot`` incident at the next backup
+    capture)."""
 
-        assert not (tmp_path / "procedural").exists()
+    def test_payload_only_under_pending_reports_no_unbound_payload(self, tmp_path: Path) -> None:
+        tier_root = tmp_path / "episodic"
+        pending_slot = tier_root / ".pending" / "20260101-000000"
+        pending_slot.mkdir(parents=True)
+        (pending_slot / "graph.json").write_bytes(b"{}")
+        (pending_slot / "meta.json").write_bytes(b"{}")
 
-        iter_tier_names = [name for name, _ in iter_tier_roots(tmp_path)]
-        store_tier_names = [name for name, _ in MemoryStore._iter_tier_registry_paths(tmp_path)]
+        assert has_unbound_payload(tier_root) is False
 
-        assert "procedural" in iter_tier_names
-        assert "procedural" in store_tier_names
+    def test_payload_outside_pending_still_reports_unbound_payload(self, tmp_path: Path) -> None:
+        """Control: a payload file NOT under a dot-prefixed directory is
+        still detected -- the fix narrows the predicate, it does not
+        disable it."""
+        tier_root = tmp_path / "episodic"
+        stray_slot = tier_root / "20260101-000000"
+        stray_slot.mkdir(parents=True)
+        (stray_slot / "graph.json").write_bytes(b"{}")
 
-        from paramem.backup.integrity import verify_infrastructure_integrity
+        assert has_unbound_payload(tier_root) is True
 
-        cfg = MagicMock()
-        cfg.adapter_dir = tmp_path
-        cfg.consolidation.mode = "train"
-        cfg.key_metadata_path = tmp_path / "registry" / "key_metadata.json"
-        cfg.paths.data = tmp_path / "data"
-        report = verify_infrastructure_integrity(cfg, daily_loadable=False)
-        registry_checks = {c.tier: c.status for c in report.checks if c.category == "registry"}
 
-        assert registry_checks.get("procedural") == "skipped"
-        assert registry_checks.get("episodic") == "ok"
-        assert registry_checks.get("semantic") == "ok"
+class TestHasUnboundPayloadVenueAndInterimScope:
+    """``has_unbound_payload``'s interim-prune and venue-blind detection
+    (paramem/memory/interim_adapter.py:183-236)."""
 
-        assert donor_name not in iter_tier_names
-        assert donor_name not in store_tier_names
-        assert donor_name not in registry_checks
+    def test_payload_only_inside_an_interim_child_reports_no_unbound_payload(
+        self, tmp_path: Path
+    ) -> None:
+        """A main tier root whose only payload sits inside an
+        interim_<stamp>/ child reads as clean -- the scan prunes
+        interim_* children before descending, so a sibling interim
+        slot's own debris never satisfies the MAIN tier's signal."""
+        tier_root = tmp_path / "episodic"
+        interim_slot = tier_root / "interim_20260101T0000" / "20260101-000000"
+        interim_slot.mkdir(parents=True)
+        (interim_slot / "graph.json").write_bytes(b"{}")
+
+        assert has_unbound_payload(tier_root) is False
+
+    def test_train_payload_with_no_graph_json_anywhere_reports_unbound_payload(
+        self, tmp_path: Path
+    ) -> None:
+        """A stray adapter_model.safetensors payload is detected even with
+        no graph.json anywhere beneath -- has_unbound_payload is
+        venue-blind (a train payload counts equally to a simulate one)."""
+        tier_root = tmp_path / "episodic"
+        stray_slot = tier_root / "20260101-000000"
+        stray_slot.mkdir(parents=True)
+        (stray_slot / payload_filename("train")).write_bytes(b"")
+
+        assert has_unbound_payload(tier_root) is True

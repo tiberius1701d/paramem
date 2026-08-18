@@ -40,7 +40,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 # Migration / backup imports at module level so tests can patch them.
-from paramem.backup.backup import enforce_disk_cap, write_bundle
+from paramem.backup.backup import enforce_disk_cap, read_bundle_manifest, write_bundle
 from paramem.backup.backup import write as backup_write
 from paramem.backup.types import ArtifactKind, DiskCapExceeded
 from paramem.cloud.providers import get_cloud_agent
@@ -101,12 +101,11 @@ from paramem.server.vram_validator import (
     format_baseline_fit,
 )
 from paramem.training.consolidation import (
-    AbortedDuringConsolidation,
     ActiveKeyHydrationFailure,
-    FoldAccountingRefusal,
     RecallGateRejected,
-    RegistryBookkeepingDivergence,
+    interim_outcome_label,
 )
+from paramem.training.stage_ledger import data_state_dir
 from paramem.training.thermal_throttle import ThermalPolicy, wait_for_cooldown
 from paramem.utils import systemctl
 from paramem.utils.identity import canonical as _canonical
@@ -150,14 +149,24 @@ _state = {
     "ha_client": None,
     "consolidation_loop": None,
     "memory_store": None,
-    # Set to a BootDegraded dict when ``inference.preload_cache=True`` and the
-    # lifespan preload could not materialise every active key.  Recall is
-    # unaffected — the inference path probes the weights on a cache miss
-    # (``MemoryStore.probe`` on-miss source delegation); only first-recall
-    # latency is paid until the cache re-warms.  Surfaced in the /status
-    # attention block; cleared on full hydration, on preload_cache=False
-    # (intentional opt-out), and on a successful live apply.
-    "boot_degraded": None,
+    # True once the store-preload step (_hydrate_memory_store_in_place, via
+    # _build_store_contents) has cleanly completed for the CURRENT store
+    # object — where completion includes the boot fill exactly when
+    # inference.preload_cache=True and the venue can serve
+    # (source.train_venue_deferred's predicate).  A train-venue pass with no
+    # model resident leaves this False so the gate re-attempts on the next
+    # act with a model (see _build_runtime_components's re-probe gate). A
+    # shortfall in the fill itself is NOT a completeness failure — it is
+    # pure telemetry, recorded as a preload_recall_incomplete incident by
+    # _build_store_contents and surfaced via the generic incident attention
+    # collector; it never clears this flag.  Never invalidated by a GPU
+    # release — a cloud-only deferral does not invalidate the mirror.
+    "store_preload_complete": False,
+    # Set by _enter_store_quarantine when the boot/lift store step
+    # (_hydrate_memory_store_in_place) cannot publish a fresh MemoryStore —
+    # {"cause": {"exception_type", "message"}, "quarantined_at"}. ``None``
+    # when the store is healthy. Surfaced verbatim on StatusResponse.store_quarantined.
+    "store_quarantine": None,
     "consolidating": False,
     "last_consolidation": None,
     # NOTE: last_consolidation_error and last_consolidation_result are DERIVED
@@ -472,6 +481,21 @@ class StatusResponse(BaseModel):
     # interim ring is empty.  Used by the renderer to show the deadline
     # math for the next full consolidation.
     oldest_interim_stamp: str | None = None
+    # Memory-store quarantine state. ``None`` when the store is healthy
+    # (the boot/lift store step published it — see
+    # ``_hydrate_memory_store_in_place``). When set, the store failed its
+    # invariant (a bookkeeping-completeness violation, an unverified
+    # tier-registry binding, or any other non-CUDA hydration failure) and
+    # ``_state["memory_store"]`` is unset — every other subsystem (model,
+    # STT/TTS, HA, tri-path routing) keeps serving normally; only the
+    # parametric-memory recall arm is out (HA / cloud / abstention still
+    # answer chat). Shape: ``{"cause": {"exception_type", "message"},
+    # "quarantined_at"}``. The four consolidation endpoints, the
+    # ``/migration/confirm`` and ``/migration/accept`` trial doors,
+    # ``POST /speaker/forget``, and ``POST /interim/discard`` refuse with
+    # ``"store_quarantined"`` while this is set; admin endpoints (this one
+    # included) keep serving.
+    store_quarantined: dict | None = None
 
 
 class IntegrityCheckItem(BaseModel):
@@ -504,7 +528,8 @@ class ConsolidateResponse(BaseModel):
         What the request actually resolved to — ``"full"`` (the interim slots
         collapsed into main memory), ``"interim"`` (recent conversations
         absorbed into a new interim slot), ``"reconcile"`` (main memory rebuilt
-        from its own stored knowledge, interim slots left alone), or ``"auto"``
+        from its own stored knowledge — the same interim-ring absorption as a
+        full fold, with pending sessions left pending), or ``"auto"``
         when the dispatch was refused before the schedule could resolve it.
         ``POST /scheduled-tick`` is the only REST door that requests
         ``AUTO`` (the boot-completion catch-up task also requests it, but
@@ -644,15 +669,67 @@ class SpeakerForgetRequest(BaseModel):
 
     Note
     ----
-    There is exactly one erasure operation (hard erase — see
-    :func:`speaker_forget`'s docstring); it has no variant to select.
-    Discarding an interim slot wholesale (rather than erasing one speaker's
+    There is exactly one operation (a stale-mark that withholds the key
+    from serving immediately and is retired at its owning tier's own next
+    rebuild — see :func:`speaker_forget`'s docstring); it has no variant to
+    select.
+    Discarding an interim slot wholesale (rather than staling one speaker's
     keys within it) is a separate operation — ``POST /interim/discard``.
     Unrecognised fields in the request body are ignored (``extra="ignore"``),
     so a caller still sending a ``strategy`` field is unaffected.
     """
 
     speaker_id: str
+
+
+class TierRestampOutcome(BaseModel):
+    """One tier's outcome from an erase door's registry-mutation + rebind pass.
+
+    Shared response item for ``POST /speaker/forget`` and
+    ``POST /debug/erase-keys`` — both build their ``tiers`` list from
+    :func:`~paramem.memory.persistence.erase_keys_and_restamp_manifest`'s
+    per-tier :class:`~paramem.memory.persistence.RestampResult` (via the
+    shared :func:`_stale_mark_keys` sequence). The registry mutation for
+    every named tier already landed on disk regardless of ``outcome`` —
+    an erase door never refuses (see
+    :func:`~paramem.memory.persistence.erase_keys_and_restamp_manifest`'s
+    own docstring) — this model reports only whether the tier's slot
+    manifest was rebound to match.
+
+    Attributes
+    ----------
+    tier:
+        Tier (or interim slot) name.
+    outcome:
+        ``"rebound"`` — the mutation landed and, when the tier had
+        anything to bind, its slot manifest now matches. ``"unbound"`` —
+        the mutation landed but the tier's slot manifest could not be
+        rebound because :func:`~paramem.memory.persistence.plan_restamp`
+        found no legal target; see ``reason``. ``"rebind_failed"`` — the
+        mutation landed but an ``OSError`` or
+        :class:`~paramem.adapters.manifest.ManifestError` was raised while
+        attempting the rebind itself (a transient I/O failure, not a
+        planning refusal); ``reason`` carries the exception's message.
+        Both ``"unbound"`` and ``"rebind_failed"`` tiers will fail to bind
+        on the next boot/reload until a consolidation fold or registry
+        restore repairs them — surfaced via a ``tier_registry_unverified``
+        incident and an ERROR log line.
+    slot:
+        The rebound slot's path, only when ``outcome == "rebound"`` AND a
+        slot was actually re-stamped (a tier with nothing to bind has no
+        slot to report); ``None`` otherwise.
+    reason:
+        ``None`` when ``outcome == "rebound"``. When ``outcome ==
+        "unbound"``, one of :data:`~paramem.memory.persistence.KEYS_WITHOUT_SLOT`,
+        :data:`~paramem.memory.persistence.NO_PRE_WRITE_HASH`, or
+        :data:`~paramem.memory.persistence.SLOT_ORPHANED`. When
+        ``outcome == "rebind_failed"``, the caught exception's message.
+    """
+
+    tier: str
+    outcome: str
+    slot: "str | None" = None
+    reason: "str | None" = None
 
 
 class SpeakerForgetResponse(BaseModel):
@@ -664,38 +741,41 @@ class SpeakerForgetResponse(BaseModel):
         ``True`` when the speaker profile was found and removed from
         :class:`~paramem.server.speaker.SpeakerStore`.  ``False`` when the
         speaker ID was unknown to the store (no profile to delete).
-    erased_keys:
-        Indexed-memory keys that were removed from every per-tier
-        :class:`~paramem.training.key_registry.KeyRegistry` and their
-        corresponding SimHash entries — a hard erase, not a stale flip.
-        A tier that still holds other keys keeps its resident weights (they
-        decay only through a future training cycle or an operator-invoked
-        ``/reconsolidate``); a tier this erase reduced to zero known keys is
-        reaped immediately instead — see ``reaped_tiers``.
+    staled_keys:
+        Indexed-memory keys withheld in their owning tier's
+        :class:`~paramem.training.key_registry.KeyRegistry` — a marker that
+        reserves the id and carries no fingerprint (the active simhash does
+        not survive the transition), not a hard erase. Every named key is
+        immediately unreachable for serving (excluded from
+        ``list_active()``); its content and bookkeeping row leave with the
+        rest of the key at its owning tier's own next rebuild, when the key
+        is genuinely retired rather than merely withheld. A tier's rebuild
+        is a full consolidation or ``POST /reconsolidate`` (both rebuild
+        every main tier) or an interim cycle (rebuilds only the slot it
+        mints) — a tier no consolidation reaches keeps its markers
+        indefinitely. A key already withheld (or unknown) is reported here
+        too — re-erasing it is idempotent, not an error.
     discarded_sessions:
         Pending conversation IDs that were found in the
         :class:`~paramem.server.session_buffer.SessionBuffer` attributed to
         the speaker and discarded (JSONL deleted, turns dropped).
-    reaped_tiers:
-        Tier names (main or interim) that this erase reduced to zero known
-        keys and that were therefore unmounted and deleted on the spot
-        (deliberate) rather than left for a future cycle.
-    unloaded_adapters:
-        PEFT adapter names deleted from the live model as part of the reap
-        (:func:`~paramem.models.loader.detach_adapters`'s return) — empty
-        when no tier was reaped, or in the simulate/non-PEFT venue.
-    removed_dirs:
-        On-disk tier root directory names whose artifacts were removed by
-        the reap (:func:`~paramem.memory.persistence.reap_tier_artifacts`)
-        — empty when no tier was reaped.
+    tiers:
+        Per-tier :class:`TierRestampOutcome` for every tier the erase
+        touched — the registry mutation always landed; this reports
+        whether the tier's slot manifest was rebound to match.
+    unbound_tiers:
+        Tier names left unbound — every ``TierRestampOutcome.outcome !=
+        "rebound"``, i.e. ``"unbound"`` or ``"rebind_failed"`` — a non-empty
+        list means at least one affected tier will fail to bind on the
+        next boot/reload until repaired; see ``GET /integrity`` and the
+        ``tier_registry_unverified`` incident it emits for each.
     """
 
     removed_speaker: bool
-    erased_keys: list[str]
+    staled_keys: list[str]
     discarded_sessions: list[str]
-    reaped_tiers: list[str]
-    unloaded_adapters: list[str]
-    removed_dirs: list[str]
+    tiers: list[TierRestampOutcome]
+    unbound_tiers: list[str]
 
 
 # --- Interim discard schemas ---
@@ -1076,7 +1156,7 @@ class RollbackResponse(BaseModel):
         Always ``"LIVE"`` on success (A config is restored).
     trial_adapter_archive_path:
         Absolute path to the trial adapter archive slot directory (or the
-        still-in-place state/trial_adapter/ when rotation failed — 207).
+        still-in-place state/trial/adapters/ when rotation failed — 207).
     rollback_pre_mortem_backup_path:
         Absolute path to the rollback pre-mortem B-config snapshot slot.
     restart_required:
@@ -1198,8 +1278,12 @@ def _validate_adapter_slot(
         one the verdict was computed from). ``None`` unless ``binding.status``
         is :data:`~paramem.adapters.registry_binding.VERIFIED`.
       * ``should_mount``: True when the boot caller should mount this slot.
-        False for "no slot," "registry unverified," "key-count mismatch,"
-        or "fingerprint mismatch."
+        False for "no slot," "registry unverified," "active keys with no
+        slot candidate," "key-count mismatch," "payload digest mismatch,"
+        "fingerprint mismatch," or a verified slot whose payload kind is
+        ``"simulate"`` — a bound simulate slot is healthy (``slot`` and
+        ``manifest`` are still returned) but there are no PEFT weights to
+        mount.
 
     Used by:
       * :func:`_mount_adapters_from_slots` (boot path) — for both the main
@@ -1211,12 +1295,16 @@ def _validate_adapter_slot(
     """
     from paramem.adapters.registry_binding import (
         KEY_COUNT_MISMATCH,
+        KEYS_WITHOUT_SLOT,
         NO_CANDIDATES,
         NO_MATCHING_SLOT,
+        PAYLOAD_MISMATCH,
         REGISTRY_ABSENT_WITH_SLOTS,
         REGISTRY_UNREADABLE,
+        VERIFIED,
     )
     from paramem.backup.backup import sweep_orphan_pending
+    from paramem.server.manifest_status import ROW_STATUS_FOR_VERDICT
 
     severity = "red" if _is_primary_adapter(name) else "yellow"
 
@@ -1228,9 +1316,29 @@ def _validate_adapter_slot(
         logger.info("Adapter %s: no slots found — fresh install", name)
         return None, None, False
 
+    if binding.status == KEYS_WITHOUT_SLOT:
+        _record_manifest_row(
+            manifest_status,
+            name,
+            ROW_STATUS_FOR_VERDICT[KEYS_WITHOUT_SLOT],
+            "keys_without_slot",
+            severity,
+        )
+        logger.error(
+            "Adapter %s: registry holds active keys but no written payload slot "
+            "candidate exists (%s) — skipping mount",
+            name,
+            binding.detail,
+        )
+        return None, None, False
+
     if binding.status == NO_MATCHING_SLOT:
         _record_manifest_row(
-            manifest_status, name, "no_matching_slot", "no_matching_slot", severity
+            manifest_status,
+            name,
+            ROW_STATUS_FOR_VERDICT[NO_MATCHING_SLOT],
+            "no_matching_slot",
+            severity,
         )
         logger.warning("Adapter %s: no slot matching registry hash — skipping mount", name)
         return None, None, False
@@ -1241,7 +1349,9 @@ def _validate_adapter_slot(
             if binding.status == REGISTRY_UNREADABLE
             else "registry_absent_with_slots"
         )
-        _record_manifest_row(manifest_status, name, "registry_unverified", reason, severity)
+        _record_manifest_row(
+            manifest_status, name, ROW_STATUS_FOR_VERDICT[binding.status], reason, severity
+        )
         logger.error(
             "Adapter %s: registry binding unverified (%s: %s) — skipping mount",
             name,
@@ -1254,7 +1364,7 @@ def _validate_adapter_slot(
         _record_manifest_row(
             manifest_status,
             name,
-            "key_count_mismatch",
+            ROW_STATUS_FOR_VERDICT[KEY_COUNT_MISMATCH],
             "key_count_mismatch",
             severity,
             binding.slot,
@@ -1267,11 +1377,60 @@ def _validate_adapter_slot(
         )
         return None, None, False
 
+    if binding.status == PAYLOAD_MISMATCH:
+        _record_manifest_row(
+            manifest_status,
+            name,
+            ROW_STATUS_FOR_VERDICT[PAYLOAD_MISMATCH],
+            "payload_mismatch",
+            severity,
+            binding.slot,
+        )
+        logger.error(
+            "Adapter %s: bound slot's payload bytes no longer match the manifest "
+            "digest (%s) — skipping mount",
+            name,
+            binding.detail,
+        )
+        return None, None, False
+
+    if binding.status != VERIFIED:
+        # Every verdict registry_binding.py documents today is handled by
+        # name above. A future verdict added there without a matching
+        # branch here must not silently fall into the VERIFIED handling
+        # below and dereference binding.manifest (None for every
+        # non-VERIFIED verdict) — leave it unpublishable loudly instead of
+        # crashing boot.
+        _record_manifest_row(
+            manifest_status,
+            name,
+            "unrecognized_verdict",
+            f"unrecognized_verdict:{binding.status}",
+            severity,
+            binding.slot,
+        )
+        logger.error(
+            "Adapter %s: unrecognized binding verdict %r — skipping mount",
+            name,
+            binding.status,
+        )
+        return None, None, False
+
     # binding.status == VERIFIED — the manifest is already parsed on the
     # binding; verify_tier_binding only returns VERIFIED after a successful
     # read, so this is never None here.
     slot = binding.slot
     manifest = binding.manifest
+
+    if manifest.payload.kind == "simulate":
+        # A simulate payload verifies against the registry exactly like a
+        # train one, but there are no PEFT weights to mount — the
+        # fingerprint checks below (base_model/tokenizer/lora) apply only to
+        # a train payload; a simulate manifest carries all three as None by
+        # construction. A bound, verified simulate slot is healthy, not
+        # degraded, so no row is recorded — only pop any stale prior row.
+        manifest_status.pop(name, None)
+        return slot, manifest, False
 
     mismatch_field = _check_manifest_fingerprints(manifest, model, adapter_cfg)
     if mismatch_field is not None:
@@ -1332,15 +1491,23 @@ def _revalidate_adapter_manifests(state: dict) -> None:
     """Re-run :func:`_validate_adapter_slot` for every tier — main AND
     interim — and refresh ``state['adapter_manifest_status']``.  The single
     row-freshness owner for the whole ``adapter_manifest_status`` dict,
-    called from the two TRAINING-path fold finalizers (``_finalize_full``
-    and ``_finalize_interim``) so rows refresh at every training fold, not
-    only once a dir vanishes.  ``_finalize_simulate`` does NOT call this —
-    a simulate-mode interim cycle writes only ``graph.json`` (no
-    ``adapter_model.safetensors``), so it has no weight-slot candidate and
-    :func:`_validate_adapter_slot` can never mint a row for it either way;
-    any row that predates a switch to simulate mode still gets refreshed at
-    the next boot or the next training fold, so skipping the call here
-    costs nothing.
+    called from the two event-kind fold finalizers (``_finalize_full`` and
+    ``_finalize_interim``) so rows refresh at every fold, train or
+    simulate venue alike (``_finalize_interim`` is the one finalizer for
+    every interim-shaped terminal, first-run or resumed, either venue — see
+    its own docstring).  A simulate-mode tier's own bound, VERIFIED slot
+    mints no row — :func:`_validate_adapter_slot`'s simulate branch pops any
+    stale row and reports ``should_mount=False`` without recording one (a
+    healthy graph payload has no PEFT weights to mount but is not degraded).
+    Every OTHER binding verdict (``KEYS_WITHOUT_SLOT``, ``NO_MATCHING_SLOT``,
+    ``KEY_COUNT_MISMATCH``, ``PAYLOAD_MISMATCH``, ``REGISTRY_UNREADABLE``,
+    ``REGISTRY_ABSENT_WITH_SLOTS``) mints a row exactly like a train-mode
+    tier's would — none of those branches inspect ``payload.kind`` at all —
+    so a simulate-mode cycle CAN mint a row (e.g. a corrupted ``graph.json``
+    after write). Calling this on a simulate terminal is therefore not
+    always a no-op; any row that predates a switch to simulate mode still
+    gets refreshed here exactly like a train terminal would, and a fresh
+    simulate-venue failure gets its own row the same way a train one does.
 
     Boot's :func:`_mount_adapters_from_slots` snapshots adapter health from
     the on-disk state at startup.  After a fold re-saves a tier's slot with
@@ -1493,7 +1660,7 @@ def _sweep_keyless_tier_artifacts(config, state: dict) -> list[str]:
     reads any tier's registry a second time for mounting. Nothing this sweep
     removes is ever mounted, and it never unmounts a live adapter — at this
     point in boot nothing has been mounted yet. The memory store is hydrated
-    later still (the lifespan calls ``_build_config_derived_state`` only
+    later still (the lifespan calls ``_build_runtime_components`` only
     after ``_load_model_into_state`` returns), so no RAM-resident tier can
     ever outlive the files this sweep removed. The same call also runs on
     every live reload — :func:`_live_reload_base_model` reaches this
@@ -1508,26 +1675,21 @@ def _sweep_keyless_tier_artifacts(config, state: dict) -> list[str]:
     :func:`~paramem.backup.integrity.cleanup_partial_slots`, before any
     binding is computed and self-heals it then.)
 
-    Erase-in-flight marker (self-heal for an interrupted hard erase). The
-    marker (:func:`~paramem.memory.persistence.read_erase_marker`,
-    :func:`~paramem.memory.persistence.write_erase_marker`,
-    :func:`~paramem.memory.persistence.clear_erase_marker`) distinguishes an
-    interrupted hard erase from ordinary corruption — the two otherwise
-    leave a byte-identical disk shape (a registry that reads zero known keys
-    beside a slot manifest whose stamped hash or ``key_count`` still
-    disagrees). It is read ONCE, before the scan loop below, naming the
-    tier set an in-flight erase was mutating at write time; a tier's
-    membership in that set is the ONLY thing that turns a "registry says
-    empty, slot binding does not independently corroborate it" shape from a
-    preserved ERROR into a reap. The marker is cleared UNCONDITIONALLY after
-    the loop completes — even when the read itself failed (already logged
-    an ERROR by :func:`read_erase_marker`) — so a marker that outlives its
-    own boot (a stale marker surviving a restore, since it is one of
-    :func:`~paramem.backup.encryption.infra_paths`; or one a prior crash
-    left behind with nothing left to authorise) can never linger to
-    authorise an unrelated tier at a later boot. A marker naming a tier that
-    still reads a nonzero known-key count authorises nothing — every reap
-    row below requires ``list_known()`` empty regardless of the marker.
+    Operator erase doors (``POST /speaker/forget``, ``POST /debug/erase-keys``) no longer
+    empty a tier's registry — they stale-mark, withholding an ACTIVE key as
+    a marker that keeps its id in ``list_known()`` (see
+    :func:`~paramem.memory.persistence.erase_keys_and_restamp_manifest`), so
+    ``list_known()`` never drops as a side effect of an operator erase. The
+    one legitimate emptier of a tier's ``list_known()`` is that tier's own
+    rebuild, which seeds the fold's working copy from active keys alone and
+    so publishes a registry carrying no marker (item 4 below is exactly that
+    shape: a matched, zero-``key_count`` manifest). A "registry says empty,
+    slot binding does not independently corroborate it" shape at boot can
+    therefore only be a torn commit or genuine corruption — never a
+    legitimately-interrupted erase, and never an unmatched rebuild, which
+    would show as item 4's clean match instead — and is always preserved
+    (never reaped) below; the operator's recovery door is
+    ``POST /backup/restore``.
 
     Per tier root, after ``binding = verify_tier_binding(name, root)``:
 
@@ -1537,18 +1699,20 @@ def _sweep_keyless_tier_artifacts(config, state: dict) -> list[str]:
        registry is never inferred to hold zero keys; only a registry that
        actually answers and says so is swept.
     2. ``binding.registry.list_known()`` (active ∪ stale) non-empty —
-       preserved. When the tier carries neither adapter weights nor a
-       ``graph.json`` (no payload at all,
-       :func:`~paramem.memory.interim_adapter.slot_payload_kind` returns
-       ``None``) this is logged as an ERROR naming the known-key count — the
-       same shape a crash-interrupted erase or a torn training write can
-       both produce, and deleting facts that were never folded anywhere
-       else would be a silent data loss. Every other non-empty shape
-       (simulate-venue slot, real weight-bearing slot, keyed main tier
-       still awaiting a matching slot) is preserved SILENTLY — a tier that
-       still knows keys is not this sweep's to report; the mount stage
-       mints its own row and log line for whatever binding status a keyed
-       tier resolves to, and this keeps that to one reporter per condition.
+       preserved. When the tier carries at least one ACTIVE key and no slot
+       candidate at all in either venue (``binding.status ==
+       KEYS_WITHOUT_SLOT``, i.e. ``binding.candidate_count == 0`` — no
+       payload at all) this is logged as an ERROR naming the known-key
+       count — the same shape a crash-interrupted erase or a torn training
+       write can both produce, and deleting facts that were never folded
+       anywhere else would be a silent data loss. Every other non-empty
+       shape (a bound slot in either venue, a keyed main tier still
+       awaiting a matching slot, or a registry whose only known keys are
+       STALE with zero candidates — still ``NO_CANDIDATES`` under the
+       active-key-gated split) is preserved SILENTLY — a tier that still
+       knows keys is not this sweep's to report; the mount stage mints its
+       own row and log line for whatever binding status a keyed tier
+       resolves to, and this keeps that to one reporter per condition.
     3. ``list_known()`` empty and the registry file does not exist
        (``binding.registry_present is False``):
        :data:`~paramem.adapters.registry_binding.NO_CANDIDATES` — skipped
@@ -1557,18 +1721,20 @@ def _sweep_keyless_tier_artifacts(config, state: dict) -> list[str]:
        ``""``-stamped slot whose manifest agrees the tier is empty, stamping
        ``key_count`` as ``0`` or leaving it
        :data:`~paramem.adapters.manifest.UNKNOWN`) — skipped silently (the
-       replay-disabled/experiment-install shape);
+       experiment-install shape);
        :data:`~paramem.adapters.registry_binding.REGISTRY_ABSENT_WITH_SLOTS`
-       — preserved and logged as an ERROR, UNCONDITIONALLY (never
-       marker-authorised): this is the torn :func:`commit_tier_slot` shape
-       (a crash after the weight write but before the registry flush — see
-       that function's crash-semantics note), and a reap here would discard
-       a slot whose registry commit never landed rather than one an erase
-       genuinely emptied; a ``""``-stamped slot whose manifest disagrees on
+       — preserved and logged as an ERROR, UNCONDITIONALLY: this is the torn
+       weight-before-registry commit shape shared by both per-tier commit
+       primitives (:func:`commit_tier_slot`'s migration/trial-tree callers
+       and the fold path's :func:`write_tier_slot` + :func:`publish_tier_registry`
+       — a crash after the weight write but before the registry flush; see
+       either function's crash-semantics note), and a reap here would
+       discard a slot whose registry commit never landed; a ``""``-stamped
+       slot whose manifest disagrees on
        ``key_count`` (:data:`~paramem.adapters.registry_binding.KEY_COUNT_MISMATCH`)
        or the rare manifest-read-race
        :data:`~paramem.adapters.registry_binding.NO_MATCHING_SLOT` falls
-       through to the marker-gated case below.
+       through to the unconditional-preserve fallback below.
     4. ``list_known()`` empty and the registry file exists
        (``binding.registry_present is True``):
        :data:`~paramem.adapters.registry_binding.NO_CANDIDATES` — reaped
@@ -1591,15 +1757,15 @@ def _sweep_keyless_tier_artifacts(config, state: dict) -> list[str]:
        (a matching-hash slot whose ``key_count`` disagrees), or a
        ``VERIFIED`` match whose ``key_count`` is
        :data:`~paramem.adapters.manifest.UNKNOWN` — falls through to the
-       marker-gated case below.
-    5. Marker-gated fallback (every ``list_known()``-empty shape not
-       resolved by 3 or 4 above): reaped when the erase-in-flight marker
-       names this tier (the interrupted-hard-erase self-heal — the registry
-       write from :func:`~paramem.memory.persistence.erase_keys_and_restamp_manifest`
-       landed, but the reap that should have followed it did not); preserved
-       and logged as an ERROR otherwise, naming ``POST /backup/restore``
-       as the recovery door (never ``/reconsolidate``, which cannot rebuild
-       a tier whose registry binding is itself unverified).
+       unconditional-preserve fallback below.
+    5. Fallback (every ``list_known()``-empty shape not resolved by 3 or 4
+       above): always preserved and logged as an ERROR, naming
+       ``POST /backup/restore`` as the recovery door (never
+       ``/reconsolidate``, which cannot rebuild a tier whose registry
+       binding is itself unverified). No caller can legitimately produce
+       this shape — the operator erase doors stale-mark rather than empty a
+       tier — so there is nothing left to authorise a reap against; a torn
+       commit or genuine corruption is the only remaining explanation.
 
     Args:
         config: Loaded ``ServerConfig``; only ``adapter_dir`` is read.
@@ -1615,20 +1781,15 @@ def _sweep_keyless_tier_artifacts(config, state: dict) -> list[str]:
         removed by :func:`~paramem.backup.integrity.cleanup_partial_slots`.
     """
     from paramem.adapters.registry_binding import (
+        KEYS_WITHOUT_SLOT,
         NO_CANDIDATES,
         REGISTRY_ABSENT_WITH_SLOTS,
         VERIFIED,
         verify_tier_binding,
     )
     from paramem.backup.integrity import cleanup_partial_slots
-    from paramem.memory.interim_adapter import (
-        INTERIM_NAME_PREFIX,
-        iter_tier_roots,
-        slot_payload_kind,
-    )
+    from paramem.memory.interim_adapter import iter_tier_roots
     from paramem.memory.persistence import (
-        clear_erase_marker,
-        read_erase_marker,
         reap_tier_artifacts,
         resume_pending_reaps,
     )
@@ -1646,12 +1807,6 @@ def _sweep_keyless_tier_artifacts(config, state: dict) -> list[str]:
 
     roots: list[tuple[str, Path]] = list(iter_tier_roots(config.adapter_dir))
 
-    # Read the erase-in-flight marker ONCE, before any tier below is
-    # evaluated — a marker authorises at most one boot's worth of reaps (see
-    # the docstring paragraph above). Cleared unconditionally after the loop,
-    # regardless of whether it named anything reap-eligible.
-    marker_tiers = set(read_erase_marker(config.adapter_dir))
-
     reaped: list[str] = []
     for name, root in roots:
         binding = verify_tier_binding(name, root)
@@ -1666,25 +1821,24 @@ def _sweep_keyless_tier_artifacts(config, state: dict) -> list[str]:
 
         known = binding.registry.list_known()
         if known:
-            payload_kind = slot_payload_kind(root)
-            if payload_kind is None:
+            if binding.status == KEYS_WITHOUT_SLOT:
                 logger.error(
                     "Boot sweep: tier %s has a registry with %d known key(s) but "
-                    "no payload (no adapter weights, no graph.json) — preserving; "
-                    "recover via consolidation fold or registry restore",
+                    "no slot candidate at all (candidate_count=%d, no payload in "
+                    "either venue) — preserving; recover via consolidation fold "
+                    "or registry restore",
                     name,
                     len(known),
+                    binding.candidate_count,
                 )
-            elif payload_kind == "simulate" and name.startswith(INTERIM_NAME_PREFIX):
-                logger.debug(
-                    "Boot sweep: interim tier %s is a simulate-mode slot "
-                    "(has graph.json, no safetensors) — preserving",
-                    name,
-                )
-            # payload_kind == "train", or a keyed tier whose binding is not
-            # VERIFIED (no_matching_slot, key_count_mismatch, ...): the tier
-            # carries content — whether/why it mounts is the mount stage's
-            # report to make, not this sweep's. One reporter per condition.
+            # Every other status (VERIFIED, KEY_COUNT_MISMATCH,
+            # NO_MATCHING_SLOT, REGISTRY_ABSENT_WITH_SLOTS, PAYLOAD_MISMATCH,
+            # or NO_CANDIDATES with only STALE known keys) means either at
+            # least one slot candidate exists for this tier in either venue,
+            # or no active key needs one: the tier's content, if any, is not
+            # this sweep's to report — the mount stage mints its own row and
+            # log line for whatever binding status a keyed tier resolves to.
+            # One reporter per condition.
             continue
 
         # known is empty from here on. One reap primitive for every arm below
@@ -1696,8 +1850,9 @@ def _sweep_keyless_tier_artifacts(config, state: dict) -> list[str]:
                 reaped.append(name)
                 logger.warning(
                     "Boot sweep: tier %s reaped — %s — removed %d stale "
-                    "artifact path(s) (self-heals a crash between a hard "
-                    "key erase and its reap, or a torn training write)",
+                    "artifact path(s) (self-heals a torn commit or genuine "
+                    "corruption — never an operator erase, which stale-marks "
+                    "rather than empties a registry)",
                     name,
                     reason,
                     len(removed),
@@ -1706,24 +1861,23 @@ def _sweep_keyless_tier_artifacts(config, state: dict) -> list[str]:
         # The decision table's two halves, structurally: registry-absent
         # shapes on one side, registry-present shapes on the other. Neither
         # branch falls all the way through on its own — every arm either
-        # `continue`s (resolved without the marker) or drops out of the
-        # if/else to the shared marker-gated fallback below.
+        # `continue`s or drops out of the if/else to the shared
+        # unconditional-preserve fallback below.
         if not binding.registry_present:
             if binding.status == NO_CANDIDATES:
                 continue  # fresh install — nothing on disk to reap
             if binding.status == VERIFIED:
                 # A ""-stamped slot whose manifest independently agrees the
                 # tier is empty (key_count 0 or UNKNOWN) — the
-                # replay-disabled / experiment-install shape. Nothing to
-                # reap, nothing to log.
+                # experiment-install shape. Nothing to reap, nothing to log.
                 continue
             if binding.status == REGISTRY_ABSENT_WITH_SLOTS:
                 logger.error(
                     "Boot sweep: tier %s has %d candidate slot(s) but no "
                     "indexed_key_registry.json at all (%s) — preserving; "
-                    "this is the torn commit_tier_slot shape (registry "
-                    "flush interrupted after the weight write) and is "
-                    "never eligible for a marker-authorised reap — recover "
+                    "this is the torn weight-before-registry commit shape "
+                    "(registry flush interrupted after the weight write, "
+                    "from either per-tier commit primitive) — recover "
                     "via POST /backup/restore then restart",
                     name,
                     binding.candidate_count,
@@ -1731,15 +1885,17 @@ def _sweep_keyless_tier_artifacts(config, state: dict) -> list[str]:
                 )
                 continue
             # KEY_COUNT_MISMATCH (a ""-stamped slot whose manifest disagrees
-            # on key_count) or the rare manifest-read-race NO_MATCHING_SLOT
-            # falls through to the marker-gated fallback below.
+            # on key_count), PAYLOAD_MISMATCH (a ""-stamped slot whose
+            # payload bytes disagree with its own manifest digest), or the
+            # rare manifest-read-race NO_MATCHING_SLOT falls through to the
+            # unconditional-preserve fallback below.
         else:
             if binding.status == NO_CANDIDATES:
                 # A registry file and nothing else — no manifest to read at
                 # all, so there is no visible cross-artifact claim to weigh
                 # against the registry's own empty read; the ordinary
                 # self-heal this sweep has always performed.
-                _reap("registry lists zero known keys with no weight-slot candidate")
+                _reap("registry lists zero known keys with no written payload slot candidate")
                 continue
             if (
                 binding.status == VERIFIED
@@ -1756,35 +1912,29 @@ def _sweep_keyless_tier_artifacts(config, state: dict) -> list[str]:
             # candidate's meta.json was merely unreadable — this status
             # cannot tell a stale slot from a transiently corrupt one, so it
             # never gets the benefit of the doubt), KEY_COUNT_MISMATCH (a
-            # matching-hash slot whose key_count disagrees), or a VERIFIED
-            # match whose key_count is UNKNOWN falls through to the
-            # marker-gated fallback below.
+            # matching-hash slot whose key_count disagrees), PAYLOAD_MISMATCH
+            # (a matching-hash slot whose payload bytes disagree with its own
+            # manifest digest), or a VERIFIED match whose key_count is
+            # UNKNOWN falls through to the unconditional-preserve fallback
+            # below.
 
-        # Marker-gated fallback: the registry reads zero known keys, but the
-        # binding does not independently, unambiguously corroborate that.
-        # Every other empty-known shape was already resolved above without
-        # needing the marker. Only a same-boot erase-in-flight marker naming
-        # this tier authorises treating this as the interrupted-hard-erase
-        # self-heal rather than corruption.
-        if name in marker_tiers:
-            _reap(
-                "erase-in-flight marker authorised recovery from an "
-                f"interrupted hard erase (binding was {binding.status}: {binding.detail})"
-            )
-        else:
-            logger.error(
-                "Boot sweep: tier %s registry reads zero known keys but its "
-                "slot binding (%s: %s) does not independently corroborate "
-                "that, and no erase-in-flight marker authorises treating "
-                "this as an interrupted hard erase — preserving; restore "
-                "this tier from a snapshot bundle via POST /backup/restore "
-                "and restart; see GET /integrity",
-                name,
-                binding.status,
-                binding.detail,
-            )
-
-    clear_erase_marker(config.adapter_dir)
+        # Unconditional-preserve fallback: the registry reads zero known
+        # keys, but the binding does not independently, unambiguously
+        # corroborate that. Every other empty-known shape was already
+        # resolved above. The operator erase doors stale-mark rather than
+        # empty a tier, so there is no legitimate producer of this shape
+        # left to authorise a reap against — a torn commit or genuine
+        # corruption is the only remaining explanation, and both are
+        # preserved for the operator to recover.
+        logger.error(
+            "Boot sweep: tier %s registry reads zero known keys but its "
+            "slot binding (%s: %s) does not independently corroborate "
+            "that — preserving; restore this tier from a snapshot bundle "
+            "via POST /backup/restore and restart; see GET /integrity",
+            name,
+            binding.status,
+            binding.detail,
+        )
 
     return sorted(reaped)
 
@@ -1945,6 +2095,17 @@ def _mount_adapters_from_slots(model, tokenizer, config, state: dict):
 def _check_manifest_fingerprints(manifest, model, adapter_cfg) -> "str | None":
     """Compare manifest fingerprints against live runtime state.
 
+    TRAIN-payload manifests only — the sole caller,
+    :func:`_validate_adapter_slot`, short-circuits on
+    ``manifest.payload.kind == "simulate"`` (its own docstring's
+    "should_mount" note) BEFORE ever calling this function, so
+    ``manifest.base_model``/``manifest.tokenizer``/``manifest.lora`` are
+    guaranteed non-``None`` here by the schema invariant
+    (:class:`~paramem.adapters.manifest.AdapterManifest`'s own
+    ``__post_init__``: ``payload.kind == "train"`` requires all three
+    present). A ``simulate``-payload manifest never reaches this function at
+    all — it does not need a defensive re-check here.
+
     Skips UNKNOWN values (cannot verify) on the ``base_model`` fields.
     Returns the name of the first mismatching field, or ``None`` when all
     checked fields match.
@@ -2016,16 +2177,24 @@ def _check_manifest_fingerprints(manifest, model, adapter_cfg) -> "str | None":
 def _first_unknown_field(manifest) -> "str | None":
     """Return the name of the first UNKNOWN-valued field, or None.
 
-    Only checks fields that are material for adapter verification.
+    TRAIN-payload manifests only — the sole caller,
+    :func:`_validate_adapter_slot`, short-circuits on
+    ``manifest.payload.kind == "simulate"`` BEFORE ever calling this
+    function (same short-circuit :func:`_check_manifest_fingerprints`
+    documents), so ``manifest.base_model``/``manifest.tokenizer`` are
+    guaranteed non-``None`` here by the schema invariant and their checks
+    below run unconditionally. Only checks fields that are material for
+    adapter verification; ``registry_sha256`` and ``key_count`` are checked
+    regardless of payload kind (both fields exist on every manifest).
     """
     from paramem.adapters.manifest import UNKNOWN
 
-    checks = [
+    checks: list[tuple[str, "str | int"]] = [
+        ("registry_sha256", manifest.registry_sha256),
         ("base_model.repo", manifest.base_model.repo),
         ("base_model.sha", manifest.base_model.sha),
         ("base_model.hash", manifest.base_model.hash),
         ("tokenizer.name_or_path", manifest.tokenizer.name_or_path),
-        ("registry_sha256", manifest.registry_sha256),
     ]
     for field, value in checks:
         if value == UNKNOWN:
@@ -2361,7 +2530,7 @@ def _record_cuda_fatal_exit() -> None:
     config = _state.get("config")
     if config is None:
         return
-    state_dir = (config.paths.data / "state").resolve()
+    state_dir = data_state_dir(config.paths.data).resolve()
     state_dir.mkdir(parents=True, exist_ok=True)
     history_file = state_dir / "cuda_fault_history.json"
     pending_dir = state_dir / ".pending"
@@ -2395,7 +2564,7 @@ def _cuda_crashloop_exhausted() -> bool:
     config = _state.get("config")
     if config is None:
         return False
-    state_dir = (config.paths.data / "state").resolve()
+    state_dir = data_state_dir(config.paths.data).resolve()
     history_file = state_dir / "cuda_fault_history.json"
     if not history_file.exists():
         return False
@@ -2663,7 +2832,7 @@ async def lifespan(app: FastAPI):
         live_config_path = (
             Path(_state["config_path"]) if _state.get("config_path") else DEFAULT_SERVER_CONFIG_PATH
         )
-        state_dir = config.paths.data / "state"
+        state_dir = data_state_dir(config.paths.data)
         backups_root = config.paths.data / "backups"
         max_age_hours = getattr(
             getattr(getattr(config, "security", None), "backups", None),
@@ -2899,7 +3068,7 @@ async def lifespan(app: FastAPI):
     # Note: _apply_config_in_progress is not set here (boot path); the re-probe gate
     # inside the routine treats a None/absent store as cold and runs the probe.
     try:
-        _build_config_derived_state(config, cloud_only=cloud_only)
+        _build_runtime_components(config, cloud_only=cloud_only)
     except BaseException as _bcs_exc:
         if is_fatal_cuda_fault(_bcs_exc):
             _fail_fast_cuda(_bcs_exc, "preload")
@@ -2908,7 +3077,7 @@ async def lifespan(app: FastAPI):
             raise
 
     # Eager consolidation-loop creation — mounts the adapters as soon as a
-    # local-mode model is resident (_build_config_derived_state's memory-store
+    # local-mode model is resident (_build_runtime_components's memory-store
     # preload just populated _state["memory_store"]) so /status's
     # adapter_loaded reading does not depend on the first consolidation door
     # having run. No-op in cloud-only mode; a later post-load VRAM-overflow
@@ -2921,7 +3090,7 @@ async def lifespan(app: FastAPI):
     # for every caller that needs the loop, so a swallowed failure here only
     # costs /status reporting adapter_loaded=false until the first
     # consolidation door creates it. Only a sticky, process-fatal CUDA fault
-    # gets the crash-loop treatment, mirroring _build_config_derived_state's
+    # gets the crash-loop treatment, mirroring _build_runtime_components's
     # handling just above.
     try:
         _eager_create_consolidation_loop(config)
@@ -2937,7 +3106,7 @@ async def lifespan(app: FastAPI):
                 "consolidation door runs"
             )
 
-    # Post-load authoritative gate. Runs AFTER _build_config_derived_state so
+    # Post-load authoritative gate. Runs AFTER _build_runtime_components so
     # the measured allocation includes the STT/TTS GPU footprint. On failure,
     # release the partially-loaded GPU pair and continue in cloud-only mode —
     # symmetric with _live_reload_base_model and consistent with the boot
@@ -3002,7 +3171,7 @@ async def lifespan(app: FastAPI):
             _state["wyoming_server"] = await start_wyoming_server(
                 host=config.server.host,
                 port=config.stt.port,
-                # Provider, not an eager snapshot: _build_config_derived_state
+                # Provider, not an eager snapshot: _build_runtime_components
                 # rebinds _state["speaker_store"] on every full config-apply
                 # (app.py step 2), and this Wyoming socket is bound once here
                 # at lifespan boot — an eager _state.get("speaker_store") would
@@ -3040,7 +3209,7 @@ async def lifespan(app: FastAPI):
                 audio_chunk_bytes=config.tts.audio_chunk_bytes,
                 tts_manager_provider=lambda: _state["voice_box"]["tts_manager"],
                 language_source=config.tts.language_source,
-                # Provider, not an eager snapshot: _build_config_derived_state
+                # Provider, not an eager snapshot: _build_runtime_components
                 # rebinds _state["speaker_store"] on every full config-apply
                 # (app.py step 2), and this Wyoming socket is bound once here
                 # at lifespan boot — an eager _state.get("speaker_store") would
@@ -3116,7 +3285,7 @@ async def lifespan(app: FastAPI):
     # --- Base-swap resume: re-launch orchestration on crash recovery ---
     # When recovery_result.action == RESUME_BASE_SWAP, the lifespan seeded
     # _state["_base_swap_resume_marker"] above.  Now that the model is loaded
-    # and all config-derived state is initialised, launch the orchestration
+    # and every runtime component is built, launch the orchestration
     # coroutine to resume from wherever the marker left off.
     #
     # Resume semantics by base_swap_phase:
@@ -3145,7 +3314,7 @@ async def lifespan(app: FastAPI):
         _bs_live_cfg = (
             Path(_state["config_path"]) if _state.get("config_path") else DEFAULT_SERVER_CONFIG_PATH
         )
-        _bs_state_dir = (config.paths.data / "state").resolve()
+        _bs_state_dir = data_state_dir(config.paths.data).resolve()
         _bs_backups_root = (config.paths.data / "backups").resolve()
         # Handle stored in _state (mirroring reclaim_task/config_drift_task
         # above) so it is awaitable (the boot-completion task awaits it
@@ -3511,7 +3680,7 @@ async def _run_boot_completion_tasks() -> None:
         if _backup_atom is not None and _backup_atom.kind != "off":
             from paramem.backup.state import last_attempt_epoch as _last_attempt_epoch
 
-            state_dir = (config.paths.data / "state").resolve()
+            state_dir = data_state_dir(config.paths.data).resolve()
             _last_stamp = _last_attempt_epoch(state_dir)
             # NO_STAMP -> RUN here (the opposite of consolidation's seed-and-noop
             # below): a first backup is cheap and welcome, so its absence must
@@ -3546,7 +3715,9 @@ async def _run_boot_completion_tasks() -> None:
         if _cadence_atom is not None and _cadence_atom.kind != "off":
             from paramem.server import schedule_state as _schedule_state
 
-            _last_scheduled = _schedule_state.read_last_scheduled_run(config.paths.data / "state")
+            _last_scheduled = _schedule_state.read_last_scheduled_run(
+                data_state_dir(config.paths.data)
+            )
             _cadence_due = scheduled_run_due(cadence, _last_scheduled)
             if _cadence_due is ScheduleDueStatus.DUE:
                 status, action = _dispatch_consolidation(ConsolidationAction.AUTO)
@@ -4505,9 +4676,6 @@ async def _run_chat_turn(
         speaker=speaker,
     )
 
-    # Training was aborted (not paused) — the next job submission will resume
-    # from the checkpoint automatically via the staging_resume.json path.
-
     resolved_text = resolve_speaker_tokens(
         response_text, speaker_store, current_speaker_id=speaker_id
     )
@@ -5194,7 +5362,7 @@ async def status():
     # store is constructed (e.g. cloud-only before preload), count from disk
     # using the store's own loader rather than re-inlining a registry scan.
     store = _state.get("memory_store")
-    if store is not None and store.replay_enabled:
+    if store is not None:
         keys_count = len(store.all_active_keys())
         tier_key_counts = {
             tier: len(store.active_keys_in_tier(tier)) for tier in store.tiers_with_registry()
@@ -5463,7 +5631,7 @@ async def status():
     _base_swap_phase = None
     if _mig_state == "trial":
         try:
-            _sm = read_trial_marker((config.paths.data / "state").resolve())
+            _sm = read_trial_marker(data_state_dir(config.paths.data).resolve())
             if _sm is not None and _sm.migration_kind == "base_swap":
                 _base_swap_phase = _sm.base_swap_phase or "phaseA"
         except Exception:  # noqa: BLE001 — display-only; never fail /status on it
@@ -5494,7 +5662,7 @@ async def status():
         )
 
         _backups_root = (config.paths.data / "backups").resolve()
-        _state_dir = (config.paths.data / "state").resolve()
+        _state_dir = data_state_dir(config.paths.data).resolve()
 
         # Read persisted runner state — None when no run has ever happened.
         _backup_record = None
@@ -5581,7 +5749,7 @@ async def status():
     # Derive last_consolidation_error and last_consolidation_result from durable
     # stores (incidents.json + run_status.json) rather than from RAM.  Both fields
     # are computed once per /status poll; no RAM snapshot survives across restarts.
-    _status_state_dir = (config.paths.data / "state").resolve()
+    _status_state_dir = data_state_dir(config.paths.data).resolve()
     _consolidation_error, _consolidation_result = _derive_consolidation_status_fields(
         _status_state_dir
     )
@@ -5650,6 +5818,7 @@ async def status():
         next_full_consolidation_seconds=next_full_consolidation_seconds,
         tier_key_counts=tier_key_counts,
         oldest_interim_stamp=oldest_interim_stamp,
+        store_quarantined=_state.get("store_quarantine"),
     )
 
 
@@ -5658,10 +5827,16 @@ async def integrity_check():
     """Run the infrastructure integrity check and return the report.
 
     Cloud-only-safe — no GPU or model dependency.  Verifies every tier's
-    ``indexed_key_registry.json`` (which now carries the unified simhash map),
-    ``meta.json`` (live weight slot), and ``graph.json`` (simulate mode only),
-    plus common files (``key_metadata.json``, ``speaker_profiles.json``,
-    ``observed_languages.json``, ``state/backup.json``).
+    ``indexed_key_registry.json`` (which now carries the unified simhash map)
+    and ``key_metadata.json``, plus common (whole-store) files
+    (``speaker_profiles.json``, ``observed_languages.json``,
+    ``state/backup.json``).  A keyed tier's live slot and its registry↔slot
+    binding verdict are resolved venue-blind via
+    :func:`~paramem.adapters.registry_binding.verify_tier_binding` — one
+    ``"manifest"``-category row and one ``"payload"``-category row per tier,
+    both from the SAME resolution; the payload row reads the BOUND slot's
+    ``graph.json`` when its manifest declares a ``"simulate"`` payload
+    (nothing writes a tier-root ``graph.json`` any more).
 
     Returns a JSON report with ``ok``, ``checks``, and ``failures`` fields.
     """
@@ -5794,7 +5969,7 @@ async def gpu_acquire():
                 if not _bs_mig.get("base_swap_active", False):
                     _config_for_resume = _state.get("config")
                     if _config_for_resume is not None:
-                        _sd_resume = (_config_for_resume.paths.data / "state").resolve()
+                        _sd_resume = data_state_dir(_config_for_resume.paths.data).resolve()
                         _br_resume = (_config_for_resume.paths.data / "backups").resolve()
                         _deferred_marker = read_trial_marker(_sd_resume)
                         if (
@@ -5892,44 +6067,42 @@ def _build_store_contents(
     *,
     model,
     tokenizer,
-    should_abort=None,
-    materialized_entries: "dict[str, dict] | None" = None,
 ) -> "tuple[dict, dict, dict, dict]":
-    """Build fresh store contents entirely off-store.
+    """Build fresh store contents entirely off-store, or raise if any tier fails verification.
 
-    Reads registries and bookkeeping from disk, then fills entry content
-    from one of two media, and returns three fresh dicts plus a stats dict.
-    The live store is NOT touched — callers publish via
-    :meth:`~paramem.memory.store.MemoryStore.swap`.
+    Reads registries and bookkeeping from disk, then fills entry content —
+    the mirror's boot fill act — by probing the source medium (adapter
+    weights or on-disk ``graph.json``, selected by
+    ``config.consolidation.mode``), and returns three fresh dicts plus a
+    stats dict.  The live store is NOT touched — the caller publishes via
+    :meth:`~paramem.memory.store.MemoryStore.swap`.  Every entry entering
+    ``new_entries`` is SimHash-verified against the staged fingerprints by
+    the source medium's own ``finalize_recalled`` before it ever reaches
+    this function.  A shortfall in the fill is telemetry, never a verdict:
+    every key admitted before a failure stays cached, and the fill records
+    (or clears) a ``preload_recall_incomplete`` incident naming what was
+    missed — it never aborts the build and never discards what it already
+    has.  A train-venue call with no model resident defers the whole fill
+    act (:func:`~paramem.memory.source.train_venue_deferred`) rather than
+    attempting one — a simulate-venue call always fills, since
+    :class:`~paramem.memory.source.DiskMemorySource` needs no model.
 
-    **Two entry-content media, never both.** When *materialized_entries* is
-    supplied, every enumerated active key is looked up in that map, written
-    into a transient store, and accepted or dropped by
-    :meth:`~paramem.memory.store.MemoryStore.probe`'s SimHash gate — no
-    ``MemorySource`` is constructed and no GPU work runs.  When it is
-    ``None`` (the default), entry content is probed from the source medium
-    (adapter weights or on-disk ``graph.json``, selected by
-    ``config.consolidation.mode``) exactly as before this parameter existed.
-    Every entry entering ``new_entries`` is SimHash-verified against the
-    staged fingerprints exactly ONCE, at its own medium's boundary: the
-    source medium's own ``finalize_recalled`` gates it before it ever
-    reaches this function, and the materialized medium is gated by the
-    transient store's ``probe`` call below — the two gates are never both
-    applied to the same entry.
+    There is no per-tier half-publish: a single tier whose registry↔slot
+    binding is not publishable
+    (:attr:`~paramem.adapters.registry_binding.TierBinding.publishable` is
+    ``False``) raises
+    :class:`~paramem.adapters.registry_binding.TierBindingUnpublishable`
+    (via :func:`~paramem.adapters.registry_binding.raise_tier_binding_unpublishable`)
+    immediately after the tree walk, before any entry preload or
+    bookkeeping read — nothing partial is built. The caller (the boot/lift
+    store step, :func:`_hydrate_memory_store_in_place`) catches this
+    alongside :class:`~paramem.memory.store.BookkeepingInvariantViolation`
+    and quarantines the whole store rather than publishing a subset of
+    tiers.
 
-    This is the single canonical builder used by:
-
-    * :func:`_hydrate_memory_store_in_place` (boot / in-process reload) —
-      called immediately followed by ``store.swap()``; always the source
-      medium (``materialized_entries`` stays ``None``).
-    * :func:`_run_full_cycle` (post-fold refill) — called on the BG worker
-      thread under ``gpu_lock``.  Uses the materialized medium after a
-      weights-venue fold (no GPU work at all — the training gate probe
-      already proved this content, see
-      :class:`~paramem.training.consolidation.ConsolidationLoop`'s
-      ``entries_gate_attested`` result field); falls back to the source
-      medium after a disk-venue fold, still inside ``gpu_lock`` so the GPU
-      probe cannot race a concurrent ``/chat``.
+    This is the single canonical builder, used by
+    :func:`_hydrate_memory_store_in_place` (boot / in-process reload / the
+    lift) — called immediately followed by ``store.swap()`` on success.
 
     **BASE-MODEL HOLDER INVARIANT** — the ``WeightMemorySource`` is a
     frame-local created and dropped within this function.  The caller passes
@@ -5937,8 +6110,7 @@ def _build_store_contents(
     caller local).  The three returned dicts hold NO model reference.
     Setting ``_source = None`` before return releases the only in-frame
     handle.  A surviving reference here would re-introduce the cloud-only
-    VRAM leak fixed 2026-05-21.  The materialized medium never creates a
-    ``_source`` at all, so this invariant is vacuously satisfied there.
+    VRAM leak fixed 2026-05-21.
 
     Parameters
     ----------
@@ -5949,100 +6121,108 @@ def _build_store_contents(
         site; do NOT bind to a caller local before passing.
     tokenizer:
         Tokenizer handle — same constraint.
-    should_abort:
-        Optional zero-argument callable forwarded to the weight probe.  When
-        it returns ``True`` the probe exits early with partial entry results;
-        registry and bookkeeping are still complete in that case.  Reached
-        only on the source medium (``materialized_entries is None``) — the
-        materialized medium runs no GPU probe, so there is nothing to
-        interrupt.  A tier whose registry binding fails verification (see
-        :func:`~paramem.adapters.registry_binding.verify_adapter_tree`) is
-        simply ABSENT from ``new_registry``/``new_entries`` — every other
-        tier still publishes normally.  ``None`` (default) means no abort
-        check — used on the boot path.
-    materialized_entries:
-        Flat ``{key: entry}`` of already-materialised entry content —
-        production source: ``_run_full_cycle``'s ``loop.store.iter_entries()``
-        snapshot, taken only when the fold result carries
-        ``entries_gate_attested=True`` (weights venue).  ``None`` (default)
-        selects the source medium instead — used at the boot/reload caller
-        and at the post-fold refill after a disk-venue fold.  A key absent
-        from the map, or dropped by the SimHash gate, is a miss like any
-        other.
 
     Returns
     -------
     tuple of (new_entries, new_registry, new_bookkeeping, stats)
         ``new_entries``: ``dict[tier, dict[key, entry]]``
-        ``new_registry``: ``dict[tier, KeyRegistry]`` — only tiers whose
-            binding is publishable.
+        ``new_registry``: ``dict[tier, KeyRegistry]`` — every tier from
+            ``stats["tier_bindings"]`` (a raise above already guarantees
+            every one is publishable by the time this is built).
         ``new_bookkeeping``: ``dict[key, bookkeeping_record]``
-        ``stats``: ``{"boot_degraded": dict | None,
+        ``stats``: ``{"preload_complete": bool,
                       "tier_bindings": dict[str, TierBinding],
-                      "meta_loaded": int, "meta_orphaned": int,
-                      "meta_unbookkept": int}``. ``tier_bindings`` carries the
-        actual :class:`~paramem.adapters.registry_binding.TierBinding`
-        objects (not a lossy status-string projection) — a consumer that
-        needs to report *why* an unverified tier lost verification (e.g.
-        the incident store) reads ``binding.detail`` directly rather than
+                      "meta_loaded": int, "meta_orphaned": int}``.
+        ``preload_complete`` is ``False`` only when the fill was deferred
+        for lack of a resident model on the train venue — never when it ran
+        and came up short (that is telemetry, recorded as an incident
+        below, not a completeness failure).
+        ``tier_bindings`` carries the actual
+        :class:`~paramem.adapters.registry_binding.TierBinding` objects
+        (not a lossy status-string projection) — a consumer that needs to
+        report *why* an unverified tier lost verification (e.g. the
+        quarantine incident) reads ``binding.detail`` directly rather than
         re-deriving it.
+
+    Raises
+    ------
+    ~paramem.adapters.registry_binding.TierBindingUnpublishable
+        At least one tier (main or interim) failed registry↔slot
+        verification.
+    ~paramem.memory.store.BookkeepingInvariantViolation
+        A tier's registry has known keys but no ``key_metadata.json``
+        covering them.
     """
-    from paramem.adapters.registry_binding import verify_adapter_tree
-    from paramem.memory.entry import carries_content_fields, content_only_entry
+    from paramem.adapters.registry_binding import (
+        raise_tier_binding_unpublishable,
+        verify_adapter_tree,
+    )
+    from paramem.memory.entry import content_only_entry, is_admissible_probe_result
     from paramem.memory.source import build_memory_source as _build_memory_source
+    from paramem.memory.source import train_venue_deferred as _train_venue_deferred
     from paramem.memory.store import MemoryStore as _MemoryStoreB
 
     stats: dict = {
-        "boot_degraded": None,
+        "preload_complete": True,
         "tier_bindings": {},
         "meta_loaded": 0,
         "meta_orphaned": 0,
-        "meta_unbookkept": 0,
     }
 
     # ------------------------------------------------------------------ #
     # Registry — verify fresh from disk, per tier; no live store          #
-    # interaction.  A tier whose binding is not publishable contributes   #
-    # nothing to new_registry — it stays absent (MemoryStore.registry()   #
-    # setdefaults a fresh empty registry for any tier a reader asks for). #
+    # interaction.  There is no per-tier half-publish: a single           #
+    # unpublishable tier fails the WHOLE build, before any entry preload  #
+    # or bookkeeping read runs, via                                      #
+    # raise_tier_binding_unpublishable — the caller (the boot/lift store  #
+    # step) catches it and quarantines the store rather than swapping in #
+    # a registry map with one tier silently missing.                     #
     # ------------------------------------------------------------------ #
     new_registry: dict = {}
     stats["tier_bindings"] = verify_adapter_tree(config.adapter_dir)
-    for _tier, _binding in stats["tier_bindings"].items():
-        if _binding.publishable:
-            new_registry[_tier] = _binding.registry
-        else:
+    _unpublishable_tiers = {
+        _tier: _binding
+        for _tier, _binding in stats["tier_bindings"].items()
+        if not _binding.publishable
+    }
+    if _unpublishable_tiers:
+        for _tier, _binding in _unpublishable_tiers.items():
             logger.error(
-                "Tier %s registry binding unverified (%s: %s) — publishing nothing for this tier",
+                "Tier %s registry binding unverified (%s: %s) — quarantining the store",
                 _tier,
                 _binding.status,
                 _binding.detail,
             )
+        raise_tier_binding_unpublishable(stats["tier_bindings"])
+    for _tier, _binding in stats["tier_bindings"].items():
+        new_registry[_tier] = _binding.registry
 
     # ------------------------------------------------------------------ #
-    # Transient store — hoisted above the entry section so the           #
-    # materialized medium can put() candidates into it before the        #
-    # SimHash acceptance probe below.  Safe to build this early:         #
-    # tier_for_known_key (used later by load_bookkeeping_from_disk)      #
-    # reads only _registry, so pre-populated entries here cannot shift   #
-    # meta_loaded / meta_orphaned.  NOT the live store singleton.        #
+    # Transient store — hoisted above the entry section for use by       #
+    # load_bookkeeping_from_disk further down.  Safe to build this       #
+    # early: tier_for_known_key (used there) reads only _registry, so    #
+    # building it before the entry section cannot shift meta_loaded /    #
+    # meta_orphaned.  NOT the live store singleton.                      #
     # ------------------------------------------------------------------ #
-    _tmp_store = _MemoryStoreB(replay_enabled=True)
+    _tmp_store = _MemoryStoreB()
     for _t, _r in new_registry.items():
         _tmp_store.load_registry(_t, _r)
 
     # ------------------------------------------------------------------ #
-    # Entry content — from the materialized medium (a caller-supplied    #
-    # map, e.g. a post-fold store snapshot) or the source medium         #
-    # (adapter weights / on-disk graph.json), depending on mode.         #
+    # Entry content — from the source medium (adapter weights or         #
+    # on-disk graph.json, selected by config.consolidation.mode).        #
     # ------------------------------------------------------------------ #
     new_entries: dict = {}
 
     if not config.inference.preload_cache:
-        # Intentional opt-out: inference pays per-key latency on misses.
-        # Clear boot_degraded so the cold-cache attention item is not raised on
-        # a preload-off deployment after an apply.
-        stats["boot_degraded"] = None
+        # Intentional opt-out: the mirror is never filled, so every probe
+        # goes straight to the live door (MemoryStore.probe_source) and pays
+        # its per-key latency there — the cache stays plain off.
+        # This counts as a CLEAN pass for the mirror — there is no fill to be
+        # incomplete about — so a stale preload_recall_incomplete incident
+        # from an earlier preload_cache=true pass is resolved here rather
+        # than left to warn about a mirror that no longer serves.
+        resolve_incidents_by_type(data_state_dir(config.paths.data), "preload_recall_incomplete")
         logger.info(
             "preload_cache: disabled — store stays entry-empty; inference pays source latency"
         )
@@ -6057,209 +6237,198 @@ def _build_store_contents(
                 _preload_keys_by_tier[_tier] = _active
 
         if not _preload_keys_by_tier:
-            # No active keys — nothing to preload; store is correctly empty.
-            stats["boot_degraded"] = None
+            # No active keys — nothing to preload; store is correctly empty
+            # and, like the preload_cache=false arm above, this is a clean
+            # pass for the mirror.
+            resolve_incidents_by_type(
+                data_state_dir(config.paths.data), "preload_recall_incomplete"
+            )
+        elif _train_venue_deferred(config.consolidation.mode, model):
+            # Train venue, no model resident (cloud-only boot, or a failed
+            # load): defer the whole fill act to the next act with a model
+            # rather than raising build_memory_source's ValueError.  The
+            # completion flag stays False so the caller's re-probe gate
+            # re-attempts once a model is resident.  Any existing
+            # preload_recall_incomplete incident is left UNTOUCHED here — the
+            # fill act itself is deferred, not run, so it has produced no new
+            # verdict; the deferred fill's own record-or-clear site (below)
+            # runs when it actually executes at the next /gpu/acquire.
+            stats["preload_complete"] = False
+            logger.info(
+                "preload_cache: deferring entry preload — no model resident "
+                "(cloud-only mode or model load failed); the fill runs on the "
+                "next act with a model, and inference pays source latency "
+                "on each query until then"
+            )
         else:
             _total = sum(len(v) for v in _preload_keys_by_tier.values())
-            # `_results` ends up in the shape both media speak:
-            # dict[key, result | None] (the MemorySource.probe contract).
-            # Staying None guards the one degenerate sub-case that produces
-            # no results at all (no model loaded on the source medium) —
-            # today's behavior there is to leave boot_degraded untouched,
-            # not to compute a partial-hydration verdict over zero results.
-            _results: "dict[str, dict | None] | None" = None
-            _medium_name = ""
 
-            if materialized_entries is not None:
-                # Materialized medium: this content already crossed its own
-                # verification boundary before it ever reached this
-                # function (see the docstring) — put it into the transient
-                # store and let THAT store's SimHash gate (not a second,
-                # redundant gate here) decide acceptance.  No MemorySource
-                # is constructed, so there is no GPU work to cooldown-gate
-                # or CUDA-fail-fast-wrap.  A malformed candidate is skipped
-                # here (never put) rather than left to raise KeyError out of
-                # content_only_entry — drop-to-miss, not fail-the-rebuild.
-                for _tier, _keys in _preload_keys_by_tier.items():
-                    for _key in _keys:
-                        _candidate = materialized_entries.get(_key)
-                        if carries_content_fields(_candidate):
-                            _tmp_store.put(
-                                _tier, _key, content_only_entry(_candidate), register=False
-                            )
-                logger.info(
-                    "preload_cache: materialized medium — verifying %d active key(s) "
-                    "across %d tier(s) against staged fingerprints (no GPU probe)",
-                    _total,
-                    len(_preload_keys_by_tier),
-                )
-                _results = _tmp_store.probe(_preload_keys_by_tier, source=None, memoize=False)
-                _medium_name = "fold_entries"
-            else:
-                # Source medium: unchanged from before this parameter
-                # existed.  NOTE — the result of this probe is NOT routed
-                # through the transient store's confidence gate below: the
-                # source's own finalize_recalled already gated it against
-                # the same on-disk fingerprints, so a second pass here would
-                # be a second invocation of the same transformation (and the
-                # boot-path tests drive this with MagicMock registries that
-                # carry no fingerprints at all).
-                #
-                # Mode-aware source, built by the one factory.  Select from
-                # config.consolidation.mode — NOT from _state["mode"] (that
-                # conflates consolidation persistence mode with runtime mode).
-                # BASE-MODEL HOLDER (_source frame-local — set to None before return)
-                _source = _build_memory_source(
-                    mode=config.consolidation.mode,
-                    adapter_dir=config.adapter_dir,
-                    batch_size=config.consolidation.recall_probe_batch_size,
-                    model=model,
-                    tokenizer=tokenizer,
-                )
-                if _source is None:
-                    logger.info(
-                        "preload_cache: skipping entry preload — no model loaded "
-                        "(cloud-only mode or model load failed); store will stay "
-                        "empty for entries and inference will pay source latency "
-                        "on each query"
-                    )
-                else:
-                    logger.info(
-                        "preload_cache: probing %d active key(s) across %d tier(s) via %s",
-                        _total,
-                        len(_preload_keys_by_tier),
-                        type(_source).__name__,
-                    )
-                    # Pre-task GPU cooldown gate — wait until GPU is cool
-                    # before the ~198-key generate burst.  Bounded by
-                    # cooldown_gate_max_wait_boot_s (default 60 s <
-                    # TimeoutStartSec=120) so boot cannot be SIGKILL-ed.
-                    # Proceeds with a WARNING on timeout rather than hanging.
-                    # Sits BEFORE the probe below, whose exception handler
-                    # classifies a fault via is_fatal_cuda_fault, so the
-                    # device settles before that fail-fast-guarded burst.
-                    wait_for_cooldown(
-                        config.vram.cooldown_gate_threshold_c,
-                        config.vram.cooldown_gate_max_wait_boot_s,
-                        config.vram.cooldown_gate_poll_s,
-                        label="preload",
-                    )
-                    try:
-                        _results = _source.probe(_preload_keys_by_tier, should_abort=should_abort)
-                    except Exception as _probe_exc:
-                        if is_fatal_cuda_fault(_probe_exc):
-                            # Sticky context loss — do NOT swallow into boot_degraded.
-                            # Propagate so the lifespan fail-fast handler os._exit(1)s
-                            # into a fresh process (the only recovery).
-                            logger.critical(
-                                "preload_cache: FATAL CUDA context fault during probe "
-                                "— context poisoned, process restart required: %s",
-                                _probe_exc,
-                            )
-                            raise
-                        logger.exception(
-                            "preload_cache: source probe failed; store remains "
-                            "empty for entries (queries will retry per-key on demand)"
+            # NOTE — this probe's results are NOT routed through a second
+            # confidence gate below: both WeightMemorySource and
+            # DiskMemorySource gate their own results against the same
+            # on-disk fingerprints before returning (a hit below threshold
+            # comes back as a failure marker, handled by the miss predicate
+            # in the per-tier loop below like any other miss), so a second
+            # pass here would be a second invocation of the same
+            # transformation (and the boot-path tests drive this with
+            # MagicMock registries that carry no fingerprints at all).
+            #
+            # Mode-aware source, built by the one factory.  Select from
+            # config.consolidation.mode — NOT from _state["mode"] (that
+            # conflates consolidation persistence mode with runtime mode).
+            # BASE-MODEL HOLDER (_source frame-local — set to None before return)
+            _source = _build_memory_source(
+                mode=config.consolidation.mode,
+                adapter_dir=config.adapter_dir,
+                batch_size=config.consolidation.recall_probe_batch_size,
+                model=model,
+                tokenizer=tokenizer,
+            )
+            _medium_name = type(_source).__name__
+            logger.info(
+                "preload_cache: probing %d active key(s) across %d tier(s) via %s",
+                _total,
+                len(_preload_keys_by_tier),
+                _medium_name,
+            )
+            # Pre-task GPU cooldown gate — wait until GPU is cool
+            # before the ~198-key generate burst.  Bounded by
+            # cooldown_gate_max_wait_boot_s (default 60 s <
+            # TimeoutStartSec=120) so boot cannot be SIGKILL-ed.
+            # Proceeds with a WARNING on timeout rather than hanging.
+            # Sits BEFORE the per-tier probe loop below, whose exception
+            # handler classifies a fault via is_fatal_cuda_fault, so the
+            # device settles before that fail-fast-guarded burst.
+            wait_for_cooldown(
+                config.vram.cooldown_gate_threshold_c,
+                config.vram.cooldown_gate_max_wait_boot_s,
+                config.vram.cooldown_gate_poll_s,
+                label="preload",
+            )
+
+            # Probe PER TIER (not one grouped call over every tier) so a
+            # mid-fill raise cannot discard tiers already decoded: each
+            # tier's own try/except boundary lets everything admitted by
+            # earlier tiers stay cached, with the remaining (not-yet-probed)
+            # tiers counted as missed rather than the whole result replaced.
+            # Same GPU cost either way — WeightMemorySource already does one
+            # switch_adapter + one batched generate per tier internally, so
+            # this only isolates exceptions, not batching.
+            _hits = 0
+            _missed_by_tier: dict[str, list[str]] = {}
+            _probe_failed = False
+            for _tier, _keys in _preload_keys_by_tier.items():
+                if _probe_failed:
+                    # An earlier tier's probe failed (non-fatal) — every
+                    # later tier is an unattempted miss, not a re-attempt.
+                    _missed_by_tier.setdefault(_tier, []).extend(_keys)
+                    continue
+                try:
+                    _tier_results = _source.probe({_tier: _keys})
+                except Exception as _probe_exc:
+                    if is_fatal_cuda_fault(_probe_exc):
+                        # Sticky context loss — propagate so the lifespan
+                        # fail-fast handler os._exit(1)s into a fresh process
+                        # (the only recovery); never swallowed into telemetry.
+                        logger.critical(
+                            "preload_cache: FATAL CUDA context fault during probe "
+                            "— context poisoned, process restart required: %s",
+                            _probe_exc,
                         )
-                        _results = {}
-                    _medium_name = type(_source).__name__
-                # Drop the WeightMemorySource frame-local — the preload probe is
-                # complete; the source must not outlive this function's frame.
-                _source = None
+                        raise
+                    logger.exception(
+                        "preload_cache: source probe failed for tier %s; everything "
+                        "admitted before this failure stays cached, the rest answers "
+                        "None at the cache door (see the preload_recall_incomplete "
+                        "incident for what was missed)",
+                        _tier,
+                    )
+                    _probe_failed = True
+                    _missed_by_tier.setdefault(_tier, []).extend(_keys)
+                    continue
+                # Project once through content_only_entry, count hits,
+                # collect misses.  is_admissible_probe_result covers a
+                # malformed source result too (absent, a failure marker —
+                # including a confidence-gate drop — or missing one of the
+                # four content fields) so it becomes a clean miss instead of
+                # a cached empty-string triple.
+                for _key in _keys:
+                    _entry = _tier_results.get(_key)
+                    if not is_admissible_probe_result(_entry):
+                        _missed_by_tier.setdefault(_tier, []).append(_key)
+                        continue
+                    new_entries.setdefault(_tier, {})[_key] = content_only_entry(_entry)
+                    _hits += 1
+            # Drop the WeightMemorySource frame-local — the preload probe is
+            # complete; the source must not outlive this function's frame.
+            _source = None
 
-            if _results is not None:
-                # Single shared tail over both media: bucket by the tier from
-                # the enumeration loop, project once through
-                # content_only_entry, count hits, collect misses.  The miss
-                # predicate covers a malformed source result too (absent, a
-                # failure marker, or missing one of the four content fields)
-                # so it becomes a clean miss instead of a cached empty-string
-                # triple.
-                _hits = 0
-                _missed_by_tier: dict[str, list[str]] = {}
-                for _tier, _keys in _preload_keys_by_tier.items():
-                    for _key in _keys:
-                        _entry = _results.get(_key)
-                        if (
-                            _entry is None
-                            or "failure_reason" in _entry
-                            or not carries_content_fields(_entry)
-                        ):
-                            _missed_by_tier.setdefault(_tier, []).append(_key)
-                            continue
-                        new_entries.setdefault(_tier, {})[_key] = content_only_entry(_entry)
-                        _hits += 1
-                logger.info(
-                    "preload_cache: cached %d / %d active key(s) via %s",
-                    _hits,
-                    _total,
-                    _medium_name,
-                )
-                if _hits < _total:
-                    stats["boot_degraded"] = {
-                        "reason": "preload_partial",
+            logger.info(
+                "preload_cache: cached %d / %d active key(s) via %s",
+                _hits,
+                _total,
+                _medium_name,
+            )
+            # The fill ran (whatever it produced): completion is unaffected
+            # by a shortfall — a shortfall is telemetry, never a verdict.
+            # One record-or-clear site for the preload_recall_incomplete
+            # incident, keyed by the venue.
+            _state_dir = data_state_dir(config.paths.data)
+            if _hits < _total:
+                record_incident(
+                    _state_dir,
+                    type="preload_recall_incomplete",
+                    key=config.consolidation.mode,
+                    severity="warning",
+                    summary=(
+                        f"Store preload cached {_hits}/{_total} active key(s) via "
+                        f"{_medium_name} — the missed keys answer nothing until the "
+                        f"mirror re-warms (next boot/config-apply fill, or the next "
+                        f"go-live that rebuilds the tier)"
+                    ),
+                    detail={
                         "hits": _hits,
                         "total": _total,
                         "missed_by_tier": {
                             tier: keys[:10] for tier, keys in _missed_by_tier.items()
                         },
                         "source": _medium_name,
-                    }
-                    # Recoverable partial cache miss only — a fatal CUDA context
-                    # loss is re-raised at the probe catch above and never reaches
-                    # this branch (the process would have os._exit'd or degraded
-                    # cloud-only via _fail_fast_cuda before arriving here).
-                    logger.warning(
-                        "boot_degraded: preload_cache could not materialise %d / %d "
-                        "active keys via %s — recall self-heals via on-miss weight "
-                        "probing; the cache re-warms on the next apply or /gpu/acquire",
-                        _total - _hits,
-                        _total,
-                        _medium_name,
-                    )
-                else:
-                    # Full hydration — clear any prior degraded flag.
-                    stats["boot_degraded"] = None
+                    },
+                )
+                logger.warning(
+                    "preload_recall_incomplete: preload_cache could not materialise %d / %d "
+                    "active keys via %s — the missed keys answer nothing until the mirror "
+                    "re-warms (next boot/config-apply fill, or the next go-live that "
+                    "rebuilds the tier)",
+                    _total - _hits,
+                    _total,
+                    _medium_name,
+                )
+            else:
+                resolve_incidents_by_type(_state_dir, "preload_recall_incomplete")
 
     # ------------------------------------------------------------------ #
-    # Bookkeeping — read from key_metadata.json; entry-independent.      #
-    # Reuses the transient store hoisted above (with the fresh registries #
-    # already installed) so load_bookkeeping_from_disk can use            #
-    # tier_for_known_key() to skip orphans.                               #
+    # Bookkeeping — read from every tier's key_metadata.json;            #
+    # entry-independent.  Reuses the transient store hoisted above (with #
+    # the fresh registries already installed) so load_bookkeeping_from_disk #
+    # can use tier_for_known_key() to resolve ownership and skip orphans. #
     # ------------------------------------------------------------------ #
-    new_bookkeeping: dict = {}
-    try:
-        _meta_stats = _tmp_store.load_bookkeeping_from_disk(config.key_metadata_path)
-        # Extract the populated _bookkeeping dict from the temp store.
-        # iter_bookkeeping snapshots under the lock — safe, no external refs.
-        new_bookkeeping = dict(_tmp_store.iter_bookkeeping())
-        stats["meta_loaded"] = _meta_stats["loaded"]
-        stats["meta_orphaned"] = _meta_stats["orphaned"]
-        # Inverse direction of "orphaned": active registry keys that have NO
-        # bookkeeping row at all (registry_bookkeeping_divergence surfaced
-        # at boot).  Detect-and-surface only — never blocks or degrades
-        # boot; the fold-time integrity gate
-        # (ConsolidationLoop._assert_registry_bookkeeping_parity) is what
-        # prevents new divergence from being written.
-        _active_keys = {key for _reg in new_registry.values() for key in _reg.list_active()}
-        stats["meta_unbookkept"] = len(_active_keys - set(new_bookkeeping))
-        _unbookkept_by_tier = {
-            _t: len(set(_r.list_active()) - set(new_bookkeeping))
-            for _t, _r in new_registry.items()
-            if set(_r.list_active()) - set(new_bookkeeping)
-        }
-        logger.info(
-            "load_bookkeeping_from_disk: loaded=%d orphaned=%d unbookkept=%d by_tier=%s",
-            _meta_stats["loaded"],
-            _meta_stats["orphaned"],
-            stats["meta_unbookkept"],
-            _unbookkept_by_tier,
-        )
-    except Exception:
-        logger.exception(
-            "key_metadata bookkeeping load failed; _bookkeeping will be empty "
-            "until next consolidation cycle (speaker scoping will cold-start)"
-        )
+    # No try/except here: a tier whose registry has known keys but no
+    # key_metadata.json, or a row set that does not cover every known key,
+    # is a violation of the every-known-key-has-a-row invariant and must
+    # fail the boot store build loudly (BookkeepingInvariantViolation)
+    # rather than swap in a registry with zero rows and continue.
+    _meta_stats = _tmp_store.load_bookkeeping_from_disk(config.adapter_dir)
+    # Extract the populated _bookkeeping dict from the temp store.
+    # iter_bookkeeping snapshots under the lock — safe, no external refs.
+    new_bookkeeping = dict(_tmp_store.iter_bookkeeping())
+    stats["meta_loaded"] = _meta_stats["loaded"]
+    stats["meta_orphaned"] = _meta_stats["orphaned"]
+    logger.info(
+        "load_bookkeeping_from_disk: loaded=%d orphaned=%d",
+        _meta_stats["loaded"],
+        _meta_stats["orphaned"],
+    )
 
     return new_entries, new_registry, new_bookkeeping, stats
 
@@ -6267,30 +6436,84 @@ def _build_store_contents(
 _TIER_REGISTRY_UNVERIFIED_INCIDENT_TYPE = "tier_registry_unverified"
 
 
-def _record_unverified_tier_incidents(config, tier_bindings: dict) -> None:
-    """Record (or clear) a ``tier_registry_unverified`` incident per tier.
+def _record_or_resolve_tier_health(
+    config,
+    *,
+    tier: str,
+    unhealthy_status: "str | None",
+    detail: str,
+    candidate_count: int,
+    resolves_payload_status: bool = True,
+) -> None:
+    """Record (or clear) ONE tier's ``tier_registry_unverified`` incident.
 
-    Shared by both hydrate venues — :func:`_hydrate_memory_store_in_place`
-    (boot / in-process reload) and :func:`_finalize_full` (post-fold) — so an
-    operator sees exactly one incident type regardless of which venue
-    observed the loss.  This is the single record-or-clear site for the
-    type: a tier whose binding is publishable (``binding.publishable``)
-    resolves any prior incident for it (idempotent no-op when there was
-    none); an unpublishable tier records one, with ``binding.detail`` (the
-    actual failure reason) in the incident payload — the incident store is
-    the plaintext control-plane that survives a keyless restart, exactly
-    when the ERROR log line this same failure also produced is gone.
+    THE single record-or-clear implementation for the type — both callers
+    that mint a per-tier health verdict compose this rather than writing
+    the incident shape a second way:
+
+    * :func:`_record_unverified_tier_incidents` — the post-fold drift-
+      detection sweep, passing a fold finalizer's own publish verdict
+      (``binding.status``/``binding.detail``/``binding.candidate_count``) —
+      a FULL :class:`~paramem.adapters.registry_binding.TierBinding`
+      resolution, so its healthy signal (``unhealthy_status=None``) already
+      proved the bound slot's payload digest still matches (see
+      :func:`~paramem.adapters.registry_binding.verify_tier_binding` step
+      7). Leaves *resolves_payload_status* at its default ``True``.
+    * :func:`_stale_mark_keys` — an erase door's post-mutation report,
+      passing a :class:`~paramem.memory.persistence.RestampResult`'s
+      status and reason for a tier left unbound, ``None`` for a rebound
+      tier, and ``count_slot_candidates(tier_root)`` for the count. A
+      restamp NEVER reads the payload file — it only proves the registry
+      now binds a slot by hash — so it passes ``resolves_payload_status=
+      False``: its own healthy signal is weaker than the sweep's and must
+      not be mistaken for one.
+
+    ``unhealthy_status is None`` resolves any prior incident for *tier*
+    (idempotent no-op when there was none) — the tier is bound/verified —
+    UNLESS *resolves_payload_status* is ``False`` and the existing incident
+    (if any) was last recorded with
+    :data:`~paramem.adapters.registry_binding.PAYLOAD_MISMATCH`: a
+    restamp-only healthy signal proves nothing about the payload, so it
+    must not silently clear a payload-level failure the drift sweep
+    recorded — the incident stays open until the sweep itself recomputes
+    the full binding and finds the payload verified. This is the one
+    reconciliation point between the two callers; no second incident type
+    is introduced for it. Otherwise a new incident is recorded, with
+    *detail* (the actual failure reason) in the payload — the incident
+    store is the plaintext control-plane that survives a keyless restart,
+    exactly when the ERROR log line the same failure also produced is gone.
+
+    Sticky-payload-status invariant: a payload-level status
+    (:data:`~paramem.adapters.registry_binding.PAYLOAD_MISMATCH`) recorded
+    by a FULL-authority caller (*resolves_payload_status* ``True``) can be
+    OVERWRITTEN or RESOLVED only by another full-authority caller. This
+    applies on BOTH paths through this function, not only the resolve path
+    above: :func:`~paramem.server.incidents.record_incident` replaces
+    ``detail`` wholesale on every call, so a limited-authority RECORD (e.g.
+    the erase door's own restamp-only failure, ``unhealthy_status`` set to
+    its own — unrelated — status) would otherwise silently erase a
+    previously-recorded ``PAYLOAD_MISMATCH`` marker from ``detail["status"]``
+    without ever having verified the payload itself; a later limited-
+    authority RESOLVE would then find no marker to guard against and clear
+    an incident the drift sweep never actually re-verified. The RECORD path
+    below therefore looks up any existing open incident the same way the
+    RESOLVE path does and, when *resolves_payload_status* is ``False`` and
+    that incident's ``detail["status"]`` is already
+    :data:`~paramem.adapters.registry_binding.PAYLOAD_MISMATCH`, keeps
+    ``status`` pinned to :data:`~paramem.adapters.registry_binding.PAYLOAD_MISMATCH`
+    in the freshly-recorded ``detail`` — the caller's own *detail* text
+    (which every current caller already folds its own status string into,
+    e.g. ``_stale_mark_keys``'s ``f"... manifest re-stamp {result.status}"``)
+    still lands verbatim in ``detail["detail"]``, so nothing about the NEW
+    failure is lost — only the row's headline ``status`` field stays pinned
+    to the unresolved payload-level marker. One incident type, no second
+    field, no sidecar marker.
 
     Severity follows the same primary/secondary tiering every manifest row
-    this unit mints uses (:func:`_is_primary_adapter`): ``"failed"`` for the
-    primary (episodic) tier, ``"info"`` otherwise — a transient interim
+    this type mints uses (:func:`_is_primary_adapter`): ``"failed"`` for
+    the primary (episodic) tier, ``"info"`` otherwise — a transient interim
     slot or a secondary-tier (semantic/procedural) failure must not raise a
     failed-level row.
-
-    A tier that no longer appears in *tier_bindings* at all (an interim
-    slot folded away, a tier removed from config) can never be re-verified
-    again under its old name — any incident still open for it is resolved
-    here too, so it does not ride ``GET /status`` forever.
 
     The recorded detail/message deliberately names ``POST /backup/restore``
     (restore the affected tier from a snapshot bundle, then restart) and
@@ -6299,73 +6522,322 @@ def _record_unverified_tier_incidents(config, tier_bindings: dict) -> None:
 
     Args:
         config: Live server config object; only ``paths.data`` is read.
-        tier_bindings: ``{tier: TierBinding}`` from ``_build_store_contents``'s
-            ``stats["tier_bindings"]``.
+        tier: The tier (or interim slot) name this verdict is for.
+        unhealthy_status: ``None`` when *tier* is bound/verified (resolves
+            any prior incident, subject to *resolves_payload_status*);
+            otherwise the failure status string
+            (:data:`~paramem.adapters.registry_binding.KEY_COUNT_MISMATCH`,
+            :data:`~paramem.adapters.registry_binding.KEYS_WITHOUT_SLOT`,
+            and :data:`~paramem.adapters.registry_binding.PAYLOAD_MISMATCH`
+            each get distinct wording; every other value a generic one).
+        detail: The failure detail to record verbatim in the incident
+            payload. Ignored when *unhealthy_status* is ``None``.
+        candidate_count: The number of on-disk slot candidates for *tier*
+            at the time of this verdict. Ignored when *unhealthy_status*
+            is ``None``.
+        resolves_payload_status: Whether THIS caller's healthy signal is
+            authoritative enough to clear a prior
+            :data:`~paramem.adapters.registry_binding.PAYLOAD_MISMATCH`
+            record. ``True`` (default) for a caller that recomputed the
+            full :class:`~paramem.adapters.registry_binding.TierBinding`;
+            ``False`` for a restamp-only caller. Ignored when
+            *unhealthy_status* is not ``None``.
     """
-    from paramem.adapters.registry_binding import KEY_COUNT_MISMATCH
-
-    state_dir = config.paths.data / "state"
-    _action_hint = (
-        "restore this tier from a snapshot bundle via POST /backup/restore "
-        "and restart; see GET /integrity"
+    from paramem.adapters.registry_binding import (
+        KEY_COUNT_MISMATCH,
+        KEYS_WITHOUT_SLOT,
+        PAYLOAD_MISMATCH,
     )
-    for tier, binding in tier_bindings.items():
-        if binding.publishable:
+
+    state_dir = data_state_dir(config.paths.data)
+
+    def _is_sticky_payload_mismatch(existing_row: "dict | None") -> bool:
+        # Evaluated under the incidents-store lock, against the row as it
+        # stands at write time — never a pre-lock read, which would race a
+        # concurrent writer between the read and this call and could lose a
+        # payload-mismatch marker the drift sweep is relying on staying put.
+        return (
+            existing_row is not None
+            and existing_row.get("detail", {}).get("status") == PAYLOAD_MISMATCH
+        )
+
+    if unhealthy_status is None:
+        if resolves_payload_status:
             resolve_incident(state_dir, _TIER_REGISTRY_UNVERIFIED_INCIDENT_TYPE, tier)
-            continue
+        else:
+            # A restamp-only caller never reads the payload — only the
+            # drift sweep's own next full-binding pass can clear a sticky
+            # PAYLOAD_MISMATCH marker. skip_if vetoes the resolve under the
+            # same lock that reads the row, so no separate pre-lock read is
+            # needed to make that decision.
+            resolve_incident(
+                state_dir,
+                _TIER_REGISTRY_UNVERIFIED_INCIDENT_TYPE,
+                tier,
+                skip_if=_is_sticky_payload_mismatch,
+            )
+        return
+
+    def _fields_for_existing(existing_row: "dict | None") -> "tuple[str, str, dict]":
+        # Sticky-payload-status guard (see docstring): a limited-authority
+        # RECORD must never overwrite an existing PAYLOAD_MISMATCH marker
+        # with its own weaker status — record_incident replaces `detail`
+        # wholesale, so without this the marker a full-authority caller
+        # recorded would be silently lost the next time a restamp-only
+        # caller records anything. Evaluated under the lock (see
+        # _is_sticky_payload_mismatch) so the decision and the write are
+        # atomic.
+        recorded_status = unhealthy_status
+        if not resolves_payload_status and _is_sticky_payload_mismatch(existing_row):
+            recorded_status = PAYLOAD_MISMATCH
+
         severity = "failed" if _is_primary_adapter(tier) else "info"
-        if binding.status == KEY_COUNT_MISMATCH:
+        if recorded_status == KEY_COUNT_MISMATCH:
             summary = (
                 f"Tier '{tier}' manifest key_count disagrees with its registry's "
-                f"active-key count — publishing nothing for this tier"
+                f"active-key count since the last verified store step"
+            )
+        elif recorded_status == KEYS_WITHOUT_SLOT:
+            summary = (
+                f"Tier '{tier}' registry holds active keys but no written payload "
+                f"slot candidate exists since the last verified store step"
+            )
+        elif recorded_status == PAYLOAD_MISMATCH:
+            summary = (
+                f"Tier '{tier}' bound slot payload no longer matches its manifest "
+                f"digest since the last verified store step"
             )
         else:
             summary = (
                 f"Tier '{tier}' registry could not be verified against its slot "
-                f"manifests ({binding.status}) — publishing nothing for this tier"
+                f"manifests ({recorded_status}) since the last verified store step"
             )
-        record_incident(
-            state_dir,
-            type=_TIER_REGISTRY_UNVERIFIED_INCIDENT_TYPE,
-            key=tier,
-            severity=severity,
-            summary=summary,
-            detail={
+        return (
+            severity,
+            summary,
+            {
                 "tier": tier,
-                "status": binding.status,
-                "detail": binding.detail,
-                "candidate_count": binding.candidate_count,
-                "action_hint": _action_hint,
+                "status": recorded_status,
+                "detail": detail,
+                "candidate_count": candidate_count,
+                "action_hint": (
+                    "restore this tier from a snapshot bundle via POST /backup/restore "
+                    "and restart; see GET /integrity"
+                ),
             },
         )
 
-    _id_prefix = f"{_TIER_REGISTRY_UNVERIFIED_INCIDENT_TYPE}:"
-    for _incident in read_incidents(state_dir):
-        if _incident.type != _TIER_REGISTRY_UNVERIFIED_INCIDENT_TYPE:
-            continue
-        if _incident.status not in ("active", "acknowledged"):
-            continue
-        _incident_tier = _incident.id[len(_id_prefix) :]
-        if _incident_tier not in tier_bindings:
-            resolve_incident(state_dir, _TIER_REGISTRY_UNVERIFIED_INCIDENT_TYPE, _incident_tier)
+    # Literal severity/summary/detail below are placeholders overridden by
+    # fields_for_existing on every call — computed under the lock, from the
+    # row as it stands at write time, per the sticky-payload-status guard.
+    record_incident(
+        state_dir,
+        type=_TIER_REGISTRY_UNVERIFIED_INCIDENT_TYPE,
+        key=tier,
+        severity="failed" if _is_primary_adapter(tier) else "info",
+        summary="",
+        detail={},
+        fields_for_existing=_fields_for_existing,
+    )
 
 
-def _hydrate_memory_store_in_place(store, config, *, model, tokenizer):
-    """Load registries, hydrate the content cache, and publish atomically.
+def _record_unverified_tier_incidents(config, tier_bindings: dict) -> None:
+    """Record (or clear) a ``tier_registry_unverified`` incident per tier.
 
-    Delegates the rebuild to :func:`_build_store_contents`, then publishes
-    the three new structures via :meth:`~paramem.memory.store.MemoryStore.swap`
-    so no reader ever observes a torn state.
+    Post-fold drift detection ONLY — called from the two event-kind fold
+    finalizers (:func:`_finalize_interim`, :func:`_finalize_full`) right
+    after :func:`_revalidate_adapter_manifests`, so a tier whose on-disk
+    registry↔slot binding breaks sometime AFTER the last successful boot/lift
+    store step (:func:`_hydrate_memory_store_in_place`) is still observed and
+    reported before the next boot or lift re-runs that step. This is
+    reporting only — nothing here changes what the live store currently
+    serves for the tier; the store-publish boundary itself no longer has a
+    per-tier unpublishable arm to report on (a tier that fails verification
+    THERE quarantines the whole store instead — see
+    :func:`_enter_store_quarantine` — a single ``store_quarantined``
+    incident, not a per-tier one).
 
-    Called from two sites:
+    Thin per-event driver over :func:`_record_or_resolve_tier_health` — the
+    extracted body now also serves :func:`_stale_mark_keys` (the erase
+    door), so this function contributes only the fold-specific input
+    shape: one :class:`~paramem.adapters.registry_binding.TierBinding` per
+    tier.
 
-    * :func:`_preload_memory_store` (boot / in-process reload) — after a fresh
-      :class:`MemoryStore` has been constructed and the base-swap gate has passed.
-    * The post-fold entry-cache refill is now handled by :func:`_run_full_cycle`
-      directly (calling :func:`_build_store_contents` on the worker thread under
-      ``gpu_lock``, with the materialized medium after a weights-venue fold and
-      the source medium otherwise), so ``_finalize_full`` no longer calls this
-      function.
+    Narrow, per-event semantics only: this call only ever records or
+    resolves incidents for the tier(s) named in *tier_bindings*. A tier
+    that goes unmentioned here — because it sat untouched by this event —
+    keeps whatever incident state it already has; that incident persists
+    until the SAME tier appears in a later call's *tier_bindings* (that
+    tier's own next publish) and resolves it. Both current callers pass a
+    fold's own publish verdict
+    (:meth:`~paramem.training.consolidation.ConsolidationLoop.run_build_and_publish`'s
+    ``result["tier_bindings"]``) — the tier(s) that ONE event's ledger
+    names, never the whole tree.
+
+    Args:
+        config: Live server config object; only ``paths.data`` is read.
+        tier_bindings: ``{tier: TierBinding}`` — a fold finalizer's own
+            publish verdict, scoped to this event's tier(s) only.
+    """
+    for tier, binding in tier_bindings.items():
+        _record_or_resolve_tier_health(
+            config,
+            tier=tier,
+            unhealthy_status=None if binding.publishable else binding.status,
+            detail=binding.detail,
+            candidate_count=binding.candidate_count,
+        )
+
+
+_STORE_QUARANTINE_INCIDENT_TYPE = "store_quarantined"
+_STORE_QUARANTINE_INCIDENT_KEY = "store"
+
+
+def _enter_store_quarantine(
+    config, exc: BaseException | None = None, *, reason: str | None = None
+) -> None:
+    """Quarantine the memory store: set the marker, record the ONE incident.
+
+    ONE marker shape (``_state["store_quarantine"]`` = ``{"cause", "quarantined_at"}``)
+    and ONE incident type (:data:`_STORE_QUARANTINE_INCIDENT_TYPE`) for BOTH
+    of quarantine's two entries — the cause distinguishes which entry
+    produced it, never a second marker or incident type:
+
+    - The INVOLUNTARY entry — called from :func:`_hydrate_memory_store_in_place`
+      when the store step's build/verify raises. Pass *exc*; the cause is
+      the exception's type and message. Both
+      :class:`~paramem.memory.store.BookkeepingInvariantViolation` and
+      :class:`~paramem.adapters.registry_binding.TierBindingUnpublishable`
+      already format their message with the offending tier and key(s), so
+      no separate structured tier/key field is needed here — the message
+      carries it.
+    - The DELIBERATE entry — a repair door about to rewrite the tier tree
+      (``POST /backup/restore``, the base-swap branch of
+      ``POST /migration/rollback``) that has no exception to report because
+      nothing has failed yet; the mutation itself is the reason the store
+      must go offline first. Pass *reason*, a short human description of
+      the action in progress (e.g. ``"restoring backup 20260421-04000012"``).
+      The cause is synthesised with the SAME two keys an involuntary cause
+      carries (``exception_type="StoreOfflineForRepair"``, ``message=reason``)
+      so every cause reader — :func:`refusal_for`'s quarantine formatting,
+      the incident detail — needs no branch for which entry produced it.
+
+    Exactly one of *exc* / *reason* is given.
+
+    No on-disk artifact beyond the incident row — the marker is process
+    state (``_state["store_quarantine"]``) that a restart re-derives by
+    re-running the same store step, never a durable file of its own.
+
+    Args:
+        config: Live server config object; only ``paths.data`` is read.
+        exc: The exception caught at the store step (involuntary entry).
+        reason: Human-readable description of the deliberate action about
+            to rewrite the tree (deliberate entry).
+
+    Raises:
+        ValueError: Neither *exc* nor *reason* was given.
+    """
+    if exc is not None:
+        cause = {"exception_type": type(exc).__name__, "message": str(exc)}
+    elif reason is not None:
+        cause = {"exception_type": "StoreOfflineForRepair", "message": reason}
+    else:
+        raise ValueError("_enter_store_quarantine requires exc or reason")
+
+    _state["store_quarantine"] = {
+        "cause": cause,
+        "quarantined_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    logger.error(
+        "Memory store quarantined (%s: %s) — the parametric-memory serving "
+        "arm is out; every other capability proceeds normally (model, "
+        "STT/TTS, HA entity graph, tri-path routing).",
+        cause["exception_type"],
+        cause["message"],
+    )
+    record_incident(
+        data_state_dir(config.paths.data),
+        type=_STORE_QUARANTINE_INCIDENT_TYPE,
+        key=_STORE_QUARANTINE_INCIDENT_KEY,
+        severity="failed",
+        summary=f"Memory store quarantined: {cause['exception_type']}: {cause['message'][:160]}",
+        detail={
+            **cause,
+            "action_hint": (
+                "restore the affected tier from a snapshot bundle via "
+                "POST /backup/restore; see GET /integrity"
+            ),
+        },
+    )
+
+
+def _clear_store_quarantine(config) -> None:
+    """Resolve the store-quarantine incident and clear the marker.
+
+    Called only from :func:`_hydrate_memory_store_in_place` on a successful
+    store step — the record-and-clear-same-site pattern
+    :func:`_record_unverified_tier_incidents` also uses. Idempotent: a
+    store step that was never quarantined finds nothing to resolve.
+
+    Args:
+        config: Live server config object; only ``paths.data`` is read.
+    """
+    _state["store_quarantine"] = None
+    resolve_incident(
+        data_state_dir(config.paths.data),
+        _STORE_QUARANTINE_INCIDENT_TYPE,
+        _STORE_QUARANTINE_INCIDENT_KEY,
+    )
+
+
+def _hydrate_memory_store_in_place(store, config, *, model, tokenizer) -> bool:
+    """The boot store step, and the lift: build, verify, and publish — or quarantine.
+
+    Delegates the rebuild to :func:`_build_store_contents`. On success,
+    publishes the three new structures via
+    :meth:`~paramem.memory.store.MemoryStore.swap` (no reader ever observes
+    a torn state) and resolves any open store quarantine
+    (:func:`_clear_store_quarantine`). On failure — ANY exception from the
+    build, most commonly
+    :class:`~paramem.adapters.registry_binding.TierBindingUnpublishable`
+    (a tier's registry↔slot binding did not verify) or
+    :class:`~paramem.memory.store.BookkeepingInvariantViolation` (a known
+    key has no bookkeeping row), but not limited to that family — *store*
+    is left completely UNTOUCHED (``store.swap`` never runs: no partial
+    publish, ever) and the store is quarantined
+    (:func:`_enter_store_quarantine`). A fatal CUDA context fault
+    (:func:`~paramem.utils.vram_guard.is_fatal_cuda_fault`) is NOT caught
+    here: :func:`_build_store_contents` already re-raises it unchanged from
+    its own probe, and it propagates through this function to the lifespan
+    fail-fast handler — a poisoned CUDA context is recovered by a process
+    restart, never by quarantining the store.
+
+    This ONE function is both:
+
+    - **The boot store step** — called from :func:`_preload_memory_store`
+      (boot, and every in-process config apply / base-model reload) after a
+      fresh :class:`MemoryStore` has been constructed and the base-swap
+      gate has passed.
+    - **The lift** — the identical, re-runnable primitive the repair flows
+      invoke (via :func:`_lift_quarantined_store` →
+      :func:`_preload_memory_store`) to re-attempt hydration without a
+      restart or model churn: the quarantined branch of
+      ``POST /debug/erase-keys`` after its file surgery, and
+      ``POST /backup/restore``'s same-base convergence after the bundle
+      rewrites the tier tree. The base-swap branch of
+      ``POST /migration/rollback`` reaches it indirectly — its full
+      release+reload re-runs :func:`_preload_memory_store` as part of the
+      component rebuild. It runs fine with NO MODEL RESIDENT: passing
+      ``model=None, tokenizer=None`` defers entry preload exactly as a
+      cloud-only boot already does inside :func:`_build_store_contents` —
+      registry and bookkeeping hydration need no model. The entry cache
+      stays as it was until a model is resident again; a key the cache
+      lacks in the meantime answers nothing at serving (no on-miss
+      fallback), until the next model-resident fill act re-warms it.
+
+    The post-fold entry cache is refilled by ``run_build_and_publish``'s
+    ``adopt_increments`` instead, inside the same locked act that takes the
+    fold's bundle live — :func:`_finalize_full` never calls this function.
 
     **NO-BASE-MODEL-PINNING INVARIANT** — enforced inside
     :func:`_build_store_contents`.  The caller passes ``model`` and
@@ -6379,47 +6851,76 @@ def _hydrate_memory_store_in_place(store, config, *, model, tokenizer):
         Live :class:`~paramem.memory.store.MemoryStore` to hydrate in place.
         Must be the shared singleton (``_state["memory_store"]`` /
         ``loop.store``) so all holders (router, consolidation loop, /debug/dump)
-        observe the rebuild without re-wiring.
+        observe the rebuild without re-wiring. Left untouched when this
+        call quarantines.
     config:
         Live server config object.
     model:
         Base model handle passed directly as a kwarg expression — do NOT bind to
-        a caller local before passing.
+        a caller local before passing. ``None`` when no model is resident
+        (the lift during a cloud-only deferral, or a cloud-only boot).
     tokenizer:
         Tokenizer handle — same constraint.
+
+    Returns
+    -------
+    bool
+        ``True`` when *store* was published (the common case). ``False``
+        when this pass quarantined instead — *store* was left untouched and
+        the caller must not treat it as live.
     """
-    new_entries, new_registry, new_bookkeeping, stats = _build_store_contents(
-        config,
-        model=model,
-        tokenizer=tokenizer,
-    )
-    # Publish unconditionally — per-tier verification already excluded any
-    # unverified tier's registry/entries from the built dicts, so swapping
-    # always reflects the healthy subset of tiers.
+    try:
+        new_entries, new_registry, new_bookkeeping, stats = _build_store_contents(
+            config,
+            model=model,
+            tokenizer=tokenizer,
+        )
+    except Exception as exc:  # noqa: BLE001 — the store step's quarantine boundary
+        if is_fatal_cuda_fault(exc):
+            raise
+        _enter_store_quarantine(config, exc)
+        return False
+
     store.swap(new_entries, new_registry, new_bookkeeping)
 
-    _state["boot_degraded"] = stats["boot_degraded"]
-    _record_unverified_tier_incidents(config, stats["tier_bindings"])
+    _state["store_preload_complete"] = stats["preload_complete"]
+    _clear_store_quarantine(config)
+    return True
 
 
 def _preload_memory_store(config, *, model, tokenizer):
     """Build the MemoryStore, load registries, and hydrate the active-key cache.
 
-    Called by :func:`_build_config_derived_state`.  Returned store is assigned
-    to ``_state["memory_store"]`` by the caller.
+    Called by :func:`_build_runtime_components`.  Returned store is assigned
+    to ``_state["memory_store"]`` by the caller — ``None`` when the store
+    step quarantined, so the caller leaves ``_state["memory_store"]`` unset
+    and every non-store boot step still proceeds.
 
     Source selection uses ``config.consolidation.mode`` (NOT
     ``_state["mode"]``).  This prevents conflating the consolidation
     persistence mode (train/simulate) with the runtime mode (local/cloud-only).
 
-    boot_degraded lifecycle:
-    - Cleared when full hydration succeeds.
-    - Cleared when ``config.inference.preload_cache=False`` (intentional opt-out).
-    - Cleared (with an empty store, early return) while a base-model swap is in
-      flight — the on-disk registry describes the PREVIOUS model and is invalid
-      for the loaded one (see the base-swap gate below).
-    - Set when partial hydration occurs (some active keys not materialised),
-      including the registry-sha256 binding-bug (slot present but unmounted).
+    ``_state["store_preload_complete"]`` lifecycle:
+    - Set ``True`` when the fill act ran to whatever extent the venue could
+      serve (a shortfall is telemetry — a ``preload_recall_incomplete``
+      incident — never a completeness failure).
+    - Set ``True`` when ``config.inference.preload_cache=False`` (intentional
+      opt-out — nothing to fill) or when there are no active keys to fill.
+    - Set ``False`` while a base-model swap is in flight (empty store, early
+      return) — the on-disk registry describes the PREVIOUS model and is
+      invalid for the loaded one (see the base-swap gate below) — and when the
+      fill is deferred for lack of a resident model on the train venue
+      (:func:`~paramem.memory.source.train_venue_deferred`).  Both leave the
+      caller's re-probe gate armed to retry on the next act.
+    - Left as whatever it already was when the store step quarantines — a
+      quarantine is a distinct, more severe condition surfaced via
+      ``_state["store_quarantine"]``, not folded into this flag.
+
+    The infrastructure integrity check below still runs — with ``store=None``
+    — even when the store step quarantines: it is a read-only diagnostic
+    over the on-disk tree, not a re-read of the (unpublished) store's
+    content, so ``_state["integrity_check_failed"]`` stays accurate
+    regardless of whether the store itself quarantined.
 
     The ``WeightMemorySource`` is kept as a frame-local and dropped on return —
     mirrors the no-frame-retention pattern of ``_load_model_into_state`` so the
@@ -6439,15 +6940,14 @@ def _preload_memory_store(config, *, model, tokenizer):
 
     Returns
     -------
-    MemoryStore
+    MemoryStore | None
         The fully-constructed store (registries loaded; entries hydrated when
-        ``preload_cache=True`` and the source probe succeeded).
+        ``preload_cache=True`` and the source probe succeeded), or ``None``
+        when the store step quarantined instead of publishing.
     """
     from paramem.memory.store import MemoryStore as _MemoryStore
 
-    memory_store = _MemoryStore(
-        replay_enabled=config.consolidation.indexed_key_replay,
-    )
+    memory_store = _MemoryStore()
 
     # Base-swap invalidity gate.  While a base-model swap is in flight (Phase A has
     # deleted the old model's weight slots; Phase B has not yet retrained the new
@@ -6461,10 +6961,10 @@ def _preload_memory_store(config, *, model, tokenizer):
     # covers both the in-process reload and a boot-resume.
     from paramem.server.trial_state import read_trial_marker as _read_trial_marker
 
-    _swap_marker = _read_trial_marker((config.paths.data / "state").resolve())
+    _swap_marker = _read_trial_marker(data_state_dir(config.paths.data).resolve())
     if _swap_marker is not None and _swap_marker.migration_kind == "base_swap":
         _state["integrity_check_failed"] = False
-        _state["boot_degraded"] = None
+        _state["store_preload_complete"] = False
         logger.info(
             "preload_cache: base-swap in flight (phase=%s) — on-disk registry "
             "describes the previous model; live store starts empty until Phase B "
@@ -6474,13 +6974,25 @@ def _preload_memory_store(config, *, model, tokenizer):
         return memory_store
 
     # Delegate registry load + entry hydration to the shared helper so the same
-    # path is used at boot and at post-consolidation re-hydration.
-    _hydrate_memory_store_in_place(memory_store, config, model=model, tokenizer=tokenizer)
+    # path is used at boot and at post-consolidation re-hydration.  A quarantine
+    # leaves memory_store untouched (still the fresh, empty instance above) —
+    # it is discarded below (this function returns None) rather than treated
+    # as live.  The integrity check still runs (with store=None): it is a
+    # read-only diagnostic over on-disk files, not a tolerant re-read of the
+    # store's content, so it stays the authoritative integrity_check_failed
+    # signal (surfaced via GET /integrity and the active-store migration
+    # gate) regardless of whether the store itself quarantined.
+    _hydrated = _hydrate_memory_store_in_place(
+        memory_store, config, model=model, tokenizer=tokenizer
+    )
 
-    # Infrastructure integrity check — runs after all loaders so the store
-    # is fully populated for cross-consistency checks.  A corrupt registry
-    # blocks migrations and flags integrity_check_failed (a corrupt registry
-    # is a different, more severe condition than boot_degraded's cold cache).
+    # Infrastructure integrity check — runs after all loaders so a published
+    # store is fully populated for cross-consistency checks (store=None when
+    # this pass quarantined — verify_infrastructure_integrity tolerates that,
+    # same as the cold /integrity GET path before any preload has run). A
+    # corrupt registry blocks migrations and flags integrity_check_failed (a
+    # corrupt registry is a different, more severe condition than a deferred
+    # or partial cache fill).
     #
     # cleanup_partial_slots (scratch left by interrupted training) no longer
     # runs here — it moved pre-mount, into _sweep_keyless_tier_artifacts
@@ -6504,7 +7016,7 @@ def _preload_memory_store(config, *, model, tokenizer):
         )
         _integrity_report = verify_infrastructure_integrity(
             config,
-            store=memory_store,
+            store=memory_store if _hydrated else None,
             daily_loadable=_daily_ok_local,
         )
         if not _integrity_report.ok:
@@ -6533,7 +7045,74 @@ def _preload_memory_store(config, *, model, tokenizer):
             "Boot-time integrity check raised unexpectedly; integrity_check_failed left unchanged"
         )
 
-    return memory_store
+    return memory_store if _hydrated else None
+
+
+def _lift_quarantined_store(config) -> bool:
+    """Re-run the store step against the resident process, model-optional —
+    the ONE re-runnable "lift" a repair flow invokes to bring the memory
+    store back online without a restart or a model reload.
+
+    Delegates to :func:`_preload_memory_store` — the same fresh-``MemoryStore``
+    -construct-then-hydrate path a config apply or a base-model reload
+    already runs — passing ``model=_state.get("model")`` (``None`` in
+    cloud-only mode, which skips entry preload exactly as a cloud-only boot
+    already does; registry and bookkeeping hydration need no model) so a
+    resident local-mode server also gets its entry cache re-warmed from
+    weights. On success, republishes ``_state["memory_store"]`` AND rebuilds
+    ``_state["router"]`` against the new store object — the router's index
+    was built by capturing the store instance at construction time, so
+    reusing the pre-lift router's own ``.reload()`` would silently keep
+    reading the discarded store; only a fresh :class:`QueryRouter` observes
+    the swap. Quarantine clear/incident-resolve is NOT this function's job —
+    it already happened inside :func:`_hydrate_memory_store_in_place` (called
+    by :func:`_preload_memory_store`) as a side effect of the successful
+    build.
+
+    Callers: the quarantined branch of ``POST /debug/erase-keys`` (after its
+    file surgery), the post-restore step of ``POST /backup/restore`` (after
+    the bundle rewrites the tier tree), and the tail of
+    :func:`_finish_resumed_event` (a pending event's resume that went fully
+    live while the store was quarantined — the automatic heal for a
+    crashed publish on a cold-born tier). Safe to call again after a failed
+    lift — the quarantine marker and its incident are re-derived from the
+    fresh attempt, not accumulated across retries.
+
+    The resume caller is structurally different from the other two: it
+    cannot null ``_state["consolidation_loop"]`` before calling this
+    function, unlike the erase/restore doors (which null it, then let the
+    next fold's lazily-cached loop recreate against the fresh store this
+    function publishes) — the resume's ``loop`` local is already captured
+    by the finalizer closure it is about to dispatch, so nulling the cached
+    loop would leave that closure holding a discarded, empty-store object.
+    The resume caller instead rebinds ``loop.store`` to the new
+    ``_state["memory_store"]`` itself, in place, immediately after this
+    function returns ``True``; this function's own contract (publish
+    ``_state["memory_store"]`` + rebuild ``_state["router"]``) is unchanged
+    either way.
+
+    Args:
+        config: Live server config object.
+
+    Returns:
+        ``True`` when the store was published (quarantine cleared, if it was
+        set) and the router rebuilt; ``False`` when the store step
+        quarantined instead — ``_state["memory_store"]`` is ``None`` and the
+        cause is in ``_state["store_quarantine"]``.
+    """
+    new_store = _preload_memory_store(
+        config, model=_state.get("model"), tokenizer=_state.get("tokenizer")
+    )
+    _state["memory_store"] = new_store
+    if new_store is None:
+        return False
+    _state["router"] = QueryRouter(
+        adapter_dir=config.adapter_dir,
+        memory_store=new_store,
+        ha_graph=_state.get("ha_graph"),
+        intent_config=config.intent,
+    )
+    return True
 
 
 def _report_intent_classifier_health(config, encoder_handle, exemplar_bank) -> None:
@@ -6558,7 +7137,9 @@ def _report_intent_classifier_health(config, encoder_handle, exemplar_bank) -> N
     if not (config.intent.enabled and config.intent.mode == "embeddings"):
         return
     if encoder_handle is not None and exemplar_bank is not None:
-        resolve_incidents_by_type(config.paths.data / "state", "intent_classifier_unavailable")
+        resolve_incidents_by_type(
+            data_state_dir(config.paths.data), "intent_classifier_unavailable"
+        )
         return
     missing = []
     if encoder_handle is None:
@@ -6566,7 +7147,7 @@ def _report_intent_classifier_health(config, encoder_handle, exemplar_bank) -> N
     if exemplar_bank is None:
         missing.append("exemplars")
     record_incident(
-        config.paths.data / "state",
+        data_state_dir(config.paths.data),
         type="intent_classifier_unavailable",
         key=config.intent.mode,
         severity="warning",
@@ -6578,14 +7159,14 @@ def _report_intent_classifier_health(config, encoder_handle, exemplar_bank) -> N
     )
 
 
-def _build_config_derived_state(
+def _build_runtime_components(
     config,
     *,
     cloud_only: bool,
     rebuild_session_buffer: bool = True,
     full_rebuild: bool = True,
 ) -> None:
-    """Construct every config-derived component into ``_state``.
+    """Construct every runtime component into ``_state`` from stable first-level configuration.
 
     Single idempotent routine called by BOTH the lifespan startup and the
     live-apply path.  Replaces the lifespan's inline construction blocks at
@@ -6638,7 +7219,7 @@ def _build_config_derived_state(
         avoid losing in-flight state.  Only meaningful when ``full_rebuild=True``
         (the session buffer is never rebuilt on a plain reclaim).
     full_rebuild:
-        When ``True`` (default, boot + apply path): rebuild ALL config-derived
+        When ``True`` (default, boot + apply path): rebuild ALL runtime
         components (steps 1–9 above).
         When ``False`` (plain ``/gpu/acquire`` + auto-reclaim same config):
         skip the expensive, potentially network-touching steps (speaker_store,
@@ -6664,21 +7245,14 @@ def _build_config_derived_state(
 
         _state["session_buffer"] = SessionBuffer(
             config.session_dir,
-            state_dir=config.paths.data / "state",
             retain_sessions=config.consolidation.retain_sessions,
             debug=config.debug,
-            consolidation_retry_cap=config.consolidation.consolidation_retry_cap,
             idle_timeout_minutes=config.session.idle_timeout_minutes,
         )
         # Cold-start: rehydrate pending JSONL into memory before loading the
         # encrypted snapshot (snapshot carries mid-turn _sessions state only).
         _state["session_buffer"].rehydrate_from_disk()
         _state["session_buffer"].load_snapshot()
-        # Seed in-memory retry counts from the durable store.  Runs after
-        # load_snapshot so the durable file overwrites any snapshot-carried
-        # values — the durable store survives ungraceful restarts; the
-        # snapshot does not.
-        _state["session_buffer"].hydrate_retry_counts()
 
     if full_rebuild:
         # ── 2. speaker_store ─────────────────────────────────────────────────
@@ -6870,18 +7444,20 @@ def _build_config_derived_state(
         # and ha_graph — config did not change, no network reconnect needed.
         ha_graph = _state.get("ha_graph")
         logger.info(
-            "_build_config_derived_state: plain reclaim — skipping STT/TTS/HA/cloud/exemplar "
+            "_build_runtime_components: plain reclaim — skipping STT/TTS/HA/cloud/exemplar "
             "rebuild (full_rebuild=False, same config)"
         )
 
     # ── 6. Memory store preload ───────────────────────────────────────────────
-    # Re-probe gate: re-probe only when (a) the cache is cold (boot_degraded set or
-    # store is None/empty), or (b) called from the apply path (caller sets
+    # Re-probe gate: re-probe only when (a) the store step's completion
+    # record is absent (deferred or never run), or the store object itself
+    # is absent, or (b) called from the apply path (caller sets
     # _state["_apply_config_in_progress"] = True before calling this routine
-    # and clears it after).  On a plain reclaim with a warm store, still
-    # rebuild the Router cheaply but skip the probe.
+    # and clears it after).  On a plain reclaim with a complete store, still
+    # rebuild the Router cheaply but skip the probe — never invalidated by a
+    # GPU release: a cloud-only deferral does not invalidate the mirror.
     _do_probe = (
-        _state.get("boot_degraded") is not None
+        not _state.get("store_preload_complete", False)
         or _state.get("memory_store") is None
         or _state.get("_apply_config_in_progress", False)
     )
@@ -6894,9 +7470,9 @@ def _build_config_derived_state(
         )
         _state["memory_store"] = memory_store
     else:
-        # Warm store survives — keep it, just rebuild the Router below.
+        # Complete store survives — keep it, just rebuild the Router below.
         logger.info(
-            "_build_config_derived_state: warm store present (boot_degraded=None) — "
+            "_build_runtime_components: store-preload step already complete — "
             "skipping re-probe (re-probe gate); rebuilding router only"
         )
         memory_store = _state["memory_store"]
@@ -6974,6 +7550,75 @@ def _build_config_derived_state(
             lang_id.load_at_startup(config.text_lang_detection.model_path)
 
 
+def _remount_adapters_from_disk(config) -> None:
+    """Re-mount every tier adapter from disk onto the resident model, on demand.
+
+    Runs the boot mount machinery (:func:`_mount_adapters_from_slots`)
+    AGAIN against an already-running server whose weight slots just changed
+    underneath it — the case ``POST /backup/restore`` (same-base restore)
+    needs after it rewrites the tier tree, and ``_load_model_into_state``
+    does NOT cover: that function only ever mounts onto a FRESH base model
+    at boot or after a full release+reload, never onto a model that already
+    has these exact tier names mounted.
+
+    NO-OP in cloud-only mode (``_state["model"] is None``): slots on disk
+    are the truth and the next model acquisition mounts them — the same
+    contract a cloud-only boot already has (see
+    :func:`_preload_memory_store`'s docstring).
+
+    When a model IS resident, every currently mounted tier adapter (main
+    and interim alike — whatever the PRE-restore tree had mounted,
+    including any orphan interim family the restore's clean-slate sweep
+    just removed from disk) is disposed first via
+    :func:`~paramem.models.loader.detach_adapters` — the ``PEFT``
+    switch-before-delete discipline :func:`~paramem.memory.interim_adapter.unload_interim_adapters`
+    also relies on. A same-base restore can legitimately replace every
+    mounted tier adapter, so this may (and, for a full bundle, does) empty
+    ``model.peft_config`` entirely — :func:`detach_adapters` documents this
+    exact "the caller is emptying peft_config deliberately and owns the
+    restore" branch. Emptying leaves ``model.active_adapter`` stale (the PEFT
+    sole-adapter trap: an emptied-but-still-PeftModel-wrapped model must
+    never receive ``add_adapter``/``load_adapter`` next — see this module's
+    PEFT rules), so the model is unwrapped to the bare base
+    (``model.base_model.model``) BEFORE calling
+    :func:`_mount_adapters_from_slots` again — its first re-mount then takes
+    the clean ``PeftModel.from_pretrained`` wrap path, identical to the very
+    first adapter mounted at boot, rather than ``PeftModel.load_adapter`` on
+    a model whose active-adapter reference no longer resolves.
+
+    Caller responsibility: serialize this against every other GPU user —
+    call under ``gpu_lock`` (mirrors every other PEFT-mutating primitive in
+    this module). This function does not acquire the lock itself.
+
+    Args:
+        config: Live server config object.
+    """
+    from peft import PeftModel
+
+    from paramem.models.loader import detach_adapters
+
+    model = _state.get("model")
+    if model is None:
+        logger.info("Adapter re-mount skipped — cloud-only mode (no resident model)")
+        return
+
+    tokenizer = _state.get("tokenizer")
+    if isinstance(model, PeftModel):
+        mounted = sorted(model.peft_config.keys())
+        detach_adapters(model, mounted)
+        model = model.base_model.model  # unwrap — the clean re-wrap path below needs it
+
+    # Manifest status describes the PRE-restore tree; every row is stale the
+    # instant the tree is rewritten underneath it — same reset
+    # _load_model_into_state performs on every fresh load.
+    _state["adapter_manifest_status"] = {}
+    model = _mount_adapters_from_slots(model, tokenizer, config, _state)
+    if hasattr(model, "peft_config") and "episodic" in model.peft_config:
+        switch_adapter(model, "episodic")
+    _state["model"] = model
+    logger.info("Adapter re-mount complete — model handle refreshed in _state")
+
+
 def _load_model_into_state(config) -> None:
     """Load base model + adapters into ``_state`` without retaining the
     handles in the caller's frame.
@@ -7030,17 +7675,6 @@ def _load_model_into_state(config) -> None:
 
     # Mount adapters from slots — wraps the model in PeftModel.
     model = _mount_adapters_from_slots(model, tokenizer, config, _state)
-
-    # Drop orphan entries from key_metadata.json — keys whose tier registry was
-    # wiped (e.g. by the interim-cleanup pass above) must not linger as
-    # bookkeeping. Wipe invariant: key_metadata is for active keys, not
-    # recovery. Runs every boot; no-op when nothing to prune.
-    from paramem.server.consolidation import prune_key_metadata_orphans
-
-    try:
-        prune_key_metadata_orphans(config)
-    except Exception:
-        logger.exception("Boot-time key_metadata orphan prune failed; continuing")
 
     # Restore the main episodic adapter as the active adapter.
     if hasattr(model, "peft_config") and "episodic" in model.peft_config:
@@ -7121,7 +7755,7 @@ def _live_reload_base_model(
     (when ``voice_profile=="gpu"``) and restores it after a successful
     PARTIAL reload (``refresh_config_from_disk=False``).  The FULL-rebuild
     path (``refresh_config_from_disk=True``) restores voice via
-    ``_build_config_derived_state`` — adding a restore here for that branch
+    ``_build_runtime_components`` — adding a restore here for that branch
     would double-load.  Failure branches leave voice on CPU so the
     cloud-only server holds ~0 GiB.  A voice-restore failure on the PARTIAL
     path is a handled, non-fatal degradation — logged and re-drained to CPU,
@@ -7130,7 +7764,7 @@ def _live_reload_base_model(
 
     The drain is idempotent for cloud-only callers (``voice_profile=="cpu"``
     → ``_set_voice_pipeline_profile`` early-returns on a matching profile).
-    It also closes the double-voice leak in ``_build_config_derived_state``
+    It also closes the double-voice leak in ``_build_runtime_components``
     full-rebuild: the rebuild overwrites ``_state["stt_gpu"]``/``["tts_gpu"]``
     without unloading the old GPU instances; the drain unloads and nulls them
     first so the rebuild starts from a clean slate.
@@ -7158,21 +7792,23 @@ def _live_reload_base_model(
           **before** ``_release_base_model_in_process`` — so the new config is
           committed before the release (recoverable if the reload then fails).
         - After a successful ``_load_model_into_state``, call
-          ``_build_config_derived_state(config, cloud_only=False,
-          full_rebuild=True)`` to rebuild ALL config-derived components
-          (memory store preload, router, exemplar banks, STT/TTS managers,
-          ha_client/ha_graph, etc.).
+          ``_build_runtime_components(config, cloud_only=False,
+          full_rebuild=True)`` to rebuild ALL first-level-configuration
+          components (memory store preload, router, exemplar banks, STT/TTS
+          managers, ha_client/ha_graph, etc.).
         - Flip ``_state["mode"]="local"`` after a clean full rebuild.  A
-          partial preload (``boot_degraded`` set) is NOT a failure — recall
-          self-heals via on-miss weight probing, so the server stays local and
-          surfaces ``boot_degraded`` as a /status attention signal.
+          partial preload (``preload_recall_incomplete`` incident recorded) is
+          NOT a failure — the missed keys simply answer nothing until the
+          mirror re-warms at the next fill act, so the server stays local
+          and the incident surfaces via the generic /status attention
+          collector.
         - On rebuild failure: stay cloud-only, set ``cloud_only_reason`` to
           ``"apply_failed"``.
 
         When ``False`` (plain ``/gpu/acquire`` + auto-reclaim, same config):
 
         - Model reload + ``set_classifier_model`` (to register the new handle).
-        - ``_build_config_derived_state`` is called with ``full_rebuild=False``
+        - ``_build_runtime_components`` is called with ``full_rebuild=False``
           (rebuilds memory-store probe [re-probe-gated] + Router re-point only).
           STT/TTS, HA reconnect, exemplar banks, and language_tracker are
           skipped — same config, no delta.
@@ -7240,7 +7876,7 @@ def _live_reload_base_model(
     # and defers to cloud-only (observed 2026-05-29: effective free 3.28 GiB,
     # needed 5.00 GiB).  Idempotent: _set_voice_pipeline_profile early-returns
     # when voice_profile already matches ("cpu" for cloud-only callers).
-    # Also closes the double-voice leak in _build_config_derived_state
+    # Also closes the double-voice leak in _build_runtime_components
     # full-rebuild: the rebuild overwrites _state["stt_gpu"]/_state["tts_gpu"]
     # without unloading the old GPU instances; draining here unloads and nulls
     # them first so the rebuild constructs on a clean slate.
@@ -7336,14 +7972,14 @@ def _live_reload_base_model(
         try:
             # rebuild_session_buffer is threaded from _apply_config_live
             # (True when retain_sessions or debug changed between A and B).
-            _build_config_derived_state(
+            _build_runtime_components(
                 config,
                 cloud_only=False,
                 rebuild_session_buffer=rebuild_session_buffer,
                 full_rebuild=True,
             )
         except Exception:
-            logger.exception("Live config apply: _build_config_derived_state failed")
+            logger.exception("Live config apply: _build_runtime_components failed")
             rebuild_failed = True
         finally:
             _state.pop("_apply_config_in_progress", None)
@@ -7357,22 +7993,24 @@ def _live_reload_base_model(
             )
             return "apply_failed"
 
-        # Full rebuild succeeded.  A partial preload (boot_degraded set by
-        # _preload_memory_store inside _build_config_derived_state) is NOT a
-        # failure: recall self-heals via on-miss weight probing and the cache
-        # re-warms on demand, so the server stays local.  boot_degraded stays
-        # set as a signal — surfaced in the /status attention block — and is
-        # cleared when a later preload fully hydrates.  The set_classifier_model
-        # call is inside _build_config_derived_state (step 8 exemplar banks).
+        # Full rebuild succeeded.  A partial preload (a preload_recall_incomplete
+        # incident recorded by _preload_memory_store inside
+        # _build_runtime_components) is NOT a failure: the missed keys simply
+        # answer nothing at serving until a later fill act (the next apply or
+        # /gpu/acquire) re-warms the mirror, so the server stays local.  The
+        # incident stays active as a signal — surfaced via the generic
+        # /status attention collector — and is resolved when a later preload
+        # fully hydrates.  The set_classifier_model call is inside
+        # _build_runtime_components (step 8 exemplar banks).
         _state["mode"] = "local"
         _state["cloud_only_reason"] = None
         logger.info("Live config apply — complete; mode=local")
         result = None
     else:
         # Plain reclaim path (same config): rebuild Router + classifier handle.
-        # Re-probe gate: _build_config_derived_state skips the expensive weight-probe
-        # when the store is warm (boot_degraded=None, memory_store non-None).
-        # _apply_config_in_progress is NOT set here.
+        # Re-probe gate: _build_runtime_components skips the expensive weight-probe
+        # when the store-preload step's completion record is present and
+        # memory_store is non-None.  _apply_config_in_progress is NOT set here.
         rebuild_failed = False
         try:
             # full_rebuild=False — plain reclaim rebuilds only the memory
@@ -7380,7 +8018,7 @@ def _live_reload_base_model(
             # set_classifier_model (re-register the new model handle).
             # STT/TTS construction, HA reconnect, cloud_agent, exemplar banks,
             # and language_tracker are skipped (same config, no delta).
-            _build_config_derived_state(
+            _build_runtime_components(
                 config,
                 cloud_only=False,
                 rebuild_session_buffer=False,
@@ -7388,7 +8026,7 @@ def _live_reload_base_model(
             )
         except Exception:
             logger.exception(
-                "Live model reload: _build_config_derived_state failed; "
+                "Live model reload: _build_runtime_components failed; "
                 "intent/router may be stale until next reload or restart"
             )
             rebuild_failed = True
@@ -7396,7 +8034,7 @@ def _live_reload_base_model(
         if not rebuild_failed:
             # Partial-path success restore: the entry-drain moved voice to CPU;
             # put it back now that the base model is live.  The full-rebuild path
-            # (refresh_config_from_disk=True) skips this — _build_config_derived_state
+            # (refresh_config_from_disk=True) skips this — _build_runtime_components
             # already reconstructed voice on GPU and set voice_profile="gpu".
             #
             # A voice-restore failure is a handled, non-fatal degradation: this
@@ -7511,10 +8149,10 @@ def _release_base_model_in_process() -> None:
     NOTE: ``paramem.training.graph_tier.GraphTierRefiner`` also carries a
     ``# BASE-MODEL HOLDER`` tag (per the CLAUDE.md grep-registry
     convention) but is NOT a sixth holder above —
-    ``ConsolidationLoop._refine_consolidation_graph`` constructs a fresh
-    instance as a local variable on every call and drops it (no reference
-    retained anywhere) when the method returns, so it needs no release
-    reach from this function.
+    ``ConsolidationLoop.build_tier_refiner`` constructs a fresh instance as a
+    local variable on every call and drops it (no reference retained
+    anywhere) when the caller returns, so it needs no release reach from
+    this function.
 
     NOTE: this function CANNOT reach references held in the **lifespan
     async-generator frame** (it stays suspended at ``yield`` for the app's
@@ -7697,7 +8335,7 @@ def _release_base_model_in_process() -> None:
 _APPLY_CONFIG_LOCK_TIMEOUT_S: float = 60.0
 
 
-def _apply_config_live() -> dict:
+def _apply_config_live(*, force: bool = False) -> dict:
     """Apply the on-disk ``configs/server.yaml`` to the running server in-process.
 
     Acquires ``gpu_lock_sync`` with a bounded timeout, then:
@@ -7709,6 +8347,9 @@ def _apply_config_live() -> dict:
        was active in memory when the server last booted or accepted a migration).
        This is the rollback case — disk is back to A, memory is A.  Returns
        immediately without GPU churn (disk hash equals memory hash — config A is already active).
+       Skipped entirely when *force* is ``True`` — see the *force* parameter
+       below; the reload always runs on that path regardless of what the
+       disk/memory hash comparison would have concluded.
 
        **Caller ordering precondition:** the accept handler MUST dispatch
        ``_apply_config_live`` BEFORE refreshing ``config_drift.loaded_hash``
@@ -7780,6 +8421,22 @@ def _apply_config_live() -> dict:
     ``_live_reload_base_model`` must NOT acquire it again — double-acquire on
     the non-reentrant ``threading.Lock`` deadlocks.
 
+    Parameters
+    ----------
+    force:
+        When ``True``, step 2's no-op skip is bypassed entirely — the reload
+        always runs. The sole caller is the base-swap branch of
+        ``POST /migration/rollback``: that branch has already entered store
+        quarantine and rewritten the tier tree from a bundle before calling
+        here, so a skipped reload would strand the quarantine with the base
+        model never reloaded and the store never lifted. The skip logic
+        itself stays intact for every other caller (migration accept, both
+        ``POST /backup/restore`` branches, the non-base-swap rollback
+        branch, and any future caller) — this parameter only lets ONE
+        caller step around it, rather than the skip being weakened for
+        everyone. ``False`` (default) preserves the existing
+        disk-hash-vs-memory-hash comparison for every other caller.
+
     Returns
     -------
     dict
@@ -7846,10 +8503,11 @@ def _apply_config_live() -> dict:
             }
 
         # ── no-op skip (disk hash == memory hash → rollback already applied config) ──
+        # Bypassed entirely when force=True — see the *force* parameter doc.
         config_path_str = _state.get("config_path")
         config_a = _state.get("config")
         live_config_path = Path(config_path_str) if config_path_str else DEFAULT_SERVER_CONFIG_PATH
-        if live_config_path.exists():
+        if not force and live_config_path.exists():
             disk_hash = compute_config_hash(live_config_path)
             # Compare the on-disk hash against the hash of config A that was
             # captured at boot (or at the last accept).  ``ServerConfig`` has
@@ -8091,7 +8749,7 @@ def _apply_config_live() -> dict:
         applied_live = reason is None
 
         if applied_live:
-            # Voice pipeline was set by _build_config_derived_state inside
+            # Voice pipeline was set by _build_runtime_components inside
             # _live_reload_base_model; final no-op profile flip to confirm gpu.
             _set_voice_pipeline_profile("gpu", lock_held=True)
 
@@ -8107,7 +8765,7 @@ def _apply_config_live() -> dict:
         lock_ctx.__exit__(None, None, None)
 
 
-async def _apply_config_live_guarded() -> dict:
+async def _apply_config_live_guarded(*, force: bool = False) -> dict:
     """Dispatch ``_apply_config_live`` under the synchronous maintenance guard.
 
     Sole owner of the guard+dispatch+restore pattern shared by the migration
@@ -8125,6 +8783,11 @@ async def _apply_config_live_guarded() -> dict:
     server is still serving in its prior mode (carve changes take effect on the
     operator's restart) and must not be left degraded to cloud-only.
 
+    Args:
+        force: Forwarded to :func:`_apply_config_live` — see its own *force*
+            parameter doc. Only the base-swap branch of
+            ``POST /migration/rollback`` passes ``True``.
+
     Returns the ``_apply_config_live`` result dict (``applied_live``,
     ``restart_required_reason``, ``restart_eligible``, ...).  Callers that only
     need the mode-restore side effect may ignore the return.
@@ -8135,7 +8798,13 @@ async def _apply_config_live_guarded() -> dict:
     _state["cloud_only_reason"] = "live_reload"
 
     loop = asyncio.get_running_loop()
-    apply_result = await loop.run_in_executor(None, _apply_config_live)
+    # Call with zero args in the (overwhelmingly common) force=False case —
+    # every existing test double patching _apply_config_live at module scope
+    # was written against that zero-arg signature; only a caller that
+    # explicitly opts into force=True (see _apply_config_live's own
+    # docstring) needs the kwarg-carrying partial.
+    call = functools.partial(_apply_config_live, force=True) if force else _apply_config_live
+    apply_result = await loop.run_in_executor(None, call)
 
     if _state.get("mode") == "cloud-only" and _state.get("cloud_only_reason") == "live_reload":
         _state["mode"] = _prior_mode
@@ -8305,7 +8974,7 @@ async def incidents_ack(incident_id: str):
         ``{"status": "not_found", "id": incident_id}`` when no matching
         incident exists.
     """
-    state_dir = _state["config"].paths.data / "state"
+    state_dir = data_state_dir(_state["config"].paths.data)
     ok = ack_incident(state_dir, incident_id)
     return {"status": "ok" if ok else "not_found", "id": incident_id}
 
@@ -8364,13 +9033,30 @@ async def admin_assign_orphans(speaker_id: str | None = None):
     ``config.debug``.
 
     Body: optional ``speaker_id`` query parameter — defaults to the first
-    enrolled profile when omitted.  When ``buffer.debug=True`` the on-disk
-    session jsonls are rewritten in place; in production-mode (no on-disk
-    transcripts) the binding lives only in memory but still flows through
-    the next consolidation into adapter weights — the
-    durable medium changes with the deployment posture, the operation is
-    the same.
+    enrolled profile when omitted.  Production always writes session
+    jsonls — ``SessionBuffer._append_turn``'s write-and-fsync is
+    unconditional — so the on-disk rewrite below always fires; it is not
+    gated on ``buffer.debug``.  The binding also flows through the next
+    consolidation into adapter weights either way.
+
+    Errors
+    ------
+    409 ``consolidating`` | ``training_active`` | ``trial_active`` |
+    ``cloud_only`` | ``base_swap_active`` | ``consolidation_pending``
+        A fold, background training, a migration TRIAL, or an active
+        base-swap migration is in flight, the server has no local model
+        loaded, or a consolidation event's record is pending resume
+        (:func:`active_consolidation`, mapped via :func:`refusal_for`) —
+        this door rewrites session jsonls that a pending event's ledger may
+        be about to consume.
     """
+    verdict = active_consolidation()
+    if verdict is not None:
+        error, message = refusal_for(
+            verdict, doing="re-attributing orphan sessions", then="re-attribute"
+        )
+        raise HTTPException(status_code=409, detail={"error": error, "message": message})
+
     store = _state.get("speaker_store")
     buffer = _state.get("session_buffer")
     if store is None or buffer is None:
@@ -8388,10 +9074,12 @@ async def admin_assign_orphans(speaker_id: str | None = None):
             turn["speaker"] = sname
             turn["speaker_id"] = sid
         claimed += 1
-        # Rewrite the on-disk jsonl when one exists.  In production
-        # (debug=false) no jsonls are written, so ``path.exists()`` is
-        # False and the rewrite skips — the in-memory mutation above is
-        # the only durable medium until consolidation runs.  Mode-agnostic.
+        # Rewrite the on-disk jsonl when one exists.  Every turn is written
+        # and fsynced to a per-session jsonl ungated by ``debug``
+        # (``SessionBuffer._append_turn``), so ``path.exists()`` is normally
+        # True in production too; the guard only skips a session whose
+        # transcript already retired (archived or deleted at consolidation)
+        # while its in-memory buffer entry survived.  Mode-agnostic.
         path = buffer.session_dir / f"{conv_id}.jsonl"
         if path.exists():
             with open(path, "w") as f:
@@ -8401,177 +9089,118 @@ async def admin_assign_orphans(speaker_id: str | None = None):
     return {"status": "ok", "claimed": claimed, "speaker": sname, "speaker_id": sid}
 
 
-def _reap_emptied_tiers(loop, tier_roots: dict[str, Path]) -> tuple[list[str], list[str]]:
-    """Reap every tier in *tier_roots* down to its never-trained shape.
+def _stale_mark_keys(*, config, staled_keys: list[str], label: str, store=None) -> dict:
+    """Stale-mark *staled_keys* on disk and settle the resulting RAM state —
+    the shared post-erase sequence used by both ``POST /speaker/forget`` and
+    ``POST /debug/erase-keys``.
 
-    Called only for tiers whose ``KeyRegistry.list_known()`` reads empty
-    after a hard erase — see :func:`speaker_forget`'s docstring for the
-    trigger rationale. Handles interim and main tiers identically: the
-    on-disk shape (whole interim slot dir vs a main tier's root minus its
-    ``interim_*`` children) is decided by
-    :func:`~paramem.memory.persistence.reap_tier_artifacts` from
-    *tier_root* itself — this helper never branches on tier kind.
+    Delegates to
+    :func:`~paramem.memory.persistence.erase_keys_and_restamp_manifest`, a
+    file surgeon that reads every affected tier's registry straight off
+    disk. A tier is *affected*, and a key is marked, iff that tier's
+    registry holds the key ACTIVE: each such key is withheld — a marker
+    reserving the id and carrying no fingerprint, since the active
+    fingerprint does not survive the transition — and that tier's bound
+    slot manifest is re-stamped so
+    :func:`~paramem.adapters.manifest.find_live_slot` still resolves it on
+    restart — the single shared implementation for every out-of-fold
+    registry-mutation caller. It needs neither a live
+    :class:`~paramem.memory.store.MemoryStore` nor a model, which is what
+    lets ``POST /debug/erase-keys`` run this sequence in cloud-only mode and
+    while the store is quarantined. This is a stale-mark, not a hard erase:
+    entries and bookkeeping are untouched, and the row leaves with the rest
+    of the key at its owning tier's own next rebuild, when the key is
+    genuinely retired rather than merely withheld. A tier's rebuild is a
+    full consolidation or ``POST /reconsolidate`` (both rebuild every main
+    tier) or an interim cycle (rebuilds only the slot it mints) — a tier no
+    consolidation reaches keeps its markers indefinitely. A key already
+    withheld (or unknown) in every tier affects nothing — no bytes written, no
+    rebind attempted — the ordinary idempotent outcome, not a refusal.
 
-    Order is load-bearing:
+    ``erase_keys_and_restamp_manifest`` NEVER refuses — every affected
+    tier's mutation lands and every rebind is attempted regardless of
+    outcome, INCLUDING an I/O failure during one tier's own rebind attempt:
+    that tier's :class:`~paramem.memory.persistence.RestampResult` carries
+    :data:`~paramem.memory.persistence.REBIND_FAILED` (with the caught
+    exception's message) rather than aborting the remaining tiers. This
+    function reports the per-tier outcome (never raises for it): for every
+    affected tier, records the tier's
+    :class:`~paramem.memory.persistence.RestampResult` as a
+    :class:`~paramem.server.app.TierRestampOutcome` — outcome
+    ``"rebound"``, ``"unbound"``, or ``"rebind_failed"`` — and drives that
+    same verdict through :func:`_record_or_resolve_tier_health` (rebound ->
+    resolves any prior ``tier_registry_unverified`` incident EXCEPT one
+    last recorded as
+    :data:`~paramem.adapters.registry_binding.PAYLOAD_MISMATCH` — a restamp
+    never reads the payload, so it passes ``resolves_payload_status=False``
+    and cannot clear that one; unbound OR rebind_failed -> records one,
+    plus an ERROR log naming the tier and the reason) — the same incident
+    type and record-or-clear implementation the post-fold drift sweep
+    (:func:`_record_unverified_tier_incidents`) uses.
 
-    1. Drop each tier from the store
-       (:meth:`~paramem.memory.store.MemoryStore.drop_tier`) — RAM first,
-       so the tier is unroutable immediately.
-    2. Delete every reaped tier's PEFT adapter in ONE
-       :func:`~paramem.models.loader.detach_adapters` call, interim and
-       main tiers alike.
-    3. Immediately rebuild the production adapter set
-       (:meth:`~paramem.training.consolidation.ConsolidationLoop.ensure_adapters`)
-       and re-publish it to ``_state["model"]``. This closes the window
-       where the live model could hold an EMPTY ``peft_config`` before any
-       disk work runs — measured on peft 0.18.1, a ``PeftModel`` with no
-       resident adapter left ``active_adapter`` stale at zero survivors
-       and raised ``KeyError`` on ``forward()``. Re-creating a
-       never-trained tier's adapter here IS that tier's pristine in-RAM
-       shape, so there is nothing to preserve across the swap. The
-       re-publish is a defensive no-op on every path that reaches this
-       helper today (``loop.model`` already IS ``_state["model"]``) — it
-       exists so a future caller cannot reintroduce a stale reference.
-    4. Remove each reaped tier's on-disk artifacts
-       (:func:`~paramem.memory.persistence.reap_tier_artifacts`) and drop
-       its ``adapter_manifest_status`` row.
+    When *store* is given — a caller holding a live, RAM-resident
+    ``MemoryStore`` for a healthy (non-quarantined) server —
+    ``store.discard_keys(staled_keys)`` is called immediately after the file
+    surgery so the RAM registries stay in lockstep with what just landed on
+    disk: every named key is unreachable for serving (excluded from
+    ``list_active()``) the moment this call returns. *store* is ``None`` for
+    a caller with no live store to sync (cloud-only, or the store is
+    quarantined) — files remain the driving source and a later lift picks
+    them up.
 
-    Args:
-        loop: The live :class:`~paramem.training.consolidation.ConsolidationLoop`.
-        tier_roots: Tier name -> already-resolved, validated slot-root
-            path. Never re-derived here — the caller resolved it before
-            any mutation ran.
-
-    Returns:
-        ``(unloaded, removed_dirs)``. ``unloaded`` is the sorted adapter
-        names :func:`~paramem.models.loader.detach_adapters` actually
-        deleted from the live model (may be a subset of ``tier_roots``
-        when a tier was never trained and had no live PEFT slot).
-        ``removed_dirs`` has one entry per tier whose on-disk artifacts
-        were non-empty before the reap — that tier's own root directory
-        name. Note a main tier's root directory can still exist on disk
-        afterward when a sibling ``interim_*`` child survives beneath it
-        (:func:`~paramem.memory.persistence.reap_tier_artifacts` only
-        removes a root once it is left empty); the tier is still listed
-        here because its own content was fully removed.
-    """
-    from peft import PeftModel
-
-    from paramem.memory.persistence import reap_tier_artifacts
-    from paramem.models.loader import detach_adapters, switch_adapter
-
-    for tier in tier_roots:
-        loop.store.drop_tier(tier)
-
-    unloaded = detach_adapters(loop.model, list(tier_roots))
-
-    loop.model = loop.ensure_adapters()
-    if isinstance(loop.model, PeftModel) and "episodic" in loop.model.peft_config:
-        switch_adapter(loop.model, "episodic")
-    _state["model"] = loop.model
-
-    manifest_status = _state.get("adapter_manifest_status", {})
-    removed_dirs: list[str] = []
-    for tier, tier_root in tier_roots.items():
-        removed = reap_tier_artifacts(tier_root)
-        if removed:
-            removed_dirs.append(tier_root.name)
-        manifest_status.pop(tier, None)
-
-    return unloaded, sorted(removed_dirs)
-
-
-def _erase_keys_with_reap(*, loop, config, erased_keys: list[str], label: str) -> dict:
-    """Hard-erase *erased_keys* from the store and settle every downstream
-    bookkeeping consequence — the shared post-erase sequence used by both
-    ``POST /speaker/forget`` and ``POST /debug/erase-keys``.
-
-    Remove keys from every per-tier ``KeyRegistry`` (in-memory + disk), their
-    cached entry payload, and their bookkeeping record.  Uses
-    ``store.discard_keys(mode="erase")``, which delegates to
-    :meth:`~paramem.memory.store.MemoryStore.delete` per key: entries,
-    registry (active + stale + simhash) and bookkeeping are dropped in
-    lockstep across every tier — the same full retirement ``delete()``/
-    ``drop_tier()`` perform elsewhere.  This is a HARD erasure (privacy /
-    right-to-forget); soft-stale is wrong here (the record must be GONE,
-    including the simhash).  ``erase_keys_and_restamp_manifest`` additionally
-    erases the fact content from each affected tier's on-disk ``graph.json``
-    (:func:`~paramem.memory.persistence.erase_keys_from_graph_file`) and
-    re-stamps a surviving tier's weight-slot manifest so ``find_live_slot``
-    rebinds it on restart — the single shared implementation for every
-    out-of-fold registry-mutation caller (see its docstring for the full
-    ordering and the venue/empty-hash guards near the re-stamp).
-
-    A tier the erase reduces to zero known keys is reaped instead of
-    re-stamped (:func:`_reap_emptied_tiers`) — EMPTIED tiers have no slot
-    left to bind.  A soft-staled tier can never land here: the fold's
-    soft-stale sites use ``discard_keys(mode="stale")``, which keeps keys in
-    the stale partition, and ``KeyRegistry.list_known`` is active ∪ stale —
-    only a tier THIS erase's own hard erase touched can read as zero-known.
-    Ring-lifecycle incidents are resolved when the erase empties the interim
-    ring entirely, mirroring ``POST /interim/discard``'s own resolution.
-
-    Retires the erased keys from ``loop.promoted_keys`` and rewrites
-    ``key_metadata.json`` once, AFTER the reap so ``all_known_keys()``
-    reflects any dropped tiers — without this a forgotten-but-promoted key
-    survives on disk until restart (``training/consolidation.py`` filters
-    ``promoted_keys`` against ``is_known()`` on load, not on save).  A no-op
-    (no store mutation, no metadata write) when *erased_keys* is empty.
-
-    The hard-erase-in-flight marker
-    (:func:`~paramem.memory.persistence.write_erase_marker`, written by
-    ``erase_keys_and_restamp_manifest`` before any tier mutation) is cleared
-    here on every SUCCESSFUL completion of this call, whether or not the
-    erase actually emptied a tier. This call site must never move into a
-    ``finally`` block: a failure anywhere before this point (the reap,
-    ``write_key_metadata``) must LEAVE the marker in place — that survival
-    is the record of an interrupted erase, which is exactly what a later
-    boot needs to read.
+    A no-op (no disk or RAM mutation) when *staled_keys* is empty — returns
+    empty ``tiers``/``unbound_tiers``.
 
     Args:
-        loop: The live :class:`~paramem.training.consolidation.ConsolidationLoop`,
-            re-resolved by the caller against the current ``_state["config"]``
-            (door-staleness safe).
-        config: The live server config the caller re-resolved alongside *loop*.
-        erased_keys: Keys to hard-erase; sorted, may be empty.
-        label: Short caller identifier folded into the malformed-tier-name
-            error detail, the ring-incident resolution reason, and its
-            failure log line — so a divergence-repair erase and a speaker
-            forget are distinguishable in logs and error bodies without a
-            second copy of this sequence.
+        config: The live server config the caller re-resolved against
+            ``_state["config"]`` (door-staleness safe).
+        staled_keys: Keys to stale-mark; sorted, may be empty.
+        label: Short caller identifier folded into the malformed-registry
+            error detail and the unbound-tier log line — so a
+            divergence-repair stale-mark and a speaker forget are
+            distinguishable without a second copy of this sequence.
+        store: The live :class:`~paramem.memory.store.MemoryStore` to sync
+            in RAM after the disk write, or ``None`` when the caller has no
+            live store to sync.
 
     Returns:
-        dict with ``erased_keys`` (echoes the input), ``reaped_tiers``,
-        ``unloaded_adapters``, and ``removed_dirs`` — the same shape
-        :func:`_reap_emptied_tiers` reports, empty when nothing was reaped.
+        dict with ``staled_keys`` (echoes the input), ``tiers`` (one
+        :class:`TierRestampOutcome`-shaped dict per affected tier — always
+        200-worthy, the mutation already landed for every one, whatever
+        its rebind outcome) and ``unbound_tiers`` (every tier whose
+        outcome is not ``"rebound"`` — covers both ``"unbound"`` and
+        ``"rebind_failed"`` — also present in ``tiers`` with that outcome).
 
     Raises:
-        HTTPException: 500 ``malformed_tier_name`` when a key belongs to a
-            tier whose on-disk slot root cannot be resolved
-            (:func:`~paramem.memory.interim_adapter.adapter_slot_root_for_name`
-            propagated from
+        HTTPException: 500 ``malformed_tier_name`` when an affected tier's
+            on-disk registry file exists but is not KeyRegistry-shaped
+            (propagated from
             :func:`~paramem.memory.persistence.erase_keys_and_restamp_manifest`),
             raised before any mutation.
     """
-    reaped_tiers: list[str] = []
-    unloaded_adapters: list[str] = []
-    removed_dirs: list[str] = []
+    tiers_report: list[dict] = []
+    unbound_tiers: list[str] = []
 
-    if erased_keys:
-        from paramem.memory.interim_adapter import INTERIM_NAME_PREFIX, iter_interim_dirs
-        from paramem.memory.persistence import clear_erase_marker, erase_keys_and_restamp_manifest
+    if staled_keys:
+        from paramem.adapters.manifest import count_slot_candidates
+        from paramem.memory.interim_adapter import iter_tier_roots
+        from paramem.memory.persistence import (
+            NOTHING_TO_BIND,
+            REBIND_FAILED,
+            RESTAMPED,
+            erase_keys_and_restamp_manifest,
+        )
 
         try:
-            emptied_tiers = erase_keys_and_restamp_manifest(
-                store=loop.store,
+            results = erase_keys_and_restamp_manifest(
                 adapter_dir=config.adapter_dir,
-                keys=erased_keys,
+                keys=staled_keys,
             )
         except ValueError as exc:
-            # adapter_slot_root_for_name raises ValueError on a malformed
-            # interim tier name — resolved (and this raised) BEFORE any
-            # mutation, so a bad name never leaves the store half-erased
-            # with nothing persisted.
+            # KeyRegistry.load raises ValueError on an existing but
+            # non-KeyRegistry-shaped registry file — resolved (and this
+            # raised) BEFORE any mutation, so a corrupt tier never leaves
+            # the others half-mutated with nothing persisted.
             raise HTTPException(
                 status_code=500,
                 detail={
@@ -8580,71 +9209,65 @@ def _erase_keys_with_reap(*, loop, config, erased_keys: list[str], label: str) -
                 },
             ) from exc
 
-        if emptied_tiers:
-            reaped_tiers = sorted(emptied_tiers)
-            unloaded_adapters, removed_dirs = _reap_emptied_tiers(loop, emptied_tiers)
+        tier_roots = dict(iter_tier_roots(config.adapter_dir))
+        for tier_name in sorted(results):
+            result = results[tier_name]
+            rebound = result.status in (RESTAMPED, NOTHING_TO_BIND)
+            if rebound:
+                outcome = "rebound"
+            elif result.status == REBIND_FAILED:
+                outcome = "rebind_failed"
+            else:
+                outcome = "unbound"
+            # rebind_failed's reason is the caught exception's message
+            # (RestampResult.message); unbound's reason is the planning
+            # status restamp_tier_manifest returned — the same two shapes
+            # TierRestampOutcome.reason documents.
+            reason = None
+            if not rebound:
+                reason = result.message if outcome == "rebind_failed" else result.status
+            tier_root = tier_roots.get(tier_name)
+            candidate_count = count_slot_candidates(tier_root) if tier_root is not None else 0
+            _record_or_resolve_tier_health(
+                config,
+                tier=tier_name,
+                unhealthy_status=None if rebound else result.status,
+                detail=f"{label}: registry mutation landed, manifest re-stamp {result.status}",
+                candidate_count=candidate_count,
+                # A restamp only proves the registry now binds a slot by
+                # hash — it never reads the payload — so a rebound tier's
+                # healthy signal here must not clear a payload-level
+                # incident the drift sweep recorded (see
+                # _record_or_resolve_tier_health's docstring).
+                resolves_payload_status=False,
+            )
+            tiers_report.append(
+                {
+                    "tier": tier_name,
+                    "outcome": outcome,
+                    "slot": str(result.slot) if result.slot is not None else None,
+                    "reason": reason,
+                }
+            )
+            if not rebound:
+                unbound_tiers.append(tier_name)
+                logger.error(
+                    "%s: tier %s left %s after registry mutation (%s) -- "
+                    "recover via a consolidation fold or registry restore",
+                    label,
+                    tier_name,
+                    "REBIND-FAILED" if outcome == "rebind_failed" else "UNBOUND",
+                    reason,
+                )
 
-            any_interim_reaped = any(t.startswith(INTERIM_NAME_PREFIX) for t in reaped_tiers)
-            if any_interim_reaped and next(iter_interim_dirs(config.adapter_dir), None) is None:
-                state_dir = config.paths.data / "state"
-                for _type in _RING_LIFECYCLE_INCIDENT_TYPES:
-                    try:
-                        resolve_incidents_by_type(
-                            state_dir,
-                            _type,
-                            reason=f"interim ring emptied by {label}",
-                        )
-                    except Exception:
-                        logger.exception(
-                            "%s: ring-incident resolution failed for %s (non-fatal)",
-                            label,
-                            _type,
-                        )
-
-        loop.promoted_keys.difference_update(erased_keys)
-        loop.write_key_metadata()
-
-        clear_erase_marker(config.adapter_dir)
+        if store is not None:
+            store.discard_keys(staled_keys)
 
     return {
-        "erased_keys": erased_keys,
-        "reaped_tiers": sorted(reaped_tiers),
-        "unloaded_adapters": unloaded_adapters,
-        "removed_dirs": removed_dirs,
+        "staled_keys": staled_keys,
+        "tiers": tiers_report,
+        "unbound_tiers": unbound_tiers,
     }
-
-
-# Verdict → (HTTP error code, human message) for POST /speaker/forget's busy
-# guard. Reuses _consolidation_dispatch_guards() — the single predicate for
-# "is a memory-mutating operation safe now" — rather than re-implementing the
-# four checks. Deliberately a SECOND map alongside
-# _INTERIM_DISCARD_GUARD_VERDICTS: the two doors have distinct operator-facing
-# prose (what to do next differs — forgetting a speaker vs. discarding a ring),
-# so the verdict->message mapping is not parameterized across doors.
-_SPEAKER_FORGET_GUARD_VERDICTS: dict[str, tuple[str, str]] = {
-    "deferred_already_running": (
-        "consolidating",
-        "Consolidation is running; wait for completion before forgetting a speaker.",
-    ),
-    "deferred_cloud_only": (
-        "cloud_only",
-        "Server is in cloud-only mode; no local model or consolidation loop is available. "
-        "Reacquire the GPU (POST /gpu/acquire), then forget.",
-    ),
-    "deferred_bg_training": (
-        "training_active",
-        "Background training is active; wait for completion before forgetting a speaker.",
-    ),
-    "deferred_trial_active": (
-        "trial_active",
-        "A migration TRIAL is in progress. Accept or roll back the migration first.",
-    ),
-    "deferred_base_swap_active": (
-        "base_swap_active",
-        "A base-swap migration is actively running. "
-        "Wait for it to complete (or fail) before forgetting a speaker.",
-    ),
-}
 
 
 @app.post(
@@ -8653,25 +9276,25 @@ _SPEAKER_FORGET_GUARD_VERDICTS: dict[str, tuple[str, str]] = {
     dependencies=[Depends(require_admin)],
 )
 async def speaker_forget(request: SpeakerForgetRequest):
-    """Forget a speaker: erase their indexed-memory keys, discard pending sessions.
+    """Forget a speaker: stale-mark their indexed-memory keys, discard pending sessions.
 
-    The operation performed is a full in-store retirement
-    (:meth:`~paramem.memory.store.MemoryStore.discard_keys` with
-    ``mode="erase"``, which delegates to
-    :meth:`~paramem.memory.store.MemoryStore.delete` per key) plus the
-    on-disk fact content in every affected tier's ``graph.json`` — safe on a
-    live store, and does not trigger retraining.  Whether a resident tier's
-    adapter weights are touched now depends on the erase's outcome for that
-    tier, by design:
-
-    - A tier that still holds other keys keeps its registry-level posture:
-      the erased key is unservable immediately at the SimHash gate, but the
-      tier's resident weight encoding is not trimmed by ordinary (warm-init)
-      consolidation cycles — only an operator-invoked ``POST /reconsolidate``
-      (cold rebuild) does that.
-    - A tier this erase reduces to zero known keys is reaped on the spot
-      instead: its PEFT adapter is unmounted and its on-disk weight/registry
-      artifacts are deleted, immediately, in the same request.
+    The operation performed is a stale-mark, always allowed, never refused:
+    a file-surgeon pass
+    (:func:`~paramem.memory.persistence.erase_keys_and_restamp_manifest`,
+    which constructs no :class:`~paramem.memory.store.MemoryStore`) mutates
+    every affected tier's on-disk registry — a tier is affected, and a key
+    is marked, iff that tier's registry holds the key ACTIVE — and a
+    separate :meth:`~paramem.memory.store.MemoryStore.discard_keys` call
+    syncs the RAM store to match — safe on a live store, and does not
+    trigger retraining, reap nothing, and unmount no adapter. A withheld key
+    is immediately unservable (excluded from the tier's ``list_active()``);
+    its content and bookkeeping row leave with the rest of the key at its
+    owning tier's own next rebuild, when the key is genuinely retired. A
+    tier's rebuild is a full consolidation or ``POST /reconsolidate`` (both
+    rebuild every main tier) or an interim cycle (rebuilds only the slot it
+    mints) — a tier no consolidation reaches keeps its markers indefinitely.
+    A key already withheld (or unknown) affects no tier and is an ordinary
+    idempotent no-op, not an error.
 
     Steps
     -----
@@ -8680,22 +9303,11 @@ async def speaker_forget(request: SpeakerForgetRequest):
        speaker→key and is available between cycles (unlike the transient merged
        graph, which is cleared at cycle-end).
 
-    2. **Erase the keys from the store and from disk.**
-       ``store.discard_keys(mode="erase")`` drops the entry payload, the
-       per-tier registry (active + stale + simhash), and the bookkeeping
-       record for each key, in-memory.  For every affected tier the updated
-       registry is persisted to disk (so a restart does not resurrect the
-       key) and the fact content itself is erased from that tier's
-       ``graph.json`` when one exists
-       (:func:`~paramem.memory.persistence.erase_keys_from_graph_file`).  A
-       tier that still knows at least one key afterward gets its live weight
-       slot's manifest re-stamped (train venue only); a tier reduced to zero
-       known keys is reaped instead
-       (:func:`_reap_emptied_tiers` — live PEFT unmount + on-disk artifact
-       removal).  ``loop.promoted_keys`` and the on-disk ``key_metadata.json``
-       are then rewritten once, after any reap, so a forgotten-but-promoted
-       key does not survive to the next restart and ``all_known_keys()``
-       reflects any dropped tiers.
+    2. **Stale-mark the keys and re-stamp affected manifests.**
+       :func:`~paramem.memory.persistence.erase_keys_and_restamp_manifest`
+       withholds each key found ACTIVE in its owning tier's registry (marker
+       only — no fingerprint) and re-stamps that tier's bound slot manifest
+       so ``find_live_slot`` still resolves it.
 
     3. **Remove the speaker profile** from
        :class:`~paramem.server.speaker.SpeakerStore` (persisted immediately).
@@ -8703,9 +9315,8 @@ async def speaker_forget(request: SpeakerForgetRequest):
     4. **Discard any pending sessions** for the speaker from
        :class:`~paramem.server.session_buffer.SessionBuffer`.
 
-    5. **Reload** :attr:`_state`\\ ``["router"]`` so the speaker→key index
-       drops any erased or reaped keys immediately, rather than waiting for
-       the next fold.
+    5. **Reload** :attr:`_state`\\ ``["router"]`` so the speaker→key index and
+       the simhash-registry cache are fresh after the mutation.
 
     Steps 3–5 run in a no-await tail after the executor call returns — see
     the handler body for why that atomicity matters.
@@ -8714,39 +9325,44 @@ async def speaker_forget(request: SpeakerForgetRequest):
         request: :class:`SpeakerForgetRequest` with ``speaker_id``.
 
     Returns:
-        :class:`SpeakerForgetResponse` reporting what was removed and, when
-        applicable, what was reaped.
+        :class:`SpeakerForgetResponse` reporting what was removed and staled.
 
     Errors
     ------
-    409 ``consolidating`` | ``training_active`` | ``trial_active`` | ``cloud_only`` |
-    ``base_swap_active``
-        A fold, background training, a migration TRIAL, or an active
-        base-swap migration is in flight, or the server has no local model
-        loaded (:func:`_consolidation_dispatch_guards`, mapped via
-        ``_SPEAKER_FORGET_GUARD_VERDICTS``).  No mutation on any of these.
+    409 ``store_quarantined`` | ``consolidating`` | ``training_active`` | ``trial_active`` |
+    ``cloud_only`` | ``base_swap_active`` | ``consolidation_pending``
+        The memory store is quarantined (:func:`_store_quarantine_verdict`),
+        a fold, background training, a migration TRIAL, or an active
+        base-swap migration is in flight, the server has no local model
+        loaded, or a consolidation event's record is pending resume
+        (mapped via :func:`refusal_for`).  No mutation on any of these.
     500 ``malformed_tier_name``
-        A stale key belongs to a tier whose on-disk slot root cannot be
-        resolved.  Raised before ``store.discard_keys`` runs (from inside
-        the executor — see below), so the store is left untouched.
+        An affected tier's on-disk registry file exists but is not
+        KeyRegistry-shaped (a ``ValueError`` from ``KeyRegistry.load``,
+        propagated from
+        :func:`~paramem.memory.persistence.erase_keys_and_restamp_manifest`).
+        Raised before any mutation and before ``store.discard_keys`` runs
+        (from inside the executor — see below), so the store is left
+        untouched.
     500 (uncaught)
         Surfaced by FastAPI when a tier's on-disk registry EXISTS but cannot
-        be read/decrypted while reading the pre-erase hash
+        be read/decrypted while reading the pre-mutation hash
         (``tier_registry_sha256`` — read BEFORE ``store.discard_keys`` runs,
-        so the store is left untouched), or when the reap fails mid-operation.
+        so the store is left untouched).
         ``_state["consolidating"]`` is cleared in a ``finally`` regardless of
         outcome.
 
     Note
     ----
-    Discarding an interim slot wholesale (rather than erasing one speaker's
+    Discarding an interim slot wholesale (rather than staling one speaker's
     keys within it) is ``POST /interim/discard`` — a separate admin door.
     """
-    guard = _consolidation_dispatch_guards()
-    if guard is not None:
-        error, message = _SPEAKER_FORGET_GUARD_VERDICTS.get(
-            guard, (guard, "Cannot forget this speaker right now.")
-        )
+    # Store quarantine is checked first (see _store_quarantine_verdict) —
+    # this door mutates the live store, so it must refuse before
+    # active_consolidation's own checks.
+    verdict = _store_quarantine_verdict() or active_consolidation()
+    if verdict is not None:
+        error, message = refusal_for(verdict, doing="forgetting a speaker", then="forget")
         raise HTTPException(status_code=409, detail={"error": error, "message": message})
 
     config = _state["config"]
@@ -8778,25 +9394,24 @@ async def speaker_forget(request: SpeakerForgetRequest):
         for key, record in loop.store.iter_bookkeeping()
         if record.get("speaker_id") == speaker_id
     }
-    erased_keys: list[str] = sorted(keys)
+    staled_keys: list[str] = sorted(keys)
 
     def _forget_sync() -> dict:
-        """The disk/PEFT-touching half of the forget, run off the event loop
+        """The disk-touching half of the forget, run off the event loop
         under ``gpu_lock``.  Returns the response fields this half can
-        compute (``erased_keys``, ``reaped_tiers``, ``unloaded_adapters``,
-        ``removed_dirs``); the caller's no-await tail fills in
+        compute (``staled_keys``); the caller's no-await tail fills in
         ``removed_speaker`` and ``discarded_sessions``.
         """
         # Re-resolve rather than close over the handler's pre-lock `loop`
         # AND `config`: a config-apply that won the lock ahead of us may
         # have replaced `_state["config"]` and released + recreated the
         # process-lifetime ConsolidationLoop, and every mutation below
-        # (registry writes, PEFT unmount) must land on the live objects, not
-        # a stale pre-lock capture (door staleness race).
+        # (registry writes) must land on the live objects, not a stale
+        # pre-lock capture (door staleness race).
         config = _state["config"]
         loop = _get_or_create_consolidation_loop(config)
-        return _erase_keys_with_reap(
-            loop=loop, config=config, erased_keys=erased_keys, label="speaker/forget"
+        return _stale_mark_keys(
+            config=config, staled_keys=staled_keys, label="speaker/forget", store=loop.store
         )
 
     from paramem.server.gpu_lock import gpu_lock
@@ -8840,12 +9455,11 @@ async def speaker_forget(request: SpeakerForgetRequest):
         result["discarded_sessions"] = discarded_sessions
 
         logger.info(
-            "speaker/forget: speaker=%s keys=%d profile_removed=%s sessions=%d reaped=%d",
+            "speaker/forget: speaker=%s keys=%d profile_removed=%s sessions=%d",
             speaker_id,
-            len(result["erased_keys"]),
+            len(result["staled_keys"]),
             removed_speaker,
             len(discarded_sessions),
-            len(result["reaped_tiers"]),
         )
         return SpeakerForgetResponse(**result)
     finally:
@@ -8911,46 +9525,14 @@ def _interim_discard_inventory(loop, config) -> dict:
     }
 
 
-# The three ring-lifecycle incident types, resolved wherever the interim ring
-# is emptied without a fold — POST /interim/discard, and POST /speaker/forget
-# when a forget's own erase leaves no interim tier resident.  Single source so
-# a future fourth ring incident cannot be added to only one of the two sites.
+# The three ring-lifecycle incident types, resolved when the interim ring is
+# emptied without a fold (POST /interim/discard).  Single source so a future
+# fourth ring incident type is added here, not inlined at the call site.
 _RING_LIFECYCLE_INCIDENT_TYPES: tuple[str, ...] = (
     "full_consolidation_overdue",
     "interim_cap_reached",
     "interim_overflow_pending",
 )
-
-
-# Verdict → (HTTP error code, human message) for POST /interim/discard's busy
-# guard.  Reuses _consolidation_dispatch_guards() — the single predicate for
-# "is a memory-mutating operation safe now" — rather than re-implementing the
-# four checks; this only maps its verdict onto the 409 body idiom the repo
-# already uses for destructive-surgery routes (POST /backup/restore).
-_INTERIM_DISCARD_GUARD_VERDICTS: dict[str, tuple[str, str]] = {
-    "deferred_already_running": (
-        "consolidating",
-        "Consolidation is running; wait for completion before discarding the interim ring.",
-    ),
-    "deferred_cloud_only": (
-        "cloud_only",
-        "Server is in cloud-only mode; no local model or consolidation loop is available. "
-        "Reacquire the GPU (POST /gpu/acquire), then discard.",
-    ),
-    "deferred_bg_training": (
-        "training_active",
-        "Background training is active; wait for completion before discarding the interim ring.",
-    ),
-    "deferred_trial_active": (
-        "trial_active",
-        "A migration TRIAL is in progress. Accept or roll back the migration first.",
-    ),
-    "deferred_base_swap_active": (
-        "base_swap_active",
-        "A base-swap migration is actively running. "
-        "Wait for it to complete (or fail) before discarding the interim ring.",
-    ),
-}
 
 
 @app.post(
@@ -8984,10 +9566,10 @@ async def interim_discard(request: InterimDiscardRequest):
        (:func:`~paramem.memory.interim_adapter.unload_interim_adapters`):
        delete the PEFT adapters (when any) and ``rmtree`` every on-disk slot,
        payload-bearing or not.
-    3. Prune ``loop.promoted_keys`` of the discarded tiers' keys (mirrors
-       ``POST /speaker/forget``'s pruning — otherwise a discarded-but-promoted
-       key survives on disk until restart), then rewrite ``key_metadata.json``
-       from the now-smaller :meth:`~paramem.memory.store.MemoryStore.all_known_keys`.
+    3. Prune ``loop.promoted_keys`` of the discarded tiers' keys in RAM
+       (mirrors ``POST /speaker/forget``'s pruning). Nothing to rewrite on
+       disk: the reap in step 2 already deleted each discarded tier's
+       directory — key_metadata.json included — wholesale.
     4. Resolve the three ring-lifecycle incidents
        (``full_consolidation_overdue``, ``interim_cap_reached``,
        ``interim_overflow_pending``) — their only other clear site is the
@@ -9007,12 +9589,13 @@ async def interim_discard(request: InterimDiscardRequest):
 
     Errors
     ------
-    409 ``consolidating`` | ``training_active`` | ``trial_active`` | ``cloud_only`` |
-    ``base_swap_active``
-        A fold, background training, a migration TRIAL, or an active
-        base-swap migration is in flight, or the server has no local model
-        loaded (:func:`_consolidation_dispatch_guards`, mapped via
-        ``_INTERIM_DISCARD_GUARD_VERDICTS``).  No mutation on any of these.
+    409 ``store_quarantined`` | ``consolidating`` | ``training_active`` | ``trial_active`` |
+    ``cloud_only`` | ``base_swap_active`` | ``consolidation_pending``
+        The memory store is quarantined (:func:`_store_quarantine_verdict`),
+        a fold, background training, a migration TRIAL, or an active
+        base-swap migration is in flight, the server has no local model
+        loaded, or a consolidation event's record is pending resume
+        (mapped via :func:`refusal_for`).  No mutation on any of these.
     409 ``confirmation_required`` (``_INTERIM_DISCARD_UNCONFIRMED_STATUS``)
         ``confirm`` was not ``true`` and the ring is non-empty.  The response
         detail carries ``would_discard`` — the same inventory the mutation
@@ -9024,14 +9607,15 @@ async def interim_discard(request: InterimDiscardRequest):
         ``finally`` regardless of outcome; the operation is idempotent and
         safe to retry (a second call reaps whatever the first left behind).
     """
-    # Step 0a — shared pre-dispatch guard: already-running / cloud-only /
-    # bg-training / migration TRIAL.  No second implementation of these four
-    # checks — see _consolidation_dispatch_guards' own docstring.
-    guard = _consolidation_dispatch_guards()
-    if guard is not None:
-        error, message = _INTERIM_DISCARD_GUARD_VERDICTS.get(
-            guard, (guard, "Cannot discard the interim ring right now.")
-        )
+    # Step 0a — shared activity predicate: already-running / cloud-only /
+    # bg-training / migration TRIAL / a pending consolidation event's
+    # record.  No second implementation of these checks — see
+    # active_consolidation's own docstring.  Store quarantine is checked
+    # first (see _store_quarantine_verdict) — this door mutates the live
+    # store, so it must refuse before active_consolidation's own checks.
+    verdict = _store_quarantine_verdict() or active_consolidation()
+    if verdict is not None:
+        error, message = refusal_for(verdict, doing="discarding the interim ring", then="discard")
         raise HTTPException(status_code=409, detail={"error": error, "message": message})
 
     config = _state["config"]
@@ -9042,7 +9626,7 @@ async def interim_discard(request: InterimDiscardRequest):
     # an operator most plausibly wants to discard from.
     loop = _get_or_create_consolidation_loop(config)
 
-    # Step 0c — pure read; a no-op ring must not write key_metadata.json,
+    # Step 0c — pure read; a no-op ring must not mutate the store,
     # must not touch incidents, must not log a destructive run.
     inv = _interim_discard_inventory(loop, config)
     if inv["empty"]:
@@ -9075,7 +9659,7 @@ async def interim_discard(request: InterimDiscardRequest):
     from paramem.memory.interim_adapter import unload_interim_adapters
     from paramem.server.gpu_lock import gpu_lock
 
-    state_dir = config.paths.data / "state"
+    state_dir = data_state_dir(config.paths.data)
     # Every name this operation destroys, from every source it could have
     # been recorded under — the union covers a name recorded only via the
     # boot-time disk scan (adapter_manifest_status row with no live PEFT
@@ -9109,19 +9693,14 @@ async def interim_discard(request: InterimDiscardRequest):
         for tier in inv["store_tiers"]:
             loop.store.drop_tier(tier)
         # Step 2 — ONE reaper, both venues (PEFT delete + on-disk rmtree).
+        # The reap removes each discarded tier's directory wholesale,
+        # including its own key_metadata.json — there is no surviving
+        # per-tier file left to rewrite; nothing else holds a row for a
+        # key that lived only in a now-deleted interim tier.
         unloaded = unload_interim_adapters(loop.model, config.adapter_dir)
         # Step 3 — prune promoted_keys of the discarded tiers' keys (mirrors
-        # POST /speaker/forget's pruning), then rebuild key_metadata.json now
-        # the discarded keys are gone from all_known_keys().  Steps 1-2 above
-        # already dropped the tier from the store and reaped its adapter —
-        # that destructive ring drop is already complete, so a key-metadata
-        # write failure here must not surface as an HTTP 500 (same rationale
-        # as Step 6's swallow below).
+        # POST /speaker/forget's pruning).
         loop.promoted_keys.difference_update(discarded_keys)
-        try:
-            loop.write_key_metadata()
-        except Exception:
-            logger.exception("Post-discard key-metadata save failed (non-fatal)")
         # Step 4 — the ring's own incidents have no other clear site once
         # the ring is gone (_oldest_interim_stamp returns None post-discard).
         # Same rationale as Step 3: the ring drop already happened, so a
@@ -9523,8 +10102,12 @@ async def debug_recall(request: DebugRecallRequest):
 class DebugDumpResponse(BaseModel):
     """Flat list of every content entry in the live ``MemoryStore``.
 
-    ``entries``/``total`` reflect the inference CONTENT cache (``_entries``)
-    only — empty under ``inference.preload_cache=False``, which is correct.
+    ``entries``/``total`` reflect the non-authoritative entry mirror
+    (``_entries``) only.  Under ``inference.preload_cache=False`` the boot
+    fill is skipped, but the mirror's other writer — go-live adoption
+    (:meth:`~paramem.memory.store.MemoryStore.adopt_increments`) — installs a
+    rebuilt tier's entries regardless of the setting, so the counts are
+    empty only until the first fold in the process.
     ``bookkeeping_total`` reflects ``_bookkeeping`` (speaker provenance for
     every registered key) — populated regardless of preload setting.
     """
@@ -9542,9 +10125,10 @@ async def debug_dump():
     Returns ``forbidden_not_debug`` (403) when ``config.debug=false``.
     Returns ``not_ready`` (503) when the memory store isn't constructed
     yet (early-boot, cloud-only with no preload).  When
-    ``inference.preload_cache=false`` the store is empty by design and
-    this endpoint returns an empty list — that's a correct read, not
-    an error.  ``bookkeeping_total`` will still be non-zero when the
+    ``inference.preload_cache=false`` the boot fill is skipped, so this
+    endpoint returns an empty list until the first consolidation's go-live
+    adoption installs entries — a correct read either way, not an error.
+    ``bookkeeping_total`` will still be non-zero when the
     router has speaker provenance loaded from ``key_metadata.json``.
 
     Each entry dict is the entry payload as stored, with ``tier`` and
@@ -9553,8 +10137,9 @@ async def debug_dump():
     ``last_reinforced_cycle``, ``last_seen``, and ``first_seen`` are
     sourced from ``store.bookkeeping_for_key(key)`` (authoritative
     ``_bookkeeping`` dict) rather than the entry payload, which may be
-    stale or absent.  When a key has no bookkeeping record the fields
-    are omitted rather than fabricated.
+    stale.  Every entry key is registered active (:meth:`MemoryStore.put`
+    always registers), so its bookkeeping row is read directly — the
+    every-known-key-has-a-row invariant.
     """
     config = _state["config"]
     if not getattr(config, "debug", False):
@@ -9569,15 +10154,13 @@ async def debug_dump():
     for tier, key, entry in store.iter_entries():
         row = {"tier": tier, "key": key, **entry}
         # Overlay the FULL authoritative bookkeeping record onto the row. The
-        # entry payload (_entries) may carry stale or absent bookkeeping fields
+        # entry payload (_entries) may carry stale bookkeeping-shaped fields
         # (e.g. speaker_id/relation_type) — _bookkeeping is the single source of
         # truth (store.py:53-58), so it wins. Splatting the whole record (rather
         # than a hand-maintained field list) makes the dump integrally reflect
         # every bookkeeping field, so a newly-added field can never be silently
-        # omitted here. Use is None (not truthiness) — an empty record is valid.
-        bk = store.bookkeeping_for_key(key)
-        if bk is not None:
-            row.update(bk)
+        # omitted here.
+        row.update(store.bookkeeping_for_key(key))
         entries.append(row)
         tiers[tier] = tiers.get(tier, 0) + 1
 
@@ -9590,15 +10173,18 @@ async def debug_dump():
 
 
 # --------------------------------------------------------------------------
-# Debug erase-keys endpoint — sanctioned repair tool for registry<->bookkeeping
-# divergence.  A key that is active in a registry but carries no bookkeeping
-# record is unreachable via POST /speaker/forget (it resolves its key set from
-# store.iter_bookkeeping()) and fails the consolidation integrity gate
-# (RegistryBookkeepingDivergence) while it exists.  This door takes the
-# explicit key list the operator already has (from /debug/dump output or the
-# boot "meta_unbookkept" log line — a count logged at startup, not exposed
-# through any endpoint) and erases exactly those — no wildcard, no speaker
-# derivation, no "erase everything divergent" mode.
+# Debug erase-keys endpoint — the operator's scalpel for a key that is wrong
+# for an unknown reason, when the only other alternatives are a full bundle
+# restore (POST /backup/restore) or a full wipe.  A FILE SURGEON: it reads
+# the named tiers' persisted registries straight off disk, stale-marks the
+# operator's explicit key list, and writes the registry + manifest restamp
+# back — no MemoryStore hydration and no model are required, so the door
+# works in cloud-only mode and while the store is quarantined.  On a
+# quarantined store the file surgery is followed by an attempt at the lift
+# (:func:`_lift_quarantined_store`), so a successful repair swaps a fresh
+# store in without a restart.  Takes the explicit key list the operator
+# already has (from GET /debug/dump output) and stale-marks exactly those —
+# no wildcard, no speaker derivation, no "erase everything" mode.
 # --------------------------------------------------------------------------
 
 
@@ -9607,37 +10193,6 @@ async def debug_dump():
 # rather than hard-coded so the handler, tests, and docs read one definition.
 _DEBUG_ERASE_KEYS_UNCONFIRMED_STATUS: int = 409
 
-# Verdict → (HTTP error code, human message) for POST /debug/erase-keys' busy
-# guard.  Reuses _consolidation_dispatch_guards() — the single predicate for
-# "is a memory-mutating operation safe now" — rather than re-implementing the
-# four checks.  A THIRD map alongside _SPEAKER_FORGET_GUARD_VERDICTS and
-# _INTERIM_DISCARD_GUARD_VERDICTS: same reasoning — distinct operator-facing
-# prose per door.
-_DEBUG_ERASE_KEYS_GUARD_VERDICTS: dict[str, tuple[str, str]] = {
-    "deferred_already_running": (
-        "consolidating",
-        "Consolidation is running; wait for completion before erasing keys.",
-    ),
-    "deferred_cloud_only": (
-        "cloud_only",
-        "Server is in cloud-only mode; no local model or consolidation loop is available. "
-        "Reacquire the GPU (POST /gpu/acquire), then erase.",
-    ),
-    "deferred_bg_training": (
-        "training_active",
-        "Background training is active; wait for completion before erasing keys.",
-    ),
-    "deferred_trial_active": (
-        "trial_active",
-        "A migration TRIAL is in progress. Accept or roll back the migration first.",
-    ),
-    "deferred_base_swap_active": (
-        "base_swap_active",
-        "A base-swap migration is actively running. "
-        "Wait for it to complete (or fail) before erasing keys.",
-    ),
-}
-
 
 class DebugEraseKeysRequest(BaseModel):
     """Request body for ``POST /debug/erase-keys``.
@@ -9645,13 +10200,12 @@ class DebugEraseKeysRequest(BaseModel):
     Attributes
     ----------
     keys:
-        Explicit indexed-memory keys to hard-erase.  Production source of
-        this value is the operator, reading divergence diagnostics
-        (``GET /debug/dump`` output or the boot "meta_unbookkept" log line) —
-        there is no wildcard or "all divergent" expansion; the caller names
-        exactly the keys to erase.
+        Explicit indexed-memory keys to stale-mark.  Production source of
+        this value is the operator, reading ``GET /debug/dump`` output —
+        there is no wildcard or "all" expansion; the caller names exactly
+        the keys to stale-mark.
     confirm:
-        Must be ``True`` to actually erase the keys.  ``False`` (default)
+        Must be ``True`` to actually stale-mark the keys.  ``False`` (default)
         refuses with ``confirmation_required`` — mirrors
         ``POST /interim/discard``'s ``confirm`` field: the operator's own
         invocation is the only source for this value; the system cannot
@@ -9667,23 +10221,41 @@ class DebugEraseKeysResponse(BaseModel):
 
     Attributes
     ----------
-    erased:
-        Requested keys that were known to the store (registry active or
-        stale, regardless of bookkeeping presence) and were hard-erased.
+    staled:
+        Requested keys that were known to an on-disk tier registry (active
+        or stale, regardless of bookkeeping presence). A key already
+        withheld in every tier that knows it is reported here too, with
+        zero mutation — re-erasing it is idempotent, not an error.
     unknown:
-        Requested keys the store's registries did not recognise — reported,
+        Requested keys no on-disk tier registry recognised — reported,
         never an error; a repeat request with the same list is idempotent.
-    total, tiers, bookkeeping_total:
-        Post-erase store counts, same vocabulary as
-        :class:`DebugDumpResponse` — the live content cache size, its
-        per-tier breakdown, and the bookkeeping record count.
+    lifted:
+        ``None`` when the store was not quarantined (no lift was
+        attempted — the RAM store, when one exists, was synced directly).
+        ``True``/``False`` when the store WAS quarantined at the time of
+        this call and the door attempted :func:`_lift_quarantined_store`
+        after the file surgery: ``True`` on a successful lift (the store is
+        now live and serving again), ``False`` when the lift itself
+        re-quarantined (the store step failed again — see
+        ``GET /integrity`` and the ``store_quarantined`` incident for the
+        updated cause).
+    tiers:
+        Per-tier :class:`TierRestampOutcome` for every tier the erase
+        touched — the registry mutation always landed; this reports
+        whether the tier's slot manifest was rebound to match.
+    unbound_tiers:
+        Tier names left unbound — every ``TierRestampOutcome.outcome !=
+        "rebound"``, i.e. ``"unbound"`` or ``"rebind_failed"`` — a non-empty
+        list means at least one affected tier will fail to bind on the
+        next boot/reload until repaired; see ``GET /integrity`` and the
+        ``tier_registry_unverified`` incident it emits for each.
     """
 
-    erased: list[str]
+    staled: list[str]
     unknown: list[str]
-    total: int
-    tiers: dict[str, int]
-    bookkeeping_total: int
+    lifted: bool | None = None
+    tiers: list[TierRestampOutcome]
+    unbound_tiers: list[str]
 
 
 @app.post(
@@ -9692,40 +10264,50 @@ class DebugEraseKeysResponse(BaseModel):
     dependencies=[Depends(require_admin)],
 )
 async def debug_erase_keys(request: DebugEraseKeysRequest):
-    """Hard-erase an explicit list of indexed-memory keys from the live store.
+    """Stale-mark an explicit list of indexed-memory keys — a file surgeon.
 
-    Sanctioned repair tool for registry<->bookkeeping divergence — see the
-    module comment above this route for why ``POST /speaker/forget`` cannot
-    reach an un-bookkept key.  Shares its erase/reap/bookkeeping-settle
-    sequence with ``/speaker/forget`` via :func:`_erase_keys_with_reap`; the
-    only new logic here is partitioning the caller's explicit list into
-    known (erased) vs. unknown (reported, not an error) against
-    ``store.all_known_keys()`` — registry active ∪ stale, so a key with no
-    bookkeeping record (the repair case) is still erasable.
+    The operator's scalpel: targeted removal of a key that is wrong for an
+    unknown reason, when the only other alternatives are a full bundle
+    restore (``POST /backup/restore``) or a full wipe — see the module
+    comment above this route. Reads the affected tiers' registries straight
+    off disk, stale-marks the operator's explicit key list, and writes the
+    registry + manifest restamp back
+    (:func:`~paramem.memory.persistence.erase_keys_and_restamp_manifest`, via
+    the shared :func:`_stale_mark_keys` sequence ``/speaker/forget`` also
+    uses) — no :class:`~paramem.memory.store.MemoryStore` hydration and no
+    model are required. The only new logic here is partitioning the
+    caller's explicit list into known (staled) vs. unknown (reported, not
+    an error) by loading every tier's on-disk registry directly — registry
+    active ∪ stale, so a key with no bookkeeping record is still
+    stale-markable.
+
+    On a QUARANTINED store, the file surgery above is followed by an
+    attempt at the lift (:func:`_lift_quarantined_store`): a successful
+    repair swaps a fresh store in, clears the marker, resolves the
+    incident, and reloads the router — no restart. On a HEALTHY store, the
+    live :class:`MemoryStore` (when one is resident) is synced in RAM
+    directly and the router is reloaded in place — no lift needed.
 
     Returns ``forbidden_not_debug`` (403) when ``config.debug=false``.
     Returns ``invalid_keys`` (400) when *request.keys* is empty or contains
     a non-string/empty entry (pydantic's ``list[str]`` typing already
     rejects a non-string body value with 422; this catches the empty-list
     and empty-string cases pydantic's plain type does not).  Refuses with
-    409 (:data:`_DEBUG_ERASE_KEYS_GUARD_VERDICTS`) under the same conditions
-    ``/speaker/forget`` refuses under — consolidation running, background
-    training active, cloud-only mode, an active migration TRIAL, or an
-    active base-swap migration — mirroring
-    :func:`_consolidation_dispatch_guards`, the shared predicate for "is a
-    memory-mutating operation safe now".  Refuses with
+    409 (:func:`refusal_for`) under every arm :func:`active_consolidation`
+    checks EXCEPT cloud-only (``include_cloud_only=False``) — consolidation
+    running, background training active, an active migration TRIAL, or an
+    active base-swap migration, PLUS its pending-record arm (a stage ledger
+    on disk with no fold actively running — ``deferred_event_pending``), so
+    this door never mutates tier files a resumable consolidation event
+    could republish over. Cloud-only mode does NOT refuse — the door needs
+    no resident model — and quarantine does NOT refuse either
+    (:func:`_store_quarantine_verdict` is deliberately not composed here;
+    see its own docstring) — a quarantined store is exactly the condition
+    this door can repair. Refuses with
     :data:`_DEBUG_ERASE_KEYS_UNCONFIRMED_STATUS` (409) ``confirmation_required``
     when ``request.confirm`` is not ``True`` — mirrors ``POST
-    /interim/discard``'s confirmation gate: this door irreversibly destroys
-    facts, so nothing is mutated without the operator's explicit confirm.
-
-    Router reload runs in the same no-await tail ``/speaker/forget`` uses
-    (see that handler's comment) so no concurrent ``/chat`` turn can observe
-    a store whose keys were erased but whose router index still reflects the
-    pre-erase state.  The response's store counts (``total``/``tiers``/
-    ``bookkeeping_total``) are computed earlier, inside ``_erase_sync``
-    itself under the GPU lock, so they reflect exactly this request's
-    mutation with no window for a concurrent one to land in between.
+    /interim/discard``'s confirmation gate: this door mutates on-disk state,
+    so nothing is mutated without the operator's explicit confirm.
     """
     config = _state["config"]
     if not getattr(config, "debug", False):
@@ -9737,11 +10319,14 @@ async def debug_erase_keys(request: DebugEraseKeysRequest):
             status_code=400,
         )
 
-    guard = _consolidation_dispatch_guards()
-    if guard is not None:
-        error, message = _DEBUG_ERASE_KEYS_GUARD_VERDICTS.get(
-            guard, (guard, "Cannot erase keys right now.")
-        )
+    # include_cloud_only=False — the door is a file surgeon and needs no
+    # resident model; every other busy/pending arm still applies.  Quarantine
+    # is deliberately NOT composed here (see _store_quarantine_verdict's
+    # docstring) — a quarantined store is exactly the condition this door
+    # can repair.
+    verdict = active_consolidation(include_cloud_only=False)
+    if verdict is not None:
+        error, message = refusal_for(verdict, doing="erasing keys", then="erase")
         raise HTTPException(status_code=409, detail={"error": error, "message": message})
 
     # The operator sees exactly what they asked to destroy before committing;
@@ -9754,42 +10339,60 @@ async def debug_erase_keys(request: DebugEraseKeysRequest):
             detail={
                 "error": "confirmation_required",
                 "message": (
-                    "Erasing keys destroys the only copy of their facts. "
+                    "Staling keys makes them immediately unservable. "
                     'Resend with {"confirm": true} to proceed.'
                 ),
-                "would_erase": sorted(request.keys),
+                "would_stale": sorted(request.keys),
             },
         )
 
     def _erase_sync() -> dict:
-        # Re-resolve config/loop rather than close over the handler's
-        # pre-lock capture — same door-staleness argument as
-        # /speaker/forget's _forget_sync.
+        # Re-resolve config rather than close over the handler's pre-lock
+        # capture — same door-staleness argument as /speaker/forget's
+        # _forget_sync. No loop is created here — the door is loop-free.
         config = _state["config"]
-        loop = _get_or_create_consolidation_loop(config)
 
-        known = set(loop.store.all_known_keys())
+        from paramem.memory.interim_adapter import iter_tier_roots
+        from paramem.training.key_registry import KeyRegistry
+
+        known: set[str] = set()
+        for _tier_name, tier_root in iter_tier_roots(config.adapter_dir):
+            known.update(KeyRegistry.load(tier_root / "indexed_key_registry.json").list_known())
+
         requested = set(request.keys)
-        to_erase = sorted(requested & known)
+        to_stale = sorted(requested & known)
         unknown = sorted(requested - known)
 
-        result = _erase_keys_with_reap(
-            loop=loop, config=config, erased_keys=to_erase, label="debug/erase-keys"
+        result = _stale_mark_keys(
+            config=config,
+            staled_keys=to_stale,
+            label="debug/erase-keys",
+            store=_state.get("memory_store"),
         )
         result["unknown"] = unknown
 
-        # Post-erase store counts, computed here (not after the executor
-        # call returns) so the count reflects exactly the mutation this
-        # request just made — no window for a concurrent mutation to land
-        # between the erase and the read.
-        total = 0
-        tiers: dict[str, int] = {}
-        for tier, _key, _entry in loop.store.iter_entries():
-            tiers[tier] = tiers.get(tier, 0) + 1
-            total += 1
-        result["total"] = total
-        result["tiers"] = tiers
-        result["bookkeeping_total"] = loop.store.bookkeeping_count()
+        # The store may have been quarantined coming into this call (a
+        # resumable-file-only door must keep working in that state). File
+        # surgery alone leaves no live store to serve from — attempt the
+        # lift so a successful repair swaps a fresh, erase-reflecting store
+        # in without a restart.
+        result["lifted"] = None
+        if to_stale and _state.get("store_quarantine") is not None:
+            # Release the process-lifetime ConsolidationLoop holder before
+            # lifting — same base by construction as POST /backup/restore's
+            # same-base convergence (_restore_converge_sync): without this,
+            # _state["consolidation_loop"] keeps its OLD .store (the
+            # pre-lift store _lift_quarantined_store replaces), and the next
+            # fold's lazily-cached loop would go live against an object the
+            # server no longer serves.
+            _loop = _state.get("consolidation_loop")
+            if _loop is not None:
+                try:
+                    _loop.release()
+                except Exception:
+                    logger.exception("Error releasing consolidation loop during erase-keys lift")
+            _state["consolidation_loop"] = None
+            result["lifted"] = _lift_quarantined_store(config)
         return result
 
     from paramem.server.gpu_lock import gpu_lock
@@ -9803,22 +10406,26 @@ async def debug_erase_keys(request: DebugEraseKeysRequest):
         # NO-AWAIT TAIL — same atomicity argument as /speaker/forget: from the
         # executor call returning to the flag clear in `finally` there must be
         # ZERO await points, so no /chat turn observes a store whose keys were
-        # erased but whose router speaker->key index still lists them.
-        _state["router"].reload()
+        # staled but whose router speaker->key index still lists them. When a
+        # lift ran, _lift_quarantined_store already rebuilt the router against
+        # the fresh store — a second reload here would just re-derive the
+        # identical index from the same object.
+        if not result.get("lifted"):
+            _state["router"].reload()
 
         logger.info(
-            "debug/erase-keys: erased=%d unknown=%d reaped=%d",
-            len(result["erased_keys"]),
+            "debug/erase-keys: staled=%d unknown=%d lifted=%s",
+            len(result["staled_keys"]),
             len(result["unknown"]),
-            len(result["reaped_tiers"]),
+            result["lifted"],
         )
 
         return DebugEraseKeysResponse(
-            erased=result["erased_keys"],
+            staled=result["staled_keys"],
             unknown=result["unknown"],
-            total=result["total"],
+            lifted=result["lifted"],
             tiers=result["tiers"],
-            bookkeeping_total=result["bookkeeping_total"],
+            unbound_tiers=result["unbound_tiers"],
         )
     finally:
         _state["consolidating"] = False
@@ -9944,15 +10551,12 @@ def _trial_active() -> bool:
     """True when a migration TRIAL is in progress and consolidation must refuse.
 
     Thin wrapper around :func:`paramem.server.trial_state.trial_active` bound
-    to this module's own ``_state`` — the single predicate shared by every
-    refusal that must never drift apart: :func:`require_no_trial` (the
+    to this module's own ``_state`` — the single predicate shared by both
+    refusals that must never drift apart: :func:`require_no_trial` (the
     FastAPI dependency — HTTP 409 on every consolidation route and on
-    ``/ingest-sessions``' in-handler gate), :func:`_consolidation_dispatch_guards`
+    ``/ingest-sessions``' in-handler gate) and :func:`_consolidation_dispatch_guards`
     (the arbitrator's own guard, ``"deferred_trial_active"``, for in-process
-    callers that never go through FastAPI's dependency resolution), and
-    ``ConsolidationLoop.guard_trial_state`` (the training-layer refusal for
-    callers, including experiment scripts, that carry the server ``_state``
-    dict).
+    callers that never go through FastAPI's dependency resolution).
 
     During a TRIAL the candidate store is live but unaccepted; starting a
     consolidation run would train against a store the operator may still roll
@@ -10126,23 +10730,36 @@ async def consolidate_interim():
 async def reconsolidate():
     """Rebuild main memory from its own stored knowledge — even when nothing is new.
 
-    This is the operation to run after changing the model, the extraction
-    prompts, or the extraction config: main memory is reconstructed from the
-    keys it already holds, re-groomed, and re-learned from the result.
+    This is the operation to run after changing the extraction prompts or the
+    extraction config: main memory is reconstructed from the keys it already
+    holds, re-groomed, and re-learned from the result.  A model change is a
+    different flow — the base-swap active-store migration, not this door.
 
-    It is the one door with a narrower key source than the full fold: the
-    interim slots are NOT folded in, NOT reaped and NOT marked consumed, and
-    the pending conversations stay pending.  Nothing is lost by running it — the
-    recent material is still there for ``POST /consolidate`` or the schedule to
-    absorb afterwards.
+    A reconcile IS a full consolidation whose input excludes pending
+    sessions: one fold topology throughout — the interim ring is recalled,
+    absorbed into the main tiers, and reaped, exactly as any full fold; warm
+    start is uniform, with no cold-start arm.  Only pending sessions differ:
+    they stay pending here, unlike an ordinary full fold at
+    ``max_interim_count == 0``.  The pending conversations are still there
+    for ``POST /consolidate`` or the schedule to absorb afterwards.
 
-    Its input is the knowledge already stored — every active key in a main
-    tier (episodic/semantic/procedural) — so it is turned away only by an
+    This door has no relationship to a pending consolidation event's
+    stage-ledger record: it never discards one, and it is not a recovery or
+    abandon door.  A pending interrupted run is resumed and finished first,
+    exactly like the other three consolidation endpoints — see
+    :func:`_dispatch_consolidation`'s resume-pending-first step — and this
+    rebuild request waits for the next dispatch.  A record stuck in a
+    deterministic resume-failure loop has exactly one in-band exit: restoring
+    a healthy snapshot bundle (``POST /backup/restore``), whose wholesale
+    tier rewrite discards the record as part of the restore.
+
+    Its input is the knowledge already stored — every active key in any
+    registered tier, main or interim — so it is turned away only by an
     empty store, never by the absence of the NEW material ``POST /consolidate``
     and ``POST /consolidate/interim`` require: a call with no interim slot
     and no pending session still dispatches here.  It noops
     (``noop_no_stored_keys``) only when the store itself holds no active key
-    in any main tier — nothing to rebuild.  The run does not move the cadence
+    in any tier — nothing to rebuild.  The run does not move the cadence
     window.  It still passes through the shared safety guards ahead of the
     gate — busy/cloud-only/bg-training
     (``_consolidation_dispatch_guards``), a main tier's registry binding
@@ -10155,13 +10772,17 @@ async def reconsolidate():
 
     - ``started_full`` — the rebuild was submitted; poll ``GET /status``
       (``consolidating``).  It seizes the GPU for the duration.
-    - ``noop_no_stored_keys`` — no main tier holds an active key; there is
+    - ``noop_no_stored_keys`` — no tier holds an active key; there is
       nothing to rebuild.
     - ``deferred_*`` — busy (a run is already going, someone is chatting, the
       GPU is held, or the server is cloud-only).  Retry later.
 
     Returns 409 ``trial_active`` when a migration TRIAL is in progress.
     """
+    # Bare dispatch.  A pending interrupted run is resumed and finished
+    # first (`_dispatch_consolidation`'s resume-pending-first step) — the
+    # identical contract the other three consolidation endpoints already
+    # have.  This door never discards a pending event's record.
     status, action = _dispatch_consolidation(ConsolidationAction.RECONCILE)
     return ConsolidateResponse(status=status, action=action.value)
 
@@ -10342,7 +10963,26 @@ async def ingest_sessions_cancel(request: IngestCancelRequest):
     Returns:
         :class:`IngestCancelResponse` splitting the requested IDs into
         ``cancelled`` (found and removed) and ``not_found`` (unknown).
+
+    Errors
+    ------
+    409 ``consolidating`` | ``training_active`` | ``trial_active`` |
+    ``cloud_only`` | ``base_swap_active`` | ``consolidation_pending``
+        A fold, background training, a migration TRIAL, or an active
+        base-swap migration is in flight, the server has no local model
+        loaded, or a consolidation event's record is pending resume
+        (:func:`active_consolidation`, mapped via :func:`refusal_for`) —
+        under a pending record these sessions are already extracted into
+        the ledger and will be trained by the resume, so a 200 here would
+        report a cancellation that did not happen.
     """
+    verdict = active_consolidation()
+    if verdict is not None:
+        error, message = refusal_for(
+            verdict, doing="cancelling queued ingest sessions", then="cancel"
+        )
+        raise HTTPException(status_code=409, detail={"error": error, "message": message})
+
     buffer: SessionBuffer = _state["session_buffer"]
 
     # Snapshot before so we can classify each id as found or not-found
@@ -10521,12 +11161,12 @@ async def migration_preview(request: PreviewRequest):
     from paramem.backup.preflight import compute_pre_flight_check as _compute_pre_flight
     from paramem.server.migration import MigrationStashState
 
-    _registry_path_for_pf = None
+    _adapter_dir_for_pf = None
     try:
         if config is not None and hasattr(config, "paths") and config.paths.data is not None:
-            _registry_path_for_pf = config.paths.key_metadata
+            _adapter_dir_for_pf = config.adapter_dir
     except (AttributeError, TypeError):
-        _registry_path_for_pf = None
+        _adapter_dir_for_pf = None
 
     try:
         _backups_root_for_pf = (config.paths.data / "backups").resolve()
@@ -10539,7 +11179,7 @@ async def migration_preview(request: PreviewRequest):
             loop=_state.get("consolidation_loop"),
             backups_root=_backups_root_for_pf,
             live_config_path=live_config_path,
-            registry_path=_registry_path_for_pf,
+            adapter_dir=_adapter_dir_for_pf,
         )
     except Exception:
         # An exception here must not surface as an uncaught 500 — but it must
@@ -10706,6 +11346,10 @@ async def migration_confirm(request: ConfirmRequest):
         Base-swap branch only — the backup store is at its cap, so the
         rollback anchor cannot be written.  Checked before any mutation;
         nothing staged, STAGING retained.
+    409 ``store_quarantined``
+        The memory store is quarantined (:func:`_store_quarantine_verdict`)
+        — a trial reads the live store (the base-swap branch trains
+        against it directly). Checked before any mutation.
     """
     from fastapi import HTTPException
 
@@ -10719,6 +11363,14 @@ async def migration_confirm(request: ConfirmRequest):
         promote_config,
         validate_candidate,
     )
+
+    # --- Step 0: memory store must be publishable before a trial reads it ---
+    _quarantine_verdict = _store_quarantine_verdict()
+    if _quarantine_verdict is not None:
+        error, message = refusal_for(
+            _quarantine_verdict, doing="starting a migration trial", then="confirm"
+        )
+        raise HTTPException(status_code=409, detail={"error": error, "message": message})
 
     # --- Step 1: Pre-checks (outside the lock for fast fail) ---
     if _state.get("consolidating", False):
@@ -10771,14 +11423,14 @@ async def migration_confirm(request: ConfirmRequest):
         Path(_state["config_path"]) if _state.get("config_path") else DEFAULT_SERVER_CONFIG_PATH
     )
     if config is not None:
-        state_dir = (config.paths.data / "state").resolve()
+        state_dir = data_state_dir(config.paths.data).resolve()
         backups_root = (config.paths.data / "backups").resolve()
     else:
-        state_dir = (default_data_dir() / "state").resolve()
+        state_dir = data_state_dir(default_data_dir()).resolve()
         backups_root = (default_data_dir() / "backups").resolve()
 
-    trial_adapter_dir = str((state_dir / "trial_adapter").resolve())
-    trial_graph_dir = str((state_dir / "trial_graph").resolve())
+    trial_adapter_dir = str((state_dir / "trial" / "adapters").resolve())
+    trial_graph_dir = str((state_dir / "trial" / "graph").resolve())
 
     async with lock:
         # Re-check inside the lock (state may have changed while waiting).
@@ -11261,7 +11913,7 @@ async def _run_trial_consolidation() -> None:
 
     Acquires the GPU lock, reloads config from the newly-active server.yaml,
     builds a trial ConsolidationLoop with overrides (mode=train, paths →
-    state/trial_adapter/), and calls ``_run_extraction_phase`` with
+    state/trial/adapters/), and calls ``_run_extraction_phase`` with
     ``mark_sessions=False``.
 
     Passing ``mark_sessions=False`` ensures that
@@ -11302,9 +11954,13 @@ async def _run_trial_consolidation() -> None:
 
         # CRITICAL: do NOT override trial_config.paths.data here.
         # Previously this was set to trial_adapter_dir.parent.parent (= data/ha), causing
-        # _save_registry / write_key_metadata to resolve to the LIVE registry paths.
-        # Registry path isolation is now handled entirely inside _build_trial_loop via
-        # loop.trial_registry_path / loop.trial_key_metadata_path overrides.
+        # _save_registry to resolve to the LIVE registry path and per-tier
+        # key_metadata.json writes to land under the LIVE adapter tree.
+        # Isolation is now handled entirely inside _build_trial_loop: the
+        # legacy combined registry via loop.trial_registry_path, and
+        # per-tier key_metadata.json by construction — loop.output_dir IS
+        # trial_adapter_dir, so the fold's per-tier writes (write_tier_slot /
+        # publish_tier_registry, via run_consolidation_cycle) land there.
 
         model = _state.get("model")
         tokenizer = _state.get("tokenizer")
@@ -11405,10 +12061,11 @@ async def _run_trial_consolidation() -> None:
                             )
 
                             # Trial graph capture (after extraction completes).
-                            # simulate: stash the newest interim-slot graph.json the
-                            # trial just wrote (the fold writes to
-                            # episodic/interim_<stamp>/graph.json, NOT the canonical
-                            # episodic/graph.json).
+                            # simulate: stash the newest interim family's BOUND
+                            # slot graph.json the trial just wrote (the fold
+                            # writes into episodic/interim_<stamp>/<ts2>/graph.json —
+                            # resolved via _resolve_bound_graph_path, never a
+                            # bare family-root path, which nothing writes).
                             # train: reconstruct the trial loop's adapter weights.
                             if _trial_mode == "simulate":
                                 from paramem.memory.interim_adapter import iter_interim_dirs
@@ -11417,8 +12074,8 @@ async def _run_trial_consolidation() -> None:
                                 if _loop_out is not None:
                                     _slots = list(iter_interim_dirs(Path(_loop_out)))
                                     if _slots:
-                                        # Newest slot last (iter_interim_dirs sorts by stamp).
-                                        _newest_path = _slots[-1][1] / "graph.json"
+                                        # Newest family last (iter_interim_dirs sorts by stamp).
+                                        _newest_path = _resolve_bound_graph_path(_slots[-1][1])
                                         _graph_stash["trial_graph_path"] = _newest_path
                             else:
                                 from paramem.graph.reconstruct import reconstruct_graph
@@ -11448,21 +12105,18 @@ async def _run_trial_consolidation() -> None:
                     exc_captured = _exc
 
             # --- Gate evaluation ---
-            # live_registry_path comes from the PRE-TRIAL config (not the candidate).
+            # live_adapter_dir comes from the PRE-TRIAL config (not the candidate).
             live_config = _state.get("config")
             if live_config is None:
                 raise RuntimeError(
                     "trial consolidation: _state['config'] is missing — "
-                    "cannot resolve live registry path for gate 4"
+                    "cannot resolve live adapter dir for gate 4"
                 )
-            # Use the canonical property — config.paths.key_metadata resolves to
-            # config.paths.data / "registry" / "key_metadata.json", matching the
-            # path that the consolidation writer uses.
-            live_registry_path: Path = live_config.paths.key_metadata
+            live_adapter_dir: Path = live_config.adapter_dir
             trial_adapter_dir = (
                 Path(trial_adapter_dir_str)
                 if trial_adapter_dir_str
-                else default_data_dir() / "state" / "trial_adapter"
+                else data_state_dir(default_data_dir()) / "trial" / "adapters"
             )
 
             # Use loop.model (the PeftModel wrapper) instead of the raw
@@ -11481,7 +12135,7 @@ async def _run_trial_consolidation() -> None:
                 model=gate_model,
                 tokenizer=tokenizer,
                 trial_adapter_dir=trial_adapter_dir,
-                live_registry_path=live_registry_path,
+                live_adapter_dir=live_adapter_dir,
                 session_buffer_empty=session_buffer_empty,
                 consolidation_summary=summary,
                 consolidation_exception=exc_captured,
@@ -11554,7 +12208,11 @@ async def _run_base_swap_orchestration(
        dirs + registry + speaker_profiles, written before any mutations.
        Rollback anchor.  **Written exactly once** at fresh start; resume paths
        read ``bundle_slot`` from the existing marker and NEVER call
-       ``write_bundle`` again.
+       ``write_bundle`` again.  Immediately after the fresh-start write, the
+       just-written manifest is read back and checked for a tier marked
+       weightless (see **Failure semantics** below) — the swap refuses to
+       proceed on a rollback anchor that does not capture a fully bound
+       store.
     2. **Phase A** — arm the active-store ``train→simulate`` migration state
        file and submit it to a fresh ``BackgroundTrainer`` worker (holds GPU
        lock during execution).  Reconstructs keyed facts from live Mistral
@@ -11658,7 +12316,20 @@ async def _run_base_swap_orchestration(
       ``True`` (a resume's own precondition is that its marker still reads
       back), so a mid-resume failure is never misclassified as setup_failed —
       it falls through to the ``phase_b_failed`` case below, ``state`` stays
-      ``TRIAL``.
+      ``TRIAL``.  A fresh-start setup failure also covers the rollback-anchor
+      gate: the rollback anchor must capture a fully bound store, so a
+      capture that had to mark any tier's adapter record
+      ``weightless_cause`` (``write_bundle`` found an on-disk payload that
+      looked trained but no slot matched the live registry) refuses the swap
+      here, before any mutation — ``RuntimeError`` names the torn tier(s),
+      cause(s), and the remedy (repair the store — retire the affected keys
+      via the erase endpoint or restore a healthy backup — then retry the
+      swap) and is classified ``setup_failed`` by this same arm.  The
+      bundle is real and preserved (surfaced via ``gates["bundle_path"]``
+      exactly as any other setup-failure bundle) — it is the truthful
+      forensic capture of the broken tier, not something to hide.  This gate
+      only runs on the fresh-start path: a resume never re-captures, and its
+      marker's mere presence already proves the original capture passed it.
     - Phase A failure: gates → ``phase_a_failed``; bundle + marker preserved
       for ``POST /migration/rollback``.
     - Reload deferred: gates → ``reload_deferred``; marker stays at
@@ -11751,7 +12422,6 @@ async def _run_base_swap_orchestration(
                 if _tier_cfg is not None and getattr(_tier_cfg, "enabled", False):
                     adapter_dirs[_tier_name] = Path(config.adapter_dir) / _tier_name
 
-            registry_path = Path(config.paths.key_metadata)
             data_dir = Path(config.paths.data)
             speaker_profiles_path = data_dir / "speaker_profiles.json"
 
@@ -11760,7 +12430,6 @@ async def _run_base_swap_orchestration(
             # reach this block (guarded by the resume_phase check above).
             bundle_slot = write_bundle(
                 config_path=live_config_path,
-                registry_path=registry_path,
                 adapter_dirs=adapter_dirs,
                 backups_root=backups_root,
                 backups_cfg=config.security.backups,
@@ -11773,6 +12442,40 @@ async def _run_base_swap_orchestration(
             )
             bundle_slot_str = str(bundle_slot.resolve())
             _bundle_written = True
+
+            # ── Rollback-anchor validity gate ──────────────────────────────
+            # A rollback replays this bundle unconditionally (no defensive
+            # handling in the rollback branch of POST /migration/rollback)
+            # because the bundle is guaranteed to be a working-state capture.
+            # write_bundle marks a tier's adapter record weightless_cause
+            # ("torn_train_slot") when the tier's on-disk payload looked
+            # trained but no slot matched the live registry — that tier was
+            # already broken before this swap touched anything. Refuse to
+            # BEGIN rather than anchor a rollback to a store that cannot be
+            # restored to a working state.  No mutation has happened yet:
+            # _marker_written is still False, so raising here is classified
+            # setup_failed by the except-arm below — the live config stays
+            # untouched and the swap is immediately retryable once the store
+            # is repaired.  The bundle itself is left on disk (retention-immune,
+            # never auto-deleted) and surfaced via gates["bundle_path"] as a
+            # truthful forensic capture of the broken state.
+            _bundle_manifest = read_bundle_manifest(bundle_slot)
+            _weightless_tiers = {
+                _name: _record["weightless_cause"]
+                for _name, _record in _bundle_manifest.adapters.items()
+                if _record["weightless_cause"] is not None
+            }
+            if _weightless_tiers:
+                _tier_report = "; ".join(
+                    f"{_name} ({_cause})" for _name, _cause in sorted(_weightless_tiers.items())
+                )
+                raise RuntimeError(
+                    "base-swap refused before any mutation: rollback anchor "
+                    f"{bundle_slot_str} captured {_tier_report} without adapter "
+                    "weights — repair the store first (retire the affected keys "
+                    "via the erase endpoint or restore a healthy backup), then "
+                    "retry the swap."
+                )
 
             # Update the in-memory trial stash with the bundle slot.
             migration_stash = _state.get("migration", {})
@@ -12212,6 +12915,9 @@ async def _run_base_swap_orchestration(
             than swallowed.
             """
             from paramem.server.active_store_migration import load_state as _phase_b_load_state
+            from paramem.server.consolidation import (
+                load_max_tier_cycle as _phase_b_load_max_tier_cycle,
+            )
 
             try:
                 _fresh_state_b = _phase_b_load_state(Path(config_b.adapter_dir))
@@ -12230,6 +12936,27 @@ async def _run_base_swap_orchestration(
                 # registry.  Without this the store is empty → migrate refuses with
                 # "0 tiers but on-disk content exists".
                 loop_b.store.load_registries_from_disk(config_b.adapter_dir)
+                # Bookkeeping + promotion state — mirrors the ordinary lifespan-boot
+                # hydration order (registries, then bookkeeping). commit_tier_slot's
+                # bookkeeping write is per-tier now (each tier writes only its own
+                # rows, never truncating another tier's file), but seed_key_metadata
+                # still needs the store's bookkeeping already loaded — its
+                # promoted_keys rebuild reads the per-key promoted flag off the
+                # store. load_bookkeeping_from_disk is the sole boot loader for
+                # per-key bookkeeping (speaker_id, relation_type,
+                # reinforcement_count, ...); create_consolidation_loop's
+                # construction-time seed_key_metadata call
+                # (paramem/server/consolidation.py) ran against the still-empty
+                # base-swap store and found no bookkeeping to derive promoted_keys
+                # from, so it is re-run here now that the registries above are
+                # loaded — loop_b picks up the correct promoted_keys/cycle_count
+                # the same way the ordinary live-singleton mode-switch venue
+                # already does (its store is fully hydrated at boot, so this is a
+                # no-op change for it).
+                loop_b.store.load_bookkeeping_from_disk(config_b.adapter_dir)
+                _phase_b_cycle_count = _phase_b_load_max_tier_cycle(config_b.adapter_dir)
+                if _phase_b_cycle_count is not None:
+                    loop_b.seed_key_metadata(_phase_b_cycle_count)
                 updated_b = migrate(loop_b, config_b, _fresh_state_b)
                 _state["model"] = loop_b.model
                 if not updated_b.all_tiers_done(loop_b.store.tiers_with_registry()):
@@ -12245,29 +12972,6 @@ async def _run_base_swap_orchestration(
 
         if phase_b_error:
             raise phase_b_error[0]
-
-        # ── Promotion carry-over ─────────────────────────────────────────────
-        # The migration never writes key_metadata.json, so it still holds the
-        # PREVIOUS model's promotion state (per-key reinforcement_count + promoted_keys).
-        # loop_b was created against the empty live store (the base-swap preload
-        # gate skips loading the old registry), so its construction-time seed
-        # orphan-dropped every key.  Now that Phase B has retrained the SAME keys
-        # (stable via graph.json ``ik_key``) and repopulated the store, re-seed
-        # from the preserved key_metadata.json so promotion momentum carries
-        # across the swap — a key at reinforcement_count=N does not reset to 0, and the
-        # already-promoted set is restored.  Without this, the next consolidation's
-        # write_key_metadata would overwrite the on-disk counts with loop_b's empty
-        # in-memory state.  seed_key_metadata SETs (not increments) so it is
-        # idempotent; the keys match by construction so there is no orphan-drop now.
-        from paramem.server.consolidation import _load_key_metadata as _carry_load_meta
-
-        _carry_meta = _carry_load_meta(config_b.key_metadata_path)
-        if _carry_meta is not None:
-            loop_b.seed_key_metadata(_carry_meta)
-            logger.info(
-                "base-swap: carried over promotion state — %d key(s) promoted",
-                len(loop_b.promoted_keys),
-            )
 
         # ── Step 6: Post-Phase-B in-process reload — align in-RAM peft_config
         # with disk.  Phase B's migrate() promoted weights for every tier and
@@ -12366,7 +13070,7 @@ async def _run_base_swap_orchestration(
         # does not survive a clean run.
         try:
             resolve_incidents_by_type(
-                _state["config"].paths.data / "state",
+                data_state_dir(_state["config"].paths.data),
                 "migration_phase_failed",
                 reason=f"base-swap completed: {old_model} → {new_model}",
             )
@@ -12442,10 +13146,10 @@ async def _run_base_swap_orchestration(
         # bundle + POST /migration/rollback path is unchanged; this adds
         # durability + /status visibility alongside the trial-gates marker.
         # Recorded after the gates/state update above — record_incident
-        # writes to config.paths.data / "state", which the migration reset
+        # writes to data_state_dir(config.paths.data), which the migration reset
         # does not touch.
         record_incident(
-            _state["config"].paths.data / "state",
+            data_state_dir(_state["config"].paths.data),
             type="migration_phase_failed",
             key=_status,
             severity="failed",
@@ -12530,52 +13234,77 @@ def _rollup_gate_status(results: list, session_buffer_empty: bool) -> str:
 def _build_trial_loop(model, tokenizer, trial_config, trial_adapter_dir, trial_graph_dir):
     """Build a ConsolidationLoop for the trial, overriding output paths.
 
-    Registry isolation:
-    ``loop.trial_registry_path`` and ``loop.trial_key_metadata_path`` are set
-    to paths inside a ``trial_registry/`` sibling of ``trial_adapter/`` so that
-    ``_save_registry`` / ``write_key_metadata`` in consolidation.py write to
-    the trial-isolated directory instead of the live ``data/ha/registry.json``
-    / ``data/ha/registry/key_metadata.json``.
+    Registry isolation: ``loop.output_dir`` is set to ``trial_adapter_dir``
+    (below), so every per-tier file the fold's commit primitives write —
+    ``indexed_key_registry.json`` and ``key_metadata.json`` alike, via
+    ``write_tier_slot`` / ``publish_tier_registry`` (the trial consolidation
+    run) or ``commit_tier_slot`` (``commit_main_tiers``'s copy-forward of
+    the unchanged main adapters) — lands inside the trial adapter tree.
+    The loop carries no separate metadata-path override; there is nothing
+    left to isolate beyond ``output_dir`` itself.
 
     The previous pattern (``trial_config.paths.data = trial_adapter_dir.parent.parent``)
     is removed: it pointed ``paths.data`` back to ``data/ha`` and caused both
     registry writers to resolve to the LIVE paths.  The adapter output path is
     now set via ``loop.output_dir`` only, leaving ``trial_config.paths.data``
-    alone so config-derived paths (sessions, debug, prompts) remain valid.
+    alone so the paths resolved from configuration (sessions, debug, prompts)
+    remain valid.
+
+    Args:
+        trial_adapter_dir: Required.  A ``None`` value would leave
+            ``loop.output_dir`` on ``create_consolidation_loop``'s production
+            default (``config.adapter_dir``) — and since the fold state dir
+            is derived from ``output_dir.parent`` via
+            :func:`~paramem.training.stage_ledger.data_state_dir`, an
+            un-overridden trial would read, overwrite, and dispose
+            PRODUCTION fold state.  Refused loudly instead; there is no
+            fallback.
+
+    Raises:
+        ValueError: When *trial_adapter_dir* is ``None``, or when a tier's
+            ``indexed_key_registry.json`` under *trial_adapter_dir* exists
+            but is not KeyRegistry-shaped — propagated from
+            :meth:`~paramem.memory.store.MemoryStore.load_registries_from_disk`
+            (batch, all-or-nothing per
+            :meth:`~paramem.memory.store.MemoryStore.read_registries_from_disk`).
+            A malformed tier registry aborts the trial loudly rather than
+            degrading to an empty store; the sole caller
+            (``_run_trial_consolidation``) catches this and records
+            ``status="trial_exception"``.
     """
+    if trial_adapter_dir is None:
+        raise ValueError(
+            "_build_trial_loop: trial_adapter_dir is required — None would leave "
+            "loop.output_dir on its production default (config.adapter_dir), so "
+            "the trial would read, overwrite, and dispose PRODUCTION fold state"
+        )
+
     from paramem.memory.store import MemoryStore as _MemoryStore
     from paramem.server.consolidation import create_consolidation_loop
 
     # Trial path: construct a fresh, isolated store that mirrors the trial
     # adapter dir's registries.  Do NOT reuse the live ``_state["memory_store"]``
-    # — the trial must not pollute the production store.
-    trial_store = _MemoryStore(
-        replay_enabled=trial_config.consolidation.indexed_key_replay,
-    )
-    if trial_adapter_dir is not None:
-        try:
-            trial_store.load_registries_from_disk(trial_adapter_dir)
-        except Exception:
-            logger.exception("Trial memory_store registry load failed; starting empty")
+    # — the trial must not pollute the production store.  A registry load
+    # failure propagates rather than degrading to an empty store — see
+    # Raises below.
+    trial_store = _MemoryStore()
+    trial_store.load_registries_from_disk(trial_adapter_dir)
     loop = create_consolidation_loop(model, tokenizer, trial_config, trial_store)
 
-    if trial_adapter_dir is not None:
-        loop.output_dir = trial_adapter_dir
-        trial_adapter_dir.mkdir(parents=True, exist_ok=True)
+    loop.output_dir = trial_adapter_dir
+    trial_adapter_dir.mkdir(parents=True, exist_ok=True)
 
-        # Donor stores stay on the LIVE root: the trial's adapters are cold by
-        # construction, so without this every trial pays a full inline donor
-        # build into its own scratch tree. Borrowing is read-only, so a trial
-        # can neither add to nor prune the live donor stores.
-        loop.borrow_donor_cache(trial_config.adapter_dir)
+    # Donor stores stay on the LIVE root: the trial's adapters are cold by
+    # construction, so without this every trial pays a full inline donor
+    # build into its own scratch tree. Borrowing is read-only, so a trial
+    # can neither add to nor prune the live donor stores.
+    loop.borrow_donor_cache(trial_config.adapter_dir)
 
-        # Redirect registry writes to a trial-isolated directory
-        # (sibling of trial_adapter/, e.g. data/ha/state/trial_registry/).
-        # _save_registry / write_key_metadata check these attributes and use them
-        # instead of config.registry_path / config.key_metadata_path.
-        trial_registry_dir = trial_adapter_dir.parent / "trial_registry"
-        loop.trial_registry_path = trial_registry_dir / "registry.json"
-        loop.trial_key_metadata_path = trial_registry_dir / "registry" / "key_metadata.json"
+    # Redirect the legacy combined-SimHash registry write to a trial-isolated
+    # directory under the trial root (sibling of adapters/, e.g.
+    # data/ha/state/trial/trial_registry/).
+    trial_registry_dir = trial_adapter_dir.parent / "trial_registry"
+    loop.trial_registry_path = trial_registry_dir / "registry.json"
 
     return loop
 
@@ -12657,6 +13386,57 @@ async def _update_trial_gates(gates: dict) -> None:
         if trial is None:
             return
         trial["gates"] = gates
+
+
+def _resolve_bound_graph_path(tier_root: "Path") -> "Path | None":
+    """Resolve *tier_root*'s BOUND slot's ``graph.json`` for the migration
+    comparison report.
+
+    Nothing writes a tier-root ``graph.json`` any more — the payload lives in
+    a timestamped slot under *tier_root*, written via
+    :func:`~paramem.adapters.slot.write_slot`. Composes the same two
+    primitives every other bound-slot reader in the package does
+    (:func:`~paramem.adapters.manifest.tier_registry_sha256` +
+    :func:`~paramem.adapters.manifest.find_live_slot` —
+    :mod:`paramem.memory.source`, :mod:`paramem.server.active_store_migration`,
+    :mod:`paramem.backup.backup`) rather than the heavier registry↔slot
+    binding oracle, which is for boot verification and publish gating, not a
+    read-only display value.
+
+    Best-effort, matching this pair's own documented convention (see
+    ``tier_registry_sha256``'s docstring: "callers at a boot boundary that
+    must degrade rather than fail ... catch locally there") — a read/decrypt
+    failure on the registry, or any failure resolving the slot, degrades to
+    ``None`` rather than raising, because a comparison report must never
+    crash the request; the caller passes ``None`` straight through to
+    ``_summarise_graph``, which renders ``"—"``.
+
+    Args:
+        tier_root: Directory holding the tier's ``indexed_key_registry.json``
+            at its root — a main tier root or an interim family root.
+
+    Returns:
+        Path to the bound slot's ``graph.json``, or ``None`` when no slot is
+        bound or resolution failed.
+    """
+    import pyrage
+
+    from paramem.adapters.manifest import find_live_slot, tier_registry_sha256
+    from paramem.adapters.slot import payload_filename
+
+    try:
+        live_hash = tier_registry_sha256(tier_root)
+        slot = find_live_slot(tier_root, live_hash)
+    except (OSError, RuntimeError, pyrage.DecryptError) as exc:
+        logger.warning(
+            "migration comparison report: could not resolve bound slot for %s: %s",
+            tier_root,
+            exc,
+        )
+        return None
+    if slot is None:
+        return None
+    return slot / payload_filename("simulate")
 
 
 async def _stash_trial_graph(
@@ -12753,14 +13533,15 @@ async def migration_status():
     ):
         # Resolve graph shape from stashed artifacts.
         #
-        # Pre-trial simulate: canonical episodic/graph.json from the production
-        # loop's output_dir (on disk before the trial ran).  Resolved here
-        # without GPU access — the file already exists.
+        # Pre-trial simulate: the production episodic tier's BOUND slot
+        # graph.json (nothing writes a tier-root graph.json any more —
+        # resolved via _resolve_bound_graph_path, on disk before the trial
+        # ran, no GPU access needed).
         # Pre-trial train: in-memory graph reconstructed before extraction ran
         # (captured proactively under the GPU lock in _run_trial_consolidation).
         #
-        # Trial simulate: Path to the newest interim-slot graph.json the trial
-        # wrote (episodic/interim_<stamp>/graph.json), stashed by _stash_trial_graph.
+        # Trial simulate: Path to the newest interim family's bound slot
+        # graph.json the trial wrote, stashed by _stash_trial_graph.
         # Trial train: in-memory graph reconstructed from trial adapter weights,
         # stashed by _stash_trial_graph.
         #
@@ -12768,12 +13549,16 @@ async def migration_status():
         pre_trial_graph_path: Path | None = None
         pre_trial_graph: object | None = trial.get("pre_trial_graph")
         if pre_trial_graph is None:
-            # simulate mode: read from the canonical on-disk file.
+            # simulate mode: resolve the production episodic tier's bound slot.
             _loop_obj = _state.get("consolidation_loop")
             if _loop_obj is not None:
                 _out_dir = getattr(_loop_obj, "output_dir", None)
                 if _out_dir is not None:
-                    pre_trial_graph_path = Path(_out_dir) / "episodic" / "graph.json"
+                    from paramem.memory.interim_adapter import adapter_slot_root_for_name
+
+                    pre_trial_graph_path = _resolve_bound_graph_path(
+                        adapter_slot_root_for_name(Path(_out_dir), "episodic")
+                    )
 
         trial_graph_path: Path | None = trial.get("trial_graph_path")
         trial_graph: object | None = trial.get("trial_graph")
@@ -12878,6 +13663,9 @@ async def migration_accept():
         Trial gates failed — only rollback is valid.
     409 ``migration_in_progress``
         Lock already held by a concurrent operation.
+    409 ``store_quarantined``
+        The memory store is quarantined (:func:`_store_quarantine_verdict`).
+        Checked before any mutation.
     500 ``trial_archive_failed``
         Could not create the rotation slot for the trial adapter.
     """
@@ -12885,6 +13673,14 @@ async def migration_accept():
 
     from paramem.server.drift import ConfigDriftState, compute_config_hash
     from paramem.server.migration import initial_migration_state
+
+    # --- Store must be publishable before promoting a trial live ---
+    _quarantine_verdict = _store_quarantine_verdict()
+    if _quarantine_verdict is not None:
+        error, message = refusal_for(
+            _quarantine_verdict, doing="accepting a migration trial", then="accept"
+        )
+        raise HTTPException(status_code=409, detail={"error": error, "message": message})
 
     # --- Pre-checks outside the lock (fast 4xx path) ---
     migration = _state.get("migration") or initial_migration_state()
@@ -12945,10 +13741,10 @@ async def migration_accept():
         Path(_state["config_path"]) if _state.get("config_path") else DEFAULT_SERVER_CONFIG_PATH
     )
     if config is not None:
-        state_dir = (config.paths.data / "state").resolve()
+        state_dir = data_state_dir(config.paths.data).resolve()
         backups_root = (config.paths.data / "backups").resolve()
     else:
-        state_dir = (default_data_dir() / "state").resolve()
+        state_dir = data_state_dir(default_data_dir()).resolve()
         backups_root = (default_data_dir() / "backups").resolve()
 
     trial_adapters_dir = backups_root / "trial_adapters"
@@ -13029,7 +13825,7 @@ async def migration_accept():
 
         # --- Step 3: Clear trial marker BEFORE adapter/graph move ---
         # Rationale: if marker-clear fails, nothing else has mutated yet.
-        # If rotation below fails after marker-clear, state/trial_adapter/ is still
+        # If rotation below fails after marker-clear, state/trial/adapters/ is still
         # intact and state/trial.json is gone → startup recovery sees no marker +
         # B live → clean LIVE, no stale marker pointing at an already-rotated slot.
         try:
@@ -13287,10 +14083,10 @@ async def migration_rollback():
         Path(_state["config_path"]) if _state.get("config_path") else DEFAULT_SERVER_CONFIG_PATH
     )
     if config is not None:
-        state_dir = (config.paths.data / "state").resolve()
+        state_dir = data_state_dir(config.paths.data).resolve()
         backups_root = (config.paths.data / "backups").resolve()
     else:
-        state_dir = (default_data_dir() / "state").resolve()
+        state_dir = data_state_dir(default_data_dir()).resolve()
         backups_root = (default_data_dir() / "backups").resolve()
 
     trial_adapters_dir = backups_root / "trial_adapters"
@@ -13342,15 +14138,17 @@ async def migration_rollback():
         # (config + registry + per-tier adapters + speaker_profiles) so
         # Mistral weights come back alongside the Mistral config.
         #
-        # Split-brain fix: after restore_bundle writes the Mistral config to
-        # disk, the in-memory model may be Qwen3 (if the reload in Step 3 of
-        # the orchestration succeeded before the rollback was triggered).  The
-        # no-op skip inside _apply_config_live compares disk_hash against
-        # _state["config_drift"]["loaded_hash"]. After a config-swap the loaded
-        # hash equals the Qwen3 config, NOT the Mistral config now on disk, so
-        # the skip fires on the WRONG branch and leaves Qwen3 resident.
-        # Fix: invalidate loaded_hash BEFORE dispatching _apply_config_live so
-        # the skip cannot fire and the full reload runs.
+        # Store-side convergence: this branch enters quarantine deliberately
+        # BEFORE restore_bundle rewrites the tree (the same enter-quarantine
+        # -> restore-tree -> lift sequence POST /backup/restore uses — see
+        # _enter_store_quarantine's docstring for the shared marker/incident
+        # shape). The lift itself is not a separate call here: the base
+        # MODEL is also changing, so the full release+reload below
+        # (_apply_config_live_guarded(force=True) -> _live_reload_base_model
+        # -> _build_runtime_components) already re-runs the store step as
+        # part of its normal full-rebuild, which is what clears the
+        # quarantine on success. A restore_bundle failure leaves the
+        # quarantine in place with the failure recorded as its cause.
         _bs_marker = read_trial_marker(state_dir)
         if _bs_marker is not None and _bs_marker.migration_kind == "base_swap":
             bundle_slot_path_str = _bs_marker.bundle_slot
@@ -13396,6 +14194,24 @@ async def migration_rollback():
 
             data_dir_rb = Path(config.paths.data).resolve()
 
+            # Deliberate quarantine entry BEFORE the tree rewrite — the store
+            # goes offline for the duration of the rewrite; chat keeps
+            # serving on the HA/cloud paths exactly as any quarantine does.
+            #
+            # LOAD-BEARING INVARIANT: this entry, the tree rewrite below, and
+            # the ledger dispose further down (`_sl.dispose(state_dir)`) run
+            # in one synchronous stretch with NO `await` in between -- see
+            # the identical invariant note at `POST /backup/restore`'s own
+            # deliberate quarantine entry.  A deliberate quarantine that left
+            # a pending ledger observable across an await boundary here could
+            # race the arbitrator's resume-pending-first arm (which now
+            # treats quarantined-AND-pending as "resume it") against a tree
+            # this rollback is still mid-rewriting.
+            _enter_store_quarantine(
+                config,
+                reason=f"rolling back a base-swap migration (bundle {bundle_slot_path.name})",
+            )
+
             try:
                 _restore_bundle_fn(
                     bundle_slot_path,
@@ -13404,6 +14220,9 @@ async def migration_rollback():
                     restore_config=True,
                 )
             except (BundleManifestError, FingerprintMismatchError) as exc:
+                # Failed restore -- leave the quarantine in place, updated
+                # with the actual failure as its cause.
+                _enter_store_quarantine(config, exc)
                 raise HTTPException(
                     status_code=500,
                     detail={
@@ -13412,6 +14231,7 @@ async def migration_rollback():
                     },
                 ) from exc
             except RuntimeError as exc:
+                _enter_store_quarantine(config, exc)
                 raise HTTPException(
                     status_code=500,
                     detail={
@@ -13423,16 +14243,18 @@ async def migration_rollback():
                     },
                 ) from exc
 
-            # Mistral config is now on disk.  Invalidate config_drift.loaded_hash
-            # so _apply_config_live's no-op skip (disk_hash == loaded_hash) cannot
-            # fire — we need a forced reload regardless of what was previously in
-            # memory.  Using a sentinel string that can never equal a real SHA-256
-            # (which is 64 lower-hex characters) is safe.
-            _cd = _state.get("config_drift")
-            if isinstance(_cd, dict):
-                _cd["loaded_hash"] = "__rollback_invalidated__"
-            else:
-                _state["config_drift"] = {"loaded_hash": "__rollback_invalidated__"}
+            # This restore rewrites every tier wholesale, which a pending
+            # consolidation event's ledger would otherwise classify FOREIGN
+            # on its next resume.  Path-only -- no live ConsolidationLoop
+            # required, so this fires in every server mode, cloud-only
+            # included.
+            from paramem.training import stage_ledger as _sl
+
+            _sl.dispose(state_dir)
+            # Every exit of a pending record resolves the incident naming it --
+            # this rollback's discard is one of the wholesale-tier-rewrite
+            # sites, the same invariant as the other dispose call sites.
+            resolve_incidents_by_type(state_dir, "consolidation_resume_blocked")
 
             # Clear the active-store migration state file and the base-swap marker
             # BEFORE the reload.  The swap is being abandoned, so the preload
@@ -13446,9 +14268,19 @@ async def migration_rollback():
             clear_trial_marker(state_dir)
 
             # Dispatch the in-process reload to bring Mistral back, under the
-            # shared synchronous maintenance guard (restore-on-no-op handled
-            # inside).  This path does not consume the apply result.
-            await _apply_config_live_guarded()
+            # shared synchronous maintenance guard.  force=True makes the
+            # reload run UNCONDITIONALLY — no config-hash sentinel: the
+            # quarantine entered above must not be left stranded by a no-op
+            # skip, and _apply_config_live's own skip logic stays intact for
+            # every other caller (see its *force* parameter doc).  The
+            # dispatched reload's own full component rebuild is what runs the
+            # store-side lift and clears the quarantine on success — no
+            # separate lift call is needed here.  This path does not consume
+            # the apply result — a reload failure leaves the quarantine (and
+            # cloud-only mode) in place; the operator recovers via
+            # GET /integrity and a repeat POST /migration/rollback or
+            # POST /gpu/acquire.
+            await _apply_config_live_guarded(force=True)
 
             # Reset migration state to LIVE.
             prior_recovery_rb = list(migration.get("recovery_required") or [])
@@ -13857,8 +14689,8 @@ class BackupListItem(BaseModel):
     backup_id:
         Slot directory name (e.g. ``"20260421-04000012"``).
     kind:
-        Artifact kind string (``"config"`` | ``"graph"`` | ``"registry"`` |
-        ``"snapshot"`` | ``"resume"``).
+        Artifact kind string (``"config"`` | ``"graph"`` | ``"snapshot"`` |
+        ``"resume"`` | ``"snapshot_bundle"``).
     tier:
         Backup tier (``"daily"`` | ``"manual"`` | ``"pre_migration"`` | …).
     timestamp:
@@ -13869,6 +14701,12 @@ class BackupListItem(BaseModel):
         Optional operator-supplied annotation; ``None`` when absent.
     path:
         Absolute path to the slot directory.
+    incompatible:
+        ``True`` when this is a ``snapshot_bundle`` slot written at a
+        ``bundle_schema_version`` this build no longer understands — the
+        slot is enumerated (visible) but ``POST /backup/restore`` refuses
+        it. Always ``False`` for a per-artifact record or a bundle at the
+        current version.
     """
 
     backup_id: str
@@ -13878,6 +14716,7 @@ class BackupListItem(BaseModel):
     size_bytes: int
     label: str | None
     path: str
+    incompatible: bool = False
 
 
 class BackupListResponse(BaseModel):
@@ -13905,9 +14744,9 @@ class BackupCreateRequest(BaseModel):
     ----------
     kinds:
         Artifact kinds to back up.  ``None`` or ``[]`` → default
-        ``["snapshot_bundle"]`` (self-contained recovery bundle).  The
-        deprecated per-artifact kinds ``"config"``, ``"graph"``, and
-        ``"registry"`` are still accepted for backward compatibility.
+        ``["snapshot_bundle"]`` (self-contained recovery bundle) — the one
+        comprehensive, restorable artifact.  ``"config"`` and ``"graph"``
+        remain independently selectable extras.
     label:
         Optional annotation written into each slot sidecar.
     tier:
@@ -13988,19 +14827,15 @@ class BackupRestoreResponse(BaseModel):
     ----------
     restored:
         Mapping of artifact kind / name → live path that was overwritten.
-        For ``snapshot_bundle`` restores this maps adapter names to their new
-        slot directories and includes ``"registry"`` and (optionally)
-        ``"speaker_profiles"`` and ``"config"``.
+        For ``snapshot_bundle`` restores this maps each restored adapter name
+        to its new slot directory, plus a ``"<adapter_name>_key_metadata"``
+        entry per adapter whose ``key_metadata.json`` was restored, and
+        (optionally) ``"speaker_profiles"`` and ``"config"``.
     backed_up_pre_restore:
         Mapping of kind → safety backup slot path taken before restore.
         For ``snapshot_bundle`` restores the key is ``"bundle"`` and the value
         is the pre-restore safety bundle slot path (or ``""`` when skipped
         because the live store was empty).
-    restart_required:
-        Always ``True`` — the server must be restarted to load the restored
-        config and re-mount adapters from the restored slots.
-    restart_hint:
-        Human-readable restart command.
     restored_adapters:
         List of adapter names restored from the bundle.  Empty for
         ``config``-kind restores.
@@ -14011,14 +14846,30 @@ class BackupRestoreResponse(BaseModel):
         ``{"name": <adapter_name>, "kind": "interim"|"main", "active_keys": <int>}``.
         Routine within-tier stale-slot cleanup is logged but not listed here.
         Empty when no orphan adapters were pruned.
+    serving:
+        ``True`` when the server is fully serving with the restored artifacts
+        live — no restart, no residual quarantine — by the time this response
+        is returned.  ``False`` means either an operator restart is still
+        required to converge the restore (a ``config``-kind restore, or a
+        ``snapshot_bundle`` restore with ``restore_config=True`` — both leave
+        their existing restart posture unchanged, since a same-base lift
+        would be wrong when the config may have changed the base model), or
+        the post-restore lift itself re-quarantined the store (see
+        ``quarantine_cause``).
+    quarantine_cause:
+        The current ``_state["store_quarantine"]`` cause dict when
+        ``serving`` is ``False`` because the store is quarantined
+        (``snapshot_bundle`` restores only — a plain ``config``-kind restore
+        never quarantines, since it touches no adapter tree); ``None`` when
+        the store is not quarantined.
     """
 
     restored: dict[str, str]
     backed_up_pre_restore: dict[str, str]
-    restart_required: bool = True
-    restart_hint: str
     restored_adapters: list[str] = []
     pruned_orphans: list[dict] = []
+    serving: bool
+    quarantine_cause: dict | None = None
 
 
 class BackupPruneRequest(BaseModel):
@@ -14072,7 +14923,7 @@ async def backup_list(kind: str | None = None):
     """Enumerate backups across all kinds, newest-first.
 
     Query parameter ``kind`` filters by artifact kind (``"config"`` |
-    ``"graph"`` | ``"registry"`` | ``"snapshot"`` | ``"resume"``).
+    ``"graph"`` | ``"snapshot"`` | ``"resume"`` | ``"snapshot_bundle"``).
     Unknown values return 400 ``kind_invalid``.
 
     Reads via ``enumerate_backups(backups_root, kind=...)``.  Size is taken
@@ -14135,6 +14986,7 @@ async def backup_list(kind: str | None = None):
                 size_bytes=size,
                 label=record.label,
                 path=str(record.slot_dir),
+                incompatible=record.incompatible,
             )
         )
 
@@ -14181,9 +15033,8 @@ def _create_backup(
     ``backups_root/snapshot/`` containing the full recovery set (config,
     registry, adapter weights, speaker profiles); the server holds the
     ``PARAMEM_DAILY_PASSPHRASE`` needed to decrypt registries for per-tier
-    hash resolution, which is why scheduled backups are server-mediated. The
-    deprecated per-artifact kinds ``"config"``, ``"graph"``, and
-    ``"registry"`` are still accepted for backward compatibility.
+    hash resolution, which is why scheduled backups are server-mediated.
+    ``"config"`` and ``"graph"`` remain independently selectable extras.
 
     Persists the result via ``update_backup_state`` so the next ``/status``
     reflects the freshly-updated ``last_success_at``.
@@ -14213,7 +15064,7 @@ def _create_backup(
     from paramem.backup.runner import run_scheduled_backup
     from paramem.backup.state import update_backup_state
 
-    _VALID_KINDS = {"config", "graph", "registry", "snapshot_bundle"}
+    _VALID_KINDS = {"config", "graph", "snapshot_bundle"}
 
     # Validate kinds.
     if not kinds:
@@ -14281,7 +15132,7 @@ def _create_backup(
 
     proxy_config = _ConfigProxy(config, per_call_security)
 
-    state_dir = (config.paths.data / "state").resolve()
+    state_dir = data_state_dir(config.paths.data).resolve()
     backups_root = (config.paths.data / "backups").resolve()
     live_config_path = (
         Path(_state["config_path"]) if _state.get("config_path") else DEFAULT_SERVER_CONFIG_PATH
@@ -14346,43 +15197,66 @@ async def backup_create(req: BackupCreateRequest):
     dependencies=[Depends(require_admin)],
 )
 async def backup_restore(req: BackupRestoreRequest):
-    """Restore a backup atop the live store.
+    """Restore a backup atop the live store — the RECOVERY door: it stays
+    open in cloud-only mode and under an existing store quarantine.
 
     Supports two restore kinds:
 
     - ``kind="config"`` — restore a single ``server.yaml`` from a per-artifact
-      config slot.  The existing ``config``-kind branch is unchanged.
+      config slot.  Unchanged mechanism (no live-apply dispatch, no store
+      quarantine — a config-kind restore touches no adapter tree): an
+      operator restart is still what converges it, reported via
+      ``serving=False`` in the response (see ``BackupRestoreResponse``).
     - ``kind="snapshot_bundle"`` — restore a complete self-contained recovery
       set (adapter weights, per-tier registries, speaker profiles, and
       optionally config) from a bundle slot.
 
-    Atomic restore sequence for ``snapshot_bundle`` (decrypt-probe, then
-    safety bundle, then atomic per-file swaps, registry written LAST):
+    Sequence for ``snapshot_bundle`` (decrypt-probe, then safety bundle, then
+    the atomic tree rewrite, registry written LAST, then convergence):
 
-    1. Verify preconditions (no TRIAL/STAGING, no active consolidation, no
-       background training).
+    1. Verify preconditions (no STAGING, and every arm
+       :func:`_consolidation_dispatch_guards` checks with
+       ``include_cloud_only=False`` — see the guard comment in the body). A
+       pending consolidation event record does NOT refuse here; see the
+       per-kind handling in step 4.
     2. Locate the slot by ``backup_id``.
     3. Dispatch to the appropriate kind handler.
     4. For ``snapshot_bundle``:
        a. Verify all file hashes in ``bundle.meta.json`` against on-disk bytes.
        b. Decrypt-probe encrypted metadata files (BEFORE any mutation).
-       c. Take a manual safety bundle of the current live state.
-       d. Atomic restore via ``restore_bundle()``, registry written LAST.
-       e. Append recovery banner + return ``restart_required=True``.
+       c. Enter store quarantine deliberately (:func:`_enter_store_quarantine`)
+          — the store goes offline for the duration of the rewrite; chat
+          keeps serving on the HA/cloud paths exactly as any quarantine does.
+       d. Take a manual safety bundle of the current live state.
+       e. Atomic restore via ``restore_bundle()``, registry written LAST. A
+          failure here leaves quarantine in place with the failure as its
+          cause.
+       f. Converge: when ``restore_config`` restored a config (the base
+          model may have changed), a same-base lift would be wrong — leave
+          the quarantine as entered and let an operator restart converge it,
+          same restart posture as the ``config`` kind above. When the bundle
+          records weightless-marked tiers (``RestoreResult.
+          weightless_adapters`` — registry keys with no weight slot), a lift
+          would publish silently-unrecallable keys, so the quarantine stays
+          with a cause naming the marked tiers and the repair doors. Otherwise
+          (same base by construction, no markings) re-mount adapters from the
+          restored slots onto the resident model (no-op in cloud-only mode)
+          and lift the store (:func:`_lift_quarantined_store`) — no restart
+          needed.
 
     Errors
     ------
-    409 ``trial_active``
-        Migration state is TRIAL.
     409 ``staging_active``
-        Migration state is STAGING.
-    409 ``consolidating``
-        A consolidation run is in progress.
-    409 ``training_active``
-        A background training run is in progress.  Between registry-swap and
-        restart a running background trainer could ``find_live_slot`` on the
-        restored slot and stomp it with a checkpoint.  Refuse until training
-        is idle.
+        Migration state is STAGING (no shared-guard equivalent).
+    409 ``trial_active`` | ``consolidating`` | ``training_active`` |
+    ``base_swap_active``
+        One of :func:`_consolidation_dispatch_guards`'s five busy arms is
+        set (:func:`refusal_for` maps the verdict to the error body). A
+        pending consolidation event record does NOT refuse here (see step 4
+        above). ``training_active`` matters here specifically because
+        between the tree rewrite and the on-demand re-mount a running
+        background trainer could ``find_live_slot`` on the restored slot
+        and stomp it with a checkpoint.
     404 ``not_found``
         No slot with the given ``backup_id`` exists.
     400 ``restore_kind_not_supported``
@@ -14400,7 +15274,8 @@ async def backup_restore(req: BackupRestoreRequest):
     500 ``config_restore_failed``
         Atomic rename of the restore temp file failed.
     500 ``bundle_restore_failed``
-        Unexpected error during bundle restore.
+        Unexpected error during bundle restore. The store is left quarantined
+        with the failure as its cause.
     """
     from fastapi import HTTPException
 
@@ -14433,6 +15308,10 @@ async def backup_restore(req: BackupRestoreRequest):
             },
         )
     if mig_state == "STAGING":
+        # No shared-guard equivalent — STAGING is a tier-migration-trial
+        # state active_consolidation's vocabulary does not model at all
+        # (it is neither a busy arm nor a pending-event arm), so it stays a
+        # hand-rolled check here.
         raise HTTPException(
             status_code=409,
             detail={
@@ -14441,31 +15320,26 @@ async def backup_restore(req: BackupRestoreRequest):
                 "message": ("Cannot restore during STAGING. Cancel the migration first."),
             },
         )
-    if _state.get("consolidating"):
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "error": "consolidating",
-                "message": "Consolidation is running; wait for completion before restoring.",
-            },
-        )
 
-    # Background trainer check: a live BG trainer could
-    # call find_live_slot on the restored slot between the registry swap and the
-    # server restart, stomping the restored weights with a checkpoint.
-    _bg_trainer = _state.get("background_trainer")
-    if _bg_trainer is not None and getattr(_bg_trainer, "is_training", False):
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "error": "training_active",
-                "message": (
-                    "Background training is active. Stop or wait for training to complete "
-                    "before restoring a bundle — a running trainer can overwrite the "
-                    "restored adapter slot with a checkpoint."
-                ),
-            },
-        )
+    # Every other busy arm is the shared five-arm vocabulary
+    # (_consolidation_dispatch_guards): consolidating, background training,
+    # an active migration TRIAL, and an active base-swap migration —
+    # composed with include_cloud_only=False because restore is a RECOVERY
+    # door and must stay open in cloud-only mode (a cloud-only server is
+    # exactly a state a restore may need to run in). A pending consolidation
+    # event record (a stage ledger on disk with no fold actively running)
+    # does NOT refuse here: for kind="snapshot_bundle" the ledger is
+    # disposed immediately after the bundle restore (the tier rewrite would
+    # otherwise leave it classifying everything FOREIGN on the next resume
+    # — see the dispose call below); for kind="config" it is left untouched,
+    # since a config restore rewrites no tier. Quarantine is likewise NOT
+    # composed here (_store_quarantine_verdict is deliberately excluded) —
+    # restore must remain open under an EXISTING quarantine; a deliberate
+    # re-entry below just updates the cause (see _enter_store_quarantine).
+    verdict = _consolidation_dispatch_guards(include_cloud_only=False)
+    if verdict is not None:
+        error, message = refusal_for(verdict, doing="restoring a backup", then="restore")
+        raise HTTPException(status_code=409, detail={"error": error, "message": message})
 
     config = _state.get("config")
     if config is not None:
@@ -14503,14 +15377,27 @@ async def backup_restore(req: BackupRestoreRequest):
     # SNAPSHOT_BUNDLE branch
     # -------------------------------------------------------------------------
     if target_record.kind == ArtifactKind.SNAPSHOT_BUNDLE:
-        # Derive data_dir from config.paths.data when available.
-        if config is not None:
-            try:
-                data_dir = config.paths.data.resolve()
-            except (AttributeError, TypeError):
-                data_dir = default_data_dir().resolve()
-        else:
+        # Derive data_dir from config.paths.data.
+        try:
+            data_dir = config.paths.data.resolve()
+        except (AttributeError, TypeError):
             data_dir = default_data_dir().resolve()
+
+        # Deliberate quarantine entry BEFORE the tree rewrite -- the store
+        # goes offline for the duration; chat keeps serving on the HA/cloud
+        # paths exactly as any quarantine does.
+        #
+        # LOAD-BEARING INVARIANT: this entry, the tree rewrite below, and the
+        # ledger dispose further down (`_sl.dispose(_restore_state_dir)`) run
+        # in one synchronous stretch with NO `await` in between -- the
+        # arbitrator's resume-pending-first arm now treats a
+        # quarantined-AND-pending dispatch as "resume it"
+        # (`_dispatch_consolidation`'s docstring, step 3), so a deliberate
+        # quarantine that left a pending ledger observable across an await
+        # boundary here could race a resume attempt against a tree this
+        # restore is still mid-rewriting. Keep the whole
+        # enter-quarantine -> rewrite -> dispose sequence await-free.
+        _enter_store_quarantine(config, reason=f"restoring backup {req.backup_id}")
 
         try:
             result = _restore_bundle(
@@ -14520,6 +15407,7 @@ async def backup_restore(req: BackupRestoreRequest):
                 restore_config=req.restore_config,
             )
         except BundleManifestError as exc:
+            _enter_store_quarantine(config, exc)
             raise HTTPException(
                 status_code=500,
                 detail={
@@ -14528,6 +15416,7 @@ async def backup_restore(req: BackupRestoreRequest):
                 },
             ) from exc
         except FingerprintMismatchError as exc:
+            _enter_store_quarantine(config, exc)
             raise HTTPException(
                 status_code=500,
                 detail={
@@ -14539,6 +15428,7 @@ async def backup_restore(req: BackupRestoreRequest):
                 },
             ) from exc
         except RuntimeError as exc:
+            _enter_store_quarantine(config, exc)
             raise HTTPException(
                 status_code=500,
                 detail={
@@ -14554,6 +15444,7 @@ async def backup_restore(req: BackupRestoreRequest):
             # write phase (step 5) fails after the safety bundle was already
             # captured (step 4).  Surface the safety_slot path so the operator
             # can recover without searching server logs.
+            _enter_store_quarantine(config, exc)
             safety_path = str(exc.safety_slot) if exc.safety_slot is not None else ""
             raise HTTPException(
                 status_code=500,
@@ -14567,6 +15458,7 @@ async def backup_restore(req: BackupRestoreRequest):
             # Catch pyrage.DecryptError (not a RuntimeError subclass) and any
             # unexpected restore-phase OSError that was not wrapped into
             # RestoreAbortedError (e.g. errors before step 5 starts).
+            _enter_store_quarantine(config, exc)
             error_code = "bundle_restore_failed"
             exc_str = str(exc)
             # Distinguish decrypt failures (wrong recipient) from other errors.
@@ -14584,15 +15476,31 @@ async def backup_restore(req: BackupRestoreRequest):
                 },
             ) from exc
 
-        # Build restored dict: adapter name → new slot path, plus registry/profiles/config.
+        # This restore rewrites every tier wholesale, which a pending
+        # consolidation event's ledger would otherwise classify FOREIGN on
+        # its next resume.  Path-only -- no live ConsolidationLoop required,
+        # so this fires in every server mode, cloud-only included.
+        from paramem.training import stage_ledger as _sl
+
+        _restore_state_dir = _sl.data_state_dir(data_dir)
+        _sl.dispose(_restore_state_dir)
+        # Every exit of a pending record resolves the incident naming it --
+        # this restore's discard is one of the wholesale-tier-rewrite sites,
+        # the same invariant as the other dispose call sites.
+        resolve_incidents_by_type(_restore_state_dir, "consolidation_resume_blocked")
+
+        # Build restored dict: adapter name → new slot path, plus each
+        # adapter's own key_metadata.json (per-tier now, not a single global
+        # registry path), plus profiles/config.
         restored_map: dict[str, str] = {}
         for adapter_name in result.restored_adapters:
             from paramem.memory.interim_adapter import adapter_slot_root_for_name
 
             tier_root = adapter_slot_root_for_name(data_dir / "adapters", adapter_name)
             restored_map[adapter_name] = str(tier_root)
-        if (data_dir / "registry" / "key_metadata.json").exists():
-            restored_map["registry"] = str(data_dir / "registry" / "key_metadata.json")
+            _km_path = tier_root / "key_metadata.json"
+            if _km_path.exists():
+                restored_map[f"{adapter_name}_key_metadata"] = str(_km_path)
         if (data_dir / "speaker_profiles.json").exists():
             restored_map["speaker_profiles"] = str(data_dir / "speaker_profiles.json")
         if result.restored_config:
@@ -14600,16 +15508,11 @@ async def backup_restore(req: BackupRestoreRequest):
 
         safety_slot_str = str(result.safety_slot) if result.safety_slot is not None else ""
 
-        # Append recovery banner.
-        if "migration" not in _state:
-            _state["migration"] = initial_migration_state()
-        if "recovery_required" not in _state["migration"]:
-            _state["migration"]["recovery_required"] = []
-        _state["migration"]["recovery_required"].append(
-            f"Restored snapshot_bundle from backup {req.backup_id} — "
-            "restart server to re-mount adapters from restored slots."
-        )
         if result.pruned_orphans:
+            if "migration" not in _state:
+                _state["migration"] = initial_migration_state()
+            if "recovery_required" not in _state["migration"]:
+                _state["migration"]["recovery_required"] = []
             _state["migration"]["recovery_required"].append(
                 f"Pruned {len(result.pruned_orphans)} orphan interim adapter "
                 f"families during restore: "
@@ -14617,13 +15520,121 @@ async def backup_restore(req: BackupRestoreRequest):
                 + f" — safety bundle at {safety_slot_str} can restore them if needed."
             )
 
+        # --- Convergence ---
+        serving = False
+
+        if result.restored_config:
+            # The bundle's config was written to disk and MAY have changed
+            # the base model — a same-base lift would be wrong here (see
+            # _enter_store_quarantine's cause above). This restore keeps its
+            # existing restart posture: quarantine stays exactly as entered
+            # (its cause still names this restore), and NO live-apply is
+            # dispatched — an operator restart, like the config-kind branch
+            # below, is what converges it. Routing this arm through the
+            # live-apply machinery instead is a legitimate alternative but
+            # was not taken: it would also change the config-kind branch's
+            # long-standing restart posture, which is out of scope here.
+            logger.info(
+                "backup_restore: restore_config=True restored a config that may "
+                "have changed the base model — leaving the store quarantined "
+                "for an operator restart rather than attempting a same-base lift "
+                "(backup_id=%s)",
+                req.backup_id,
+            )
+        elif result.weightless_adapters:
+            # The bundle records tiers captured WITHOUT weights (registry
+            # keys with no weight slot — the capture-path marking). At the
+            # file layer this shape is indistinguishable from a legitimate
+            # fresh/simulate tier, so a lift would PUBLISH a store whose
+            # marked keys are silently unrecallable. Skip re-mount + lift
+            # entirely and keep the store offline: re-enter the quarantine
+            # with a cause naming the marked tiers — that same call
+            # re-records the store_quarantined incident, which is the
+            # durable signal (the marker itself is process state and a
+            # restarted boot cannot re-derive this shape from disk).
+            _marked = ", ".join(
+                f"{tier} ({cause})" for tier, cause in sorted(result.weightless_adapters.items())
+            )
+            _enter_store_quarantine(
+                config,
+                reason=(
+                    f"restored backup {req.backup_id} with weightless tiers: {_marked} — "
+                    "registry keys have no weight slot; stale-mark the affected keys "
+                    "via POST /debug/erase-keys, or restore a healthy bundle"
+                ),
+            )
+            logger.warning(
+                "backup_restore: bundle %s carries weightless tiers (%s) — "
+                "lift skipped, store stays quarantined",
+                req.backup_id,
+                _marked,
+            )
+        else:
+            # Same base by construction (no config was restored) — the
+            # lightweight convergence: release the two process-lifetime
+            # holders that pin the PRE-restore model/store (same treatment
+            # as _release_base_model_in_process's holders 2 and 3, minus
+            # releasing the base model itself), re-mount adapters from the
+            # restored slots onto the resident model (no-op in cloud-only
+            # mode), then lift the store. Without this release,
+            # _state["consolidation_loop"] keeps its old .model (a detached
+            # PEFT wrapper _remount_adapters_from_disk unwraps and discards)
+            # and its old .store (the pre-restore store _lift_quarantined_store
+            # replaces) — the next fold's lazily-cached loop would then run
+            # against both stale objects. Nulling here means the next fold's
+            # _get_or_create_consolidation_loop rebuilds fresh against the
+            # post-restore _state["model"]/_state["memory_store"]. Both
+            # releases and the remount+lift are GPU-touching when a model is
+            # resident, so all of it runs off the event loop under gpu_lock.
+            def _restore_converge_sync() -> bool:
+                # Re-resolve rather than close over the handler's pre-lock
+                # capture — same door-staleness argument as
+                # /speaker/forget's _forget_sync.
+                _config = _state["config"]
+                _bt = _state.get("background_trainer")
+                if _bt is not None:
+                    try:
+                        _bt.release()
+                    except Exception:
+                        logger.exception(
+                            "Error releasing background trainer during restore convergence"
+                        )
+                _loop = _state.get("consolidation_loop")
+                if _loop is not None:
+                    try:
+                        _loop.release()
+                    except Exception:
+                        logger.exception(
+                            "Error releasing consolidation loop during restore convergence"
+                        )
+                _state["background_trainer"] = None
+                _state["consolidation_loop"] = None
+                _remount_adapters_from_disk(_config)
+                return _lift_quarantined_store(_config)
+
+            from paramem.server.gpu_lock import gpu_lock
+
+            async with gpu_lock():
+                loop_aio = asyncio.get_running_loop()
+                lifted = await loop_aio.run_in_executor(None, _restore_converge_sync)
+            serving = lifted
+
+            if not serving:
+                logger.error(
+                    "backup_restore: post-restore lift re-quarantined the store "
+                    "(backup_id=%s) — see GET /integrity for the cause",
+                    req.backup_id,
+                )
+
+        quarantine_cause = None if serving else (_state.get("store_quarantine") or {}).get("cause")
+
         return BackupRestoreResponse(
             restored=restored_map,
             backed_up_pre_restore={"bundle": safety_slot_str},
-            restart_required=True,
-            restart_hint=_RESTART_HINT,
             restored_adapters=result.restored_adapters,
             pruned_orphans=result.pruned_orphans,
+            serving=serving,
+            quarantine_cause=quarantine_cause,
         )
 
     # -------------------------------------------------------------------------
@@ -14740,21 +15751,18 @@ async def backup_restore(req: BackupRestoreRequest):
             },
         ) from exc
 
-    # --- Step 7: Append recovery banner ---
-    if "migration" not in _state:
-        _state["migration"] = initial_migration_state()
-    if "recovery_required" not in _state["migration"]:
-        _state["migration"]["recovery_required"] = []
-    _state["migration"]["recovery_required"].append(
-        f"Restored config from backup {req.backup_id} — restart to clear recovery banner."
-    )
-
+    # --- Step 7: this branch's existing restart posture ---
+    # Unchanged mechanism: a config-kind restore only ever swaps
+    # server.yaml on disk — no live-apply dispatch, no adapter tree touched,
+    # no store quarantine. An operator restart is what converges it, same as
+    # before this change; only the response shape is new (see
+    # BackupRestoreResponse's serving field).
     return BackupRestoreResponse(
         restored={"config": str(live_config_path)},
         backed_up_pre_restore={"config": safety_slot_path},
-        restart_required=True,
-        restart_hint=_RESTART_HINT,
         restored_adapters=[],
+        serving=False,
+        quarantine_cause=None,
     )
 
 
@@ -14783,7 +15791,7 @@ async def backup_prune(req: BackupPruneRequest):
     if config is not None:
         try:
             backups_root = (config.paths.data / "backups").resolve()
-            state_dir = (config.paths.data / "state").resolve()
+            state_dir = data_state_dir(config.paths.data).resolve()
             backups_cfg = config.security.backups
         except (AttributeError, TypeError) as exc:
             raise HTTPException(
@@ -14794,7 +15802,7 @@ async def backup_prune(req: BackupPruneRequest):
         from paramem.server.config import ServerBackupsConfig
 
         backups_root = (default_data_dir() / "backups").resolve()
-        state_dir = (default_data_dir() / "state").resolve()
+        state_dir = data_state_dir(default_data_dir()).resolve()
         backups_cfg = ServerBackupsConfig()
 
     try:
@@ -15041,9 +16049,10 @@ def _is_full_cycle_due(config) -> bool:
     slot would be minted — that tick resolves FULL and drains the ring, so an
     (N+1)-th slot never comes into existence for a count gate to observe.
 
-    **What is counted:** only interim slots that carry the configured venue's
-    payload (``iter_interim_dirs(..., mode=config.consolidation.mode)`` — a
-    ``graph.json`` in simulate, adapter weights in train).  A slot directory
+    **What is counted:** only interim slots that carry a written payload, in
+    either venue (``iter_interim_dirs(..., payload_only=True)`` — a slot
+    candidate is present, whether it carries ``graph.json`` or adapter
+    weights; the gate stops asking which venue it is in).  A slot directory
     whose payload write never landed holds nothing to fold, so it must not
     drive the gate on its own.  ``_oldest_interim_stamp``,
     ``_full_cycle_deadline_dt`` and ``_seconds_until_next_full_consolidation``
@@ -15071,10 +16080,11 @@ def _is_full_cycle_due(config) -> bool:
     Timestamps are in LOCAL time throughout, consistent with
     ``current_interim_stamp``'s ``datetime.now()`` basis.
 
-    ``window_stamp`` is not read here, nor anywhere else.  ``_save_adapters``
-    still writes it on every main slot via ``current_full_consolidation_stamp``,
-    but purely as provenance — no code compares stamps to decide whether a fold
-    is due.
+    ``window_stamp`` is not read here, nor anywhere else.  ``write_tier_slot``
+    still writes it on every main slot's manifest (derived via
+    ``current_full_consolidation_stamp`` and threaded through
+    ``run_build_and_publish`` / ``stage_event``'s ledger stamp), but purely
+    as provenance — no code compares stamps to decide whether a fold is due.
     """
     from paramem.memory.interim_adapter import iter_interim_dirs
 
@@ -15089,7 +16099,7 @@ def _is_full_cycle_due(config) -> bool:
     if N < 0:
         return False
 
-    if not any(iter_interim_dirs(config.adapter_dir, mode=config.consolidation.mode)):
+    if not any(iter_interim_dirs(config.adapter_dir, payload_only=True)):
         return False
 
     # Deadline: the oldest un-folded interim may not age past the full period.
@@ -15102,7 +16112,7 @@ def _is_full_cycle_due(config) -> bool:
 def _oldest_interim_stamp(config) -> "str | None":
     """Return the oldest un-folded interim stamp, or ``None`` when none exist.
 
-    Reads ``iter_interim_dirs(config.adapter_dir, mode=config.consolidation.mode)``,
+    Reads ``iter_interim_dirs(config.adapter_dir, payload_only=True)``,
     sorted ascending (oldest first), and extracts the timestamp from the directory
     name via ``interim_stamp_from_name``.  No age gate — returns the stamp regardless
     of how old it is.  Payload-less slot dirs are skipped: this stamp is the cycle key
@@ -15126,7 +16136,7 @@ def _oldest_interim_stamp(config) -> "str | None":
     """
     from paramem.memory.interim_adapter import interim_stamp_from_name, iter_interim_dirs
 
-    dirs = list(iter_interim_dirs(config.adapter_dir, mode=config.consolidation.mode))
+    dirs = list(iter_interim_dirs(config.adapter_dir, payload_only=True))
     if not dirs:
         return None
     oldest_name, _ = dirs[0]  # sorted ascending; [0] is oldest
@@ -15142,8 +16152,8 @@ def _full_cycle_deadline_dt(config) -> "datetime | None":
     The deadline is ``oldest_interim_dt + consolidation_period_seconds``.
     Returns ``None`` when:
 
-    - No un-folded, payload-bearing interim slots exist (the scan is venue-filtered
-      via ``mode=config.consolidation.mode``, same set as :func:`_is_full_cycle_due`).
+    - No un-folded, payload-bearing interim slots exist (the scan is
+      ``payload_only=True``, venue-blind, same set as :func:`_is_full_cycle_due`).
     - ``consolidation_period_seconds`` is ``None`` (manual-only cadence).
 
     Timestamps are in LOCAL time throughout, consistent with
@@ -15161,7 +16171,7 @@ def _full_cycle_deadline_dt(config) -> "datetime | None":
     full_period_seconds = config.consolidation.consolidation_period_seconds
     if full_period_seconds is None:
         return None
-    dirs = list(iter_interim_dirs(config.adapter_dir, mode=config.consolidation.mode))
+    dirs = list(iter_interim_dirs(config.adapter_dir, payload_only=True))
     if not dirs:
         return None
     oldest_name, _ = dirs[0]
@@ -15186,9 +16196,9 @@ def _seconds_until_next_full_consolidation(
     - Cadence disabled (``refresh_cadence`` maps to ``None``): returns ``None``
       (manual-only, no scheduled ticks).
     - No payload-bearing interim slots exist yet: returns ``None`` (nothing to
-      fold).  The scan is venue-filtered (``mode=config.consolidation.mode``)
-      exactly as the gate's is — an unfiltered predictor would contradict the
-      gate in ``/status``.
+      fold).  The scan is ``payload_only=True`` (venue-blind) exactly as the
+      gate's is — an unfiltered predictor would contradict the gate in
+      ``/status``.
     - Otherwise: ``deadline = oldest_interim_dt + full_period_seconds``; the
       result is the deadline ceiled to the next tick boundary, since folds only
       happen on ticks.
@@ -15226,7 +16236,7 @@ def _seconds_until_next_full_consolidation(
     if N == 0:
         return _next_tick_seconds()
 
-    if not any(iter_interim_dirs(config.adapter_dir, mode=config.consolidation.mode)):
+    if not any(iter_interim_dirs(config.adapter_dir, payload_only=True)):
         return None  # no interims yet — nothing to fold
 
     deadline_dt = _full_cycle_deadline_dt(config)
@@ -15317,6 +16327,49 @@ def _full_consolidation_overdue_key(config) -> "str | None":
     return oldest_stamp if age >= 2 * period else None
 
 
+def _record_full_consolidation_overdue(config) -> None:
+    """Fire the ``full_consolidation_overdue`` incident when due.
+
+    The one overdue check + incident, shared by the resume-pending-first arm
+    (:func:`_dispatch_resume`) and the FULL dispatch arm of
+    :func:`_dispatch_consolidation` — both need the identical key, summary
+    and detail so the same stuck cycle is reported once regardless of which
+    arm happens to run it.
+
+    Purely informational: the fold still dispatches either way.  Deduped by
+    the oldest un-folded interim stamp (:func:`_full_consolidation_overdue_key`)
+    — stable for the entire time that cycle's interims are un-folded, so one
+    incident fires per stuck cycle and reopens only on a new cycle's failure.
+
+    A RECONCILE dispatch is exempt from firing this check: the schedule does
+    not wait on a manually triggered reconcile the way it waits on a full
+    fold, so the incident's own deduping (one open incident per stuck cycle)
+    stays keyed to the schedule's own runway.  A reconcile still absorbs and
+    reaps the interim ring like any full fold once dispatched — see
+    ``_finalize_full``'s own incident resolution. The caller is responsible
+    for not calling this when the action being dispatched is RECONCILE.
+    """
+    overdue_key = _full_consolidation_overdue_key(config)
+    if overdue_key is None:
+        return
+    logger.warning(
+        "Consolidation dispatch: full consolidation OVERDUE — oldest interim %s "
+        "has aged >= 2x the full period without being folded",
+        overdue_key,
+    )
+    record_incident(
+        data_state_dir(config.paths.data),
+        type="full_consolidation_overdue",
+        key=overdue_key,
+        severity="failed",
+        summary="Full consolidation overdue — fold has not completed within its runway",
+        detail={
+            "oldest_interim_stamp": overdue_key,
+            "type": "full_consolidation_overdue",
+        },
+    )
+
+
 class ConsolidationAction(str, Enum):
     """What a consolidation dispatch is asked to do — the internal vocabulary.
 
@@ -15350,10 +16403,11 @@ class ConsolidationAction(str, Enum):
       sessions (the fold's only content when no interim tier exists at all).
     - ``INTERIM`` — absorb the pending conversations into a new interim slot.
       Content is pending NAMED sessions.
-    - ``RECONCILE`` — rebuild the main tiers from their OWN keys.  Same fold as
-      ``FULL``, narrower key source: the interim slots are neither folded in
-      nor reaped, and pending sessions are left where they are.  Content is
-      any active key in a main tier (episodic/semantic/procedural); with none
+    - ``RECONCILE`` — a full consolidation whose input excludes pending
+      sessions.  One fold topology throughout: the interim ring is
+      recalled, absorbed into the main tiers, and reaped exactly as
+      ``FULL``; only pending sessions differ — they stay pending.  Content
+      is any active key in any registered tier, main or interim; with none
       the store has nothing to rebuild and the dispatch noops
       (``noop_no_stored_keys``).  It still passes through the shared safety
       guards ahead of the content gate — busy/cloud-only/bg-training, a main
@@ -15361,8 +16415,9 @@ class ConsolidationAction(str, Enum):
       pending-rehydration.
 
     The arbitrator resolves ``AUTO`` and keeps the result: the training layer
-    below receives the fold's mode, its key source and its fold inputs — never
-    who asked.
+    below receives the fold's mode, its key source, its fold inputs, and the
+    resolved door name itself (``event`` — ``"full"``/``"reconcile"``/
+    ``"interim"``, recorded verbatim in the ledger head) — never who asked.
     """
 
     AUTO = "auto"
@@ -15371,7 +16426,51 @@ class ConsolidationAction(str, Enum):
     RECONCILE = "reconcile"
 
 
-def _consolidation_dispatch_guards() -> "str | None":
+def _store_quarantine_verdict() -> "str | None":
+    """``"deferred_store_quarantined"`` while the memory store is quarantined, else ``None``.
+
+    The quarantine arm of :func:`refusal_for`'s closed verdict vocabulary —
+    composed at the specific call sites that must refuse while the boot/lift
+    store step has no publishable store (:func:`_hydrate_memory_store_in_place`):
+    the consolidation arbitrator (:func:`_dispatch_consolidation`), the
+    ``/migration/confirm`` · ``/migration/accept`` trial-state-transition
+    doors, ``POST /speaker/forget``, and ``POST /interim/discard`` — every
+    door that reads or writes the live ``MemoryStore``.
+
+    In the arbitrator specifically, this is no longer an unconditional
+    refusal while quarantined: a PENDING event resumes ahead of this check
+    (:func:`_dispatch_consolidation`'s docstring, step 3) and — a resume
+    needing nothing from the live store — completes and, on going fully
+    live, lifts the quarantine itself (the heal at
+    :func:`_finish_resumed_event`'s tail). This function's own verdict is
+    unchanged for every other case: quarantined with nothing pending still
+    defers here exactly as before, and a still-quarantined dispatch (no
+    pending record, or a resume whose lift failed) reaches this check and
+    refuses same as always.
+
+    Deliberately NOT folded into :func:`_consolidation_dispatch_guards` (the
+    shared predicate :func:`active_consolidation` wraps): that predicate
+    also gates two doors that must keep serving, or keep repairing, while
+    the store is quarantined — ``POST /debug/erase-keys`` (a file surgeon
+    that touches neither the live store nor a model, and on a quarantined
+    store attempts the lift itself after its file mutation) and
+    ``POST /backup/restore`` / the base-swap branch of
+    ``POST /migration/rollback`` (both recovery doors: quarantine is
+    deliberately entered before the tree rewrite and exited by the lift on
+    success, so refusing on an existing quarantine would make the door
+    unable to recover from the very condition it exists to fix) — adding an
+    arm here would close all three. See :func:`_consolidation_dispatch_guards`'s
+    own tier-unverified comment for the identical reasoning applied to a
+    sibling exception.
+
+    Returns:
+        ``"deferred_store_quarantined"`` when ``_state["store_quarantine"]``
+        is set, else ``None``.
+    """
+    return "deferred_store_quarantined" if _state.get("store_quarantine") is not None else None
+
+
+def _consolidation_dispatch_guards(*, include_cloud_only: bool = True) -> "str | None":
     """Shared pre-dispatch guard for consolidation dispatch.
 
     Checks the cross-cutting block conditions that prevent any consolidation
@@ -15381,6 +16480,12 @@ def _consolidation_dispatch_guards() -> "str | None":
       (``_state["migration"]["base_swap_active"]``).
     - ``_state["consolidating"]`` — another fold is already running.
     - ``_state["mode"] != "local"`` — cloud-only mode (no model loaded).
+      Skipped when *include_cloud_only* is ``False`` — the composition two
+      doors use: ``POST /debug/erase-keys`` (a file-only repair door that
+      needs no resident model) and ``POST /backup/restore`` (a RECOVERY
+      door that must stay open in cloud-only mode — a cloud-only server is
+      exactly a state a restore may need to run in). Cloud-only must not
+      block either while every other busy arm still does.
     - Background trainer is actively training (GPU lock contention risk).
     - A migration TRIAL is active (:func:`_trial_active`) — the same refusal
       ``require_no_trial`` enforces at the REST boundary (HTTP 409 on every
@@ -15397,6 +16502,12 @@ def _consolidation_dispatch_guards() -> "str | None":
     the state — the same "in practice the state=TRIAL check fires first"
     framing ``/migration/confirm``'s own belt guard uses.
 
+    Args:
+        include_cloud_only: When ``False``, the cloud-only arm is skipped —
+            every other arm (base-swap, already-running, bg-training,
+            trial-active) still applies. ``True`` (default) preserves the
+            full five-arm check every other caller relies on.
+
     Returns:
         A non-None ``"deferred_*"`` reason string when a block is in effect,
         ``None`` when clear (caller should proceed).  The string mirrors the
@@ -15406,7 +16517,7 @@ def _consolidation_dispatch_guards() -> "str | None":
         return "deferred_base_swap_active"
     if _state["consolidating"]:
         return "deferred_already_running"
-    if _state["mode"] != "local":
+    if include_cloud_only and _state["mode"] != "local":
         return "deferred_cloud_only"
     bg = _state.get("background_trainer")
     if bg is not None and bg.is_training:
@@ -15414,6 +16525,143 @@ def _consolidation_dispatch_guards() -> "str | None":
     if _trial_active():
         return "deferred_trial_active"
     return None
+
+
+def _pending_event_state_dir(config) -> Path:
+    """The directory a pending stage ledger would live under.
+
+    ``data_state_dir(config.paths.data)`` is the directory
+    ``ConsolidationLoop._fold_state_dir`` resolves to for the production
+    loop — the only reason the arbitrator and the doors can ask the
+    ledger's head without constructing a loop.
+    """
+    return data_state_dir(config.paths.data)
+
+
+def _pending_event_action_name(config) -> "str | None":
+    """The pending event's reported action name, or ``None`` when none is pending.
+
+    Reporting reads ``event`` directly off the ledger head — ``"interim"``,
+    ``"full"``, or ``"reconcile"`` — rather than deriving it: a report names
+    the door.
+    """
+    from paramem.training import stage_ledger as _sl
+
+    state_dir = _pending_event_state_dir(config)
+    ledger = _sl.read_ledger(state_dir)
+    if ledger is None:
+        return None
+    return ledger.event
+
+
+def active_consolidation(*, include_cloud_only: bool = True) -> "str | None":
+    """The activity predicate: the five busy arms, then the pending-record arm.
+
+    Every externally-triggerable operation that mutates tier state or
+    dispatches a consolidation reads this one function.  Order is the
+    contract: a running event past its staging phase holds both arms —
+    ``_state["consolidating"]`` was set at dispatch, and its ledger appeared
+    inside the executor job — and the two verdicts differ, so answering the
+    five busy arms first is what makes ``POST /reconsolidate`` against a
+    running fold answer ``deferred_already_running`` instead of resuming an
+    event that is already running.
+
+    Args:
+        include_cloud_only: Forwarded to
+            :func:`_consolidation_dispatch_guards` — ``False`` for a door
+            that mutates on-disk tier state without touching the live store
+            or model (``POST /debug/erase-keys``), so cloud-only mode alone
+            does not close it while every other busy/pending arm still
+            does. ``POST /backup/restore`` calls
+            :func:`_consolidation_dispatch_guards` directly instead of this
+            function — the RECOVERY door must stay open in cloud-only mode
+            AND on a pending consolidation event record, so only the
+            five-arm guard applies there.
+
+    Returns:
+        The verdict key (one of ``_consolidation_dispatch_guards``'s five,
+        or ``"deferred_event_pending"``), or ``None`` when no consolidation
+        is active.
+    """
+    guard = _consolidation_dispatch_guards(include_cloud_only=include_cloud_only)
+    if guard is not None:
+        return guard
+    config = _state.get("config")
+    if _pending_event_action_name(config) is not None:
+        return "deferred_event_pending"
+    return None
+
+
+def refusal_for(verdict: str, *, doing: str, then: str) -> "tuple[str, str]":
+    """The verdict map: one ``(error, message)`` pair per verdict of
+    :func:`active_consolidation`.
+
+    Args:
+        verdict: The string :func:`active_consolidation` (or
+            :func:`_consolidation_dispatch_guards`) returned.
+        doing: The gerund the three wait-shaped busy arms (in-flight,
+            bg-training, base-swap) and the pending arm share —
+            ``"forgetting a speaker"``, ``"discarding the interim ring"``,
+            ``"erasing keys"``, ``"re-attributing orphan sessions"``,
+            ``"cancelling queued ingest sessions"`` — rendered as
+            ``"... before <doing>."``.
+        then: The imperative tail the cloud-only arm takes — ``"forget"``,
+            ``"discard"``, ``"erase"``, ``"re-attribute"``, ``"cancel"`` —
+            rendered as ``"Reacquire the GPU (POST /gpu/acquire), then
+            <then>."``.
+
+    Returns:
+        ``(error_code, message)``.  The five busy verdicts keep the codes
+        their doors already answered with — a programmatic surface, not
+        prose (``cli/backup_restore.py`` branches on ``detail["error"]``).
+        The pending-record verdict is a distinct code,
+        ``"consolidation_pending"``, so an operator or a script can tell
+        "wait" from "finish now".  ``"deferred_store_quarantined"``
+        (:func:`_store_quarantine_verdict`) maps to ``"store_quarantined"``
+        and names the quarantine cause in the message.
+    """
+    if verdict == "deferred_store_quarantined":
+        cause = (_state.get("store_quarantine") or {}).get("cause") or {}
+        return (
+            "store_quarantined",
+            "The memory store is quarantined "
+            f"({cause.get('exception_type', 'unknown')}: "
+            f"{cause.get('message', 'unknown cause')}); wait for a repair before {doing}.",
+        )
+    if verdict == "deferred_event_pending":
+        action_name = _pending_event_action_name(_state.get("config")) or "a run"
+        return (
+            "consolidation_pending",
+            f"A pending consolidation event ({action_name}) is being resumed; "
+            f"wait before {doing}. It clears at the next scheduled consolidation, "
+            "or POST /consolidate to finish it now. A run that keeps failing to "
+            "resume is superseded by restoring a healthy backup "
+            "(POST /backup/restore).",
+        )
+    if verdict == "deferred_trial_active":
+        return (
+            "trial_active",
+            "A migration TRIAL is in progress. Accept or roll back the migration first.",
+        )
+    if verdict == "deferred_cloud_only":
+        return (
+            "cloud_only",
+            "Server is in cloud-only mode; no local model or consolidation loop is "
+            f"available. Reacquire the GPU (POST /gpu/acquire), then {then}.",
+        )
+    if verdict == "deferred_already_running":
+        return ("consolidating", f"Consolidation is running; wait for completion before {doing}.")
+    if verdict == "deferred_bg_training":
+        return (
+            "training_active",
+            f"Background training is active; wait for completion before {doing}.",
+        )
+    if verdict == "deferred_base_swap_active":
+        return (
+            "base_swap_active",
+            f"A base-swap migration is actively running. Wait for it to complete "
+            f"(or fail) before {doing}.",
+        )
 
 
 def _stamp_scheduled_run(config) -> None:
@@ -15449,7 +16697,7 @@ def _stamp_scheduled_run(config) -> None:
     if atom is None or atom.kind == "off":
         return
     _schedule_state.write_last_scheduled_run(
-        config.paths.data / "state",
+        data_state_dir(config.paths.data),
         scheduled_run_stamp_value(cadence, time.time()),
     )
 
@@ -15470,8 +16718,9 @@ def _dispatch_to_executor(fn: Callable[[], None], status: str) -> str:
         fn: The zero-arg sync entry point (``_extract_and_start_training``,
             ``_run_active_store_migration_sync``), or a ``functools.partial``
             that has already bound the entry point's arguments —
-            ``_run_full_consolidation_sync`` takes the fold's key source that
-            way, since the executor contract itself carries no arguments.
+            ``_run_full_consolidation_sync`` takes its resolved door name
+            (``event`` — ``"full"`` or ``"reconcile"``) that way, since the
+            executor contract itself carries no arguments.
         status: The status string to return to the caller on submission.
 
     Returns:
@@ -15587,26 +16836,30 @@ def _consolidation_content_gate(
     - **FULL** — its input is any payload-bearing interim slot ON DISK,
       checked regardless of the CURRENT ``max_interim_count``: a slot minted
       while the count was positive is still content after an operator lowers
-      it to 0 (the fold's ``keys_from="all_tiers"`` absorbs and reaps it
-      either way — a stranded slot is a bug, not a design). Only when NO such
+      it to 0 (every full-topology fold absorbs and reaps it either way — a
+      stranded slot is a bug, not a design). Only when NO such
       slot exists does ``max_interim_count`` matter: at ``> 0`` the standard
       full cycle does not consume pending sessions directly (that is the
       interim tier's job) so there is nothing left to check and the gate
       noops; at ``== 0`` no interim slot is ever minted going forward, so
       pending NAMED sessions are the fold's own content and the gate falls
       through to the shared check below.
-    - **RECONCILE** — its input is the keys already active in a MAIN tier
-      (episodic/semantic/procedural), via ``memory_store.active_keys_in_tier``.
-      A store that cannot answer the question (no live store yet, or
-      ``replay_enabled`` is False) is unprovable rather than empty, and the
-      gate lets the dispatch proceed — the same "can't prove it's empty, so
-      don't block it" posture the rest of this function does not need because
+    - **RECONCILE** — a full consolidation whose input excludes pending
+      sessions: its content is the keys already active in ANY registered
+      tier, main or interim, via ``memory_store.active_keys_in_tier`` over
+      ``memory_store.tiers_with_registry()`` — the same universe the fold's
+      own pre-fold recall step probes, since a reconcile absorbs and reaps
+      the interim ring exactly like any full fold.  No live store yet is
+      unprovable rather than empty, and the gate lets the dispatch proceed
+      — the same "can't prove it's empty, so don't block it" posture the
+      rest of this function does not need because
       ``pending_count``/``named_count`` are always countable.  Otherwise, no
-      active key in any main tier means there is nothing to rebuild.
+      active key in any tier means there is nothing to rebuild.
 
     Interim slots are counted through the payload-aware primitive
-    (``iter_interim_dirs(..., mode=config.consolidation.mode)``): a slot whose
-    payload write never landed is a directory, not content, and must not
+    (``iter_interim_dirs(..., payload_only=True)`` — venue-blind, a slot
+    candidate in either venue counts): a slot whose payload write never
+    landed is a directory, not content, and must not
     satisfy the gate.
 
     Called for every dispatch that reaches it, whoever asked — ``AUTO``'s
@@ -15641,18 +16894,25 @@ def _consolidation_content_gate(
         A terminal ``"noop_*"`` string when there is nothing to consolidate,
         ``None`` when the dispatch may proceed.
     """
-    from paramem.memory.interim_adapter import MAIN_TIERS, iter_interim_dirs
+    from paramem.memory.interim_adapter import iter_interim_dirs
 
     if action is ConsolidationAction.RECONCILE:
-        if memory_store is None or not memory_store.replay_enabled:
+        if memory_store is None:
             return None
         # active_keys_in_tier is the non-mutating accessor (paramem/memory/
         # store.py) -- unlike MemoryStore.registry(), which MINTS an empty
         # registry for a tier that has never seen one.  A noop verdict must
         # not itself create the registry it just reported as empty.
-        if any(memory_store.active_keys_in_tier(tier) for tier in MAIN_TIERS):
+        # tiers_with_registry() spans every registered tier, main and
+        # interim alike: a RECONCILE is a full consolidation whose input
+        # excludes pending sessions, so it recalls and absorbs the interim
+        # ring exactly like any full fold, and a ring holding the only
+        # active key must not noop.
+        if any(
+            memory_store.active_keys_in_tier(tier) for tier in memory_store.tiers_with_registry()
+        ):
             return None
-        logger.info("Consolidation dispatch: no active keys in any main tier — noop")
+        logger.info("Consolidation dispatch: no active keys in any tier — noop")
         return "noop_no_stored_keys"
 
     if action is ConsolidationAction.FULL:
@@ -15660,7 +16920,7 @@ def _consolidation_content_gate(
         # matter what max_interim_count says NOW — checked unconditionally so
         # slots stranded by a later N>0 -> 0 config change still get absorbed
         # and reaped instead of sitting on disk forever.
-        if any(iter_interim_dirs(config.adapter_dir, mode=config.consolidation.mode)):
+        if any(iter_interim_dirs(config.adapter_dir, payload_only=True)):
             return None
         if config.consolidation.max_interim_count > 0:
             # No interim-slot content, and at this count the full fold does
@@ -15682,6 +16942,315 @@ def _consolidation_content_gate(
         return "noop_no_pending"
     logger.info("Consolidation dispatch: no NAMED sessions remain — noop")
     return "noop_no_named"
+
+
+def _record_consolidation_resume_blocked_incident(exc, event: str) -> None:
+    """Record the ``consolidation_resume_blocked`` incident for a refuse-and-hold
+    resume outcome.
+
+    Keyed by the tier that classified FOREIGN (:data:`~paramem.training.
+    consolidation.FOREIGN`) — the ledger and every shadow artifact are left
+    untouched by the resume routine itself; this is the operator-visible
+    signal that a later dispatch will meet the same refusal.  It resolves
+    when a later resume finally succeeds (the two finalizers' own
+    successful completion), or when a wholesale tier rewrite discards the
+    stuck record outright (``POST /backup/restore``'s snapshot-bundle
+    restore, or an active-store migration).
+    """
+    try:
+        record_incident(
+            data_state_dir(_state["config"].paths.data),
+            type="consolidation_resume_blocked",
+            key=exc.tier,
+            severity="failed",
+            summary=f"Consolidation resume blocked: tier {exc.tier!r} classified {exc.reason!r}",
+            detail={"event": event, "tier": exc.tier, "reason": exc.reason},
+        )
+    except Exception:
+        logger.exception("Failed to record consolidation_resume_blocked incident (non-fatal)")
+
+
+def _finish_resumed_event(loop, staged_event, *, router) -> dict:
+    """Take a pending event's ledger the rest of the way live.
+
+    Calls :meth:`~paramem.training.consolidation.ConsolidationLoop.run_build_and_publish`
+    directly — skipping ``stage_event`` entirely, per its own contract for a
+    resumed dispatch (a caller-reconstructed :class:`StagedEvent`
+    naming the same ``state_dir``/``event``).  *router* is threaded only for
+    a full event, mirroring the fresh-dispatch shape: the interim event's
+    own finalizer owns its one reload.
+
+    Returns a result dict shaped like the fresh-dispatch entries'
+    (``run_consolidation_cycle`` / ``consolidate``) own — ``tiers_rebuilt``,
+    ``consumed_session_ids``, ``consumed_episodic_rels``,
+    ``consumed_procedural_rels``, ``completed``, ``aborted``,
+    ``tier_bindings``, ``mode``, ``adapter_name`` — so the SAME finalizers
+    (:func:`_finalize_interim` / :func:`_finalize_full`) consume it
+    unchanged, including the publish verdict (``tier_bindings``,
+    threaded straight from ``run_build_and_publish``'s own summary) their
+    unverified-tier incident sweep now reads instead of re-walking the
+    adapter tree.  The interim ``mode`` is
+    computed through :func:`~paramem.training.consolidation.interim_outcome_label`
+    — the same computation the fresh interim cycle uses — so a resumed event
+    that aborted mid-bundle reports ``"aborted"`` rather than being
+    mislabelled ``"noop"``.
+
+    **Quarantine heal, at the tail.** Both venues traverse this ONE function,
+    off the event loop on both, so the lift lives here rather than being
+    duplicated per-venue. When the resumed event went fully live
+    (``build_summary["all_live"]``) AND the store was quarantined coming
+    into this call (``_state["store_quarantine"] is not None`` — the
+    condition under which *loop* was constructed against a throwaway empty
+    store, see :func:`_run_pending_event_resume`), this function calls
+    :func:`_lift_quarantined_store` and, on success, REBINDS ``loop.store``
+    (and re-derives its key-mint counters via
+    :meth:`~paramem.training.consolidation.ConsolidationLoop._derive_key_counters`)
+    to the freshly published ``_state["memory_store"]`` — in place, on the
+    SAME loop object already cached at ``_state["consolidation_loop"]`` and
+    already captured by the finalizer closure
+    (:func:`_finalize_interim`/:func:`_finalize_full`) the caller is about
+    to dispatch. This differs from every other lift caller (``POST
+    /debug/erase-keys``, ``POST /backup/restore``), which instead null
+    ``_state["consolidation_loop"]`` and let the next fold's lazily-cached
+    loop recreate against the fresh store: nulling it here would leave the
+    about-to-run finalizer holding a discarded, empty-store loop instead.
+
+    **Venue-conditional lock around the lift.** The lift's source medium
+    (:func:`_lift_quarantined_store` → :func:`_preload_memory_store` →
+    :func:`_build_store_contents`) is selected by
+    ``config.consolidation.mode`` — NOT by ``staged_event.venue`` — so a
+    ``mode: train`` config reached via a ``disk``-venue ledger (a
+    ``simulate``-staged event resumed after the operator switched the config
+    to ``train``) drives the lift into a ``WeightMemorySource`` fill that
+    calls ``model.generate()``. The weights venue's caller
+    (:func:`_run_pending_event_resume` → :func:`_run_stage_b_cycle`) already
+    holds the non-reentrant ``_gpu_thread_lock`` for the whole cycle
+    (acquired by ``BackgroundTrainer``'s worker,
+    ``paramem/server/gpu_lock.py:17`` via ``background_trainer.py:323``), so
+    the weights-venue lift call stays bare — re-acquiring here would
+    deadlock it. The disk venue holds no lock at all on entry, so its lift
+    call takes ``gpu_lock_sync()`` itself (blocking, no timeout — mirrors the
+    ``nullcontext() if lock_held else gpu_lock_sync()`` pattern elsewhere in
+    this module) before calling :func:`_lift_quarantined_store`: without it,
+    a mode-switched disk-venue resume could run ``model.generate()`` on the
+    executor thread concurrently with a ``/chat`` turn holding the lock.
+
+    Protected: a fault here must not skip the caller's finalizer/disposal —
+    ledger disposal downstream is gated on ``result["completed"]``
+    (``== build_summary["all_live"]``), which is already fixed by the time
+    the lift runs, so a raising or ``False``-returning lift still lets the
+    record dispose normally; a raising lift is caught and logged here
+    (mirroring the "Protected: a fault here must not wedge the finalizer"
+    idiom in :func:`_finalize_interim`), and a ``False``-returning lift
+    needs no retry logic of its own — ``_lift_quarantined_store`` already
+    recorded the fresh quarantine cause, and the NEXT dispatch simply defers
+    on it again via :func:`_store_quarantine_verdict` (no pending record is
+    left to resume).
+
+    Raises:
+        ConsolidationResumeBlocked: A not-yet-done tier classified FOREIGN.
+            The ledger and every shadow artifact are left untouched.
+    """
+    from paramem.training import stage_ledger as _sl
+
+    extraction_stage = _sl.extraction_entry(staged_event.ledger) or {}
+    consumed_session_ids = list(extraction_stage.get("sessions", []))
+
+    # No absorbed_interim_tiers to compute here: run_build_and_publish reads
+    # it straight from the ledger (ledger.absorbed_interim_tiers, recorded
+    # when the event was staged, phase 1) -- never recomputed from the live
+    # store, which could disagree with what the original staging pass
+    # actually absorbed if the ring already partially reaped before this
+    # resume.
+    build_summary = loop.run_build_and_publish(
+        staged_event,
+        router=router if _sl.full_topology(staged_event.event) else None,
+    )
+
+    result: dict = {
+        "tiers_rebuilt": build_summary["published_tiers"],
+        "consumed_session_ids": consumed_session_ids,
+        "consumed_episodic_rels": extraction_stage.get("episodic_rels", 0),
+        "consumed_procedural_rels": extraction_stage.get("procedural_rels", 0),
+        "completed": build_summary["all_live"],
+        "aborted": build_summary["aborted"],
+        "tier_bindings": build_summary["tier_bindings"],
+    }
+    if not _sl.full_topology(staged_event.event):
+        result["adapter_name"] = next(iter(staged_event.ledger.tiers), None)
+        result["mode"] = interim_outcome_label(build_summary, venue=staged_event.venue)
+        result["new_keys"] = []
+        result["triples_extracted"] = 0
+
+    # Quarantine heal: see this function's own docstring "Venue-conditional
+    # lock around the lift" section above.  The weights venue already holds
+    # _gpu_thread_lock for this whole cycle (re-acquiring would deadlock);
+    # the disk venue holds none on entry, so it takes gpu_lock_sync() around
+    # the lift itself -- the lift's source medium follows
+    # config.consolidation.mode, not the venue, so a disk-venue ledger can
+    # still resolve to a GPU-touching WeightMemorySource fill.  The lock
+    # acquisition is inside the try so a raise there is caught the same as a
+    # raise from the lift call.  Protected: a fault here must not skip the
+    # caller's finalizer/disposal.
+    if build_summary["all_live"] and _state.get("store_quarantine") is not None:
+        config = _state["config"]
+        try:
+            if staged_event.venue == "disk":
+                from paramem.server.gpu_lock import gpu_lock_sync
+
+                with gpu_lock_sync():
+                    lifted = _lift_quarantined_store(config)
+            else:
+                lifted = _lift_quarantined_store(config)
+        except Exception:
+            logger.exception(
+                "Post-resume quarantine lift raised; store stays quarantined "
+                "-- the resumed event still completes and disposes normally"
+            )
+            lifted = False
+        if lifted:
+            loop.store = _state["memory_store"]
+            loop._derive_key_counters()
+            # loop.promoted_keys is deliberately left as-constructed here
+            # (seeded from store.iter_bookkeeping() at __init__ time, see
+            # ConsolidationLoop.seed_key_metadata) -- not re-derived against
+            # the rebound store. Traced benign: a promoted key has already
+            # left the episodic active set by the time it was promoted, so
+            # the rebound store's bookkeeping cannot un-promote it under
+            # this loop instance, and re-flagging an already-promoted key as
+            # semantic on a later cycle is idempotent.
+
+    return result
+
+
+def _run_pending_event_resume() -> None:
+    """Executor entry point: resume a pending consolidation event straight
+    from its stage ledger.
+
+    The resume-pending-first arm of :func:`_dispatch_consolidation` submits
+    this exactly like any fresh dispatch (:func:`_dispatch_to_executor` has
+    already set ``_state["consolidating"] = True``).  The disk venue (a
+    pending simulate event) needs no GPU lock and runs inline; the weights
+    venue routes through :func:`_run_stage_b_cycle` for the same GPU-lock /
+    cooldown-gate / crash-envelope every fresh training dispatch gets.
+
+    A ``ConsolidationResumeBlocked`` reaching either path means the ledger
+    and every shadow artifact are left untouched — recorded as its own
+    ``consolidation_resume_blocked`` incident (never the generic crash
+    incident a raise into ``_run_stage_b_cycle`` would otherwise produce),
+    and the record stays pending for the next dispatch to meet the same
+    refusal, until either a resume finally succeeds or a content-replacing
+    operation whose write already overtook the record discards it (``POST
+    /backup/restore``'s snapshot-bundle restore, or a base-swap rollback).
+    An active-store migration is content-preserving, not content-replacing
+    — it refuses outright, record untouched, while any record is pending.
+
+    **Store-independent resume.** A pending event now resumes ahead of the
+    store-quarantine verdict (:func:`_dispatch_consolidation`'s docstring,
+    step 3), so this function may run with ``_state["memory_store"] is
+    None``.  In that case it constructs a throwaway, locally-scoped empty
+    :class:`~paramem.memory.store.MemoryStore` and threads it into whichever
+    venue's loop-construction seam applies
+    (:func:`_get_or_create_consolidation_loop`'s *store* kwarg for the disk
+    venue, :func:`_run_stage_b_cycle`'s *store* kwarg — same seam — for the
+    weights venue) — ONLY when a fresh loop is being built; an
+    already-cached process-lifetime loop ignores the override.  The resumed
+    event needs nothing FROM the store: :meth:`~paramem.training.consolidation.
+    ConsolidationLoop._derive_key_counters` scans an empty store down to the
+    same donor floor a hydrated one would clamp at (harmless — the resumed
+    event replays keys already decided at staging, not fresh mints), and
+    :func:`~paramem.training.go_live.publish_bundle`'s
+    ``store.adopt_increments`` reads only the bundle's own increment data,
+    never prior store state.  :func:`_finish_resumed_event`'s own tail lifts
+    the real store back online and rebinds the loop to it once this call
+    completes successfully.  Every other caller of both seams passes no
+    override and is unaffected.
+    """
+    from paramem.memory.store import MemoryStore
+    from paramem.training import stage_ledger as _sl
+    from paramem.training.consolidation import ConsolidationResumeBlocked, StagedEvent
+
+    config = _state["config"]
+    state_dir = data_state_dir(config.paths.data)
+    ledger = _sl.read_ledger(state_dir)
+
+    staged_event = StagedEvent(
+        event=ledger.event,
+        venue=ledger.venue,
+        state_dir=state_dir,
+        built_tiers=tuple(ledger.tiers),
+        ledger=ledger,
+    )
+
+    # See the docstring's "Store-independent resume" section: None only
+    # when the store is quarantined (or never yet built) coming into this
+    # resume, which is exactly when this seam exists to unblock the heal.
+    _store_override = MemoryStore() if _state.get("memory_store") is None else None
+
+    if ledger.venue == "disk":
+        loop = _get_or_create_consolidation_loop(config, store=_store_override)
+        try:
+            result = _finish_resumed_event(loop, staged_event, router=_state.get("router"))
+        except ConsolidationResumeBlocked as exc:
+            _record_consolidation_resume_blocked_incident(exc, ledger.event)
+            _state["consolidating"] = False
+            return
+        finalizer = (
+            functools.partial(_finalize_interim, loop, result)
+            if not _sl.full_topology(ledger.event)
+            else functools.partial(_finalize_full, loop, result)
+        )
+        _dispatch_finalize(finalizer)
+        return
+
+    def _body(loop, bt) -> "tuple[str, Callable[[], None] | None]":
+        try:
+            result = _finish_resumed_event(loop, staged_event, router=_state.get("router"))
+        except ConsolidationResumeBlocked as exc:
+            _record_consolidation_resume_blocked_incident(exc, ledger.event)
+            return "resume_blocked", _finalize_stage_b_failure
+        if not _sl.full_topology(ledger.event):
+            return "resumed_interim", functools.partial(_finalize_interim, loop, result)
+        return "resumed_full", functools.partial(_finalize_full, loop, result)
+
+    _run_stage_b_cycle(
+        kind="training_crash" if not _sl.full_topology(ledger.event) else "consolidation_crash",
+        incident_key=ledger.event,
+        failure_summary=f"Resumed {ledger.event} consolidation crashed unexpectedly",
+        failure_detail={},
+        body=_body,
+        store=_store_override,
+    )
+
+
+def _dispatch_resume(config) -> "tuple[str, ConsolidationAction] | None":
+    """Resume-pending-first: dispatch a pending event's resume, or ``None``
+    when nothing is pending.
+
+    Any consolidation dispatch that finds a pending ledger resumes and
+    finishes that event before any new event starts.  The reported action
+    derives from the ledger head's ``event`` field directly
+    (:func:`_pending_event_action_name`) — ``"interim"`` is ``INTERIM``,
+    ``"full"`` is ``FULL``, ``"reconcile"`` is ``RECONCILE``.  The
+    content gate is skipped deliberately: a resume's input is the ledger,
+    not new material.  The originally requested action waits for the next
+    tick.
+    """
+    action_name = _pending_event_action_name(config)
+    if action_name is None:
+        return None
+    resumed_action = {
+        "interim": ConsolidationAction.INTERIM,
+        "full": ConsolidationAction.FULL,
+        "reconcile": ConsolidationAction.RECONCILE,
+    }[action_name]
+    if resumed_action is ConsolidationAction.FULL:
+        _record_full_consolidation_overdue(config)
+    logger.info(
+        "Consolidation dispatch: resuming pending %s event ahead of any new dispatch",
+        action_name,
+    )
+    return _dispatch_to_executor(_run_pending_event_resume, "started_resume"), resumed_action
 
 
 def _dispatch_consolidation(
@@ -15710,36 +17279,73 @@ def _dispatch_consolidation(
     Order (unconditional gates first, so an explicit request cannot walk past a
     safety property):
 
-    1. ``_consolidation_dispatch_guards()`` — base-swap active / already-running /
-       cloud-only / bg-training / migration TRIAL active.  All actions.
-    2. **Any MAIN tier's registry binding unverified** — every action, including
-       ``RECONCILE``.  A tier the boot/fold validator could not bind to a
-       registry has an unknowable key set, which the merger's cross-tier
-       identity space cannot tolerate, and both persist branches would
-       overwrite the very manifest/registry pair preserved for recovery.
-    3. **Idle debounce** — all actions.  This protects a live chat turn from a
-       long GPU seizure; it is a safety property, not a schedule, so an explicit
-       request defers on it too.
-    4. Retroactive orphan-session voice claim + :func:`_triage_pending_sessions`
-       — the two side-effect-only pre-stages, run on every dispatch.  Retiring
-       what can never be attributed does not depend on which door was used.
-    5. ``pending_rehydration`` — an incoherent active store pre-empts every
-       action until the migration completes.
-    6. **``AUTO`` only** — the suspend/power-off catch-up gate, and the
+    1. ``_consolidation_dispatch_guards()`` — base-swap active / already-running
+       / cloud-only / bg-training / migration TRIAL active.  All actions.
+       Verified side-effect-free, so it can run before anything a pending
+       event below might need.
+    2. **Idle debounce** — all actions.  This protects a live chat turn from a
+       long GPU seizure; it is a safety property, not a schedule, so an
+       explicit request defers on it too.  MUST stay ahead of resume (step 3):
+       a weights-venue resume trains on GPU, and a chat-turn abort landing
+       mid-resume would livelock the very heal step 3 exists to run.
+    3. **Resume-pending-first** (:func:`_dispatch_resume`) — a pending event's
+       ledger is resumed and finished before any new event starts, the
+       identical contract for every action including ``RECONCILE``; the
+       content gate below is skipped for a resume, since its input is the
+       ledger, not new material.  Runs ahead of BOTH the store-quarantine
+       verdict (step 4) and the tier-unverified gate (step 5): a resume
+       never re-stages — it replays the shadow-byte increments recorded when
+       the event was originally staged — so neither "there is no live store
+       to fold into" nor "a tier's binding is unknowable for a fresh merge"
+       applies to it, and finishing it is precisely what HEALS a store
+       quarantined by a crashed publish on a cold-born tier (the lift at
+       :func:`_finish_resumed_event`'s tail).  A dispatch that resumes never
+       reaches steps 4-6 on this same call — skipping the pre-stages (step 6)
+       on a resuming dispatch is a deliberate, accepted behavior change:
+       retiring orphan sessions is not time-critical, and the next
+       non-resuming dispatch runs it.
+    4. :func:`_store_quarantine_verdict` — the memory store is quarantined
+       (the boot/lift store step could not publish a fresh
+       :class:`~paramem.memory.store.MemoryStore`).  All actions, including
+       ``RECONCILE``: with no store there is nothing to fold into or rebuild
+       from.  Only reached when step 3 found nothing pending — the verdict
+       itself is unchanged for that case, quarantined-and-idle still defers
+       here exactly as before.
+    5. **Any MAIN tier's registry binding unverified SINCE the last store
+       step** — every action, including ``RECONCILE``.  Distinct from step 4:
+       this is drift a fold's own post-cycle revalidation
+       (:func:`_revalidate_adapter_manifests`) observed AFTER the last
+       successful boot/lift store step, not (yet) caught by a fresh one. A
+       tier the boot/fold validator could not bind to a registry has an
+       unknowable key set, which the merger's cross-tier identity space
+       cannot tolerate, and both persist branches would overwrite the very
+       manifest/registry pair preserved for recovery.
+    6. Retroactive orphan-session voice claim + :func:`_triage_pending_sessions`
+       — the two side-effect-only pre-stages.  Reached only on a dispatch
+       that did not resume at step 3 (see step 3's note) — retiring what can
+       never be attributed does not depend on which door was used, but it no
+       longer runs ahead of a resume.
+    7. ``pending_rehydration`` — an incoherent active store pre-empts every
+       action until the migration completes.  Runs after resume (step 3) for
+       the same reason it always did: the store migration is
+       content-preserving and needs a coherent, record-free tree, so a
+       pending event always resumes to completion first and the migration
+       only ever reaches a dispatch with no pending record.
+    8. **``AUTO`` only** — the suspend/power-off catch-up gate, and the
        resolution to ``FULL`` or ``INTERIM`` via :func:`_is_full_cycle_due`
        (its only call site).  Both belong to the schedule; a direct
        ``FULL``/``INTERIM``/``RECONCILE`` request skips straight past them.
-    7. **Every action reaching this point** — :func:`_consolidation_content_gate`.
+    9. **Every action reaching this point** — :func:`_consolidation_content_gate`.
        An empty input set is empty whether the schedule resolved into it or
        an operator named it directly.  A ``noop_*`` status is not a refusal —
        it is the answer.  ``FULL``/``INTERIM`` check for new material;
-       ``RECONCILE`` checks whether any main tier holds an active key —
-       unprovable (no live store, or replay disabled) is treated as
+       ``RECONCILE`` checks whether any tier — main or interim — holds an
+       active key — no live store yet is unprovable and is treated as
        "proceed", not "empty".
-    8. Dispatch via :func:`_dispatch_to_executor`, advancing the schedule stamp
-       (:func:`_stamp_scheduled_run`) on an ``AUTO`` dispatch only — a direct
-       ``FULL``/``INTERIM``/``RECONCILE`` request does not move the cadence
-       window.
+    10. Dispatch via :func:`_dispatch_to_executor`, advancing the schedule
+        stamp (:func:`_stamp_scheduled_run`) on an ``AUTO`` dispatch only —
+        a direct ``FULL``/``INTERIM``/``RECONCILE`` request does not move
+        the cadence window.
 
     Args:
         action: ``AUTO`` (the scheduled tick — let ``_is_full_cycle_due``
@@ -15748,8 +17354,9 @@ def _dispatch_consolidation(
             directly by ``/consolidate``), ``INTERIM`` (absorb pending
             sessions into a new interim slot — resolved from ``AUTO`` or
             requested directly by ``/consolidate/interim``), or ``RECONCILE``
-            (rebuild the main tiers from their own keys, leaving the interim
-            slots and pending sessions where they are — ``/reconsolidate``).
+            (a full consolidation whose input excludes pending sessions:
+            pending sessions stay pending; stored interim knowledge is
+            absorbed and reaped like any full fold — ``/reconsolidate``).
 
     Returns:
         ``(status, action)`` — the terminal status string and the action as
@@ -15758,6 +17365,9 @@ def _dispatch_consolidation(
         ``noop_*`` means "nothing to do"; ``started*`` means the fold was
         submitted to the executor.
     """
+    config = _state["config"]
+    _scheduled = action is ConsolidationAction.AUTO
+
     _guard = _consolidation_dispatch_guards()
     if _guard is not None:
         if _guard == "deferred_cloud_only":
@@ -15787,35 +17397,10 @@ def _dispatch_consolidation(
             )
         return _guard, action
 
-    # A MAIN tier (episodic/semantic/procedural) whose registry<->manifest
-    # binding could not be verified has an unknowable key set: the merger's
-    # identity space spans every main tier, so an invisible tier's keys get
-    # re-minted as duplicates, and both persist branches rewrite all three
-    # main registries -- overwriting the very file preserved for recovery.
-    # This defers every action, including RECONCILE (which rebuilds all
-    # three main registries from the store). It lives here rather than in
-    # _consolidation_dispatch_guards because three of that predicate's four
-    # callers are the erase/discard doors (POST /speaker/forget,
-    # POST /interim/discard, POST /debug/erase-keys) that must stay open
-    # while a tier is unverified -- adding an arm there would close them too.
-    from paramem.memory.interim_adapter import MAIN_TIERS
-
-    _manifest_status = _state.get("adapter_manifest_status", {})
-    _unverified_statuses = {"no_matching_slot", "registry_unverified", "key_count_mismatch"}
-    if any(
-        _manifest_status.get(_tier, {}).get("status") in _unverified_statuses
-        for _tier in MAIN_TIERS
-    ):
-        logger.warning(
-            "Consolidation dispatch (%s): a main tier's registry binding is unverified — deferred",
-            action.value,
-        )
-        return "deferred_tier_unverified", action
-
-    config = _state["config"]
-
     # Idle debounce — every action.  A fold seizes the GPU for minutes; firing
-    # one seconds after a chat turn would strand the next one.
+    # one seconds after a chat turn would strand the next one.  Ahead of
+    # resume (below) on purpose: a weights-venue resume trains on GPU too, and
+    # this is the one property that must hold regardless of what is pending.
     debounce_s = config.consolidation.training_idle_debounce_s
     last_chat = _state.get("last_chat_monotonic")
     # Check last_chat first so MagicMock configs (tests that patch _state with
@@ -15830,16 +17415,97 @@ def _dispatch_consolidation(
         )
         return "deferred_idle", action
 
+    # Resume-pending-first: a pending event's ledger is resumed and finished
+    # before any new event starts.  Runs ahead of the store-quarantine
+    # verdict and the tier-unverified gate below (see this function's own
+    # docstring, step 3): a resume replays shadow-byte increments recorded
+    # at staging time rather than re-staging, so neither gate's rationale
+    # applies to it, and completing it is what heals a store quarantined by
+    # a crashed publish on a cold-born tier — see the lift at
+    # :func:`_finish_resumed_event`'s tail.  Also ahead of the migration
+    # pre-empt further below: a dispatch that finds both a pending record
+    # and an armed mode switch resumes the event, and the migration only
+    # ever reaches a dispatch with no pending record.  The content gate is
+    # skipped deliberately — a resume's input is the ledger, not new
+    # material — and so are the pre-stages below (retiring orphan sessions
+    # is not time-critical; the next non-resuming dispatch runs them).
+    _resume = _dispatch_resume(config)
+    if _resume is not None:
+        if _scheduled:
+            # The resumed run counts as this window's run: stamping here
+            # means a later record-free tick inside the same window reads
+            # not-due instead of starting a fresh fold. It does not throttle
+            # resume itself, which runs unconditionally while a record is
+            # pending, regardless of the stamp.
+            _stamp_scheduled_run(config)
+        return _resume
+
+    _quarantine_verdict = _store_quarantine_verdict()
+    if _quarantine_verdict is not None:
+        logger.warning(
+            "Consolidation dispatch (%s): memory store is quarantined — deferred", action.value
+        )
+        return _quarantine_verdict, action
+
+    # A MAIN tier (episodic/semantic/procedural) whose registry<->manifest
+    # binding could not be verified has an unknowable key set: the merger's
+    # identity space spans every main tier, so an invisible tier's keys get
+    # re-minted as duplicates, and both persist branches rewrite all three
+    # main registries -- overwriting the very file preserved for recovery.
+    # This is NOT the same fault as the store-quarantine check above: this
+    # arm reads adapter_manifest_status, refreshed by fold finalizers
+    # (_revalidate_adapter_manifests) whenever a fold's OWN post-save
+    # revalidation finds a tier newly broken -- drift discovered strictly
+    # BETWEEN two store steps, which _store_quarantine_verdict cannot see
+    # (quarantine is set only when the boot/lift store step itself runs and
+    # fails; it is not re-run on every dispatch). This defers every action,
+    # including RECONCILE (which rebuilds all three main registries from the
+    # store). It lives here rather than in _consolidation_dispatch_guards
+    # because POST /debug/erase-keys must stay open while a tier is
+    # unverified this way -- adding an arm to that shared predicate would
+    # close it too. That door calls active_consolidation() (which wraps
+    # _consolidation_dispatch_guards with the pending-record arm), never
+    # this dispatcher; the predicate itself has exactly two direct callers
+    # -- active_consolidation() and this dispatcher -- and this arm binds to
+    # the dispatcher alone. POST /speaker/forget and POST /interim/discard
+    # separately compose _store_quarantine_verdict() at their own call
+    # sites (see there) -- unlike this arm, that composition is specific to
+    # those two doors, not shared via either predicate function. A pending
+    # resume (step 3 above) never reaches this gate: it is not re-staging,
+    # so an unknowable tier's identity space is not at risk from it.
+    # BINDING_ROW_STATUSES (paramem/server/manifest_status.py) is the single-
+    # sourced set of row statuses this arm defers on -- it includes
+    # "keys_without_slot" and "payload_mismatch" alongside the pre-existing
+    # three, so a main tier holding active keys with no slot, or whose bound
+    # slot's payload no longer matches its manifest digest, defers every
+    # action exactly like a no-matching-slot or key-count-mismatched tier
+    # already did.
+    from paramem.memory.interim_adapter import MAIN_TIERS
+    from paramem.server.manifest_status import BINDING_ROW_STATUSES
+
+    _manifest_status = _state.get("adapter_manifest_status", {})
+    if any(
+        _manifest_status.get(_tier, {}).get("status") in BINDING_ROW_STATUSES
+        for _tier in MAIN_TIERS
+    ):
+        logger.warning(
+            "Consolidation dispatch (%s): a main tier's registry binding is unverified — deferred",
+            action.value,
+        )
+        return "deferred_tier_unverified", action
+
     # Retroactive voice-match claim: scan orphan sessions against every
     # enrolled speaker. Attributes sessions whose embeddings match an
     # existing profile at high confidence. Cheap — centroids are cached.
+    # Not reached on a dispatch that resumed above (see step 3's note).
     _retro_claim_orphan_sessions()
 
     # Pending-session triage: retire what can never be attributed (and expired
     # holdables), and count what remains.  A side-effect pre-stage like the
-    # retro-claim above, NOT a gate — it runs for every action, so no door can
-    # switch orphan retirement off by skipping the content gate.  The counts
-    # feed that gate when the scheduled tick reaches it.
+    # retro-claim above, NOT a gate — it runs for every non-resuming
+    # dispatch, so no door can switch orphan retirement off by skipping the
+    # content gate.  The counts feed that gate when the scheduled tick
+    # reaches it.
     _pending_count, _named_count = _triage_pending_sessions(
         config,
         _state["session_buffer"],
@@ -15850,7 +17516,12 @@ def _dispatch_consolidation(
     # (or an in-progress migration was interrupted), every consolidation
     # dispatch routes to the migration sync until all tiers have cleared the
     # 1.0 recall gate. This pre-empts the action's own gates because the active
-    # store is not yet coherent with the operator's yaml mode.
+    # store is not yet coherent with the operator's yaml mode -- grouped with
+    # the safety gates above, ahead of the schedule's own business below, for
+    # the same reason resume-pending-first is. Runs AFTER resume-pending-
+    # first (above): the store migration is content-preserving and needs a
+    # coherent, record-free tree, so a pending event always resumes to
+    # completion first and the migration runs on a later dispatch.
     if _state.get("pending_rehydration", False):
         if _state.get("integrity_check_failed", False):
             logger.warning(
@@ -15869,8 +17540,6 @@ def _dispatch_consolidation(
     # direct FULL/INTERIM/RECONCILE request skips this whole block: the
     # catch-up gate and the deadline resolution are the SCHEDULE's business,
     # never a manual door's.
-    _scheduled = action is ConsolidationAction.AUTO
-
     if _scheduled:
         # Suspend/power-off catch-up gate, universal across every real cadence
         # kind (anchored daily/weekly/HH:MM and exact-divisor intervals, not
@@ -15888,7 +17557,9 @@ def _dispatch_consolidation(
         cadence = config.consolidation.refresh_cadence or ""
         _cadence_atom = _parse_schedule_atom(cadence)
         if _cadence_atom is not None and _cadence_atom.kind != "off":
-            last_attempt = _schedule_state.read_last_scheduled_run(config.paths.data / "state")
+            last_attempt = _schedule_state.read_last_scheduled_run(
+                data_state_dir(config.paths.data)
+            )
             _due_status = _scheduled_run_due(cadence, last_attempt)
             if _due_status is _ScheduleDueStatus.NO_STAMP:
                 _stamp_scheduled_run(config)
@@ -15944,43 +17615,23 @@ def _dispatch_consolidation(
         # of the fold itself).  Clear-on-attempt hid still-failing conditions.
 
         # Overdue check: fire a loud incident when the prior cycle's full fold
-        # missed its runway (oldest interim aged ≥ 2× the full period).  This is
-        # purely informational — the fold still dispatches.  Deduped by the oldest
-        # interim stamp (stable per stuck cycle; reopens on a new cycle's failure).
-        # NOT a scheduling state — does NOT bump per-session retry counters.
-        # RECONCILE is exempt: it does not absorb the interim slots, so the state
-        # of the interim backlog is not a property of the run being dispatched.
-        _overdue_key = (
-            _full_consolidation_overdue_key(config) if action is ConsolidationAction.FULL else None
-        )
-        if _overdue_key is not None:
-            logger.warning(
-                "Consolidation dispatch: full consolidation OVERDUE — oldest interim %s "
-                "has aged ≥ 2× the full period without being folded",
-                _overdue_key,
-            )
-            record_incident(
-                config.paths.data / "state",
-                type="full_consolidation_overdue",
-                key=_overdue_key,
-                severity="failed",
-                summary="Full consolidation overdue — fold has not completed within its runway",
-                detail={
-                    "oldest_interim_stamp": _overdue_key,
-                    "type": "full_consolidation_overdue",
-                },
-            )
+        # missed its runway.  RECONCILE is exempt from firing it here, since
+        # its own dispatch is not what the schedule waits on — but it absorbs
+        # and reaps the interim ring exactly like a full fold once dispatched
+        # (see _finalize_full's own incident resolution).
+        if action is ConsolidationAction.FULL:
+            _record_full_consolidation_overdue(config)
 
         # A manually triggered fold keys its telemetry and outputs exactly like
         # a scheduled one — same stamp, same family of rows.  There is no
-        # manual flavour of a fold; the only thing the action decides below the
-        # arbitrator is the fold's KEY SOURCE, and RECONCILE is the one door
-        # that narrows it to the main tiers (leaving the interim slots on disk,
-        # since a fold that did not absorb them must not reap them).
-        _keys_from = "main_tiers" if action is ConsolidationAction.RECONCILE else "all_tiers"
+        # manual flavour of a fold; the only thing the action decides below
+        # the arbitrator is the door name recorded in the ledger — RECONCILE
+        # runs the identical full-topology fold, differing only in leaving
+        # sessions pending (see _run_full_consolidation_sync).
+        _event = "reconcile" if action is ConsolidationAction.RECONCILE else "full"
         return (
             _dispatch_to_executor(
-                functools.partial(_run_full_consolidation_sync, _keys_from), "started_full"
+                functools.partial(_run_full_consolidation_sync, _event), "started_full"
             ),
             action,
         )
@@ -16235,7 +17886,6 @@ def _build_bg_trainer(config) -> "BackgroundTrainer":
         training_config=config.training_config,
         output_dir=config.adapter_dir,
         thermal_policy=ThermalPolicy.from_consolidation_config(config.consolidation),
-        preload_cache=config.inference.preload_cache,
     )
 
 
@@ -16294,6 +17944,7 @@ def _await_bg_cycle(
     schedule: str = "",
     max_interim_count: int = 7,
     inference_fallback_adapter: str = "episodic",
+    session_ids: "list[str]",
 ) -> dict:
     """Submit ``run_consolidation_cycle`` to the BG trainer and block until done.
 
@@ -16317,12 +17968,21 @@ def _await_bg_cycle(
         episodic_rels: Extracted episodic relations for this cycle.
         procedural_rels: Extracted procedural relations for this cycle.
         speaker_id: Default speaker tag for relations without one.
-        mode: ``"train"`` writes adapter weights; ``"simulate"`` writes sidecar JSON.
+        mode: ``"train"`` writes adapter weights; ``"simulate"`` writes a
+            ``graph.json`` payload into the same written-slot envelope.
         run_label: Traceability tag passed to ``run_consolidation_cycle``.
         schedule: Consolidation refresh-cadence string for stamp computation.
         max_interim_count: Cap on concurrent interim adapters.
-        inference_fallback_adapter: Adapter the BG pause mechanism switches to
-            when inference is requested mid-cycle.  Defaults to ``"episodic"``.
+        inference_fallback_adapter: Adapter name recorded for bookkeeping only
+            on the sentinel job while the cycle runs — nothing reads it back
+            to reactivate an adapter; inference generation always runs under
+            ``model.disable_adapter()`` regardless.  Defaults to ``"episodic"``.
+        session_ids: The app layer's own authoritative completed-session list
+            (``extraction.completed_session_ids(session_buffer)``), forwarded
+            verbatim to ``run_consolidation_cycle`` — the source of truth for
+            what the resulting ledger's extraction stage retires.  Required:
+            a relation-derived fallback would miss a session yielding zero
+            relations or only attribute-typed facts.
 
     Returns:
         Result dict from ``run_consolidation_cycle``:
@@ -16361,6 +18021,7 @@ def _await_bg_cycle(
             run_label=run_label,
             schedule=schedule,
             max_interim_count=max_interim_count,
+            session_ids=session_ids,
         )
         # Propagate any PeftModel handle rebinding from create_interim_adapter.
         _state["model"] = loop.model
@@ -16546,8 +18207,19 @@ def _run_extraction_phase(
                 run_label=f"full-{primary_speaker_sim or 'anon'}",
                 schedule=config.consolidation.refresh_cadence,
                 max_interim_count=config.consolidation.max_interim_count,
+                session_ids=session_ids,
             )
-            loop.write_key_metadata()
+            # A "noop" result (no registry, or — not reachable here since
+            # all_episodic_rels/all_procedural_rels are already known
+            # non-empty by this point — no relations) means
+            # run_consolidation_cycle returned before stage_event ever ran,
+            # so no tier committed this cycle. Per-tier bookkeeping is written
+            # only inside write_tier_slot / publish_tier_registry, at that
+            # tier's own commit — there is no whole-store flush left to call
+            # for a cycle that written no tier (the same "a cycle that writes
+            # no tier does not advance its state" consequence documented on
+            # cycle_count).  Every other outcome ("simulated") already
+            # reached that bookkeeping write inside run_consolidation_cycle.
         except Exception:
             logger.exception(
                 "Simulated consolidation failed — leaving %d sessions pending",
@@ -16567,9 +18239,9 @@ def _run_extraction_phase(
             "total_relations": total_relations,
             "episodic_rels": len(all_episodic_rels),
             "procedural_rels": len(all_procedural_rels),
-            "episodic_keys": loop.store.simhash_count_in_tier("episodic"),
-            "semantic_keys": loop.store.simhash_count_in_tier("semantic"),
-            "procedural_keys": loop.store.simhash_count_in_tier("procedural"),
+            "episodic_keys": len(loop.store.active_keys_in_tier("episodic")),
+            "semantic_keys": len(loop.store.active_keys_in_tier("semantic")),
+            "procedural_keys": len(loop.store.active_keys_in_tier("procedural")),
             "elapsed_seconds": round(elapsed, 1),
             "simulated": sim_result.get("mode") == "simulated",
             "loop": loop,
@@ -16596,7 +18268,7 @@ def _run_extraction_phase(
         from paramem.utils.vram_guard import vram_scope as _vram_scope
 
         with _vram_scope("training"):
-            train_result = loop.run_consolidation_cycle(
+            loop.run_consolidation_cycle(
                 all_episodic_rels,
                 all_procedural_rels,
                 speaker_id=primary_speaker,
@@ -16604,13 +18276,35 @@ def _run_extraction_phase(
                 run_label=f"full-{primary_speaker or 'anon'}",
                 schedule=config.consolidation.refresh_cadence,
                 max_interim_count=config.consolidation.max_interim_count,
+                session_ids=session_ids,
             )
-        # Both verifies are intentional: run_consolidation_cycle above performs
-        # the interim-slot disk-verify (_verify_committed_slot), and
-        # _save_adapters performs its own main-tier disk-integrity verify (step
-        # 4a in its docstring).  Do not collapse them into one.
-        loop._save_adapters()
-        loop.write_key_metadata()
+        # This branch is reached only from the base-swap trial path
+        # (_run_extraction_phase's sole caller).  run_consolidation_cycle
+        # above runs the interim fold with its own gate: training commits
+        # into the cycle's own interim adapter slot
+        # (episodic_interim_<stamp>) via write_tier_slot / publish_tier_registry,
+        # gated by its staged-weights recall verdict (_probe_recall / _assert_tier_recall)
+        # before that commit — see RecallGateRejected's docstring for the
+        # two current raise sites.  The per-tier commit below is a separate
+        # action on the trial's own loop: it copies the main
+        # "episodic"/"semantic"/"procedural" PEFT adapters — resident,
+        # unchanged by this event — into the trial tree via
+        # ConsolidationLoop.commit_main_tiers, one commit_tier_slot
+        # (paramem/memory/persistence.py) call per tier, stamping them with
+        # the trial store's registries.  commit_tier_slot durably writes each
+        # tier's own key_metadata.json rows as part of its own commit
+        # sequence, so no separate bookkeeping write is needed after it.
+        # This tier set is DIFFERENT from a production fold's
+        # tiers_rebuilt by design: it is every resident main adapter
+        # (unchanged by the trial event), not the subset a fold retrained.
+        _trial_tiers = []
+        if "episodic" in loop.model.peft_config:
+            _trial_tiers.append("episodic")
+        if "semantic" in loop.model.peft_config:
+            _trial_tiers.append("semantic")
+        if "procedural" in loop.model.peft_config:
+            _trial_tiers.append("procedural")
+        loop.commit_main_tiers(_trial_tiers, output_dir=loop.output_dir)
     except Exception:
         logger.exception(
             "Consolidation failed during train/save — leaving %d sessions pending",
@@ -16629,10 +18323,9 @@ def _run_extraction_phase(
         "status": "complete",
         "sessions": len(session_ids),
         "total_relations": total_relations,
-        "episodic_keys": loop.store.simhash_count_in_tier("episodic"),
-        "semantic_keys": loop.store.simhash_count_in_tier("semantic"),
-        "procedural_keys": loop.store.simhash_count_in_tier("procedural"),
-        "train_loss": train_result.get("train_loss"),
+        "episodic_keys": len(loop.store.active_keys_in_tier("episodic")),
+        "semantic_keys": len(loop.store.active_keys_in_tier("semantic")),
+        "procedural_keys": len(loop.store.active_keys_in_tier("procedural")),
         "elapsed_seconds": round(elapsed, 1),
         "loop": loop,
     }
@@ -16670,7 +18363,7 @@ def _scheduled_extract_done_callback(future):
             phase = exc.args[0] if exc.args else "unknown"
             _at = datetime.now(timezone.utc).isoformat()
             record_incident(
-                _state["config"].paths.data / "state",
+                data_state_dir(_state["config"].paths.data),
                 type="vram_exhausted",
                 key=str(phase),
                 severity="failed",
@@ -16688,7 +18381,7 @@ def _scheduled_extract_done_callback(future):
         _state["consolidating"] = False
 
 
-def _get_or_create_consolidation_loop(config):
+def _get_or_create_consolidation_loop(config, *, store=None):
     """Return the process-lifetime ``ConsolidationLoop``, creating it on first use.
 
     Shared get-or-create used by :func:`_run_stage_b_cycle` (all three Stage-B
@@ -16697,7 +18390,21 @@ def _get_or_create_consolidation_loop(config):
     loop before any BG-dispatch decision is made — earlier than
     ``_run_stage_b_cycle`` is ever called for that path.  Idempotent: a
     second call finds the loop already in ``_state`` and returns it
-    unchanged.
+    unchanged — *store* is then a no-op, since only a first-time construction
+    reads it.
+
+    Args:
+        store: Optional store override used ONLY when a fresh loop is being
+            constructed (``_state["consolidation_loop"]`` is ``None``).
+            ``None`` (default, every caller except the pending-event resume)
+            falls through to ``_state["memory_store"]`` — unchanged behavior.
+            The pending-event resume (:func:`_run_pending_event_resume`)
+            passes a locally-constructed empty :class:`MemoryStore` here when
+            ``_state["memory_store"] is None`` (the store is quarantined), so
+            the resumed event's loop has something to fold into without
+            waiting on a lift; :func:`_eager_create_consolidation_loop`
+            never passes this — it still refuses to construct a loop at all
+            while ``_state["memory_store"]`` is ``None``.
     """
     loop = _state.get("consolidation_loop")
     if loop is not None:
@@ -16706,7 +18413,7 @@ def _get_or_create_consolidation_loop(config):
         _state["model"],
         _state["tokenizer"],
         config,
-        _state["memory_store"],
+        store if store is not None else _state["memory_store"],
         state_provider=lambda: _state,
     )
     _state["consolidation_loop"] = loop
@@ -16735,7 +18442,7 @@ def _eager_create_consolidation_loop(config) -> None:
     ``VramExhausted`` from ``ensure_adapters`` -> ``create_adapter``
     allocating GPU memory) — this function does not catch. The lifespan
     boot call site wraps this in a log-and-continue handler (mirroring
-    ``_build_config_derived_state``'s) so a failure here degrades rather
+    ``_build_runtime_components``'s) so a failure here degrades rather
     than crashing the boot; the ``_live_reload_base_model`` tail call is
     unwrapped because that function's own callers already wrap the whole
     reload.
@@ -16751,11 +18458,12 @@ def _eager_create_consolidation_loop(config) -> None:
 def _finalize_stage_b_failure() -> None:
     """Clear-only finalizer shared by every failed Stage-B cycle.
 
-    No ``router.reload()``: on a failed interim commit
-    ``ConsolidationLoop._run_fold``'s transactional rollback leaves the store
-    pre-cycle-identical, and the full/migration failure paths never
-    published anything either — there is nothing new for a failed cycle to
-    reload.
+    No ``router.reload()``: a consolidation event only touches the live
+    store at its own go-live
+    (:meth:`~paramem.training.consolidation.ConsolidationLoop.run_build_and_publish`);
+    a failure before that point leaves the store pre-cycle-identical, and the
+    full/migration failure paths never published anything either — there is
+    nothing new for a failed cycle to reload.
     """
     _state["consolidating"] = False
 
@@ -16767,6 +18475,7 @@ def _run_stage_b_cycle(
     failure_summary: str,
     failure_detail: dict,
     body: "Callable[[object, object], tuple[str, Callable[[], None] | None]]",
+    store=None,
 ) -> None:
     """Own the fire-and-forget BG-worker lifecycle shared by the interim-train,
     full-cycle, and active-store-migration Stage-B closures.
@@ -16799,18 +18508,25 @@ def _run_stage_b_cycle(
         kind: Incident type recorded on an uncaught exception
             (``"training_crash"``, ``"consolidation_crash"``, or
             ``"migration_error"``).
-        incident_key: Incident dedup key (``"interim"``, ``"full"``, or
-            ``"active_store"``).  Also used as the neutral cycle label on
-            the success-path completion log — unlike ``kind``, it carries
-            no incident-type implication.
+        incident_key: Incident dedup key — ``"interim"``, ``"active_store"``,
+            or the full-topology door name recorded verbatim (``"full"`` or
+            ``"reconcile"``).  Also used as the neutral cycle label on the
+            success-path completion log — unlike ``kind``, it carries no
+            incident-type implication.
         failure_summary: Human-readable incident summary on an uncaught
             exception.
         failure_detail: Incident detail payload on an uncaught exception.
         body: The path-specific Stage-B payload, closing over whatever
             pre-stage state (extracted relations, session ids, ...) it needs.
+        store: Forwarded to :func:`_get_or_create_consolidation_loop`
+            unchanged — ``None`` (default) for the three ordinary Stage-B
+            entry points; the pending-event resume's weights-venue call
+            passes a locally-constructed empty store when
+            ``_state["memory_store"] is None``, so a quarantined store
+            never blocks the resume that heals it.
     """
     config = _state["config"]
-    loop = _get_or_create_consolidation_loop(config)
+    loop = _get_or_create_consolidation_loop(config, store=store)
     bt = _active_bg_trainer(config)
     loop._bg_trainer = bt
 
@@ -16825,20 +18541,21 @@ def _run_stage_b_cycle(
             outcome, finalizer = body(loop, bt)
         except Exception as exc:
             logger.exception("%s crashed", kind)
-            # RegistryBookkeepingDivergence names the divergent keys on the
-            # exception itself; fold them into the incident detail so the
+            # BookkeepingInvariantViolation names the divergent tier/keys on
+            # the exception itself (raised by the pre-write parity gate among
+            # other boundaries); fold them into the incident detail so the
             # incident record — not just the log traceback — identifies what
             # diverged.  ActiveKeyHydrationFailure names the keys it could
             # not hydrate and the venue it tried.  RecallGateRejected reaches
-            # here only from the main-tiers fold (the interim fold catches it
-            # and returns a normal recall_failed outcome instead) — it names
-            # the tier that fell short of 100% recall over its own full key
-            # set, and the individual keys that failed.  FoldAccountingRefusal
-            # names the keys a main-tiers fold could not account for
-            # (genuine_loss).  Every other exception keeps the generic detail
-            # unchanged.
+            # here from either fold kind, main-tiers or interim — both route
+            # a recall-gate rejection through this same crash path — and
+            # names the tier that fell short of 100% recall over its own
+            # full key set, and the individual keys that failed.  Every
+            # other exception keeps the generic detail unchanged.
+            from paramem.memory.store import BookkeepingInvariantViolation
+
             incident_detail = dict(failure_detail)
-            if isinstance(exc, RegistryBookkeepingDivergence):
+            if isinstance(exc, BookkeepingInvariantViolation):
                 incident_detail["divergent_keys"] = exc.divergent_keys
             if isinstance(exc, ActiveKeyHydrationFailure):
                 incident_detail["dropped_keys"] = exc.dropped_keys
@@ -16847,17 +18564,20 @@ def _run_stage_b_cycle(
                 incident_detail["adapter_name"] = exc.adapter_name
                 incident_detail["recall_rate"] = exc.recall_rate
                 incident_detail["threshold"] = exc.threshold
-                # Only publish failed_keys when non-empty — the disk-verify
-                # raise site (_verify_saved_adapter_from_disk) has no per-key
-                # data, so an empty list next to a failing recall_rate reads
-                # as "no keys failed" rather than "not applicable here".
+                # Only publish failed_keys when non-empty.  Both current
+                # RecallGateRejected raise sites populate it directly from
+                # the failing probe entries (ConsolidationLoop._assert_tier_recall
+                # in consolidation.py; _migrate_tier_simulate_to_train in
+                # active_store_migration.py) — a rate that falls short of a
+                # <=1.0 threshold always leaves at least one failed key, so
+                # in practice this guard has nothing to filter today.  Kept
+                # as a defensive no-op against a future raise site that
+                # cannot supply per-key data.
                 if exc.failed_keys:
                     incident_detail["failed_keys"] = exc.failed_keys
-            if isinstance(exc, FoldAccountingRefusal):
-                incident_detail["unexplained_keys"] = exc.unexplained_keys
             try:
                 record_incident(
-                    config.paths.data / "state",
+                    data_state_dir(config.paths.data),
                     type=kind,
                     key=incident_key,
                     severity="failed",
@@ -16888,47 +18608,95 @@ def _run_stage_b_cycle(
 # Interim-cycle outcomes that never represent a completed encoding attempt —
 # ABORT (yielded to an inference request before training ran) and CAP_PENDING
 # (interim ring full, session stays queued for the next full fold).  Neither
-# increments the consolidation-retry counter
-# (``ConsolidationScheduleConfig.consolidation_retry_cap``) and neither
-# counts as a "clean success" for auto-resolving the
-# ``consolidation_retry_exhausted`` incident.  Single source of truth for
-# both _finalize_interim's clean-success guard and
-# _extract_and_start_training's pin-without-count logic.
+# is an encoding failure, so contributing sessions are pinned (kept pending)
+# rather than retired — see the pin logic in ``_run_interim_training``. A
+# recall-gate rejection is not in this set: it raises ``RecallGateRejected``
+# and never reaches the pin logic at all — the crash path leaves the
+# contributing sessions pending structurally, with nothing to pin.
 _INTERIM_NON_ENCODING_OUTCOMES: frozenset[str] = frozenset({"aborted", "cap_pending"})
 
 
-def _is_interim_clean_success(result: dict, cycle_mode: str, released_sids: list) -> bool:
-    """``True`` only for a genuine clean interim success.
+def _retire_ledger_sessions_and_dispose(loop, *, disposed: bool) -> list[str]:
+    """Retire what the event's own ledger recorded, then dispose the record.
 
-    Gates whether :func:`_finalize_interim` may auto-resolve a
-    ``consolidation_retry_exhausted`` incident: resolving on anything less
-    than a clean success would wipe an incident recorded by the SAME cycle
-    that is being finalized.  A clean success requires all three:
+    Retirement reads the ledger fresh from disk — never a value captured
+    earlier in the same process — so a crash between this call and the
+    :func:`~paramem.training.stage_ledger.dispose` call it ends with leaves
+    the SAME durable evidence on disk for the next resume to read:
+    retire-then-dispose is what makes that resume idempotent (an
+    already-retired session set retires again harmlessly, and
+    disposal-of-an-absent-record is a no-op).  Disposing first — even when a
+    copy of the session list survives in RAM — would delete that evidence: a
+    crash in the gap strands the sessions pending with no pending record
+    left for anything to resume.
 
-    - no recall-gate failures this cycle (``recall_failed_session_ids`` empty),
-    - an outcome that represents a completed encoding attempt (excludes
-      :data:`_INTERIM_NON_ENCODING_OUTCOMES` — abort/cap_pending never
-      attempted or committed an encode), and
-    - no sessions released from the consolidation-retry cap this cycle
-      (a release means an incident was just recorded).
+    A retirement failure is convergence, not loss, and is treated the same
+    way a crash is: the ledger is left pending (dispose is NOT called) so
+    the next scheduled consolidation or boot resume re-reads the same
+    ledger and retries retirement from it — idempotently, since a session
+    already marked consolidated tolerates a repeat call.  The failure is
+    recorded as a ``session_retirement_failed`` incident (session ids and
+    cause) rather than only logged, so a stuck retirement stays visible
+    until it resolves; a subsequent successful retirement resolves every
+    active incident of that type, which also clears any instance stranded
+    on a deployed store from before this event's own failure.
+
+    *disposed* is the driver's own ``all_live`` verdict (every tier the
+    ledger names verifies ``tier_live``).  ``False`` means this event is
+    not actually complete (an abort or a partial bundle) — nothing is
+    retired and the ledger stays pending for a genuine resume; the caller
+    is expected to reach this only on outcomes that already imply
+    completion, and the gate exists as the belt for that expectation
+    rather than a routine branch.
+
+    Returns:
+        The session ids retired (possibly empty) — folded into the
+        caller's own run-status detail.  Empty also on a retirement
+        failure: nothing is retired-and-disposed on that path, so there is
+        nothing this call can honestly report as retired.
     """
-    return (
-        not result.get("recall_failed_session_ids", [])
-        and cycle_mode not in _INTERIM_NON_ENCODING_OUTCOMES
-        and not released_sids
-    )
+    if not disposed:
+        return []
+
+    from paramem.server.consolidation import session_retention_dir
+    from paramem.training import stage_ledger as _sl
+
+    ledger = _sl.read_ledger(loop._fold_state_dir)
+    session_ids: list[str] = []
+    if ledger is not None:
+        extraction_stage = _sl.extraction_entry(ledger) or {}
+        session_ids = list(extraction_stage.get("sessions", []))
+        if session_ids:
+            incidents_dir = data_state_dir(_state["config"].paths.data)
+            try:
+                _state["session_buffer"].mark_consolidated(
+                    session_ids,
+                    retention_dir=session_retention_dir(loop, _state["config"]),
+                )
+            except Exception as exc:
+                logger.exception(
+                    "Consolidation event: session retirement failed -- the ledger "
+                    "stays pending; the next resume retries retirement from it"
+                )
+                record_incident(
+                    incidents_dir,
+                    type="session_retirement_failed",
+                    key=f"{ledger.event}:{ledger.stamp}",
+                    severity="failed",
+                    summary="Session retirement failed after a completed consolidation event",
+                    detail={"session_ids": session_ids, "cause": str(exc)},
+                )
+                return []
+            resolve_incidents_by_type(incidents_dir, "session_retirement_failed")
+    _sl.dispose(loop._fold_state_dir)
+    return session_ids
 
 
-def _finalize_interim(
-    loop,
-    result: dict,
-    *,
-    session_ids: list,
-    released_sids: list,
-    episodic_rels: int = 0,
-    procedural_rels: int = 0,
-) -> None:
-    """Success/terminal finalizer for the interim-training Stage-B cycle.
+def _finalize_interim(loop, result: dict, *, extraction=None) -> None:
+    """Success/terminal finalizer for every interim-shaped consolidation
+    event — the scheduled tick, in either venue, and a resumed pending
+    event whose ledger names the interim door (``ledger.event`` is
+    literally ``"interim"``).
 
     Runs on the asyncio event loop via ``_dispatch_finalize``.  Revalidates
     every tier's ``adapter_manifest_status`` row against the freshly-saved
@@ -16936,17 +18704,23 @@ def _finalize_interim(
     performs its documented ``.pending/`` sweep via ``sweep_orphan_pending``,
     see that function's own docstring; the read+hash cost profile otherwise
     matches the full-fold call this mirrors), records (or clears) any
-    ``tier_registry_unverified`` incident for the FULL tier tree
-    (:func:`_record_unverified_tier_incidents`
-    over :func:`~paramem.adapters.registry_binding.verify_adapter_tree` —
-    not the revalidate loop's enabled-tiers subset, so a disabled-but-broken
-    tier is never mistaken for a vanished one and wrongly auto-resolved),
-    reloads the router, records the durable run-status row, auto-resolves
-    the incidents a clean interim success clears, and clears
+    ``tier_registry_unverified`` incident for the tier(s) THIS event's
+    ledger names (:func:`_record_unverified_tier_incidents` over
+    ``result["tier_bindings"]`` — the publish verdict
+    :meth:`~paramem.training.consolidation.ConsolidationLoop.run_build_and_publish`
+    already computed, never a fresh tree walk; empty when the event did not
+    reach ``all_live``, so an aborted/cap_pending terminal sweeps nothing),
+    reloads the router, retires what the ledger recorded and disposes the
+    event's record, records the durable run-status row, auto-resolves the
+    incidents a clean interim success clears, and clears
     ``_state["consolidating"]``. Covers every non-crash interim terminal
-    (``trained`` / ``simulated`` / ``recall_failed`` / ``aborted`` /
-    ``cap_pending``) — the outcome label and clean-success gating come from
-    *result* and *released_sids*.
+    (``trained`` / ``simulated`` / ``cap_pending`` / ``aborted``) — a
+    recall-gate rejection never reaches this finalizer at all, since
+    ``RecallGateRejected`` propagates to the crash path instead.
+    ``training_crash`` / ``vram_exhausted`` auto-resolution is gated on
+    ``result["completed"]``: an ``aborted`` or ``cap_pending`` terminal made
+    no encoding attempt, so it must not clear an operator's pending
+    crash/exhaustion signal.
 
     The incident bookkeeping is wrapped in its own protected region: this
     is the SOLE operator-visible reporter for an unverified tier (the
@@ -16954,25 +18728,36 @@ def _finalize_interim(
     ``attention.py``), so a fault recording it must be logged, never allowed
     to wedge the finalizer before ``_state["consolidating"]`` clears.
 
+    The no-staging terminal (``result["mode"] == "noop"`` with no
+    ``adapter_name``) writes no ledger at all, so the ledger-based
+    retirement above has no record to read: with *extraction* supplied,
+    this pre-stage's own successfully-extracted sessions are retired here
+    instead, through :func:`_retire_extracted_sessions` — the one call site
+    for that fallback, shared by every caller that can reach this terminal
+    (a fresh scheduled tick, either venue) — and its returned set is what
+    gets reported, rather than the empty set the ledger-based retirement
+    above always returns on this terminal.  A caller with no fresh
+    extraction to fall back on (a resumed event) never reaches this
+    terminal in practice — a resumed ledger always names an ``adapter_name``
+    — so *extraction* stays ``None`` there.
+
     Args:
         loop: The cycle's ``ConsolidationLoop`` (post-training PEFT rebind).
-        result: The ``run_consolidation_cycle`` return dict.
-        session_ids: Session ids extracted this cycle (for the run-status
-            detail count).
-        released_sids: Sessions released from the consolidation-retry cap
-            this cycle — a non-empty list blocks the clean-success
-            incident resolution below (mirrors the crash-recorded incident
-            still being live).
-        episodic_rels: Count of episodic relations the extraction stage
-            produced this cycle.  Carried into the run-status detail for
-            every outcome — one outcome label, one detail contract — so
-            ``scripts/dev/paramem-status.sh``'s ``simulated`` render (which
-            reads ``detail["episodic_rels"]``/``detail["procedural_rels"]``)
-            is populated regardless of which finalizer wrote the record.
-        procedural_rels: Count of procedural relations, same rationale.
+        result: The ``run_consolidation_cycle`` return dict.  Relation
+            counts for the run-status detail are read from
+            ``result["consumed_episodic_rels"]`` /
+            ``result["consumed_procedural_rels"]`` (the ledger's own
+            extraction stage, recorded when the event was staged); the retired session list
+            itself is re-read from the ledger at this finalizer's own
+            retire-then-dispose step (see
+            :func:`_retire_ledger_sessions_and_dispose`), never from a
+            value captured earlier in the process, except on the
+            no-staging terminal (see above).
+        extraction: The pre-stage's own ``_PendingExtraction`` outcome, for
+            the no-staging terminal's own retirement fallback.  ``None``
+            (the default) when the caller has none to offer — safe exactly
+            when the no-staging terminal cannot occur (a resumed event).
     """
-    from paramem.adapters.registry_binding import verify_adapter_tree
-
     loop.model.eval()
     _state["last_consolidation"] = datetime.now(timezone.utc).isoformat()
     # Re-validate manifests now that this interim slot has been freshly
@@ -16980,36 +18765,59 @@ def _finalize_interim(
     # a stale FINGERPRINT MISMATCH row for this interim doesn't linger on
     # /status until the next full cycle happens to prune it.
     _revalidate_adapter_manifests(_state)
-    # Interim folds are the first observer of a tier whose binding breaks
-    # after boot — without this, nothing renders and no incident exists for
-    # it until the next full cycle (up to the full-consolidation period).
+    # The unverified-tier incident sweep consumes the publish verdict this
+    # event's own driver call already computed (result["tier_bindings"] --
+    # one verify_tier_binding read per tier the event's ledger names,
+    # populated only when the event went all_live) rather than re-walking
+    # the whole adapter tree.  This narrows what an interim fold observes
+    # to the interim slot IT touched: a DIFFERENT tier's binding breaking
+    # is no longer caught here -- it stays open until that tier's own next
+    # publish (interim or full) or the next boot check, sound under the
+    # single-writer architecture (tier state changes only at publish).
     # Protected: a fault here must not wedge the finalizer.
     _config = _state["config"]
     try:
-        _record_unverified_tier_incidents(_config, verify_adapter_tree(_config.adapter_dir))
+        _record_unverified_tier_incidents(_config, result.get("tier_bindings", {}))
     except Exception:
         logger.exception(
             "Post-interim tier-incident bookkeeping failed (non-fatal); finalization continues"
         )
     _state["router"].reload()
+
+    # Retire what the ledger recorded, then dispose the event's record.  A
+    # crash between the two re-enters, finds every tier entry present,
+    # retires an already-retired set (idempotent) and disposes.
+    session_ids = _retire_ledger_sessions_and_dispose(loop, disposed=bool(result.get("completed")))
+
+    # The no-staging terminal: no ledger was ever written (stage_event's own
+    # no-material early exit), so the ledger-based retirement above always
+    # returns [] here.  A "noop" that DOES carry an adapter_name reached a
+    # real ledger that simply never went live (all_live False); that record
+    # stays pending for the next resume and is intentionally left alone.
+    _no_staging = result.get("mode") == "noop" and result.get("adapter_name") is None
+    if _no_staging and extraction is not None:
+        session_ids = _retire_extracted_sessions(
+            extraction, _state["session_buffer"], loop, _config
+        )
+
     # inference path sees the just-written interim slot (and any tier whose
     # format drifted from the loop's current setting).  Count via the
     # indexed_key_registry — it tracks every active key regardless of which
     # adapter (main or interim) currently holds it.  The previous
     # main-tier-simhash sum under-reported by the count of keys living in
     # episodic_interim_<stamp> slots between full cycles.
-    total_keys = len(loop.store.all_active_keys()) if loop.store.replay_enabled else 0
+    total_keys = len(loop.store.all_active_keys())
     _interim_outcome = result.get("mode", "trained")
     _interim_detail = {
         "sessions": len(session_ids),
         "total_keys": total_keys,
         "adapter": result.get("adapter_name"),
-        "episodic_rels": episodic_rels,
-        "procedural_rels": procedural_rels,
+        "episodic_rels": result.get("consumed_episodic_rels", 0),
+        "procedural_rels": result.get("consumed_procedural_rels", 0),
     }
     try:
         record_last_run(
-            _state["config"].paths.data / "state",
+            data_state_dir(_state["config"].paths.data),
             op_type="consolidation",
             outcome=_interim_outcome,
             summary=(
@@ -17018,14 +18826,19 @@ def _finalize_interim(
             ),
             detail=_interim_detail,
         )
-        # Auto-resolve op-level incidents cleared by a successful interim cycle.
-        _interim_state_dir = _state["config"].paths.data / "state"
-        resolve_incidents_by_type(_interim_state_dir, "training_crash")
-        resolve_incidents_by_type(_interim_state_dir, "vram_exhausted")
-        # Resolve consolidation_retry_exhausted ONLY on a genuine clean
-        # success — see _is_interim_clean_success for the exact gate.
-        if _is_interim_clean_success(result, _interim_outcome, released_sids):
-            resolve_incidents_by_type(_interim_state_dir, "consolidation_retry_exhausted")
+        # Auto-resolve op-level incidents cleared by a successful interim
+        # cycle — gated on completion so an aborted/cap_pending terminal
+        # (this finalizer is the terminal for every non-crash interim
+        # outcome, not only "trained"/"simulated") leaves the operator's
+        # crash/exhaustion signal in place.
+        _interim_state_dir = data_state_dir(_state["config"].paths.data)
+        if result.get("completed"):
+            resolve_incidents_by_type(_interim_state_dir, "training_crash")
+            resolve_incidents_by_type(_interim_state_dir, "vram_exhausted")
+        # A refuse-and-hold resume that later completes (the FOREIGN write was
+        # resolved out-of-band, or the record was replaced by a disposing
+        # door and this is a fresh event) clears the incident it opened.
+        resolve_incidents_by_type(_interim_state_dir, "consolidation_resume_blocked")
     except Exception:
         logger.exception("Post-interim run-status/incident bookkeeping failed (non-fatal)")
     _state["consolidating"] = False
@@ -17062,11 +18875,11 @@ class _PendingExtraction:
         Sessions whose extraction exhausted VRAM.  They are NOT retired;
         they stay pending for the next cycle.  ALIASING CONTRACT: the interim
         caller binds this set by reference (``failed_session_ids =
-        extraction.failed_session_ids``) and the recall gate mutates it in
-        place after the stage returns — ``update(_pin_sids)`` /
-        ``difference_update(_released_sids)`` — with retirement reading the
-        mutated set back through :meth:`completed_session_ids`.  Do NOT give
-        this field a defensive copy; that would silently detach pin/release
+        extraction.failed_session_ids``) and the pin logic mutates it in
+        place after the stage returns — ``update(session_ids)`` for a
+        non-encoding outcome (ABORT / CAP_PENDING) — with retirement reading
+        the mutated set back through :meth:`completed_session_ids`.  Do NOT
+        give this field a defensive copy; that would silently detach pinning
         from retirement.
     speaker_ids:
         Speaker id per successfully-extracted session (the interim path
@@ -17097,6 +18910,49 @@ class _PendingExtraction:
         """
         raw = {sid for sid in self.session_ids if sid not in self.failed_session_ids}
         return session_buffer.retirable(raw)
+
+
+def _retire_extracted_sessions(extraction, session_buffer, loop, config) -> "list[str]":
+    """Retire the sessions this pre-stage successfully extracted, for an
+    outcome that consumed them without producing an event record.
+
+    An interim tick's own no-staging terminal
+    (``stage_event``'s no-material early exit, surfaced as
+    ``run_consolidation_cycle``'s ``"mode": "noop"`` / ``"completed": False``
+    result with no ``adapter_name``) writes no ledger at all — the event
+    terminal that normally retires via the ledger
+    (:func:`_retire_ledger_sessions_and_dispose`) has nothing to read.  That
+    early exit fires only when the batch extracted no relations AT ALL
+    (``not episodic_rels and not procedural_rels``) AND no tier in this
+    event's working universe already holds an active key — never merely
+    because everything extracted was a duplicate of an existing fact: a
+    batch of all-duplicates still has new material, so ``stage_event``
+    still writes a ledger (and dedup runs, and finds, nothing new to write).
+    The full path's own consume-pending pre-stage reaches the identical
+    no-material shape.  Without this, the sessions this pre-stage extracted
+    would re-extract on every tick forever, since no record exists for
+    anything to retire them from.
+
+    Args:
+        extraction: The pre-stage's own ``_PendingExtraction`` outcome.
+        session_buffer: The live ``SessionBuffer``.
+        loop: The cycle's ``ConsolidationLoop`` — resolves the retention
+            directory.
+        config: The live ``ServerConfig``.
+
+    Returns:
+        The session ids retired — callers with no ledger to read this from
+        (the shape this function exists for) report this set directly
+        rather than under-reporting a retirement the ledger never recorded.
+    """
+    from paramem.server.consolidation import session_retention_dir
+
+    retired = extraction.completed_session_ids(session_buffer)
+    session_buffer.mark_consolidated(
+        retired,
+        retention_dir=session_retention_dir(loop, config),
+    )
+    return retired
 
 
 def _extract_pending_sessions(loop, *, lock_held: bool) -> _PendingExtraction:
@@ -17265,7 +19121,7 @@ def _extract_pending_sessions(loop, *, lock_held: bool) -> _PendingExtraction:
                     }
                 )
                 record_incident(
-                    config.paths.data / "state",
+                    data_state_dir(config.paths.data),
                     type="extraction_failed",
                     key=str(exc.phase),
                     severity="failed",
@@ -17310,9 +19166,8 @@ def _extract_and_start_training():
     ``episodic_interim_20260706T1200``).  When a slot for the current
     window already exists, that slot is retrained in place; a new
     stamp/slot is minted only when a new window opens.  Training is
-    new-plus-replay: with replay enabled (``indexed_key_replay``, the live
-    default), the slot is retrained on its existing keys reconstructed from
-    adapter weights UNION the new batch, not the new batch alone.
+    new-plus-replay: the slot is retrained on its existing keys reconstructed
+    from adapter weights UNION the new batch, not the new batch alone.
     ``max_interim_count`` is the overflow ceiling governing what happens
     when a NEW window's mint would exceed it — an overflow slot beyond the
     cap (when ``interim_overflow_slack > 0``) or ``cap_pending`` (sessions
@@ -17352,6 +19207,17 @@ def _extract_and_start_training():
         _state["consolidating"] = False
         return
 
+    # No-facts fast path: a zero-relation batch never reaches
+    # run_consolidation_cycle at all, so it never dispatches to the BG
+    # trainer and never acquires the GPU lock for a cycle that will train
+    # nothing — the same outcome stage_event's own no-facts exit
+    # ("terminates here... no shadow tree, no ledger, nothing to dispose")
+    # and run_consolidation_cycle's own noop guard implement one level
+    # down, for every OTHER caller that reaches them with an already-known
+    # non-empty batch. Retirement here goes through the extraction
+    # tracker (extraction.completed_session_ids), never the ledger: a
+    # no-facts outcome produces no ledger to retire from, so this is the
+    # one and only site that can retire these sessions.
     if not all_episodic_rels and not all_procedural_rels:
         logger.info("No relations extracted — skipping")
         session_buffer.mark_consolidated(
@@ -17382,7 +19248,7 @@ def _extract_and_start_training():
             }
             try:
                 record_last_run(
-                    _state["config"].paths.data / "state",
+                    data_state_dir(_state["config"].paths.data),
                     op_type="consolidation",
                     outcome="no_facts",
                     summary=f"No facts extracted from {len(session_ids)} session(s)",
@@ -17421,73 +19287,44 @@ def _extract_and_start_training():
             run_label=f"tick-{primary_speaker_sim or 'anon'}",
             schedule=config.consolidation.refresh_cadence,
             max_interim_count=config.consolidation.max_interim_count,
+            session_ids=extraction.completed_session_ids(session_buffer),
         )
-        # _save_registry is retired: the combined SimHash registry at
-        # config.registry_path was maintained by no production path, interim or
-        # full-cycle, and its only reader (the temporal-query
-        # filter_registry_by_date, itself retired) needed fields the writer
-        # never emitted.
         # Per-adapter indexed_key_registry.json files carry the unified simhash
         # map; MemoryStore.read_simhash_registry_from_disk merges the "simhash"
         # key out of each one for the source factory.
-        if sim_result.get("mode") == "noop":
-            # The only terminal where this write is load-bearing: cycle_count
-            # was already bumped in RAM (run_consolidation_cycle increments it
-            # before either early-return guard), but a noop result means
-            # commit_tier_slot never ran, so nothing durable persisted that
-            # counter.  Every other outcome already wrote identical bytes
-            # inside commit_tier_slot's own key-metadata step.
-            loop.write_key_metadata()
-        # Per-tier graph.json is written by commit_tier_slot inside
-        # run_consolidation_cycle; cycle_<N>/ snapshots are dropped.
-
-        # Simulate is peer storage — retire successfully-extracted sessions
-        # like train. OOM-skipped chunks stay pending for retry.
-        session_buffer.mark_consolidated(
-            extraction.completed_session_ids(session_buffer),
-            retention_dir=session_retention_dir(loop, config),
-        )
+        #
+        # A "noop" result means no tier committed this cycle, so cycle_count
+        # (which now advances only once run_build_and_publish confirms a
+        # bundle all_live — see that method's own docstring) never moved for
+        # it either; cycle_count is a derivation anyway — the loop's counter
+        # at boot is the maximum tier_cycle across every tier's own
+        # key_metadata.json — so there is no whole-store counter to flush
+        # here.
+        # Per-tier graph.json is written by write_tier_slot (via
+        # _write_built_tier) inside run_consolidation_cycle's
+        # stage_event/run_build_and_publish spine; cycle_<N>/ snapshots
+        # are dropped.
 
         if evict_voice_for_cycle:
             _set_voice_pipeline_profile(_target_profile(), lock_held=False)
 
         # State mutations + router reload — post to the event loop so the
         # router cache and inference path see the freshly-written state
-        # atomically with the consolidating flag clear.  Mode-agnostic at the
-        # routing point: mirrors `_finalize_interim` / `_finalize_full` so a
-        # simulate-mode cycle is queryable without a server restart, identical
-        # to a trained cycle.
-        def _finalize_simulate() -> None:
-            _state["last_consolidation"] = datetime.now(timezone.utc).isoformat()
-            _state["router"].reload()
-            _sim_detail = {
-                "sessions": len(session_ids),
-                "skipped_oom": len(failed_session_ids),
-                "episodic_rels": len(all_episodic_rels),
-                "procedural_rels": len(all_procedural_rels),
-                "simulated": sim_result.get("mode") == "simulated",
-            }
-            try:
-                record_last_run(
-                    _state["config"].paths.data / "state",
-                    op_type="consolidation",
-                    outcome="simulated",
-                    summary=(
-                        f"Simulate: {len(all_episodic_rels)} episodic, "
-                        f"{len(all_procedural_rels)} procedural relations"
-                    ),
-                    detail=_sim_detail,
-                )
-            except Exception:
-                logger.exception("Failed to record simulated run status (non-fatal)")
-            _state["consolidating"] = False
-            logger.info(
-                "Simulation complete: %d episodic, %d procedural relations",
-                len(all_episodic_rels),
-                len(all_procedural_rels),
-            )
-
-        _dispatch_finalize(_finalize_simulate)
+        # atomically with the consolidating flag clear.  The event-kind
+        # finalizer, exactly the shape the resume path already proves
+        # sufficient for both venues (_finish_resumed_event selects
+        # _finalize_interim/_finalize_full by ledger.event alone, never by
+        # venue) — simulate is peer storage: the ledger the simulate venue's
+        # stage_event/run_build_and_publish wrote is a real pending record
+        # too, and _finalize_interim's own retire-then-dispose is what keeps
+        # a completed simulate tick from being burned as a resume of a
+        # finished event on the next dispatch.  Every venue-derived
+        # reporting field (the "simulated" outcome string, the run-status
+        # summary) is read from sim_result — never a second, hand-rolled
+        # finalizer body.
+        _dispatch_finalize(
+            functools.partial(_finalize_interim, loop, sim_result, extraction=extraction)
+        )
         return
 
     # --- Train into the current-window interim slot via the BG trainer ---
@@ -17504,17 +19341,6 @@ def _extract_and_start_training():
     # procedural.  Freshness-wins router order: probing the newest interim
     # before main means recently
     # learned facts surface ahead of the stale main snapshot.
-    if not loop.config.indexed_key_replay:
-        logger.warning("Indexed key replay disabled — skipping training")
-        session_buffer.mark_consolidated(
-            extraction.completed_session_ids(session_buffer),
-            retention_dir=session_retention_dir(loop, config),
-        )
-        if evict_voice_for_cycle:
-            _set_voice_pipeline_profile(_target_profile(), lock_held=False)
-        _state["consolidating"] = False
-        return
-
     primary_speaker = extraction.speaker_ids[-1] if extraction.speaker_ids else ""
     schedule = config.consolidation.refresh_cadence
     max_interim_count = config.consolidation.max_interim_count
@@ -17525,17 +19351,16 @@ def _extract_and_start_training():
 
         Runs on the BG trainer worker thread under the GPU lock (the entry
         cooldown gate, the try/except crash envelope, and the model-handle
-        refresh are owned by ``_run_stage_b_cycle``).  The helper does its
-        own atomic ``commit_tier_slot`` save of the interim slot + registry;
-        we then run the cross-cycle bookkeeping (promotion check,
-        key-metadata save, session marking, router reload, state updates)
-        after each cycle.
+        refresh are owned by ``_run_stage_b_cycle``).  ``run_consolidation_cycle``
+        already stages, writes, and publishes the interim slot + registry +
+        key metadata durably inside the fold; this closure runs only the
+        cross-cycle bookkeeping the fold does not own (ring-cap incidents,
+        session pinning, and — via the returned finalizer — session marking,
+        router reload, state updates) after each cycle.
         """
         # Callsite 4: BG-worker interim train.  Runs inside the BG worker
         # thread under ``gpu_lock_sync()`` (acquired by
-        # ``_run_callable_queue``).  The surrounding BG-trainer construction
-        # and closure pattern are unchanged; only the deleted
-        # ``_train_extracted_into_interim`` is replaced with the unified
+        # ``_run_callable_queue``), driving the unified
         # ``run_consolidation_cycle``.  Fire-and-forget semantics are
         # preserved — this is NOT converted to ``_await_bg_cycle``.
         result = loop.run_consolidation_cycle(
@@ -17547,6 +19372,7 @@ def _extract_and_start_training():
             schedule=schedule,
             max_interim_count=max_interim_count,
             interim_overflow_slack=interim_overflow_slack,
+            session_ids=extraction.completed_session_ids(session_buffer),
         )
 
         logger.info(
@@ -17556,30 +19382,32 @@ def _extract_and_start_training():
             len(result.get("new_keys", [])),
         )
 
-        # Keep sessions pending when their facts were NOT successfully encoded,
-        # with a bounded per-session durable retry counter.  Two sources feed
-        # the unified failure set (in priority order):
-        #   1. recall_failed_session_ids — the recall gate fired after
-        #      training; triples were re-queued to RAM only, weights
-        #      unchanged.  Facts not encoded → count increments.
-        #   2. ABORT / CAP_PENDING mode — training yielded to an inference
-        #      request, or the interim ring was full (drains at the next
-        #      full fold); no encoding attempt was made either way.
-        #      Sessions stay pending but count does NOT increment (neither
-        #      is an encoding failure).
-        # In the SUCCESS path (cycle returned normally) — NOT inside the try that
-        # wraps run_consolidation_cycle (crash ≠ recall failure — the failed-session
-        # set is populated only on a successful cycle return).
-        # The simulate callsite never produces a non-empty failed set because
-        # _epi_passing is None in simulate mode, so this code is a no-op there.
+        # Keep sessions pending when their facts were NOT successfully
+        # encoded. Holding a session pending for a non-encoding outcome is
+        # structural, not a mechanism: a recall-gate rejection raises
+        # ``RecallGateRejected`` out of ``run_consolidation_cycle`` and
+        # never reaches this success path at all (see the crash path
+        # below) — *session_ids* still names every contributing session,
+        # but nothing here calls ``mark_consolidated`` for them, so they
+        # stay pending on the crash path exactly like ABORT/CAP_PENDING.
+        # The two outcomes that DO reach here with sessions to pin are
+        # ABORT (training yielded to an inference request) and CAP_PENDING
+        # (the interim ring was full) — neither made an encoding attempt,
+        # so the sessions they touched are pinned (kept pending) below
+        # rather than retired.
         _cycle_mode = result.get("mode", "trained")
 
+        # The no-staging terminal's own retirement fallback (no ledger was
+        # ever written, so _finalize_interim's ledger-based retirement has
+        # nothing to read) runs inside _finalize_interim itself now, fed by
+        # the *extraction* passed to the finalizer below — one call site,
+        # shared by every venue that can reach this terminal, rather than a
+        # copy hand-rolled at each dispatch site.
+
         # --- Loud incidents for ring-cap states ---
-        # Neither bumps the retry counter — scheduling backpressure is not an
-        # encoding failure; retry budget is for sessions that failed to encode.
         # Both are deduped by the oldest-interim stamp so one incident fires per
         # stuck cycle and reopens only when a new cycle's interims become oldest.
-        _interim_incident_state_dir = _state["config"].paths.data / "state"
+        _interim_incident_state_dir = data_state_dir(_state["config"].paths.data)
         _overflow_inc = _overflow_incident_for(_cycle_mode, result.get("overflow_slot", False))
         if _overflow_inc is not None:
             _inc_type, _inc_severity = _overflow_inc
@@ -17608,166 +19436,29 @@ def _extract_and_start_training():
             except Exception:
                 logger.exception("_run_interim_training: failed to record %s incident", _inc_type)
 
-        _recall_failed = result.get("recall_failed_session_ids", [])
-        # Build the set of sessions to pin (keep pending) this cycle.
-        # recall_failed: pin + count (encoding attempted but recall gate failed).
-        # aborted: pin only (yield-to-inference, not an encoding failure).
-        # cap_pending: pin only (ring full — scheduling condition, full fold drains ring).
-        _pin_sids: set[str] = set(_recall_failed)
-        _count_sids: set[str] = set(_recall_failed)  # sessions whose counter increments
+        # Pin every session this cycle touched (keep pending) on a
+        # non-encoding outcome (ABORT / CAP_PENDING): none of them made an
+        # encoding attempt, so none may be retired below.
         if _cycle_mode in _INTERIM_NON_ENCODING_OUTCOMES:
-            # Contributing sessions = those that passed extraction but whose
-            # results were not committed.  OOM-skipped chunks are already in
-            # failed_session_ids; exclude them to avoid double-counting.
-            _contributing = {sid for sid in session_ids if sid not in failed_session_ids}
-            _pin_sids.update(_contributing)
-            # ABORT: pin without incrementing — yield-to-inference is not a
-            # fact-encoding failure and must not consume the retry budget.
-            # CAP_PENDING: pin without incrementing — scheduling backpressure
-            # is not an encoding failure (full fold drains the ring).
-        _released_sids: list[str] = []
-        if _pin_sids:
-            failed_session_ids.update(_pin_sids)
-        if _count_sids:
-            # Durable increment — survives ungraceful restarts.  One call covers
-            # all sessions for this cycle; set ensures one-per-session-per-cycle.
-            # Raises RetryStateCapacityError on ENOSPC/EDQUOT.
-            from paramem.server.retry_state import RetryStateCapacityError
-
-            try:
-                _released_sids = session_buffer.bump_retry_and_release(_count_sids)
-            except RetryStateCapacityError as exc:
-                logger.error(
-                    "_run_interim_training: disk full writing retry state — "
-                    "leaving %d session(s) pending, no retry spin: %s",
-                    len(_count_sids),
-                    exc,
-                )
-                try:
-                    record_incident(
-                        _state["config"].paths.data / "state",
-                        type="storage_capacity_reached",
-                        key="consolidation_retry",
-                        severity="failed",
-                        summary="Disk full — consolidation retry state cannot persist",
-                        detail={"errno": getattr(exc.__cause__, "errno", None)},
-                    )
-                except Exception:
-                    logger.exception(
-                        "_run_interim_training: also failed to record "
-                        "storage_capacity_reached incident (disk is full)"
-                    )
-                # Hard stop: sessions stay pending, no release, no spin.
-                # Fall through to bookkeeping with _released_sids empty.
-            else:
-                # The write that raised the incident is the write that clears
-                # it — a persisted retry state IS the recovery, and this is the
-                # only site that observes it.
-                resolve_incident(
-                    _state["config"].paths.data / "state",
-                    "storage_capacity_reached",
-                    "consolidation_retry",
-                )
-        if _released_sids:
-            # Remove capped sessions from failed_session_ids so they retire
-            # this cycle (un-pinned; the un-encodable fact is logged + incident).
-            failed_session_ids.difference_update(_released_sids)
-            _interim_state_dir_b8 = _state["config"].paths.data / "state"
-            for _capped_sid in _released_sids:
-                try:
-                    record_incident(
-                        _interim_state_dir_b8,
-                        type="consolidation_retry_exhausted",
-                        key=_capped_sid,
-                        severity="warning",
-                        summary=(
-                            f"Session {_capped_sid}: facts could not be encoded "
-                            f"after {session_buffer._consolidation_retry_cap} cycle(s)"
-                        ),
-                        detail={
-                            "session_id": _capped_sid,
-                            "consolidation_retry_cap": session_buffer._consolidation_retry_cap,
-                            "cycle_mode": _cycle_mode,
-                        },
-                    )
-                except Exception:
-                    logger.exception(
-                        "_run_interim_training: failed to record retry_exhausted incident "
-                        "for session %s (non-fatal)",
-                        _capped_sid,
-                    )
-            logger.warning(
-                "_run_interim_training: %d session(s) hit consolidation-retry cap "
-                "— releasing; facts could not be encoded",
-                len(_released_sids),
-            )
-        # Reset-on-recall-success: for sessions that were previously counted
-        # (had a durable retry entry) but passed recall cleanly this cycle,
-        # clear their durable count so only consecutive failures accrue toward
-        # the cap.  A session passes recall if it is in session_ids, NOT in the
-        # current _count_sids (i.e. was not a failure this cycle), and has an
-        # existing durable count entry.
-        if _cycle_mode not in _INTERIM_NON_ENCODING_OUTCOMES:
-            for _sid in session_ids:
-                if _sid not in _pin_sids and _sid in session_buffer._sessions:
-                    _existing = session_buffer._sessions[_sid].get("recall_retry_count", 0)
-                    if _existing > 0:
-                        session_buffer.reset_retry_count_for(_sid)
+            failed_session_ids.update(session_ids)
 
         # Disk I/O — safe from any thread.  Key-metadata persistence is now
         # written durably inside the fold itself, ahead of the interim
-        # helper's registry / simhash commit signal (see
-        # ConsolidationLoop.write_key_metadata / commit_tier_slot).
+        # tier's own registry / simhash commit signal (see
+        # paramem.memory.persistence.publish_tier_registry).
         # Promotion runs at the full fold rather than here, so the key is
         # still in episodic when its adapter weights are probed during
         # reconstruction.
         #
-        # This cycle's interim slot is ALREADY durably committed by
-        # commit_tier_slot inside run_consolidation_cycle above, so a
-        # transcript-retirement failure here is honest boundary I/O, not a
-        # training crash — letting it propagate to _run_stage_b_cycle's crash
-        # envelope would misreport a committed cycle as "still pending".
-        # Record the incident locally and continue to the finalizer (router
-        # reload, run-status row, retry bookkeeping still need to run).
-        try:
-            session_buffer.mark_consolidated(
-                extraction.completed_session_ids(session_buffer),
-                retention_dir=session_retention_dir(loop, config),
-                retired_session_ids=set(_released_sids),
-            )
-        except Exception:
-            logger.exception(
-                "_run_interim_training: session-retirement failed after a "
-                "successfully committed cycle (non-fatal — cycle itself "
-                "succeeded, sessions remain pending retirement)"
-            )
-            try:
-                record_incident(
-                    _state["config"].paths.data / "state",
-                    type="session_retirement_failed",
-                    key=result.get("adapter_name") or "interim",
-                    severity="failed",
-                    summary="Interim cycle committed but session retirement failed",
-                    detail={"session_ids": session_ids, "cycle_mode": _cycle_mode},
-                )
-            except Exception:
-                logger.exception(
-                    "_run_interim_training: also failed to record "
-                    "session_retirement_failed incident"
-                )
-        else:
-            # The write that failed is the write that clears it — a
-            # successful retirement IS the recovery from a prior cycle's
-            # failure, and this is the only site that observes it.
-            try:
-                resolve_incidents_by_type(
-                    _state["config"].paths.data / "state", "session_retirement_failed"
-                )
-            except Exception:
-                logger.exception(
-                    "_run_interim_training: failed to resolve "
-                    "session_retirement_failed incident (non-fatal)"
-                )
+        # Session retirement itself does NOT happen here: this cycle's
+        # interim slot is durably committed inside run_consolidation_cycle
+        # above (stage_event's shadow tree, written and published by
+        # run_build_and_publish), but retire-then-dispose ordering makes the
+        # finalizer (_finalize_interim, via _retire_ledger_sessions_and_dispose)
+        # the sole retirement site — it re-reads the ledger fresh rather than
+        # trusting a value captured earlier in this process, so a crash
+        # between this point and the finalizer resumes to complete retirement
+        # exactly once instead of retiring twice from two different sources.
 
         # Restore voice pipeline on the BG worker thread, before returning the
         # terminal — voice load is multi-second GPU work; running it on the
@@ -17777,15 +19468,7 @@ def _extract_and_start_training():
         if evict_voice_for_cycle:
             _set_voice_pipeline_profile(_target_profile(), lock_held=True)
 
-        finalizer = functools.partial(
-            _finalize_interim,
-            loop,
-            result,
-            session_ids=session_ids,
-            released_sids=_released_sids,
-            episodic_rels=len(all_episodic_rels),
-            procedural_rels=len(all_procedural_rels),
-        )
+        finalizer = functools.partial(_finalize_interim, loop, result, extraction=extraction)
         return _cycle_mode, finalizer
 
     _run_stage_b_cycle(
@@ -17827,7 +19510,7 @@ def _finalize_full_status_only(
         _state["last_consolidation"] = datetime.now(timezone.utc).isoformat()
     try:
         record_last_run(
-            _state["config"].paths.data / "state",
+            data_state_dir(_state["config"].paths.data),
             op_type="consolidation",
             outcome=outcome,
             summary=summary,
@@ -17841,110 +19524,123 @@ def _finalize_full_status_only(
 def _finalize_full(
     loop,
     result: dict,
-    staged: "tuple[dict, dict, dict, dict] | None",
-    *,
-    absorbed_interims: bool,
 ) -> None:
     """CPU-only event-loop closure for the full-cycle ``full_trained`` terminal.
 
-    Publishes the staged store contents built on the worker thread, updates
-    ``_state`` flags, revalidates manifests, reloads the router, and records
-    the consolidation result.
+    The store is already fully published by this point — ``run_build_and_publish``'s
+    ``adopt_increments`` converged it (registry, rows, entries, per tier) inside
+    the same locked act that took the bundle live, and its own per-bundle
+    ``router.reload()`` already ran for this event.  This finalizer's job is
+    everything outside that: manifest revalidation, the unverified-tier
+    incident sweep, retiring what the ledger recorded, disposing the event's
+    record, and the durable run-status row.
 
     Step order is load-bearing:
 
-    a. ``store.swap`` — atomically publish new entries/registry/bookkeeping,
-       ONLY when *staged* is not ``None``.  ``staged is None`` means the
-       worker-thread rebuild itself raised — the live store is preserved
-       and ``_state["boot_degraded"]`` keeps its PRIOR value (a failed
-       rebuild proves nothing about cache warmth).  When *staged* IS
-       present, the swap runs unconditionally: per-tier verification
-       already excluded any unverified tier's registry/entries from the
-       staged dicts, so publishing the staged payload always reflects the
-       healthy subset of tiers — an incident is recorded for the rest.
-    b. ``_state["boot_degraded"]`` — from the staged stats, only when
-       *staged* is present. ``_record_unverified_tier_incidents`` (the SOLE
-       operator-visible reporter for an unverified tier — the row-driven
-       attention populator deliberately stays silent for it) runs in its
-       own protected region here: a fault is logged, never allowed to wedge
-       the finalizer before ``_state["consolidating"]`` clears at step e.
-    c. ``_revalidate_adapter_manifests`` — reads fresh on-disk slots and
+    a. ``_revalidate_adapter_manifests`` — reads fresh on-disk slots and
        prunes stale interim ``adapter_manifest_status`` rows.
-    d. ``_state["router"].reload()`` — AFTER the swap so the speaker index
-       is built from the freshly-published bookkeeping.
-    e. ``_state`` flags / result bookkeeping — ``last_consolidation`` etc.
+    b. The unverified-tier incident sweep — the SOLE operator-visible
+       reporter for an unverified tier (the row-driven attention populator
+       deliberately stays silent for it), over ``result["tier_bindings"]``
+       — the publish verdict ``run_build_and_publish`` already computed
+       for every tier this event's ledger names (one ``verify_tier_binding``
+       read each, populated only when the event reached ``all_live``),
+       never a fresh whole-tree ``verify_adapter_tree`` walk.  Protected: a
+       fault here must be logged, never allowed to wedge the finalizer
+       before ``_state["consolidating"]`` clears.
+    c. Retire the ledger's own recorded sessions (completed extractions
+       only, re-read from the ledger itself — never a value captured
+       earlier in the process) and dispose the event's record — not gated
+       on the consume-pending pre-stage having run, since the ledger is
+       the source of truth for what to retire either way.
+    d. ``_state`` flags / result bookkeeping — ``last_consolidation`` etc.
+       ``full_consolidation_overdue`` resolves only when every tier the
+       event's ledger names went live (``result["completed"]``): a
+       partially completed event (one whose bundle has not all gone live)
+       must not resolve it.  This finalizer is reachable both from a fresh
+       dispatch (where reaching it already implies ``result["completed"]``
+       is ``True`` — the caller routes an aborted/no-op fresh result to
+       ``_finalize_full_status_only`` instead) and from a resumed event
+       (:func:`_run_pending_event_resume`, which calls this finalizer
+       unconditionally on whatever :func:`_finish_resumed_event` returns).
+       A resumed result whose bundle yielded mid-publish
+       (``result["aborted"]`` or an otherwise incomplete ``result["completed"]``)
+       therefore reports outcome ``"aborted"`` rather than ``"full_trained"``,
+       never stamps ``last_consolidation``, and skips resolving
+       ``consolidation_crash`` / ``vram_exhausted`` / ``extraction_failed`` —
+       the operator's stuck-fold signal must survive an abort, not be
+       cleared by one.
 
     Args:
         loop: The cycle's ``ConsolidationLoop`` (post-fold PEFT rebind).
-        result: The ``loop.consolidate(...)`` return dict.
-        staged: ``(staged_e, staged_r, staged_b, staged_stats)`` built
-            off-store on the worker thread by ``_build_store_contents``, or
-            ``None`` when that rebuild raised.
-        absorbed_interims: Whether this fold's key source included the interim
-            slots (and therefore drained the ring).  Only such a fold may
-            auto-resolve the ring incidents — a reconcile leaves the backlog
-            exactly where it was, so clearing them would report a drain that
-            did not happen.
+        result: The ``loop.consolidate(...)`` (or, on a resumed event,
+            :func:`_finish_resumed_event`) return dict.  ``result["aborted"]``
+            and ``result["completed"]`` together decide the recorded
+            outcome and which incidents may auto-resolve — see step d above.
     """
-    if loop.store.replay_enabled and staged is not None:
-        staged_e, staged_r, staged_b, staged_stats = staged
-        # a. Publish unconditionally — see docstring.
-        loop.store.swap(staged_e, staged_r, staged_b)
-        # b. Propagate boot_degraded from the staged build.
-        _state["boot_degraded"] = staged_stats["boot_degraded"]
-        # Protected: this is the SOLE operator-visible reporter for an
-        # unverified tier (attention.py's row-driven populator deliberately
-        # stays silent for it) — a fault here must be logged, never allowed
-        # to wedge the finalizer before _state["consolidating"] clears below.
-        try:
-            _record_unverified_tier_incidents(_state["config"], staged_stats["tier_bindings"])
-        except Exception:
-            logger.exception(
-                "Post-fold tier-incident bookkeeping failed (non-fatal); finalization continues"
-            )
-    # staged is None: the worker-thread rebuild raised — preserve the live
-    # store, no swap, and _state["boot_degraded"] keeps its prior value.
-    # c. Re-validate manifests now that main slots have been re-saved
+    # a. Re-validate manifests now that main slots have been re-saved
     #    with a fresh registry hash + window_stamp.  Without this,
     #    /status keeps showing "FINGERPRINT MISMATCH" until restart.
     _revalidate_adapter_manifests(_state)
-    # d. Reload router AFTER swap so the speaker index is built from
-    #    the freshly-published bookkeeping (phase-2 ordering fix).
-    _state["router"].reload()
-    # e. Result bookkeeping.
-    total_keys = len(loop.store.all_active_keys()) if loop.store.replay_enabled else 0
-    _state["last_consolidation"] = datetime.now(timezone.utc).isoformat()
-    _full_outcome = "rolled_back" if result.get("rolled_back") else "full_trained"
+    # b. Protected: this is the SOLE operator-visible reporter for an
+    # unverified tier (attention.py's row-driven populator deliberately
+    # stays silent for it) — a fault here must be logged, never allowed
+    # to wedge the finalizer before _state["consolidating"] clears below.
+    _config = _state["config"]
+    try:
+        _record_unverified_tier_incidents(_config, result.get("tier_bindings", {}))
+    except Exception:
+        logger.exception(
+            "Post-fold tier-incident bookkeeping failed (non-fatal); finalization continues"
+        )
+    # c. Retire what the ledger recorded, then dispose.  A crash between the
+    # two re-enters, finds every tier entry present, retires an
+    # already-retired set (idempotent) and disposes.
+    _retire_ledger_sessions_and_dispose(loop, disposed=bool(result.get("completed")))
+    # d. Result bookkeeping.  An aborted or otherwise incomplete result
+    # (reachable only from a resumed event whose bundle yielded mid-publish —
+    # the fresh dispatch site routes that shape to
+    # `_finalize_full_status_only` before ever calling this finalizer)
+    # reports its own "aborted" outcome, never stamps last_consolidation,
+    # and skips the incident resolution a genuine success clears.
+    total_keys = len(loop.store.all_active_keys())
+    _full_completed = bool(result.get("completed"))
+    if result.get("aborted") or not _full_completed:
+        _full_outcome = "aborted"
+    else:
+        _full_outcome = "full_trained"
+    if _full_completed:
+        _state["last_consolidation"] = datetime.now(timezone.utc).isoformat()
     _full_detail = {
         "tiers_rebuilt": result.get("tiers_rebuilt", []),
-        "rollback_tier": result.get("rollback_tier"),
-        "graph_drift_count": result.get("graph_drift_count", 0),
         "total_keys": total_keys,
     }
     try:
         record_last_run(
-            _state["config"].paths.data / "state",
+            data_state_dir(_state["config"].paths.data),
             op_type="consolidation",
             outcome=_full_outcome,
             summary=f"Full cycle {_full_outcome}: {total_keys} total keys",
             detail=_full_detail,
         )
-        # Auto-resolve op-level incidents cleared by a successful full cycle.
-        _full_state_dir = _state["config"].paths.data / "state"
-        resolve_incidents_by_type(_full_state_dir, "consolidation_crash")
-        resolve_incidents_by_type(_full_state_dir, "vram_exhausted")
-        resolve_incidents_by_type(_full_state_dir, "extraction_failed")
-        # Full-cycle path mirrors the interim path — resolve
-        # consolidation_retry_exhausted only when the cycle returned zero
-        # recall-failed session ids and was not itself aborted.
-        if not result.get("recall_failed_session_ids", []) and result.get(
-            "mode", "full_trained"
-        ) not in {"aborted"}:
-            resolve_incidents_by_type(_full_state_dir, "consolidation_retry_exhausted")
-        # A fold that absorbed the interim slots drains the ring — overdue and
-        # ring-cap incidents are all resolved regardless of recall outcome.  A
-        # reconcile did not touch them, so their incidents stand.
-        if absorbed_interims:
+        # Auto-resolve op-level incidents cleared by a successful full cycle —
+        # gated on completion so an aborted/incomplete result leaves the
+        # operator's stuck-fold signal in place.
+        _full_state_dir = data_state_dir(_state["config"].paths.data)
+        if _full_completed:
+            resolve_incidents_by_type(_full_state_dir, "consolidation_crash")
+            resolve_incidents_by_type(_full_state_dir, "vram_exhausted")
+            resolve_incidents_by_type(_full_state_dir, "extraction_failed")
+        # A refuse-and-hold resume that later completes (the FOREIGN write was
+        # resolved out-of-band, or the record was replaced by a disposing
+        # door and this is a fresh event) clears the incident it opened.
+        resolve_incidents_by_type(_full_state_dir, "consolidation_resume_blocked")
+        # Every full-topology fold (a full fold or a reconcile) absorbs the
+        # interim ring and drains it — overdue and ring-cap incidents
+        # resolve only once the event's ledger is actually gone (every
+        # planned tier verified live) — a partially completed event must
+        # not report a drain that did not happen.
+        if _full_completed:
             resolve_incidents_by_type(_full_state_dir, "full_consolidation_overdue")
             resolve_incidents_by_type(_full_state_dir, "interim_cap_reached")
             resolve_incidents_by_type(_full_state_dir, "interim_overflow_pending")
@@ -17954,28 +19650,33 @@ def _finalize_full(
     logger.info("Full cycle bookkeeping complete — %d total keys", total_keys)
 
 
-def _run_full_consolidation_sync(keys_from: "Literal['all_tiers', 'main_tiers']") -> None:
-    """Submit a full-cycle consolidation over *keys_from*'s key source.
+def _run_full_consolidation_sync(event: "Literal['full', 'reconcile']") -> None:
+    """Submit a full-topology consolidation event — an ordinary full fold or
+    a reconcile — under *event*'s door name.
 
-    Runs ``loop.consolidate(mode=..., keys_from=...)`` on the BG trainer so the
-    GPU lock is held for the entire per-tier rebuild (the train fold's entry
-    guard requires this — calling without the lock raises).  Both venues fold
-    the same input — the memory store, whose main-tier and interim-slot
-    registries and entries carry every active key — and both end by reloading
-    the router.  In train mode the fold additionally trains each main adapter
-    on the cumulative keyed-pair set and persists the weights; on a failed
-    recall-sanity check it rolls back to the snapshot and aborts that tier.
-    Warm init is the default: a resident tier's weights are kept and trained
-    in place (the funnel's staging copy warm-starts from them,
-    ``paramem.training.trainer.train_adapter``). A tier is deleted and
-    recreated cold in exactly two cases: this call is a RECONCILE
-    (``keys_from == "main_tiers"`` is that structural identity, exposed as
-    ``FoldScope.cold_init`` inside ``consolidate()``); or a resident tier's LoRA
-    config no longer matches the tier config
-    (``paramem.models.loader.ensure_adapter_matching``). In simulate mode it
-    touches no PEFT weights and persists each main tier as
-    ``<adapter_dir>/<tier>/graph.json`` — the projection ``DiskMemorySource``
-    reads back at the next hydration.
+    A reconcile (``/reconsolidate``) IS a full consolidation whose input
+    excludes pending sessions: one fold topology throughout.  Runs
+    ``loop.consolidate(mode=..., event=...)`` on the BG trainer so the GPU
+    lock is held for the entire per-tier rebuild (the train fold's entry
+    guard requires this — calling without the lock raises).  Both venues
+    fold the same input — the memory store, whose main-tier and interim-slot
+    registries and entries carry every active key — and both end by
+    reloading the router.  In train mode the fold additionally trains each
+    main adapter on the cumulative keyed-pair set and persists the weights;
+    on a failed recall-sanity check ``tier_backup_scope`` restores only the
+    in-VRAM state of the one tier that was training — the tier's on-disk and
+    live-serving state are untouched — and the fold aborts that tier.
+    Warm start is uniform for every tier of every event — no cold-start arm:
+    a resident tier's weights are kept, and the funnel's staging copy
+    warm-starts from them (``paramem.training.trainer.train_adapter``). The
+    tier itself is never deleted or recreated by this call — only a resident
+    tier's LoRA config that no longer matches the tier config is recreated
+    (still never written live) ahead of the snapshot via
+    ``paramem.models.loader.ensure_adapter_matching``.  In simulate mode it
+    touches no PEFT weights and persists each main tier's projection into a
+    fresh written slot under ``<adapter_dir>/<tier>/`` (``graph.json``, via
+    :func:`~paramem.adapters.slot.write_slot` — never a tier-root path) —
+    the bound slot ``DiskMemorySource`` reads back at the next hydration.
 
     Whether there is anything to consolidate is decided before dispatch; the fold
     itself has no content gate.
@@ -17985,21 +19686,16 @@ def _run_full_consolidation_sync(keys_from: "Literal['all_tiers', 'main_tiers']"
     interim cycles otherwise drift away from.
 
     Args:
-        keys_from: The fold's key source, bound by the arbitrator at the
-            dispatch site (the executor contract carries no arguments, so it
-            arrives through a ``functools.partial``).
-
-            - ``"all_tiers"`` — collapse the interim slots into main: their keys
-              enter the fold, the slots are reaped afterwards, and at
-              ``max_interim_count == 0`` the pending sessions are consumed
-              directly by the pre-stage below.
-            - ``"main_tiers"`` — rebuild main memory from its own keys.  The
-              interim slots are left on disk untouched and the pending sessions
-              are left pending, so ``consume_pending`` is ``False`` here no
-              matter what ``max_interim_count`` says.
+        event: ``"full"`` or ``"reconcile"`` — the door name, bound by the
+            arbitrator at the dispatch site (the executor contract carries
+            no arguments, so it arrives through a ``functools.partial``) and
+            recorded verbatim in the ledger head.  Both run the identical
+            fold: the interim ring is always recalled, absorbed into the
+            main tiers, and reaped.  Only pending sessions differ — a
+            ``"full"`` event at ``max_interim_count == 0`` consumes them via
+            the pre-stage below; a ``"reconcile"`` event never does, so they
+            stay pending no matter what ``max_interim_count`` says.
     """
-    from paramem.server.consolidation import session_retention_dir
-
     config = _state["config"]
 
     def _run_full_cycle(loop, bt) -> "tuple[str, Callable[[], None] | None]":
@@ -18009,7 +19705,8 @@ def _run_full_consolidation_sync(keys_from: "Literal['all_tiers', 'main_tiers']"
         model-handle refresh are owned by ``_run_stage_b_cycle``.
         """
         # ------------------------------------------------------------------
-        # Consume-pending pre-stage (max_interim_count == 0, absorbing folds only).
+        # Consume-pending pre-stage (max_interim_count == 0, ordinary full
+        # folds only).
         #
         # At count == 0 no interim slots are ever minted, so pending sessions
         # must be extracted directly here, before the fold, depositing their
@@ -18018,8 +19715,9 @@ def _run_full_consolidation_sync(keys_from: "Literal['all_tiers', 'main_tiers']"
         # trains them into the main tiers.  The standard full cycle (count > 0)
         # collapses already-trained interim slots into main and runs no
         # extraction chain at all — hence no pre-stage and no voice eviction.
-        # A main-tiers-only fold consumes nothing pending by definition, so the
-        # pre-stage does not run there at any count.
+        # A reconcile event never consumes pending sessions by definition —
+        # pending sessions stay pending — so the pre-stage does not run there
+        # at any count.
         #
         # HARD CONSTRAINT: the extraction stage is called with lock_held=True.
         # This closure already runs under the BG trainer worker's GPU lock
@@ -18035,7 +19733,7 @@ def _run_full_consolidation_sync(keys_from: "Literal['all_tiers', 'main_tiers']"
         # prevents already-processed sessions from accumulating unboundedly.
         # ------------------------------------------------------------------
         _consume_pending = (
-            keys_from == "all_tiers"
+            event != "reconcile"
             and config.consolidation.max_interim_count == 0
             and config.consolidation.mode != "simulate"
         )
@@ -18059,32 +19757,21 @@ def _run_full_consolidation_sync(keys_from: "Literal['all_tiers', 'main_tiers']"
                 # retries.  The stage logged it and recorded the incident.
                 return "extraction_failed", None
 
-        try:
-            result = loop.consolidate(
-                mode=config.consolidation.mode,
-                keys_from=keys_from,
-                trainer=bt,
-                router=_state.get("router"),
-                consume_pending=_consume_pending,
-            )
-        except AbortedDuringConsolidation as exc:
-            # aborted = normal yield-to-chat outcome; NOT an incident — a
-            # normal terminal return, never raised past this point (raising
-            # to _run_stage_b_cycle would record a consolidation_crash
-            # incident, which this is not).
-            logger.info("Full consolidation aborted for inference: %s", exc)
-            return "aborted", functools.partial(
-                _finalize_full_status_only,
-                outcome="aborted",
-                summary="Full consolidation aborted to yield GPU for inference",
-                detail={},
-            )
-
+        result = loop.consolidate(
+            mode=config.consolidation.mode,
+            event=event,
+            trainer=bt,
+            router=_state.get("router"),
+            consume_pending=_consume_pending,
+            session_ids=(
+                extraction.completed_session_ids(_cp_session_buffer)
+                if extraction is not None
+                else None
+            ),
+        )
         logger.info(
-            "Full cycle complete — tiers_rebuilt=%s, drift=%d, rolled_back=%s",
+            "Full cycle complete — tiers_rebuilt=%s",
             result.get("tiers_rebuilt"),
-            result.get("graph_drift_count", 0),
-            result.get("rolled_back"),
         )
 
         # Layering boundary. ``loop.consolidate(...)`` already
@@ -18109,17 +19796,39 @@ def _run_full_consolidation_sync(keys_from: "Literal['all_tiers', 'main_tiers']"
         # Clear the consolidating flag, record the no-op as a successful
         # cycle outcome, and return.
         if not result.get("tiers_rebuilt"):
+            if result.get("aborted"):
+                # Training yielded (to inference, or a graceful shutdown)
+                # mid-bundle -- distinct from the no-facts noop below.
+                # Nothing was learned from the consume-pending pre-stage's
+                # extracted content, so retiring these sessions here would
+                # be an unrecoverable loss (transcripts gone, nothing
+                # learned, /reconsolidate rebuilds from stored knowledge and
+                # can never recover what was never encoded).  Every session
+                # this pre-stage touched stays pending for the next tick's
+                # retry -- mark_consolidated is not called at all.
+                logger.info(
+                    "Full cycle aborted mid-bundle — nothing rebuilt, sessions "
+                    "kept pending for retry; consolidating flag cleared"
+                )
+                return "aborted", functools.partial(
+                    _finalize_full_status_only,
+                    outcome="aborted",
+                    summary="Full cycle aborted — training yielded mid-bundle",
+                    detail={
+                        "tiers_rebuilt": [],
+                    },
+                    touch_last_consolidation=False,
+                )
             # MF-A Site A: at count==0 the consume-pending pre-stage extracted
             # sessions into merger.graph, but the fold found nothing new to train
-            # (all facts already present after dedup).  Mark extraction-succeeded
-            # sessions consolidated so they do not accumulate unboundedly.
-            # Extraction-failed sessions keep their pending status for retry.
+            # (all facts already present after dedup) — no ledger names these
+            # sessions, so the ledger-based retirement site has nothing to
+            # read.  Mark extraction-succeeded sessions consolidated so they
+            # do not accumulate unboundedly.  Extraction-failed sessions keep
+            # their pending status for retry.
             if extraction is not None and extraction.session_ids:
                 try:
-                    _cp_session_buffer.mark_consolidated(
-                        extraction.completed_session_ids(_cp_session_buffer),
-                        retention_dir=session_retention_dir(loop, config),
-                    )
+                    _retire_extracted_sessions(extraction, _cp_session_buffer, loop, config)
                 except Exception:
                     logger.exception("consume-pending noop: mark_consolidated failed (non-fatal)")
             logger.info(
@@ -18132,7 +19841,6 @@ def _run_full_consolidation_sync(keys_from: "Literal['all_tiers', 'main_tiers']"
                 summary="Full cycle no-op — nothing to rebuild",
                 detail={
                     "tiers_rebuilt": [],
-                    "graph_drift_count": result.get("graph_drift_count", 0),
                 },
                 touch_last_consolidation=True,
             )
@@ -18147,9 +19855,10 @@ def _run_full_consolidation_sync(keys_from: "Literal['all_tiers', 'main_tiers']"
         # crash envelope (consolidation_crash incident, sessions left pending) —
         # so reaching here means main is durable.
 
-        # Key metadata is now persisted durably inside the fold itself, ahead
-        # of the per-tier registry rewrite (see
-        # ConsolidationLoop.write_key_metadata) — no app-layer call needed.
+        # Key metadata is now persisted durably inside the fold itself, per
+        # tier, ahead of that tier's own registry rewrite (see
+        # paramem.memory.persistence.publish_tier_registry) — no app-layer
+        # call needed.
         #
         # When max_interim_count > 0 (standard mode): the full consolidation run
         # folds interim-adapter content into main; it does NOT run the extraction
@@ -18164,77 +19873,36 @@ def _run_full_consolidation_sync(keys_from: "Literal['all_tiers', 'main_tiers']"
         # extraction-succeeded sessions consolidated now that the fold has persisted
         # their knowledge to the main tiers.  Extraction-failed sessions stay pending.
 
-        # MF-A Site B: mark extraction-succeeded sessions consolidated after
-        # successful fold training (count==0 consume-pending mode only).
-        if extraction is not None and extraction.session_ids:
-            try:
-                _cp_session_buffer.mark_consolidated(
-                    extraction.completed_session_ids(_cp_session_buffer),
-                    retention_dir=session_retention_dir(loop, config),
-                )
-            except Exception:
-                logger.exception("consume-pending success: mark_consolidated failed (non-fatal)")
+        # Session retirement itself does NOT happen here (count==0
+        # consume-pending mode's own success path): retire-then-dispose
+        # ordering makes _finalize_full (via _retire_ledger_sessions_and_dispose,
+        # dispatched below) the sole retirement site — it re-reads the
+        # ledger's own recorded session list fresh rather than trusting a
+        # value captured earlier in this process, so a crash between this
+        # point and the finalizer resumes to complete retirement exactly
+        # once instead of retiring twice from two different sources.
 
-        # ------------------------------------------------------------------ #
-        # Post-fold entry-cache refill — runs HERE on the BG worker thread    #
-        # under gpu_lock (held by BackgroundTrainer._run_callable_queue).     #
-        #                                                                      #
-        # A weights-venue fold that reached this point already ran its own    #
-        # training gate probe per tier, all-or-refuse, before promoting the   #
-        # staged weights (ConsolidationLoop._assert_tier_recall) -- and the   #
-        # fold's main-tier state rebuild wrote every rebuilt tier's content   #
-        # into the live store's entry cache from that SAME verified content   #
-        # (see _rebuild_main_tier_state).  result["entries_gate_attested"]    #
-        # names that: when it is True, the live store's entries are already  #
-        # gate-verified, so the refill takes a store snapshot instead of      #
-        # re-probing the weights a second time over the same content --       #
-        # no GPU work runs at all on this path.  A disk-venue fold runs no    #
-        # gate (entries_gate_attested is False there), so the refill falls    #
-        # back to the source medium exactly as before this change.           #
-        #                                                                      #
-        # Still runs inside the same gpu_lock window as the fold either way,  #
-        # so the event loop is never blocked by GPU work on the fallback      #
-        # path, and no concurrent CUDA call can race it.  A failed rebuild    #
-        # (staged=None) is NOT published and the live store is preserved.    #
-        # Missing entry slots self-heal via on-miss probing.                    #
-        # ------------------------------------------------------------------ #
-        staged: "tuple[dict, dict, dict, dict] | None" = None
-        if loop.store.replay_enabled:
-            loop.model.eval()
-            _materialized = None
-            if result.get("entries_gate_attested"):
-                _materialized = {key: entry for _tier, key, entry in loop.store.iter_entries()}
-            try:
-                staged = _build_store_contents(
-                    config,
-                    model=loop.model,
-                    tokenizer=loop.tokenizer,
-                    should_abort=bt.abort_requested,
-                    materialized_entries=_materialized,
-                )
-            except Exception:
-                logger.exception(
-                    "Post-fold store rebuild failed (non-fatal); "
-                    "live store not updated — queries self-heal on-miss"
-                )
-                staged = None
+        # The store is already fully published by this point:
+        # run_build_and_publish's adopt_increments converged the live store
+        # (registry, rows, entries) for every tier this event built, inside
+        # the same locked act that took the bundle live.  No second,
+        # off-store rebuild-and-swap is needed or run.
+        loop.model.eval()
 
         return "full_trained", functools.partial(
             _finalize_full,
             loop,
             result,
-            staged,
-            absorbed_interims=keys_from == "all_tiers",
         )
 
     _run_stage_b_cycle(
         kind="consolidation_crash",
-        incident_key="full",
-        failure_summary="Full consolidation crashed unexpectedly",
+        incident_key=event,
+        failure_summary=f"{event.capitalize()} consolidation crashed unexpectedly",
         failure_detail={},
         body=_run_full_cycle,
     )
-    logger.info("Full consolidation submitted to BG trainer")
+    logger.info("%s consolidation submitted to BG trainer", event.capitalize())
 
 
 def _arm_active_store_migration(config) -> bool:
@@ -18324,7 +19992,7 @@ def _finalize_migration(loop, updated) -> None:
     }
     try:
         record_last_run(
-            _state["config"].paths.data / "state",
+            data_state_dir(_state["config"].paths.data),
             op_type="consolidation",
             outcome=_mig_outcome,
             summary=f"Migration {_mig_outcome}: direction={updated.direction}",
@@ -18332,7 +20000,7 @@ def _finalize_migration(loop, updated) -> None:
         )
         if _all_done:
             # Auto-resolve migration incidents on successful completion.
-            _mig_state_dir = _state["config"].paths.data / "state"
+            _mig_state_dir = data_state_dir(_state["config"].paths.data)
             resolve_incidents_by_type(_mig_state_dir, "migration_error")
             resolve_incidents_by_type(_mig_state_dir, "migration_phase_failed")
     except Exception:

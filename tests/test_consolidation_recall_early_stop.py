@@ -235,9 +235,10 @@ class _Captured:
 #
 # The invariant is now two-part:
 #   1. _train_tier_adapter calls _maybe_make_recall_callback (the funnel).
-#   2. Every production caller (run_consolidation_cycle, the full fold via
-#      _run_fold, and _migrate_tier_simulate_to_train) calls
-#      _train_tier_adapter (they use the funnel, not a direct bypass).
+#   2. Every production caller (run_consolidation_cycle and the full fold,
+#      both via run_build_and_publish's _train_gate_write, and
+#      _migrate_tier_simulate_to_train) calls _train_tier_adapter (they use
+#      the funnel, not a direct bypass).
 #
 # Class F's structural gate (TestProbeTargetIsFullReplaySet) independently
 # checks that every function containing a train_adapter call also contains
@@ -303,15 +304,16 @@ class TestCallSiteWiringSourcePresence:
             "_maybe_make_recall_callback",
         )
 
-    def test_run_fold_calls_funnel(self) -> None:
-        """_run_fold must call _train_tier_adapter (the funnel), not invoke
-        train_adapter directly.  Both run_consolidation_cycle and the full fold
-        (ConsolidationLoop.consolidate) delegate their training to _run_fold,
-        so a single check on _run_fold is sufficient.
+    def test_train_gate_write_calls_funnel(self) -> None:
+        """_train_gate_write must call _train_tier_adapter (the funnel), not
+        invoke train_adapter directly.  Both run_consolidation_cycle and the
+        full fold (ConsolidationLoop.consolidate) delegate their per-tier
+        training to it via run_build_and_publish, so a single check on
+        _train_gate_write is sufficient.
         """
         assert self._function_contains_attr_call(
             PROJECT_ROOT / "paramem/training/consolidation.py",
-            "_run_fold",
+            "_train_gate_write",
             "_train_tier_adapter",
         )
 
@@ -749,96 +751,3 @@ class TestProbeRecall:
             loop._probe_recall("episodic", entries)
 
         loop.model.gradient_checkpointing_enable.assert_not_called()
-
-
-# ---------------------------------------------------------------------------
-# Class I — TestResetRegistersEveryKey
-# _rebuild_main_tier_state admits every key it is given —
-# there is no per-key recall filtering left in this method.  The
-# training-completeness verdict now lives one level up, in
-# ConsolidationLoop._assert_tier_recall.
-# ---------------------------------------------------------------------------
-
-
-class TestResetRegistersEveryKey:
-    """Every key in tier_keyed lands in the rebuilt registry -- with its
-    simhash, and without a probe."""
-
-    def _make_loop(self, tmp_path: Path) -> "ConsolidationLoop":
-        from paramem.memory.store import MemoryStore
-        from paramem.utils.config import TrainingConfig
-
-        loop = ConsolidationLoop.__new__(ConsolidationLoop)
-        loop.model = MagicMock()
-        loop.tokenizer = MagicMock()
-        loop.training_config = TrainingConfig(
-            recall_early_stopping=False,
-            recall_probe_batch_size=1,
-        )
-        loop.store = MemoryStore()
-        return loop
-
-    def test_reset_registers_every_keyed_entry(self, tmp_path: Path) -> None:
-        """Every key in tier_keyed is registered, across all three tiers --
-        there is no per-key filtering left in this method.  Simhash pairing
-        is pinned separately by
-        ``TestResetMainTierRegistriesAndSimhashes.test_registry_and_simhash_rebuilt_together``
-        (tests/test_consolidation.py) -- not duplicated here."""
-        loop = self._make_loop(tmp_path)
-        tier_keyed = {
-            "episodic": [
-                {"key": "graph1", "subject": "S1", "predicate": "p", "object": "O1"},
-                {"key": "graph2", "subject": "S2", "predicate": "p", "object": "O2"},
-            ],
-            "semantic": [
-                {"key": "graph3", "subject": "S3", "predicate": "p", "object": "O3"},
-            ],
-            "procedural": [
-                {"key": "proc1", "subject": "S4", "predicate": "p", "object": "O4"},
-            ],
-        }
-
-        loop._rebuild_main_tier_state(tier_keyed)
-
-        assert set(loop.store.registry("episodic").list_active()) == {"graph1", "graph2"}
-        assert set(loop.store.registry("semantic").list_active()) == {"graph3"}
-        assert set(loop.store.registry("procedural").list_active()) == {"proc1"}
-
-    def test_reset_never_probes(self, tmp_path: Path) -> None:
-        """_probe_recall is never called by the reset -- registration is
-        unconditional now that the training-completeness verdict is
-        enforced earlier, by _assert_tier_recall.  Also carries the
-        stale-seeding and simhash-pairing coverage the deleted
-        TestRegistrationFilter class exercised, so that coverage survives."""
-        loop = self._make_loop(tmp_path)
-        tier_keyed = {
-            "episodic": [
-                {"key": "graph1", "subject": "S1", "predicate": "p", "object": "O1"},
-            ],
-            "semantic": [
-                {"key": "graph2", "subject": "S2", "predicate": "p", "object": "O2"},
-            ],
-            "procedural": [
-                {"key": "proc1", "subject": "S3", "predicate": "p", "object": "O3"},
-            ],
-        }
-        soft_stale_by_tier = {
-            "episodic": {"graph_stale": {"simhash": 0xDEAD}},
-        }
-
-        from unittest.mock import patch
-
-        with patch.object(ConsolidationLoop, "_probe_recall") as mock_probe:
-            loop._rebuild_main_tier_state(tier_keyed, soft_stale_by_tier=soft_stale_by_tier)
-            mock_probe.assert_not_called()
-
-        # Active keys registered in every tier.
-        assert "graph1" in loop.store.registry("episodic")
-        assert "graph2" in loop.store.registry("semantic")
-        assert "proc1" in loop.store.registry("procedural")
-
-        # Stale partition seeded before the active keys -- survives the
-        # rebuild, and its simhash is carried onto the fresh registry too.
-        epi_reg = loop.store.registry("episodic")
-        assert "graph_stale" in epi_reg._stale
-        assert epi_reg._stale["graph_stale"]["simhash"] == 0xDEAD

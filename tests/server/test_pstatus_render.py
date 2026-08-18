@@ -16,6 +16,7 @@ the server responds; the rendered content is what matters.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -198,6 +199,41 @@ def _run_pstatus(status_dict: dict) -> subprocess.CompletedProcess:
 
 
 # ---------------------------------------------------------------------------
+# ANSI-aware line helpers
+#
+# The script colors every rendered field via `echo -e "\033[...m...\033[0m"`;
+# `echo -e` interprets those escapes unconditionally (no TTY check), so the
+# captured subprocess stdout carries real ESC bytes. Substring assertions
+# are unaffected (the color codes wrap the text, never split it), but exact
+# line comparisons need the codes stripped first.
+# ---------------------------------------------------------------------------
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _strip_ansi(text: str) -> str:
+    return _ANSI_RE.sub("", text)
+
+
+def _line_with_prefix(stdout: str, prefix: str) -> str:
+    """Return the single ANSI-stripped stdout line starting with ``prefix``.
+
+    Fails loudly (with full stdout) on zero or multiple matches rather than
+    silently picking the first — a duplicate or missing line is itself a
+    finding.
+    """
+    matches = [
+        stripped
+        for stripped in (_strip_ansi(line) for line in stdout.splitlines())
+        if stripped.startswith(prefix)
+    ]
+    assert len(matches) == 1, (
+        f"expected exactly one line starting with {prefix!r}, found {len(matches)}:\n{stdout}"
+    )
+    return matches[0]
+
+
+# ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
 
@@ -269,6 +305,51 @@ class TestAttentionBlockRendered:
         result = _run_pstatus(status)
         assert "→ paramem migrate-accept" in result.stdout
 
+    def test_no_arrow_line_when_action_hint_none(self):
+        """item with action_hint=None → the arrow line (paramem-status.sh:829-831,
+        rendered only when ahint is non-empty) is absent immediately after
+        that item's own summary line — scoped to the item, not the whole
+        output, since another item elsewhere could legitimately carry one."""
+        status = dict(_BASE_STATUS)
+        status["attention"] = {
+            "items": [
+                self._make_item(summary="NO_HINT_ITEM_SUMMARY", action_hint=None, age_seconds=None)
+            ]
+        }
+        result = _run_pstatus(status)
+        lines = result.stdout.splitlines()
+        summary_indices = [i for i, line in enumerate(lines) if "NO_HINT_ITEM_SUMMARY" in line]
+        assert summary_indices
+        for i in summary_indices:
+            assert i + 1 < len(lines)
+            assert "→" not in lines[i + 1]
+
+    def test_age_present_hint_none_no_arrow_shift(self):
+        """Regression: item with action_hint=None AND age_seconds=2520 — the
+        shape that broke under IFS=$'\\t' reads. Bash `read` collapses
+        consecutive tab delimiters when a field is empty, so the empty
+        action_hint shifted age_seconds into the hint variable and rendered
+        a bogus '→ 2520' arrow line instead of the '(age 42m)' tag with no
+        arrow (paramem-status.sh:492-500 print, :807-831 read/render — both
+        now use '|' delimiters, mirroring the BACKUP line at :515-531)."""
+        status = dict(_BASE_STATUS)
+        status["attention"] = {
+            "items": [
+                self._make_item(
+                    summary="AGE_NO_HINT_ITEM_SUMMARY", action_hint=None, age_seconds=2520
+                )
+            ]
+        }
+        result = _run_pstatus(status)
+        lines = result.stdout.splitlines()
+        summary_indices = [i for i, line in enumerate(lines) if "AGE_NO_HINT_ITEM_SUMMARY" in line]
+        assert summary_indices
+        for i in summary_indices:
+            assert "(age 42m" in lines[i]
+            assert i + 1 < len(lines)
+            assert "→" not in lines[i + 1]
+        assert "→ 2520" not in result.stdout
+
     def test_age_rendered_when_present(self):
         """item with age_seconds=2520 → output contains '(age 42m'."""
         status = dict(_BASE_STATUS)
@@ -312,11 +393,16 @@ class TestAttentionBlockRendered:
 
 class TestMigrateFooter:
     def test_migrate_footer_rendered_in_live(self):
-        """migration.state=live, config_rev=a1b2c3d4 → 'Migrate:' and 'config rev a1b2c3d4'."""
+        """migration.config_rev renders verbatim and is NOT the config_drift
+        fallback. ``_BASE_STATUS['config_drift']['loaded_hash']`` is
+        ``a1b2c3d4e5f6a7b8``, whose ``[:8]`` fallback prefix (``a1b2c3d4``)
+        is deliberately made to differ from ``config_rev`` here so this
+        assertion cannot pass merely because the two values collide (as they
+        did prior to this fixture change)."""
         status = dict(_BASE_STATUS)
         status["migration"] = {
             "state": "live",
-            "config_rev": "a1b2c3d4",
+            "config_rev": "ffeeddcc",
             "trial_started_at": None,
             "gates": None,
             "comparison": None,
@@ -324,7 +410,37 @@ class TestMigrateFooter:
         result = _run_pstatus(status)
         assert "Migrate:" in result.stdout
         assert "config rev" in result.stdout
+        assert "ffeeddcc" in result.stdout
+        assert "a1b2c3d4" not in result.stdout
+
+    def test_migrate_footer_config_rev_empty_falls_back_to_loaded_hash(self):
+        """migration.config_rev='' (falsy) → the footer renders
+        config_drift.loaded_hash[:8] instead (paramem-status.sh:504)."""
+        status = dict(_BASE_STATUS)
+        status["migration"] = {
+            "state": "live",
+            "config_rev": "",
+            "trial_started_at": None,
+            "gates": None,
+            "comparison": None,
+        }
+        result = _run_pstatus(status)
         assert "a1b2c3d4" in result.stdout
+
+    def test_migrate_footer_live_line_exact(self):
+        """Exact rendered Migrate footer line for state=live, ANSI-stripped."""
+        status = dict(_BASE_STATUS)
+        status["migration"] = {
+            "state": "live",
+            "config_rev": "ffeeddcc",
+            "trial_started_at": None,
+            "gates": None,
+            "comparison": None,
+        }
+        status["server_started_at"] = "2026-04-22T08:00:00+00:00"
+        result = _run_pstatus(status)
+        line = _line_with_prefix(result.stdout, "  Migrate:")
+        assert line == "  Migrate:  LIVE (config rev ffeeddcc applied 2026-04-22)"
 
     def test_migrate_footer_color_trial(self):
         """migration.state=trial → output contains 'TRIAL'."""
@@ -360,17 +476,111 @@ class TestMigrateFooter:
         assert "ParaMem Server" in result.stdout
 
 
+class TestMigrateFooterGateBranches:
+    """state=trial dispatches on migration.gates.status
+    (paramem-status.sh:1041-1061); each branch renders distinct text. Every
+    fixture pins gates to the shape the script parses: ``{"status": ...}``.
+    """
+
+    def _run_trial(self, gate_status: str) -> subprocess.CompletedProcess:
+        status = dict(_BASE_STATUS)
+        status["migration"] = {
+            "state": "trial",
+            "config_rev": "abc",
+            "trial_started_at": None,
+            "gates": {"status": gate_status},
+            "comparison": None,
+        }
+        return _run_pstatus(status)
+
+    def test_reload_deferred_renders_swap_paused(self):
+        result = self._run_trial("reload_deferred")
+        assert "SWAP PAUSED" in result.stdout
+        assert "new-base reload deferred — Phase B pending" in result.stdout
+
+    def test_phase_a_failed_renders_swap_failed_capture(self):
+        result = self._run_trial("phase_a_failed")
+        assert "SWAP FAILED" in result.stdout
+        assert "Phase A (capture)" in result.stdout
+
+    def test_phase_b_failed_renders_swap_failed_relearn(self):
+        result = self._run_trial("phase_b_failed")
+        assert "SWAP FAILED" in result.stdout
+        assert "Phase B (relearn)" in result.stdout
+
+    def test_phase_b_model_mismatch_renders_swap_aborted(self):
+        result = self._run_trial("phase_b_model_mismatch")
+        assert "SWAP ABORTED" in result.stdout
+        assert "loaded model ≠ target" in result.stdout
+
+    def test_fail_renders_trial_failed(self):
+        result = self._run_trial("fail")
+        line = _line_with_prefix(result.stdout, "  Migrate:")
+        assert line == "  Migrate:  TRIAL FAILED (config rev abc applied 2026-04-22)"
+
+    def test_pass_renders_trial_gates_passed(self):
+        result = self._run_trial("pass")
+        line = _line_with_prefix(result.stdout, "  Migrate:")
+        assert line == (
+            "  Migrate:  TRIAL — gates passed, awaiting accept/rollback "
+            "(config rev abc applied 2026-04-22)"
+        )
+
+
+class TestRehydrateLine:
+    """Rehydrate line (paramem-status.sh:662-671) is rendered only when
+    pending_rehydration is true; its progress text depends on whether
+    completed/failed tiers are present in the last consolidation result's
+    detail (migration_completed_tiers/migration_failed_tiers,
+    paramem-status.sh:428-439)."""
+
+    def test_pending_rehydration_not_started(self):
+        status = dict(_BASE_STATUS)
+        status["pending_rehydration"] = True
+        status["effective_mode"] = "cloud-only"
+        result = _run_pstatus(status)
+        line = _line_with_prefix(result.stdout, "  Rehydrate:")
+        assert line == (
+            "  Rehydrate:REHYDRATING → effective_mode=cloud-only "
+            "(not started — trigger via /consolidate)"
+        )
+
+    def test_pending_rehydration_completed_and_failed_tiers(self):
+        status = dict(_BASE_STATUS)
+        status["pending_rehydration"] = True
+        status["effective_mode"] = "local"
+        status["last_consolidation_result"] = {
+            "detail": {
+                "completed_tiers": ["episodic", "semantic"],
+                "failed_tiers": ["procedural"],
+            }
+        }
+        result = _run_pstatus(status)
+        line = _line_with_prefix(result.stdout, "  Rehydrate:")
+        assert line == (
+            "  Rehydrate:REHYDRATING → effective_mode=local "
+            "(completed:[episodic,semantic] failed:[procedural])"
+        )
+
+    def test_no_rehydration_line_when_not_pending(self):
+        status = dict(_BASE_STATUS)
+        status["pending_rehydration"] = False
+        result = _run_pstatus(status)
+        assert "Rehydrate:" not in result.stdout
+
+
 class TestConsolResultRendering:
     """``fmt_result`` must read the REAL writer detail keys (RunRecord.detail
-    as written by ``_finalize_simulate``/``_finalize_interim``/``_finalize_full``
-    in ``paramem/server/app.py``), not stale/never-written key names.
+    as written by ``_finalize_interim`` -- every interim-shaped outcome,
+    train or simulate venue alike -- and ``_finalize_full`` in
+    ``paramem/server/app.py``), not stale/never-written key names.
 
     Each assertion below discriminates the pre-fix script: pre-fix, the
     ``simulated`` branch read ``detail['episodic_qa']`` (no longer written by
     any current writer — see b547c73/e4d5587 for its history) and always
     rendered ``0ep``; the ``trained`` branch read ``detail['jobs']`` (same —
-    no longer written) and always rendered ``(?)``; ``full_trained``/
-    ``rolled_back`` fell through to the bare outcome string with zero detail.
+    no longer written) and always rendered ``(?)``; ``full_trained`` fell
+    through to the bare outcome string with zero detail.
     """
 
     def test_simulated_renders_episodic_and_procedural_rel_counts(self):
@@ -415,70 +625,42 @@ class TestConsolResultRendering:
         # Pre-fix key ("jobs", no longer written) always rendered "(?)" here.
         assert "(?)" not in result.stdout
 
-    def test_full_trained_renders_tiers_and_drift_detail(self):
+    def test_trained_consol_line_exact(self):
+        """Exact rendered Consol line for outcome=trained, ANSI-stripped."""
+        status = dict(_BASE_STATUS)
+        status["consolidating"] = False
+        status["last_consolidation"] = "2026-04-22T04:00:00+00:00"
+        status["last_consolidation_result"] = {
+            "op_type": "consolidation",
+            "outcome": "trained",
+            "summary": "Interim trained: adapter=episodic_interim_20260801T0000, 120 total keys",
+            "detail": {
+                "sessions": 4,
+                "total_keys": 120,
+                "adapter": "episodic_interim_20260801T0000",
+            },
+        }
+        result = _run_pstatus(status)
+        line = _line_with_prefix(result.stdout, "  Consol:")
+        assert line == (
+            "  Consol:   last 2026-04-22T04:00:00+00:00 | "
+            "trained 120 keys (4s, adapter=episodic_interim_20260801T0000)"
+        )
+
+    def test_full_trained_renders_tiers_and_total_keys(self):
         status = dict(_BASE_STATUS)
         status["consolidating"] = False
         status["last_consolidation_result"] = {
             "op_type": "consolidation",
             "outcome": "full_trained",
-            "summary": "Full cycle full_trained: 550 total keys",
-            "detail": {
-                "tiers_rebuilt": ["episodic", "semantic"],
-                "rollback_tier": None,
-                "graph_drift_count": 3,
-                "total_keys": 550,
-            },
-        }
-        result = _run_pstatus(status)
-        assert "full_trained 550 keys" in result.stdout
-        assert "tiers=episodic,semantic" in result.stdout
-        assert "drift=3" in result.stdout
-
-    def test_rolled_back_renders_rollback_tier(self):
-        status = dict(_BASE_STATUS)
-        status["consolidating"] = False
-        status["last_consolidation_result"] = {
-            "op_type": "consolidation",
-            "outcome": "rolled_back",
-            "summary": "Full cycle rolled_back: 400 total keys",
+            "summary": "Full cycle full_trained: 400 total keys",
             "detail": {
                 "tiers_rebuilt": ["semantic"],
-                "rollback_tier": "semantic",
-                "graph_drift_count": 1,
                 "total_keys": 400,
             },
         }
         result = _run_pstatus(status)
-        assert "rolled_back 400 keys" in result.stdout
-        assert "rollback=semantic" in result.stdout
-
-    def test_full_trained_tolerates_none_detail_values(self):
-        """A present-but-``None`` ``tiers_rebuilt``/``graph_drift_count``/
-        ``total_keys`` must degrade the rendered line, not crash the whole
-        script — under ``set -euo pipefail`` an uncaught Python ``TypeError``
-        in the embedded parser kills the entire status render, not just the
-        Consol line. Pre-fix, ``",".join(detail.get("tiers_rebuilt", []))``
-        raised ``TypeError: NoneType is not iterable`` on this input; the
-        script exited non-zero and produced no output at all.
-        """
-        status = dict(_BASE_STATUS)
-        status["consolidating"] = False
-        status["last_consolidation_result"] = {
-            "op_type": "consolidation",
-            "outcome": "full_trained",
-            "summary": "Full cycle full_trained",
-            "detail": {
-                "tiers_rebuilt": None,
-                "rollback_tier": None,
-                "graph_drift_count": None,
-                "total_keys": None,
-            },
-        }
-        result = _run_pstatus(status)
-        assert result.returncode == 0, result.stderr
-        assert "full_trained 0 keys" in result.stdout
-        assert "tiers=-" in result.stdout
-        assert "drift=0" in result.stdout
+        assert "full_trained 400 keys (tiers=semantic)" in result.stdout
 
     def test_interim_discarded_renders_tier_and_adapter_counts(self):
         """``fmt_result`` must render the discard writer's real keys
@@ -532,8 +714,13 @@ class TestSecurityFooter:
         assert "plaintext" in result.stdout
 
     def test_security_field_absent_renders_placeholder(self):
-        """Legacy /status JSON without encryption → dim placeholder, no crash."""
+        """Legacy /status JSON without encryption → dim '-' placeholder, no
+        crash, and neither the ON nor OFF wording renders (paramem-status.sh's
+        default `*)` case, :1078-1082)."""
         status = {k: v for k, v in _BASE_STATUS.items() if k != "encryption"}
         result = _run_pstatus(status)
         assert result.returncode == 0
-        assert "Security:" in result.stdout
+        line = _line_with_prefix(result.stdout, "  Security:")
+        assert line == "  Security: -"
+        assert "age daily" not in result.stdout
+        assert "plaintext" not in result.stdout

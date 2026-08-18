@@ -1,264 +1,177 @@
-"""Structural guard: SimHash unification — no stale accessor or sidecar references.
+"""Structural guard: SimHash unification — one fingerprint map, no sidecar.
 
-After the SimHash unification refactor, fingerprints live in
-``indexed_key_registry.json`` under the ``"simhash"`` key of each tier's
-:class:`~paramem.training.key_registry.KeyRegistry`.  The legacy accessor
-``simhashes_in_tier`` (the read path that returned the live dict directly,
-enabling callers to mutate it) and the sidecar ``simhash_registry.json`` have
-been deleted.  The private methods ``_active_simhashes`` / ``_known_simhashes``
-on ``KeyRegistry`` are the only internal implementation, callable only from
-``MemoryStore.tier_simhashes`` (the public facade) and ``integrity.py`` (the
-cross-check tool).
+Fingerprints live in ``indexed_key_registry.json`` under the ``"simhash"``
+key of each tier's :class:`~paramem.training.key_registry.KeyRegistry`. The
+tier's ONE fingerprint map is :attr:`KeyRegistry._simhash`, private, with a
+single private accessor :meth:`KeyRegistry._simhashes` — the only public path
+to a fingerprint set is :meth:`~paramem.memory.store.MemoryStore.tier_simhashes`
+(no ``include_stale`` keyword — that distinction was deleted along with the
+stale-record fingerprint). The separate ``simhash_registry.json`` sidecar
+file has been eliminated.
 
 This test scans the codebase and fails if:
-1. ``simhashes_in_tier`` or ``active_simhashes_in_tier`` appear as call sites.
+1. ``KeyRegistry._simhash`` / ``KeyRegistry._simhashes`` are named (as an
+   attribute access) anywhere outside ``paramem/training/key_registry.py``
+   except inside ``MemoryStore.tier_simhashes`` (``paramem/memory/store.py``)
+   — the one accessor outside ``key_registry.py`` that still reads the
+   private map directly.  ``MemoryStore.replace_simhashes_in_tier`` writes
+   through the public :meth:`KeyRegistry.replace_simhashes` primitive
+   instead, so it is no longer on this allow-list — a regression back to a
+   direct ``reg._simhash`` write there is exactly what this guard now
+   catches. ``paramem/backup/integrity.py`` reads fingerprints through the
+   public ``KeyRegistry.load_simhashes`` leaf, not the private map, and is
+   therefore NOT on this allow-list.
 2. ``simhash_registry.json`` is referenced as a *write target or read path*
    (comments and docstrings explaining its elimination are allowed).
-3. ``_active_simhashes`` or ``_known_simhashes`` are called directly outside
-   the allowed-access files (``store.py``, ``key_registry.py``,
-   ``integrity.py``).
+
+Scans via ``ast`` (real ``Attribute``/string-literal nodes), not text
+matching, so a docstring or comment mentioning ``_simhash``/``_simhashes`` in
+prose never produces a false positive — the old text-scan guard this file
+replaces missed exactly that case (``paramem/memory/store.py``'s own module
+docstring names ``registry._simhash`` in prose).
 
 Mirrors the structure of ``tests/test_extraction_pipeline_guard.py``.
 """
 
 from __future__ import annotations
 
+import ast
 import re
 from pathlib import Path
 
-from tests._guard_utils import tracked_python_files
+from tests._guard_utils import find_function, tracked_python_files
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_KEY_REGISTRY_PATH = _REPO_ROOT / "paramem" / "training" / "key_registry.py"
+_STORE_PATH = _REPO_ROOT / "paramem" / "memory" / "store.py"
+
+_PRIVATE_FINGERPRINT_ATTRS = frozenset({"_simhash", "_simhashes"})
+
+
+def _attribute_accesses(py_file: Path) -> list[tuple[int, str]]:
+    """Return ``(lineno, attr)`` for every real ``ast.Attribute`` node in
+    *py_file* whose attribute name is one of :data:`_PRIVATE_FINGERPRINT_ATTRS`.
+
+    AST-based, not text matching: a docstring or comment merely mentioning
+    ``_simhash``/``_simhashes`` in prose produces no ``ast.Attribute`` node
+    and is never flagged.
+    """
+    try:
+        text = py_file.read_text(encoding="utf-8")
+        tree = ast.parse(text, filename=str(py_file))
+    except (UnicodeDecodeError, SyntaxError):
+        return []
+    hits: list[tuple[int, str]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and node.attr in _PRIVATE_FINGERPRINT_ATTRS:
+            hits.append((node.lineno, node.attr))
+    return hits
+
+
+def test_the_fingerprint_map_is_named_only_by_its_one_store_accessor():
+    """``KeyRegistry._simhash`` / ``._simhashes`` are named outside
+    ``key_registry.py`` only inside ``MemoryStore.tier_simhashes``.
+
+    ``MemoryStore.replace_simhashes_in_tier`` delegates to the public
+    :meth:`KeyRegistry.replace_simhashes` and no longer names either private
+    attribute directly, so it carries no allowance here.  Any other module
+    naming either — including a stray direct access from a test, a
+    regression in ``replace_simhashes_in_tier``, or a resurrected read site
+    in ``integrity.py`` bypassing the public ``load_simhashes`` leaf — is a
+    guard failure.
+    """
+    store_tree = ast.parse(_STORE_PATH.read_text(encoding="utf-8"), filename=str(_STORE_PATH))
+    tier_simhashes_fn = find_function(store_tree, "tier_simhashes")
+    assert tier_simhashes_fn is not None, "MemoryStore.tier_simhashes not found — guard is stale"
+    allowed_ranges = [
+        (tier_simhashes_fn.lineno, tier_simhashes_fn.end_lineno),
+    ]
+
+    def _within_allowed_range(lineno: int) -> bool:
+        return any(start <= lineno <= end for start, end in allowed_ranges)
+
+    offenders: list[tuple[str, int, str]] = []
+    for py_file in sorted(tracked_python_files(_REPO_ROOT)):
+        rel = py_file.relative_to(_REPO_ROOT).as_posix()
+        if rel.startswith("archive/"):
+            continue
+        if py_file == _KEY_REGISTRY_PATH:
+            continue
+        for lineno, attr in _attribute_accesses(py_file):
+            if py_file == _STORE_PATH and _within_allowed_range(lineno):
+                continue
+            offenders.append((rel, lineno, attr))
+
+    assert not offenders, (
+        "KeyRegistry._simhash / ._simhashes named outside key_registry.py and "
+        "outside MemoryStore.tier_simhashes / replace_simhashes_in_tier:\n"
+        + "\n".join(f"  {p}:{n} .{a}" for p, n, a in offenders)
+    )
+
 
 # ---------------------------------------------------------------------------
-# Files allowed to reference ``_known_simhashes`` / ``_active_simhashes``
-# directly — these are the implementation sites and authorised callers.
+# The eliminated sidecar file
 # ---------------------------------------------------------------------------
-_PRIVATE_ACCESSOR_ALLOWLIST = frozenset(
-    {
-        "paramem/memory/store.py",  # MemoryStore.tier_simhashes dispatcher
-        "paramem/training/key_registry.py",  # method definitions
-        "paramem/backup/integrity.py",  # cross-check tool (explicitly allowed)
-        "tests/test_key_registry.py",  # unit tests for the methods themselves
-        "tests/test_memory_store.py",  # unit tests for MemoryStore.tier_simhashes
-        "tests/server/test_integrity_endpoint.py",  # integrity endpoint tests
-        "tests/backup/test_integrity.py",  # backup integrity tests
-        "tests/server/test_active_store_migration.py",  # migration tests
-    }
-)
 
-# Regex patterns that identify CALL SITES (not definitions or docstrings).
-# We look for method-call syntax ``something.simhashes_in_tier(`` rather than
-# a bare name so that the old docstring in store.py (which still mentions the
-# removed API in a comment) doesn't trigger a false positive.
-_FORBIDDEN_CALL_PATTERNS: list[tuple[str, re.Pattern]] = [
-    (
-        "simhashes_in_tier call (read accessor deleted)",
-        re.compile(r"\.\s*simhashes_in_tier\s*\("),
-    ),
-    (
-        "active_simhashes_in_tier call (deleted)",
-        re.compile(r"\.\s*active_simhashes_in_tier\s*\("),
-    ),
-]
-
-# Files allowed to write / create ``simhash_registry.json`` — NONE.
-# Any remaining write is a regression.
-_SIMHASH_SIDECAR_WRITE_RE = re.compile(
-    r"""(?x)
-    (?:open|write_text|write_bytes|\.write\b|json\.dump\b)   # write verbs
-    .*?                                                        # lazy gap
-    simhash_registry\.json                                     # sidecar name
-    |
-    simhash_registry\.json                                     # name first …
-    .*?
-    (?:open|write_text|write_bytes|\.write\b|json\.dump\b)    # … then write
-    """,
-)
-
-# Simpler heuristic: any live code line (not a comment, not a docstring) that
-# contains ``simhash_registry.json`` as a string literal is suspicious.
-# We use a line-level scan and exclude comment lines and known explanation sites.
 _SIMHASH_SIDECAR_STRING_RE = re.compile(r'["\']simhash_registry\.json["\']')
 
 
-def _is_comment_or_docstring_line(line: str) -> bool:
-    """Return True if the line is a pure comment or clearly inside a docstring."""
-    stripped = line.strip()
-    return stripped.startswith("#") or stripped.startswith('"""') or stripped.startswith("'''")
-
-
-def _find_forbidden_call_sites(
-    py_file: Path,
-) -> list[tuple[str, int, str]]:
-    """Return ``(violation_label, lineno, source)`` tuples for forbidden calls.
-
-    Only scans actual source lines; skips comment-only lines so that surviving
-    docstring references (explaining the deletion) don't generate false alarms.
-    """
+def _simhash_sidecar_string_sites(py_file: Path) -> list[tuple[int, str]]:
+    """Return ``(lineno, source)`` for real string-literal AST nodes whose
+    value is ``simhash_registry.json`` — a docstring/comment mention is not
+    an ``ast.Constant`` string-literal node in live code and is never
+    flagged."""
     try:
         text = py_file.read_text(encoding="utf-8")
-    except UnicodeDecodeError:
+        tree = ast.parse(text, filename=str(py_file))
+    except (UnicodeDecodeError, SyntaxError):
         return []
-
-    violations: list[tuple[str, int, str]] = []
-    for lineno, line in enumerate(text.splitlines(), 1):
-        if _is_comment_or_docstring_line(line):
-            continue
-        for label, pattern in _FORBIDDEN_CALL_PATTERNS:
-            if pattern.search(line):
-                violations.append((label, lineno, line.strip()))
-    return violations
-
-
-def _find_simhash_sidecar_string_sites(
-    py_file: Path,
-) -> list[tuple[str, int, str]]:
-    """Return ``(label, lineno, source)`` for live string literals ``'simhash_registry.json'``.
-
-    Skips comment-only lines because a number of docstrings legitimately
-    explain that the sidecar has been removed.
-    """
-    try:
-        text = py_file.read_text(encoding="utf-8")
-    except UnicodeDecodeError:
-        return []
-
-    violations: list[tuple[str, int, str]] = []
-    for lineno, line in enumerate(text.splitlines(), 1):
-        if _is_comment_or_docstring_line(line):
-            continue
-        if _SIMHASH_SIDECAR_STRING_RE.search(line):
-            violations.append(("simhash_registry.json string in live code", lineno, line.strip()))
-    return violations
-
-
-def _find_private_accessor_calls_outside_allowlist(
-    py_file: Path, rel: str
-) -> list[tuple[str, int, str]]:
-    """Return violations for direct ``._active_simhashes(`` / ``._known_simhashes(``
-    calls in files that are not in the private-accessor allowlist.
-    """
-    if rel in _PRIVATE_ACCESSOR_ALLOWLIST:
-        return []
-    try:
-        text = py_file.read_text(encoding="utf-8")
-    except UnicodeDecodeError:
-        return []
-
-    pattern = re.compile(r"\._(?:active|known)_simhashes\s*\(")
-    violations: list[tuple[str, int, str]] = []
-    for lineno, line in enumerate(text.splitlines(), 1):
-        if _is_comment_or_docstring_line(line):
-            continue
-        if pattern.search(line):
-            violations.append(
-                (
-                    "direct _active_simhashes/_known_simhashes call outside allowlist",
-                    lineno,
-                    line.strip(),
-                )
-            )
-    return violations
-
-
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
-
-
-def test_no_simhashes_in_tier_calls():
-    """``simhashes_in_tier`` and ``active_simhashes_in_tier`` must not appear as call sites."""
-    repo_root = Path(__file__).resolve().parent.parent
-    offenders: list[tuple[str, str, int, str]] = []
-
-    for py_file in sorted(tracked_python_files(repo_root)):
-        rel = py_file.relative_to(repo_root).as_posix()
-        # Allow archive/ — historical scripts that are not executed.
-        # Allow the guard test itself — its error strings mention the old API names.
-        if rel.startswith("archive/") or rel == "tests/test_simhash_unification_guard.py":
-            continue
-        for label, lineno, src in _find_forbidden_call_sites(py_file):
-            offenders.append((rel, label, lineno, src))
-
-    assert not offenders, (
-        "Stale simhash accessor call sites found. The read accessor "
-        "``simhashes_in_tier`` was deleted; route callers through "
-        "``MemoryStore.tier_simhashes(tier, *, include_stale=bool)``:\n"
-        + "\n".join(f"  {p}:{n} [{lbl}] — {s}" for p, lbl, n, s in offenders)
-    )
+    hits: list[tuple[int, str]] = []
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and "simhash_registry.json" in node.value
+        ):
+            hits.append((node.lineno, node.value))
+    return hits
 
 
 def test_no_simhash_sidecar_string_in_live_code():
     """``'simhash_registry.json'`` must not appear as a string literal in live code.
 
-    The sidecar file has been eliminated; any surviving string literal (outside
-    a comment or docstring) is a regression — either a write path that was
-    missed or a test that still expects the file to exist.
+    The sidecar file has been eliminated; any surviving string-literal
+    reference is either a missed write path or a test that still expects the
+    file to exist.
     """
-    repo_root = Path(__file__).resolve().parent.parent
     offenders: list[tuple[str, int, str]] = []
 
-    # Files with a legitimate surviving string reference (commenting out old
-    # paths or guarding that the file does NOT exist).
+    # Files with a legitimate surviving string reference (asserting the file
+    # does NOT exist / is NOT in a bundle / is skipped / is not picked up).
     _SIDECAR_ALLOWLIST: frozenset[str] = frozenset(
         {
-            # test_restore.py asserts the file does NOT exist; the string is
-            # in an ``assert not (...).exists()`` expression.
             "tests/backup/test_restore.py",
-            # test_bundle.py asserts the file is NOT in the bundle.
             "tests/backup/test_bundle.py",
-            # test_integrity.py uses the string to assert the file is skipped.
             "tests/backup/test_integrity.py",
-            # trial_inference_isolation.py writes a stale sidecar to assert
-            # the reader does NOT pick it up.
             "tests/server/test_trial_inference_isolation.py",
         }
     )
 
     guard_self = "tests/test_simhash_unification_guard.py"
-    for py_file in sorted(tracked_python_files(repo_root)):
-        rel = py_file.relative_to(repo_root).as_posix()
-        # Scope: production code and tests only. Experiments and scripts are
-        # standalone historical artifacts that may reference the old sidecar name
-        # without affecting production behaviour.
+    for py_file in sorted(tracked_python_files(_REPO_ROOT)):
+        rel = py_file.relative_to(_REPO_ROOT).as_posix()
         if not (rel.startswith("paramem/") or rel.startswith("tests/")):
             continue
         if rel.startswith("archive/") or rel in _SIDECAR_ALLOWLIST or rel == guard_self:
             continue
-        for label, lineno, src in _find_simhash_sidecar_string_sites(py_file):
-            offenders.append((rel, lineno, src))
+        for lineno, value in _simhash_sidecar_string_sites(py_file):
+            if _SIMHASH_SIDECAR_STRING_RE.search(f'"{value}"'):
+                offenders.append((rel, lineno, value))
 
     assert not offenders, (
-        "``simhash_registry.json`` string literal found in live code. "
-        "The sidecar has been eliminated; simhashes now live in "
-        "``indexed_key_registry.json``.  Remove the reference or add the "
-        "file to the allowlist with a comment explaining why it legitimately "
-        "references the old name:\n" + "\n".join(f"  {p}:{n} — {s}" for p, n, s in offenders)
-    )
-
-
-def test_no_private_simhash_accessor_calls_outside_allowlist():
-    """``._active_simhashes(`` / ``._known_simhashes(`` must only be called from
-    the designated implementation files.
-
-    The two private accessors exist to support ``MemoryStore.tier_simhashes``
-    (the mandatory-keyword public facade) and the integrity cross-check tool.
-    Any other caller bypasses the ``include_stale`` guard and reopens the
-    enumeration bug.
-    """
-    repo_root = Path(__file__).resolve().parent.parent
-    offenders: list[tuple[str, int, str]] = []
-
-    guard_self = "tests/test_simhash_unification_guard.py"
-    for py_file in sorted(tracked_python_files(repo_root)):
-        rel = py_file.relative_to(repo_root).as_posix()
-        if rel.startswith("archive/") or rel == guard_self:
-            continue
-        for label, lineno, src in _find_private_accessor_calls_outside_allowlist(py_file, rel):
-            offenders.append((rel, lineno, src))
-
-    assert not offenders, (
-        "Direct ``._active_simhashes()`` / ``._known_simhashes()`` calls found "
-        "outside the allowlist.  Route callers through "
-        "``MemoryStore.tier_simhashes(tier, *, include_stale=bool)``:\n"
-        + "\n".join(f"  {p}:{n} — {s}" for p, n, s in offenders)
+        "'simhash_registry.json' string literal found in live code. The "
+        "sidecar has been eliminated; simhashes now live in "
+        "indexed_key_registry.json. Remove the reference or add the file to "
+        "the allowlist with a comment explaining why it legitimately "
+        "references the old name:\n" + "\n".join(f"  {p}:{n} — {s!r}" for p, n, s in offenders)
     )

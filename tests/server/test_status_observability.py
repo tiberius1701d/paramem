@@ -52,21 +52,28 @@ def _make_config(
 
 
 def _make_interim_dir(adapter_dir: Path, stamp: str) -> Path:
-    """Create an episodic/interim_<stamp> slot carrying a train-venue payload.
+    """Create an episodic/interim_<stamp> slot carrying a written payload.
 
     ``iter_interim_dirs`` scans <adapter_dir>/episodic/interim_*; the
     function returns (adapter_name, path) where adapter_name includes the
-    "interim_" prefix.  The schedule helpers scan it venue-filtered, so the
-    slot needs the train payload (``adapter_model.safetensors``) to be counted
-    — a payload-less directory carries nothing to fold and is skipped.
+    "interim_" prefix.  The schedule helpers scan it via
+    ``payload_only=True``, which is venue-blind — it counts any slot
+    candidate (a subdirectory carrying its own ``meta.json``,
+    ``count_slot_candidates``' presence-only predicate), never which venue's
+    payload file it holds. No payload file is written here: a payload-less
+    directory with no slot candidate at all carries nothing to fold and is
+    skipped, but the candidate predicate itself is satisfied by ``meta.json``
+    alone.
     """
     p = adapter_dir / "episodic" / f"interim_{stamp}"
     p.mkdir(parents=True, exist_ok=True)
-    # Write a minimal meta.json so the dir is recognised as a valid interim slot.
-    (p / "meta.json").write_text(json.dumps({"window_stamp": stamp}))
     slot = p / f"{stamp}-slot"
     slot.mkdir(parents=True, exist_ok=True)
-    (slot / "adapter_model.safetensors").write_bytes(b"")
+    # meta.json lives INSIDE the slot subdirectory -- that is the candidate
+    # predicate count_slot_candidates/iter_slot_candidates checks (a
+    # subdirectory of the interim dir carrying its own meta.json), not the
+    # interim dir itself.
+    (slot / "meta.json").write_text(json.dumps({"window_stamp": stamp}))
     return p
 
 
@@ -236,7 +243,6 @@ class TestTierKeyCounts:
     def _build_mock_store(self, tier_data: dict[str, list[str]]) -> object:
         """Return a MemoryStore-like mock for the given tier → keys mapping."""
         store = MagicMock()
-        store.replay_enabled = True
         store.all_active_keys.return_value = [k for keys in tier_data.values() for k in keys]
         store.tiers_with_registry.return_value = list(tier_data.keys())
         store.active_keys_in_tier.side_effect = lambda tier: tier_data.get(tier, [])

@@ -30,7 +30,6 @@ _VALID_BUNDLE_MANIFEST: dict[str, Any] = {
     "created_at": "2026-05-20T20:55:00Z",
     "tier": "manual",
     "label": None,
-    "key_metadata_sha256": "a" * 64,
     "base_model": {},
     "files": [],
     "adapters": {},
@@ -223,13 +222,32 @@ class TestCorruptBundleManifest:
         warn_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
         assert warn_records, "Expected a WARNING log for corrupt bundle manifest, got none."
 
-    def test_wrong_schema_version_skipped(self, tmp_path) -> None:
-        """Bundle manifest with wrong schema version is skipped (not raised)."""
+    def test_wrong_schema_version_enumerated_as_incompatible_not_hidden(self, tmp_path) -> None:
+        """A bundle whose bundle_schema_version does not match this build's
+        version is still enumerated (visible in /backup/list) -- marked
+        incompatible with the version actually found, not silently hidden."""
         base = tmp_path / "backups"
         slot = base / "snapshot_bundle" / "20260520-20550000"
         slot.mkdir(parents=True)
         m = _VALID_BUNDLE_MANIFEST.copy()
         m["bundle_schema_version"] = 999  # unknown version
+        (slot / "bundle.meta.json").write_text(json.dumps(m), encoding="utf-8")
+
+        records = enumerate_backups(base)
+        assert len(records) == 1
+        assert records[0].incompatible is True
+        assert records[0].found_bundle_schema_version == 999
+        assert records[0].is_bundle is True
+
+    def test_wrong_schema_version_missing_entirely_still_skipped(self, tmp_path) -> None:
+        """A manifest that never named a version at all (a corrupt/garbage
+        file, not a legitimate old-format bundle) still stays hidden -- only
+        a manifest that NAMES a version is a legitimate incompatible bundle."""
+        base = tmp_path / "backups"
+        slot = base / "snapshot_bundle" / "20260520-20550000"
+        slot.mkdir(parents=True)
+        m = _VALID_BUNDLE_MANIFEST.copy()
+        del m["bundle_schema_version"]
         (slot / "bundle.meta.json").write_text(json.dumps(m), encoding="utf-8")
 
         records = enumerate_backups(base)

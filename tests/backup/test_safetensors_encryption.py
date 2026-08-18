@@ -8,14 +8,11 @@ Covers:
   RAM before handing the path to PEFT.
 - :func:`paramem.backup.encryption.infra_paths` — verifies that
   ``adapter_model.safetensors`` files are included in the candidate set.
-- :func:`paramem.models.loader.atomic_save_adapter` — verifies that Step 3.5
-  (encrypt) is wired into the save sequence.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -256,7 +253,7 @@ class TestInfraPathsIncludesSafetensors:
 
         Telemetry (paths.telemetry, integers-only VRAM/adapter metrics) must
         stay plaintext and greppable during an incident — unlike
-        fold_resume.json and checkpoints, which are age blobs you cannot
+        staging_resume.json, which is an age blob you cannot
         ``cat`` mid-incident.
         """
         data_dir = tmp_path / "data"
@@ -267,31 +264,3 @@ class TestInfraPathsIncludesSafetensors:
 
         paths = infra_paths(data_dir)
         assert telemetry_file not in paths
-
-
-# ---------------------------------------------------------------------------
-# atomic_save_adapter — encrypt step wired in
-# ---------------------------------------------------------------------------
-
-
-class TestAtomicSaveAdapterEncryptStep:
-    """atomic_save_adapter calls _encrypt_adapter_safetensors during the save."""
-
-    def test_encrypt_called_on_save(self, tmp_path):
-        """_encrypt_adapter_safetensors is invoked during atomic_save_adapter."""
-        from paramem.models.loader import atomic_save_adapter
-
-        fake_model = MagicMock()
-        fake_model.peft_config = {"episodic": MagicMock()}
-
-        def _fake_save_pretrained(slot_str, selected_adapters=None):
-            slot = Path(slot_str)
-            (slot / "adapter_model.safetensors").write_bytes(_FAKE_SAFETENSORS)
-            (slot / "adapter_config.json").write_text('{"r": 8}')
-
-        fake_model.save_pretrained.side_effect = _fake_save_pretrained
-
-        with patch("paramem.models.loader._encrypt_adapter_safetensors") as mock_encrypt:
-            atomic_save_adapter(fake_model, tmp_path / "adapters" / "episodic", "episodic")
-
-        mock_encrypt.assert_called_once()

@@ -567,7 +567,7 @@ class TestConsolidationIntegration:
     def _make_session_buffer(tmp_path, conv_id, speaker_id):
         from paramem.server.session_buffer import SessionBuffer
 
-        buffer = SessionBuffer(tmp_path / "sessions", state_dir=tmp_path / "state", debug=False)
+        buffer = SessionBuffer(tmp_path / "sessions", debug=False)
         buffer.set_speaker(conv_id, speaker_id, speaker_id)
         buffer.append(conv_id, "user", "Hello there")
         buffer.append(conv_id, "assistant", "Hi!")
@@ -886,14 +886,13 @@ class TestPerChunkOOMSkip:
             sessions=ha / "sessions",
             debug=ha / "debug",
         )
-        # Disable indexed_key_replay so the no-facts/early-exit path
-        # is the simplest and most testable shape (we're only verifying
-        # the per-chunk skip + mark_consolidated filter, not training).
-        config.consolidation.indexed_key_replay = False
-
+        # Both chunks return no relations, so extraction lands on the
+        # unconditional "no facts extracted" early-exit — the simplest and
+        # most testable shape (we're only verifying the per-chunk skip +
+        # mark_consolidated filter, not training).
         (ha / "adapters").mkdir(parents=True, exist_ok=True)
 
-        buffer = SessionBuffer(ha / "sessions", state_dir=ha / "state", debug=False)
+        buffer = SessionBuffer(ha / "sessions", debug=False)
         # Two pending document sessions, both with speaker_id set. Uses
         # append_document_chunk (not append) so the session_id is the
         # deterministic sid itself, mirroring the real /ingest-sessions
@@ -913,7 +912,6 @@ class TestPerChunkOOMSkip:
         loop = MagicMock()
         loop.shutdown_requested = False
         loop.config = MagicMock()
-        loop.config.indexed_key_replay = False
 
         from paramem.utils.vram_guard import VramExhausted as _Exh
 
@@ -1040,10 +1038,9 @@ class TestExtractionFailedAbortsCycle:
             sessions=ha / "sessions",
             debug=ha / "debug",
         )
-        config.consolidation.indexed_key_replay = False
         (ha / "adapters").mkdir(parents=True, exist_ok=True)
 
-        buffer = SessionBuffer(ha / "sessions", state_dir=ha / "state", debug=False)
+        buffer = SessionBuffer(ha / "sessions", debug=False)
         # append_document_chunk (not append): deterministic session_id,
         # mirroring the real /ingest-sessions handler.
         for sid in ("doc-aaa", "doc-bbb", "doc-ccc"):
@@ -1060,7 +1057,6 @@ class TestExtractionFailedAbortsCycle:
         loop = MagicMock()
         loop.shutdown_requested = False
         loop.config = MagicMock()
-        loop.config.indexed_key_replay = False
 
         def _extract(transcript, sid, **kwargs):
             if sid == "doc-bbb":

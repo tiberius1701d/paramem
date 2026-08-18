@@ -41,7 +41,7 @@ def _make_loop() -> ConsolidationLoop:
     # Minimal state expected by seeding helpers.
     from paramem.memory.store import MemoryStore as _MS
 
-    loop.store = _MS(replay_enabled=False)
+    loop.store = _MS()
     loop.cycle_count: int = 1
     return loop
 
@@ -128,7 +128,8 @@ class TestRelationToEntryDict:
         raw ``session_graph.relations`` predicate must carry the SAME
         surface as the full-cycle edge entry, which merger.py:710 stamps via
         ``canonical()`` onto the edge attribute (read back verbatim by
-        ``_build_all_edge_entries_into``'s ``pred = _t_data.get("predicate", "")``).
+        ``ConsolidationLoop._build_working_keyed_walk``'s edge walk,
+        ``pred = data.get("predicate", "")``).
         """
         from paramem.utils.identity import canonical
 

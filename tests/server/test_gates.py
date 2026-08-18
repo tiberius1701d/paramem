@@ -7,24 +7,15 @@ is patched for quad-mode tests.  Registry files are written to ``tmp_path``.
 
 Coverage:
   - Each gate's pass/fail/skip paths including the 2 new skip conditions.
-  - NO_NEW_SESSIONS end-to-end (session_buffer_empty=True).
   - Gate 4 deterministic sample stability.
   - Gate 4 retry seed produces a different list.
-  - Gate 4 ≥ 18/20 first sample → PASS, no retry.
-  - Gate 4 17/20 first, 20/20 retry → PASS + cluster-variance warning.
-  - Gate 4 17/20 both samples → FAIL.
-  - Gate 4 < 20 keys → SKIPPED.
-  - Gate 4 missing registry file → SKIPPED.
-  - Gate 4 metrics includes sampled_keys.
   - Phase categorizer: extraction exception → gate 1 FAIL, gate 2 SKIPPED.
   - Phase categorizer: training exception → gate 1 PASS, gate 2 FAIL.
   - Phase categorizer logs at WARNING.
   - Unmount: delete_adapter called when > 1 adapter mounted.
   - Unmount: delete_adapter NOT called when trial_probe is the sole adapter.
   - Unmount survives delete_adapter raising.
-  - Enriched registry format ({key: {"simhash": int, ...}}) works in gate 4.
   - Gate 3: read_keyed_pairs + probe_entries → PASS / FAIL.
-  - Gate 4: probe_entries (batched) + verify_confidence → PASS.
 """
 
 from __future__ import annotations
@@ -46,11 +37,9 @@ from paramem.server.gates import (
     _gate_1_extraction,
     _gate_2_training,
     _gate_3_reload_smoke,
-    _gate_4_recall_check,
     _is_training_marker,
     _sample_registry_keys,
     _unmount_trial_probe,
-    evaluate_gates,
 )
 from paramem.training.key_registry import KeyRegistry
 
@@ -70,41 +59,6 @@ def _no_real_sleep_in_mount(monkeypatch):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-def _make_registry(n: int, tmp_path: Path, fname: str = "key_metadata.json") -> Path:
-    """Write the REAL production ``key_metadata.json`` schema with ``n`` keys.
-
-    Matches ``ConsolidationLoop.write_key_metadata``
-    (``paramem/training/consolidation.py``):
-    ``{"cycle_count": int, "promoted_keys": [...], "keys": {key: bookkeeping}}``.
-    Per-key bookkeeping mirrors ``MemoryStore.bookkeeping_for_key``
-    (``paramem/memory/store.py:435-445``) — ``speaker_id``, ``relation_type``,
-    ``reinforcement_count``, ``last_reinforced_cycle``, ``last_seen``,
-    ``first_seen``.  Crucially: NO ``simhash`` field anywhere — this file is
-    never a SimHash source, only a key-population source (see
-    ``KeyRegistry.load_simhashes`` / ``_registry_key_population`` in gates.py).
-
-    This is what ``live_registry_path`` (``live_config.paths.key_metadata``,
-    ``paramem/server/app.py:8695``) actually points at in production — a flat
-    ``{key: simhash}`` file, as this fixture previously wrote, is a schema
-    production never produces for that path.
-    """
-    keys_payload = {
-        f"graph{i}": {
-            "speaker_id": "",
-            "relation_type": "unknown",
-            "reinforcement_count": 1,
-            "last_reinforced_cycle": 1,
-            "last_seen": "2026-04-22T00:00:00+00:00",
-            "first_seen": "2026-04-22T00:00:00+00:00",
-        }
-        for i in range(1, n + 1)
-    }
-    registry = {"cycle_count": 1, "promoted_keys": [], "keys": keys_payload}
-    p = tmp_path / fname
-    p.write_text(json.dumps(registry))
-    return p
 
 
 def _make_trial_adapter(tmp_path: Path, with_registry: bool = True) -> Path:
@@ -175,44 +129,47 @@ class TestGateResultToDict:
 
 
 class TestSampleRegistryKeys:
-    def _make_content(self, n: int) -> bytes:
-        """Build KeyRegistry JSON bytes for n keys using the new per-tier schema."""
+    def _make_content(self, n: int) -> tuple[bytes, list[str]]:
+        """Build KeyRegistry JSON bytes + sorted population for n keys.
+
+        Returns ``(registry_content, population)`` — the same pair
+        :func:`_live_key_population` hands to :func:`_sample_registry_keys`.
+        """
         reg = KeyRegistry()
         for i in range(1, n + 1):
             reg.add(f"graph{i}")
-        return reg.save_bytes()
+        return reg.save_bytes(), sorted(reg.list_active())
 
     def test_stable_same_input(self):
         """Same bytes → same list every time (deterministic)."""
-        content = self._make_content(50)
-        keys1 = _sample_registry_keys(content)
-        keys2 = _sample_registry_keys(content)
+        content, population = self._make_content(50)
+        keys1 = _sample_registry_keys(content, population)
+        keys2 = _sample_registry_keys(content, population)
         assert keys1 == keys2
 
     def test_sample_size_capped_at_20(self):
-        content = self._make_content(50)
-        keys = _sample_registry_keys(content)
+        content, population = self._make_content(50)
+        keys = _sample_registry_keys(content, population)
         assert len(keys) == GATE_4_SAMPLE_SIZE
 
     def test_sample_size_less_than_20(self):
-        content = self._make_content(10)
-        keys = _sample_registry_keys(content)
+        content, population = self._make_content(10)
+        keys = _sample_registry_keys(content, population)
         assert len(keys) == 10
 
     def test_retry_suffix_produces_different_list(self):
         """seed_suffix=b'|retry' must produce a different sample."""
-        content = self._make_content(50)
-        keys_first = _sample_registry_keys(content, seed_suffix=b"")
-        keys_retry = _sample_registry_keys(content, seed_suffix=b"|retry")
+        content, population = self._make_content(50)
+        keys_first = _sample_registry_keys(content, population, seed_suffix=b"")
+        keys_retry = _sample_registry_keys(content, population, seed_suffix=b"|retry")
         # Very unlikely to be identical with 50 keys and sample of 20.
         assert keys_first != keys_retry
 
     def test_sorted_population(self):
         """All returned keys must be from the registry's active_keys."""
-        content = self._make_content(30)
-        registry = json.loads(content)
-        all_keys = set(registry["active_keys"])
-        keys = _sample_registry_keys(content)
+        content, population = self._make_content(30)
+        all_keys = set(population)
+        keys = _sample_registry_keys(content, population)
         assert set(keys).issubset(all_keys)
 
 
@@ -528,85 +485,11 @@ class TestPhaseCategorizer:
 
 
 # ---------------------------------------------------------------------------
-# NO_NEW_SESSIONS end-to-end via evaluate_gates
+# gates module import hygiene
 # ---------------------------------------------------------------------------
 
 
-class TestEvaluateGatesNoNewSessions:
-    def test_all_gates_skipped_when_buffer_empty(self, tmp_path):
-        """session_buffer_empty=True → all gates return skipped."""
-        reg_path = _make_registry(25, tmp_path)
-        trial_dir = tmp_path / "trial_adapter"
-        trial_dir.mkdir()
-        model = _make_mock_model()
-
-        results = evaluate_gates(
-            model=model,
-            tokenizer=MagicMock(),
-            trial_adapter_dir=trial_dir,
-            live_registry_path=reg_path,
-            session_buffer_empty=True,
-            consolidation_summary=None,
-            consolidation_exception=None,
-            recall_probe_batch_size=16,
-        )
-
-        assert len(results) == 4
-        # Gates 1/2/3 must be skipped.
-        for r in results[:3]:
-            assert r.status == "skipped", f"Gate {r.gate} expected skipped, got {r.status}"
-
-    def test_trial_probe_not_in_adapters_after_evaluate(self, tmp_path):
-        """Acceptance criterion D — trial_probe must not remain after evaluate_gates.
-
-        The mock model starts with one adapter ("episodic").  The trial dir has
-        episodic/indexed_key_registry.json so the in-memory path is taken:
-        set_adapter is used (not load_adapter), and unmount restores the original
-        adapter via set_adapter — delete_adapter is NOT called (we never added
-        an extra adapter).  The peft_config keys remain unchanged (just "episodic").
-        """
-        reg_path = _make_registry(25, tmp_path)
-        trial_dir = _make_trial_adapter(tmp_path)
-        model = _make_mock_model(["episodic"])
-
-        # Both gate 3 and gate 4 use probe_entries (generator yielding (entry, recalled) tuples).
-        def _yield_recalled(m, tok, entries, registry=None, batch_size=1, **kw):
-            for e in entries:
-                yield (
-                    e,
-                    {
-                        "key": e["key"],
-                        "subject": "S",
-                        "predicate": "p",
-                        "object": "O",
-                        "confidence": 1.0,
-                        "raw_output": '{"key":"graph1","subject":"S","predicate":"p","object":"O"}',
-                    },
-                )
-
-        with (
-            patch("paramem.training.recall_eval.probe_entries", side_effect=_yield_recalled),
-            patch("paramem.memory.entry.verify_confidence", return_value=1.0),
-        ):
-            evaluate_gates(
-                model=model,
-                tokenizer=MagicMock(),
-                trial_adapter_dir=trial_dir,
-                live_registry_path=reg_path,
-                session_buffer_empty=False,
-                consolidation_summary={"status": "complete"},
-                consolidation_exception=None,
-                recall_probe_batch_size=16,
-            )
-
-        # In-memory mount path: set_adapter was used, not load_adapter.
-        # delete_adapter must NOT be called (no extra adapter was added).
-        model.load_adapter.assert_not_called()
-        model.delete_adapter.assert_not_called()
-        # set_adapter was called at least twice: once to activate "episodic"
-        # during mount, once to restore it during unmount.
-        assert model.set_adapter.call_count >= 2
-
+class TestGatesModuleNoGpuImport:
     def test_no_gpu_import_at_module_level(self):
         """Acceptance criterion C — gates module must not import torch at top level."""
 
@@ -774,128 +657,10 @@ class TestGate3AdapterReloadQuad:
 # ---------------------------------------------------------------------------
 
 
-def _make_quad_registry(n: int, tmp_path: Path, fname: str = "registry_quad.json") -> Path:
-    """Write the REAL production ``key_metadata.json`` schema with ``n`` keys.
-
-    See :func:`_make_registry` docstring — same schema, ``qgraph``-prefixed
-    key names so tests can distinguish this population from a trial
-    adapter's own ``graph``-prefixed keys where relevant. Previously wrote a
-    flat ``{key: simhash}`` shape production never produces for this file —
-    that fixture was lying about the on-disk schema (the very defect this
-    fix targets), so a test built on it could pass while the real code path
-    stayed broken.
-    """
-    keys_payload = {
-        f"qgraph{i}": {
-            "speaker_id": "",
-            "relation_type": "unknown",
-            "reinforcement_count": 1,
-            "last_reinforced_cycle": 1,
-            "last_seen": "2026-04-22T00:00:00+00:00",
-            "first_seen": "2026-04-22T00:00:00+00:00",
-        }
-        for i in range(1, n + 1)
-    }
-    registry = {"cycle_count": 1, "promoted_keys": [], "keys": keys_payload}
-    p = tmp_path / fname
-    p.write_text(json.dumps(registry))
-    return p
-
-
-class TestGate4RecallCheckQuad:
-    """Gate 4 quad-path: probe_entries (batched) + quad verify_confidence dispatch."""
-
-    def test_pass_quad_20_of_20(self, tmp_path):
-        """20/20 quad probes passing → PASS."""
-        reg_path = _make_quad_registry(25, tmp_path)
-        trial_dir = _make_trial_adapter_quad(tmp_path)
-        model = _make_mock_model()
-
-        def _probe_quad_batch(m, tok, entries, registry=None, batch_size=1, **kw):
-            # Mirror probe_entries: a generator yielding (entry, recalled) tuples.
-            for e in entries:
-                key = e["key"]
-                yield (
-                    e,
-                    {
-                        "key": key,
-                        "subject": "Alex",
-                        "predicate": "lives_in",
-                        "object": "Heilbronn",
-                        "confidence": 1.0,
-                        "raw_output": (
-                            f'{{"key": "{key}", "subject": "Alex", '
-                            '"predicate": "lives_in", "object": "Heilbronn"}'
-                        ),
-                    },
-                )
-
-        with patch("paramem.training.recall_eval.probe_entries", side_effect=_probe_quad_batch):
-            with patch("paramem.memory.entry.verify_confidence", return_value=1.0):
-                g = _gate_4_recall_check(
-                    model=model,
-                    tokenizer=MagicMock(),
-                    trial_adapter_dir=trial_dir,
-                    live_registry_path=reg_path,
-                    mount_state={"mounted": True, "pre_active_adapter": ["episodic"]},
-                    recall_probe_batch_size=16,
-                )
-
-        assert g.status == "pass"
-        assert g.metrics["retried"] is False
-
-
 # ---------------------------------------------------------------------------
-# KeyRegistry.load_simhashes / _registry_key_population — the shared helper and
-# the schema-mismatch bug it fixes
+# KeyRegistry.load_simhashes — the shared helper and the schema-mismatch bug
+# it fixes
 # ---------------------------------------------------------------------------
-
-
-class TestRegistryKeyPopulation:
-    """_registry_key_population must count real indexed keys, not top-level
-    fields.
-
-    Regression coverage for Gate 4's "never runs" bug: live_registry_path
-    (key_metadata.json) always has exactly 3 top-level fields
-    (cycle_count / promoted_keys / keys) regardless of how many keys are
-    actually tracked, so the OLD ``len(registry_parsed)`` always computed 3
-    — permanently below GATE_4_MIN_REGISTRY_SIZE (20) — and gate 4 skipped
-    on every deployment.
-    """
-
-    def test_key_metadata_schema_top_level_field_count_is_three(self, tmp_path):
-        """Evidence: the OLD buggy `len(registry_parsed)` always computed 3,
-        regardless of how many keys key_metadata.json actually tracks."""
-        reg_path = _make_registry(25, tmp_path)
-        parsed = json.loads(reg_path.read_text())
-        assert len(parsed) == 3, (
-            "key_metadata.json (consolidation.py:436-440) always has exactly "
-            "3 top-level fields — this is the bug: len(registry_parsed) never "
-            "reflects the actual key count"
-        )
-
-    def test_population_counts_actual_keys(self, tmp_path):
-        """The FIX: population extraction counts the real per-key entries
-        nested under 'keys', not the 3 top-level bookkeeping fields."""
-        from paramem.server.gates import _registry_key_population
-
-        reg_path = _make_registry(25, tmp_path)
-        parsed = json.loads(reg_path.read_text())
-        assert len(_registry_key_population(parsed)) == 25
-
-    def test_active_keys_schema_unaffected(self):
-        """KeyRegistry per-tier schema (active_keys) still works unchanged."""
-        from paramem.server.gates import _registry_key_population
-
-        parsed = {"active_keys": ["graph1", "graph2", "graph3"], "simhash": {}}
-        assert _registry_key_population(parsed) == ["graph1", "graph2", "graph3"]
-
-    def test_flat_legacy_schema_unaffected(self):
-        """Legacy flat {key: simhash} registries still work unchanged."""
-        from paramem.server.gates import _registry_key_population
-
-        parsed = {"graph1": 111, "graph2": 222}
-        assert _registry_key_population(parsed) == ["graph1", "graph2"]
 
 
 class TestLoadSimhashRegistry:
@@ -910,14 +675,6 @@ class TestLoadSimhashRegistry:
 
     def test_missing_file_returns_empty(self, tmp_path):
         assert KeyRegistry.load_simhashes(tmp_path / "missing.json") == {}
-
-    def test_key_metadata_shape_raises(self, tmp_path):
-        """key_metadata.json has no per-key simhash field anywhere — passing
-        it to this helper must raise, not silently return an empty/wrong map.
-        """
-        reg_path = _make_registry(5, tmp_path)
-        with pytest.raises(ValueError, match="simhash"):
-            KeyRegistry.load_simhashes(reg_path)
 
     def test_keyregistry_shape_extracts_simhash(self, tmp_path):
         reg = KeyRegistry()
@@ -938,48 +695,6 @@ class TestLoadSimhashRegistry:
         import paramem.server.gates as gates_mod
 
         assert not hasattr(gates_mod, "_load_simhash_registry")
-
-
-class TestGate4NoLongerAlwaysSkips:
-    """End-to-end: gate 4 must actually run its recall check against a
-    real-schema key_metadata.json with >= GATE_4_MIN_REGISTRY_SIZE keys — it
-    must not SKIP with "has only 3 keys" (the old top-level-field-count bug).
-    """
-
-    def test_gate4_proceeds_past_size_check(self, tmp_path):
-        reg_path = _make_registry(25, tmp_path)
-        trial_dir = _make_trial_adapter_quad(tmp_path)
-        model = _make_mock_model()
-
-        def _probe(m, tok, entries, registry=None, batch_size=1, **kw):
-            for e in entries:
-                yield (
-                    e,
-                    {
-                        "key": e["key"],
-                        "subject": "S",
-                        "predicate": "p",
-                        "object": "O",
-                        "confidence": 1.0,
-                        "raw_output": "irrelevant — verify_confidence mocked",
-                    },
-                )
-
-        with (
-            patch("paramem.training.recall_eval.probe_entries", side_effect=_probe),
-            patch("paramem.memory.entry.verify_confidence", return_value=1.0),
-        ):
-            g = _gate_4_recall_check(
-                model=model,
-                tokenizer=MagicMock(),
-                trial_adapter_dir=trial_dir,
-                live_registry_path=reg_path,
-                mount_state={"mounted": True, "pre_active_adapter": ["episodic"]},
-                recall_probe_batch_size=16,
-            )
-
-        assert g.status == "pass", g.reason
-        assert g.reason is None or "only" not in g.reason
 
 
 class TestGate3RealConfidenceVerification:
@@ -1064,127 +779,6 @@ class TestGate3RealConfidenceVerification:
         assert "low_confidence" in g.reason
 
 
-class TestGate4RealConfidenceVerification:
-    """Gate 4 must sample the population from the live registry
-    (key_metadata.json) but verify recall content against the trial
-    adapter's own SimHash fingerprints. Uses REAL verify_confidence
-    (nothing mocked) end-to-end to prove the wiring is correct, not just
-    that the code path doesn't crash.
-    """
-
-    def test_correct_recall_passes_with_real_verification(self, tmp_path):
-        from paramem.memory.entry import entry_simhash, finalize_recalled
-
-        # Live population: 20 keys graph1..graph20 (>= GATE_4_MIN_REGISTRY_SIZE),
-        # sourced from key_metadata.json (bookkeeping only, no simhash).
-        reg_path = _make_registry(20, tmp_path)
-
-        trial_dir = tmp_path / "trial_adapter"
-        episodic_dir = trial_dir / "episodic"
-        episodic_dir.mkdir(parents=True)
-        (trial_dir / "adapter_config.json").write_text("{}")
-        (trial_dir / "adapter_model.safetensors").write_bytes(b"\x00" * 4)
-
-        # Trial adapter's own per-tier registry — full-replay retrain wrote
-        # ground-truth fingerprints for the WHOLE live population.
-        reg = KeyRegistry()
-        ground_truth: dict[str, tuple[str, str, str]] = {}
-        for i in range(1, 21):
-            key = f"graph{i}"
-            subject, predicate, obj = f"Person{i}", "lives_in", f"City{i}"
-            reg.add(key)
-            reg.set_simhash(
-                key,
-                entry_simhash(
-                    {"key": key, "subject": subject, "predicate": predicate, "object": obj}
-                ),
-            )
-            ground_truth[key] = (subject, predicate, obj)
-        (episodic_dir / "indexed_key_registry.json").write_bytes(reg.save_bytes())
-
-        model = _make_mock_model()
-
-        def _probe_batch(m, tok, entries, registry=None, batch_size=1, **kw):
-            for e in entries:
-                subject, predicate, obj = ground_truth[e["key"]]
-                raw = json.dumps(
-                    {"key": e["key"], "subject": subject, "predicate": predicate, "object": obj}
-                )
-                yield e, finalize_recalled(raw, e["key"], registry, 0.75)
-
-        with patch("paramem.training.recall_eval.probe_entries", side_effect=_probe_batch):
-            g = _gate_4_recall_check(
-                model=model,
-                tokenizer=MagicMock(),
-                trial_adapter_dir=trial_dir,
-                live_registry_path=reg_path,
-                mount_state={"mounted": True, "pre_active_adapter": ["episodic"]},
-                recall_probe_batch_size=16,
-            )
-
-        assert g.status == "pass", g.reason
-        assert g.metrics["recalled"] == g.metrics["sampled"] == 20
-
-    def test_donor_content_across_all_sampled_keys_fails(self, tmp_path):
-        """Warm-start-donor scenario at gate-4 scale: every recalled key
-        echoes the correct key but a foreign adapter's content — both the
-        first sample and the retry must fail, so the gate FAILs overall."""
-        from paramem.memory.entry import entry_simhash, finalize_recalled
-
-        reg_path = _make_registry(20, tmp_path)
-
-        trial_dir = tmp_path / "trial_adapter"
-        episodic_dir = trial_dir / "episodic"
-        episodic_dir.mkdir(parents=True)
-        (trial_dir / "adapter_config.json").write_text("{}")
-        (trial_dir / "adapter_model.safetensors").write_bytes(b"\x00" * 4)
-
-        reg = KeyRegistry()
-        for i in range(1, 21):
-            key = f"graph{i}"
-            reg.add(key)
-            reg.set_simhash(
-                key,
-                entry_simhash(
-                    {
-                        "key": key,
-                        "subject": f"Person{i}",
-                        "predicate": "lives_in",
-                        "object": f"City{i}",
-                    }
-                ),
-            )
-        (episodic_dir / "indexed_key_registry.json").write_bytes(reg.save_bytes())
-
-        model = _make_mock_model()
-
-        def _probe_batch(m, tok, entries, registry=None, batch_size=1, **kw):
-            for e in entries:
-                # Donor content: correct key, wrong (constant, foreign) fact.
-                raw = json.dumps(
-                    {
-                        "key": e["key"],
-                        "subject": "DonorPerson",
-                        "predicate": "works_at",
-                        "object": "DonorCorp",
-                    }
-                )
-                yield e, finalize_recalled(raw, e["key"], registry, 0.75)
-
-        with patch("paramem.training.recall_eval.probe_entries", side_effect=_probe_batch):
-            g = _gate_4_recall_check(
-                model=model,
-                tokenizer=MagicMock(),
-                trial_adapter_dir=trial_dir,
-                live_registry_path=reg_path,
-                mount_state={"mounted": True, "pre_active_adapter": ["episodic"]},
-                recall_probe_batch_size=16,
-            )
-
-        assert g.status == "fail", g.reason
-        assert g.metrics["recalled"] == 0
-
-
 # ---------------------------------------------------------------------------
 # Gate 3 per-kind subdir layout: _find_tier_registry helper
 # ---------------------------------------------------------------------------
@@ -1205,8 +799,8 @@ class TestGate3KindSubdirLayout:
     def _registry_content(self) -> bytes:
         """Return minimal indexed_key_registry.json content bytes.
 
-        Uses the new per-tier KeyRegistry schema:
-        ``{active_keys: [...], fidelity_history: {}, health: null}``.
+        Uses the per-tier KeyRegistry schema:
+        ``{active_keys: [...], stale: {...}, simhash: {...}}``.
         """
         reg = KeyRegistry()
         reg.add("graph1")
@@ -1339,155 +933,6 @@ class TestGate3KindSubdirLayout:
             f"got {g.status}: {g.reason}"
         )
         assert "no kind-specific adapter trained" in (g.reason or "")
-
-
-# ---------------------------------------------------------------------------
-# Gate 4 file-not-found → SKIPPED (2026-04-22 re-test fix)
-# ---------------------------------------------------------------------------
-
-
-class TestGate4RegistryFileNotFoundSkip:
-    """Gate 4 must return SKIPPED (not FAIL) when the live registry file does
-    not exist.
-
-    Gate 4 skips if the live registry has fewer than 20 keys (fresh install);
-    file-not-found is the strongest form of that condition.  Only corrupt /
-    unparseable files (that *do* exist) should FAIL (missing-file case was
-    changed to SKIPPED; corrupt-but-existing is still FAIL).
-    """
-
-    def test_gate4_skips_when_registry_file_does_not_exist(self, tmp_path):
-        """live_registry_path points at a non-existent file → status='skipped'.
-
-        Before the file-not-found fix, gate 4 returned FAIL with
-        'live registry file not found'.  Fresh-install hosts have no
-        production registry and must not be penalised.
-        """
-        trial_dir = tmp_path / "trial_adapter"
-        trial_dir.mkdir()
-        (trial_dir / "adapter_config.json").write_text("{}")
-        (trial_dir / "adapter_model.safetensors").write_bytes(b"\x00" * 4)
-
-        non_existent = tmp_path / "does_not_exist" / "key_metadata.json"
-        # Do not create the file — it must be genuinely absent.
-        assert not non_existent.exists()
-
-        model = _make_mock_model()
-        g = _gate_4_recall_check(
-            model=model,
-            tokenizer=MagicMock(),
-            trial_adapter_dir=trial_dir,
-            live_registry_path=non_existent,
-            mount_state={"mounted": False, "pre_active_adapter": []},
-            recall_probe_batch_size=16,
-        )
-
-        assert g.status == "skipped", (
-            f"Gate 4 should return skipped on file-not-found, got {g.status}: {g.reason}"
-        )
-        assert "not found" in (g.reason or ""), f"Reason should mention 'not found': {g.reason!r}"
-        assert "fresh install" in (g.reason or ""), (
-            f"Reason should mention 'fresh install': {g.reason!r}"
-        )
-
-    def test_gate4_fails_when_registry_file_exists_but_unparseable(self, tmp_path):
-        """File-not-found is SKIPPED; corrupt-but-existing is still FAIL.
-
-        Pins the narrow scope of the fix: only the missing-file case was changed
-        to SKIPPED.  A file that exists but contains invalid JSON must still
-        return FAIL so genuine data corruption is not silently swallowed as a
-        fresh-install skip.
-        """
-        trial_dir = tmp_path / "trial_adapter"
-        trial_dir.mkdir()
-        (trial_dir / "adapter_config.json").write_text("{}")
-        (trial_dir / "adapter_model.safetensors").write_bytes(b"\x00" * 4)
-
-        # Create a file that exists but contains invalid JSON.
-        registry_path = tmp_path / "key_metadata.json"
-        registry_path.write_text("not valid json {{{")
-        assert registry_path.exists()
-
-        model = _make_mock_model()
-        g = _gate_4_recall_check(
-            model=model,
-            tokenizer=MagicMock(),
-            trial_adapter_dir=trial_dir,
-            live_registry_path=registry_path,
-            mount_state={"mounted": False, "pre_active_adapter": []},
-            recall_probe_batch_size=16,
-        )
-
-        assert g.status == "fail", (
-            f"Gate 4 should FAIL for corrupt-but-existing registry, got {g.status}: {g.reason}"
-        )
-        # Reason must not mention fresh install — this is data corruption, not a fresh deploy.
-        assert "fresh install" not in (g.reason or ""), (
-            f"Corrupt-file FAIL reason must not mention 'fresh install': {g.reason!r}"
-        )
-
-
-# ---------------------------------------------------------------------------
-# Gate 4 — SKIP unconditionally on missing live registry file
-# ---------------------------------------------------------------------------
-
-
-class TestGate4MissingRegistrySkips:
-    """Gate 4 SKIPS on missing key_metadata.json — fresh install or pre-timestamped-slot
-    layout. The CRITICAL #1 fix isolates trial registry writes to
-    state/trial_registry/, so trial-induced corruption of the live file is no
-    longer a concern that the gate needs to police.
-    """
-
-    def test_gate4_skip_when_file_missing(self, tmp_path):
-        """Missing live registry → SKIPPED (no FAIL)."""
-        missing_path = tmp_path / "nonexistent_registry.json"
-        assert not missing_path.exists()
-
-        trial_dir = tmp_path / "trial_adapter"
-        trial_dir.mkdir()
-        (trial_dir / "adapter_config.json").write_text("{}")
-        (trial_dir / "adapter_model.safetensors").write_bytes(b"\x00" * 4)
-
-        g = _gate_4_recall_check(
-            model=_make_mock_model(),
-            tokenizer=MagicMock(),
-            trial_adapter_dir=trial_dir,
-            live_registry_path=missing_path,
-            mount_state={"mounted": False, "pre_active_adapter": []},
-            recall_probe_batch_size=16,
-        )
-
-        assert g.status == "skipped", (
-            f"missing registry must be SKIPPED, got {g.status}: {g.reason}"
-        )
-
-    def test_evaluate_gates_skips_g4_on_missing(self, tmp_path):
-        """evaluate_gates threads the missing-file SKIP all the way through."""
-        missing_path = tmp_path / "nonexistent_registry.json"
-        trial_dir = tmp_path / "trial_adapter"
-        trial_dir.mkdir()
-        (trial_dir / "adapter_config.json").write_text("{}")
-        (trial_dir / "adapter_model.safetensors").write_bytes(b"\x00" * 4)
-
-        from paramem.server.gates import evaluate_gates
-
-        results = evaluate_gates(
-            model=_make_mock_model(),
-            tokenizer=MagicMock(),
-            trial_adapter_dir=trial_dir,
-            live_registry_path=missing_path,
-            session_buffer_empty=False,
-            consolidation_summary=None,
-            consolidation_exception=None,
-            recall_probe_batch_size=16,
-        )
-        assert results[3].status == "skipped"
-
-
-# ---------------------------------------------------------------------------
-# Bug A (live test) — trial-probe mount must use per-kind subdir
-# ---------------------------------------------------------------------------
 
 
 class TestTrialProbeMountResolvesKindSubdir:
@@ -1906,6 +1351,78 @@ class TestTrialProbeMountResolvesKindSubdir:
 
 
 # ---------------------------------------------------------------------------
+# The trial-tree layout ConsolidationLoop.commit_main_tiers actually writes,
+# read back by the real gate readers (_resolve_adapter_mount_path,
+# KeyRegistry.load_simhashes) — closes the gap left by _make_trial_adapter*
+# hand-building the layout by hand.
+# ---------------------------------------------------------------------------
+
+
+class TestGateReadersBindTheProductionWriterLayout:
+    """The trial layout ``ConsolidationLoop.commit_main_tiers`` writes is
+    exactly what ``_resolve_adapter_mount_path`` and
+    ``KeyRegistry.load_simhashes`` bind — generated by the production writer
+    itself, not a hand-built fixture, so a writer-side layout regression
+    surfaces here."""
+
+    def test_mount_path_and_simhash_reader_bind_a_real_commit_main_tiers_write(self, tmp_path):
+        from paramem.memory.store import MemoryStore
+        from paramem.server.gates import _resolve_adapter_mount_path
+        from paramem.training.consolidation import ConsolidationLoop
+        from tests._fold_fixtures import _FakeModel, _FakeTokenizer
+
+        trial_root = tmp_path / "trial_adapter"
+
+        loop = ConsolidationLoop.__new__(ConsolidationLoop)
+        loop.model = _FakeModel()
+        loop.tokenizer = _FakeTokenizer()
+        loop.output_dir = trial_root
+        loop.fingerprint_cache = None
+        loop.save_cycle_snapshots = False
+        loop._debug_base = None
+        loop.cycle_count = 0
+        loop._keep_prior_slots = 5
+
+        store = MemoryStore()
+        reg = KeyRegistry()
+        reg.add("graph1")
+        reg.set_simhash("graph1", 123456789)
+        store.load_registry("episodic", reg)
+        store.put(
+            "episodic",
+            "graph1",
+            {
+                "subject": "Alice",
+                "predicate": "lives_in",
+                "object": "Berlin",
+                "speaker_id": "sp1",
+            },
+            register=False,
+        )
+        store.set_bookkeeping(
+            "graph1", speaker_id="sp1", relation_type="factual", first_seen="", promoted=False
+        )
+        loop.store = store
+
+        committed = loop.commit_main_tiers(["episodic"], output_dir=trial_root)
+        assert committed == {"episodic"}
+
+        mount_path = _resolve_adapter_mount_path(trial_root)
+        assert mount_path.parent == trial_root / "episodic", (
+            f"the resolver must bind commit_main_tiers's own per-kind slot layout; got {mount_path}"
+        )
+        assert (mount_path / "adapter_model.safetensors").exists()
+
+        loaded_simhash = KeyRegistry.load_simhashes(
+            trial_root / "episodic" / "indexed_key_registry.json"
+        )
+        assert loaded_simhash == {"graph1": 123456789}, (
+            "the gate's per-kind fingerprint read must bind commit_main_tiers's "
+            f"own committed registry; got {loaded_simhash}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # _find_tier_registry — per-kind indexed_key_registry.json locator
 # ---------------------------------------------------------------------------
 
@@ -1955,3 +1472,237 @@ class TestFindTierRegistry:
 
         result = _find_tier_registry(trial_dir)
         assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Gate 4 — runs against the live per-tier registries, no global file anywhere
+# ---------------------------------------------------------------------------
+
+
+class TestGate4RunsAgainstPerTierRegistries:
+    """Gate 4's population + GATE_4_MIN_REGISTRY_SIZE precondition are drawn
+    from the live adapter store's per-tier ``indexed_key_registry.json``
+    files (_live_key_population / iter_tier_roots) -- there is no global
+    ``key_metadata.json`` sample-population file to read."""
+
+    def _live_registry_with_n_keys(self, tmp_path: Path, n: int) -> Path:
+        """A live adapter store whose episodic tier alone carries *n* active
+        keys -- no key_metadata.json anywhere, main or interim."""
+        live_dir = tmp_path / "live_adapters"
+        episodic_dir = live_dir / "episodic"
+        episodic_dir.mkdir(parents=True)
+        reg = KeyRegistry()
+        for i in range(n):
+            reg.add(f"graph{i}")
+        (episodic_dir / "indexed_key_registry.json").write_bytes(reg.save_bytes())
+        assert not any(live_dir.rglob("key_metadata.json"))
+        return live_dir
+
+    def _trial_adapter_with_matching_registry(
+        self, tmp_path: Path, key_fingerprints: dict[str, int]
+    ) -> Path:
+        trial_dir = tmp_path / "trial_adapter"
+        trial_dir.mkdir()
+        (trial_dir / "adapter_config.json").write_text("{}")
+        (trial_dir / "adapter_model.safetensors").write_bytes(b"\x00" * 4)
+        episodic_dir = trial_dir / "episodic"
+        episodic_dir.mkdir()
+        reg = KeyRegistry()
+        for k, fp in key_fingerprints.items():
+            reg.add(k)
+            reg.set_simhash(k, fp)
+        (episodic_dir / "indexed_key_registry.json").write_bytes(reg.save_bytes())
+        return trial_dir
+
+    def test_runs_not_skipped_at_the_min_registry_size_threshold(self, tmp_path):
+        import json as _json
+
+        from paramem.memory.entry import entry_simhash, finalize_recalled
+        from paramem.server.gates import GATE_4_MIN_REGISTRY_SIZE, _gate_4_recall_check
+
+        keys = [f"graph{i}" for i in range(GATE_4_MIN_REGISTRY_SIZE)]
+        live_dir = self._live_registry_with_n_keys(tmp_path, GATE_4_MIN_REGISTRY_SIZE)
+
+        def _fact_for(key: str) -> dict:
+            return {"key": key, "subject": "Alex", "predicate": "lives_in", "object": "Heilbronn"}
+
+        key_fingerprints = {k: entry_simhash(_fact_for(k)) for k in keys}
+        trial_dir = self._trial_adapter_with_matching_registry(tmp_path, key_fingerprints)
+
+        def _probe_gen(m, tok, entries, registry=None, **kw):
+            for e in entries:
+                raw = _json.dumps(_fact_for(e["key"]))
+                yield e, finalize_recalled(raw, e["key"], registry, 0.75)
+
+        model = _make_mock_model(["episodic"])
+        with patch("paramem.training.recall_eval.probe_entries", side_effect=_probe_gen):
+            result = _gate_4_recall_check(
+                model=model,
+                tokenizer=MagicMock(),
+                trial_adapter_dir=trial_dir,
+                live_adapter_dir=live_dir,
+                mount_state={},
+                recall_probe_batch_size=4,
+            )
+
+        assert result.status != "skipped", (
+            f"gate 4 must run at exactly GATE_4_MIN_REGISTRY_SIZE ({GATE_4_MIN_REGISTRY_SIZE}) "
+            f"live keys with no global key_metadata.json anywhere; got status={result.status!r} "
+            f"reason={result.reason!r}"
+        )
+        assert result.status == "pass", result.reason
+        assert result.metrics["sampled"] == GATE_4_MIN_REGISTRY_SIZE
+
+    def test_skipped_one_key_below_the_threshold(self, tmp_path):
+        """One key short of the threshold still SKIPS -- the boundary is
+        exact, not off-by-one, under the per-tier population."""
+        from paramem.server.gates import GATE_4_MIN_REGISTRY_SIZE, _gate_4_recall_check
+
+        live_dir = self._live_registry_with_n_keys(tmp_path, GATE_4_MIN_REGISTRY_SIZE - 1)
+        trial_dir = tmp_path / "trial_adapter"
+        trial_dir.mkdir()
+        (trial_dir / "adapter_model.safetensors").write_bytes(b"\x00" * 4)
+
+        result = _gate_4_recall_check(
+            model=_make_mock_model(["episodic"]),
+            tokenizer=MagicMock(),
+            trial_adapter_dir=trial_dir,
+            live_adapter_dir=live_dir,
+            mount_state={},
+            recall_probe_batch_size=4,
+        )
+
+        assert result.status == "skipped"
+
+    def test_write_only_trial_shape_with_no_registry_fails_zero_of_twenty(self, tmp_path):
+        """The trial adapter has been written (weights on disk) but never
+        published (no ``indexed_key_registry.json`` under any kind subdir --
+        the shape a write-without-publish crash leaves behind). ``gate 4``
+        must not skip: it runs, ``load_simhashes`` yields ``{}`` for a
+        missing file, ``verify_confidence`` returns 0.0 for every key
+        against that empty map, and the gate fails 0/20 rather than passing
+        vacuously or crashing."""
+        from paramem.server.gates import GATE_4_MIN_REGISTRY_SIZE, _gate_4_recall_check
+
+        keys = [f"graph{i}" for i in range(GATE_4_MIN_REGISTRY_SIZE)]
+        live_dir = self._live_registry_with_n_keys(tmp_path, GATE_4_MIN_REGISTRY_SIZE)
+
+        # Written weights only -- no per-kind indexed_key_registry.json at all.
+        trial_dir = tmp_path / "trial_adapter"
+        trial_dir.mkdir()
+        (trial_dir / "adapter_config.json").write_text("{}")
+        (trial_dir / "adapter_model.safetensors").write_bytes(b"\x00" * 4)
+        assert not any(trial_dir.rglob("indexed_key_registry.json"))
+
+        def _probe_gen(m, tok, entries, registry=None, **kw):
+            assert registry == {}
+            for e in entries:
+                yield e, {"key": e["key"], "subject": "x", "predicate": "y", "object": "z"}
+
+        model = _make_mock_model(["episodic"])
+        with patch("paramem.training.recall_eval.probe_entries", side_effect=_probe_gen):
+            result = _gate_4_recall_check(
+                model=model,
+                tokenizer=MagicMock(),
+                trial_adapter_dir=trial_dir,
+                live_adapter_dir=live_dir,
+                mount_state={},
+                recall_probe_batch_size=4,
+            )
+
+        assert result.status == "fail"
+        assert result.metrics["recalled"] == 0
+        assert result.metrics["sampled"] == GATE_4_MIN_REGISTRY_SIZE
+        assert keys  # sample population is non-empty; the failure is real, not vacuous
+
+    def test_registry_read_os_error_fails_gate_4_instead_of_escaping(self, tmp_path):
+        """A decrypt/permission ``OSError`` reading a live per-tier registry
+        must surface as a gate-4 ``fail`` result -- not escape uncaught to
+        the generic ``trial_exception`` path, which would leave the failure
+        unattributed to the gate that actually hit it."""
+        from paramem.server.gates import _gate_4_recall_check
+
+        live_dir = self._live_registry_with_n_keys(tmp_path, 1)
+        trial_dir = tmp_path / "trial_adapter"
+        trial_dir.mkdir()
+        (trial_dir / "adapter_model.safetensors").write_bytes(b"\x00" * 4)
+
+        with patch(
+            "paramem.memory.store.MemoryStore.read_registries_from_disk",
+            side_effect=OSError("permission denied"),
+        ):
+            result = _gate_4_recall_check(
+                model=_make_mock_model(["episodic"]),
+                tokenizer=MagicMock(),
+                trial_adapter_dir=trial_dir,
+                live_adapter_dir=live_dir,
+                mount_state={},
+                recall_probe_batch_size=4,
+            )
+
+        assert result.status == "fail"
+        assert result.gate == 4
+        assert "permission denied" in result.reason
+
+    def test_population_excludes_interim_tier_keys(self, tmp_path):
+        """An interim slot's active keys carry no fingerprint in the trial's
+        per-tier SimHash map -- full-replay training only ever writes that
+        map for the three main tiers (``_ADAPTER_KIND_SUBDIRS``), never for
+        an interim slot.  ``_live_key_population`` must never draw an
+        interim key into the sample population, or the probe would score an
+        unverifiable key as a spurious miss."""
+        from paramem.server.gates import GATE_4_MIN_REGISTRY_SIZE, _live_key_population
+
+        live_dir = self._live_registry_with_n_keys(tmp_path, GATE_4_MIN_REGISTRY_SIZE)
+        interim_dir = live_dir / "episodic" / "interim_20260101T0000"
+        interim_dir.mkdir(parents=True)
+        interim_reg = KeyRegistry()
+        interim_reg.add("interim_only_key")
+        (interim_dir / "indexed_key_registry.json").write_bytes(interim_reg.save_bytes())
+
+        _content, population = _live_key_population(live_dir)
+
+        assert "interim_only_key" not in population
+        assert population == sorted(f"graph{i}" for i in range(GATE_4_MIN_REGISTRY_SIZE))
+
+    def test_gate_4_never_samples_an_interim_only_key(self, tmp_path):
+        """End-to-end: an interim-only key never reaches the deciding
+        sample, even when it would otherwise be drawn -- the trial's
+        SimHash map cannot score it, so the gate must never ask it to."""
+        import json as _json
+
+        from paramem.memory.entry import entry_simhash, finalize_recalled
+        from paramem.server.gates import GATE_4_MIN_REGISTRY_SIZE, _gate_4_recall_check
+
+        keys = [f"graph{i}" for i in range(GATE_4_MIN_REGISTRY_SIZE)]
+        live_dir = self._live_registry_with_n_keys(tmp_path, GATE_4_MIN_REGISTRY_SIZE)
+        interim_dir = live_dir / "episodic" / "interim_20260101T0000"
+        interim_dir.mkdir(parents=True)
+        interim_reg = KeyRegistry()
+        interim_reg.add("interim_only_key")
+        (interim_dir / "indexed_key_registry.json").write_bytes(interim_reg.save_bytes())
+
+        def _fact_for(key: str) -> dict:
+            return {"key": key, "subject": "Alex", "predicate": "lives_in", "object": "Heilbronn"}
+
+        key_fingerprints = {k: entry_simhash(_fact_for(k)) for k in keys}
+        trial_dir = self._trial_adapter_with_matching_registry(tmp_path, key_fingerprints)
+
+        def _probe_gen(m, tok, entries, registry=None, **kw):
+            for e in entries:
+                raw = _json.dumps(_fact_for(e["key"]))
+                yield e, finalize_recalled(raw, e["key"], registry, 0.75)
+
+        model = _make_mock_model(["episodic"])
+        with patch("paramem.training.recall_eval.probe_entries", side_effect=_probe_gen):
+            result = _gate_4_recall_check(
+                model=model,
+                tokenizer=MagicMock(),
+                trial_adapter_dir=trial_dir,
+                live_adapter_dir=live_dir,
+                mount_state={},
+                recall_probe_batch_size=4,
+            )
+
+        assert result.status == "pass", result.reason
+        assert "interim_only_key" not in result.metrics["sampled_keys"]

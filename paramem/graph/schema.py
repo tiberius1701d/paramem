@@ -100,12 +100,15 @@ class Relation(BaseModel):
             "edge['sessions'] so the merger accumulates the UNION across all "
             "contributing sessions.  Read back from edge['sessions'] when "
             "reconstructing Relation objects from the cumulative graph "
-            "(_pending_relations build in run_consolidation_cycle) and carried "
-            "on the deferred-write record in _build_all_edge_entries_into so "
-            "the episodic drop site (step 11b) can identify which sessions "
-            "contributed a recall-failed key.  Always [] for extraction-time "
-            "Relations that have not been stamped yet; never persisted to the "
-            "registry, cumulative_graph.json, or adapter weights."
+            "(ConsolidationLoop._capture_pending_relations, shared by "
+            "run_consolidation_cycle and _stage_and_publish_full_event) and "
+            "unioned into the event's own session_ids argument to "
+            "stage_event, which lands verbatim in the stage ledger's "
+            "extraction-entry 'sessions' list -- the app layer's own source "
+            "for which sessions this event's terminal retires.  Always [] "
+            "for extraction-time Relations that have not been stamped yet; "
+            "never persisted to the registry, cumulative_graph.json, or "
+            "adapter weights."
         ),
         exclude=True,
     )
@@ -133,9 +136,10 @@ class Relation(BaseModel):
         default="",
         description=(
             "Transient wall-clock timestamp carry-slot (ISO 8601). Populated by "
-            "_build_registry_true_relations from bookkeeping['last_seen'] so the "
-            "value travels through GraphMerger.merge() onto the merged graph edge. "
-            "Empty for extraction-time Relations. Never persisted to the registry, "
+            "ConsolidationLoop._working_registry_true_relations from "
+            "bookkeeping['last_seen'] so the value travels through "
+            "GraphMerger.merge() onto the merged graph edge. Empty for "
+            "extraction-time Relations. Never persisted to the registry, "
             "cumulative_graph.json, or adapter weights."
         ),
         exclude=True,
@@ -144,9 +148,10 @@ class Relation(BaseModel):
         default="",
         description=(
             "Transient wall-clock timestamp carry-slot (ISO 8601). Populated by "
-            "_build_registry_true_relations from bookkeeping['first_seen'] so the "
-            "value travels through GraphMerger.merge() onto the merged graph edge. "
-            "Empty for extraction-time Relations. Never persisted to the registry, "
+            "ConsolidationLoop._working_registry_true_relations from "
+            "bookkeeping['first_seen'] so the value travels through "
+            "GraphMerger.merge() onto the merged graph edge. Empty for "
+            "extraction-time Relations. Never persisted to the registry, "
             "cumulative_graph.json, or adapter weights."
         ),
         exclude=True,

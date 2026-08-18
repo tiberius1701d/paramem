@@ -35,7 +35,7 @@ class TestRouterReadsFromLoopCache:
         """
         from paramem.memory.store import MemoryStore
 
-        store = MemoryStore(replay_enabled=True)
+        store = MemoryStore()
         for k, q in cache.items():
             store.put("episodic", k, q)
             spk = q.get("speaker_id", "")
@@ -45,6 +45,7 @@ class TestRouterReadsFromLoopCache:
                     speaker_id=spk,
                     relation_type=q.get("relation_type", "factual"),
                     first_seen="",
+                    promoted=False,
                 )
         return store
 
@@ -93,7 +94,7 @@ class TestRouterReadsFromLoopCache:
 
         router = QueryRouter(
             adapter_dir=adapter_dir,
-            memory_store=MemoryStore(replay_enabled=False),
+            memory_store=MemoryStore(),
         )
 
         all_keys: set[str] = set()
@@ -110,7 +111,7 @@ class TestRouterReadsFromLoopCache:
 
         router = QueryRouter(
             adapter_dir=tmp_path / "nonexistent",
-            memory_store=MemoryStore(replay_enabled=False),
+            memory_store=MemoryStore(),
         )
         assert router._speaker_key_index == {}
 
@@ -313,7 +314,7 @@ class TestReadSimhashRegistryPerTierPaths:
         adapter_dir = tmp_path / "adapters"
         (adapter_dir / "episodic").mkdir(parents=True)
         (adapter_dir / "episodic" / "indexed_key_registry.json").write_text(
-            json.dumps({"active_keys": ["graph1"], "fidelity_history": {}, "stale": {}}),
+            json.dumps({"active_keys": ["graph1"], "stale": {}}),
             encoding="utf-8",
         )
         self._write_registry(adapter_dir / "semantic" / "indexed_key_registry.json", {"graph2": 2})

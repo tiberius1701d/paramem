@@ -21,6 +21,11 @@ Tests cover:
 41. POST /backup/restore — encrypted wrong key → 500, no safety slot
 42. POST /backup/prune — happy path
 43. POST /backup/prune — dry run
+
+``restore_bundle`` itself (real bundle/slot fixtures, corrupt-bundle
+handling, the incompatible-bundle list-then-refuse arc) is covered in
+``tests/backup/test_restore.py`` and ``tests/backup/test_bundle_boot_binding.py``,
+not at the REST-endpoint level here.
 """
 
 from __future__ import annotations
@@ -62,7 +67,7 @@ def _make_config(
     config.security = SecurityConfig(
         backups=ServerBackupsConfig(
             schedule=schedule,
-            artifacts=["config", "graph", "registry"],
+            artifacts=["snapshot_bundle"],
             max_total_disk_gb=max_total_disk_gb,
         )
     )
@@ -110,6 +115,70 @@ def _seed_config_slot(backups_root: Path, slot_name: str = "20260421-040000") ->
     return slot_dir
 
 
+def _seed_restorable_bundle(tmp_path: Path, backups_root: Path) -> str:
+    """Write a real, restorable ``snapshot_bundle`` slot: one episodic tier
+    carrying a bound simulate slot (registry + key_metadata + graph.json),
+    captured through the real ``write_bundle`` path -- the same
+    registry-bound-slot shape ``tests/backup/test_bundle_boot_binding.py``
+    round-trips through ``restore_bundle``. Returns the backup_id (the
+    bundle slot directory name)."""
+    import json as _json
+
+    from paramem.backup.backup import write_bundle
+    from paramem.training.key_registry import KeyRegistry
+    from tests._fold_fixtures import _write_graph
+
+    src = tmp_path / "bundle_src"
+    episodic_dir = src / "adapters" / "episodic"
+    episodic_dir.mkdir(parents=True, exist_ok=True)
+
+    key = "graph1"
+    registry = KeyRegistry()
+    registry.add(key)
+    registry.set_simhash(key, 12345)
+    registry.save(episodic_dir / "indexed_key_registry.json")
+    (episodic_dir / "key_metadata.json").write_text(
+        _json.dumps(
+            {
+                "tier_cycle": 0,
+                "keys": {
+                    key: {
+                        "speaker_id": "speaker0",
+                        "relation_type": "factual",
+                        "reinforcement_count": 1,
+                        "last_reinforced_cycle": 0,
+                        "last_seen": "2026-01-01T00:00:00Z",
+                        "first_seen": "2026-01-01T00:00:00Z",
+                        "promoted": False,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    _write_graph(
+        episodic_dir,
+        [
+            {
+                "key": key,
+                "subject": "alice",
+                "predicate": "lives_in",
+                "object": "berlin",
+                "speaker_id": "speaker0",
+            }
+        ],
+    )
+
+    bundle_slot = write_bundle(
+        config_path=tmp_path / "no-such-config.yaml",
+        adapter_dirs={"episodic": episodic_dir},
+        backups_root=backups_root,
+        backups_cfg=None,
+        meta_fields={"tier": "manual", "label": "dispose-test-bundle"},
+    )
+    return bundle_slot.name
+
+
 # ---------------------------------------------------------------------------
 # Test 26 — /backup/list empty store
 # ---------------------------------------------------------------------------
@@ -136,7 +205,7 @@ class TestListEmptyStore:
 
 class TestListMixedKindsNewestFirst:
     def test_list_mixed_kinds_newest_first(self, tmp_path: Path, monkeypatch) -> None:
-        """Seed slots across config/graph/registry → all returned, newest-first."""
+        """Seed slots across config/graph/resume → all returned, newest-first."""
         config = _make_config(tmp_path)
         backups_root = config.paths.data / "backups"
         backups_root.mkdir(parents=True, exist_ok=True)
@@ -149,8 +218,8 @@ class TestListMixedKindsNewestFirst:
             backups_cfg=ServerBackupsConfig(),
         )
         _slot2 = backup_write(
-            ArtifactKind.REGISTRY,
-            b"registry_data",
+            ArtifactKind.RESUME,
+            b"resume_data",
             meta_fields={"tier": "daily"},
             backups_root=backups_root,
             backups_cfg=ServerBackupsConfig(),
@@ -169,7 +238,7 @@ class TestListMixedKindsNewestFirst:
         assert timestamps == sorted(timestamps, reverse=True)
         kinds = {i["kind"] for i in items}
         assert "config" in kinds
-        assert "registry" in kinds
+        assert "resume" in kinds
 
 
 # ---------------------------------------------------------------------------
@@ -192,8 +261,8 @@ class TestListFilteredByKind:
             backups_cfg=ServerBackupsConfig(),
         )
         backup_write(
-            ArtifactKind.REGISTRY,
-            b"registry_data",
+            ArtifactKind.RESUME,
+            b"resume_data",
             meta_fields={"tier": "daily"},
             backups_root=backups_root,
             backups_cfg=ServerBackupsConfig(),
@@ -271,9 +340,8 @@ class TestCreateCustomKindsLabel:
         body = resp.json()
         assert body["success"] is True
         assert "config" in body["written_slots"]
-        # graph and registry not in written_slots (they were not requested).
+        # graph not in written_slots (it was not requested).
         assert "graph" not in body["written_slots"]
-        assert "registry" not in body["written_slots"]
 
 
 # ---------------------------------------------------------------------------
@@ -391,7 +459,13 @@ class TestCreateCloudOnlySkipsGraphGracefully:
 
 class TestRestoreHappyPathConfig:
     def test_restore_happy_path_config(self, tmp_path: Path, monkeypatch) -> None:
-        """Pre-seed a config backup; POST restore → 200, live config matches backup."""
+        """Pre-seed a config backup; POST restore → 200, live config matches backup.
+
+        A config-kind restore keeps its existing mechanism (no live-apply
+        dispatch, no store quarantine) — the response reports
+        ``serving=False`` (an operator restart is still what converges it)
+        rather than the retired ``restart_required``/``restart_hint`` fields.
+        """
         config = _make_config(tmp_path)
         backups_root = config.paths.data / "backups"
         backups_root.mkdir(parents=True, exist_ok=True)
@@ -414,8 +488,10 @@ class TestRestoreHappyPathConfig:
         assert resp.status_code == 200, resp.text
         body = resp.json()
         assert "config" in body["restored"]
-        assert body["restart_required"] is True
-        assert body["restart_hint"]
+        assert body["serving"] is False
+        assert body["quarantine_cause"] is None
+        assert "restart_required" not in body
+        assert "restart_hint" not in body
 
         # Live config should now contain the backup content.
         live_path = Path(state["config_path"])
@@ -424,9 +500,138 @@ class TestRestoreHappyPathConfig:
         # Safety backup must have been created.
         assert "config" in body["backed_up_pre_restore"]
 
-        # Recovery banner must be appended.
-        recovery = state["migration"]["recovery_required"]
-        assert any("backup" in msg.lower() for msg in recovery)
+    def test_pending_consolidation_event_config_restore_succeeds_and_leaves_ledger(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """A pending consolidation event's stage ledger does NOT refuse a
+        config-kind restore either, and — unlike a snapshot_bundle restore —
+        it is left untouched: a config restore rewrites no tier, so there is
+        nothing for the ledger to misclassify on the next resume."""
+        from paramem.training import stage_ledger as sl
+
+        config = _make_config(tmp_path)
+        backups_root = config.paths.data / "backups"
+        backups_root.mkdir(parents=True, exist_ok=True)
+
+        backup_content = b"model: gemma\n"
+        slot_dir = backup_write(
+            ArtifactKind.CONFIG,
+            backup_content,
+            meta_fields={"tier": "daily"},
+            backups_root=backups_root,
+            backups_cfg=ServerBackupsConfig(),
+        )
+        backup_id = slot_dir.name
+
+        state = _make_state(tmp_path, config)
+        client = _make_client(monkeypatch, state)
+
+        state_dir = config.paths.data.resolve() / "state"
+        scratch = config.paths.data / "adapters" / "episodic" / "cycle_0"
+        (scratch / "checkpoint-1").mkdir(parents=True, exist_ok=True)
+        ledger = sl.StageLedger(
+            version=2,
+            event="full",
+            venue="weights",
+            stamp="20260101T0000",
+            tiers={"episodic": {"adapter": "episodic", "pre_sha": "a", "scratch": str(scratch)}},
+        )
+        sl.write_stages(state_dir, ledger, [])
+
+        resp = client.post("/backup/restore", json={"backup_id": backup_id})
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert "config" in body["restored"]
+        # The pending record survives untouched -- a config restore rewrites
+        # no tier, so the ledger has nothing to misclassify.
+        assert sl.read_ledger(state_dir) is not None
+        assert scratch.exists()
+
+
+class TestPendingConsolidationEventBundleRestoreDisposesLedger:
+    def test_pending_consolidation_event_bundle_restore_disposes_ledger_and_resolves_incident(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """A snapshot_bundle restore rewrites the episodic tier wholesale, so
+        the pending event's stage ledger would misclassify it FOREIGN on the
+        next resume -- the ruled design discards the record instead: the
+        ledger is disposed (file gone, scratch dir removed) and every
+        ``consolidation_resume_blocked`` incident naming it is resolved.
+
+        The real ``restore_bundle`` runs unmocked -- backup_id resolves to a
+        genuine bound episodic slot (registry + key_metadata + graph.json)
+        via ``write_bundle``, so the endpoint's own dispatch, decrypt-probe,
+        and atomic tree rewrite all execute for real. Only the two
+        convergence collaborators ``_lift_quarantined_store`` reaches for
+        (``_preload_memory_store``, ``QueryRouter``) are patched -- the same
+        pair ``TestLiftQuarantinedStore`` patches -- because ``_make_config``
+        builds a bare ``ServerConfig`` with no ``adapter_dir`` and the state
+        carries no real memory store to rehydrate; the dispose call itself
+        is never touched.
+        """
+        from paramem.server.incidents import read_incidents, record_incident
+        from paramem.training import stage_ledger as sl
+
+        config = _make_config(tmp_path)
+        # _lift_quarantined_store builds the (patched) QueryRouter's kwargs
+        # from config.intent before the call -- Python evaluates
+        # keyword-argument expressions unconditionally, so patching
+        # QueryRouter alone does not skip that attribute lookup.
+        # _make_config's bare ServerConfig (built via __new__, no dataclass
+        # defaults) carries no ``intent``; ``adapter_dir`` is a property
+        # derived from ``paths.data``, already set, so it needs no help.
+        config.intent = None
+        backups_root = config.paths.data / "backups"
+        backups_root.mkdir(parents=True, exist_ok=True)
+
+        backup_id = _seed_restorable_bundle(tmp_path, backups_root)
+
+        state = _make_state(tmp_path, config)
+        client = _make_client(monkeypatch, state)
+
+        monkeypatch.setattr(
+            app_module, "_preload_memory_store", lambda cfg, *, model, tokenizer: MagicMock()
+        )
+        monkeypatch.setattr(app_module, "QueryRouter", MagicMock())
+
+        state_dir = config.paths.data.resolve() / "state"
+        scratch = config.paths.data / "adapters" / "episodic" / "cycle_0"
+        (scratch / "checkpoint-1").mkdir(parents=True, exist_ok=True)
+        ledger = sl.StageLedger(
+            version=2,
+            event="full",
+            venue="weights",
+            stamp="20260101T0000",
+            tiers={"episodic": {"adapter": "episodic", "pre_sha": "a", "scratch": str(scratch)}},
+        )
+        sl.write_stages(state_dir, ledger, [])
+        record_incident(
+            state_dir,
+            type="consolidation_resume_blocked",
+            key="episodic",
+            severity="failed",
+            summary="Consolidation resume blocked: tier 'episodic' classified 'FOREIGN'",
+            detail={"event": "full", "tier": "episodic", "reason": "FOREIGN"},
+        )
+
+        resp = client.post("/backup/restore", json={"backup_id": backup_id})
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert "episodic" in body["restored_adapters"]
+        assert body["serving"] is True
+        assert body["quarantine_cause"] is None
+
+        # The pending record is DISCARDED -- ledger file gone, scratch dir removed.
+        assert sl.read_ledger(state_dir) is None
+        assert not scratch.exists()
+
+        # Every consolidation_resume_blocked incident naming this tier resolved.
+        incidents = read_incidents(state_dir)
+        resume_blocked = [i for i in incidents if i.type == "consolidation_resume_blocked"]
+        assert resume_blocked, "expected the seeded incident to still be present, now resolved"
+        assert all(i.status == "resolved" for i in resume_blocked)
 
 
 class TestRestoreConfigSafetySlotExemptFromDiskCap:
@@ -993,322 +1198,71 @@ class TestCreateSnapshotBundleKind:
 
 
 # ---------------------------------------------------------------------------
-# /backup/restore snapshot_bundle handler tests
+# _remount_adapters_from_disk — the on-demand re-mount step factored from
+# the boot mount machinery
 # ---------------------------------------------------------------------------
 
 
-def _make_bundle_slot(backups_root: Path, adapter_dirs: dict, config_path, registry_path) -> Path:
-    """Write a real bundle slot into backups_root/snapshot/ for endpoint tests.
-
-    Returns the bundle slot directory.
-    """
-    from paramem.backup.backup import write_bundle
-
-    bundle_base = backups_root / "snapshot"
-    bundle_base.mkdir(parents=True, exist_ok=True)
-
-    return write_bundle(
-        config_path=config_path,
-        registry_path=registry_path,
-        adapter_dirs=adapter_dirs,
-        backups_root=backups_root,
-        backups_cfg=ServerBackupsConfig(),
-        meta_fields={"tier": "manual", "label": "test_bundle"},
-        adapter_scope="live",
-    )
-
-
-def _make_adapter_slot_for_handler(
-    parent_dir: Path,
-    slot_name: str,
-    registry_sha256: str,
-    adapter_name: str,
-    weight_bytes: bytes = b"fake_weights",
-) -> Path:
-    """Create a minimal adapter slot for handler test fixtures."""
-    import json as _json
-
-    slot = parent_dir / slot_name
-    slot.mkdir(parents=True, exist_ok=True)
-    meta = {
-        "schema_version": 4,
-        "name": adapter_name,
-        "trained_at": "2026-05-21T00:00:00Z",
-        "window_stamp": "",
-        "base_model": {
-            "repo": "mistralai/Mistral-7B-Instruct-v0.3",
-            "sha": "abc",
-            "hash": "sha256:def",
-        },
-        "tokenizer": {
-            "name_or_path": "mistralai/Mistral-7B-Instruct-v0.3",
-            "vocab_size": 32000,
-            "merges_hash": "e" * 64,
-        },
-        "lora": {"rank": 8, "alpha": 16, "dropout": 0.0, "target_modules": ["q_proj"]},
-        "registry_sha256": registry_sha256,
-        "key_count": 5,
-        "synthesized": False,
-    }
-    (slot / "meta.json").write_text(_json.dumps(meta), encoding="utf-8")
-    (slot / "adapter_model.safetensors").write_bytes(weight_bytes)
-    (slot / "adapter_config.json").write_bytes(b'{"peft_type": "LORA"}')
-    return slot
-
-
-def _seed_bundle_fixture(tmp_path: Path, config: object) -> tuple[Path, Path, Path]:
-    """Build a minimal bundle fixture for handler tests.
-
-    Returns (bundle_slot_dir, data_dir, adapter_dirs).
-    """
-    import hashlib
-
-    data_dir = config.paths.data
-    data_dir.mkdir(parents=True, exist_ok=True)
-
-    # Config
-    cfg_path = tmp_path / "server.yaml"
-    cfg_path.write_bytes(b"model: mistral\n")
-
-    # Registry
-    reg_dir = data_dir / "registry"
-    reg_dir.mkdir(parents=True, exist_ok=True)
-    reg_path = reg_dir / "key_metadata.json"
-    reg_path.write_bytes(b'{"speakers": {}}')
-
-    # Episodic: interim-only (production state)
-    ep_content = b'{"keys": {"k": 1}}'
-    ep_hash = hashlib.sha256(ep_content).hexdigest()
-    ep_dir = data_dir / "adapters" / "episodic"
-    ep_dir.mkdir(parents=True)
-    interim_fam = ep_dir / "interim_20260521T1000"
-    interim_fam.mkdir()
-    _make_adapter_slot_for_handler(
-        interim_fam,
-        "20260521-100000",
-        ep_hash,
-        "episodic_interim_20260521T1000",
-    )
-    (interim_fam / "indexed_key_registry.json").write_bytes(ep_content)
-
-    adapter_dirs = {"episodic": ep_dir}
-    backups_root = data_dir / "backups"
-    bundle_slot = _make_bundle_slot(backups_root, adapter_dirs, cfg_path, reg_path)
-    return bundle_slot, data_dir, adapter_dirs
-
-
-class TestRestoreSnapshotBundleHappyPath:
-    """POST /backup/restore with a snapshot_bundle → 200 + restore artifacts."""
-
-    def test_bundle_restore_returns_200(self, tmp_path: Path, monkeypatch) -> None:
-        """Happy path: restore a real bundle → 200, restart_required=True."""
+class TestRemountAdaptersFromDisk:
+    def test_cloud_only_is_a_noop(self, tmp_path, monkeypatch) -> None:
+        """No resident model (``_state["model"] is None``) -- slots on disk
+        are the truth and the next model acquisition mounts them; this call
+        must not touch *config* or raise."""
         config = _make_config(tmp_path)
-        bundle_slot, data_dir, adapter_dirs = _seed_bundle_fixture(tmp_path, config)
-        backup_id = bundle_slot.name
+        state = {"model": None, "tokenizer": None}
+        monkeypatch.setattr(app_module, "_state", state)
 
-        state = _make_state(tmp_path, config)
-        client = _make_client(monkeypatch, state)
+        app_module._remount_adapters_from_disk(config)
 
-        resp = client.post("/backup/restore", json={"backup_id": backup_id})
-        assert resp.status_code == 200, resp.text
-        body = resp.json()
-        assert body["restart_required"] is True
+        assert state["model"] is None
 
-    def test_bundle_restore_restored_adapters_populated(self, tmp_path: Path, monkeypatch) -> None:
-        """restored_adapters list in response must be non-empty after bundle restore."""
-        config = _make_config(tmp_path)
-        bundle_slot, data_dir, adapter_dirs = _seed_bundle_fixture(tmp_path, config)
-        backup_id = bundle_slot.name
 
-        state = _make_state(tmp_path, config)
-        client = _make_client(monkeypatch, state)
+# ---------------------------------------------------------------------------
+# _lift_quarantined_store — the ONE re-runnable store-repair primitive
+# ---------------------------------------------------------------------------
 
-        resp = client.post("/backup/restore", json={"backup_id": backup_id})
-        assert resp.status_code == 200, resp.text
-        body = resp.json()
-        assert isinstance(body["restored_adapters"], list)
-        assert len(body["restored_adapters"]) > 0
 
-    def test_bundle_restore_backed_up_pre_restore_has_bundle_key(
-        self, tmp_path: Path, monkeypatch
+class TestLiftQuarantinedStore:
+    def test_publishes_store_and_rebuilds_router_on_success(self, tmp_path, monkeypatch) -> None:
+        config = MagicMock()
+        new_store = MagicMock()
+
+        def _fake_preload(cfg, *, model, tokenizer):
+            assert cfg is config
+            return new_store
+
+        monkeypatch.setattr(app_module, "_preload_memory_store", _fake_preload)
+
+        router_calls = []
+
+        class _FakeRouter:
+            def __init__(self, **kwargs):
+                router_calls.append(kwargs)
+
+        monkeypatch.setattr(app_module, "QueryRouter", _FakeRouter)
+
+        state = {"model": None, "tokenizer": None, "ha_graph": None, "memory_store": "OLD"}
+        monkeypatch.setattr(app_module, "_state", state)
+
+        result = app_module._lift_quarantined_store(config)
+
+        assert result is True
+        assert state["memory_store"] is new_store
+        assert router_calls and router_calls[0]["memory_store"] is new_store
+
+    def test_returns_false_and_leaves_memory_store_none_when_quarantine_persists(
+        self, tmp_path, monkeypatch
     ) -> None:
-        """backed_up_pre_restore response must have 'bundle' key for snapshot_bundle restores."""
         config = _make_config(tmp_path)
-        bundle_slot, data_dir, adapter_dirs = _seed_bundle_fixture(tmp_path, config)
-        backup_id = bundle_slot.name
-
-        state = _make_state(tmp_path, config)
-        client = _make_client(monkeypatch, state)
-
-        resp = client.post("/backup/restore", json={"backup_id": backup_id})
-        assert resp.status_code == 200, resp.text
-        body = resp.json()
-        assert "bundle" in body["backed_up_pre_restore"], (
-            "backed_up_pre_restore must have 'bundle' key for snapshot_bundle"
+        monkeypatch.setattr(
+            app_module, "_preload_memory_store", lambda cfg, *, model, tokenizer: None
         )
 
-    def test_bundle_restore_recovery_banner_appended(self, tmp_path: Path, monkeypatch) -> None:
-        """Recovery banner must be appended to _state['migration']['recovery_required']."""
-        config = _make_config(tmp_path)
-        bundle_slot, data_dir, adapter_dirs = _seed_bundle_fixture(tmp_path, config)
-        backup_id = bundle_slot.name
+        state = {"model": None, "tokenizer": None, "memory_store": "OLD", "router": "UNCHANGED"}
+        monkeypatch.setattr(app_module, "_state", state)
 
-        state = _make_state(tmp_path, config)
-        client = _make_client(monkeypatch, state)
+        result = app_module._lift_quarantined_store(config)
 
-        resp = client.post("/backup/restore", json={"backup_id": backup_id})
-        assert resp.status_code == 200, resp.text
-
-        recovery = state["migration"].get("recovery_required", [])
-        assert any("snapshot_bundle" in msg or backup_id in msg for msg in recovery), (
-            f"Expected recovery banner in state; got: {recovery}"
-        )
-
-    def test_bundle_restore_config_false_leaves_config(self, tmp_path: Path, monkeypatch) -> None:
-        """restore_config=False (default) must not change the live server.yaml."""
-        config = _make_config(tmp_path)
-        bundle_slot, data_dir, adapter_dirs = _seed_bundle_fixture(tmp_path, config)
-        backup_id = bundle_slot.name
-
-        state = _make_state(tmp_path, config)
-        original_config = Path(state["config_path"]).read_bytes()
-        client = _make_client(monkeypatch, state)
-
-        resp = client.post(
-            "/backup/restore", json={"backup_id": backup_id, "restore_config": False}
-        )
-        assert resp.status_code == 200, resp.text
-
-        assert Path(state["config_path"]).read_bytes() == original_config, (
-            "restore_config=False must not alter the live server.yaml"
-        )
-
-    def test_bundle_restore_config_true_writes_config(self, tmp_path: Path, monkeypatch) -> None:
-        """restore_config=True must write the bundle's server.yaml to live config path."""
-        config = _make_config(tmp_path)
-        bundle_slot, data_dir, adapter_dirs = _seed_bundle_fixture(tmp_path, config)
-        backup_id = bundle_slot.name
-
-        state = _make_state(tmp_path, config)
-        live_config = Path(state["config_path"])
-        live_config.write_bytes(b"model: overwrite_me\n")
-        client = _make_client(monkeypatch, state)
-
-        resp = client.post("/backup/restore", json={"backup_id": backup_id, "restore_config": True})
-        assert resp.status_code == 200, resp.text
-        body = resp.json()
-        assert body.get("restored_adapters") is not None
-
-        # The live config should now contain the bundle's config content.
-        restored_content = live_config.read_bytes()
-        assert restored_content != b"model: overwrite_me\n", (
-            "restore_config=True must overwrite the live config"
-        )
-
-
-class TestRestoreSnapshotBundlePreconditions:
-    """409 preconditions for snapshot_bundle restore."""
-
-    def test_trial_active_returns_409(self, tmp_path: Path, monkeypatch) -> None:
-        """TRIAL state → 409 trial_active (same as config restore)."""
-        config = _make_config(tmp_path)
-        state = _make_state(tmp_path, config)
-        state["migration"]["state"] = "TRIAL"
-        client = _make_client(monkeypatch, state)
-
-        resp = client.post("/backup/restore", json={"backup_id": "irrelevant"})
-        assert resp.status_code == 409
-        assert resp.json()["detail"]["error"] == "trial_active"
-
-    def test_staging_active_returns_409(self, tmp_path: Path, monkeypatch) -> None:
-        """STAGING state → 409 staging_active."""
-        config = _make_config(tmp_path)
-        state = _make_state(tmp_path, config)
-        state["migration"]["state"] = "STAGING"
-        client = _make_client(monkeypatch, state)
-
-        resp = client.post("/backup/restore", json={"backup_id": "irrelevant"})
-        assert resp.status_code == 409
-        assert resp.json()["detail"]["error"] in {"staging_active", "trial_active"}
-
-    def test_consolidating_returns_409(self, tmp_path: Path, monkeypatch) -> None:
-        """consolidating=True → 409 consolidating."""
-        config = _make_config(tmp_path)
-        state = _make_state(tmp_path, config)
-        state["consolidating"] = True
-        client = _make_client(monkeypatch, state)
-
-        resp = client.post("/backup/restore", json={"backup_id": "irrelevant"})
-        assert resp.status_code == 409
-        assert resp.json()["detail"]["error"] == "consolidating"
-
-    def test_training_active_returns_409(self, tmp_path: Path, monkeypatch) -> None:
-        """Background training active → 409 training_active."""
-        from unittest.mock import MagicMock
-
-        config = _make_config(tmp_path)
-        bundle_slot, data_dir, adapter_dirs = _seed_bundle_fixture(tmp_path, config)
-        backup_id = bundle_slot.name
-
-        state = _make_state(tmp_path, config)
-
-        # Wire a fake background trainer with is_training=True.
-        fake_trainer = MagicMock()
-        fake_trainer.is_training = True
-        state["background_trainer"] = fake_trainer
-        client = _make_client(monkeypatch, state)
-
-        resp = client.post("/backup/restore", json={"backup_id": backup_id})
-        assert resp.status_code == 409, resp.text
-        assert resp.json()["detail"]["error"] == "training_active"
-
-
-class TestRestoreSnapshotBundleCorrupt:
-    """Error codes for corrupt / invalid bundle restores."""
-
-    def test_corrupt_bundle_returns_500_bundle_corrupt(self, tmp_path: Path, monkeypatch) -> None:
-        """Tampered bundle file → 500 bundle_corrupt, no live mutation."""
-        config = _make_config(tmp_path)
-        bundle_slot, data_dir, adapter_dirs = _seed_bundle_fixture(tmp_path, config)
-        backup_id = bundle_slot.name
-
-        # Tamper with a bundle file to cause a hash mismatch.
-        import json as _json
-
-        manifest = _json.loads((bundle_slot / "bundle.meta.json").read_text(encoding="utf-8"))
-        for entry in manifest.get("files", []):
-            candidate = bundle_slot / entry["path"]
-            if candidate.exists() and candidate.is_file():
-                candidate.write_bytes(b"TAMPERED_CONTENT_BREAKS_HASH")
-                break
-
-        state = _make_state(tmp_path, config)
-        client = _make_client(monkeypatch, state)
-
-        resp = client.post("/backup/restore", json={"backup_id": backup_id})
-        assert resp.status_code == 500, resp.text
-        assert resp.json()["detail"]["error"] == "bundle_corrupt"
-
-    def test_non_bundle_non_config_kind_returns_400(self, tmp_path: Path, monkeypatch) -> None:
-        """GRAPH slot → 400 restore_kind_not_supported."""
-        config = _make_config(tmp_path)
-        data_dir = config.paths.data
-        data_dir.mkdir(parents=True, exist_ok=True)
-        backups_root = data_dir / "backups"
-        backups_root.mkdir(parents=True, exist_ok=True)
-
-        slot_dir = backup_write(
-            ArtifactKind.GRAPH,
-            b'{"nodes": []}',
-            meta_fields={"tier": "daily"},
-            backups_root=backups_root,
-            backups_cfg=ServerBackupsConfig(),
-        )
-        backup_id = slot_dir.name
-
-        state = _make_state(tmp_path, config)
-        client = _make_client(monkeypatch, state)
-
-        resp = client.post("/backup/restore", json={"backup_id": backup_id})
-        assert resp.status_code == 400, resp.text
-        assert resp.json()["detail"]["error"] == "restore_kind_not_supported"
+        assert result is False
+        assert state["memory_store"] is None
+        assert state["router"] == "UNCHANGED"

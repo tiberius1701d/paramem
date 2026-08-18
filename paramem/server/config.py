@@ -233,12 +233,12 @@ class ServerBackupsConfig:
     orphan_sweep: OrphanSweepConfig = field(default_factory=OrphanSweepConfig)
     retention: RetentionConfig = field(default_factory=RetentionConfig)
     schedule: str = "daily 04:00"  # "off" disables scheduled backups
-    # Deprecated: the per-artifact list ["config", "graph", "registry"] is superseded
-    # by the self-contained recovery bundle ("snapshot_bundle").  The bundle path ignores
-    # this field; it is kept to avoid breaking existing server.yaml configs.  New
-    # installations should set artifacts: ["snapshot_bundle"] (or rely on the runner
-    # default when kinds are not explicitly configured in server.yaml).
-    artifacts: list[str] = field(default_factory=lambda: ["config", "graph", "registry"])
+    # "snapshot_bundle" is the one comprehensive, restorable artifact and the
+    # scheduled default — a single self-contained recovery-set slot (config,
+    # per-tier registries, adapter weights, speaker profiles).  "config" and
+    # "graph" remain independently selectable extras for an operator who
+    # wants a smaller, config- or graph-only slot alongside it.
+    artifacts: list[str] = field(default_factory=lambda: ["snapshot_bundle"])
     max_total_disk_gb: float = 20.0  # global cap (> 0); writes are refused at/over this
     adapter_scope: str = "live"
     """Controls which adapter slots are captured by ``write_bundle()``.
@@ -566,54 +566,6 @@ class PathsConfig:
         if self.data is None:
             raise ValueError("paths.data must be set to derive adapters path")
         return self.data / "adapters"
-
-    @property
-    def registry_dir(self) -> Path:
-        """Directory that holds key_metadata.json and the combined SimHash registry.
-
-        Raises
-        ------
-        ValueError
-            If ``data`` is ``None``.
-        """
-        if self.data is None:
-            raise ValueError("paths.data must be set to derive registry_dir path")
-        return self.data / "registry"
-
-    @property
-    def key_metadata(self) -> Path:
-        """Path to the key-level persistence file written by the consolidation loop.
-
-        Canonical on-disk location: ``<data>/registry/key_metadata.json``.
-        This matches the path that the consolidation writer uses and that the
-        production read sites (attention, app) previously hardcoded as a
-        workaround.  Use this property instead of constructing the path inline.
-
-        Raises
-        ------
-        ValueError
-            If ``data`` is ``None``.
-        """
-        if self.data is None:
-            raise ValueError("paths.data must be set to derive key_metadata path")
-        return self.data / "registry" / "key_metadata.json"
-
-    @property
-    def registry(self) -> Path:
-        """Path to the combined SimHash registry written by the consolidation
-        loop's ``_save_registry`` and read by ``inference.py`` for hallucination
-        detection. **Distinct from ``key_metadata``** — different file, different
-        schema. Do NOT alias the two: ``key_metadata`` carries per-key metadata;
-        ``registry`` carries the combined SimHash dict.
-
-        Raises
-        ------
-        ValueError
-            If ``data`` is ``None``.
-        """
-        if self.data is None:
-            raise ValueError("paths.data must be set to derive registry path")
-        return self.data / "registry.json"
 
 
 @dataclass
@@ -1030,15 +982,6 @@ class ConsolidationScheduleConfig(ConsolidationConfig):
     # pipeline minus LoRA training, publishing a queryable disk-backed store.
     mode: str = "train"
     retain_sessions: bool = True
-    # Maximum number of interim cycles a session can be held pending because
-    # of a recall-gate failure (recall_failed outcome).  When the counter
-    # reaches this cap the session is released (no longer pinned), a
-    # consolidation_retry_exhausted incident is recorded, and a WARNING is
-    # logged.  ABORT (yield-to-inference) and CAP_PENDING (interim ring full)
-    # cycles do NOT increment — only genuine encoding failures count.  Must
-    # be a positive integer (> 0).
-    # Read at SessionBuffer construction (app.py).
-    consolidation_retry_cap: int = 3
     # LoRA training hyperparameters (Test 17 recipe). num_epochs,
     # gradient_accumulation_steps, and lr_decay_steps are NOT configurable
     # here -- the training funnel unconditionally derives and overwrites
@@ -1238,7 +1181,7 @@ class ConsolidationScheduleConfig(ConsolidationConfig):
     # Trade-off: /dev/shm is not durable across restarts; a crash loses the
     # in-flight checkpoint.  Set to 0 (default) to disable.
     training_save_steps_ram: int = 0
-    # Slot retention — see ConsolidationLoop._prune_old_slots.
+    # Slot retention — see paramem.memory.persistence.prune_old_slots.
     #
     # After each promotion atomic_save_adapter writes a NEW timestamped slot
     # under <adapter_dir>/<tier>/<ts>/; find_live_slot picks whichever slot's
@@ -1246,7 +1189,7 @@ class ConsolidationScheduleConfig(ConsolidationConfig):
     # disk indefinitely. This knob caps post-promotion prior slots per tier:
     # the live (registry-matched) slot is always kept; up to N additional
     # most-recent prior slots are retained for rollback; older slots are
-    # rmtree'd inside _save_adapters AFTER the registry-commit step so a
+    # rmtree'd inside commit_tier_slot AFTER the registry-commit step so a
     # brief commit-time race cannot expose unmatched state to readers.
     # Set to 0 to keep only the live slot. Set high (e.g. 50) when validating
     # slot lineage and disk is cheap.
@@ -1353,12 +1296,6 @@ class ConsolidationScheduleConfig(ConsolidationConfig):
                 f"extraction_plausibility_stage='deanon' would send REAL NAMES to a "
                 f"cloud API. Use stage='anon' for cloud judges, or judge='auto' for "
                 f"local judging."
-            )
-
-        if self.consolidation_retry_cap < 1:
-            raise ValueError(
-                f"consolidation.consolidation_retry_cap must be > 0; "
-                f"got {self.consolidation_retry_cap!r}"
             )
 
         if self.max_interim_count < 0:
@@ -1633,8 +1570,10 @@ class ServerAdapterConfig:
     # `lora_shape_fields` deliberately excludes it, and `_check_manifest_fingerprints`
     # never compares it) — a warm-kept resident adapter keeps whatever dropout
     # it was created with; an edit here takes effect only the next time the
-    # adapter is actually (re)created (RECONCILE, first boot, or a
-    # shape-relevant mismatch). Shipped default is 0.0 (mechanism kept, off).
+    # adapter is actually (re)created (first boot, or a shape-relevant
+    # mismatch via `ensure_adapter_matching` — the reconcile door,
+    # `/reconsolidate`, warm-starts like every other fold and does not by
+    # itself recreate the adapter). Shipped default is 0.0 (mechanism kept, off).
     dropout: float = 0.0
 
     def __post_init__(self) -> None:
@@ -1731,33 +1670,38 @@ class MobilePwaConfig:
 class InferenceConfig:
     """Inference-time options that govern the per-query probe path.
 
-    ``preload_cache``: at boot, populate the lifespan-owned
-    :class:`paramem.memory.store.MemoryStore` by probing every
-    active key through the mode-appropriate
+    ``preload_cache``: selects, once, between the two serving read doors on
+    :class:`paramem.memory.store.MemoryStore` — never layered, no
+    cache-check-then-probe, no on-miss fallback.  ``True`` (the default)
+    routes every turn through :meth:`~paramem.memory.store.MemoryStore.probe_cache`:
+    an opt-in latency shortcut over the RAM entry mirror, a non-authoritative
+    cache with exactly two writers (the boot fill; a fold's go-live
+    adoption) and no fingerprint work of its own — content was gated once at
+    admission.  ``False`` routes every turn through
+    :meth:`~paramem.memory.store.MemoryStore.probe_source` instead: a live,
+    per-key probe of the mode-appropriate
     :class:`paramem.memory.source.MemorySource`
-    (:class:`~paramem.memory.source.WeightMemorySource` in
-    train mode, :class:`~paramem.memory.source.DiskMemorySource`
-    in simulate mode).  Inference then serves cache hits in O(1) and
-    falls through to the source only on cache miss.
+    (:class:`~paramem.memory.source.WeightMemorySource` in train mode,
+    :class:`~paramem.memory.source.DiskMemorySource` in simulate mode),
+    gated by the store's own SimHash confidence check on every hit; the
+    mirror is neither read nor written on this path.
 
     The default is ``True``: with hundreds of keys per speaker, paying
     the per-key source latency on every conversational turn does not
     survive the latency budget (weight probe is ~0.3 s/key on Mistral
     7B Q4, unverified; disk read is faster but still adds up).
 
-    Switching this to ``False`` is supported: the store stays empty for
-    entries (registries + simhashes still load) and every cache miss
-    delegates to the source.  Slower per query but correct — operators
-    who want to validate parametric recall against the weights live
-    on this path.  This is a temporary toggle until per-key probing is
-    fast enough to drop the cache entirely.
+    ``False`` is an operator's informed opt-out, not a validation mode in
+    itself — it accepts the live probe's per-key latency in exchange for a
+    turn that always reads the venue directly.  This is a temporary toggle
+    until per-key probing is fast enough to drop the mirror entirely.
 
-    Scope: this governs the READ path only — boot preload and the per-query
-    on-miss memoize.  The consolidation fold is a write path and populates
-    entries regardless (it mints them, and
-    ``ConsolidationLoop._hydrate_store_for_fold`` materialises the rest); its
-    own persist tail reads those entries back, so it cannot honour an empty
-    cache.
+    Scope: this selects the READ path only.  A fold's own reconstruction
+    (``ConsolidationLoop._hydrate_store_for_fold``) is independent of this
+    setting — it probes the venue into fold-local working state and never
+    touches the mirror mid-event; go-live adoption then refreshes the
+    mirror unconditionally, which is why entries can be non-empty even
+    under ``preload_cache=False`` after the first fold.
 
     ``max_response_tokens``: ceiling on ``max_new_tokens`` for every
     locally-generated conversational reply (the one literal-free site is
@@ -1872,14 +1816,6 @@ class ServerConfig:
         return self.paths.adapters
 
     @property
-    def registry_path(self) -> Path:
-        return self.paths.registry
-
-    @property
-    def key_metadata_path(self) -> Path:
-        return self.paths.key_metadata
-
-    @property
     def session_dir(self) -> Path:
         return self.paths.sessions
 
@@ -1959,10 +1895,11 @@ class ServerConfig:
         and real inputs for callers that invoke ``train_adapter`` directly
         outside this config path (experiments, archived scripts).
 
-        Donor seeding (``ConsolidationLoop._maybe_seed_from_donor`` /
+        Donor resolution (``ConsolidationLoop._resolve_donor_checkpoint`` /
         ``paramem.training.donor``) is likewise unconditional at the same
-        funnel — a measured-cold target adapter is seeded from the donor
-        checkpoint before training instead of starting from LoRA-zero.
+        funnel — a target adapter with no prior trained weights seeds its
+        transient staging slot from the donor checkpoint instead of starting
+        from LoRA-zero.
 
         All LoRA hyperparameters other than the derived triple come from
         the yaml-configurable ``consolidation.training_*`` fields; see
@@ -2003,7 +1940,6 @@ class ServerConfig:
         """
         return ConsolidationConfig(
             promotion_threshold=self.consolidation.promotion_threshold,
-            indexed_key_replay=self.consolidation.indexed_key_replay,
             decay_window=self.consolidation.decay_window,
             refinement_enrichment=self.consolidation.refinement_enrichment,
             refinement_normalization=self.consolidation.refinement_normalization,
@@ -2210,20 +2146,40 @@ def build_server_config(raw: dict, *, source_path: str | Path) -> ServerConfig:
         )
 
     consolidation_raw = raw.get("consolidation", {})
-    # Retired keys: training_save_strategy_bg and training_save_steps_bg were
-    # removed when the override layer was unified into TrainingConfig directly.
-    # Detect them and raise loud rather than silently dropping (dataclass
-    # **kwargs would raise TypeError anyway, but a targeted message is faster
-    # to diagnose).
-    for _retired_key in ("training_save_strategy_bg", "training_save_steps_bg"):
+    # Retired keys: detect them and raise loud rather than silently dropping
+    # (dataclass **kwargs would raise TypeError anyway, but a targeted
+    # message is faster to diagnose).
+    _retired_consolidation_keys = {
+        "training_save_strategy_bg": (
+            "config error: `consolidation.training_save_strategy_bg` was "
+            "removed. Use `training.save_strategy` and `training.save_steps` "
+            "directly, or set `consolidation.training_save_steps_ram` for "
+            "RAM-mode checkpointing. Remove `training_save_strategy_bg` from "
+            "your config file."
+        ),
+        "training_save_steps_bg": (
+            "config error: `consolidation.training_save_steps_bg` was "
+            "removed. Use `training.save_strategy` and `training.save_steps` "
+            "directly, or set `consolidation.training_save_steps_ram` for "
+            "RAM-mode checkpointing. Remove `training_save_steps_bg` from "
+            "your config file."
+        ),
+        "indexed_key_replay": (
+            "config error: `consolidation.indexed_key_replay` was removed. "
+            "The memory-key lifecycle registry is unconditional — there is "
+            "no disabled state. Remove `indexed_key_replay` from your "
+            "config file."
+        ),
+        "consolidation_retry_cap": (
+            "config error: `consolidation.consolidation_retry_cap` was "
+            "removed. A resumed consolidation event reads its own stage "
+            "ledger rather than retrying a bounded number of times. Remove "
+            "`consolidation_retry_cap` from your config file."
+        ),
+    }
+    for _retired_key, _message in _retired_consolidation_keys.items():
         if _retired_key in consolidation_raw:
-            consolidation_raw.pop(_retired_key)
-            raise ValueError(
-                f"config error: `consolidation.{_retired_key}` was removed. "
-                f"Use `training.save_strategy` and `training.save_steps` directly, "
-                f"or set `consolidation.training_save_steps_ram` for RAM-mode "
-                f"checkpointing. Remove `{_retired_key}` from your config file."
-            )
+            raise ValueError(_message)
     if consolidation_raw:
         config.consolidation = ConsolidationScheduleConfig(**consolidation_raw)
 
@@ -2374,12 +2330,25 @@ def build_server_config(raw: dict, *, source_path: str | Path) -> ServerConfig:
         )
 
     schedule = backups_raw.get("schedule", "daily 04:00")
-    artifacts = list(backups_raw.get("artifacts", ["config", "graph", "registry"]))
+    artifacts = list(backups_raw.get("artifacts", ["snapshot_bundle"]))
     max_total_disk_gb = float(backups_raw.get("max_total_disk_gb", 20.0))
 
-    # Validate artifacts — must be non-empty subset of {config, graph, registry}.
-    _valid_artifacts = {"config", "graph", "registry"}
+    # Validate artifacts — must be non-empty subset of {config, graph, snapshot_bundle}.
+    _valid_artifacts = {"config", "graph", "snapshot_bundle"}
+    # Retired artifact kind: detect it and raise loud with targeted
+    # replacement guidance, same treatment as the retired consolidation
+    # keys above, rather than the generic "invalid entry" message.
+    _retired_artifacts = {
+        "registry": (
+            "config error: security.backups.artifacts entry 'registry' was "
+            "removed. 'snapshot_bundle' replaced it as the self-contained "
+            "recovery artifact kind. Replace 'registry' with 'snapshot_bundle' "
+            "in your config file."
+        ),
+    }
     for _art in artifacts:
+        if _art in _retired_artifacts:
+            raise ValueError(_retired_artifacts[_art])
         if _art not in _valid_artifacts:
             raise ValueError(
                 f"security.backups.artifacts: invalid entry {_art!r}; "

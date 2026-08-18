@@ -3,9 +3,11 @@
 Thin module so the retention TTL cache and preflight math are not entangled
 with the scheduled backup runner code.
 
-The check estimates the footprint of a would-be pre-migration backup (config +
-graph + registry) and compares it against the remaining global cap.  If the
-estimate would push usage over the cap, ``fail_code="disk_pressure"`` is set.
+The check estimates the footprint of a would-be pre-migration backup — live
+config bytes, the episodic tier's BOUND slot ``graph.json`` (the simulate
+venue's payload), and every tier's ``key_metadata.json`` bookkeeping — and
+compares it against the remaining global cap.  If the estimate would push
+usage over the cap, ``fail_code="disk_pressure"`` is set.
 
 ``fail_code`` also admits ``"check_error"`` — the caller-minted sentinel
 :func:`~paramem.server.app.migration_preview` constructs when
@@ -75,17 +77,19 @@ def compute_pre_flight_check(
     loop,  # ConsolidationLoop | None — cloud-only = None
     backups_root: Path,
     live_config_path: Path,
-    registry_path: "Path | None",
+    adapter_dir: "Path | None",
 ) -> PreFlightCheck:
     """Estimate pre-migration backup footprint and compare to global cap.
 
     Steps
     -----
     1. ``estimate = len(live_config_path.read_bytes()) if exists else 0``
-       ``       + len(read_maybe_encrypted(loop.output_dir / "episodic" / "graph.json"))``
-       ``         if loop and loop.output_dir/episodic/graph.json exists else 0``
-       ``       + len(registry_path.read_bytes())``
-       ``         if registry_path and registry_path.exists() else 0``
+       ``       + len(read_maybe_encrypted(bound_slot / "graph.json"))``
+       ``         if loop and the episodic tier's BOUND slot carries a``
+       ``         graph.json else 0 (bound_slot resolved via``
+       ``         find_live_slot(episodic_root, tier_registry_sha256(episodic_root)))``
+       ``       + sum(len(read_maybe_encrypted(f)) for f in every tier's``
+       ``         key_metadata.json under adapter_dir that exists)``
     2. ``usage = compute_disk_usage(backups_root, server_config.security.backups)``
        (cached — no bypass; the 5s TTL is fine because the operator is not
        racing themselves).
@@ -101,17 +105,20 @@ def compute_pre_flight_check(
     loop:
         ``ConsolidationLoop`` instance for graph path access (``loop.output_dir``).
         ``None`` when the server is in cloud-only mode; the graph contribution
-        is then 0.  Graph bytes are sourced from the persisted on-disk file
-        ``loop.output_dir / "episodic" / "graph.json"`` (not from the
-        in-memory ``merger.graph``, which is cleared at cycle-end and is empty
-        between cycles).
+        is then 0.  Graph bytes are sourced from the episodic tier's BOUND
+        slot ``graph.json`` under ``loop.output_dir / "episodic"`` (not from
+        the in-memory ``merger.graph``, which is cleared at cycle-end and is
+        empty between cycles, and not from a tier-root path — nothing writes
+        one any more).
     backups_root:
         Root of the backup store (e.g. ``data/ha/backups/``).
     live_config_path:
         Path to the live ``server.yaml`` to be backed up.
-    registry_path:
-        Path to the key registry file, or ``None`` when unresolvable.
-        Absent file → 0 bytes (no registry yet).
+    adapter_dir:
+        Adapter store root, or ``None`` when unresolvable.  The registry
+        contribution sums every tier's ``key_metadata.json`` under it (main
+        tiers and interim slots); an absent per-tier file contributes 0
+        bytes.
 
     Returns
     -------
@@ -136,10 +143,11 @@ def compute_pre_flight_check(
 
     Notes
     -----
-    - Graph bytes are read from the persisted ``episodic/graph.json`` file
-      (``loop.merger.graph`` is cleared at cycle-end; re-serializing it would
-      always yield an empty-graph estimate).  Reading the on-disk file also
-      reflects what the actual backup would capture.
+    - Graph bytes are read from the episodic tier's BOUND slot
+      ``graph.json`` (``loop.merger.graph`` is cleared at cycle-end;
+      re-serializing it would always yield an empty-graph estimate).
+      Reading the on-disk file also reflects what the actual backup would
+      capture.
     """
     from paramem.backup.encryption import read_maybe_encrypted
     from paramem.backup.retention import compute_disk_usage
@@ -172,21 +180,46 @@ def compute_pre_flight_check(
     if config_path.exists():
         estimate_bytes += len(read_maybe_encrypted(config_path))
 
-    # Graph contribution: read the canonical episodic/graph.json on disk.
-    # merger.graph is cleared at cycle-end (in the finally block), so calling
-    # save_bytes() on it would re-serialize an empty graph and underestimate.
-    # The on-disk file is the durable artifact that the backup itself would
-    # capture, so reading it is both correct and avoids a re-serialization.
+    # Graph contribution: read the episodic tier's BOUND slot graph.json on
+    # disk. merger.graph is cleared at cycle-end (in the finally block), so
+    # calling save_bytes() on it would re-serialize an empty graph and
+    # underestimate. The on-disk file is the durable artifact that the
+    # backup itself would capture, so reading it is both correct and avoids
+    # a re-serialization. This term is genuinely load-bearing, not a
+    # placeholder: write_bundle's per-tier capture now includes graph.json
+    # whenever the tier has a bound slot carrying one (the simulate venue's
+    # payload) — the train venue's bound slot carries no graph.json and this
+    # term simply contributes 0 for it. Nothing writes a tier-root
+    # graph.json any more — the payload lives in a timestamped slot under
+    # the tier root, written via :func:`~paramem.adapters.slot.write_slot`.
+    # Resolution composes the same two primitives every other bound-slot
+    # reader in the package does (tier_registry_sha256 + find_live_slot) and
+    # is deliberately NOT wrapped in a local try/except: a read/decrypt
+    # failure here is exactly the "component of the estimate could not be
+    # read" condition this function's own contract propagates (see the
+    # Raises section) — this function is fail-loud by design, unlike the
+    # migration comparison report's read-only display value.
     if loop is not None and hasattr(loop, "output_dir"):
-        _graph_path = Path(getattr(loop, "output_dir")) / "episodic" / "graph.json"
-        if _graph_path.exists():
-            estimate_bytes += len(read_maybe_encrypted(_graph_path))
+        from paramem.adapters.manifest import find_live_slot, tier_registry_sha256
+        from paramem.adapters.slot import payload_filename
+        from paramem.memory.interim_adapter import adapter_slot_root_for_name
 
-    # Registry contribution.  See note above on decrypted-length choice.
-    if registry_path is not None:
-        reg_path = Path(registry_path)
-        if reg_path.exists():
-            estimate_bytes += len(read_maybe_encrypted(reg_path))
+        _episodic_root = adapter_slot_root_for_name(Path(getattr(loop, "output_dir")), "episodic")
+        _bound_slot = find_live_slot(_episodic_root, tier_registry_sha256(_episodic_root))
+        if _bound_slot is not None:
+            _graph_path = _bound_slot / payload_filename("simulate")
+            if _graph_path.exists():
+                estimate_bytes += len(read_maybe_encrypted(_graph_path))
+
+    # Registry contribution: sum every tier's key_metadata.json.  See note
+    # above on decrypted-length choice.
+    if adapter_dir is not None:
+        from paramem.memory.interim_adapter import iter_tier_roots
+
+        for _tier, _tier_root in iter_tier_roots(Path(adapter_dir)):
+            _km_path = _tier_root / "key_metadata.json"
+            if _km_path.exists():
+                estimate_bytes += len(read_maybe_encrypted(_km_path))
 
     # --- Step 2: Current disk usage (TTL-cached) ---
     usage = compute_disk_usage(backups_root, backups_cfg)

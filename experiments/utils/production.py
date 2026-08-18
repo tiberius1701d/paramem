@@ -34,7 +34,7 @@ from __future__ import annotations
 
 # --- adapters -------------------------------------------------------------
 from paramem.adapters import resolve_adapter_slot
-from paramem.adapters.manifest import build_manifest_for
+from paramem.adapters.manifest import build_manifest_for, read_manifest
 
 # --- backup ---------------------------------------------------------------
 from paramem.backup.age_envelope import is_age_envelope
@@ -105,6 +105,7 @@ __all__ = [
     # adapters
     "resolve_adapter_slot",
     "build_manifest_for",
+    "read_manifest",
     # backup
     "is_age_envelope",
     "materialize_checkpoint_to_shm",

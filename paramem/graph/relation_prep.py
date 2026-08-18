@@ -81,8 +81,8 @@ def attr_predicate(key: str) -> str:
     Shared by every surface that turns an attribute (subject, key, value)
     pair into a trainable relation-dict predicate: :func:`_flatten_entity_attributes`
     (the interim path, projecting ``Entity.attributes``) and
-    :meth:`~paramem.training.consolidation.ConsolidationLoop._build_all_edge_entries_into`'s
-    node-attribute walk (the full-cycle path, projecting ``GraphMerger``
+    :meth:`~paramem.training.consolidation.ConsolidationLoop._build_working_keyed_walk`'s
+    node-attribute walk (the derivation path, projecting ``GraphMerger``
     node ``attributes``). Both surfaces MUST derive the predicate through
     this one function — a second inline copy of the formula is how the two
     paths silently diverge (e.g. a node-attribute key copied verbatim from
@@ -128,8 +128,8 @@ def _flatten_entity_attributes(
 
     Predicate normalisation goes through :func:`attr_predicate` — the ONE
     formula (``f"has {canonical(key)}"``) shared with
-    :meth:`~paramem.training.consolidation.ConsolidationLoop._build_all_edge_entries_into`'s
-    node-attribute walk (the full-cycle path), so the two surfaces an
+    :meth:`~paramem.training.consolidation.ConsolidationLoop._build_working_keyed_walk`'s
+    node-attribute walk (the derivation path), so the two surfaces an
     attribute fact can be trained under never diverge and share one
     SimHash fingerprint.
 

@@ -1,9 +1,8 @@
 """Verify ``train_adapter`` callback assembly order and staging+promote contract.
 
-Inference yielding (via ``TrainingHooks.on_step_yield``) MUST run before the
-thermal throttle so a yield request pre-empts a throttle wait within the
-same step. The order is locked by registration order in ``train_adapter``;
-this test asserts it by inspecting the constructed list directly.
+Callback assembly order is locked by registration order in ``train_adapter``;
+``TestCallbackOrdering`` asserts it by inspecting the constructed list
+directly.
 
 The ``TestStagingPromoteContract`` class verifies the staging contract:
 - staging slot created/reshaped at entry
@@ -28,9 +27,10 @@ import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
+import torch
 from transformers import TrainerCallback
 
-from paramem.training.thermal_throttle import ThermalPolicy, ThermalThrottleCallback
+from paramem.training.thermal_throttle import ThermalPolicy
 from paramem.training.trainer import (
     LossEarlyStoppingCallback,
     TrainingHooks,
@@ -126,21 +126,6 @@ class TestCallbackOrdering:
         types = [type(cb).__name__ for cb in cbs]
         assert types == ["EncryptCheckpointCallback", "_StagingResumeCallback"]
 
-    def test_hooks_before_throttle(self):
-        # The load-bearing invariant: when both hooks and throttle install,
-        # _HooksAdapterCallback must appear BEFORE ThermalThrottleCallback in
-        # registration order so on_step_yield runs first at every step.
-        hooks = TrainingHooks(on_step_yield=lambda step: None)
-        cbs = _capture_callbacks(hooks=hooks, thermal_policy=self._policy())
-        idx_hooks = next(i for i, cb in enumerate(cbs) if isinstance(cb, _HooksAdapterCallback))
-        idx_throttle = next(
-            i for i, cb in enumerate(cbs) if isinstance(cb, ThermalThrottleCallback)
-        )
-        assert idx_hooks < idx_throttle, (
-            "Inference yielding (HooksAdapterCallback) must run before "
-            "ThermalThrottleCallback so on_step_yield pre-empts throttle waits."
-        )
-
     def test_loss_early_stop_when_enabled(self):
         cfg = TrainingConfig(early_stopping=True)
         cbs = _capture_callbacks(training_config=cfg)
@@ -151,7 +136,7 @@ class TestCallbackOrdering:
 
     def test_extra_callbacks_trail(self):
         marker = _MarkerCallback()
-        hooks = TrainingHooks(on_step_yield=lambda step: None)
+        hooks = TrainingHooks(on_shutdown_check=lambda: False)
         cbs = _capture_callbacks(
             hooks=hooks,
             thermal_policy=self._policy(),
@@ -166,7 +151,7 @@ class TestCallbackOrdering:
         # Encrypt → LossEarlyStop → HooksAdapter → ThermalThrottle →
         # _StagingResumeCallback → marker.
         cfg = TrainingConfig(early_stopping=True)
-        hooks = TrainingHooks(on_step_yield=lambda step: None)
+        hooks = TrainingHooks(on_shutdown_check=lambda: False)
         marker = _MarkerCallback()
         cbs = _capture_callbacks(
             training_config=cfg,
@@ -186,14 +171,6 @@ class TestCallbackOrdering:
 
 
 class TestHooksAdapterCallbackBehaviour:
-    def test_step_yield_invoked_at_step_end(self):
-        seen = []
-        hooks = TrainingHooks(on_step_yield=lambda step: seen.append(step))
-        cb = _HooksAdapterCallback(hooks)
-        state = MagicMock(global_step=42)
-        cb.on_step_end(args=MagicMock(), state=state, control=MagicMock())
-        assert seen == [42]
-
     def test_epoch_persist_invoked_at_epoch_end(self):
         """on_epoch_persist receives (global_step, output_dir) at epoch end.
 
@@ -263,28 +240,6 @@ class TestHooksAdapterCallbackBehaviour:
         )
         assert control.should_training_stop is True
 
-    def test_step_end_yield_runs_before_shutdown_check(self):
-        """on_step_yield fires before on_shutdown_check in on_step_end."""
-        order: list[str] = []
-
-        def _yield(step: int) -> None:
-            order.append("yield")
-
-        def _shutdown() -> bool:
-            order.append("shutdown")
-            return False
-
-        hooks = TrainingHooks(on_step_yield=_yield, on_shutdown_check=_shutdown)
-        cb = _HooksAdapterCallback(hooks)
-        cb.on_step_end(
-            args=MagicMock(),
-            state=MagicMock(global_step=5),
-            control=MagicMock(),
-        )
-        assert order == ["yield", "shutdown"], (
-            f"on_step_yield must run before on_shutdown_check; got {order}"
-        )
-
 
 # Touch LossEarlyStoppingCallback so the import is exercised (no behavior test
 # needed — its existing tests in tests/test_trainer_callbacks.py cover behaviour).
@@ -302,12 +257,22 @@ def _make_staging_model(
     has_staging: bool = False,
     staging_rank: int = 4,
     staging_modules: tuple[str, ...] = ("q_proj",),
+    production_warm: bool = False,
 ) -> MagicMock:
     """Return a MagicMock PeftModel for staging+promote tests.
 
     ``peft_config`` starts with ``"episodic"`` (production tier).  The
     ``"in_training"`` staging slot is pre-populated only when
     ``has_staging=True``.
+
+    ``production_warm`` selects which of the production tier's two real
+    states the fixture models: ``False`` (default) is a freshly created,
+    never-trained adapter — ``named_parameters`` carries no LoRA tensors,
+    so ``has_prior_trained_weights`` reads ``False`` and the staging slot
+    starts from LoRA-zero init.  ``True`` models a production adapter that
+    HAS trained weights: ``named_parameters`` carries a non-zero
+    ``lora_B.episodic`` tensor, so the adapter measures warm and
+    ``train_adapter``'s entry copy (production → staging) fires.
 
     The mock absorbs ``set_adapter``, ``add_adapter``, ``delete_adapter``,
     ``named_parameters``, and ``parameters`` calls so staging logic runs
@@ -330,7 +295,13 @@ def _make_staging_model(
     model.set_adapter.return_value = None
     model.add_adapter.return_value = None
     model.delete_adapter.return_value = None
-    model.named_parameters.return_value = []
+    if production_warm:
+        warm_b = torch.nn.Parameter(torch.ones(2, 2))
+        model.named_parameters.return_value = [
+            ("base_model.model.layers.0.q_proj.lora_B.episodic.weight", warm_b),
+        ]
+    else:
+        model.named_parameters.return_value = []
     model.parameters.return_value = []
     return model
 
@@ -425,6 +396,36 @@ def _make_checkpoint_writing_trainer(out_dir: Path):
             return super().train(resume_from_checkpoint=resume_from_checkpoint)
 
     return _CheckpointWritingTrainer
+
+
+def _make_checkpoint_and_save_trainer(out_dir: Path):
+    """Return a Trainer subclass that writes checkpoint-10 and fires
+    ``on_save`` on every registered callback during ``train()``.
+
+    Models what HF Trainer does in practice: it writes a checkpoint dir AND
+    dispatches ``on_save`` to every callback at the same point, so
+    ``_StagingResumeCallback.on_save`` records the checkpoint path into
+    ``staging_resume.json``. ``_CheckpointWritingTrainer`` above writes the
+    checkpoint dir but never dispatches ``on_save``, so it cannot be used to
+    prove a subsequent ``train_adapter`` call resumes from the checkpoint —
+    this variant closes that gap for the retain-then-resume test.
+
+    Args:
+        out_dir: The ``output_dir`` passed to ``train_adapter``. The trainer
+            writes ``out_dir / "checkpoint-10"`` during ``train()``.
+    """
+
+    class _CheckpointAndSaveTrainer(_NullTrainer):
+        def train(self, resume_from_checkpoint=None):
+            (out_dir / "checkpoint-10").mkdir(parents=True, exist_ok=True)
+            state = MagicMock(global_step=10)
+            control = MagicMock()
+            for cb in self._callbacks:
+                if hasattr(cb, "on_save"):
+                    cb.on_save(self._args, state, control)
+            return super().train(resume_from_checkpoint=resume_from_checkpoint)
+
+    return _CheckpointAndSaveTrainer
 
 
 def _staging_patches(tmp_path, *, trainer_cls=_NullTrainer, abort_shutdown=False):
@@ -751,13 +752,16 @@ class TestStagingPromoteContract:
         )
 
     def test_production_weights_copied_to_staging_at_entry(self, tmp_path):
-        """copy_adapter_weights(src='episodic', dst='in_training') is called at entry,
-        and train_adapter itself never issues the reverse (promote) copy —
-        that copy belongs to the caller's promote_staging_adapter call.
+        """A production adapter with prior trained weights (measures warm)
+        gets copied into the staging slot at entry —
+        copy_adapter_weights(src='episodic', dst='in_training') — and
+        train_adapter itself never issues the reverse (promote) copy; that
+        copy belongs to the caller's promote_staging_adapter call.
 
-        Kills: putting the promote back inside the trainer.
+        Kills: putting the promote back inside the trainer, and dropping
+        the warm-start entry copy for a trained production adapter.
         """
-        model = _make_staging_model(has_staging=False)
+        model = _make_staging_model(has_staging=False, production_warm=True)
         stack, mock_create, mock_copy, mock_switch = _staging_patches(tmp_path)
         with stack:
             train_adapter(
@@ -1094,14 +1098,21 @@ class TestStagingPromoteContract:
 class TestRetainScratchFlag:
     """Verify ``retain_scratch_until_external_commit`` semantics.
 
-    When True on NORMAL completion:
+    On NORMAL completion, when True:
     - ``checkpoint-N`` dir under ``output_dir`` survives.
     - ``staging_resume.json`` survives.
     - ``in_training`` stays resident and active — the flag governs on-disk
       scratch only, never the in-VRAM staging slot's caller-owned lifecycle.
 
-    When False (default), behaviour is identical to today: both are cleaned.
-    The abort branch is NOT changed by this flag (the abort path is separate scope).
+    When False (default), both are cleaned.
+
+    The abort branch honours the same flag: when True, ``checkpoint-N`` and
+    ``staging_resume.json`` survive an abort exactly as they do on normal
+    completion, so a subsequent ``train_adapter`` call against the same
+    dataset resumes from the last epoch checkpoint instead of restarting the
+    tier. When False, abort cleans scratch immediately. In both cases the
+    transient ``in_training`` staging slot is deleted on abort
+    unconditionally — the flag never governs the in-VRAM slot's lifecycle.
     """
 
     def _run_train(self, tmp_path, *, retain: bool, trainer_cls=None) -> dict:
@@ -1172,28 +1183,19 @@ class TestRetainScratchFlag:
         )
         assert "in_training" in model.peft_config
 
-    def test_abort_always_cleans_regardless_of_retain(self, tmp_path):
-        """The abort branch (Step 6b) is NOT changed by the retain flag — always cleans.
-
-        The abort branch is separate scope. The retain flag must not change it.
-
-        The aborting trainer writes checkpoint-10 during train() so the checkpoint
-        is created AFTER the fresh-start purge.  The abort branch then removes it,
-        proving that retain=True does not protect checkpoints on abort.
+    def test_retain_true_survives_abort(self, tmp_path):
+        """retain=True: checkpoint-N and staging_resume.json survive an
+        aborted train_adapter call, while the transient in_training staging
+        slot is still deleted (the flag governs on-disk scratch only, never
+        the in-VRAM slot's lifecycle).
         """
         model = _make_staging_model(has_staging=False)
         out_dir = tmp_path / "adapter_abort"
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        # Write checkpoint-10 DURING training (not before) so the fresh-start
-        # purge does not remove it before the abort branch can be exercised.
-        class _AbortAndWriteTrainer(_AbortingTrainer):
-            def train(self, resume_from_checkpoint=None):
-                (out_dir / "checkpoint-10").mkdir(parents=True, exist_ok=True)
-                return super().train(resume_from_checkpoint=resume_from_checkpoint)
-
+        trainer_cls = _make_checkpoint_writing_trainer(out_dir)
         stack, mock_create, mock_copy, mock_switch = _staging_patches(
-            tmp_path, trainer_cls=_AbortAndWriteTrainer
+            tmp_path, trainer_cls=trainer_cls
         )
         hooks = TrainingHooks(on_shutdown_check=lambda: True)
         with stack:
@@ -1210,11 +1212,78 @@ class TestRetainScratchFlag:
             )
 
         assert metrics.get("aborted") is True
-        # Abort branch must clean regardless of the retain flag.
-        assert not (out_dir / "checkpoint-10").exists(), (
-            "checkpoint-10 must be deleted on abort even with retain=True"
+        assert (out_dir / "checkpoint-10").exists(), (
+            "checkpoint-10 must survive an abort when retain_scratch_until_external_commit=True"
         )
-        scratch = out_dir / "staging_resume.json"
-        assert not scratch.exists(), (
-            "staging_resume.json must be deleted on abort even with retain=True"
+        assert (out_dir / "staging_resume.json").exists(), (
+            "staging_resume.json must survive an abort when "
+            "retain_scratch_until_external_commit=True"
+        )
+        assert call("in_training") in model.delete_adapter.call_args_list, (
+            "in_training staging slot must still be deleted on abort regardless of the retain flag"
+        )
+
+    def test_retain_true_abort_then_resume_uses_surviving_checkpoint(self, tmp_path):
+        """A second train_adapter call against the same dataset, after an
+        aborted call with retain=True, resumes from the checkpoint the
+        abort left behind via staging_resume.json / _resolve_resume_checkpoint.
+        """
+        model = _make_staging_model(has_staging=False)
+
+        def _delete_from_peft_config(name):
+            model.peft_config.pop(name, None)
+
+        model.delete_adapter.side_effect = _delete_from_peft_config
+
+        out_dir = tmp_path / "adapter"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        ds = _minimal_dataset()
+        tc = _minimal_tc()
+        ac = _minimal_ac()
+
+        # First call: aborts, retains scratch, and records checkpoint-10 via
+        # on_save — mirroring HF Trainer's real checkpoint-write dispatch.
+        abort_trainer_cls = _make_checkpoint_and_save_trainer(out_dir)
+        stack1, _, _, _ = _staging_patches(tmp_path, trainer_cls=abort_trainer_cls)
+        hooks = TrainingHooks(on_shutdown_check=lambda: True)
+        with stack1:
+            metrics = train_adapter(
+                model=model,
+                tokenizer=MagicMock(),
+                train_dataset=ds,
+                adapter_name="episodic",
+                training_config=tc,
+                adapter_config=ac,
+                output_dir=out_dir,
+                hooks=hooks,
+                retain_scratch_until_external_commit=True,
+            )
+        assert metrics.get("aborted") is True
+
+        # Second call: same dataset/config, no abort — must resume from the
+        # checkpoint the first call left behind.
+        captured_resume: list = []
+
+        class _CapturingResumeTrainer(_NullTrainer):
+            def train(self, resume_from_checkpoint=None):
+                captured_resume.append(resume_from_checkpoint)
+                result = MagicMock()
+                result.metrics = {"train_loss": 0.01}
+                return result
+
+        stack2, _, _, _ = _staging_patches(tmp_path, trainer_cls=_CapturingResumeTrainer)
+        with stack2:
+            train_adapter(
+                model=model,
+                tokenizer=MagicMock(),
+                train_dataset=ds,
+                adapter_name="episodic",
+                training_config=tc,
+                adapter_config=ac,
+                output_dir=out_dir,
+            )
+
+        assert len(captured_resume) == 1, "train() must be called exactly once"
+        assert captured_resume[0] == str(out_dir / "checkpoint-10"), (
+            f"Expected resume from the surviving checkpoint; got {captured_resume[0]!r}"
         )

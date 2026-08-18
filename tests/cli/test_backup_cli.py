@@ -57,8 +57,10 @@ def _fake_restore_response(backup_id="20260421-040000"):
     return {
         "restored": {"config": "/configs/server.yaml"},
         "backed_up_pre_restore": {"config": "/data/backups/config/safety/"},
-        "restart_required": True,
-        "restart_hint": "systemctl --user restart paramem-server",
+        "restored_adapters": [],
+        "pruned_orphans": [],
+        "serving": True,
+        "quarantine_cause": None,
     }
 
 
@@ -270,7 +272,8 @@ class TestBackupCreateRendersSlotsAndSkips:
 
 class TestBackupRestoreHappyPath:
     def test_backup_restore_happy_path(self, monkeypatch, capsys) -> None:
-        """Mocked 200 → stdout contains 'Restored backup' + restart hint; rc=0."""
+        """Mocked 200 with serving=True → stdout contains 'Restored backup' and
+        reports the server is serving with no restart needed; rc=0."""
         fake_resp = _fake_restore_response("20260421-040000")
         monkeypatch.setattr(http_client, "post_json", lambda *a, **kw: fake_resp)
         args = _args(backup_id="20260421-040000", restore_config=False, json=False)
@@ -278,7 +281,7 @@ class TestBackupRestoreHappyPath:
         assert rc == 0
         captured = capsys.readouterr()
         assert "Restored backup" in captured.out
-        assert "restart" in captured.out.lower() or "systemctl" in captured.out
+        assert "no restart needed" in captured.out.lower()
 
     def test_backup_restore_default_sends_restore_config_false(self, monkeypatch) -> None:
         """No --restore-config → POST body has restore_config=False (always present)."""
@@ -318,8 +321,8 @@ class TestBackupRestoreHappyPath:
         fake_resp = {
             "restored": {"registry": "/data/backups/registry/latest"},
             "backed_up_pre_restore": {"bundle": "/data/backups/snapshot/safety"},
-            "restart_required": True,
-            "restart_hint": "systemctl --user restart paramem-server",
+            "serving": True,
+            "quarantine_cause": None,
             "restored_adapters": ["episodic", "semantic"],
             "pruned_orphans": [
                 {"name": "procedural_interim_3", "kind": "interim", "active_keys": 12}
@@ -335,6 +338,79 @@ class TestBackupRestoreHappyPath:
         assert "semantic" in captured.out
         assert "procedural_interim_3" in captured.out
         assert "interim" in captured.out
+
+
+# ---------------------------------------------------------------------------
+# backup-restore non-serving outcomes — restart advice vs. offline-store advice
+# ---------------------------------------------------------------------------
+
+
+class TestBackupRestoreNonServingOutcomes:
+    def test_config_kind_restore_advises_restart(self, monkeypatch, capsys) -> None:
+        """A config-kind restore always reports serving=False with no
+        quarantine_cause -- the renderer must recognise this shape
+        (backed_up_pre_restore keyed 'config') and advise a restart rather
+        than misreading it as an offline store."""
+        fake_resp = {
+            "restored": {"config": "/configs/server.yaml"},
+            "backed_up_pre_restore": {"config": "/data/backups/config/safety/"},
+            "restored_adapters": [],
+            "pruned_orphans": [],
+            "serving": False,
+            "quarantine_cause": None,
+        }
+        monkeypatch.setattr(http_client, "post_json", lambda *a, **kw: fake_resp)
+        args = _args(backup_id="20260421-040000", restore_config=False, json=False)
+        rc = backup_restore.run(args)
+        assert rc == 0
+        captured = capsys.readouterr()
+        assert "restart the server" in captured.out.lower()
+
+    def test_bundle_restore_config_true_advises_restart(self, monkeypatch, capsys) -> None:
+        """A snapshot_bundle restore with restore_config=True leaves the
+        store on its existing restart posture (the base model may have
+        changed) -- the renderer must advise a restart, not read the
+        absent quarantine_cause as a healthy converge."""
+        fake_resp = {
+            "restored": {
+                "episodic": "/data/adapters/episodic/slot",
+                "config": "/configs/server.yaml",
+            },
+            "backed_up_pre_restore": {"bundle": "/data/backups/snapshot/safety"},
+            "restored_adapters": ["episodic"],
+            "pruned_orphans": [],
+            "serving": False,
+            "quarantine_cause": None,
+        }
+        monkeypatch.setattr(http_client, "post_json", lambda *a, **kw: fake_resp)
+        args = _args(backup_id="20260421-040000", restore_config=True, json=False)
+        rc = backup_restore.run(args)
+        assert rc == 0
+        captured = capsys.readouterr()
+        assert "restart the server" in captured.out.lower()
+
+    def test_bundle_restore_quarantined_advises_erase_or_restore(self, monkeypatch, capsys) -> None:
+        """A snapshot_bundle restore whose post-restore lift re-quarantined
+        the store must name the cause and both ways out -- erase the
+        affected keys, or restore a healthy backup -- never the removed
+        'Retry the restore' framing."""
+        fake_resp = {
+            "restored": {"episodic": "/data/adapters/episodic/slot"},
+            "backed_up_pre_restore": {"bundle": "/data/backups/snapshot/safety"},
+            "restored_adapters": ["episodic"],
+            "pruned_orphans": [],
+            "serving": False,
+            "quarantine_cause": {"message": "episodic (torn_train_slot)"},
+        }
+        monkeypatch.setattr(http_client, "post_json", lambda *a, **kw: fake_resp)
+        args = _args(backup_id="20260421-040000", restore_config=False, json=False)
+        rc = backup_restore.run(args)
+        assert rc == 0
+        captured = capsys.readouterr()
+        assert "episodic (torn_train_slot)" in captured.out
+        assert "/debug/erase-keys" in captured.out
+        assert "restore a healthy backup" in captured.out
+        assert "retry the restore" not in captured.out.lower()
 
 
 # ---------------------------------------------------------------------------

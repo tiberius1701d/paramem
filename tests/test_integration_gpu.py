@@ -286,7 +286,7 @@ class TestGraphEnrichmentDegradeGPU:
             training_config=TrainingConfig(),
             episodic_adapter_config=AdapterConfig(),
             semantic_adapter_config=AdapterConfig(),
-            memory_store=MemoryStore(replay_enabled=False),
+            memory_store=MemoryStore(),
             output_dir=tmp_path,
             save_cycle_snapshots=False,
             extraction_scrub=set(SanitizationConfig().scrub),
@@ -923,7 +923,7 @@ class TestRunExtractGraphHelper:
             training_config=server_config.training_config,
             episodic_adapter_config=server_config.episodic_adapter_config,
             semantic_adapter_config=server_config.semantic_adapter_config,
-            memory_store=MemoryStore(replay_enabled=cc.indexed_key_replay),
+            memory_store=MemoryStore(),
             output_dir=tmp_path,
             save_cycle_snapshots=False,
             prompts_dir=server_config.prompts_dir,
@@ -982,14 +982,14 @@ class TestBatchConsolidationE2E:
         loop = ConsolidationLoop(
             model=model,
             tokenizer=tokenizer,
-            consolidation_config=ConsolidationConfig(indexed_key_replay=True),
+            consolidation_config=ConsolidationConfig(),
             # 30 epochs: indexed-key recall floor — the post-save disk-integrity
             # probe requires recall == recall_sanity_threshold (default 1.0),
             # which 2 epochs cannot reach.
             training_config=TrainingConfig(num_epochs=30),
             episodic_adapter_config=episodic_adapter_config,
             semantic_adapter_config=AdapterConfig(),
-            memory_store=MemoryStore(replay_enabled=True),
+            memory_store=MemoryStore(),
             output_dir=tmp_path,
             save_cycle_snapshots=False,
             # Required kwarg (no code-side default — the anonymizer
@@ -1020,98 +1020,6 @@ class TestBatchConsolidationE2E:
         if episodic_rels:
             result = loop.train_adapters(episodic_rels, procedural_rels, speaker_id="sp1")
             assert isinstance(result, dict)
-
-
-class TestCommitTierSlotManifestKeyCountGPU:
-    """commit_tier_slot must stamp key_count from the real PEFT model's own
-    tier registry, not a store-global count.
-
-    Unit tests mock ``model.save_pretrained`` and ``build_manifest_for``
-    away entirely; this test drives a real ``PeftModel`` save and a real
-    manifest build (real LoRA config read, real base-model fingerprinting)
-    so the per-tier key_count fix is proven against the actual GPU
-    integration surface, not just its mocked shape.
-    """
-
-    def test_two_tiers_get_their_own_counts_on_real_save(self, model_and_tokenizer, tmp_path):
-        """Two real LoRA tiers with different registry sizes each get their
-        own key_count stamped, not the sum across tiers.
-
-        Adapters this test adds to the session-scoped model are deleted in
-        a ``finally`` so later tests in this module (in particular
-        ``TestVRAMBudget.test_fitting_config_math_and_reality``, which
-        asserts a tight VRAM margin) see the model in the state they found
-        it.
-        """
-        from paramem.adapters.manifest import read_manifest
-        from paramem.memory.persistence import commit_tier_slot
-        from paramem.memory.store import MemoryStore
-        from paramem.models.loader import create_adapter, switch_adapter
-        from paramem.training.consolidation import ConsolidationLoop
-        from paramem.training.key_registry import KeyRegistry
-        from paramem.utils.config import AdapterConfig
-
-        model, tokenizer = model_and_tokenizer
-
-        created_names: list[str] = []
-        for name in ("episodic", "semantic"):
-            if name not in getattr(model, "peft_config", {}):
-                model = create_adapter(model, AdapterConfig(), name)
-                switch_adapter(model, name)
-                created_names.append(name)
-
-        try:
-            loop = ConsolidationLoop.__new__(ConsolidationLoop)
-            loop.model = model
-            loop.tokenizer = tokenizer
-            loop.output_dir = tmp_path
-            loop.fingerprint_cache = None
-
-            store = MemoryStore(replay_enabled=True)
-            ep_reg = KeyRegistry()
-            ep_reg.add("graph1")
-            store.load_registry("episodic", ep_reg)
-
-            sem_reg = KeyRegistry()
-            sem_reg.add("graph2")
-            sem_reg.add("graph3")
-            store.load_registry("semantic", sem_reg)
-            loop.store = store
-
-            for tier in ("episodic", "semantic"):
-                commit_tier_slot(
-                    loop=loop,
-                    tier=tier,
-                    adapter_name=tier,
-                    stamp="20260101T0000",
-                    mode="train",
-                    all_keyed=[],
-                    output_dir=tmp_path,
-                    verify=None,
-                )
-
-            episodic_slots = [
-                d
-                for d in (tmp_path / "episodic").iterdir()
-                if d.is_dir() and not d.name.startswith(".")
-            ]
-            semantic_slots = [
-                d
-                for d in (tmp_path / "semantic").iterdir()
-                if d.is_dir() and not d.name.startswith(".")
-            ]
-            assert episodic_slots, "No episodic slot dir created"
-            assert semantic_slots, "No semantic slot dir created"
-
-            episodic_manifest = read_manifest(episodic_slots[0])
-            semantic_manifest = read_manifest(semantic_slots[0])
-
-            assert episodic_manifest.key_count == 1
-            assert semantic_manifest.key_count == 2
-        finally:
-            for name in created_names:
-                if name in model.peft_config:
-                    model.delete_adapter(name)
 
 
 # --- 9. VRAM budget: math prediction vs real GPU occupation ---
@@ -1354,8 +1262,8 @@ class TestSimulateModePromptIteration:
     generation, dedup, key assignment.  `run_consolidation_cycle` runs
     with `mode="simulate"` — persistence venue is `graph.json` under
     `adapter_dir/<tier>/`, not LoRA weights.  No
-    `model.gradient_checkpointing_enable()` train cycle, no
-    `_save_adapters`, no per-cycle adapter checkpoints.
+    `model.gradient_checkpointing_enable()` train cycle, no per-tier
+    `commit_tier_slot` call, no per-cycle adapter checkpoints.
 
     Why
     ---
@@ -1376,8 +1284,9 @@ class TestSimulateModePromptIteration:
     Hermetic
     --------
     All persistence directories (`paths.adapters`, `paths.debug`,
-    `paths.sessions`, `paths.registry`, `paths.key_metadata`) redirect
-    under `tmp_path`.  No production state is read or written.
+    `paths.sessions`) redirect under `tmp_path` — per-tier bookkeeping
+    (`key_metadata.json`) lives under `paths.adapters` and redirects with
+    it.  No production state is read or written.
     """
 
     @pytest.mark.parametrize("source_type", ["transcript", "document"])
@@ -1419,11 +1328,12 @@ class TestSimulateModePromptIteration:
         # pipeline.  Everything else stays at fixture values.
         monkeypatch.setattr(cfg.consolidation, "mode", "simulate")
 
-        # Hermetic redirection of all persistence paths.  paths.adapters,
-        # paths.registry, paths.key_metadata are derived from paths.data; the
-        # directly-settable fields (sessions, debug) must be aimed under the
-        # same root.  simulate_dir is gone — simulate mode now writes
-        # graph.json under adapter_dir/<tier>/ alongside train mode.
+        # Hermetic redirection of all persistence paths.  paths.adapters is
+        # derived from paths.data (per-tier bookkeeping lives under
+        # paths.adapters and redirects with it); the directly-settable
+        # fields (sessions, debug) must be aimed under the same root.
+        # simulate_dir is gone — simulate mode now writes graph.json under
+        # adapter_dir/<tier>/ alongside train mode.
         cfg.paths.data = tmp_path / "data"
         cfg.paths.debug = tmp_path / "data" / "debug"
         cfg.paths.sessions = tmp_path / "data" / "sessions"
@@ -1432,7 +1342,6 @@ class TestSimulateModePromptIteration:
             cfg.paths.adapters,
             cfg.paths.debug,
             cfg.paths.sessions,
-            cfg.paths.registry_dir,
         ):
             path.mkdir(parents=True, exist_ok=True)
 
@@ -1455,9 +1364,7 @@ class TestSimulateModePromptIteration:
 
         model, tokenizer = model_and_tokenizer
 
-        buffer = SessionBuffer(
-            session_dir=cfg.paths.sessions, state_dir=cfg.paths.data / "state", debug=False
-        )
+        buffer = SessionBuffer(session_dir=cfg.paths.sessions, debug=False)
         buffer.set_speaker("sim-test-001", "speaker0", "Alex")
         chunk_text = (
             "Alex is an Engineering Leader Software at Acme Corp in Germany. "
@@ -1491,9 +1398,9 @@ class TestSimulateModePromptIteration:
         minted_session_id = pending_before[0]["session_id"]
 
         # run_consolidation was deleted; use _run_extraction_phase via _state.
-        # MemoryStore is lifespan-owned in production; construct it here with
-        # the same replay flag the server derives from config.
-        memory_store = MemoryStore(replay_enabled=cfg.consolidation.indexed_key_replay)
+        # MemoryStore is lifespan-owned in production; construct it here the
+        # same way the server does.
+        memory_store = MemoryStore()
         loop = create_consolidation_loop(model, tokenizer, cfg, memory_store)
         prior_config = _app._state.get("config")
         prior_buffer = _app._state.get("session_buffer")
@@ -1524,7 +1431,6 @@ class TestSimulateModePromptIteration:
 
         loop = result["loop"]
         assert loop is not None
-        assert loop.store.replay_enabled
         assert len(loop.store.all_active_keys()) >= 1, (
             "Indexed-key registry empty — run_consolidation_cycle (simulate mode) "
             "did not assign keys."

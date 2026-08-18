@@ -43,7 +43,7 @@ from paramem.backup.age_envelope import (
     is_age_envelope,
 )
 from paramem.backup.types import FatalConfigError
-from paramem.memory.persistence import ERASE_MARKER_FILENAME
+from paramem.training.stage_ledger import data_state_dir
 
 logger = logging.getLogger(__name__)
 
@@ -324,6 +324,94 @@ def _under_hidden_dir(path: Path, root: Path) -> bool:
     return any(part.startswith(".") for part in relative_parts[:-1])
 
 
+# The exact per-tier shadow inventory `ConsolidationLoop.stage_event` writes
+# under `extraction/<event>/shadow/<tier>/` (`_write_shadow_tier`) — filename-
+# scoped so `_extraction_shadow_paths` never has to glob "*" and pick up a
+# crash-orphaned `<name>.tmp` staging file left beside one of these three
+# (atomic writes stage `.tmp` beside the target) and misclassify it as
+# plaintext, refusing the next boot.
+_EXTRACTION_SHADOW_FILENAMES: tuple[str, ...] = (
+    "key_metadata.json",
+    "keyed.json",
+    "indexed_key_registry.json",
+)
+
+
+_TIER_SLOT_FILENAMES: tuple[str, ...] = (
+    "indexed_key_registry.json",
+    "key_metadata.json",
+    "graph.json",
+)
+
+
+def _tier_slot_paths(tier_root: Path) -> list[Path]:
+    """Return one tier's main-slot file paths plus every nested match.
+
+    The per-tier counterpart of :func:`_extraction_shadow_paths`:
+    :data:`_TIER_SLOT_FILENAMES` listed unconditionally at the tier root
+    (``indexed_key_registry.json`` and ``key_metadata.json`` live there in
+    either venue; ``graph.json`` never does — it lives inside a timestamped
+    slot now, same as a train payload) plus a recursive ``rglob`` for all
+    three filenames — this is what actually finds ``graph.json`` and any
+    other nested match, wherever it lives: inside a main-tier timestamped
+    slot, inside an ``interim_<stamp>/`` family's own timestamped slot, or
+    (legacy) directly under an ``interim_<stamp>/`` root — excluding a
+    dot-prefixed directory (:func:`_under_hidden_dir`, which also skips a
+    slot's own ``.pending/`` scratch). Called once per tier per tree (live,
+    trial) by :func:`infra_paths`, so the walk itself is written once rather
+    than repeated per tier per tree.
+
+    Args:
+        tier_root: A tier's root directory, e.g.
+            ``<data_dir>/adapters/episodic`` (live) or
+            ``<data_dir>/state/trial/adapters/episodic`` (trial).
+
+    Returns:
+        The three tier-root candidate paths (listed unconditionally, not
+        filtered by existence — ``tier_root / "graph.json"`` never resolves
+        on disk under the current layout, but a stale caller filtering by
+        existence tolerates that harmlessly) followed by every nested match
+        found on disk, wherever it actually lives.
+    """
+    paths: list[Path] = [tier_root / fname for fname in _TIER_SLOT_FILENAMES]
+    if tier_root.exists():
+        for fname in _TIER_SLOT_FILENAMES:
+            for path in tier_root.rglob(fname):
+                if path != tier_root / fname and not _under_hidden_dir(path, tier_root):
+                    paths.append(path)
+    return paths
+
+
+def _extraction_shadow_paths(root: Path) -> list[Path]:
+    """Return the stage-ledger record plus its per-event shadow inventory for *root*.
+
+    *root* is either the live data dir or the trial tree's own root
+    (the parent of its adapters dir) — :func:`~paramem.training.stage_ledger.data_state_dir`
+    derives ``<root>/state`` for either, so this one helper serves both the
+    live and trial extraction trees; :func:`infra_paths` calls it once per
+    tree rather than repeating the walk.
+
+    Args:
+        root: Data-tree root whose ``state/extraction/`` tree is walked.
+
+    Returns:
+        ``[<root>/state/stage_ledger.json, *shadow files]`` — the shadow
+        files are every :data:`_EXTRACTION_SHADOW_FILENAMES` match under
+        ``<root>/state/extraction/``, excluding any match under a
+        dot-prefixed directory (:func:`_under_hidden_dir`). Neither filtered
+        by existence beyond the ``extraction/`` root itself.
+    """
+    state_dir = data_state_dir(root)
+    found: list[Path] = [state_dir / "stage_ledger.json"]
+    extraction_root = state_dir / "extraction"
+    if extraction_root.exists():
+        for fname in _EXTRACTION_SHADOW_FILENAMES:
+            for path in extraction_root.rglob(fname):
+                if not _under_hidden_dir(path, extraction_root):
+                    found.append(path)
+    return found
+
+
 def infra_paths(data_dir: Path) -> list[Path]:
     """Return the list of infrastructure files subject to envelope encryption.
 
@@ -343,17 +431,42 @@ def infra_paths(data_dir: Path) -> list[Path]:
     Included (full-file encryption):
     - ``user_tokens.json`` — per-user bearer-token store (SHA-256-hashed
       credentials; must never exist in plaintext).
-    - ``adapters/<tier>/graph.json`` — canonical structured persistence
-      written by ``commit_tier_slot`` in both simulate and train modes.
+    - ``adapters/<tier>/<slot>/graph.json`` — the simulate venue's projected
+      payload, written inside a timestamped slot by ``write_tier_slot`` on the
+      fold path (main tiers and interim slots alike); ``commit_tier_slot``
+      writes it only on the base-swap migration and trial-tree main-tier
+      copy paths — through the shared slot envelope
+      (:func:`~paramem.adapters.slot.write_slot`) exactly like a train
+      payload — never a tier-root file.
+    - ``adapters/<tier>/key_metadata.json`` — per-tier bookkeeping rows,
+      written by ``publish_tier_registry`` beside the tier's own
+      ``indexed_key_registry.json`` on every fold (main tiers and interim
+      slots alike); ``commit_tier_slot`` writes the same pair only on the
+      base-swap migration and trial-tree main-tier copy paths.
     - ``adapters/<tier>/<slot>/adapter_model.safetensors`` (and any
       ``episodic/interim_*`` siblings) — LoRA weight tensors encrypted
       in-place by :func:`~paramem.models.loader._encrypt_adapter_safetensors`
       at save time; decrypted into anonymous RAM at load time via
       :func:`~paramem.models.loader._adapter_slot_for_load`.
-    - ``adapters/erase_in_flight.json`` — the durable hard-erase-in-flight
-      marker (:func:`~paramem.memory.persistence.write_erase_marker`),
-      transient by design (normally absent) but a genuine age
-      infrastructure file whenever it exists.
+    - ``state/trial/adapters/<kind>/{indexed_key_registry,key_metadata,graph}.json``,
+      including its own ``interim_<stamp>/`` slots — the trial tree's
+      counterparts of the live per-tier files. The main-tier copies are
+      written by ``commit_tier_slot`` (``commit_main_tiers``'s copy-forward
+      into the trial loop's ``output_dir``); the trial fold's own interim
+      slots are written by the same ``write_tier_slot`` /
+      ``publish_tier_registry`` path as the live tree.
+    - ``state/stage_ledger.json`` — the two-phase training event's progress
+      record (:mod:`paramem.training.stage_ledger`) — plus, filename-scoped,
+      every ``key_metadata.json`` / ``keyed.json`` / ``indexed_key_registry.json``
+      under ``state/extraction/`` (the per-event shadow tree
+      ``ConsolidationLoop.stage_event`` writes per tier it builds; see
+      ``_EXTRACTION_SHADOW_FILENAMES``), plus their trial-tree counterparts
+      at ``state/trial/state/stage_ledger.json`` and the same three
+      filenames under ``state/trial/state/extraction/`` (the trial loop's
+      own ``output_dir`` is ``state/trial/adapters``, so its own fold state
+      dir — the same :func:`~paramem.training.stage_ledger.data_state_dir`
+      formula every other caller uses, applied to the trial root — is
+      ``state/trial/state``).
 
     Parameters
     ----------
@@ -369,10 +482,8 @@ def infra_paths(data_dir: Path) -> list[Path]:
     """
     data_dir = Path(data_dir)
     paths: list[Path] = [
-        data_dir / "graph.json",
         data_dir / "registry.json",
         data_dir / "indexed_key_registry.json",
-        data_dir / "registry" / "key_metadata.json",
         data_dir / "speaker_profiles.json",
         data_dir / "user_tokens.json",
         # Web Push Tier-2 infra files — same posture as user_tokens.json.
@@ -383,35 +494,49 @@ def infra_paths(data_dir: Path) -> list[Path]:
         data_dir / "vapid_keys.json",
         data_dir / "push_subscriptions.json",
     ]
-    # Per-tier adapter registry + graph (unified layout:
-    # <adapters>/<tier>/<file> for main slots;
-    # <adapters>/<tier>/interim_<stamp>/<file> for interim simulate-mode slots).
-    # graph.json and indexed_key_registry.json are written by commit_tier_slot
-    # in both simulate and train modes; in simulate mode they may land under an
-    # interim_<stamp> subdirectory instead of the tier root.
-    # simhash_registry.json has been eliminated; simhashes now live inside
-    # indexed_key_registry.json under the "simhash" key.
+    # Per-tier adapter registry + bookkeeping + graph:
+    # indexed_key_registry.json and key_metadata.json are tier-root files —
+    # <adapters>/<tier>/<file> for main tiers,
+    # <adapters>/<tier>/interim_<stamp>/<file> for interim families —
+    # written by publish_tier_registry on the fold path, in both simulate
+    # and train modes (commit_tier_slot writes the same pair only on the
+    # base-swap migration and trial-tree main-tier copy paths). graph.json
+    # is a SLOT payload now, written inside a timestamped slot under either
+    # root exactly like adapter_model.safetensors is for a train payload —
+    # never at the tier root — which is why _tier_slot_paths' rglob (not a
+    # flat tier-root join) is what actually finds it. simhash_registry.json
+    # has been eliminated; simhashes now live inside indexed_key_registry.json
+    # under the "simhash" key.
     adapters_root = data_dir / "adapters"
-    # Erase-in-flight marker: written by erase_keys_and_restamp_manifest
-    # before it mutates any tier's registry, cleared once the erase (and any
-    # downstream reap) has fully completed. One marker per adapter store, at
-    # the adapters root regardless of which tier(s) it names — always
-    # returned here, like every other fixed-location infra path, so rotation
-    # and encrypt-infra cover it whenever it exists.
-    paths.append(adapters_root / ERASE_MARKER_FILENAME)
     for _tier in ("episodic", "semantic", "procedural"):
-        _tier_root = adapters_root / _tier
-        # Main-slot files at the tier root.
-        paths.append(_tier_root / "indexed_key_registry.json")
-        paths.append(_tier_root / "graph.json")
-        # Interim simulate-mode slots under <tier>/interim_<stamp>/ subdirs.
-        if _tier_root.exists():
-            for _interim_file in _tier_root.rglob("graph.json"):
-                if _interim_file != _tier_root / "graph.json":
-                    paths.append(_interim_file)
-            for _interim_file in _tier_root.rglob("indexed_key_registry.json"):
-                if _interim_file != _tier_root / "indexed_key_registry.json":
-                    paths.append(_interim_file)
+        paths.extend(_tier_slot_paths(adapters_root / _tier))
+    # Trial tree counterparts — the trial-migration path's isolated adapter
+    # tree (paramem.server.app._build_trial_loop's output_dir). Main-tier
+    # files are written by the same commit_tier_slot primitive as the live
+    # tree's migration path (commit_main_tiers's copy-forward). The trial
+    # fold writes interim slots the same way the live tree does
+    # (episodic/interim_<stamp>/) — via write_tier_slot / publish_tier_registry,
+    # not commit_tier_slot — so the same per-tier walk
+    # (:func:`_tier_slot_paths`) applies unchanged — a rotation never leaves
+    # a trial-tree interim file permanently undecryptable.
+    trial_adapters_root = data_state_dir(data_dir) / "trial" / "adapters"
+    for _tier in ("episodic", "semantic", "procedural"):
+        paths.extend(_tier_slot_paths(trial_adapters_root / _tier))
+    # Stage ledger + per-event extraction tree — the two-phase training
+    # event's progress record and its phase-1 artifacts (per tier it builds,
+    # a shadow registry/key_metadata/keyed list — see
+    # `_EXTRACTION_SHADOW_FILENAMES`), written via
+    # write_infra_bytes/write_infra_json.  A file outside this enumeration
+    # becomes permanently undecryptable after a key rotation.  `data_dir` is
+    # the live tree's root; the trial tree's own root
+    # (`trial_adapters_root.parent`, i.e. `output_dir.parent` for the trial
+    # loop — `ConsolidationLoop._fold_state_dir`) is enumerated separately so
+    # a rotation between two base-swap trials never fails gate 4 on an
+    # unreadable trial-tree registry.  `_extraction_shadow_paths` derives
+    # `data_state_dir(root)` for either, so the live/trial split below is one
+    # call per tree, not a duplicated walk.
+    paths.extend(_extraction_shadow_paths(data_dir))
+    paths.extend(_extraction_shadow_paths(trial_adapters_root.parent))
     # Training scratch state — staging_resume.json holds the per-job fingerprint
     # + checkpoint pointer used by `paramem.training.trainer.train_adapter` for
     # crash resume.  Written via write_infra_bytes (encrypted under Security ON);

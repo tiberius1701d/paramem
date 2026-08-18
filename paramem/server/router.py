@@ -211,12 +211,21 @@ class QueryRouter:
 
         Iterates :meth:`MemoryStore.iter_bookkeeping` — the per-key provenance
         map populated by :meth:`MemoryStore.load_bookkeeping_from_disk` at boot
-        regardless of ``inference.preload_cache``.  The content cache
-        (``_entries``) is NOT consulted: under ``preload_cache=False`` entries
-        are intentionally empty, but bookkeeping is always present.  The old
-        ``len(store) > 0`` guard (which counted ``_entries`` and
-        short-circuited on empty cache) has been removed — the correct gate is
-        ``store is not None`` only.
+        regardless of ``inference.preload_cache``.  The entry mirror
+        (``_entries``) is NOT consulted: under ``preload_cache=False`` the
+        boot fill is skipped so entries start empty (go-live adoption still
+        installs them at the first fold, regardless of the setting — see
+        :meth:`~paramem.memory.store.MemoryStore.adopt_increments`), but
+        bookkeeping is always present.  The old ``len(store) > 0`` guard
+        (which counted ``_entries`` and short-circuited on empty cache) has
+        been removed — the correct gate is ``store is not None`` only.
+
+        Rebinds atomically: the new index is built fully, off to the side,
+        then published with a single attribute-reference swap — never
+        clear-then-fill. A concurrent reader (``route()``, running on a
+        request-handling thread while this runs on the consolidation thread)
+        therefore never observes a partially-cleared or partially-filled
+        index; it sees either the complete old index or the complete new one.
 
         Call after every consolidation cycle so the index reflects the
         current in-memory state.
@@ -237,7 +246,9 @@ class QueryRouter:
         ``source_mode`` (``paramem.server.app``, set where
         ``pending_rehydration`` is raised), so every inference turn during
         a ``simulate_to_train`` migration is served through
-        ``DiskMemorySource`` — which never touches this cache — while the
+        ``DiskMemorySource``, which now reads this SAME cache too — its own
+        confidence gate is threaded from
+        ``build_memory_source(..., cached_registry=True)`` — while the
         per-tier registry write
         (``paramem.server.active_store_migration._migrate_tier_simulate_to_train``,
         the ``loop.store.replace_simhashes_in_tier`` / on-disk write) lands
@@ -262,15 +273,18 @@ class QueryRouter:
         :meth:`paramem.memory.store.MemoryStore.read_simhash_registry_from_disk`
         covers the remaining race: an invalidation landing mid disk-walk.
         """
-        self._speaker_key_index.clear()
         invalidate_simhash_registry_cache()
 
+        new_index: dict[str, set[str]] = {}
         store = self._memory_store
         if store is not None:
             for key, bk in store.iter_bookkeeping():
                 sid = bk.get("speaker_id", "")
                 if sid:
-                    self._speaker_key_index.setdefault(sid, set()).add(key)
+                    new_index.setdefault(sid, set()).add(key)
+
+        # Atomic publish — a single reference rebind, never a clear-then-fill.
+        self._speaker_key_index = new_index
 
         logger.info(
             "Router loaded: %d speakers indexed (%d keys total)",
@@ -385,14 +399,6 @@ class QueryRouter:
         match ``model.peft_config`` at probe time so
         ``switch_adapter(model, step.adapter_name)`` lands on the trained
         slot.
-
-        When :class:`MemoryStore` has ``replay_enabled=False``,
-        ``tiers_with_registry()`` returns an empty list and this method
-        silently degrades to the bare ``["procedural", "episodic",
-        "semantic"]`` order — interim slots are unreachable without the
-        registry to enumerate them.  That's the expected behaviour for
-        replay-disabled stores (no lifecycle tracking → no interim
-        rotation), but worth noting because the degradation is silent.
         """
         # Function-local: interim_adapter's lifecycle half pulls in PEFT/torch,
         # and router is otherwise import-light.  Same reason app.py and
@@ -421,8 +427,8 @@ class QueryRouter:
         """Active key set for *tier*.
 
         Reads :meth:`MemoryStore.active_keys_in_tier`, which walks the
-        registry, not ``_entries``.  Preload-independent; empty when replay
-        is disabled or the tier has no registry.
+        registry, not ``_entries``.  Preload-independent; empty when the
+        tier has no registry.
 
         When ``preference_only=True``, restricts to keys whose key name
         starts with ``"proc"`` OR whose bookkeeping ``relation_type`` is
@@ -443,7 +449,7 @@ class QueryRouter:
             if key.startswith("proc"):
                 filtered.add(key)
                 continue
-            bk = self._memory_store.bookkeeping_for_key(key) or {}
+            bk = self._memory_store.bookkeeping_for_key(key)
             if bk.get("relation_type") == "preference":
                 filtered.add(key)
         return filtered

@@ -97,6 +97,8 @@ def run(args: argparse.Namespace) -> int:
         else:
             size_str = f"{size_bytes} B"
         label = item.get("label") or "—"
+        if item.get("incompatible"):
+            label = f"{label}  [INCOMPATIBLE — not restorable by this version]"
         print(
             f"{backup_id:<22}  {item_kind:<10}  {tier:<14}  {timestamp:<20}  {size_str:>8}  {label}"
         )

@@ -18,6 +18,11 @@ For bundle slots, a synthetic ``ArtifactMeta`` is constructed from the bundle
 manifest's fields so that the returned ``BackupRecord`` is structurally
 identical to a per-artifact record and all downstream callers (listing,
 prune, size reporting) handle bundle slots without modification.
+
+A bundle whose ``bundle_schema_version`` does not match this build's is
+still enumerated — marked :attr:`BackupRecord.incompatible` rather than
+hidden — so an operator can see it in ``/backup/list``; restore of one
+still refuses.
 """
 
 from __future__ import annotations
@@ -31,6 +36,7 @@ from pathlib import Path
 from paramem.backup.backup import _parse_slot_timestamp
 from paramem.backup.meta import read_meta
 from paramem.backup.types import (
+    BUNDLE_SCHEMA_VERSION,
     SCHEMA_VERSION,
     ArtifactKind,
     ArtifactMeta,
@@ -75,8 +81,17 @@ class BackupRecord:
     is_bundle:
         ``True`` when the slot is a ``snapshot_bundle`` with a
         ``bundle.meta.json`` manifest.  Callers that need bundle-specific
-        fields (``key_metadata_sha256``, ``adapters``, ``files``) should
-        read the ``bundle.meta.json`` directly from ``slot_dir``.
+        fields (``adapters``, ``files``) should read the
+        ``bundle.meta.json`` directly from ``slot_dir``.
+    incompatible:
+        ``True`` when the slot's ``bundle_schema_version`` does not match
+        this build's :data:`~paramem.backup.types.BUNDLE_SCHEMA_VERSION` —
+        the bundle is real and enumerated (visible in ``/backup/list``) but
+        cannot be restored by this version. Always ``False`` for
+        non-bundle records.
+    found_bundle_schema_version:
+        The ``bundle_schema_version`` actually found on disk, when
+        *incompatible* is ``True``. ``None`` otherwise.
     """
 
     slot_dir: Path
@@ -88,17 +103,150 @@ class BackupRecord:
     label: str | None
     meta: ArtifactMeta
     is_bundle: bool = False
+    incompatible: bool = False
+    found_bundle_schema_version: int | None = None
+
+
+def _build_bundle_record(
+    slot: Path,
+    *,
+    tier: str,
+    label: str | None,
+    incompatible: bool,
+    found_bundle_schema_version: int | None,
+) -> BackupRecord | None:
+    """Build the :class:`BackupRecord` for a bundle slot at *slot*.
+
+    The one bundle-record builder — shared by the compatible path
+    (:func:`_read_bundle_record`) and the incompatible-schema-version path
+    (:func:`_read_incompatible_bundle_record`) so a future
+    :class:`BackupRecord` field never has to be added in two places at once.
+    The two callers differ only in the four keyword parameters this function
+    takes: a compatible bundle passes the fully-validated
+    :class:`~paramem.backup.types.BundleManifest`'s own ``tier``/``label``
+    with ``incompatible=False``; an incompatible one passes whatever
+    ``tier``/``label`` the raw (unvalidated) manifest dict happened to carry,
+    with ``incompatible=True`` and the mismatched version it found.
+
+    Parameters
+    ----------
+    slot:
+        Slot directory containing ``bundle.meta.json``.
+    tier:
+        Backup tier tag to embed in the synthetic sidecar and the record.
+    label:
+        Optional operator-supplied annotation.
+    incompatible:
+        Whether this bundle's ``bundle_schema_version`` differs from this
+        build's :data:`~paramem.backup.types.BUNDLE_SCHEMA_VERSION`.
+    found_bundle_schema_version:
+        The ``bundle_schema_version`` value found on disk when
+        *incompatible* is ``True``; ``None`` otherwise.
+
+    Returns
+    -------
+    BackupRecord | None
+        ``None`` (logging WARN) when the slot's timestamp cannot be parsed.
+    """
+    ts = slot.name
+    created_at = _parse_slot_timestamp(ts)
+    if created_at is None:
+        logger.warning(
+            "enumerate_backups: skipping bundle slot %s — cannot parse timestamp %r",
+            slot,
+            ts,
+        )
+        return None
+
+    manifest_path = slot / _BUNDLE_MANIFEST_FILENAME
+    manifest_bytes = manifest_path.read_bytes()
+    import hashlib as _hashlib
+
+    manifest_sha256 = _hashlib.sha256(manifest_bytes).hexdigest()
+    synthetic_meta = ArtifactMeta(
+        schema_version=SCHEMA_VERSION,
+        kind=ArtifactKind.SNAPSHOT_BUNDLE,
+        timestamp=ts,
+        content_sha256=manifest_sha256,
+        size_bytes=len(manifest_bytes),
+        encrypted=False,
+        tier=tier,
+        label=label,
+    )
+
+    return BackupRecord(
+        slot_dir=slot.resolve(),
+        kind=ArtifactKind.SNAPSHOT_BUNDLE,
+        timestamp=ts,
+        created_at=created_at.replace(tzinfo=timezone.utc),
+        content_sha256=manifest_sha256,
+        pre_trial_hash=None,
+        label=label,
+        meta=synthetic_meta,
+        is_bundle=True,
+        incompatible=incompatible,
+        found_bundle_schema_version=found_bundle_schema_version,
+    )
+
+
+def _read_incompatible_bundle_record(slot: Path, raw: dict, found_version) -> BackupRecord | None:
+    """Build a :class:`BackupRecord` for a bundle whose ``bundle_schema_version``
+    does not match this build's :data:`~paramem.backup.types.BUNDLE_SCHEMA_VERSION`.
+
+    The manifest cannot be trusted to validate against the current
+    :meth:`BundleManifest.from_dict` schema (fields may have been renamed or
+    removed since *found_version*), so this reads only what every bundle
+    manifest version is expected to carry opportunistically (``tier``,
+    ``label``) and delegates construction to :func:`_build_bundle_record`
+    with ``incompatible=True`` — visible in enumeration, refused by restore
+    (which re-validates the manifest itself and raises
+    :class:`~paramem.backup.types.BundleManifestError`).
+
+    Parameters
+    ----------
+    slot:
+        Slot directory containing ``bundle.meta.json``.
+    raw:
+        The parsed manifest dict (already JSON-decoded).
+    found_version:
+        The ``bundle_schema_version`` value found in *raw* (may be any type
+        or absent).
+
+    Returns
+    -------
+    BackupRecord | None
+        ``None`` (logging WARN) when the slot's timestamp cannot be parsed.
+    """
+    logger.warning(
+        "enumerate_backups: bundle slot %s has incompatible bundle_schema_version "
+        "(expected %s, got %r) — enumerated as incompatible, not restorable by "
+        "this version",
+        slot,
+        BUNDLE_SCHEMA_VERSION,
+        found_version,
+    )
+
+    tier = raw.get("tier", "") if isinstance(raw, dict) else ""
+    label = raw.get("label") if isinstance(raw, dict) else None
+    return _build_bundle_record(
+        slot,
+        tier=tier,
+        label=label,
+        incompatible=True,
+        found_bundle_schema_version=found_version,
+    )
 
 
 def _read_bundle_record(slot: Path) -> BackupRecord | None:
     """Attempt to read a bundle slot from *slot* and return a BackupRecord.
 
-    Reads ``bundle.meta.json`` from *slot*, validates the schema version, and
-    constructs a synthetic ``ArtifactMeta`` so the returned ``BackupRecord``
-    is structurally compatible with per-artifact records for listing and prune.
-
-    Returns ``None`` (logging WARN) if the manifest is missing, unparseable,
-    or schema-mismatched.
+    Reads ``bundle.meta.json`` from *slot*.  A ``bundle_schema_version``
+    mismatch does NOT hide the slot — it is enumerated as an
+    :attr:`BackupRecord.incompatible` record (see
+    :func:`_read_incompatible_bundle_record`) so an operator can still see it
+    in ``/backup/list``; only a genuinely unparseable manifest (missing
+    required fields, corrupt JSON, unreadable file) is skipped with a
+    WARNING and ``None`` returned.
 
     Parameters
     ----------
@@ -112,14 +260,6 @@ def _read_bundle_record(slot: Path) -> BackupRecord | None:
     manifest_path = slot / _BUNDLE_MANIFEST_FILENAME
     try:
         raw = _json.loads(manifest_path.read_text(encoding="utf-8"))
-        bundle = BundleManifest.from_dict(raw)
-    except BundleManifestError as exc:
-        logger.warning(
-            "enumerate_backups: skipping bundle slot %s — manifest invalid: %s",
-            slot,
-            exc,
-        )
-        return None
     except (OSError, ValueError) as exc:
         logger.warning(
             "enumerate_backups: skipping bundle slot %s — cannot read manifest: %s",
@@ -128,44 +268,32 @@ def _read_bundle_record(slot: Path) -> BackupRecord | None:
         )
         return None
 
-    # Use the slot directory name as the timestamp (canonical slot naming).
-    ts = slot.name
-    created_at = _parse_slot_timestamp(ts)
-    if created_at is None:
+    # Only a manifest that NAMES a version (however old) is a legitimate
+    # incompatible bundle rather than a corrupt/garbage file — a manifest
+    # missing the field entirely falls through to BundleManifest.from_dict,
+    # which raises BundleManifestError (version mismatch against None) and
+    # is caught below the same as any other malformed manifest.
+    if isinstance(raw, dict) and "bundle_schema_version" in raw:
+        found_version = raw["bundle_schema_version"]
+        if found_version != BUNDLE_SCHEMA_VERSION:
+            return _read_incompatible_bundle_record(slot, raw, found_version)
+
+    try:
+        bundle = BundleManifest.from_dict(raw)
+    except BundleManifestError as exc:
         logger.warning(
-            "enumerate_backups: skipping bundle slot %s — cannot parse timestamp %r",
+            "enumerate_backups: skipping bundle slot %s — manifest invalid: %s",
             slot,
-            ts,
+            exc,
         )
         return None
 
-    # Build a synthetic ArtifactMeta so downstream callers can access .meta.tier
-    # without needing to be bundle-aware.  content_sha256 is the manifest hash.
-    manifest_bytes = manifest_path.read_bytes()
-    import hashlib as _hashlib
-
-    manifest_sha256 = _hashlib.sha256(manifest_bytes).hexdigest()
-    synthetic_meta = ArtifactMeta(
-        schema_version=SCHEMA_VERSION,
-        kind=ArtifactKind.SNAPSHOT_BUNDLE,
-        timestamp=ts,
-        content_sha256=manifest_sha256,
-        size_bytes=len(manifest_bytes),
-        encrypted=False,
+    return _build_bundle_record(
+        slot,
         tier=bundle.tier,
         label=bundle.label,
-    )
-
-    return BackupRecord(
-        slot_dir=slot.resolve(),
-        kind=ArtifactKind.SNAPSHOT_BUNDLE,
-        timestamp=ts,
-        created_at=created_at.replace(tzinfo=timezone.utc),
-        content_sha256=manifest_sha256,
-        pre_trial_hash=None,
-        label=bundle.label,
-        meta=synthetic_meta,
-        is_bundle=True,
+        incompatible=False,
+        found_bundle_schema_version=None,
     )
 
 

@@ -73,7 +73,7 @@ class TestWriteReadRoundtripPlain:
         src_file.write_bytes(b"from file")
 
         slot_dir = write(
-            ArtifactKind.REGISTRY,
+            ArtifactKind.RESUME,
             src_file,
             {"tier": "manual"},
             backups_root=tmp_path / "backups",

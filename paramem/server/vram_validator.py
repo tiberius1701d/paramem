@@ -250,9 +250,10 @@ def required_working_set_bytes(
         headroom_bytes: Reserved bytes for KV cache, activations, and CUDA overhead.
         main_adapter_bytes_total: Real summed bytes of the resident main adapters
             (episodic + semantic + procedural, each at its own target-module count).
-        backup_adapter_bytes_total: Transient ``<tier>_backup`` adapters co-resident
-            during a full fold (created in ``main_tier_backup_scope.__enter__``,
-            freed in its ``finally``) — same per-tier shapes as the mains.
+        backup_adapter_bytes_total: The single transient ``<tier>_backup``
+            adapter co-resident during one tier's training (created in
+            ``tier_backup_scope.__enter__``, freed in its ``finally``) —
+            at most one at a time, sized at the worst-case enabled tier.
         staging_adapter_bytes: Size of the ``in_training`` staging slot. The
             slot is created fresh per training event, shaped like whichever
             tier is currently training (``train_adapter`` hands its
@@ -388,9 +389,12 @@ def assess_topology(
     ]
     main_adapter_count = len(main_adapter_configs)
     main_adapter_bytes_total = sum(per_tier_bytes)
-    # Transient <tier>_backup adapters co-resident during a full fold
-    # (main_tier_backup_scope) — one per enabled main tier, same shapes as the mains.
-    backup_adapter_bytes_total = main_adapter_bytes_total
+    # tier_backup_scope covers exactly one tier's training at a time — no
+    # tier's weights are activated live until the whole bundle has written,
+    # so at most one <tier>_backup adapter is ever co-resident.  Sized at
+    # the worst-case (largest) enabled tier shape, since the budget models
+    # the worst-case working set.
+    backup_adapter_bytes_total = max(per_tier_bytes) if per_tier_bytes else 0
     # The in_training staging slot is created fresh per training event,
     # shaped like whichever tier is currently training (train_adapter hands
     # its adapter_config straight to _ensure_staging_slot) — the budget

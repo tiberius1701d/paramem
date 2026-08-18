@@ -129,7 +129,7 @@ class TestAbstentionEndToEnd:
             config=server_config,
             router=empty_adapter_router,
             speaker_id="spk-integration-test",
-            memory_store=MemoryStore(replay_enabled=False),
+            memory_store=MemoryStore(),
         )
 
         assert result.text == server_config.abstention.load_cold_start_response()
@@ -153,7 +153,7 @@ class TestAbstentionEndToEnd:
             config=server_config,
             router=empty_adapter_router,
             speaker_id="spk-anon-77",
-            memory_store=MemoryStore(replay_enabled=False),
+            memory_store=MemoryStore(),
         )
 
         assert result.text == server_config.abstention.load_cold_start_response()
@@ -192,7 +192,7 @@ class TestAbstentionEndToEnd:
                 cloud_agent=None,
                 ha_client=None,
                 speaker_id="spk-integration-test",
-                memory_store=MemoryStore(replay_enabled=False),
+                memory_store=MemoryStore(),
             )
 
         mock_base_model.assert_called_once()

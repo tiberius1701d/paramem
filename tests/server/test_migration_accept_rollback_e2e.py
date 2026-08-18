@@ -46,7 +46,6 @@ def _make_state(tmp_path: Path) -> dict:
     config.paths.data.mkdir(parents=True, exist_ok=True)
     config.adapter_dir = tmp_path / "data" / "ha" / "adapters"
     config.adapter_dir.mkdir(parents=True, exist_ok=True)
-    config.key_metadata_path = tmp_path / "data" / "ha" / "key_metadata.json"
 
     loop_mock = MagicMock()
     loop_mock.merger.save_bytes.return_value = b'{"nodes":[],"links":[]}'

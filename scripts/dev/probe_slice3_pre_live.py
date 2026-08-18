@@ -227,7 +227,6 @@ def run_gpu_extraction_check(out_dir: Path) -> dict:
         warmup_steps=0,
     )
     consolidation_cfg = ConsolidationConfig(
-        indexed_key_replay=False,
         promotion_threshold=3,
     )
 
@@ -239,9 +238,8 @@ def run_gpu_extraction_check(out_dir: Path) -> dict:
         episodic_adapter_config=_tier_cfg(),
         semantic_adapter_config=_tier_cfg(),
         procedural_adapter_config=_tier_cfg(),
-        # Required kwarg (no default on ConsolidationLoop.__init__) — this
-        # probe never persists to the store, so replay stays off.
-        memory_store=MemoryStore(replay_enabled=False),
+        # Required kwarg (no default on ConsolidationLoop.__init__).
+        memory_store=MemoryStore(),
         wandb_config=None,
         output_dir=out_dir,
         save_cycle_snapshots=False,

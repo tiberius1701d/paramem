@@ -37,9 +37,15 @@ _ALLOWLIST: frozenset[tuple[str, str | None]] = frozenset(
     [
         # persistence layer — the one sanctioned fork point for venue dispatch
         ("paramem/memory/persistence.py", "commit_tier_slot"),
-        # the interim-slot scan primitive: the venue→payload mapping (simulate → graph.json,
-        # train → adapter weights) lives here in ONE place so no caller re-implements it.
-        ("paramem/memory/interim_adapter.py", "iter_interim_dirs"),
+        # the write act of the two-phase build -> gate -> write driver: same
+        # venue fork as commit_tier_slot (train writes the weight slot from
+        # staging, simulate writes the projected graph.json), on the
+        # increment/TierWriteContext primitives that succeed it.
+        ("paramem/memory/persistence.py", "write_tier_slot"),
+        # the build/write driver's own per-tier write step: selects which
+        # write_tier_slot mode to call (train vs simulate) for one built
+        # tier — the same venue fork one level up the call stack.
+        ("paramem/training/consolidation.py", "_write_built_tier"),
         # the single MemorySource construction site: mode → class (simulate →
         # DiskMemorySource, train → WeightMemorySource) is decided here and
         # nowhere else.  Every consumer — boot/post-fold store hydration
@@ -48,6 +54,10 @@ _ALLOWLIST: frozenset[tuple[str, str | None]] = frozenset(
         # (ConsolidationLoop._hydrate_store_for_fold) — names the mode and takes
         # the source back, so none of them carries a fork of its own.
         ("paramem/memory/source.py", "build_memory_source"),
+        # the check-before-construct deferral predicate a caller runs before
+        # build_memory_source, to skip the train-venue/no-model-resident
+        # fill act instead of relying on build_memory_source's own raise.
+        ("paramem/memory/source.py", "train_venue_deferred"),
         # the single public fold entry: it translates the caller's mode string into a
         # FoldScope once — train retrains adapters, simulate writes graph.json.  A
         # persistence-tail divergence only; the grooming spine is shared.
@@ -64,8 +74,6 @@ _ALLOWLIST: frozenset[tuple[str, str | None]] = frozenset(
         ("paramem/server/active_store_migration.py", "migrate"),
         # migration tooling — detect_simulate_mode reads candidate YAML mode key
         ("paramem/server/migration.py", "detect_simulate_mode"),
-        # integrity checker — required/optional matrix depends on persist mode
-        ("paramem/backup/integrity.py", "verify_infrastructure_integrity"),
         # config load-time validator — rejects the illegal max_interim_count=0 +
         # mode="simulate" combination before boot. NOT a behavioural venue fork:
         # it does not dispatch different logic per mode, it refuses one specific

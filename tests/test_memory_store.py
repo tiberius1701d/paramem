@@ -82,13 +82,17 @@ class TestQuadPayload:
         Replaces the deleted setdefault_entry test — bookkeeping is now the
         canonical owner of speaker_id/relation_type/reinforcement_count/last_seen."""
         s = MemoryStore()
-        s.set_bookkeeping("graph1", speaker_id="spk-a", relation_type="factual", first_seen="")
+        s.set_bookkeeping(
+            "graph1", speaker_id="spk-a", relation_type="factual", first_seen="", promoted=False
+        )
         bk = s.bookkeeping_for_key("graph1")
         assert bk is not None
         assert bk["speaker_id"] == "spk-a"
         assert bk["relation_type"] == "factual"
         # Second call must return updated values (idempotent overwrite).
-        s.set_bookkeeping("graph1", speaker_id="spk-b", relation_type="preference", first_seen="")
+        s.set_bookkeeping(
+            "graph1", speaker_id="spk-b", relation_type="preference", first_seen="", promoted=False
+        )
         bk2 = s.bookkeeping_for_key("graph1")
         assert bk2["speaker_id"] == "spk-b"
         assert bk2["relation_type"] == "preference"
@@ -115,34 +119,42 @@ class TestSimHash:
         assert MemoryStore().simhash("episodic", "graph1") is None
         assert not MemoryStore().has_simhash("episodic", "graph1")
 
-    def test_tier_simhashes_is_dict_str_int_for_verify_confidence(self):
-        """tier_simhashes must return the same shape as the old *_simhash dicts
-        — key -> 64-bit int — so verify_confidence callers see a consistent shape."""
-        s = MemoryStore()
-        s.put_simhash("episodic", "graph1", 0xCAFE)
-        s.put_simhash("episodic", "graph2", 0xBEEF)
-        view = s.tier_simhashes("episodic", include_stale=True)
-        assert view == {"graph1": 0xCAFE, "graph2": 0xBEEF}
-        assert all(isinstance(v, int) for v in view.values())
-
-    def test_replace_simhashes_in_tier_bulk_overwrite(self):
-        s = MemoryStore()
-        s.put_simhash("episodic", "graph_old", 0xAA)
-        s.replace_simhashes_in_tier("episodic", {"graph_new": 0xBB})
-        assert s.tier_simhashes("episodic", include_stale=True) == {"graph_new": 0xBB}
-
-    def test_simhash_count_in_tier(self):
-        s = MemoryStore()
-        assert s.simhash_count_in_tier("episodic") == 0
-        s.put_simhash("episodic", "graph1", 1)
-        s.put_simhash("episodic", "graph2", 2)
-        assert s.simhash_count_in_tier("episodic") == 2
-
     def test_delete_simhash_only(self):
         s = MemoryStore()
         s.put_simhash("episodic", "graph1", 1)
         s.delete_simhash("episodic", "graph1")
         assert not s.has_simhash("episodic", "graph1")
+
+    def test_replace_simhashes_in_tier_swaps_the_whole_map(self):
+        s = MemoryStore()
+        s.registry("episodic").add("graph1")
+        s.registry("episodic").add("graph2")
+        s.replace_simhashes_in_tier("episodic", {"graph1": 1, "graph2": 2})
+
+        s.replace_simhashes_in_tier("episodic", {"graph1": 99})
+
+        assert s.simhash("episodic", "graph1") == 99
+        assert s.simhash("episodic", "graph2") is None
+
+    def test_replace_simhashes_in_tier_refuses_a_withheld_id_without_truncating_the_map(self):
+        """A naive clear-then-set loop that raises partway through leaves the
+        fingerprint map truncated. Validation must run BEFORE any mutation
+        so a refusal leaves the ORIGINAL map fully intact."""
+        from paramem.memory.store import BookkeepingInvariantViolation
+
+        s = MemoryStore()
+        s.registry("episodic").add("graph1")
+        s.registry("episodic").add("graph2")
+        s.registry("episodic").stale("graph2")
+        s.replace_simhashes_in_tier("episodic", {"graph1": 1})
+
+        with pytest.raises(BookkeepingInvariantViolation):
+            s.replace_simhashes_in_tier("episodic", {"graph1": 10, "graph2": 20})
+
+        # The original map is untouched -- not truncated, not partially
+        # overwritten.
+        assert s.simhash("episodic", "graph1") == 1
+        assert s.simhash("episodic", "graph2") is None
 
 
 # ---------------------------------------------------------------------------
@@ -154,8 +166,8 @@ class TestKeyRegistrySimhash:
     """Unit tests for the KeyRegistry simhash primitives.
 
     Locks the contract: set_simhash, drop_simhash, simhash_for,
-    has_simhash, _active_simhashes, _known_simhashes, stale auto-carry,
-    remove auto-drop.
+    has_simhash, _simhashes (the tier's one fingerprint map), stale
+    drops the fingerprint, remove auto-drop.
     """
 
     def test_set_and_simhash_for_active(self):
@@ -164,29 +176,6 @@ class TestKeyRegistrySimhash:
         reg.add("graph1")
         reg.set_simhash("graph1", 0xCAFE)
         assert reg.simhash_for("graph1") == 0xCAFE
-
-    def test_simhash_for_stale_key(self):
-        """simhash_for returns the fingerprint from the stale record."""
-        reg = KeyRegistry()
-        reg.add("graph1")
-        reg.set_simhash("graph1", 0xBEEF)
-        reg.stale("graph1")
-        # Key is now stale — simhash must still be accessible.
-        assert reg.simhash_for("graph1") == 0xBEEF
-
-    def test_stale_carries_active_simhash_atomically(self):
-        """stale() moves the active simhash into the stale record automatically.
-
-        The caller does NOT need to manually move the fingerprint.
-        """
-        reg = KeyRegistry()
-        reg.add("graph1")
-        reg.set_simhash("graph1", 0xDEAD)
-        reg.stale("graph1")
-        # Active _simhash must be empty.
-        assert "graph1" not in reg._simhash
-        # Stale record must carry the fingerprint.
-        assert reg._stale["graph1"].get("simhash") == 0xDEAD
 
     def test_remove_drops_simhash(self):
         """remove() erases the fingerprint from both active and stale partitions."""
@@ -197,41 +186,6 @@ class TestKeyRegistrySimhash:
         assert reg.simhash_for("graph1") is None
         assert not reg.has_simhash("graph1")
 
-    def test_has_simhash_active_and_stale(self):
-        """has_simhash returns True for both active and stale partitions."""
-        reg = KeyRegistry()
-        reg.add("graph1")
-        reg.set_simhash("graph1", 0x1111)
-        assert reg.has_simhash("graph1")
-        reg.stale("graph1")
-        assert reg.has_simhash("graph1")
-
-    def test_active_simhashes_excludes_stale(self):
-        """_active_simhashes returns only active-partition fingerprints."""
-        reg = KeyRegistry()
-        reg.add("graph1")
-        reg.add("graph2")
-        reg.set_simhash("graph1", 0x1111)
-        reg.set_simhash("graph2", 0x2222)
-        reg.stale("graph2")
-        active = reg._active_simhashes()
-        assert "graph1" in active
-        assert "graph2" not in active
-
-    def test_known_simhashes_includes_stale(self):
-        """_known_simhashes returns active∪stale fingerprints."""
-        reg = KeyRegistry()
-        reg.add("graph1")
-        reg.add("graph2")
-        reg.set_simhash("graph1", 0x1111)
-        reg.set_simhash("graph2", 0x2222)
-        reg.stale("graph2")
-        known = reg._known_simhashes()
-        assert "graph1" in known
-        assert "graph2" in known
-        assert known["graph1"] == 0x1111
-        assert known["graph2"] == 0x2222
-
     def test_drop_simhash_clears_both_partitions(self):
         """drop_simhash removes the fingerprint regardless of partition."""
         reg = KeyRegistry()
@@ -240,25 +194,6 @@ class TestKeyRegistrySimhash:
         reg.drop_simhash("graph1")
         assert not reg.has_simhash("graph1")
         assert reg.simhash_for("graph1") is None
-
-    def test_save_bytes_load_roundtrip_with_simhash(self):
-        """save_bytes/load round-trip preserves active and stale fingerprints."""
-        import json
-
-        reg = KeyRegistry()
-        reg.add("graph1")
-        reg.add("graph2")
-        reg.set_simhash("graph1", 0xCAFE)
-        reg.set_simhash("graph2", 0xDEAD)
-        reg.stale("graph2")
-
-        payload = reg.save_bytes()
-        data = json.loads(payload.decode("utf-8"))
-
-        # "simhash" key must be present in the new schema.
-        assert "simhash" in data
-        assert data["simhash"]["graph1"] == 0xCAFE
-        assert data["simhash"]["graph2"] == 0xDEAD
 
     def test_load_reads_simhash_from_new_schema(self, tmp_path):
         """KeyRegistry.load reads the 'simhash' field from the new schema (no .get fallback).
@@ -270,11 +205,10 @@ class TestKeyRegistrySimhash:
         import json
 
         path = tmp_path / "indexed_key_registry.json"
-        # New schema with simhash.
+        # Current schema: "stale" is a bare list of withheld ids.
         data = {
             "active_keys": ["graph1"],
-            "fidelity_history": {},
-            "stale": {},
+            "stale": [],
             "simhash": {"graph1": 0xABCDEF},
         }
         path.write_text(json.dumps(data))
@@ -283,77 +217,21 @@ class TestKeyRegistrySimhash:
         assert reg.simhash_for("graph1") == 0xABCDEF
 
 
-class TestTierSimhashes:
-    """Unit tests for MemoryStore.tier_simhashes.
-
-    The mandatory ``include_stale`` keyword makes active-vs-known confusion
-    structurally impossible.  This class locks that contract.
-    """
-
-    def test_tier_simhashes_active_only(self):
-        """tier_simhashes(include_stale=False) returns only active fingerprints."""
-        s = MemoryStore()
-        s.put("episodic", "graph1", _entry("graph1"), simhash=0x1111)
-        s.put("episodic", "graph2", _entry("graph2"), simhash=0x2222)
-        s.discard_keys(["graph2"], mode="stale")
-        active = s.tier_simhashes("episodic", include_stale=False)
-        assert "graph1" in active
-        assert "graph2" not in active
-
-    def test_tier_simhashes_include_stale(self):
-        """tier_simhashes(include_stale=True) returns active∪stale fingerprints."""
-        s = MemoryStore()
-        s.put("episodic", "graph1", _entry("graph1"), simhash=0x1111)
-        s.put("episodic", "graph2", _entry("graph2"), simhash=0x2222)
-        s.discard_keys(["graph2"], mode="stale")
-        known = s.tier_simhashes("episodic", include_stale=True)
-        assert "graph1" in known
-        assert "graph2" in known
-
-    def test_tier_simhashes_requires_keyword_argument(self):
-        """include_stale is a keyword-only argument — positional call must fail."""
-        s = MemoryStore()
-        with pytest.raises(TypeError):
-            s.tier_simhashes("episodic", True)  # type: ignore[call-arg]
-
-    def test_tier_simhashes_empty_tier_returns_empty_dict(self):
-        """Requesting simhashes for a non-existent tier returns an empty dict."""
-        s = MemoryStore()
-        result = s.tier_simhashes("nonexistent", include_stale=False)
-        assert result == {}
-
-
 # ---------------------------------------------------------------------------
 # Lifecycle registry — Optional gate
 # ---------------------------------------------------------------------------
 
 
 class TestRegistry:
-    def test_replay_enabled_default(self):
+    def test_registry_always_present(self):
         s = MemoryStore()
-        assert s.replay_enabled
         assert s.registry("episodic") is not None
         assert isinstance(s.registry("episodic"), KeyRegistry)
 
-    def test_replay_disabled_registry_is_not_none(self):
-        s = MemoryStore(replay_enabled=False)
-        assert not s.replay_enabled
-        # registry() never returns None; replay_enabled is a behaviour flag only.
-        assert isinstance(s.registry("episodic"), KeyRegistry)
-
-    def test_put_registers_when_replay_enabled(self):
+    def test_put_registers_by_default(self):
         s = MemoryStore()
         s.put("episodic", "graph1", _entry("graph1"))
         assert "graph1" in s.registry("episodic")
-
-    def test_put_does_not_register_when_replay_disabled(self):
-        s = MemoryStore(replay_enabled=False)
-        s.put("episodic", "graph1", _entry("graph1"))
-        # registry() never returns None; replay_enabled governs lifecycle only.
-        # The key was NOT added to the registry (register=False path under replay-off).
-        assert "graph1" not in s.registry("episodic")
-        # Quad is still there.
-        assert s.get("graph1") is not None
 
     def test_register_false_skips_registry(self):
         s = MemoryStore()
@@ -369,11 +247,6 @@ class TestRegistry:
         assert s.registry("episodic") is reg
         assert "graph_preloaded" in s.registry("episodic")
 
-    def test_load_registry_raises_when_replay_disabled(self):
-        s = MemoryStore(replay_enabled=False)
-        with pytest.raises(RuntimeError, match="replay is disabled"):
-            s.load_registry("episodic", KeyRegistry())
-
     def test_active_keys_in_tier(self):
         s = MemoryStore()
         s.put("episodic", "graph1", _entry("graph1"))
@@ -382,28 +255,6 @@ class TestRegistry:
         assert sorted(s.active_keys_in_tier("episodic")) == ["graph1", "graph2"]
         assert s.active_keys_in_tier("procedural") == []
 
-    def test_stale_keys_in_tier(self):
-        """Per-tier analogue of active_keys_in_tier for the stale partition
-        (fold-telemetry: measures encoded-vs-active divergence)."""
-        s = MemoryStore(replay_enabled=True)
-        s.put("episodic", "graph1", _entry("graph1"), register=True)
-        s.put("episodic", "graph2", _entry("graph2"), register=True)
-        s.put("semantic", "graph3", _entry("graph3"), register=True)
-
-        # Fresh store: nothing stale yet, and an unregistered tier reports
-        # an empty list rather than raising (mirrors active_keys_in_tier).
-        assert s.stale_keys_in_tier("episodic") == []
-        assert s.stale_keys_in_tier("procedural") == []
-
-        s.discard_keys(["graph1"], mode="stale")
-
-        assert s.stale_keys_in_tier("episodic") == ["graph1"]
-        assert s.stale_keys_in_tier("semantic") == []
-        # A fully erased key (never soft-staled) is invisible to this count
-        # by design -- it is removed from the registry entirely.
-        s.discard_keys(["graph2"], mode="erase")
-        assert s.stale_keys_in_tier("episodic") == ["graph1"]
-
     def test_all_active_keys(self):
         s = MemoryStore()
         s.put("episodic", "graph1", _entry("graph1"))
@@ -411,200 +262,22 @@ class TestRegistry:
         s.put("procedural", "proc1", _entry("proc1"))
         assert sorted(s.all_active_keys()) == ["graph1", "graph2", "proc1"]
 
-    def test_tier_for_active_key(self):
-        s = MemoryStore()
-        s.put("semantic", "graph42", _entry("graph42"))
-        assert s.tier_for_active_key("graph42") == "semantic"
-        assert s.tier_for_active_key("graph999") is None
-
-    def test_drop_registry_and_entries_removes_tier_and_entries_but_keeps_bookkeeping(self):
-        """``drop_registry_and_entries`` retires a tier's registry AND its
-        ``_entries`` bucket in one call, but — unlike ``drop_tier`` — leaves
-        the key's ``_bookkeeping`` row alone.  That contrast is the whole
-        point of this primitive: by the time it runs (interim retirement
-        after an absorbing fold), an adopted key's bookkeeping already
-        belongs to a MAIN tier, so a primitive that also swept bookkeeping
-        would delete live provenance out from under a key that still exists."""
-        s = MemoryStore()
-        tier = "episodic_interim_20260514T0000"
-        s.put(tier, "graph1", _entry("graph1"))
-        s.set_bookkeeping("graph1", speaker_id="spk-alice", relation_type="factual", first_seen="")
-        assert s.has_registry(tier)
-        assert "graph1" in s.entries_in_tier(tier)
-
-        dropped = s.drop_registry_and_entries(tier)
-
-        assert dropped is not None
-        assert "graph1" in dropped
-        assert not s.has_registry(tier)
-        assert s.entries_in_tier(tier) == {}, "the tier's _entries bucket must be gone too"
-        assert s.bookkeeping_for_key("graph1") is not None, (
-            "bookkeeping must survive -- drop_registry_and_entries is not drop_tier"
-        )
-
-    def test_drop_registry_and_entries_on_unknown_tier_is_a_noop(self):
-        s = MemoryStore()
-        assert s.drop_registry_and_entries("never_existed") is None
-
-    def test_drop_entry_removes_only_the_named_tiers_copy(self):
-        """``drop_entry`` touches ``_entries`` exclusively -- a key's copy
-        under a DIFFERENT tier, its registry membership, and its
-        bookkeeping row all survive untouched."""
-        s = MemoryStore()
-        s.put("episodic", "graph1", _entry("graph1"), register=True)
-        s.put("semantic", "graph1", _entry("graph1", subject="Bob"), register=True)
-        s.set_bookkeeping("graph1", speaker_id="spk-alice", relation_type="factual", first_seen="")
-
-        s.drop_entry("episodic", "graph1")
-
-        assert "graph1" not in s.entries_in_tier("episodic")
-        assert "graph1" in s.entries_in_tier("semantic")
-        assert "graph1" in s.registry("episodic"), "registry membership is untouched"
-        assert s.bookkeeping_for_key("graph1") is not None
-
-    def test_drop_entry_on_unknown_tier_or_key_is_a_noop(self):
+    def test_active_keys_in_tier_excludes_withheld_ids(self):
+        """The consolidation summary counts a tier's ACTIVE keys
+        (``len(store.active_keys_in_tier(tier))`` — the honest source both
+        ``_run_extraction_phase`` and ``/status`` read, see
+        ``paramem/server/app.py``) — a withheld id must not inflate it, the
+        same way it is excluded from ``__contains__``/``list_active``."""
         s = MemoryStore()
         s.put("episodic", "graph1", _entry("graph1"))
+        s.put("episodic", "graph2", _entry("graph2"))
+        s.registry("episodic").stale("graph2")
 
-        s.drop_entry("never_existed", "graph1")
-        s.drop_entry("episodic", "never_existed")
-
-        assert "graph1" in s.entries_in_tier("episodic")
-
-
-# ---------------------------------------------------------------------------
-# Known-legitimacy predicates — is_known, tier_for_known_key, all_known_keys
-# ---------------------------------------------------------------------------
-
-
-class TestKnownPredicates:
-    """Unit tests for MemoryStore.is_known, tier_for_known_key, all_known_keys.
-
-    Mirrors test_all_active_keys / test_tier_for_active_key with the KNOWN
-    (active ∪ stale) semantics.  SERVE predicates (tier_for_active_key,
-    all_active_keys) must remain unaffected — verified here too.
-    """
-
-    def _store_with_stale_key(self) -> MemoryStore:
-        """Build a store that has 'graph1' active and 'proc52' stale."""
-        s = MemoryStore()
-        s.put("episodic", "graph1", _entry("graph1"))
-        s.put("procedural", "proc52", _entry("proc52"))
-        s.discard_keys(["proc52"], mode="stale")
-        return s
-
-    def test_is_known_active_key(self):
-        """is_known() returns True for an active key."""
-        s = self._store_with_stale_key()
-        assert s.is_known("graph1")
-
-    def test_is_known_stale_key(self):
-        """is_known() returns True for a stale key."""
-        s = self._store_with_stale_key()
-        assert s.is_known("proc52")
-
-    def test_is_known_absent_key(self):
-        """is_known() returns False for a key not in any tier."""
-        s = self._store_with_stale_key()
-        assert not s.is_known("ghost")
-
-    def test_is_known_replay_disabled(self):
-        """is_known() returns False when replay is disabled."""
-        s = MemoryStore(replay_enabled=False)
-        assert not s.is_known("anything")
-
-    def test_tier_for_known_key_active(self):
-        """tier_for_known_key() returns the owning tier for an active key."""
-        s = MemoryStore()
-        s.put("semantic", "graph42", _entry("graph42"))
-        assert s.tier_for_known_key("graph42") == "semantic"
-
-    def test_tier_for_known_key_stale(self):
-        """tier_for_known_key() returns the owning tier for a stale key.
-
-        tier_for_active_key() on the same key must return None (SERVE unchanged).
-        """
-        s = self._store_with_stale_key()
-        # KNOWN sees it
-        assert s.tier_for_known_key("proc52") == "procedural"
-        # SERVE does not
-        assert s.tier_for_active_key("proc52") is None
-
-    def test_tier_for_known_key_absent(self):
-        """tier_for_known_key() returns None for an absent key."""
-        s = self._store_with_stale_key()
-        assert s.tier_for_known_key("ghost") is None
-
-    def test_all_known_keys_includes_stale(self):
-        """all_known_keys() includes both active and stale keys."""
-        s = self._store_with_stale_key()
-        known = sorted(s.all_known_keys())
-        assert "graph1" in known
-        assert "proc52" in known
-
-    def test_all_known_keys_replay_disabled(self):
-        """all_known_keys() returns [] when replay is disabled."""
-        s = MemoryStore(replay_enabled=False)
-        assert s.all_known_keys() == []
-
-    def test_all_active_keys_excludes_stale(self):
-        """all_active_keys() (SERVE) must not include stale keys after refactor."""
-        s = self._store_with_stale_key()
-        active = s.all_active_keys()
-        assert "graph1" in active
-        assert "proc52" not in active
-
-    def test_delete_stale_only_key(self):
-        """delete() removes a key that is ONLY stale (registry + simhash)."""
-        s = MemoryStore()
-        s.put("procedural", "proc52", _entry("proc52"), simhash=0xDEAD)
-        s.discard_keys(["proc52"], mode="stale")
-        # Before: proc52 is stale-only
-        assert s.is_stale("proc52")
-        assert not s.tier_for_active_key("proc52")
-        former = s.delete("proc52")
-        # After: fully gone
-        assert former == "procedural"
-        assert not s.is_known("proc52")
-        assert s.registry("procedural") is not None
-        assert "proc52" not in s.registry("procedural")
-
-
-# ---------------------------------------------------------------------------
-# Move + delete — preserve cross-structure consistency
-# ---------------------------------------------------------------------------
-
-
-class TestMoveDelete:
-    def test_delete_clears_all_three_structures(self):
-        s = MemoryStore()
-        s.put("episodic", "graph1", _entry("graph1"), simhash=0xCAFE)
-        former = s.delete("graph1")
-        assert former == "episodic"
-        assert s.get("graph1") is None
-        assert not s.has_simhash("episodic", "graph1")
-        assert "graph1" not in s.registry("episodic")
-
-    def test_delete_unknown_returns_none(self):
-        assert MemoryStore().delete("graph999") is None
-
-    def test_move_relocates_quad_simhash_registry(self):
-        s = MemoryStore()
-        s.put("episodic", "graph1", _entry("graph1"), simhash=0xCAFE)
-        s.move("graph1", "semantic")
-        assert s.tier_of("graph1") == "semantic"
-        assert s.entries_in_tier("episodic") == {}
-        assert s.tier_simhashes("episodic", include_stale=True) == {}
-        assert s.tier_simhashes("semantic", include_stale=True) == {"graph1": 0xCAFE}
-        assert "graph1" not in s.registry("episodic")
-        assert "graph1" in s.registry("semantic")
-
-    def test_move_to_same_tier_is_noop_but_keeps_registry(self):
-        s = MemoryStore()
-        s.put("episodic", "graph1", _entry("graph1"))
-        s.move("graph1", "episodic")
-        assert s.tier_of("graph1") == "episodic"
-        assert "graph1" in s.registry("episodic")
+        assert s.active_keys_in_tier("episodic") == ["graph1"]
+        assert len(s.active_keys_in_tier("episodic")) == 1
+        # The withheld id is still KNOWN (retained for bookkeeping), just not
+        # counted as active.
+        assert s.registry("episodic").knows("graph2")
 
 
 # ---------------------------------------------------------------------------
@@ -616,7 +289,13 @@ class TestDropTier:
     def test_drop_tier_removes_entries_registry_and_bookkeeping(self):
         s = MemoryStore()
         s.put("episodic_interim_20260417T0000", "graph1", _entry("graph1"), simhash=0xCAFE)
-        s.set_bookkeeping("graph1", speaker_id="speaker0", relation_type="factual", first_seen="t0")
+        s.set_bookkeeping(
+            "graph1",
+            speaker_id="speaker0",
+            relation_type="factual",
+            first_seen="t0",
+            promoted=False,
+        )
         s.drop_tier("episodic_interim_20260417T0000")
         assert s.entries_in_tier("episodic_interim_20260417T0000") == {}
         assert s.has_registry("episodic_interim_20260417T0000") is False
@@ -625,7 +304,13 @@ class TestDropTier:
     def test_drop_tier_does_not_touch_other_tiers(self):
         s = MemoryStore()
         s.put("episodic", "graph1", _entry("graph1"), simhash=1)
-        s.set_bookkeeping("graph1", speaker_id="speaker0", relation_type="factual", first_seen="t0")
+        s.set_bookkeeping(
+            "graph1",
+            speaker_id="speaker0",
+            relation_type="factual",
+            first_seen="t0",
+            promoted=False,
+        )
         s.put("episodic_interim_20260417T0000", "graph2", _entry("graph2"), simhash=2)
         s.drop_tier("episodic_interim_20260417T0000")
         assert s.get("graph1") == _entry("graph1")
@@ -638,95 +323,6 @@ class TestDropTier:
         s.drop_tier("does_not_exist")  # must not raise
         assert s.get("graph1") == _entry("graph1")
 
-    def test_drop_tier_drops_bookkeeping_for_stale_keys_too(self):
-        """A soft-staled key's bookkeeping must not survive its tier being
-        dropped — only active_keys_in_tier was swept before, leaving a stale
-        key's bookkeeping record orphaned (re-indexed by router.reload
-        against a tier that no longer exists)."""
-        s = MemoryStore()
-        s.put("episodic_interim_20260417T0000", "graph1", _entry("graph1"), simhash=1)
-        s.put("episodic_interim_20260417T0000", "graph2", _entry("graph2"), simhash=2)
-        s.set_bookkeeping("graph1", speaker_id="speaker0", relation_type="factual", first_seen="t0")
-        s.set_bookkeeping("graph2", speaker_id="speaker0", relation_type="factual", first_seen="t0")
-        s.registry("episodic_interim_20260417T0000").stale("graph2")
-
-        s.drop_tier("episodic_interim_20260417T0000")
-
-        assert dict(s.iter_bookkeeping()) == {}
-        assert s.bookkeeping_for_key("graph1") is None
-        assert s.bookkeeping_for_key("graph2") is None
-
-
-# ---------------------------------------------------------------------------
-# reactivate — dual of discard_keys(mode="stale") (Part B rollback primitive)
-# ---------------------------------------------------------------------------
-
-
-class TestReactivate:
-    def test_reactivate_restores_active_and_simhash(self):
-        s = MemoryStore()
-        s.put("episodic", "graph1", _entry("graph1"), simhash=0xBEEF)
-        s.discard_keys(["graph1"], mode="stale")
-        assert s.is_stale("graph1")
-        assert "graph1" not in s.registry("episodic")
-
-        s.reactivate("episodic", "graph1")
-        assert "graph1" in s.registry("episodic")
-        assert not s.is_stale("graph1")
-        assert s.simhash("episodic", "graph1") == 0xBEEF
-
-    def test_reactivate_noop_when_key_not_stale(self):
-        s = MemoryStore()
-        s.put("episodic", "graph1", _entry("graph1"), simhash=1)
-        s.reactivate("episodic", "graph1")  # already active — must not raise
-        assert "graph1" in s.registry("episodic")
-
-    def test_reactivate_noop_when_tier_unknown(self):
-        s = MemoryStore()
-        s.reactivate("does_not_exist", "graph1")  # must not raise
-
-    def test_reactivate_key_with_no_simhash(self):
-        """A staled key that never had a fingerprint reactivates cleanly (fp=None branch)."""
-        s = MemoryStore()
-        s.put("episodic", "graph1", _entry("graph1"))  # no simhash= kwarg
-        s.discard_keys(["graph1"], mode="stale")
-        assert s.is_stale("graph1")
-        s.reactivate("episodic", "graph1")
-        assert "graph1" in s.registry("episodic")
-        assert not s.is_stale("graph1")
-        assert s.simhash("episodic", "graph1") is None
-
-    def test_reactivate_noop_when_replay_disabled(self):
-        """reactivate() is a no-op guard, matching discard_keys' replay_enabled gate."""
-        s = MemoryStore(replay_enabled=False)
-        s.put("episodic", "graph1", _entry("graph1"), simhash=1, register=False)
-        s.reactivate("episodic", "graph1")  # must not raise
-
-
-# ---------------------------------------------------------------------------
-# Stats — diagnostic surface
-# ---------------------------------------------------------------------------
-
-
-class TestStats:
-    def test_stats_per_tier_counts(self):
-        s = MemoryStore()
-        s.put("episodic", "graph1", _entry("graph1"), simhash=1)
-        s.put("episodic", "graph2", _entry("graph2"), simhash=2)
-        s.put("semantic", "graph3", _entry("graph3"), simhash=3)
-        stats = s.stats()
-        assert stats["episodic"]["key_count"] == 2
-        assert stats["episodic"]["simhash_count"] == 2
-        assert stats["episodic"]["registry_active"] == 2
-        assert stats["semantic"]["key_count"] == 1
-
-    def test_stats_replay_disabled_no_registry_keys(self):
-        s = MemoryStore(replay_enabled=False)
-        s.put("episodic", "graph1", _entry("graph1"), simhash=1)
-        stats = s.stats()
-        assert "registry_active" not in stats["episodic"]
-        assert stats["episodic"]["key_count"] == 1
-
 
 # ---------------------------------------------------------------------------
 # Bookkeeping — speaker_id / relation_type / reinforcement_count / last_seen
@@ -737,19 +333,25 @@ class TestBookkeeping:
     def test_bookkeeping_does_not_create_content_hit(self):
         """REGRESSION LOCK: set_bookkeeping must NOT create a content cache hit.
 
-        Under preload_cache=False this is the key correctness invariant:
-        bookkeeping presence must never mask a cache miss."""
+        The cache door answers None for an active key with no entry — the
+        same no-fact shape as a miss — so bookkeeping presence alone must
+        never mask an empty mirror."""
         s = MemoryStore()
-        s.set_bookkeeping("k", speaker_id="alice", relation_type="factual", first_seen="")
+        s.registry("episodic").add("k")
+        s.set_bookkeeping(
+            "k", speaker_id="alice", relation_type="factual", first_seen="", promoted=False
+        )
         # No put — _entries is empty.
         assert s.get("k") is None
-        results = s.probe({"episodic": ["k"]}, source=None)
+        results = s.probe_cache({"episodic": ["k"]})
         assert results["k"] is None
 
     def test_new_key_write_back_round_trips_speaker_id(self):
         """set_bookkeeping + bookkeeping_for_key round-trips all fields."""
         s = MemoryStore()
-        s.set_bookkeeping("graph1", speaker_id="bob", relation_type="factual", first_seen="")
+        s.set_bookkeeping(
+            "graph1", speaker_id="bob", relation_type="factual", first_seen="", promoted=False
+        )
         bk = s.bookkeeping_for_key("graph1")
         assert bk is not None
         assert bk["speaker_id"] == "bob"
@@ -761,71 +363,16 @@ class TestBookkeeping:
 
     def test_iter_bookkeeping_yields_all_keys(self):
         s = MemoryStore()
-        s.set_bookkeeping("k1", speaker_id="alice", relation_type="factual", first_seen="")
-        s.set_bookkeeping("k2", speaker_id="bob", relation_type="preference", first_seen="")
+        s.set_bookkeeping(
+            "k1", speaker_id="alice", relation_type="factual", first_seen="", promoted=False
+        )
+        s.set_bookkeeping(
+            "k2", speaker_id="bob", relation_type="preference", first_seen="", promoted=False
+        )
         items = dict(s.iter_bookkeeping())
         assert items["k1"]["speaker_id"] == "alice"
         assert items["k2"]["speaker_id"] == "bob"
         assert s.bookkeeping_count() == 2
-
-    def test_delete_also_drops_bookkeeping(self):
-        """store.delete must retire bookkeeping automatically."""
-        s = MemoryStore()
-        s.put("episodic", "graph1", _entry("graph1"))
-        s.set_bookkeeping("graph1", speaker_id="alice", relation_type="factual", first_seen="")
-        s.delete("graph1")
-        assert s.bookkeeping_for_key("graph1") is None
-
-    def test_probe_results_never_carry_speaker_id(self):
-        """No dict returned by probe carries ``speaker_id`` — no memory source
-        emits it (content-only source-result contract), so there is nothing
-        to strip.  Covers cache-hit (graph1), plain source-served (graph2),
-        confidence-patched source-served (graphC — a stored fingerprint
-        routes through the patch arm's ``src = dict(src)`` copy) and
-        failure-dict pass-through (graphF)."""
-        from paramem.memory.entry import entry_simhash
-
-        carol = {"key": "graphC", "subject": "Carol", "predicate": "lives_in", "object": "Rome"}
-        fp = entry_simhash(carol)
-
-        class _StubSource:
-            def probe(self, keys_by_tier):
-                return {
-                    "graph2": {
-                        "key": "graph2",
-                        "subject": "Bob",
-                        "predicate": "lives_in",
-                        "object": "Paris",
-                        "fact_text": "Bob lives_in Paris",
-                    },
-                    "graphC": {
-                        **carol,
-                        "fact_text": "Carol lives_in Rome",
-                    },
-                    "graphF": {"raw_output": "garbled", "failure_reason": "parse_error"},
-                }
-
-        s = MemoryStore()
-        # Cache-hit key: bookkeeping already present.
-        s.put(
-            "episodic",
-            "graph1",
-            {"key": "graph1", "subject": "Alice", "predicate": "lives_in", "object": "Berlin"},
-        )
-        s.set_bookkeeping("graph1", speaker_id="spk-alice", relation_type="factual", first_seen="")
-        s.put_simhash("episodic", "graphC", fp)  # forces the confidence-patch arm
-
-        results = s.probe(
-            {"episodic": ["graph1", "graph2", "graphC", "graphF"]}, source=_StubSource()
-        )
-
-        for key in ("graph1", "graph2", "graphC"):
-            assert "speaker_id" not in results[key]
-        assert results["graph1"]["fact_text"] == "Alice lives_in Berlin"
-        assert results["graph2"]["subject"] == "Bob"
-        assert results["graphC"]["confidence"] == 1.0
-        # Failure dicts never carry speaker_id; nothing disturbs them.
-        assert results["graphF"] == {"raw_output": "garbled", "failure_reason": "parse_error"}
 
     def test_probe_cold_disk_source_key_does_not_backfill_bookkeeping(self):
         """A cold (previously-unbookkept) key served by a disk source on a
@@ -845,21 +392,52 @@ class TestBookkeeping:
         s.put_simhash("episodic", "graph9", entry_simhash(entry))
         assert s.bookkeeping_for_key("graph9") is None
 
-        results = s.probe({"episodic": ["graph9"]}, source=_DiskLikeSource(), memoize=True)
+        results = s.probe_source({"episodic": ["graph9"]}, source=_DiskLikeSource())
 
         assert results["graph9"]["subject"] == "Dana"
-        assert s.get("graph9") is not None  # content still memoized
         assert s.bookkeeping_for_key("graph9") is None  # no backfill
 
+    def test_probe_source_answers_none_for_an_off_contract_source_result(self, caplog):
+        """A source returning something other than a dict for a key is a
+        contract violation of ``source.probe()``'s shape -- normalized to
+        ``None`` at the door, loudly (warning level), same no-fact shape as
+        a miss or a gate-drop.  The conversation continues; it never sees
+        the off-contract value."""
+        import logging
+
+        class _OffContractSource:
+            def probe(self, keys_by_tier):
+                return {"graph9": "not-a-dict"}
+
+        s = MemoryStore()
+        with caplog.at_level(logging.WARNING):
+            results = s.probe_source({"episodic": ["graph9"]}, source=_OffContractSource())
+
+        assert results["graph9"] is None
+        assert "graph9" in results  # explicit None, not merely absent
+        assert any(
+            record.levelno == logging.WARNING and "graph9" in record.getMessage()
+            for record in caplog.records
+        )
+
     def test_probe_has_no_speaker_id_parameter(self):
-        """MemoryStore.probe takes no speaker_id kwarg — passing one raises."""
+        """Neither read door takes a speaker_id kwarg — passing one raises."""
+
+        class _NoOpSource:
+            def probe(self, keys_by_tier):
+                return {}
+
         s = MemoryStore()
         with pytest.raises(TypeError):
-            s.probe({"episodic": []}, speaker_id="x")
+            s.probe_cache({"episodic": []}, speaker_id="x")
+        with pytest.raises(TypeError):
+            s.probe_source({"episodic": []}, source=_NoOpSource(), speaker_id="x")
 
     def test_cache_off_empty_store_always_probes(self):
         """Under cache-off the store has no entries.  Every key must miss
         and be delegated to the source — restores preload_cache=False contract."""
+        from paramem.memory.entry import entry_simhash
+
         probed: list = []
 
         class _FakeSource:
@@ -873,16 +451,25 @@ class TestBookkeeping:
 
         s = MemoryStore()
         # Bookkeeping loaded but NO entries (cache-off scenario).
-        s.set_bookkeeping("k1", speaker_id="alice", relation_type="factual", first_seen="")
-        s.set_bookkeeping("k2", speaker_id="alice", relation_type="factual", first_seen="")
-        # Register keys in the registry so tier resolution works.
+        s.set_bookkeeping(
+            "k1", speaker_id="alice", relation_type="factual", first_seen="", promoted=False
+        )
+        s.set_bookkeeping(
+            "k2", speaker_id="alice", relation_type="factual", first_seen="", promoted=False
+        )
+        # Register keys in the registry so tier resolution works, with
+        # fingerprints matching what _FakeSource returns so the live door's
+        # confidence gate passes (a fingerprint-less key is dropped there).
         from paramem.training.key_registry import KeyRegistry
 
         reg = KeyRegistry()
-        reg.add("k1")
-        reg.add("k2")
+        for k in ("k1", "k2"):
+            reg.add(k)
+            reg.set_simhash(
+                k, entry_simhash({"key": k, "subject": "X", "predicate": "p", "object": "Y"})
+            )
         s.load_registry("episodic", reg)
-        results = s.probe({"episodic": ["k1", "k2"]}, source=_FakeSource())
+        results = s.probe_source({"episodic": ["k1", "k2"]}, source=_FakeSource())
         assert set(probed) == {"k1", "k2"}
         assert results["k1"] is not None
         assert results["k2"] is not None
@@ -892,7 +479,9 @@ class TestBookkeeping:
     def test_relation_type_round_trips(self):
         """set_bookkeeping with relation_type='preference' → bookkeeping_for_key returns it."""
         s = MemoryStore()
-        s.set_bookkeeping("graph1", speaker_id="alice", relation_type="preference", first_seen="")
+        s.set_bookkeeping(
+            "graph1", speaker_id="alice", relation_type="preference", first_seen="", promoted=False
+        )
         bk = s.bookkeeping_for_key("graph1")
         assert bk is not None
         assert bk["relation_type"] == "preference"
@@ -900,72 +489,66 @@ class TestBookkeeping:
     def test_relation_type_overwrite_idempotent(self):
         """A second set_bookkeeping call updates relation_type in place."""
         s = MemoryStore()
-        s.set_bookkeeping("graph1", speaker_id="alice", relation_type="factual", first_seen="")
-        s.set_bookkeeping("graph1", speaker_id="alice", relation_type="preference", first_seen="")
+        s.set_bookkeeping(
+            "graph1", speaker_id="alice", relation_type="factual", first_seen="", promoted=False
+        )
+        s.set_bookkeeping(
+            "graph1", speaker_id="alice", relation_type="preference", first_seen="", promoted=False
+        )
         bk = s.bookkeeping_for_key("graph1")
         assert bk is not None
         assert bk["relation_type"] == "preference"
 
-    def test_load_bookkeeping_from_disk_reads_relation_type(self, tmp_path):
-        """load_bookkeeping_from_disk reads relation_type from key_metadata.json."""
-        import json
 
-        path = tmp_path / "key_metadata.json"
-        path.write_text(
-            json.dumps(
-                {
-                    "keys": {
-                        "graph1": {
-                            "reinforcement_count": 1,
-                            "last_reinforced_cycle": 0,
-                            "last_seen": "",
-                            "first_seen": "",
-                            "speaker_id": "alice",
-                            "relation_type": "preference",
-                        }
-                    }
-                }
-            )
+# ---------------------------------------------------------------------------
+# reinforce — MemoryStore's own absorbing-key count resolution
+# ---------------------------------------------------------------------------
+
+
+class TestReinforce:
+    """MemoryStore.reinforce keeps its key-shaped ``absorbing`` parameter and
+    resolves counts against its own bookkeeping dict, under its own lock,
+    before delegating to credit_reinforcement.  Since ``_bookkeeping`` is one
+    flat dict spanning every tier, this is the "same-tier absorb" case: any
+    key known to the store resolves regardless of which tier owns it."""
+
+    def _set(self, s, key, count, **overrides):
+        s.set_bookkeeping(
+            key,
+            speaker_id="speaker0",
+            relation_type="factual",
+            first_seen="",
+            promoted=False,
+            reinforcement_count=count,
+            **overrides,
         )
+
+    def test_absorbing_a_higher_count_key_from_another_tier_yields_that_count(self):
         s = MemoryStore()
-        # Register graph1 so it is not treated as an orphan.
-        reg = KeyRegistry()
-        reg.add("graph1")
-        s.load_registry("episodic", reg)
-        stats = s.load_bookkeeping_from_disk(path)
-        assert stats["loaded"] == 1
-        assert stats["orphaned"] == 0
-        bk = s.bookkeeping_for_key("graph1")
-        assert bk is not None
-        assert bk["relation_type"] == "preference"
-
-    def test_load_bookkeeping_from_disk_incomplete_record_fails_loud(self, tmp_path):
-        """A persisted record missing a mandatory bookkeeping field raises —
-        no legacy-fill tolerance, no backward compatibility. The splat read
-        (``set_bookkeeping(key, **key_meta, ...)``) requires the on-disk
-        record to carry every field ``set_bookkeeping`` needs."""
-        import json
-
-        path = tmp_path / "key_metadata.json"
-        path.write_text(
-            json.dumps(
-                {
-                    "keys": {
-                        "graph1": {
-                            "speaker_id": "alice",
-                            "first_seen": "",
-                            # relation_type deliberately absent — no tolerance.
-                        }
-                    }
-                }
-            )
+        self._set(s, "survivor", 1)
+        self._set(s, "absorbed", 4)
+        s.reinforce(
+            "survivor",
+            cycle=1,
+            first_seen="",
+            timestamp="2026-01-01T00:00:00Z",
+            absorbing=["absorbed"],
+            reobserved=True,
         )
+        assert s.bookkeeping_for_key("survivor")["reinforcement_count"] == 5
+
+    def test_same_tier_absorb_keeps_max_of_absorbed(self):
         s = MemoryStore()
-        reg = KeyRegistry()
-        reg.add("graph1")
-        s.load_registry("episodic", reg)
-        with pytest.raises(TypeError):
-            s.load_bookkeeping_from_disk(path)
+        self._set(s, "survivor", 1)
+        self._set(s, "absorbed", 4)
+        s.reinforce("survivor", cycle=1, first_seen="", absorbing=["absorbed"])
+        assert s.bookkeeping_for_key("survivor")["reinforcement_count"] == 4
+
+    def test_unknown_absorbing_key_contributes_nothing(self):
+        s = MemoryStore()
+        self._set(s, "survivor", 1)
+        s.reinforce("survivor", cycle=1, first_seen="", absorbing=["ghost"])
+        assert s.bookkeeping_for_key("survivor")["reinforcement_count"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -974,14 +557,11 @@ class TestBookkeeping:
 
 
 class TestConfidenceGate:
-    """Locks the SimHash confidence gate applied at probe-time on both
-    cache-hit and source-result paths (Bug B fix).
-
-    The gate must satisfy three invariants:
-    1. Cache-on and cache-off serve the SAME key set for the same registry.
-    2. replay_enabled=False is an unconditional pass-through (no fingerprints).
-    3. A key whose fingerprint matches its content is served with real confidence.
-    """
+    """Locks the SimHash confidence gate the live door applies to every
+    source result: a key whose fingerprint matches its content is served
+    with the real computed confidence, never a hardcoded 1.0.  The cache
+    door performs no fingerprint work of its own — its content was gated
+    once at admission — so this gate is exercised through probe_source."""
 
     def _spo_entry(
         self,
@@ -1010,93 +590,19 @@ class TestConfidenceGate:
         # Compute for a completely different triple so the Hamming distance is large.
         return compute_simhash("wrong_key", "Eve", "hates", "Brussels")
 
-    def test_cache_on_off_parity(self):
-        """A key whose stored fingerprint mismatches its content is DROPPED on
-        the cache-hit path exactly as on the source path.
-
-        Reproduces the live 239-vs-234 divergence: cache-on served 5 extra
-        keys that had been ungated when preloaded without a registry.  After
-        the fix, both paths must serve the same set.
-
-        Build:
-        - key "graph1": CORRECT fingerprint (should be served on both paths).
-        - key "graph2": MISMATCHED fingerprint (should be dropped on both paths).
-
-        Cache-off path: entries absent → source probe called → gate applied to
-        source result BEFORE returning.
-        Cache-on path: entries present → _render called → gate applied to cached entry.
-        Both must produce the same result: graph1 served, graph2 None."""
-        entry_good = self._spo_entry("graph1")
-        entry_bad = self._spo_entry("graph2")
-        fp_good = self._correct_fingerprint(entry_good)
-        fp_bad = self._mismatched_fingerprint(entry_bad)  # wrong hash for graph2's content
-
-        # Cache-OFF path: store is empty, source must return the entries.
-        probed: list = []
-
-        class _FakeSource:
-            def probe(self, keys_by_tier):
-                probed.extend(k for keys in keys_by_tier.values() for k in keys)
-                # Returns both entries (source itself does NOT gate here — the
-                # store boundary gate is the authority).
-                return {
-                    "graph1": {**entry_good, "confidence": 1.0},
-                    "graph2": {**entry_bad, "confidence": 1.0},
-                }
-
-        s_off = MemoryStore()
-        s_off.put_simhash("episodic", "graph1", fp_good)
-        s_off.put_simhash("episodic", "graph2", fp_bad)
-        off_results = s_off.probe({"episodic": ["graph1", "graph2"]}, source=_FakeSource())
-        assert "graph1" in probed and "graph2" in probed, "source must be called for misses"
-        assert off_results["graph1"] is not None, "good key must be served on cache-off"
-        assert off_results["graph2"] is None, "bad key must be dropped on cache-off"
-
-        # Cache-ON path: entries pre-populated (simulating boot preload).
-        s_on = MemoryStore()
-        s_on.put_simhash("episodic", "graph1", fp_good)
-        s_on.put_simhash("episodic", "graph2", fp_bad)
-        s_on.put("episodic", "graph1", entry_good, register=False)
-        s_on.put("episodic", "graph2", entry_bad, register=False)
-        on_results = s_on.probe({"episodic": ["graph1", "graph2"]}, source=None)
-        assert on_results["graph1"] is not None, "good key must be served on cache-on"
-        assert on_results["graph2"] is None, "bad key must be dropped on cache-on"
-
-        # The served sets must be identical (parity).
-        cache_on_served = {k for k, v in on_results.items() if v is not None}
-        cache_off_served = {k for k, v in off_results.items() if v is not None}
-        assert cache_on_served == cache_off_served, (
-            f"cache-on and cache-off must serve the same set; "
-            f"on={cache_on_served} off={cache_off_served}"
-        )
-
-    def test_replay_off_passthrough(self):
-        """With replay_enabled=False (no _simhash), all entries are served.
-
-        The gate must be a complete no-op when replay is disabled — no
-        fingerprints exist by design, and the store must not over-drop."""
-        entry = self._spo_entry("graph1")
-        s = MemoryStore(replay_enabled=False)
-        s.put("episodic", "graph1", entry, register=False)
-        # Explicitly verify no simhash is set (replay-off means no fingerprints).
-        assert not s.has_simhash("episodic", "graph1")
-        results = s.probe({"episodic": ["graph1"]}, source=None)
-        assert results["graph1"] is not None, "replay-off must serve all entries ungated"
-        assert results["graph1"]["confidence"] == 1.0, (
-            "replay-off confidence must be 1.0 (pass-through)"
-        )
-
     def test_confident_key_served(self):
-        """A key with a matching fingerprint passes the gate and is served.
-
-        The rendered result must include the real computed confidence (not
-        the hardcoded 1.0 that existed before the fix)."""
+        """A key with a matching fingerprint passes the live door's gate and
+        is served with the real computed confidence."""
         entry = self._spo_entry("graph1")
         fp = self._correct_fingerprint(entry)
+
+        class _Source:
+            def probe(self, keys_by_tier):
+                return {"graph1": dict(entry)}
+
         s = MemoryStore()
-        s.put("episodic", "graph1", entry, register=False)
         s.put_simhash("episodic", "graph1", fp)
-        results = s.probe({"episodic": ["graph1"]}, source=None)
+        results = s.probe_source({"episodic": ["graph1"]}, source=_Source())
         assert results["graph1"] is not None, "correctly-fingerprinted key must be served"
         # Confidence must be exactly 1.0 since the fingerprint was computed from
         # the same content (identical simhash → Hamming distance 0).
@@ -1104,156 +610,169 @@ class TestConfidenceGate:
             f"matching fingerprint must yield confidence 1.0, got {results['graph1']['confidence']}"
         )
 
+    def test_fingerprint_less_active_key_dropped_at_live_door(self):
+        """A key active in the registry but carrying no registered
+        fingerprint (e.g. a fresh tier before first consolidation) is
+        treated as a failed gate at the live door, never served
+        pass-through — a trained tier must always be provable."""
+        entry = self._spo_entry("graph1")
+
+        class _Source:
+            def probe(self, keys_by_tier):
+                return {"graph1": dict(entry)}
+
+        s = MemoryStore()
+        reg = KeyRegistry()
+        reg.add("graph1")  # active, but no simhash set for it
+        s.load_registry("episodic", reg)
+        results = s.probe_source({"episodic": ["graph1"]}, source=_Source())
+        assert results["graph1"] is None, (
+            "a fingerprint-less active key must answer None at the live door"
+        )
+
 
 # ---------------------------------------------------------------------------
-# discard_keys helper — erase and stale mode variants
+# load_bookkeeping_from_disk — the sole boot loader for per-tier bookkeeping
 # ---------------------------------------------------------------------------
 
 
-class TestDiscardKeys:
-    """MemoryStore.discard_keys(keys, mode=) — erase and stale variants.
+def _bk_row(speaker_id: str = "speaker0", **overrides) -> dict:
+    """A complete seven-field bookkeeping row, as written by
+    ``_write_tier_key_metadata`` and read back by ``load_bookkeeping_from_disk``."""
+    row = {
+        "speaker_id": speaker_id,
+        "relation_type": "factual",
+        "reinforcement_count": 1,
+        "last_reinforced_cycle": 0,
+        "last_seen": "",
+        "first_seen": "2026-01-01",
+        "promoted": False,
+    }
+    row.update(overrides)
+    return row
 
-    Covers: mode="erase" removes from active + drops simhash across tiers
-    (registry over tiers_with_registry, simhash over three main tiers only);
-    mode="stale" moves to stale + RETAINS simhash; idempotent on absent key;
-    no-op when replay disabled.
-    """
 
-    def _make_store_with_key(self, key: str = "graph1", tier: str = "episodic") -> MemoryStore:
-        """Build a MemoryStore with one registered key plus its simhash."""
-        s = MemoryStore(replay_enabled=True)
-        s.put(tier, key, _entry(key), simhash=0xDEADBEEF, register=True)
-        return s
+def _write_tier_key_metadata_file(tier_root, keys: dict, *, tier_cycle: int = 0) -> None:
+    from paramem.backup.encryption import write_infra_json
 
-    def test_erase_removes_from_active_and_drops_simhash(self):
-        """mode='erase': key removed from active list; simhash dropped."""
-        s = self._make_store_with_key("graph1", "episodic")
-        s.discard_keys(["graph1"], mode="erase")
+    tier_root.mkdir(parents=True, exist_ok=True)
+    write_infra_json(tier_root / "key_metadata.json", {"tier_cycle": tier_cycle, "keys": keys})
 
-        reg = s.registry("episodic")
-        assert "graph1" not in reg.list_active(), "Erased key must not be in active"
-        assert "graph1" not in reg.list_stale(), "Erased key must not be in stale either"
-        assert not s.has_simhash("episodic", "graph1"), "Erased key simhash must be dropped"
 
-    def test_erase_drops_simhash_via_registry_remove(self):
-        """mode='erase': registry.remove drops the simhash from all tiers the key
-        is known in.
+class TestLoadBookkeepingFromDisk:
+    """MemoryStore.load_bookkeeping_from_disk(adapter_dir) — walks
+    iter_tier_roots and splats each tier's own key_metadata.json rows into
+    _bookkeeping via set_bookkeeping."""
 
-        After unification, discard_keys(mode='erase') uses registry.remove, which
-        drops the fingerprint from _simhash atomically.  A key registered in an
-        interim tier's registry loses its fingerprint there too.
-        """
-        s = MemoryStore(replay_enabled=True)
-        # Register key in the interim tier (which owns both its registry and simhash).
-        s.put(
-            "episodic_interim_20260101",
-            "graph_interim",
-            _entry("graph_interim"),
-            simhash=0x2222,
-            register=True,
+    def test_relation_type_propagates_from_disk(self, tmp_path):
+        s = MemoryStore()
+        reg = KeyRegistry()
+        reg.add("graph1")
+        s.load_registry("episodic", reg)
+        _write_tier_key_metadata_file(
+            tmp_path / "episodic",
+            {"graph1": _bk_row(relation_type="preference")},
         )
 
-        s.discard_keys(["graph_interim"], mode="erase")
+        result = s.load_bookkeeping_from_disk(tmp_path)
 
-        # Interim tier simhash dropped (registry.remove covers all tiers_with_registry).
-        assert not s.has_simhash("episodic_interim_20260101", "graph_interim"), (
-            "Registry-owned simhash must be dropped by erase"
+        assert result == {"loaded": 1, "orphaned": 0}
+        bk = s.bookkeeping_for_key("graph1")
+        assert bk is not None
+        assert bk["relation_type"] == "preference"
+
+    def test_incomplete_record_raises_instead_of_silently_defaulting(self, tmp_path):
+        """A row missing a mandatory field (``promoted``, the newest of the
+        seven) fails loud from the splat into set_bookkeeping — no compat
+        shim fills it in."""
+        s = MemoryStore()
+        reg = KeyRegistry()
+        reg.add("graph1")
+        s.load_registry("episodic", reg)
+        incomplete_row = _bk_row()
+        del incomplete_row["promoted"]
+        _write_tier_key_metadata_file(tmp_path / "episodic", {"graph1": incomplete_row})
+
+        with pytest.raises(TypeError):
+            s.load_bookkeeping_from_disk(tmp_path)
+
+    def test_raises_when_registry_has_known_keys_but_no_row_file(self, tmp_path):
+        """A tier whose registry (already loaded) reports a known key but has
+        no ``key_metadata.json`` at all is a violation of the
+        every-known-key-has-a-row invariant -- raised, never silently
+        skipped past."""
+        from paramem.memory.store import BookkeepingInvariantViolation
+
+        s = MemoryStore()
+        reg = KeyRegistry()
+        reg.add("graph1")
+        s.load_registry("episodic", reg)
+        # No key_metadata.json written at all under tmp_path/episodic/.
+
+        with pytest.raises(BookkeepingInvariantViolation):
+            s.load_bookkeeping_from_disk(tmp_path)
+
+    def test_no_raise_when_registry_has_zero_known_keys_and_no_row_file(self, tmp_path):
+        """A tier with a registry and ZERO known keys and no row file is the
+        ordinary empty case, not a violation."""
+        s = MemoryStore()
+        s.load_registry("episodic", KeyRegistry())
+
+        result = s.load_bookkeeping_from_disk(tmp_path)
+
+        assert result == {"loaded": 0, "orphaned": 0}
+
+    def test_legacy_cased_speaker_id_coerced_to_lowercase(self, tmp_path):
+        """A cased ``Speaker0`` left over from a legacy key_metadata.json is
+        silently coerced to ``speaker0`` at boot via set_bookkeeping's own
+        canonicalization — self-healing on the next save."""
+        s = MemoryStore()
+        reg = KeyRegistry()
+        reg.add("graph1")
+        s.load_registry("episodic", reg)
+        _write_tier_key_metadata_file(
+            tmp_path / "episodic",
+            {"graph1": _bk_row(speaker_id="Speaker0")},
         )
 
-    def test_stale_moves_to_stale_and_retains_simhash(self):
-        """mode='stale': key moved to stale partition; simhash retained."""
-        s = self._make_store_with_key("graph1", "episodic")
-        s.discard_keys(["graph1"], mode="stale")
+        s.load_bookkeeping_from_disk(tmp_path)
 
-        reg = s.registry("episodic")
-        assert "graph1" not in reg.list_active(), "Staled key must not be in active"
-        assert "graph1" in reg.list_stale(), "Staled key must be in stale partition"
-        assert s.has_simhash("episodic", "graph1"), "Staled key simhash must be RETAINED"
+        assert s.bookkeeping_for_key("graph1")["speaker_id"] == "speaker0"
 
-    def test_erase_idempotent_on_absent_key(self):
-        """discard_keys(mode='erase') on a non-existent key does not raise."""
-        s = MemoryStore(replay_enabled=True)
-        # Should not raise
-        s.discard_keys(["nonexistent_key"], mode="erase")
 
-    def test_stale_idempotent_on_absent_key(self):
-        """discard_keys(mode='stale') on a non-existent key does not raise."""
-        s = MemoryStore(replay_enabled=True)
-        s.discard_keys(["nonexistent_key"], mode="stale")
+class TestLoadBookkeepingMergeConflictRule:
+    """When a key's row appears in more than one tier's key_metadata.json —
+    a stale leftover from a tier the key no longer belongs to — the row
+    from the tier whose registry CURRENTLY owns the key wins. A key active
+    in two tiers' registries at once has no producing path under the
+    single-tier-ownership invariant, so that shape is not modeled here."""
 
-    def test_noop_when_replay_disabled(self):
-        """When replay is disabled, discard_keys is a no-op."""
-        s = MemoryStore(replay_enabled=False)
-        s.put_simhash("episodic", "graph1", 0xAAAA)
-        # Replay disabled → must not raise and must leave simhash intact.
-        s.discard_keys(["graph1"], mode="erase")
-        assert s.has_simhash("episodic", "graph1"), (
-            "Replay-disabled discard_keys must not touch simhashes"
+    _INTERIM_STAMP_DIR = "interim_20260101T0000"
+    _INTERIM_TIER_NAME = "episodic_interim_20260101T0000"
+
+    def test_owner_tier_row_wins_over_stale_interim_leftover(self, tmp_path):
+        """graph1 is known (active) only to the main episodic registry; a
+        stale leftover row for it also sits in an interim slot's file (the
+        interim registry does NOT know it). The main tier's own row wins,
+        and the interim's stale row is never applied."""
+        s = MemoryStore()
+        main_reg = KeyRegistry()
+        main_reg.add("graph1")
+        s.load_registry("episodic", main_reg)
+        s.load_registry(self._INTERIM_TIER_NAME, KeyRegistry())  # does not know graph1
+
+        _write_tier_key_metadata_file(
+            tmp_path / "episodic", {"graph1": _bk_row(speaker_id="speaker_main")}
+        )
+        _write_tier_key_metadata_file(
+            tmp_path / "episodic" / self._INTERIM_STAMP_DIR,
+            {"graph1": _bk_row(speaker_id="speaker_interim")},
         )
 
-    def test_invalid_mode_raises_value_error(self):
-        """An unrecognised mode string raises ValueError."""
-        s = MemoryStore(replay_enabled=True)
-        with pytest.raises(ValueError, match="unknown mode"):
-            s.discard_keys(["graph1"], mode="invalid")
+        result = s.load_bookkeeping_from_disk(tmp_path)
 
-    def test_is_stale_delegates_to_registry(self):
-        """MemoryStore.is_stale(key) returns True iff the owning tier marks it stale."""
-        s = self._make_store_with_key("graph1", "episodic")
-        assert not s.is_stale("graph1")
-        s.discard_keys(["graph1"], mode="stale")
-        assert s.is_stale("graph1")
-        assert not s.is_stale("nonexistent")
-
-    def test_erase_drops_entry_and_bookkeeping_sibling_key_keeps_both(self):
-        """mode='erase' is full retirement: entry payload and bookkeeping
-        record are dropped, delegating to :meth:`delete` per key.  A sibling
-        key in the same tier keeps both."""
-        s = self._make_store_with_key("graph1", "episodic")
-        s.set_bookkeeping(
-            "graph1", speaker_id="speaker1", relation_type="factual", first_seen="2026-01-01"
-        )
-        s.put("episodic", "graph2", _entry("graph2"), simhash=0xC0FFEE, register=True)
-        s.set_bookkeeping(
-            "graph2", speaker_id="speaker1", relation_type="factual", first_seen="2026-01-01"
-        )
-
-        s.discard_keys(["graph1"], mode="erase")
-
-        assert s.get("graph1") is None, "erase must drop the entry payload"
-        assert s.bookkeeping_for_key("graph1") is None, "erase must drop the bookkeeping record"
-        assert s.get("graph2") is not None, "sibling key's entry must survive"
-        assert s.bookkeeping_for_key("graph2") is not None, (
-            "sibling key's bookkeeping record must survive"
-        )
-
-    def test_stale_keeps_entry_and_bookkeeping(self):
-        """mode='stale' must NOT leak the erase-mode entry/bookkeeping drop
-        into the soft path — entry and bookkeeping both survive."""
-        s = self._make_store_with_key("graph1", "episodic")
-        s.set_bookkeeping(
-            "graph1", speaker_id="speaker1", relation_type="factual", first_seen="2026-01-01"
-        )
-
-        s.discard_keys(["graph1"], mode="stale")
-
-        assert s.get("graph1") is not None, "stale must keep the entry payload"
-        assert s.bookkeeping_for_key("graph1") is not None, "stale must keep the bookkeeping record"
-
-    def test_all_stale_keys_aggregates_across_tiers(self):
-        """MemoryStore.all_stale_keys() returns stale keys across all registered tiers."""
-        s = MemoryStore(replay_enabled=True)
-        s.put("episodic", "ep1", _entry("ep1"), register=True)
-        s.put("semantic", "sem1", _entry("sem1"), register=True)
-        s.put("episodic", "ep2", _entry("ep2"), register=True)
-
-        s.discard_keys(["ep1"], mode="stale")
-        s.discard_keys(["sem1"], mode="stale")
-
-        stale = s.all_stale_keys()
-        assert "ep1" in stale
-        assert "sem1" in stale
-        assert "ep2" not in stale
+        assert s.bookkeeping_for_key("graph1")["speaker_id"] == "speaker_main"
+        assert result["loaded"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -1317,11 +836,15 @@ class TestConcurrencyContract:
     def test_iter_bookkeeping_snapshot_unaffected_by_subsequent_set(self):
         """iter_bookkeeping snapshot is taken before yielding."""
         s = MemoryStore()
-        s.set_bookkeeping("k1", speaker_id="alice", relation_type="factual", first_seen="")
+        s.set_bookkeeping(
+            "k1", speaker_id="alice", relation_type="factual", first_seen="", promoted=False
+        )
         it = s.iter_bookkeeping()
         snap = list(it)
         # Add a second key after the iterator is exhausted.
-        s.set_bookkeeping("k2", speaker_id="bob", relation_type="factual", first_seen="")
+        s.set_bookkeeping(
+            "k2", speaker_id="bob", relation_type="factual", first_seen="", promoted=False
+        )
         keys_in_snap = {k for k, _ in snap}
         assert "k1" in keys_in_snap
         assert "k2" not in keys_in_snap
@@ -1333,7 +856,9 @@ class TestConcurrencyContract:
         state and the old keys are gone."""
         s = MemoryStore()
         s.put("episodic", "old_key", _entry("old_key"))
-        s.set_bookkeeping("old_key", speaker_id="alice", relation_type="factual", first_seen="")
+        s.set_bookkeeping(
+            "old_key", speaker_id="alice", relation_type="factual", first_seen="", promoted=False
+        )
 
         new_reg = KeyRegistry()
         new_reg.add("new_key")
@@ -1465,6 +990,7 @@ class TestSetBookkeepingGuard:
                 speaker_id="",
                 relation_type="factual",
                 first_seen="",
+                promoted=False,
             )
 
     def test_empty_speaker_id_allowed_with_flag(self):
@@ -1476,6 +1002,7 @@ class TestSetBookkeepingGuard:
             relation_type="factual",
             allow_empty_speaker=True,
             first_seen="",
+            promoted=False,
         )
         bk = s.bookkeeping_for_key("graph2")
         assert bk is not None
@@ -1492,6 +1019,7 @@ class TestSetBookkeepingGuard:
             speaker_id="Speaker0",
             relation_type="factual",
             first_seen="",
+            promoted=False,
         )
         bk = s.bookkeeping_for_key("graph3")
         assert bk is not None
@@ -1504,7 +1032,9 @@ class TestSetBookkeepingGuard:
         ``_speaker_key_index`` receives the normalized form, eliminating the
         silent-drop regression where legacy key_metadata.json held cased ids."""
         s = MemoryStore()
-        s.set_bookkeeping("g1", speaker_id="Speaker0", relation_type="factual", first_seen="")
+        s.set_bookkeeping(
+            "g1", speaker_id="Speaker0", relation_type="factual", first_seen="", promoted=False
+        )
         bk = s.bookkeeping_for_key("g1")
         assert bk is not None
         assert bk["speaker_id"] == "speaker0", (
@@ -1520,6 +1050,7 @@ class TestSetBookkeepingGuard:
             relation_type="factual",
             allow_empty_speaker=True,
             first_seen="",
+            promoted=False,
         )
         bk = s.bookkeeping_for_key("g2")
         assert bk is not None
@@ -1528,64 +1059,18 @@ class TestSetBookkeepingGuard:
     def test_non_speaker_value_passes_through_unchanged(self):
         """A non-speaker_id value that is non-empty passes through without lowercasing."""
         s = MemoryStore()
-        s.set_bookkeeping("g3", speaker_id="alice", relation_type="factual", first_seen="")
+        s.set_bookkeeping(
+            "g3", speaker_id="alice", relation_type="factual", first_seen="", promoted=False
+        )
         bk = s.bookkeeping_for_key("g3")
         assert bk is not None
         assert bk["speaker_id"] == "alice"
 
-    def test_load_bookkeeping_legacy_cased_speaker_id_normalized(self, tmp_path):
-        """Legacy key_metadata.json with cased Speaker0 is lowercased at boot.
-
-        :meth:`load_bookkeeping_from_disk` calls :meth:`set_bookkeeping`, which
-        normalizes ``Speaker0`` → ``speaker0`` via ``is_speaker_id`` — the same
-        normalization the router's ``_speaker_key_index`` (the sole privacy
-        boundary) relies on to route legacy-cased ids without dropping the key
-        (the live regression this fix targets: 158 keys silently dropped after
-        the speaker-identity refactor)."""
-        import json
-
-        path = tmp_path / "key_metadata.json"
-        path.write_text(
-            json.dumps(
-                {
-                    "keys": {
-                        "graph42": {
-                            "speaker_id": "Speaker0",
-                            "relation_type": "factual",
-                            "reinforcement_count": 1,
-                            "last_reinforced_cycle": 0,
-                            "last_seen": "",
-                            "first_seen": "",
-                        }
-                    }
-                }
-            )
-        )
-        s = MemoryStore()
-        from paramem.training.key_registry import KeyRegistry
-
-        reg = KeyRegistry()
-        reg.add("graph42")
-        s.load_registry("episodic", reg)
-        s.put(
-            "episodic",
-            "graph42",
-            {"key": "graph42", "subject": "speaker0", "predicate": "lives_in", "object": "London"},
-        )
-        s.load_bookkeeping_from_disk(path)
-
-        bk = s.bookkeeping_for_key("graph42")
-        assert bk is not None
-        assert bk["speaker_id"] == "speaker0", (
-            "Legacy cased Speaker0 must be normalized to speaker0 at boot."
-        )
-
     def test_router_routes_by_legacy_cased_speaker_id_after_normalization(self, monkeypatch):
         """Cased-bookkeeping → normalized → routable: ``QueryRouter``'s
-        ``_speaker_key_index`` (sole privacy boundary) is built from the
-        same normalized bookkeeping the preceding test locks, so
-        ``route(speaker_id="speaker0")`` finds a key bookkept as
-        ``Speaker0``."""
+        ``_speaker_key_index`` (sole privacy boundary) is built from
+        normalized bookkeeping, so ``route(speaker_id="speaker0")`` finds a
+        key bookkept as ``Speaker0``."""
         from pathlib import Path
         from unittest.mock import MagicMock
 
@@ -1597,7 +1082,9 @@ class TestSetBookkeepingGuard:
             "graph42",
             {"key": "graph42", "subject": "speaker0", "predicate": "lives_in", "object": "London"},
         )
-        s.set_bookkeeping("graph42", speaker_id="Speaker0", relation_type="factual", first_seen="")
+        s.set_bookkeeping(
+            "graph42", speaker_id="Speaker0", relation_type="factual", first_seen="", promoted=False
+        )
 
         monkeypatch.setattr(
             "paramem.server.intent.classify_intent", MagicMock(return_value=Intent.PERSONAL)
@@ -1618,94 +1105,81 @@ class TestSetBookkeepingGuard:
 
 
 class TestProbeRendersTokensVerbatim:
-    """MemoryStore.probe renders ``fact_text`` with raw ``speaker{N}`` tokens
-    on both the cache-hit and cache-miss/source-passthrough paths.  There is
-    no resolver parameter on ``probe`` — display-name resolution happens
-    exactly once, at the reply boundary, via
-    :func:`paramem.server.speaker.resolve_speaker_tokens`, never inside probe.
+    """Both read doors render ``fact_text`` with raw ``speaker{N}`` tokens —
+    the cache door's own renderer and the live door's source passthrough
+    alike.  Neither door takes a resolver parameter — display-name
+    resolution happens exactly once, at the reply boundary, via
+    :func:`paramem.server.speaker.resolve_speaker_tokens`, never inside a
+    probe door.
     """
 
     def test_cache_hit_subject_token_verbatim(self) -> None:
-        """Cache-hit path: fact_text carries the raw subject token as-is."""
+        """Cache door: fact_text carries the raw subject token as-is."""
         s = MemoryStore()
         s.put(
             "episodic",
             "graph1",
             {"key": "graph1", "subject": "speaker0", "predicate": "lives_in", "object": "Berlin"},
         )
-        s.set_bookkeeping("graph1", speaker_id="speaker0", relation_type="factual", first_seen="")
-        results = s.probe({"episodic": ["graph1"]})
+        s.set_bookkeeping(
+            "graph1", speaker_id="speaker0", relation_type="factual", first_seen="", promoted=False
+        )
+        results = s.probe_cache({"episodic": ["graph1"]})
         assert results["graph1"]["fact_text"] == "speaker0 lives_in Berlin"
 
     def test_cache_hit_object_token_verbatim(self) -> None:
-        """Cache-hit path: fact_text carries the raw object token as-is."""
+        """Cache door: fact_text carries the raw object token as-is."""
         s = MemoryStore()
         s.put(
             "episodic",
             "graph2",
             {"key": "graph2", "subject": "speaker0", "predicate": "knows", "object": "speaker9"},
         )
-        s.set_bookkeeping("graph2", speaker_id="speaker0", relation_type="factual", first_seen="")
-        results = s.probe({"episodic": ["graph2"]})
+        s.set_bookkeeping(
+            "graph2", speaker_id="speaker0", relation_type="factual", first_seen="", promoted=False
+        )
+        results = s.probe_cache({"episodic": ["graph2"]})
         assert results["graph2"]["fact_text"] == "speaker0 knows speaker9"
 
     def test_source_miss_path_verbatim(self) -> None:
-        """Cache-MISS / source passthrough: the source's own fact_text (already
-        rendered verbatim by the source layer) passes through unmodified —
-        probe does not re-render or resolve it."""
+        """Live door: the source's own fact_text (already rendered verbatim
+        by the source layer) passes through unmodified — the door does not
+        re-render or resolve it.  Registers a matching fingerprint so the
+        confidence gate passes (a fingerprint-less key is dropped there)."""
+        from paramem.memory.entry import entry_simhash
+
+        entry = {
+            "key": "graph9",
+            "subject": "speaker9",
+            "predicate": "lives_in",
+            "object": "Paris",
+        }
 
         class _FakeSource:
             def probe(self, keys_by_tier):
-                return {
-                    "graph9": {
-                        "key": "graph9",
-                        "subject": "speaker9",
-                        "predicate": "lives_in",
-                        "object": "Paris",
-                        "fact_text": "speaker9 lives_in Paris",
-                    }
-                }
+                return {"graph9": {**entry, "fact_text": "speaker9 lives_in Paris"}}
 
         s = MemoryStore()
-        # No cache entry for graph9 — forces source path.
-        results = s.probe(
+        s.put_simhash("episodic", "graph9", entry_simhash(entry))
+        results = s.probe_source(
             {"episodic": ["graph9"]},
             source=_FakeSource(),
-            memoize=False,
         )
         assert results["graph9"]["fact_text"] == "speaker9 lives_in Paris"
 
-    def test_memoized_stash_reconstructs_from_spo(self) -> None:
-        """A source-miss result, once memoized, is re-rendered from its raw SPO
-        fields on the next cache hit — the stash holds SPO, not a frozen
-        fact_text string."""
-
-        class _FakeSource:
-            def probe(self, keys_by_tier):
-                return {
-                    "graphM": {
-                        "key": "graphM",
-                        "subject": "speaker9",
-                        "predicate": "works_at",
-                        "object": "Acme",
-                        "fact_text": "speaker9 works_at Acme",
-                    }
-                }
-
-        s = MemoryStore()
-        s.probe({"episodic": ["graphM"]}, source=_FakeSource(), memoize=True)
-
-        # Second probe is a cache hit — re-rendered from the memoized SPO.
-        results2 = s.probe({"episodic": ["graphM"]})
-        assert results2["graphM"]["fact_text"] == "speaker9 works_at Acme"
-
     def test_probe_has_no_resolver_parameter(self) -> None:
-        """MemoryStore.probe takes no speaker_resolver kwarg — passing one raises."""
+        """Neither read door takes a speaker_resolver kwarg — passing one raises."""
         import pytest
+
+        class _NoOpSource:
+            def probe(self, keys_by_tier):
+                return {}
 
         s = MemoryStore()
         with pytest.raises(TypeError):
-            s.probe({"episodic": []}, speaker_resolver=lambda t: t)
+            s.probe_cache({"episodic": []}, speaker_resolver=lambda t: t)
+        with pytest.raises(TypeError):
+            s.probe_source({"episodic": []}, source=_NoOpSource(), speaker_resolver=lambda t: t)
 
 
 # ---------------------------------------------------------------------------
@@ -1733,6 +1207,320 @@ def _clear_simhash_registry_cache():
     invalidate_simhash_registry_cache()
     yield
     invalidate_simhash_registry_cache()
+
+
+class TestFingerprintChainEndToEnd:
+    """The SimHash fingerprint gate fires exactly once per fact, at every
+    boundary source output crosses — asserted as one chain: a fold
+    registers a key's fingerprint through ``entry_simhash``; the recall
+    gate (``build_registry`` + ``verify_confidence``, the same two
+    primitives :class:`~paramem.training.early_stop.RecallEarlyStopCallback`
+    calls) accepts a matching entry and refuses a mismatched one below
+    threshold; and a hit whose stored triple does not match its stored
+    fingerprint is dropped on BOTH read doors — the live door via its own
+    confidence gate, the cache door because a mismatched entry never gets
+    admitted into the mirror in the first place (the boot fill's own gate,
+    performed by the source before content_only projection)."""
+
+    def test_register_gate_verify_and_both_doors_drop_a_mismatched_entry(self, tmp_path):
+        from paramem.memory.entry import (
+            build_registry,
+            content_only_entry,
+            entry_simhash,
+            is_admissible_probe_result,
+        )
+        from paramem.memory.source import DiskMemorySource
+        from tests._fold_fixtures import _write_graph
+
+        good_entry = {
+            "key": "graph1",
+            "subject": "Alice",
+            "predicate": "lives_in",
+            "object": "Berlin",
+        }
+        # Registered under graph1's own (correct) fingerprint, but the
+        # ON-DISK content is a different triple entirely — a fold that
+        # somehow wrote mismatched content, or on-disk tampering.
+        mismatched_key = "graph2"
+        mismatched_registered_entry = {
+            "key": mismatched_key,
+            "subject": "Bob",
+            "predicate": "works_at",
+            "object": "Acme",
+        }
+        mismatched_disk_entry = {
+            "key": mismatched_key,
+            "subject": "Eve",
+            "predicate": "hates",
+            "object": "Brussels",
+        }
+
+        # 1. Registration: a fold registers each key's fingerprint through
+        #    entry_simhash — the production registration primitive.
+        registry = KeyRegistry()
+        registry.add("graph1")
+        registry.set_simhash("graph1", entry_simhash(good_entry))
+        registry.add(mismatched_key)
+        registry.set_simhash(mismatched_key, entry_simhash(mismatched_registered_entry))
+        registry.save(tmp_path / "episodic" / "indexed_key_registry.json")
+
+        # 2. Recall gate: build_registry + verify_confidence are the exact
+        #    two primitives RecallEarlyStopCallback uses to verify staged
+        #    weights against the registered fingerprints.
+        gate_registry = build_registry([good_entry, mismatched_disk_entry])
+        from paramem.memory.entry import DEFAULT_CONFIDENCE_THRESHOLD, verify_confidence
+
+        # A staged reconstruction that recalls the CORRECT content for
+        # graph1 verifies against its own just-built registry.
+        assert (
+            verify_confidence(good_entry, {"graph1": gate_registry["graph1"]})
+            >= DEFAULT_CONFIDENCE_THRESHOLD
+        )
+        # A staged reconstruction that recalls the WRONG content for
+        # mismatched_key, verified against the REGISTERED (correct)
+        # fingerprint, refuses below threshold.
+        mismatched_registered_fp = {mismatched_key: registry.simhash_for(mismatched_key)}
+        assert (
+            verify_confidence(mismatched_disk_entry, mismatched_registered_fp)
+            < DEFAULT_CONFIDENCE_THRESHOLD
+        )
+
+        # 3. Live door: DiskMemorySource gates its own results against the
+        #    on-disk registry; a hit whose stored triple does not match its
+        #    stored fingerprint answers None at the door.
+        _write_graph(
+            tmp_path / "episodic",
+            [
+                {**good_entry, "speaker_id": "speaker0"},
+                {**mismatched_disk_entry, "speaker_id": "speaker0"},
+            ],
+        )
+        disk_registry = MemoryStore.read_simhash_registry_from_disk(tmp_path)
+        source = DiskMemorySource(tmp_path, registry=disk_registry)
+        source_results = source.probe({"episodic": ["graph1", mismatched_key]})
+
+        store = MemoryStore()
+        # The store's own confidence gate (probe_source) needs the registry
+        # loaded too — a fingerprint-less key is dropped there, so graph1's
+        # correct fingerprint must be on record for it to be served.
+        store.load_registry("episodic", registry)
+        results = store.probe_source(
+            {"episodic": ["graph1", mismatched_key]},
+            source=source,
+        )
+        assert results["graph1"] is not None, "the correctly-fingerprinted key must be served"
+        assert results[mismatched_key] is None, (
+            "a hit whose triple does not match its fingerprint is dropped at the live door"
+        )
+
+        # 4. Cache door: the mismatch is caught at ADMISSION (the source's
+        #    own gate, before content_only projection) — a mismatched entry
+        #    never enters the mirror, so it answers None there too, purely
+        #    because it was never admitted, not via a second read-time gate.
+        new_entries: dict = {}
+        for key, result in source_results.items():
+            if not is_admissible_probe_result(result):
+                continue
+            new_entries.setdefault("episodic", {})[key] = content_only_entry(result)
+        assert mismatched_key not in new_entries.get("episodic", {}), (
+            "the mismatched entry must never be admitted into the mirror"
+        )
+        assert new_entries["episodic"]["graph1"] == good_entry
+
+        new_registry = {
+            "episodic": KeyRegistry.load(tmp_path / "episodic" / "indexed_key_registry.json")
+        }
+        store.swap(new_entries, new_registry, {})
+        cache_results = store.probe_cache({"episodic": ["graph1", mismatched_key]})
+        assert cache_results["graph1"] is not None
+        assert cache_results[mismatched_key] is None, (
+            "never-admitted content answers None at the cache door, with no "
+            "fingerprint work performed at read time"
+        )
+
+
+class TestDiskMemorySourceBoundSlot:
+    """DiskMemorySource resolves each tier's LIVE slot
+    (``find_live_slot`` against the tier's own registry hash) and reads
+    ``graph.json`` from INSIDE that slot -- never a tier-root ``graph.json``
+    fallback in either direction."""
+
+    def test_disk_source_reads_the_bound_slots_graph(self, tmp_path) -> None:
+        from paramem.memory.entry import entry_simhash
+        from paramem.memory.source import DiskMemorySource
+        from tests._fold_fixtures import _write_graph
+
+        entry = {
+            "key": "graph1",
+            "subject": "Alice",
+            "predicate": "lives_in",
+            "object": "Berlin",
+        }
+
+        registry = KeyRegistry()
+        registry.add("graph1")
+        registry.set_simhash("graph1", entry_simhash(entry))
+        registry.save(tmp_path / "episodic" / "indexed_key_registry.json")
+
+        _write_graph(tmp_path / "episodic", [{**entry, "speaker_id": "speaker0"}])
+
+        disk_registry = MemoryStore.read_simhash_registry_from_disk(tmp_path)
+        source = DiskMemorySource(tmp_path, registry=disk_registry)
+
+        results = source.probe({"episodic": ["graph1"]})
+
+        assert results["graph1"] is not None
+        assert results["graph1"]["subject"] == "Alice"
+        assert results["graph1"]["object"] == "Berlin"
+
+    def test_disk_source_returns_misses_for_a_tier_with_no_bound_slot(self, tmp_path) -> None:
+        """A tier whose registry knows a key but carries no bound slot (never
+        written, or the registry moved on past whatever slot is on disk)
+        answers ``None`` for every one of its keys -- the ordinary per-key
+        miss shape, never a silently empty graph and never a tier-root
+        fallback read."""
+        from paramem.memory.source import DiskMemorySource
+
+        registry = KeyRegistry()
+        registry.add("graph1")
+        registry.set_simhash("graph1", 12345)
+        registry.save(tmp_path / "episodic" / "indexed_key_registry.json")
+        # No slot written under episodic/ at all.
+
+        disk_registry = MemoryStore.read_simhash_registry_from_disk(tmp_path)
+        source = DiskMemorySource(tmp_path, registry=disk_registry)
+
+        results = source.probe({"episodic": ["graph1"]})
+
+        assert results == {"graph1": None}
+
+
+def _write_unpublished_increment(tier_root, *, keys: "list[dict]") -> None:
+    """Write (never publish) one simulate-venue slot carrying *keys*.
+
+    Uses the production two-phase primitive
+    (:func:`~paramem.memory.persistence.write_tier_slot`) rather than
+    :func:`tests._fold_fixtures._write_graph` -- the written slot's
+    manifest is stamped with the digest of registry bytes that never land
+    at *tier_root*, so it stays unbound: ``find_live_slot`` cannot resolve
+    it until a matching ``publish_tier_registry`` call lands those exact
+    bytes.
+
+    *keys*: ``[{"key", "subject", "predicate", "object"}, ...]``.
+    """
+    import json as _json
+
+    from paramem.memory.increment import TierIncrement, TierWriteContext
+    from paramem.memory.persistence import write_tier_slot
+    from paramem.training.key_registry import KeyRegistry
+
+    registry = KeyRegistry()
+    for spec in keys:
+        registry.add(spec["key"])
+        registry.set_simhash(spec["key"], 1)
+    registry_bytes = registry.save_bytes()
+    rows_bytes = _json.dumps({"tier_cycle": 0, "keys": {}}).encode("utf-8")
+
+    increment = TierIncrement(
+        tier="episodic",
+        adapter_name="episodic",
+        registry=registry,
+        registry_bytes=registry_bytes,
+        rows_bytes=rows_bytes,
+        entries={},
+        bookkeeping={},
+        keyed=[
+            {
+                "key": spec["key"],
+                "subject": spec["subject"],
+                "predicate": spec["predicate"],
+                "object": spec["object"],
+                "speaker_id": "speaker0",
+            }
+            for spec in keys
+        ],
+        rebuilt=True,
+        pre_sha="",
+    )
+    ctx = TierWriteContext(
+        model=None,
+        tokenizer=None,
+        fingerprint_cache={},
+        output_dir=tier_root.parent,
+        tier_configs={},
+        store=None,
+        keep_prior_slots=1,
+    )
+    write_tier_slot(ctx=ctx, increment=increment, stamp="20260102T0000", mode="simulate")
+    # Deliberately no publish_tier_registry call -- this slot's manifest
+    # digest never lands at tier_root/indexed_key_registry.json.
+
+
+class TestDiskMemorySourceMidWindowWrite:
+    """A boot (or any live-door probe) landing between a tier's WRITE and
+    its PUBLISH resolves the OLD bound slot -- ``find_live_slot`` binds by
+    the registry hash actually on disk, and the written-but-unpublished
+    slot's manifest is stamped with a digest that has not landed there
+    yet."""
+
+    def test_probe_source_serves_the_published_value_and_misses_the_written_only_key(
+        self, tmp_path
+    ) -> None:
+        from paramem.memory.entry import entry_simhash
+        from paramem.memory.source import DiskMemorySource
+        from tests._fold_fixtures import _write_graph
+
+        v1_entry = {
+            "key": "graph1",
+            "subject": "alice",
+            "predicate": "lives_in",
+            "object": "berlin",
+        }
+
+        registry = KeyRegistry()
+        registry.add("graph1")
+        registry.set_simhash("graph1", entry_simhash(v1_entry))
+        registry.save(tmp_path / "episodic" / "indexed_key_registry.json")
+
+        # Published baseline: graph1 -> V1, bound to the registry above.
+        _write_graph(tmp_path / "episodic", [{**v1_entry, "speaker_id": "speaker0"}])
+
+        # Written but never published: graph1 -> V2 plus a brand-new graph2.
+        _write_unpublished_increment(
+            tmp_path / "episodic",
+            keys=[
+                {
+                    "key": "graph1",
+                    "subject": "alice",
+                    "predicate": "lives_in",
+                    "object": "hamburg",
+                },
+                {
+                    "key": "graph2",
+                    "subject": "bob",
+                    "predicate": "lives_in",
+                    "object": "munich",
+                },
+            ],
+        )
+
+        disk_registry = MemoryStore.read_simhash_registry_from_disk(tmp_path)
+        source = DiskMemorySource(tmp_path, registry=disk_registry)
+
+        store = MemoryStore()
+        store.load_registry("episodic", registry)
+        results = store.probe_source({"episodic": ["graph1", "graph2"]}, source=source)
+
+        assert results["graph1"] is not None
+        assert results["graph1"]["object"] == "berlin", (
+            "the live door must resolve the OLD bound slot -- the written-"
+            "only increment's value must never be served before its publish"
+        )
+        assert results["graph2"] is None, (
+            "a key that exists only in the unpublished slot is unreachable "
+            "-- it is not enumerable via the live registry and its slot "
+            "does not bind"
+        )
 
 
 class TestReadSimhashRegistryFromDiskCache:
@@ -1834,72 +1622,6 @@ class TestReadSimhashRegistryFromDiskCache:
         calls["n"] = 0
         MemoryStore.read_simhash_registry_from_disk(tmp_path, cached=True)
         assert calls["n"] > 0, "cache entry was not published after the race — must re-walk"
-
-
-class TestBuildMemorySourceCachedRegistry:
-    """``build_memory_source(..., cached_registry=...)`` threads through to
-    :meth:`MemoryStore.read_simhash_registry_from_disk`."""
-
-    def test_default_cached_registry_is_disk_truth(self, tmp_path) -> None:
-        from paramem.memory.source import build_memory_source
-
-        _write_episodic_registry(tmp_path, {"graph1": 111})
-        source = build_memory_source(
-            mode="train",
-            adapter_dir=tmp_path,
-            batch_size=4,
-            model=object(),
-            tokenizer=object(),
-        )
-        assert source.registry == {"graph1": 111}
-
-        _write_episodic_registry(tmp_path, {"graph1": 222})
-        source2 = build_memory_source(
-            mode="train",
-            adapter_dir=tmp_path,
-            batch_size=4,
-            model=object(),
-            tokenizer=object(),
-        )
-        assert source2.registry == {"graph1": 222}
-
-    def test_cached_registry_true_serves_stale_until_router_reload(self, tmp_path) -> None:
-        from paramem.memory.source import build_memory_source
-
-        _write_episodic_registry(tmp_path, {"graph1": 111})
-        source = build_memory_source(
-            mode="train",
-            adapter_dir=tmp_path,
-            batch_size=4,
-            model=object(),
-            tokenizer=object(),
-            cached_registry=True,
-        )
-        assert source.registry == {"graph1": 111}
-
-        _write_episodic_registry(tmp_path, {"graph1": 999})
-        source2 = build_memory_source(
-            mode="train",
-            adapter_dir=tmp_path,
-            batch_size=4,
-            model=object(),
-            tokenizer=object(),
-            cached_registry=True,
-        )
-        assert source2.registry == {"graph1": 111}, "stale cache entry survives the disk write"
-
-        from paramem.memory.store import invalidate_simhash_registry_cache
-
-        invalidate_simhash_registry_cache()
-        source3 = build_memory_source(
-            mode="train",
-            adapter_dir=tmp_path,
-            batch_size=4,
-            model=object(),
-            tokenizer=object(),
-            cached_registry=True,
-        )
-        assert source3.registry == {"graph1": 999}
 
 
 class TestRouterReloadInvalidatesSimhashRegistryCache:

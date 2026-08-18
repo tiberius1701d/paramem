@@ -238,6 +238,40 @@ def carries_content_fields(entry: "dict | None") -> bool:
     return entry is not None and all(f in entry for f in CONTENT_FIELDS)
 
 
+def is_admissible_probe_result(result: "dict | None") -> bool:
+    """True when a :class:`~paramem.memory.source.MemorySource` probe *result*
+    is a usable, content-bearing entry — never a miss.
+
+    THE one miss predicate for every source-probe consumer (the boot cache
+    fill, the per-fold reconstruction).  *result* is a miss — rejected by
+    this predicate — under any of three rules:
+
+    1. *result* is not a ``dict`` (covers ``None`` — the ordinary "unknown
+       key" miss shape — and any other non-dict a malformed source might
+       return).
+    2. *result* carries a ``"failure_reason"`` key — a source-side
+       rejection, including a SimHash confidence-gate drop, recorded as
+       ``{"raw_output", "failure_reason"}`` instead of content.
+    3. *result* is missing one of the four :data:`CONTENT_FIELDS`
+       (see :func:`carries_content_fields`).
+
+    Args:
+        result: A single per-key value from a
+            :class:`~paramem.memory.source.MemorySource`'s ``probe()``
+            result mapping — ``None``, a failure-shape dict, or a
+            content-bearing entry dict.
+
+    Returns:
+        ``True`` only when *result* is a dict carrying all four content
+        fields and no ``failure_reason``.
+    """
+    return (
+        isinstance(result, dict)
+        and "failure_reason" not in result
+        and carries_content_fields(result)
+    )
+
+
 # --- Recall parsing ---
 
 
@@ -417,7 +451,7 @@ def content_only_entry(entry: dict) -> dict:
     Args:
         entry: A working entry dict carrying at least ``key``, ``subject``,
             ``predicate``, and ``object`` — extra fields (e.g. ``speaker_id``,
-            ``relation_type``, ``_new``) are dropped.
+            ``relation_type``, ``confidence``) are dropped.
 
     Returns:
         A new dict with exactly the four content fields.

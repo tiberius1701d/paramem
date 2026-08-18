@@ -1,8 +1,7 @@
 """Server consolidation — thin wrapper around ConsolidationLoop.
 
-Uses the same ConsolidationLoop that powers Tests 1-8, with
-indexed_key_replay=True. The graph is transient (RAM-only).
-Promotion is key-level: per-key session counts persisted in
+Uses the same ConsolidationLoop that powers Tests 1-8. The graph is
+transient (RAM-only). Promotion is key-level: per-key session counts persisted in
 key_metadata.json (no personal data on disk).
 
 The loop saves adapters directly to output_dir (= adapter_dir), so
@@ -14,9 +13,10 @@ import json
 import logging
 from pathlib import Path
 
-from paramem.backup.encryption import read_maybe_encrypted, write_infra_json
+from paramem.backup.encryption import read_maybe_encrypted
 from paramem.server.config import ServerConfig
 from paramem.training.consolidation import ConsolidationLoop
+from paramem.training.stage_ledger import data_state_dir
 from paramem.training.thermal_throttle import ThermalPolicy
 
 logger = logging.getLogger(__name__)
@@ -117,10 +117,9 @@ def create_consolidation_loop(
     ----------
     state_provider:
         Optional zero-argument callable returning the server ``_state`` dict.
-        Passed to ``ConsolidationLoop`` so ``run_cycle`` can call
-        ``guard_trial_state`` and raise ``TrialActiveError`` when a migration
-        TRIAL is active.  Experiment scripts that do not pass ``state_provider``
-        are unaffected (default ``None`` → guard is a no-op).
+        Used only to wire the base-model weight-hash cache from server
+        ``_state`` into the loop (below); experiment scripts that do not pass
+        ``state_provider`` are unaffected (default ``None`` → no cache wired).
     output_dir:
         Override ``config.adapter_dir`` as the loop's output directory.
         ``None`` (default) falls through to ``config.adapter_dir``, which
@@ -191,7 +190,6 @@ def create_consolidation_loop(
         extraction_plausibility_endpoint=(
             config.consolidation.extraction_plausibility_endpoint or None
         ),
-        state_provider=state_provider,
         # Thermal fields live on ConsolidationScheduleConfig
         # (config.consolidation), NOT on ConsolidationConfig (which the loop
         # accepts as consolidation_config).  Build the policy here where both
@@ -203,8 +201,7 @@ def create_consolidation_loop(
             else config.consolidation.training_keep_prior_slots
         ),
         telemetry_dir=config.telemetry_dir,
-        incidents_state_dir=config.paths.data / "state",
-        key_metadata_path=config.key_metadata_path,
+        incidents_state_dir=data_state_dir(config.paths.data),
     )
 
     # Wire the base-model weight-hash cache from server _state into the loop so
@@ -216,7 +213,7 @@ def create_consolidation_loop(
         if state is not None:
             loop.fingerprint_cache = state.setdefault("base_model_hash_cache", {})
 
-    # Wire the full-consolidation period string so _save_adapters can stamp
+    # Wire the full-consolidation period string so commit_tier_slot can stamp
     # main slots with the current full-cycle window.  The stamp is manifest
     # PROVENANCE only — nothing reads it back and no gate compares stamps
     # (_is_full_cycle_due counts payload-bearing interim slots instead).  An
@@ -229,10 +226,14 @@ def create_consolidation_loop(
         # and still seeded here.  Entry payloads (subject/predicate/object/
         # speaker_id) live in the lifespan-owned MemoryStore — preload runs
         # at lifespan boot, not here, so the loop factory no longer touches
-        # the model or reads graph.json for that purpose.
-        metadata = _load_key_metadata(config.key_metadata_path)
-        if metadata:
-            loop.seed_key_metadata(metadata)
+        # the model or reads graph.json for that purpose.  ``memory_store``
+        # must already have its registries AND bookkeeping loaded (the
+        # ordinary boot sequence loads both before this loop is
+        # constructed) so ``seed_key_metadata`` can rebuild ``promoted_keys``
+        # from the per-key flags.
+        cycle_count = load_max_tier_cycle(config.adapter_dir)
+        if cycle_count is not None:
+            loop.seed_key_metadata(cycle_count)
 
     return loop
 
@@ -242,10 +243,11 @@ def session_retention_dir(loop, config) -> Path | None:
 
     Returns ``None`` when neither retention nor debug mode is enabled —
     the SessionBuffer will unlink the JSONL after consume.  Otherwise
-    returns ``loop.snapshot_dir_for()/sessions/``, the same root every
-    artifact hook writes under
-    (``paths.debug/episodic/cycle_<N>/run_<run_id>/sessions/``), so retained
-    transcripts sit beside the snapshots taken from them.
+    returns ``loop.snapshot_dir_for()/sessions/`` — always the un-stamped
+    per-cycle root (``paths.debug/episodic/cycle_<N>/run_<run_id>/sessions/``).
+    An interim event's own debug snapshots live under that cycle's stamped
+    ``interim_<stamp>/`` root, but retention deliberately does not follow
+    it, so the retention location stays stable across cycle kinds.
 
     Falls back to ``config.debug_dir/cycle_<N>/sessions/`` when ``debug`` is
     off and only ``retain_sessions`` asked for this: ``snapshot_dir_for``
@@ -253,8 +255,10 @@ def session_retention_dir(loop, config) -> Path | None:
     """
     if not (config.consolidation.retain_sessions or config.debug):
         return None
-    # No interim stamp: no production path assigns one to the loop, and the
-    # per-cycle root is what the artifact hooks use.
+    # Deliberately no interim stamp here: retention always lands under the
+    # stable per-cycle root regardless of which event kind (full or interim)
+    # consumed the session, so retained transcripts have one predictable
+    # location rather than following the consuming event's interim scope.
     snap = loop.snapshot_dir_for()
     if snap is None:
         return config.debug_dir / f"cycle_{loop.cycle_count}" / "sessions"
@@ -279,128 +283,42 @@ _dedup_procedural = ConsolidationLoop.dedup_procedural
 # --- Persistence ---
 
 
-def _load_key_metadata(path: Path) -> dict | None:
-    """Load key metadata from disk. Returns None if not found."""
-    if not path.exists():
-        logger.info("No key metadata found at %s, starting fresh", path)
-        return None
-    return json.loads(read_maybe_encrypted(path).decode("utf-8"))
+def load_max_tier_cycle(adapter_dir: Path) -> int | None:
+    """Return the maximum ``tier_cycle`` recorded across every tier's
+    on-disk ``key_metadata.json`` under *adapter_dir*.
 
+    THE per-tier boot-seed reader for the loop's cycle counter: walks
+    :func:`~paramem.memory.interim_adapter.iter_tier_roots` (main tiers,
+    then interim slots) and reads ``<tier_root>/key_metadata.json`` where
+    present, taking each file's ``tier_cycle`` field. Per-key bookkeeping
+    rows are not read here, and no cross-tier ownership conflict rule is
+    applied — that is
+    :meth:`~paramem.memory.store.MemoryStore.load_bookkeeping_from_disk`'s
+    job, the one canonical implementation of that conflict rule.
 
-def prune_key_metadata_orphans(config: ServerConfig) -> int:
-    """Drop entries from ``key_metadata.json`` whose tier registry is gone.
+    Returns ``None`` when no tier has a ``key_metadata.json`` file at all
+    (fresh install); callers only invoke
+    :meth:`~paramem.training.consolidation.ConsolidationLoop.seed_key_metadata`
+    when this is not ``None``.
 
-    Per the wipe invariant (2026-05-14): ``key_metadata.json`` is bookkeeping
-    for active keys, not a recovery source.  Called from the boot lifespan
-    after :func:`_mount_adapters_from_slots` so the on-disk file never carries
-    stale entries between a wipe and the next consolidation cycle.
-
-    Reads every tier's ``indexed_key_registry.json`` (main + interim slots),
-    takes the union of known keys (active ∪ stale, via ``list_known()`` — a
-    soft-staled key's bookkeeping must survive the prune), and rewrites
-    ``key_metadata.json`` keeping only keys in that union.  ``promoted_keys``
-    is filtered to the same set.
-
-    An unreadable or foreign-shaped registry (:class:`KeyRegistry.load`
-    raising :class:`ValueError`) makes the retention union unprovable for
-    that tier — the whole prune is refused (0 removed, logged at WARNING)
-    rather than risk deleting bookkeeping for keys the unreadable tier still
-    knows about.
-
-    Returns the number of orphan keys removed (0 when nothing to prune).
+    Callers: the loop-construction boot seed
+    (:func:`create_consolidation_loop`) and the base-swap migration
+    carry-over (``paramem.server.app``, Phase B).
     """
-    from paramem.training.key_registry import KeyRegistry
-
-    path = config.key_metadata_path
-    if not path.exists():
-        return 0
-
-    try:
-        raw = json.loads(read_maybe_encrypted(path).decode("utf-8"))
-    except Exception:
-        logger.exception("prune_key_metadata_orphans: could not read %s — skipping", path)
-        return 0
-
     from paramem.memory.interim_adapter import iter_tier_roots
 
-    keys_in = raw.get("keys", {}) if isinstance(raw, dict) else {}
-    if not keys_in:
-        return 0
+    adapter_dir = Path(adapter_dir)
+    max_cycle = 0
+    found_any = False
+    for _tier_name, tier_root in iter_tier_roots(adapter_dir):
+        path = tier_root / "key_metadata.json"
+        if not path.exists():
+            continue
+        found_any = True
+        raw = json.loads(read_maybe_encrypted(path).decode("utf-8"))
+        max_cycle = max(max_cycle, raw.get("tier_cycle", 0))
 
-    # Data-loss guard (2026-06-02): prune is destructive, so it must only run when
-    # the on-disk registries are AUTHORITATIVE for the active-key set.  Two
-    # transient states violate that and must NOT be treated as permanent
-    # orphanhood — they are exactly how an unfolded interim adapter's keys were
-    # silently and permanently deleted:
-    #
-    #   1. An active-store migration / base-swap is in flight.  The live store is
-    #      deliberately empty or mid-relocation (see _load_model_into_state's
-    #      preload base-swap gate), and an interim slot may have been converted to
-    #      a registry-less intermediate.  The on-disk registries do not yet
-    #      describe the post-migration key set, so an absent key proves nothing.
-    #
-    #   2. The registry union is EMPTY while key_metadata still references keys.
-    #      An empty union is indistinguishable from a transient unmounted state
-    #      (e.g. an interim slot deleted earlier this session, main tier not yet
-    #      refilled).  Pruning here would delete keys that were never folded into a
-    #      persisted main-tier adapter.  An empty union can never PROVE orphanhood;
-    #      a genuine wipe leaves the surviving tier registries non-empty.
-    from paramem.server.active_store_migration import load_state as _load_migration_state
-
-    if _load_migration_state(config.adapter_dir) is not None:
-        logger.info(
-            "prune_key_metadata_orphans: active-store migration in flight — "
-            "skipping prune so transiently-relocated keys are not deleted (%s)",
-            path,
-        )
-        return 0
-
-    # The retention union includes BOTH active and stale keys so that a
-    # soft-staled key's bookkeeping survives the prune.  A stale key is absent
-    # from list_active() but present in list_stale(); pruning it would delete
-    # bookkeeping still needed to resolve speaker/relation_type for that key.
-    active: set[str] = set()
-    for _tier, tier_root in iter_tier_roots(config.adapter_dir):
-        reg_path = tier_root / "indexed_key_registry.json"
-        if reg_path.exists():
-            try:
-                _loaded_reg = KeyRegistry.load(reg_path)
-            except ValueError as exc:
-                logger.warning(
-                    "prune_key_metadata_orphans: %s is not a KeyRegistry-shaped "
-                    "registry file — refusing to prune (retention union "
-                    "unprovable): %s (%s)",
-                    reg_path,
-                    path,
-                    exc,
-                )
-                return 0
-            active.update(_loaded_reg.list_known())
-
-    if not active:
-        # Empty registry union with non-empty key_metadata: cannot prove the keys
-        # are permanently orphaned — refuse to prune (transient-absence guard).
-        logger.warning(
-            "prune_key_metadata_orphans: every tier registry is empty/absent but "
-            "key_metadata.json still carries %d key(s) — refusing to prune "
-            "(transient unmounted/migration state, not proof of orphanhood): %s",
-            len(keys_in),
-            path,
-        )
-        return 0
-
-    pruned_keys = {k: v for k, v in keys_in.items() if k in active}
-    pruned_promoted = sorted(k for k in raw.get("promoted_keys", []) if k in active)
-    removed = len(keys_in) - len(pruned_keys)
-    if removed == 0:
-        return 0
-
-    raw["keys"] = pruned_keys
-    raw["promoted_keys"] = pruned_promoted
-    write_infra_json(path, raw)
-    logger.info(
-        "prune_key_metadata_orphans: removed %d orphan key(s) from %s",
-        removed,
-        path,
-    )
-    return removed
+    if not found_any:
+        logger.info("No key metadata found under %s, starting fresh", adapter_dir)
+        return None
+    return max_cycle

@@ -7,9 +7,9 @@ Swapping the base model requires only changing the model_id in config.
 import contextlib
 import logging
 import os
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -30,7 +30,7 @@ from transformers import (
 
 from paramem.utils.config import AdapterConfig, ModelConfig
 from paramem.utils.tokens import RenderedPrompt, encode_rendered
-from paramem.utils.vram_guard import safe_empty_cache
+from paramem.utils.vram_guard import safe_empty_cache, vram_measure
 
 logger = logging.getLogger(__name__)
 
@@ -162,16 +162,25 @@ def generate_adapter_off(
 
 @dataclass
 class _BackupScope:
-    """Handle yielded by :func:`main_tier_backup_scope`.
+    """Handle yielded by :func:`tier_backup_scope`.
 
     Carries the live ``model`` reference so callers can sync their own copy
     after entry — ``create_adapter`` may return a new object (the
     ``get_peft_model`` re-wrap branch), so the CM's own working reference
     (``scope.model``) must be reassigned on every ``create_adapter`` call
     rather than trusted to stay identical.
+
+    ``vram`` carries the ``free_before``/``free_after``/``delta``/``total``
+    mapping :func:`~paramem.utils.vram_guard.vram_measure` captured around
+    this scope's own snapshot (the backup adapter's ``create_adapter`` +
+    ``copy_adapter_weights`` pair) — populated once, at scope entry, and
+    left untouched afterwards. This scope records nothing itself; the
+    telemetry write belongs to the caller, which owns the fold's telemetry
+    directory and cycle stamp.
     """
 
     model: PeftModel
+    vram: "Mapping[str, int]" = field(default_factory=dict)
 
 
 def _switch_off(model: PeftModel, adapter_name: str, tiers: tuple[str, ...]) -> None:
@@ -188,134 +197,117 @@ def _switch_off(model: PeftModel, adapter_name: str, tiers: tuple[str, ...]) -> 
             return
 
 
-def _switch_off_all_backups(model: PeftModel, tiers: tuple[str, ...]) -> None:
-    """Move the active adapter onto a resident main tier if it is any ``<tier>_backup``.
-
-    Called immediately before the backup-delete loop in
-    :func:`main_tier_backup_scope` so a backup is never the active adapter
-    when it is deleted.
-    """
-    active = active_adapter_name(model)
-    if active is None or not active.endswith("_backup"):
-        return
-    for tier in tiers:
-        if tier in model.peft_config:
-            model.set_adapter(tier)
-            return
-
-
 @contextmanager
-def main_tier_backup_scope(
-    model: PeftModel,
-    tier_configs: dict[str, AdapterConfig],
-    *,
-    tiers: tuple[str, ...] = ("episodic", "semantic", "procedural"),
-) -> Iterator[_BackupScope]:
-    """Snapshot every resident main tier into a transient ``<tier>_backup`` adapter.
+def tier_backup_scope(model: PeftModel, config: AdapterConfig, tier: str) -> Iterator[_BackupScope]:
+    """Snapshot *tier*'s resident adapter into a transient ``<tier>_backup``
+    adapter, restored on any exception.
 
-    Manages BACKUP adapters ONLY — never interim adapters, never the on-disk
-    scratch a training event leaves behind.  On entry, every tier in
-    ``tiers`` that is resident in ``model.peft_config`` is copied into a
-    ``<tier>_backup`` adapter (any pre-existing, leaked backup is discarded
-    first so a stale snapshot can never be restored over good weights).  On
-    ANY exception raised inside the ``with`` body, every snapshotted tier is
-    restored from its backup before the ORIGINAL exception propagates
-    unchanged — whether the tier was trained warm in place (the funnel's
-    staging-copy-and-promote) or deleted and recreated cold mid-scope
-    (``_run_fold``'s tier loop does this on RECONCILE, or on a config
-    mismatch caught by ``ensure_adapter_matching``), a failure can never
-    leave production holding a zero-init adapter.  On every exit (success or
-    exception), all backup adapters are freed — they are VRAM-only and
-    never read by anything outside this scope.
+    Manages the BACKUP adapter ONLY — never interim adapters, never the
+    on-disk scratch a training event leaves behind.  On entry, if *tier* is
+    resident in ``model.peft_config`` it is copied into a ``<tier>_backup``
+    adapter (any pre-existing, leaked backup is discarded first so a stale
+    snapshot can never be restored over good weights).  On ANY exception
+    raised inside the ``with`` body, the tier is restored from its backup
+    before the ORIGINAL exception propagates unchanged. *tier* itself is
+    never deleted or recreated inside this scope — a config mismatch is
+    caught by ``ensure_adapter_matching`` BEFORE this scope is entered, and
+    every tier's transient staging slot warm-starts uniformly regardless of
+    door (an ordinary full event and the RECONCILE door alike, decided
+    inside :func:`~paramem.training.trainer.train_adapter`; its own
+    cold-start arm fires only on a LoRA shape mismatch or first boot) — so
+    the only thing this scope's restore ever unwinds is a tier trained warm
+    in place (the funnel's staging-copy-and-promote); a failure can never
+    leave production holding a zero-init adapter.  On every exit (success
+    or exception), the backup adapter is freed — it is VRAM-only and never
+    read by anything outside this scope.
 
-    The caller must keep the ``with`` body open for as long as any tier in
-    ``tiers`` may be deleted and recreated — the backups are what make that
-    delete safe (the model is never left with the deleted tier as its last
-    adapter, since the corresponding backup is still resident).
+    No tier's weights are activated live until the whole bundle has written
+    (the tandem go-live design), so this scope's only job is the unwind of
+    a tier that never went live: it covers exactly one tier's training,
+    never a whole event's worth of tiers.
 
     Args:
-        model: The live ``PeftModel`` carrying the main tiers.  Must already
-            be a ``PeftModel`` — this CM does not perform the initial
-            ``get_peft_model`` wrap.
-        tier_configs: ``{tier_name: AdapterConfig}`` used to size each
-            ``<tier>_backup`` adapter identically to its source tier.
-        tiers: The tier names to snapshot, in order.
+        model: The live ``PeftModel`` carrying *tier*, if resident.  Must
+            already be a ``PeftModel`` — this CM does not perform the
+            initial ``get_peft_model`` wrap.
+        config: *tier*'s ``AdapterConfig`` — sizes the backup identically.
+        tier: The single tier name to snapshot (the driver's tier loop
+            variable).
 
     Yields:
         _BackupScope: carries ``.model`` — the (possibly reassigned)
             ``PeftModel``.  Callers must sync their own reference from this
             after the ``with`` block starts, since ``create_adapter`` may
-            return a new object.
+            return a new object.  Also carries ``.vram`` — the
+            ``free_before``/``free_after``/``delta``/``total`` mapping
+            :func:`~paramem.utils.vram_guard.vram_measure` captured around
+            the snapshot itself; an empty ``{}`` when *tier* was not
+            resident (no snapshot taken).  This scope records nothing —
+            the caller writes it into the fold telemetry ring.
 
     Raises:
         RuntimeError: if ``model`` is not a ``PeftModel`` (runtime contract
             check — NOT an ``assert``, which is stripped under ``-O``).
     """
     if not isinstance(model, PeftModel):
-        raise RuntimeError("main_tier_backup_scope requires a PeftModel with main tiers resident")
+        raise RuntimeError("tier_backup_scope requires a PeftModel with main tiers resident")
 
     scope = _BackupScope(model=model)
-    snapshotted: list[str] = []
+    backup = f"{tier}_backup"
+    # The main-tier triple, as the fallback switch-off target list -- a
+    # literal declaration like every other main-tier reference in this
+    # module (paramem.memory.interim_adapter.MAIN_TIERS is not importable
+    # here without a cycle: it imports create_adapter from this module).
+    fallback_tiers = ("episodic", "semantic", "procedural")
+    snapshotted = False
     try:
-        for tier in tiers:
-            if tier not in scope.model.peft_config:
-                continue  # tier not resident (disabled / first fold) — skip
-            backup = f"{tier}_backup"
+        if tier in scope.model.peft_config:
             if backup in scope.model.peft_config:
-                # Leaked from a prior aborted fold — discard before
+                # Leaked from a prior aborted event — discard before
                 # re-snapshotting so the stale backup can never clobber good
                 # weights on a later restore.
-                _switch_off(scope.model, backup, tiers)
+                _switch_off(scope.model, backup, fallback_tiers)
                 scope.model.delete_adapter(backup)
-            scope.model = create_adapter(scope.model, tier_configs[tier], backup)
-            copy_adapter_weights(scope.model, src=tier, dst=backup)
-            snapshotted.append(tier)
+            with vram_measure("backup_creation") as _vram:
+                scope.model = create_adapter(scope.model, config, backup)
+                copy_adapter_weights(scope.model, src=tier, dst=backup)
+            scope.vram = dict(_vram)
+            snapshotted = True
         yield scope
     except BaseException:
-        # Restore ONLY tiers snapshotted at enter — a tier whose backup was
-        # never populated (partial-enter double-fault) must not be touched.
-        for tier in snapshotted:
-            backup = f"{tier}_backup"
-            if backup in scope.model.peft_config and tier in scope.model.peft_config:
-                try:
-                    copy_adapter_weights(scope.model, src=backup, dst=tier)
-                except Exception:  # noqa: BLE001  # boundary: best-effort per-tier
-                    # restore on an exception path — the original exception
-                    # below must always propagate unchanged, so a restore
-                    # failure here is logged and swallowed, not raised.
-                    logger.warning(
-                        "main_tier_backup_scope: restore failed for tier %s",
-                        tier,
-                        exc_info=True,
-                    )
+        # Restore only when this scope actually snapshotted the tier — a
+        # tier whose backup was never populated (partial-enter double-fault)
+        # must not be touched.
+        if snapshotted and backup in scope.model.peft_config and tier in scope.model.peft_config:
+            try:
+                copy_adapter_weights(scope.model, src=backup, dst=tier)
+            except Exception:  # noqa: BLE001  # boundary: best-effort restore on
+                # an exception path — the original exception below must
+                # always propagate unchanged, so a restore failure here is
+                # logged and swallowed, not raised.
+                logger.warning("tier_backup_scope: restore failed for tier %s", tier, exc_info=True)
         raise  # re-raise the ORIGINAL exception, untransformed
     finally:
-        # Every exit (success or exception) frees the backups — they are
-        # VRAM-only and outlive nothing outside this scope.  This block runs
-        # on the exception path too (Python runs `finally` after `except`
-        # re-raises), so a teardown failure here must NEVER replace the
-        # in-flight exception — e.g. an AbortedDuringConsolidation must still
-        # reach app.py's abort handler unchanged, not get swapped for a
-        # delete_adapter error and misrouted to the crash-incident path.
-        # Every step is therefore best-effort: log and continue, never raise.
-        # A leaked backup adapter is vastly preferable to a misrouted abort.
+        # Every exit (success or exception) frees the backup — it is
+        # VRAM-only and outlives nothing outside this scope.  This block
+        # runs on the exception path too (Python runs `finally` after
+        # `except` re-raises), so a teardown failure here must NEVER replace
+        # the in-flight exception.  Every step is therefore best-effort: log
+        # and continue, never raise — a leaked backup adapter is vastly
+        # preferable to a misrouted exception.
         try:
-            _switch_off_all_backups(scope.model, tiers)
+            _switch_off(scope.model, backup, fallback_tiers)
         except Exception:  # noqa: BLE001  # boundary: best-effort teardown; must
             # never replace an in-flight exception — see the block comment above.
-            logger.warning("main_tier_backup_scope: switch-off-backups failed", exc_info=True)
-        for tier in tiers:
-            backup = f"{tier}_backup"
-            if backup in scope.model.peft_config:
-                try:
-                    scope.model.delete_adapter(backup)
-                except Exception:  # noqa: BLE001  # boundary: best-effort teardown; must
-                    # never replace an in-flight exception — see the block comment above.
-                    logger.warning(
-                        "main_tier_backup_scope: could not delete backup %s",
-                        backup,
-                        exc_info=True,
-                    )
+            logger.warning("tier_backup_scope: switch-off-backup failed", exc_info=True)
+        if backup in scope.model.peft_config:
+            try:
+                scope.model.delete_adapter(backup)
+            except Exception:  # noqa: BLE001  # boundary: best-effort teardown; must
+                # never replace an in-flight exception — see the block comment above.
+                logger.warning(
+                    "tier_backup_scope: could not delete backup %s", backup, exc_info=True
+                )
 
 
 # Cache for system role support per tokenizer class to avoid repeated try/except
@@ -606,9 +598,10 @@ def lora_shape_fields(adapter_config: AdapterConfig) -> dict:
     :func:`ensure_adapter_matching` — a warm-kept resident adapter's
     ``lora_dropout`` stays whatever it was created with. An operator dropout
     edit in config therefore takes effect only the next time the adapter is
-    actually (re)created (RECONCILE, first boot, or a shape-relevant
-    mismatch), never on a routine warm-kept fold — see
-    ``configs/server.yaml.example``'s adapters section.
+    actually (re)created (first boot, or a shape-relevant mismatch), never
+    on a routine warm-kept fold — the reconcile door (``/reconsolidate``)
+    warm-starts like every other fold and applies no dropout edit by
+    itself — see ``configs/server.yaml.example``'s adapters section.
     """
     return {
         "r": adapter_config.rank,
@@ -876,29 +869,30 @@ def atomic_save_adapter(
 ) -> Path:
     """Save adapter atomically into a timestamped slot directory.
 
-    Implements the seven-step in-pending-flatten sequence:
+    The PEFT-specific payload writer handed to
+    :func:`paramem.adapters.slot.write_slot`, which owns the promotion
+    sequence (pending-dir creation, collision-safe timestamp, manifest
+    digest stamping, fsync, atomic rename) shared by every payload kind.
+    This function's own closure performs only the weight-specific write:
 
-    1. Ensure ``target_dir`` and ``target_dir/.pending/`` exist; pick a
-       collision-safe ``<ts>`` stamp and create ``pending_slot =
-       target_dir/.pending/<ts>/``.
-    2. ``model.save_pretrained(pending_slot, selected_adapters=[adapter_name])``.
+    1. ``model.save_pretrained(pending_slot, selected_adapters=[adapter_name])``.
        PEFT may write ``pending_slot/<adapter_name>/`` (nested) or directly
        into ``pending_slot/`` (flat — some PEFT versions).
-    3. **Flatten inside ``pending_slot``**: if ``pending_slot/<adapter_name>/``
+    2. **Flatten inside ``pending_slot``**: if ``pending_slot/<adapter_name>/``
        exists, iterate its children and rename each up one level into
        ``pending_slot/``, then rmdir the now-empty nested directory.  If the
        nested directory is absent, this step is a no-op.
-    3.5. **Encrypt ``adapter_model.safetensors`` in-place** via
+    3. **Encrypt ``adapter_model.safetensors`` in-place** via
        :func:`_encrypt_adapter_safetensors`.  When the daily age identity is
        loaded, the plaintext tensor bytes are replaced by an age envelope.
        When no key is configured the file is rewritten unchanged (plaintext
        pass-through, zero overhead).
-    4. If *manifest* is not ``None``, write ``pending_slot/meta.json`` via
-       :func:`paramem.adapters.manifest.write_manifest`.
-    5. fsync ``pending_slot`` (best-effort; ``OSError`` tolerated on
-       filesystems that don't support directory fsync).
-    6. Atomic rename ``pending_slot → target_dir/<ts>/`` (the final slot).
-       fsync ``target_dir`` for durability.
+
+    ``write_slot`` then computes the plaintext SHA-256 of the resulting
+    ``adapter_model.safetensors``, stamps it into *manifest*'s
+    ``payload.sha256``, writes ``meta.json`` (when *manifest* is not
+    ``None``), and promotes the slot — every caller of this function
+    therefore inherits the payload digest for free.
 
     Old ``.tmp.{pid}`` and ``.old`` paths are gone — all staging happens
     inside ``.pending/`` which :func:`paramem.backup.backup.sweep_orphan_pending`
@@ -917,78 +911,27 @@ def atomic_save_adapter(
     Returns:
         Path to the final (promoted) slot directory.
     """
-    import os
-    import time
+    from paramem.adapters.slot import write_slot
 
-    target_dir = Path(target_dir)
-    target_dir.mkdir(parents=True, exist_ok=True)
+    def _write_payload(pending_slot: Path) -> None:
+        # PEFT save into pending slot
+        model.save_pretrained(str(pending_slot), selected_adapters=[adapter_name])
 
-    # Step 1 — pending root + collision-retry timestamp
-    pending_root = target_dir / ".pending"
-    pending_root.mkdir(exist_ok=True)
+        # Flatten inside pending_slot — PEFT may write
+        # <pending_slot>/<adapter_name>/adapter_*.*
+        nested = pending_slot / adapter_name
+        if nested.exists() and nested.is_dir():
+            for child in list(nested.iterdir()):
+                child.rename(pending_slot / child.name)
+            nested.rmdir()
 
-    ts = _make_slot_ts()
-    pending_slot = pending_root / ts
-    for _attempt in range(10):
-        if not pending_slot.exists():
-            break
-        time.sleep(1)
-        ts = _make_slot_ts()
-        pending_slot = pending_root / ts
-    pending_slot.mkdir(parents=True, exist_ok=False)
+        # Encrypt adapter_model.safetensors in-place (age when key loaded,
+        # plaintext pass-through when no key is configured).
+        _encrypt_adapter_safetensors(pending_slot)
 
-    # Step 2 — PEFT save into pending slot
-    model.save_pretrained(str(pending_slot), selected_adapters=[adapter_name])
-
-    # Step 3 — Flatten inside pending_slot
-    # PEFT may write <pending_slot>/<adapter_name>/adapter_*.*
-    nested = pending_slot / adapter_name
-    if nested.exists() and nested.is_dir():
-        for child in list(nested.iterdir()):
-            child.rename(pending_slot / child.name)
-        nested.rmdir()
-
-    # Step 3.5 — Encrypt adapter_model.safetensors in-place (age when key loaded,
-    # plaintext pass-through when no key is configured).
-    _encrypt_adapter_safetensors(pending_slot)
-
-    # Step 4 — Write manifest alongside adapter files (before fsync/rename)
-    if manifest is not None:
-        from paramem.adapters.manifest import write_manifest
-
-        write_manifest(pending_slot, manifest)
-
-    # Step 5 — fsync pending_slot
-    try:
-        fd = os.open(str(pending_slot), os.O_RDONLY)
-        try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-    except OSError:
-        pass
-
-    # Step 6 — Atomic promotion: .pending/<ts> → target_dir/<ts>
-    final_slot = target_dir / ts
-    pending_slot.rename(final_slot)
-    try:
-        fd = os.open(str(target_dir), os.O_RDONLY)
-        try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-    except OSError:
-        pass
-
+    final_slot = write_slot(Path(target_dir), manifest=manifest, write_payload=_write_payload)
     logger.info("Adapter '%s' saved to slot %s", adapter_name, final_slot)
     return final_slot
-
-
-def _make_slot_ts() -> str:
-    """Return a ``YYYYMMDD-HHMMSS`` UTC timestamp string for slot naming."""
-    from datetime import datetime, timezone
-
-    return datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
 
 
 # ---------------------------------------------------------------------------
@@ -1015,8 +958,14 @@ def _encrypt_adapter_safetensors(slot: Path) -> None:
     plaintext, so this call propagates that failure rather than leaving a
     plaintext tensor file behind.
 
-    Called by :func:`atomic_save_adapter` at Step 3.5 — after PEFT flatten
-    (Step 3), before manifest write (Step 4).  The pending slot is not yet
+    Called from inside :func:`atomic_save_adapter`'s ``_write_payload``
+    closure, after the PEFT save-and-flatten steps and before that closure
+    returns control to :func:`~paramem.adapters.slot.write_slot` — the
+    envelope that owns the promotion sequence shared by both venues.
+    ``write_slot`` computes the plaintext payload digest and writes
+    ``meta.json`` only after ``_write_payload`` (this encryption step
+    included) has finished, so the manifest is always stamped from the
+    bytes actually on disk, encrypted or not.  The pending slot is not yet
     promoted so a failure here aborts the entire save without leaving an
     inconsistent slot in the live tree.
 
@@ -1288,9 +1237,8 @@ def measured_adapter_init_state(model: PeftModel, adapter_name: str) -> "str | N
     unchanged — those indicate a genuinely broken caller state, not an
     unmeasurable-but-otherwise-healthy adapter. In production the model is
     always a real ``PeftModel`` with *adapter_name* already created by
-    ``create_adapter`` (the main-tiers branch of
-    ``ConsolidationLoop._run_fold``) or ``create_interim_adapter`` (that
-    method's interim branch) before this is called, so this path is
+    ``create_adapter`` (a full fold's main tiers) or ``create_interim_adapter``
+    (an interim event's own slot) before this is called, so this path is
     expected to always measure successfully; the ``None`` branch exists for
     the introspection boundary, not as a normal outcome.
 
@@ -1309,6 +1257,41 @@ def measured_adapter_init_state(model: PeftModel, adapter_name: str) -> "str | N
     return "cold" if norm < LORA_B_COLD_NORM_THRESHOLD else "warm"
 
 
+def has_prior_trained_weights(model: PeftModel, adapter_name: str) -> bool:
+    """True when *adapter_name* carries weights worth starting a staging slot from.
+
+    The one predicate for "this tier has prior trained weights" — resident
+    in ``model.peft_config`` AND measuring ``"warm"`` via
+    :func:`measured_adapter_init_state`. Absence and a resident-but-cold
+    adapter (freshly created, never trained) both read ``False``: neither
+    has anything a staging slot could usefully warm-start from.
+
+    Named once here and read by both the training funnel's donor
+    resolution (:meth:`~paramem.training.consolidation.ConsolidationLoop.
+    _resolve_donor_checkpoint` — a donor applies only where there are no
+    prior trained weights) and :func:`~paramem.training.trainer.
+    train_adapter`'s own staging-init branch, so the LoRA-B threshold rule
+    is stated exactly once rather than re-derived at each call site.
+
+    Args:
+        model: The live model. Not required to be a ``PeftModel`` instance
+            — presence in ``peft_config`` is the discriminator (mirrors
+            :func:`ensure_adapter_matching`'s own absent/resident check).
+        adapter_name: Adapter/tier name to classify.
+
+    Returns:
+        ``True`` only when *adapter_name* is resident and measures
+        ``"warm"``; ``False`` on absence, a measured ``"cold"`` adapter, or
+        an unmeasurable adapter (:data:`LoraTensorsNotFound` degrades to
+        ``None`` inside :func:`measured_adapter_init_state`, which reads as
+        ``False`` here).
+    """
+    peft_config = getattr(model, "peft_config", None)
+    if peft_config is None or adapter_name not in peft_config:
+        return False
+    return measured_adapter_init_state(model, adapter_name) == "warm"
+
+
 def ensure_adapter_matching(
     model: PeftModel,
     adapter_config: AdapterConfig,
@@ -1317,11 +1300,11 @@ def ensure_adapter_matching(
     """Ensure *adapter_name* exists and matches *adapter_config*'s LoRA topology.
 
     The single config-mismatch guard for the warm-init default: warm init
-    keeps a resident adapter's trained weights across folds, so every
-    warm-init entrance (main-tier fold preamble — called on every resident
-    tier BEFORE ``main_tier_backup_scope`` is entered, see the call site's
-    own comment in ``consolidation.py`` — and interim-slot mint) must call
-    this instead of unconditionally deleting and recreating. Three outcomes:
+    keeps a resident adapter's trained weights across events, so every
+    warm-init entrance (the per-tier build/write driver, called for each
+    tier before ``tier_backup_scope`` is entered — and interim-slot mint)
+    must call this instead of unconditionally deleting and recreating.
+    Three outcomes:
 
     - Absent: cold birth via :func:`create_adapter` — there are no weights
       to preserve, so there is nothing to compare or keep warm.
@@ -1339,7 +1322,7 @@ def ensure_adapter_matching(
       ``RuntimeError`` inside :func:`copy_adapter_weights` /
       ``model.generate()``. Calling this ahead of any weight-touching
       operation on the tier (in particular ahead of
-      ``main_tier_backup_scope``, which snapshots the resident tier via
+      :func:`tier_backup_scope`, which snapshots the resident tier via
       :func:`copy_adapter_weights`) is what makes config comparison
       sufficient to catch it first.
 
@@ -1357,8 +1340,8 @@ def ensure_adapter_matching(
     # Presence in ``peft_config`` is the absent/resident discriminator, not
     # ``isinstance(model, PeftModel)``. In production this is always a real
     # PeftModel by the time either warm-init entrance calls it: the
-    # main-tier fold preamble runs immediately before
-    # ``main_tier_backup_scope``, which itself raises ``RuntimeError`` on a
+    # per-tier build/write driver runs immediately before
+    # ``tier_backup_scope``, which itself raises ``RuntimeError`` on a
     # non-PeftModel (see its own runtime contract check); the interim mint
     # branch reaches this call only after already dereferencing
     # ``self.model.peft_config`` one line above (``adapter_name not in

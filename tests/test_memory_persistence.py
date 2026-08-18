@@ -1,16 +1,21 @@
 """Unit tests for paramem.memory.persistence.
 
 Covers round-trip contract, encryption awareness, iter_entries edge-skipping,
-entry_by_key hit/miss, entity index helpers, build_tier_graph_from_store, and
-reap_tier_artifacts' rename-then-delete crash safety (+ resume_pending_reaps).
+entry_by_key hit/miss, entity index helpers, build_tier_graph_from_store, the
+every-known-key-has-a-row bookkeeping invariant (``_write_tier_key_metadata``),
+the two-phase write/publish binding for the simulate venue, slot pruning, and
+the publish preflight / no-retrain restamp pair (``plan_restamp``,
+``restamp_tier_manifest``, ``assert_publish_preconditions``).
+
+The ``reap_tier_artifacts`` rename-then-delete crash safety suite (+
+``resume_pending_reaps``) and ``erase_keys_and_restamp_manifest``'s own
+suite are covered separately, at the server door
+(``tests/server/test_erase_doors.py``).
 """
 
 from __future__ import annotations
 
-import hashlib
 import json
-import shutil
-from pathlib import Path
 
 import networkx as nx
 import pytest
@@ -26,15 +31,10 @@ from paramem.backup.key_store import (
 from paramem.memory.persistence import (
     _EDGE_SOURCE_ATTR,
     _IK_KEY_ATTR,
-    _PENDING_DELETE_DIR_NAME,
     build_tier_graph_from_store,
     entry_by_key,
-    erase_keys_and_restamp_manifest,
-    erase_keys_from_graph_file,
     iter_entries,
     load_memory_from_disk,
-    reap_tier_artifacts,
-    resume_pending_reaps,
     save_memory_to_disk,
 )
 
@@ -402,12 +402,14 @@ class TestBuildTierGraphFromStore:
         """
         from paramem.memory.store import MemoryStore
 
-        store = MemoryStore(replay_enabled=False)
+        store = MemoryStore()
         store.replace_simhashes_in_tier(tier, simhash)
         for k, q in cache.items():
             store.put(tier, k, q, register=False)
         for k, speaker_id in (bookkeeping or {}).items():
-            store.set_bookkeeping(k, speaker_id=speaker_id, relation_type="factual", first_seen="")
+            store.set_bookkeeping(
+                k, speaker_id=speaker_id, relation_type="factual", first_seen="", promoted=False
+            )
         return store
 
     def test_happy_path_single_key(self):
@@ -488,8 +490,9 @@ class TestBuildTierGraphFromStore:
         entries = list(iter_entries(g))
         assert entries[0]["key"] == "graph10"
 
-    def test_no_bookkeeping_persists_empty_speaker_id(self):
-        """A key with no bookkeeping record falls back to speaker_id=''."""
+    def test_active_key_with_no_bookkeeping_row_raises(self):
+        """An active key with no bookkeeping row is a violation of the
+        every-known-key-has-a-row invariant, not a speaker_id="" fallback."""
         store = self._make_store(
             simhash={"graph1": 0xABCDEF},
             cache={
@@ -502,48 +505,8 @@ class TestBuildTierGraphFromStore:
             },
         )
         assert store.bookkeeping_for_key("graph1") is None
-        g = build_tier_graph_from_store(store, "episodic")
-        entries = list(iter_entries(g))
-        assert entries[0]["speaker_id"] == ""
-
-    def test_memoized_cache_miss_entry_preserves_bookkeeping_speaker_id(self):
-        """Regression lock for the simulate-mode fold-persist bug: a key whose
-        entry is re-materialised as a content-only miss (the shape
-        ``MemoryStore.probe`` memoizes back on a source-served cache miss)
-        must still persist with its real speaker_id, because attribution is
-        read from bookkeeping and never from the entry."""
-        from paramem.memory.entry import entry_simhash
-        from paramem.memory.store import MemoryStore
-
-        store = MemoryStore(replay_enabled=True)
-        store.set_bookkeeping(
-            "graph1", speaker_id="speaker0", relation_type="factual", first_seen=""
-        )
-        ep_reg = store.registry("episodic")
-        ep_reg.add("graph1")
-
-        entry = {
-            "key": "graph1",
-            "subject": "Alice",
-            "predicate": "lives_in",
-            "object": "Berlin",
-        }
-
-        class _StubSource:
-            def probe(self, keys_by_tier):
-                return {"graph1": dict(entry)}
-
-        # Matching fingerprint so the store's confidence gate admits the
-        # source-served result on this cache miss.
-        store.put_simhash("episodic", "graph1", entry_simhash(entry))
-        store.probe({"episodic": ["graph1"]}, source=_StubSource(), memoize=True)
-        # The memoized entry is content-only — no speaker_id on it.
-        assert "speaker_id" not in store.get("graph1")
-
-        g = build_tier_graph_from_store(store, "episodic")
-        entries = list(iter_entries(g))
-        assert len(entries) == 1
-        assert entries[0]["speaker_id"] == "speaker0"
+        with pytest.raises(TypeError):
+            build_tier_graph_from_store(store, "episodic")
 
 
 # ---------------------------------------------------------------------------
@@ -556,115 +519,11 @@ class TestBuildTierGraphKeyError:
         """build_tier_graph_from_store raises KeyError when simhash key absent from store."""
         from paramem.memory.store import MemoryStore
 
-        store = MemoryStore(replay_enabled=False)
+        store = MemoryStore()
         store.put_simhash("episodic", "graph1", 0xABCDEF)
         # "graph1" simhash present but entry absent — must raise.
         with pytest.raises(KeyError):
             build_tier_graph_from_store(store, "episodic")
-
-
-# ---------------------------------------------------------------------------
-# 9b. build_tier_graph_from_store: stale-key projection
-# ---------------------------------------------------------------------------
-
-
-class TestBuildTierGraphStaleProjection:
-    """Stale keys must NOT be projected into graph.json, but their simhash
-    entries are retained on disk.
-
-    The enumeration spine is ``tier_simhashes(include_stale=False)`` so only
-    active keys are projected; replay-disabled stores have no registry and rely
-    on the simhash map populated via ``replace_simhashes_in_tier``.
-    """
-
-    def test_stale_key_excluded_from_graph_no_key_error(self):
-        """A stale key in the simhash dict is skipped — no KeyError, not in graph."""
-        from paramem.memory.store import MemoryStore
-
-        store = MemoryStore(replay_enabled=True)
-        # Register active key with simhash + entry.
-        store.put(
-            "episodic",
-            "graph_active",
-            {
-                "key": "graph_active",
-                "subject": "Alice",
-                "predicate": "lives_in",
-                "object": "Berlin",
-                "speaker_id": "S0",
-            },
-            simhash=0xAAAA1111,
-            register=True,
-        )
-        # Register stale key — simhash present, entry INTENTIONALLY absent.
-        # (Mimics the scenario where the stale key's entry was reaped but the
-        # simhash is retained on the stale record.)
-        store.put_simhash("episodic", "graph_stale", 0xBBBB2222)
-        # Flip to stale via the registry.
-        ep_reg = store.registry("episodic")
-        ep_reg.add("graph_stale")  # must be active to stale
-        ep_reg.stale("graph_stale")
-
-        g = build_tier_graph_from_store(store, "episodic")
-
-        # Active key projects into graph.
-        entries = list(iter_entries(g))
-        assert len(entries) == 1, f"Expected 1 edge (active only); got {entries}"
-        assert entries[0]["key"] == "graph_active"
-
-        # Stale simhash is RETAINED in the known (active∪stale) fingerprint map.
-        assert "graph_stale" in store.tier_simhashes("episodic", include_stale=True), (
-            "Stale key simhash must be retained on the store"
-        )
-
-    def test_active_key_without_entry_still_raises(self):
-        """An active key in the simhash map that has no entry raises KeyError.
-
-        This guards against stale-key filtering silently suppressing data-integrity
-        errors on active keys.
-        """
-        from paramem.memory.store import MemoryStore
-
-        store = MemoryStore(replay_enabled=True)
-        # Active key in simhash but no entry — must raise.
-        store.put_simhash("episodic", "graph_active_no_entry", 0x1234)
-        ep_reg = store.registry("episodic")
-        ep_reg.add("graph_active_no_entry")
-
-        with pytest.raises(KeyError):
-            build_tier_graph_from_store(store, "episodic")
-
-    def test_existing_happy_path_still_works_replay_disabled(self):
-        """Replay-disabled store (the existing happy-path pattern) still projects correctly.
-
-        The stale-key projection filters via the registry's own active/stale
-        distinction (``tier_simhashes(include_stale=False)``) rather than the
-        store's ``replay_enabled`` flag, precisely to keep replay-disabled
-        stores working.  This test mirrors the existing TestBuildTierGraphFromStore
-        setup (MemoryStore(replay_enabled=False), register=False) to confirm that
-        path is unaffected.
-        """
-        from paramem.memory.store import MemoryStore
-
-        store = MemoryStore(replay_enabled=False)
-        store.replace_simhashes_in_tier("episodic", {"graph1": 0xABCDEF})
-        store.put(
-            "episodic",
-            "graph1",
-            {
-                "key": "graph1",
-                "subject": "Bob",
-                "predicate": "has_job",
-                "object": "Engineer",
-                "speaker_id": "S0",
-            },
-            register=False,
-        )
-
-        g = build_tier_graph_from_store(store, "episodic")
-        entries = list(iter_entries(g))
-        assert len(entries) == 1
-        assert entries[0]["key"] == "graph1"
 
 
 # ---------------------------------------------------------------------------
@@ -719,1326 +578,808 @@ class TestEncryptionRoundTrip:
         assert "directed" in parsed
 
 
-# ---------------------------------------------------------------------------
-# 11. erase_keys_from_graph_file: surgical edge removal
-# ---------------------------------------------------------------------------
+class TestWriteTierKeyMetadataRaisesOnMissingRow:
+    """A key present in the tier's registry (active or stale) but with no
+    bookkeeping record is a violation of the every-known-key-has-a-row
+    invariant -- ``_write_tier_key_metadata`` raises rather than skipping
+    the key or fabricating a row, so it never persists a registry whose
+    rows it just dropped."""
 
+    def test_active_key_with_no_row_raises(self, tmp_path):
+        from paramem.memory.persistence import _write_tier_key_metadata
+        from paramem.memory.store import BookkeepingInvariantViolation, MemoryStore
+        from paramem.training.key_registry import KeyRegistry
 
-class TestEraseKeysFromGraphFile:
-    def test_missing_file_returns_zero_no_write(self, tmp_path):
-        """Absent file → 0, and no file is created."""
-        path = tmp_path / "graph.json"
-        result = erase_keys_from_graph_file(path, {"graph1"})
-        assert result == 0
+        store = MemoryStore()
+        store.load_registry("episodic", KeyRegistry())
+        store.registry("episodic").add("graph1")
+        store.registry("episodic").add("graph2")  # never bookkept
+        store.set_bookkeeping(
+            "graph1",
+            speaker_id="speaker0",
+            relation_type="factual",
+            reinforcement_count=1,
+            last_reinforced_cycle=0,
+            last_seen="2026-01-01T00:00:00Z",
+            first_seen="2026-01-01T00:00:00Z",
+            promoted=False,
+        )
+
+        path = tmp_path / "episodic" / "key_metadata.json"
+        with pytest.raises(BookkeepingInvariantViolation):
+            _write_tier_key_metadata(store, "episodic", path, tier_cycle=3)
+
+    def test_every_key_recordless_writes_nothing(self, tmp_path):
+        from paramem.memory.persistence import _write_tier_key_metadata
+        from paramem.memory.store import BookkeepingInvariantViolation, MemoryStore
+        from paramem.training.key_registry import KeyRegistry
+
+        store = MemoryStore()
+        store.load_registry("episodic", KeyRegistry())
+        store.registry("episodic").add("graph1")
+
+        path = tmp_path / "episodic" / "key_metadata.json"
+        with pytest.raises(BookkeepingInvariantViolation):
+            _write_tier_key_metadata(store, "episodic", path, tier_cycle=7)
         assert not path.exists()
 
-    def test_no_matching_edge_returns_zero_file_unchanged(self, tmp_path):
-        """A present file with no edge matching *keys* → 0, bytes unchanged."""
-        g = _make_simple_graph()  # single edge, key="graph1"
-        path = tmp_path / "graph.json"
-        save_memory_to_disk(g, path)
-        before = path.read_bytes()
-
-        result = erase_keys_from_graph_file(path, {"graph_absent"})
-
-        assert result == 0
-        assert path.read_bytes() == before
-
-    def test_removes_matching_edge_keeps_surviving_edge(self, tmp_path):
-        """The named key's edge is removed; a sibling edge's data is unchanged."""
-        g = nx.MultiDiGraph()
-        _add_keyed_edge(
-            g, "Alice", "Berlin", indexed_key="graph1", predicate="lives_in", speaker_id="S0"
-        )
-        _add_keyed_edge(
-            g, "Bob", "Engineer", indexed_key="graph2", predicate="has_job", speaker_id="S1"
-        )
-        path = tmp_path / "graph.json"
-        save_memory_to_disk(g, path)
-
-        removed = erase_keys_from_graph_file(path, {"graph1"})
-
-        assert removed == 1
-        g2 = load_memory_from_disk(path)
-        entries = {e["key"]: e for e in iter_entries(g2)}
-        assert "graph1" not in entries
-        assert "graph2" in entries
-        assert entries["graph2"]["subject"] == "Bob"
-        assert entries["graph2"]["object"] == "Engineer"
-        assert entries["graph2"]["predicate"] == "has_job"
-        assert entries["graph2"]["speaker_id"] == "S1"
-
-    def test_removes_multiple_keys_in_one_pass(self, tmp_path):
-        """All edges whose ik_key is in *keys* are removed in a single write."""
-        g = nx.MultiDiGraph()
-        _add_keyed_edge(
-            g, "Alice", "Berlin", indexed_key="graph1", predicate="lives_in", speaker_id="S0"
-        )
-        _add_keyed_edge(
-            g, "Bob", "Engineer", indexed_key="graph2", predicate="has_job", speaker_id="S1"
-        )
-        _add_keyed_edge(
-            g, "Carl", "Chess", indexed_key="graph3", predicate="likes", speaker_id="S2"
-        )
-        path = tmp_path / "graph.json"
-        save_memory_to_disk(g, path)
-
-        removed = erase_keys_from_graph_file(path, {"graph1", "graph3"})
-
-        assert removed == 2
-        g2 = load_memory_from_disk(path)
-        keys = {e["key"] for e in iter_entries(g2)}
-        assert keys == {"graph2"}
-
-    def test_isolated_node_dropped_after_edge_removal(self, tmp_path):
-        """A node left with degree 0 by the erase is dropped from the graph."""
-        g = _make_simple_graph(subject="Alice", object_="Berlin")  # only edge: Alice->Berlin
-        path = tmp_path / "graph.json"
-        save_memory_to_disk(g, path)
-
-        removed = erase_keys_from_graph_file(path, {"graph1"})
-
-        assert removed == 1
-        g2 = load_memory_from_disk(path)
-        assert g2.number_of_nodes() == 0
-        assert "Alice" not in g2
-        assert "Berlin" not in g2
-
-    def test_node_still_in_use_by_surviving_edge_is_kept(self, tmp_path):
-        """A node shared by an erased edge and a surviving edge is not dropped."""
-        g = nx.MultiDiGraph()
-        _add_keyed_edge(
-            g, "Alice", "Berlin", indexed_key="graph1", predicate="lives_in", speaker_id="S0"
-        )
-        _add_keyed_edge(
-            g, "Alice", "Engineer", indexed_key="graph2", predicate="has_job", speaker_id="S0"
-        )
-        path = tmp_path / "graph.json"
-        save_memory_to_disk(g, path)
-
-        removed = erase_keys_from_graph_file(path, {"graph1"})
-
-        assert removed == 1
-        g2 = load_memory_from_disk(path)
-        assert "Alice" in g2
-        assert "Berlin" not in g2
-        entries = list(iter_entries(g2))
-        assert len(entries) == 1
-        assert entries[0]["key"] == "graph2"
-
-    def test_write_stays_atomic_and_envelope_aware(self, tmp_path, monkeypatch):
-        """The write goes through save_memory_to_disk: an age-wrapped file
-        stays age-wrapped after erase, and the survivor decrypts correctly."""
-        _setup_daily(tmp_path, monkeypatch)
-        g = nx.MultiDiGraph()
-        _add_keyed_edge(
-            g, "Alice", "Berlin", indexed_key="graph1", predicate="lives_in", speaker_id="S0"
-        )
-        _add_keyed_edge(
-            g, "Bob", "Engineer", indexed_key="graph2", predicate="has_job", speaker_id="S1"
-        )
-        path = tmp_path / "graph.json"
-        save_memory_to_disk(g, path)
-
-        removed = erase_keys_from_graph_file(path, {"graph1"})
-
-        assert removed == 1
-        raw = path.read_bytes()
-        assert raw.startswith(AGE_MAGIC), "erase write must stay age-wrapped"
-        g2 = load_memory_from_disk(path)
-        keys = {e["key"] for e in iter_entries(g2)}
-        assert keys == {"graph2"}
-
-    def test_returns_int_count(self, tmp_path):
-        """The return value is an int, not a bool or other truthy type."""
-        g = _make_simple_graph()
-        path = tmp_path / "graph.json"
-        save_memory_to_disk(g, path)
-        result = erase_keys_from_graph_file(path, {"graph1"})
-        assert type(result) is int
-
 
 # ---------------------------------------------------------------------------
-# reap_tier_artifacts — shape derived from tier_root, never a caller flag
+# write_tier_slot / publish_tier_registry — the two-phase simulate-venue write
 # ---------------------------------------------------------------------------
 
 
-class TestReapTierArtifacts:
-    def test_main_tier_root_keeps_interim_children(self, tmp_path):
-        """A main tier root (e.g. ``episodic/``) keeps its ``interim_*``
-        children — those are separate tiers, not this tier's own artifacts."""
+def _build_simulate_increment(*, key: str, pre_sha: str = ""):
+    """One minimal ``TierIncrement`` carrying a single-key simulate payload,
+    plus the ``TierWriteContext`` a simulate-mode write/publish call needs.
+
+    Neither ``write_tier_slot`` nor ``publish_tier_registry`` touches
+    ``ctx.model``/``ctx.tokenizer``/``ctx.store``/``ctx.tier_configs`` on the
+    simulate path, so those stay ``None``/empty here.
+    """
+    import json as _json
+
+    from paramem.memory.increment import TierIncrement
+    from paramem.training.key_registry import KeyRegistry
+
+    registry = KeyRegistry()
+    registry.add(key)
+    registry.set_simhash(key, 12345)
+    registry_bytes = registry.save_bytes()
+    rows_bytes = _json.dumps({"tier_cycle": 0, "keys": {}}).encode("utf-8")
+
+    increment = TierIncrement(
+        tier="episodic",
+        adapter_name="episodic",
+        registry=registry,
+        registry_bytes=registry_bytes,
+        rows_bytes=rows_bytes,
+        entries={},
+        bookkeeping={},
+        keyed=[
+            {
+                "key": key,
+                "subject": "alice",
+                "predicate": "lives_in",
+                "object": "berlin",
+                "speaker_id": "speaker0",
+            }
+        ],
+        rebuilt=True,
+        pre_sha=pre_sha,
+    )
+    return increment
+
+
+def _write_context(output_dir, *, keep_prior_slots: int = 1):
+    from paramem.memory.increment import TierWriteContext
+
+    return TierWriteContext(
+        model=None,
+        tokenizer=None,
+        fingerprint_cache={},
+        output_dir=output_dir,
+        tier_configs={},
+        store=None,
+        keep_prior_slots=keep_prior_slots,
+    )
+
+
+class TestSimulateWriteTwoPhaseBinding:
+    """The simulate venue writes through the same two-phase primitive pair as
+    train: ``write_tier_slot`` writes the payload into a fresh slot but binds
+    NOTHING the live store reads until ``publish_tier_registry`` lands the
+    registry bytes that slot's manifest was stamped with."""
+
+    def test_simulate_write_binds_when_its_registry_bytes_land(self, tmp_path):
+        import hashlib
+
+        from paramem.adapters.manifest import find_live_slot, tier_registry_sha256
+        from paramem.memory.persistence import publish_tier_registry, write_tier_slot
+
+        increment = _build_simulate_increment(key="graph1")
+        ctx = _write_context(tmp_path)
         tier_root = tmp_path / "episodic"
-        slot = tier_root / "20260417-120000"
-        slot.mkdir(parents=True)
-        (slot / "adapter_model.safetensors").write_bytes(b"")
-        interim = tier_root / "interim_20260417T0000"
-        interim.mkdir()
-        (interim / "adapter_model.safetensors").write_bytes(b"")
+        expected_hash = hashlib.sha256(increment.registry_bytes).hexdigest()
 
-        removed = reap_tier_artifacts(tier_root)
+        written_slot = write_tier_slot(
+            ctx=ctx, increment=increment, stamp="20260101T0000", mode="simulate"
+        )
 
-        assert not slot.exists()
-        assert interim.exists()
-        assert tier_root.exists(), "root must survive — an interim child remains"
-        assert slot in removed
-        assert interim not in removed
+        # Written but not yet published: the slot exists with its graph
+        # payload (its own manifest is already stamped with the digest of
+        # the registry bytes ABOUT to land -- that is what "write" means),
+        # but no registry has landed at the tier root yet, so resolving the
+        # LIVE binding (by the tier's actual on-disk registry hash, the way
+        # DiskMemorySource and boot binding verification both do) finds
+        # nothing to bind to.
+        assert (written_slot / "graph.json").exists()
+        assert tier_registry_sha256(tier_root) == ""
+        assert find_live_slot(tier_root, tier_registry_sha256(tier_root)) is None
 
-    def test_semantic_root_removes_interim_scratch_children(self, tmp_path):
-        """Only ``episodic/`` spares ``interim_*`` children — under
-        ``semantic``/``procedural`` an ``interim_<stamp>/`` dir is HF Trainer
-        scratch (``ConsolidationLoop._training_output_dir`` builds one for
-        any adapter's interim training scope), not a separate tier, so it
-        must be removed like any other child and the root must fully empty
-        (including rmdir'ing the root itself)."""
-        tier_root = tmp_path / "semantic"
-        slot = tier_root / "20260417-120000"
-        slot.mkdir(parents=True)
-        (slot / "adapter_model.safetensors").write_bytes(b"")
-        scratch = tier_root / "interim_20260417T0000"
-        scratch.mkdir()
-        (scratch / "checkpoint-10").mkdir()
+        publish_tier_registry(increment=increment, ctx=ctx, written_slot=written_slot)
 
-        removed = reap_tier_artifacts(tier_root)
+        # The registry bytes have landed -- the slot is now bound, resolved
+        # live off the tier's own on-disk registry hash.
+        assert tier_registry_sha256(tier_root) == expected_hash
+        assert find_live_slot(tier_root, tier_registry_sha256(tier_root)) == written_slot
 
-        assert not tier_root.exists(), "root must be fully removed, not left with scratch"
-        assert not scratch.exists()
-        assert tier_root in removed
-        assert scratch in removed
 
-    def test_main_tier_root_rmdir_when_emptied(self, tmp_path):
-        """A main tier root with no ``interim_*`` children is removed itself
-        once its other children are gone."""
-        tier_root = tmp_path / "semantic"
-        slot = tier_root / "20260417-120000"
-        slot.mkdir(parents=True)
-        (slot / "adapter_model.safetensors").write_bytes(b"")
+class TestPayloadDriftIsTheBootTimeBindingsQuestion:
+    """``_written_member_refusal`` deliberately does not re-hash the payload
+    (persistence.py: "Payload-content drift is the boot-time binding
+    verification's question, not this preflight's.") -- so a payload byte
+    flipped after ``write_tier_slot`` but before ``publish_tier_registry``
+    sails through the preflight and the registry lands anyway. A fresh
+    ``verify_tier_binding`` boot read is what catches the drift."""
 
-        removed = reap_tier_artifacts(tier_root)
+    def test_payload_flipped_after_write_passes_preflight_but_fails_boot_binding(self, tmp_path):
+        import hashlib
 
-        assert not tier_root.exists()
-        assert tier_root in removed
-        assert slot in removed
+        from paramem.adapters.manifest import tier_registry_sha256
+        from paramem.adapters.registry_binding import PAYLOAD_MISMATCH, verify_tier_binding
+        from paramem.memory.persistence import (
+            assert_publish_preconditions,
+            publish_tier_registry,
+            write_tier_slot,
+        )
 
-    def test_interim_slot_root_removed_whole(self, tmp_path):
-        """An interim slot root (name starts with ``interim_``) is removed
-        in its entirety, including nested content."""
-        episodic_root = tmp_path / "episodic"
-        interim_root = episodic_root / "interim_20260417T0000"
-        nested_slot = interim_root / "20260417-120000"
-        nested_slot.mkdir(parents=True)
-        (nested_slot / "adapter_model.safetensors").write_bytes(b"")
-
-        removed = reap_tier_artifacts(interim_root)
-
-        assert not interim_root.exists()
-        assert interim_root in removed
-        assert nested_slot in removed
-
-    def test_absent_root_returns_empty_list(self, tmp_path):
-        """A tier_root that does not exist on disk returns []."""
-        missing = tmp_path / "episodic"
-        assert reap_tier_artifacts(missing) == []
-
-    def test_idempotent_second_call(self, tmp_path):
-        """Calling reap_tier_artifacts a second time on an already-reaped
-        root is a safe no-op returning []."""
-        tier_root = tmp_path / "procedural"
-        slot = tier_root / "20260417-120000"
-        slot.mkdir(parents=True)
-
-        first = reap_tier_artifacts(tier_root)
-        second = reap_tier_artifacts(tier_root)
-
-        assert first != []
-        assert second == []
-        assert not tier_root.exists()
-
-    def test_removed_paths_are_deepest_first(self, tmp_path):
-        """Returned paths order files/subdirs ahead of their parent so a
-        caller replaying the list top-to-bottom never orphans anything."""
+        increment = _build_simulate_increment(key="graph1")
+        ctx = _write_context(tmp_path)
         tier_root = tmp_path / "episodic"
-        slot = tier_root / "20260417-120000"
-        slot.mkdir(parents=True)
-        (slot / "adapter_model.safetensors").write_bytes(b"")
+        expected_hash = hashlib.sha256(increment.registry_bytes).hexdigest()
 
-        removed = reap_tier_artifacts(tier_root)
+        written_slot = write_tier_slot(
+            ctx=ctx, increment=increment, stamp="20260101T0000", mode="simulate"
+        )
 
-        depths = [len(p.parts) for p in removed]
-        assert depths == sorted(depths, reverse=True)
+        # Flip one byte in the written payload -- after write_tier_slot
+        # already stamped the manifest with the digest of the bytes it had
+        # just written, so the on-disk payload now disagrees with its own
+        # manifest.
+        payload_path = written_slot / "graph.json"
+        original = payload_path.read_bytes()
+        tampered = bytearray(original)
+        tampered[0] ^= 0xFF
+        payload_path.write_bytes(bytes(tampered))
 
-    def test_no_pending_delete_leftover_on_success(self, tmp_path):
-        """A fully successful reap (no crash) leaves no ``.pending-delete``
-        directory at all — every tombstone entry is removed immediately
-        after its own rename, and the now-empty tombstone dir is cleaned up
-        too."""
-        tier_root = tmp_path / "procedural"
-        slot = tier_root / "20260417-120000"
-        slot.mkdir(parents=True)
-        (slot / "adapter_model.safetensors").write_bytes(b"")
+        # The preflight performs no payload re-hash -- it passes cleanly,
+        # and the publish that follows completes: the registry bytes land.
+        assert_publish_preconditions(
+            bundle=[increment], ctx=ctx, written_slots={"episodic": written_slot}
+        )
+        publish_tier_registry(increment=increment, ctx=ctx, written_slot=written_slot)
 
-        reap_tier_artifacts(tier_root)
+        assert tier_registry_sha256(tier_root) == expected_hash
 
-        assert not (tmp_path / _PENDING_DELETE_DIR_NAME).exists()
+        # A fresh boot-time binding read re-hashes the payload from disk and
+        # refuses it.
+        binding = verify_tier_binding("episodic", tier_root)
+
+        assert binding.status == PAYLOAD_MISMATCH
+        assert binding.publishable is False
+
+
+class TestSimulateSlotPruning:
+    """Simulate slots accumulate under the tier root exactly like train
+    slots and are pruned the same way -- ``prune_old_slots`` is venue-blind."""
+
+    def test_prior_simulate_slots_are_pruned_after_publish(self, tmp_path):
+        from paramem.adapters.manifest import find_live_slot, tier_registry_sha256
+        from paramem.memory.persistence import (
+            prune_old_slots,
+            publish_tier_registry,
+            write_tier_slot,
+        )
+
+        ctx = _write_context(tmp_path, keep_prior_slots=0)
+        tier_root = tmp_path / "episodic"
+
+        def _write_and_publish(key: str):
+            increment = _build_simulate_increment(key=key, pre_sha=tier_registry_sha256(tier_root))
+            slot = write_tier_slot(
+                ctx=ctx, increment=increment, stamp="20260101T0000", mode="simulate"
+            )
+            publish_tier_registry(increment=increment, ctx=ctx, written_slot=slot)
+            return slot
+
+        first_slot = _write_and_publish("graph1")
+        assert first_slot.exists()
+
+        second_slot = _write_and_publish("graph2")
+        assert second_slot != first_slot, "each write writes a fresh timestamped slot"
+        # Both slots still exist immediately after publish -- pruning is a
+        # separate act the go-live sequencer runs after the mount, not part
+        # of publish_tier_registry itself.
+        assert first_slot.exists()
+
+        prune_old_slots(tier_root, second_slot, keep=0)
+
+        assert not first_slot.exists(), "the prior simulate slot must be pruned like a train one"
+        assert second_slot.exists()
+        assert find_live_slot(tier_root, tier_registry_sha256(tier_root)) == second_slot
 
 
 # ---------------------------------------------------------------------------
-# reap_tier_artifacts — rename-then-delete crash safety (tombstone)
+# plan_restamp / restamp_tier_manifest / assert_publish_preconditions -- the
+# one planner, the no-retrain writer that composes it, and the publish
+# preflight that composes the SAME planner a second, independent time
 # ---------------------------------------------------------------------------
 
 
-class TestReapTierArtifactsTombstone:
-    """A condemned root is renamed into ``.pending-delete/<name>`` before
-    being deleted there. A crash between the rename and the delete leaves
-    the corpse stranded under the tombstone dir — already out of the live
-    namespace — rather than half-deleted in its original location."""
+def _build_named_simulate_increment(*, tier: str, key: str, pre_sha: str = ""):
+    """Tier-parametrized counterpart of :func:`_build_simulate_increment` --
+    same single-key simulate-payload shape, for a bundle that names more
+    than one tier."""
+    import json as _json
 
-    def test_crash_after_rename_leaves_interim_slot_out_of_live_namespace(
+    from paramem.memory.increment import TierIncrement
+    from paramem.training.key_registry import KeyRegistry
+
+    registry = KeyRegistry()
+    registry.add(key)
+    registry.set_simhash(key, 12345)
+    registry_bytes = registry.save_bytes()
+    rows_bytes = _json.dumps({"tier_cycle": 0, "keys": {}}).encode("utf-8")
+
+    return TierIncrement(
+        tier=tier,
+        adapter_name=tier,
+        registry=registry,
+        registry_bytes=registry_bytes,
+        rows_bytes=rows_bytes,
+        entries={},
+        bookkeeping={},
+        keyed=[
+            {
+                "key": key,
+                "subject": "alice",
+                "predicate": "lives_in",
+                "object": "berlin",
+                "speaker_id": "speaker0",
+            }
+        ],
+        rebuilt=True,
+        pre_sha=pre_sha,
+    )
+
+
+def _build_rows_only_increment(*, tier: str, registry, pre_sha: str = ""):
+    """A rows-only member (``rebuilt=False``, empty ``keyed``) for *tier* --
+    the shape :func:`~paramem.memory.persistence.assert_publish_preconditions`
+    routes through :func:`~paramem.memory.persistence.plan_restamp` rather
+    than :func:`~paramem.memory.persistence._written_member_refusal`."""
+    import json as _json
+
+    from paramem.memory.increment import TierIncrement
+
+    registry_bytes = registry.save_bytes()
+    rows_bytes = _json.dumps({"tier_cycle": 0, "keys": {}}).encode("utf-8")
+
+    return TierIncrement(
+        tier=tier,
+        adapter_name=tier,
+        registry=registry,
+        registry_bytes=registry_bytes,
+        rows_bytes=rows_bytes,
+        entries={},
+        bookkeeping={},
+        keyed=[],
+        rebuilt=False,
+        pre_sha=pre_sha,
+    )
+
+
+def _tree_snapshot(root) -> dict:
+    """Whole-tree proof snapshot: relative path -> content digest, for every
+    file under *root*. An absent *root* snapshots as ``{}`` -- the zero-bytes
+    proof a refusal must not even create the tier directory."""
+    import hashlib
+
+    if not root.exists():
+        return {}
+    return {
+        str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
+        for p in sorted(root.rglob("*"))
+        if p.is_file()
+    }
+
+
+class TestPublishPreconditionsRefusalIsZeroBytes:
+    """``assert_publish_preconditions`` performs pure reads only (``Path.exists``,
+    ``Path.is_dir``, ``read_manifest``, ``count_slot_candidates``,
+    ``find_live_slot``, in-memory ``sha256``) -- a refusal for any reason
+    leaves the whole on-disk tree byte-for-byte unchanged: no ``mkdir``, no
+    open-for-write, no rename."""
+
+    def test_keys_without_slot_writes_zero_bytes(self, tmp_path):
+        from paramem.memory.persistence import (
+            KEYS_WITHOUT_SLOT,
+            TierWriteRefused,
+            assert_publish_preconditions,
+        )
+        from paramem.training.key_registry import KeyRegistry
+
+        scenario = tmp_path / "keys_without_slot"
+        scenario.mkdir()
+        registry = KeyRegistry()
+        registry.add("graph1")
+        increment = _build_rows_only_increment(tier="episodic", registry=registry)
+        ctx = _write_context(scenario)
+
+        before = _tree_snapshot(scenario)
+        with pytest.raises(TierWriteRefused) as excinfo:
+            assert_publish_preconditions(bundle=[increment], ctx=ctx, written_slots={})
+
+        assert excinfo.value.refusals == {"episodic": KEYS_WITHOUT_SLOT}
+        assert _tree_snapshot(scenario) == before
+
+    def test_no_pre_write_hash_writes_zero_bytes(self, tmp_path):
+        from paramem.adapters.manifest import tier_registry_sha256
+        from paramem.memory.persistence import (
+            NO_PRE_WRITE_HASH,
+            TierWriteRefused,
+            assert_publish_preconditions,
+            publish_tier_registry,
+            write_tier_slot,
+        )
+        from paramem.training.key_registry import KeyRegistry
+
+        scenario = tmp_path / "no_pre_write_hash"
+        scenario.mkdir()
+        ctx = _write_context(scenario)
+        tier_root = scenario / "episodic"
+
+        # A prior, already-bound slot -- so count_slot_candidates > 0.
+        seed = _build_named_simulate_increment(tier="episodic", key="seed")
+        seed_slot = write_tier_slot(ctx=ctx, increment=seed, stamp="20260101T0000", mode="simulate")
+        publish_tier_registry(increment=seed, ctx=ctx, written_slot=seed_slot)
+        assert tier_registry_sha256(tier_root) != ""
+
+        registry = KeyRegistry()
+        registry.add("graph_new")
+        increment = _build_rows_only_increment(tier="episodic", registry=registry, pre_sha="")
+
+        before = _tree_snapshot(scenario)
+        with pytest.raises(TierWriteRefused) as excinfo:
+            assert_publish_preconditions(bundle=[increment], ctx=ctx, written_slots={})
+
+        assert excinfo.value.refusals == {"episodic": NO_PRE_WRITE_HASH}
+        assert _tree_snapshot(scenario) == before
+
+    def test_slot_orphaned_writes_zero_bytes(self, tmp_path):
+        from paramem.memory.persistence import (
+            SLOT_ORPHANED,
+            TierWriteRefused,
+            assert_publish_preconditions,
+            publish_tier_registry,
+            write_tier_slot,
+        )
+        from paramem.training.key_registry import KeyRegistry
+
+        scenario = tmp_path / "slot_orphaned"
+        scenario.mkdir()
+        ctx = _write_context(scenario)
+
+        seed = _build_named_simulate_increment(tier="episodic", key="seed")
+        seed_slot = write_tier_slot(ctx=ctx, increment=seed, stamp="20260101T0000", mode="simulate")
+        publish_tier_registry(increment=seed, ctx=ctx, written_slot=seed_slot)
+
+        registry = KeyRegistry()
+        registry.add("graph_orphan")
+        # A pre_sha that matches neither the seeded slot's bound digest nor
+        # the digest of THIS payload -- no candidate can be adopted.
+        increment = _build_rows_only_increment(tier="episodic", registry=registry, pre_sha="f" * 64)
+
+        before = _tree_snapshot(scenario)
+        with pytest.raises(TierWriteRefused) as excinfo:
+            assert_publish_preconditions(bundle=[increment], ctx=ctx, written_slots={})
+
+        assert excinfo.value.refusals == {"episodic": SLOT_ORPHANED}
+        assert _tree_snapshot(scenario) == before
+
+    def test_written_manifest_digest_mismatch_writes_zero_bytes(self, tmp_path):
+        from paramem.memory.persistence import (
+            _WRITTEN_REGISTRY_HASH_MISMATCH,
+            TierWriteRefused,
+            assert_publish_preconditions,
+            write_tier_slot,
+        )
+
+        scenario = tmp_path / "written_hash_mismatch"
+        scenario.mkdir()
+        ctx = _write_context(scenario)
+
+        written_with = _build_named_simulate_increment(tier="episodic", key="graph_a")
+        slot = write_tier_slot(
+            ctx=ctx, increment=written_with, stamp="20260101T0000", mode="simulate"
+        )
+
+        # About to be published bearing DIFFERENT registry bytes than what
+        # the slot's manifest was stamped with -- landing them would orphan
+        # the slot the instant they land.
+        about_to_publish = _build_named_simulate_increment(tier="episodic", key="graph_b")
+
+        before = _tree_snapshot(scenario)
+        with pytest.raises(TierWriteRefused) as excinfo:
+            assert_publish_preconditions(
+                bundle=[about_to_publish], ctx=ctx, written_slots={"episodic": slot}
+            )
+
+        assert excinfo.value.refusals == {"episodic": _WRITTEN_REGISTRY_HASH_MISMATCH}
+        assert _tree_snapshot(scenario) == before
+
+    def test_written_missing_payload_file_writes_zero_bytes(self, tmp_path):
+        from paramem.memory.persistence import (
+            _WRITTEN_SLOT_INCOMPLETE,
+            TierWriteRefused,
+            assert_publish_preconditions,
+            write_tier_slot,
+        )
+
+        scenario = tmp_path / "written_missing_payload"
+        scenario.mkdir()
+        ctx = _write_context(scenario)
+
+        increment = _build_named_simulate_increment(tier="episodic", key="graph_a")
+        slot = write_tier_slot(ctx=ctx, increment=increment, stamp="20260101T0000", mode="simulate")
+        (slot / "graph.json").unlink()
+
+        before = _tree_snapshot(scenario)
+        with pytest.raises(TierWriteRefused) as excinfo:
+            assert_publish_preconditions(
+                bundle=[increment], ctx=ctx, written_slots={"episodic": slot}
+            )
+
+        assert excinfo.value.refusals == {"episodic": _WRITTEN_SLOT_INCOMPLETE}
+        assert _tree_snapshot(scenario) == before
+
+    def test_written_slot_directory_removed_writes_zero_bytes(self, tmp_path):
+        import shutil
+
+        from paramem.memory.persistence import (
+            _WRITTEN_SLOT_MISSING,
+            TierWriteRefused,
+            assert_publish_preconditions,
+            write_tier_slot,
+        )
+
+        scenario = tmp_path / "written_slot_missing"
+        scenario.mkdir()
+        ctx = _write_context(scenario)
+
+        increment = _build_named_simulate_increment(tier="episodic", key="graph_a")
+        slot = write_tier_slot(ctx=ctx, increment=increment, stamp="20260101T0000", mode="simulate")
+        shutil.rmtree(slot)
+
+        before = _tree_snapshot(scenario)
+        with pytest.raises(TierWriteRefused) as excinfo:
+            assert_publish_preconditions(
+                bundle=[increment], ctx=ctx, written_slots={"episodic": slot}
+            )
+
+        assert excinfo.value.refusals == {"episodic": _WRITTEN_SLOT_MISSING}
+        assert _tree_snapshot(scenario) == before
+
+    def test_written_manifest_unreadable_writes_zero_bytes(self, tmp_path):
+        from paramem.memory.persistence import (
+            _WRITTEN_MANIFEST_UNREADABLE,
+            TierWriteRefused,
+            assert_publish_preconditions,
+            write_tier_slot,
+        )
+
+        scenario = tmp_path / "written_manifest_unreadable"
+        scenario.mkdir()
+        ctx = _write_context(scenario)
+
+        increment = _build_named_simulate_increment(tier="episodic", key="graph_a")
+        slot = write_tier_slot(ctx=ctx, increment=increment, stamp="20260101T0000", mode="simulate")
+        (slot / "meta.json").write_bytes(b"\xff\xfe\x00garbage\x80")
+
+        before = _tree_snapshot(scenario)
+        with pytest.raises(TierWriteRefused) as excinfo:
+            assert_publish_preconditions(
+                bundle=[increment], ctx=ctx, written_slots={"episodic": slot}
+            )
+
+        assert excinfo.value.refusals == {"episodic": _WRITTEN_MANIFEST_UNREADABLE}
+        assert _tree_snapshot(scenario) == before
+
+
+class TestPublishRefusalNamesEveryFailingTier:
+    def test_a_publish_refusal_names_every_failing_tier(self, tmp_path):
+        from paramem.memory.persistence import (
+            _WRITTEN_SLOT_INCOMPLETE,
+            KEYS_WITHOUT_SLOT,
+            TierWriteRefused,
+            assert_publish_preconditions,
+            write_tier_slot,
+        )
+        from paramem.training.key_registry import KeyRegistry
+
+        ctx = _write_context(tmp_path)
+
+        # episodic: rows-only, no slot anywhere, active keys present.
+        episodic_registry = KeyRegistry()
+        episodic_registry.add("graph_ep")
+        episodic_increment = _build_rows_only_increment(tier="episodic", registry=episodic_registry)
+
+        # semantic: written, but its payload file is missing.
+        semantic_increment = _build_named_simulate_increment(tier="semantic", key="graph_sem")
+        semantic_slot = write_tier_slot(
+            ctx=ctx, increment=semantic_increment, stamp="20260101T0000", mode="simulate"
+        )
+        (semantic_slot / "graph.json").unlink()
+
+        with pytest.raises(TierWriteRefused) as excinfo:
+            assert_publish_preconditions(
+                bundle=[episodic_increment, semantic_increment],
+                ctx=ctx,
+                written_slots={"semantic": semantic_slot},
+            )
+
+        # The whole bundle's precondition loop completes before raising --
+        # BOTH failing members are named, not just the first one found.
+        assert excinfo.value.refusals == {
+            "episodic": KEYS_WITHOUT_SLOT,
+            "semantic": _WRITTEN_SLOT_INCOMPLETE,
+        }
+
+
+class TestEmptyTierPublishesWithoutRestamp:
+    def test_an_empty_tier_with_no_slot_publishes_without_a_restamp(self, tmp_path):
+        from paramem.memory.persistence import (
+            NOTHING_TO_BIND,
+            assert_publish_preconditions,
+            plan_restamp,
+            restamp_tier_manifest,
+        )
+        from paramem.training.key_registry import KeyRegistry
+
+        tier_root = tmp_path / "episodic"
+        registry = KeyRegistry()  # no active keys
+        payload = registry.save_bytes()
+
+        plan = plan_restamp(tier_root, registry=registry, payload=payload, pre_sha="")
+        assert plan.status == NOTHING_TO_BIND
+        assert plan.slot is None
+        assert not tier_root.exists(), "plan_restamp is a pure read -- no mkdir"
+
+        increment = _build_rows_only_increment(tier="episodic", registry=registry, pre_sha="")
+        ctx = _write_context(tmp_path)
+        assert_publish_preconditions(
+            bundle=[increment], ctx=ctx, written_slots={}
+        )  # does not raise
+
+        result = restamp_tier_manifest(tier_root, registry=registry, payload=payload, pre_sha="")
+
+        assert result.status == NOTHING_TO_BIND
+        assert result.slot is None
+        assert (tier_root / "indexed_key_registry.json").exists()
+        # The write is complete on its own -- no slot is created or bound.
+        non_registry = [p for p in tier_root.iterdir() if p.name != "indexed_key_registry.json"]
+        assert not any(p.is_dir() for p in non_registry)
+
+
+class TestRestampKeepsPayloadDigest:
+    def test_a_restamp_keeps_the_payload_digest_it_did_not_rewrite(self, tmp_path):
+        import hashlib
+
+        from paramem.adapters.manifest import read_manifest, tier_registry_sha256
+        from paramem.memory.persistence import (
+            RESTAMPED,
+            publish_tier_registry,
+            restamp_tier_manifest,
+            write_tier_slot,
+        )
+        from paramem.training.key_registry import KeyRegistry
+
+        ctx = _write_context(tmp_path)
+        tier_root = tmp_path / "episodic"
+
+        increment = _build_simulate_increment(key="graph1")
+        slot = write_tier_slot(ctx=ctx, increment=increment, stamp="20260101T0000", mode="simulate")
+        publish_tier_registry(increment=increment, ctx=ctx, written_slot=slot)
+
+        payload_before = (slot / "graph.json").read_bytes()
+        payload_digest_before = read_manifest(slot).payload.sha256
+        assert payload_digest_before == hashlib.sha256(payload_before).hexdigest()
+
+        pre_sha = tier_registry_sha256(tier_root)
+        new_registry = KeyRegistry()
+        new_registry.add("graph1")
+        new_registry.stale("graph1")  # content-only mutation -- the payload never changed
+        new_payload = new_registry.save_bytes()
+
+        result = restamp_tier_manifest(
+            tier_root, registry=new_registry, payload=new_payload, pre_sha=pre_sha
+        )
+
+        assert result.status == RESTAMPED
+        assert result.slot == slot
+
+        manifest_after = read_manifest(slot)
+        assert manifest_after.registry_sha256 == hashlib.sha256(new_payload).hexdigest()
+        assert manifest_after.key_count == len(new_registry) == 0
+        # The payload digest -- and the payload bytes themselves -- are
+        # UNTOUCHED: a rows-only restamp never rewrites the payload.
+        assert manifest_after.payload.sha256 == payload_digest_before
+        assert (slot / "graph.json").read_bytes() == payload_before
+
+
+class TestCrashBetweenRegistryAndManifestWriteResume:
+    def test_crash_between_registry_and_manifest_write_is_completed_by_resume(self, tmp_path):
+        import hashlib
+
+        from paramem.adapters.manifest import find_live_slot, tier_registry_sha256
+        from paramem.memory.persistence import (
+            RESTAMPED,
+            publish_tier_registry,
+            restamp_tier_manifest,
+            write_tier_slot,
+        )
+        from paramem.training.key_registry import KeyRegistry
+
+        ctx = _write_context(tmp_path)
+        tier_root = tmp_path / "episodic"
+
+        increment = _build_simulate_increment(key="graph1")
+        slot = write_tier_slot(ctx=ctx, increment=increment, stamp="20260101T0000", mode="simulate")
+        publish_tier_registry(increment=increment, ctx=ctx, written_slot=slot)
+
+        pre_sha = tier_registry_sha256(tier_root)  # == sha256(increment.registry_bytes)
+
+        new_registry = KeyRegistry()
+        new_registry.add("graph1")
+        new_registry.stale("graph1")
+        new_payload = new_registry.save_bytes()
+
+        # Simulate the crash window: the registry write landed, but the
+        # manifest re-stamp that same call would have performed never ran --
+        # write the bytes directly, bypassing restamp_tier_manifest entirely.
+        new_registry.save_from_bytes(new_payload, tier_root / "indexed_key_registry.json")
+
+        # Mid-crash: the on-disk registry's digest has moved on, but the
+        # bound slot's manifest still carries the OLD digest -- the tier
+        # resolves to unbound (visible, not silently wrong).
+        assert tier_registry_sha256(tier_root) == hashlib.sha256(new_payload).hexdigest()
+        assert find_live_slot(tier_root, tier_registry_sha256(tier_root)) is None
+
+        # Resume: re-issue the same restamp with the caller's own pre-write
+        # hash and payload -- the pure-read plan resolves the slot through
+        # the still-old manifest digest (pre_sha) and completes it.
+        result = restamp_tier_manifest(
+            tier_root, registry=new_registry, payload=new_payload, pre_sha=pre_sha
+        )
+
+        assert result.status == RESTAMPED
+        assert result.slot == slot
+        assert find_live_slot(tier_root, tier_registry_sha256(tier_root)) == slot
+
+
+class TestRestampTierManifestFailureClassification:
+    """Failure classification lives INSIDE ``restamp_tier_manifest`` -- the
+    only place that knows which phase (the registry write, or the manifest
+    rebind that follows it) raised. A registry-write failure means nothing
+    landed and must keep propagating; a rebind-phase failure means the
+    registry write already landed and is reported as ``REBIND_FAILED``
+    instead of raised."""
+
+    def test_a_registry_write_failure_propagates_and_nothing_landed(self, tmp_path, monkeypatch):
+        import paramem.backup.encryption as encryption_module
+        from paramem.memory.persistence import restamp_tier_manifest
+        from paramem.training.key_registry import KeyRegistry
+
+        tier_root = tmp_path / "episodic"
+        tier_root.mkdir(parents=True)
+        registry_path = tier_root / "indexed_key_registry.json"
+
+        # Seed an existing on-disk registry with DIFFERENT bytes than what
+        # this call will try to write -- proves a failed write leaves the
+        # file untouched, not merely absent.
+        before_registry = KeyRegistry()
+        before_registry.add("graph_before")
+        before_registry.save_from_bytes(before_registry.save_bytes(), registry_path)
+        before_bytes = registry_path.read_bytes()
+
+        registry = KeyRegistry()
+        registry.add("graph1")
+        payload = registry.save_bytes()
+
+        def _boom(path, plaintext):
+            raise OSError("simulated disk failure writing the registry")
+
+        monkeypatch.setattr(encryption_module, "write_infra_bytes", _boom)
+
+        with pytest.raises(OSError, match="simulated disk failure"):
+            restamp_tier_manifest(tier_root, registry=registry, payload=payload, pre_sha="")
+
+        # The registry write never landed: bytes on disk are byte-identical
+        # to what was there before this call, and the key it would have
+        # stale-marked is still fully active on disk.
+        assert registry_path.read_bytes() == before_bytes
+        on_disk = KeyRegistry.load(registry_path)
+        assert "graph_before" in on_disk
+        assert "graph1" not in on_disk
+        assert not on_disk.knows("graph1")
+
+    def test_a_manifest_error_during_rebind_returns_rebind_failed_with_the_mutation_landed(
         self, tmp_path, monkeypatch
     ):
-        """A shutil.rmtree failure AFTER the rename step leaves the
-        condemned interim slot stranded under .pending-delete/, fully out
-        of the live namespace and invisible to iter_interim_dirs — never
-        half-deleted in its original location. Reverting the rename step
-        (monkeypatching os.rename to a no-op, i.e. restoring the old direct
-        shutil.rmtree(root) behaviour) would leave interim_root sitting in
-        the live namespace instead, which the assertions below reject."""
-        from paramem.memory.interim_adapter import iter_interim_dirs
-
-        adapter_dir = tmp_path
-        episodic_root = adapter_dir / "episodic"
-        interim_root = episodic_root / "interim_20260417T0000"
-        nested_slot = interim_root / "20260417-120000"
-        nested_slot.mkdir(parents=True)
-        (nested_slot / "adapter_model.safetensors").write_bytes(b"")
-        (interim_root / "indexed_key_registry.json").write_text("{}")
-
-        real_rmtree = shutil.rmtree
-
-        def _boom(path, *a, **kw):
-            raise OSError("simulated crash mid-delete")
-
-        monkeypatch.setattr(shutil, "rmtree", _boom)
-        try:
-            with pytest.raises(OSError):
-                reap_tier_artifacts(interim_root)
-        finally:
-            monkeypatch.setattr(shutil, "rmtree", real_rmtree)
-
-        # Out of the live namespace immediately — the rename already ran.
-        assert not interim_root.exists()
-        assert list(iter_interim_dirs(adapter_dir)) == []
-
-        # Stranded under the tombstone dir, not yet actually deleted.
-        tombstone = adapter_dir / _PENDING_DELETE_DIR_NAME / "interim_20260417T0000"
-        assert tombstone.exists()
-        assert (tombstone / "20260417-120000" / "adapter_model.safetensors").exists()
-
-    def test_crash_during_main_tier_reap_preserves_interim_children(self, tmp_path, monkeypatch):
-        """A crash while reaping a main tier's non-interim child leaves the
-        sibling interim_* child completely untouched — the main-tier
-        branch's interim-sparing behaviour survives the tombstone rewrite."""
-        tier_root = tmp_path / "episodic"
-        slot = tier_root / "20260417-120000"
-        slot.mkdir(parents=True)
-        (slot / "adapter_model.safetensors").write_bytes(b"")
-        interim = tier_root / "interim_20260417T0000"
-        interim.mkdir()
-        (interim / "adapter_model.safetensors").write_bytes(b"")
-
-        def _boom(path, *a, **kw):
-            raise OSError("simulated crash mid-delete")
-
-        real_rmtree = shutil.rmtree
-        monkeypatch.setattr(shutil, "rmtree", _boom)
-        try:
-            with pytest.raises(OSError):
-                reap_tier_artifacts(tier_root)
-        finally:
-            monkeypatch.setattr(shutil, "rmtree", real_rmtree)
-
-        assert interim.exists()
-        assert (interim / "adapter_model.safetensors").exists()
-        assert not slot.exists(), "the condemned slot is out of the live namespace"
-
-    def test_stale_pending_delete_collision_is_cleared_before_rename(self, tmp_path):
-        """A same-name leftover already sitting in ``.pending-delete/`` from
-        a prior crash is treated as already-condemned debris and removed
-        first — without this, ``os.rename`` onto a non-empty destination
-        directory would raise and the reap would fail outright."""
-        adapter_dir = tmp_path
-        tier_root = adapter_dir / "semantic"
-        child = tier_root / "20260417-120000"
-        child.mkdir(parents=True)
-        (child / "adapter_model.safetensors").write_bytes(b"")
-
-        stale = adapter_dir / _PENDING_DELETE_DIR_NAME / "20260417-120000"
-        stale.mkdir(parents=True)
-        (stale / "leftover_from_prior_crash.bin").write_bytes(b"debris")
-
-        removed = reap_tier_artifacts(tier_root)
-
-        assert child in removed
-        assert not tier_root.exists()
-        assert not (adapter_dir / _PENDING_DELETE_DIR_NAME).exists()
-
-
-class TestResumePendingReaps:
-    """Boot-time sweep that finishes any deletion reap_tier_artifacts left
-    stranded under ``.pending-delete/``."""
-
-    def test_missing_dir_is_silent_noop(self, tmp_path):
-        """No ``.pending-delete`` directory at all is a silent no-op."""
-        resume_pending_reaps(tmp_path)
-        assert not (tmp_path / _PENDING_DELETE_DIR_NAME).exists()
-
-    def test_clears_stranded_tombstone(self, tmp_path, caplog):
-        """A directory stranded under ``.pending-delete/`` (simulating a
-        crash between reap_tier_artifacts' rename and its delete) is
-        removed, along with the now-empty tombstone dir itself, and the
-        removal is logged as a WARNING naming the resumed path."""
-        import logging
-
-        stranded = tmp_path / _PENDING_DELETE_DIR_NAME / "interim_20260417T0000"
-        nested = stranded / "20260417-120000"
-        nested.mkdir(parents=True)
-        (nested / "adapter_model.safetensors").write_bytes(b"")
-
-        caplog.set_level(logging.WARNING, logger="paramem.memory.persistence")
-        resume_pending_reaps(tmp_path)
-
-        assert not (tmp_path / _PENDING_DELETE_DIR_NAME).exists()
-        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
-        assert any("interim_20260417T0000" in msg for msg in warnings), (
-            f"expected a WARNING naming the resumed path, got: {warnings}"
+        import paramem.adapters.manifest as manifest_module
+        from paramem.adapters.manifest import ManifestError, tier_registry_sha256
+        from paramem.memory.persistence import (
+            REBIND_FAILED,
+            publish_tier_registry,
+            restamp_tier_manifest,
+            write_tier_slot,
         )
-
-    def test_clears_stranded_file(self, tmp_path):
-        """A stranded plain-file entry under ``.pending-delete/`` (the file
-        child branch of reap_tier_artifacts) is unlinked, not just handled
-        for directories."""
-        pending = tmp_path / _PENDING_DELETE_DIR_NAME
-        pending.mkdir(parents=True)
-        (pending / "indexed_key_registry.json").write_text("{}")
-
-        resume_pending_reaps(tmp_path)
-
-        assert not pending.exists()
-
-    def test_idempotent_double_resume(self, tmp_path):
-        """Calling resume_pending_reaps a second time after it already
-        cleared everything is a safe no-op."""
-        stranded = tmp_path / _PENDING_DELETE_DIR_NAME / "interim_20260417T0000"
-        stranded.mkdir(parents=True)
-
-        resume_pending_reaps(tmp_path)
-        assert not (tmp_path / _PENDING_DELETE_DIR_NAME).exists()
-
-        resume_pending_reaps(tmp_path)  # must not raise
-        assert not (tmp_path / _PENDING_DELETE_DIR_NAME).exists()
-
-    def test_end_to_end_crash_then_resume(self, tmp_path, monkeypatch):
-        """A reap_tier_artifacts crash-injection followed by
-        resume_pending_reaps leaves nothing behind — the full
-        crash-then-boot-resume cycle."""
-        tier_root = tmp_path / "episodic"
-        slot = tier_root / "20260417-120000"
-        slot.mkdir(parents=True)
-        (slot / "adapter_model.safetensors").write_bytes(b"")
-
-        real_rmtree = shutil.rmtree
-
-        def _boom(path, *a, **kw):
-            raise OSError("simulated crash mid-delete")
-
-        monkeypatch.setattr(shutil, "rmtree", _boom)
-        try:
-            with pytest.raises(OSError):
-                reap_tier_artifacts(tier_root)
-        finally:
-            monkeypatch.setattr(shutil, "rmtree", real_rmtree)
-
-        assert (tmp_path / _PENDING_DELETE_DIR_NAME).exists()
-
-        resume_pending_reaps(tmp_path)
-
-        assert not (tmp_path / _PENDING_DELETE_DIR_NAME).exists()
-
-    def test_entry_that_raises_does_not_block_the_remaining_entries(
-        self, tmp_path, monkeypatch, caplog
-    ):
-        """Best-effort: one entry whose removal raises (e.g. a permission
-        error) is logged at ERROR and skipped — it must not prevent the
-        OTHER entries under ``.pending-delete/`` from being cleared, and
-        must not propagate out of ``resume_pending_reaps`` (which would
-        abort the entire boot via ``_load_model_into_state``)."""
-        import logging
-
-        pending = tmp_path / _PENDING_DELETE_DIR_NAME
-        poisoned = pending / "interim_poisoned"
-        poisoned.mkdir(parents=True)
-        (poisoned / "adapter_model.safetensors").write_bytes(b"")
-        clean = pending / "interim_clean"
-        clean.mkdir(parents=True)
-        (clean / "adapter_model.safetensors").write_bytes(b"")
-
-        real_rmtree = shutil.rmtree
-
-        def _boom(path, *a, **kw):
-            if Path(path).name == "interim_poisoned":
-                raise OSError("simulated permission error")
-            return real_rmtree(path, *a, **kw)
-
-        monkeypatch.setattr(shutil, "rmtree", _boom)
-        caplog.set_level(logging.ERROR, logger="paramem.memory.persistence")
-        try:
-            # Must not raise — the poisoned entry's OSError is caught internally.
-            resume_pending_reaps(tmp_path)
-        finally:
-            monkeypatch.setattr(shutil, "rmtree", real_rmtree)
-
-        # The clean entry was removed despite the poisoned one failing.
-        assert not clean.exists()
-        # The poisoned entry is left stranded (retried on next boot), and the
-        # tombstone dir itself survives since it is non-empty.
-        assert poisoned.exists()
-        assert pending.exists()
-        error_records = [r for r in caplog.records if r.levelno == logging.ERROR]
-        assert any("interim_poisoned" in r.getMessage() for r in error_records), (
-            f"expected an ERROR log naming the failed entry, got: "
-            f"{[r.getMessage() for r in caplog.records]}"
-        )
-
-    def test_regular_file_pending_delete_is_removed(self, tmp_path):
-        """``.pending-delete`` itself existing as a regular file (rather
-        than a directory) is tolerated — unlinked directly instead of
-        raising ``NotADirectoryError`` out of ``iterdir()``."""
-        pending = tmp_path / _PENDING_DELETE_DIR_NAME
-        pending.write_bytes(b"unexpected file, not a directory")
-
-        resume_pending_reaps(tmp_path)
-
-        assert not pending.exists()
-
-
-# ---------------------------------------------------------------------------
-# erase_keys_and_restamp_manifest — key-erase / registry-save / graph-erase /
-# manifest-re-stamp sequence shared by every out-of-fold registry-mutation
-# caller (extracted from POST /speaker/forget).
-# ---------------------------------------------------------------------------
-
-
-class TestEraseKeysAndRestampManifest:
-    def test_empty_keys_is_a_noop(self, tmp_path):
-        """No keys -> {} and no store mutation."""
-        from paramem.memory.store import MemoryStore
-
-        store = MemoryStore(replay_enabled=True)
-        store.registry("episodic").add("graph1")
-
-        result = erase_keys_and_restamp_manifest(store=store, adapter_dir=tmp_path, keys=[])
-
-        assert result == {}
-        assert store.registry("episodic").knows("graph1")
-
-    def test_erases_keys_saves_registry_and_erases_graph(self, tmp_path):
-        """The erased key is gone from the store, the saved registry file,
-        and the tier's on-disk graph.json; a surviving key is untouched in
-        all three, and the survivor is not in the result."""
-        from paramem.memory.store import MemoryStore
         from paramem.training.key_registry import KeyRegistry
 
-        store = MemoryStore(replay_enabled=True)
-        reg = store.registry("episodic")
-        reg.add("graph1")
-        reg.add("graph2")
+        ctx = _write_context(tmp_path)
+        tier_root = tmp_path / "episodic"
 
-        adapter_dir = tmp_path / "adapters"
-        tier_root = adapter_dir / "episodic"
-        tier_root.mkdir(parents=True)
+        increment = _build_simulate_increment(key="graph1")
+        slot = write_tier_slot(ctx=ctx, increment=increment, stamp="20260101T0000", mode="simulate")
+        publish_tier_registry(increment=increment, ctx=ctx, written_slot=slot)
 
-        g = nx.MultiDiGraph()
-        _add_keyed_edge(
-            g, "Alice", "Berlin", indexed_key="graph1", predicate="lives_in", speaker_id="S0"
+        pre_sha = tier_registry_sha256(tier_root)
+        new_registry = KeyRegistry()
+        new_registry.add("graph1")
+        new_registry.stale("graph1")  # the mutation under test
+        new_payload = new_registry.save_bytes()
+
+        # plan_restamp's own lookup (find_live_slot -> read_manifest) must
+        # still see the REAL manifest, so the plan resolves RESTAMPED and
+        # names this slot -- only restamp_tier_manifest's OWN post-plan
+        # re-read (the rebind pair under test) should fail. With exactly
+        # one slot on disk, plan_restamp's search calls read_manifest
+        # exactly once before restamp_tier_manifest's own call -- so only
+        # the SECOND call onward raises.
+        real_read_manifest = manifest_module.read_manifest
+        calls = {"n": 0}
+
+        def _boom(slot_arg):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return real_read_manifest(slot_arg)
+            raise ManifestError("simulated corrupt manifest re-read")
+
+        monkeypatch.setattr(manifest_module, "read_manifest", _boom)
+
+        result = restamp_tier_manifest(
+            tier_root, registry=new_registry, payload=new_payload, pre_sha=pre_sha
         )
-        _add_keyed_edge(
-            g, "Bob", "Engineer", indexed_key="graph2", predicate="has_job", speaker_id="S1"
-        )
-        save_memory_to_disk(g, tier_root / "graph.json")
 
-        result = erase_keys_and_restamp_manifest(
-            store=store, adapter_dir=adapter_dir, keys=["graph1"]
-        )
+        # The rebind failed and is reported, not raised.
+        assert result.status == REBIND_FAILED
+        assert result.slot is None
+        assert "simulated corrupt manifest re-read" in result.message
 
-        assert result == {}
-
-        assert not reg.knows("graph1")
-        assert reg.knows("graph2")
-
+        # The registry mutation landed regardless -- the stale mark is on
+        # disk, structurally guaranteed by write-then-rebind ordering.
         on_disk = KeyRegistry.load(tier_root / "indexed_key_registry.json")
-        assert not on_disk.knows("graph1")
-        assert on_disk.knows("graph2")
-
-        g2 = load_memory_from_disk(tier_root / "graph.json")
-        keys_on_disk = {e["key"] for e in iter_entries(g2)}
-        assert keys_on_disk == {"graph2"}
-
-    def test_emptied_tier_is_returned_for_reap(self, tmp_path):
-        """A tier reduced to zero known keys is returned in the result for
-        the caller to reap. This fixture has no weight-slot candidate under
-        the tier root, so restamp_tier_manifest reports NO_WEIGHT_SLOT
-        internally (its own guard, exercised separately elsewhere) -- the
-        emptied-tier collection here is unaffected either way; see
-        test_emptied_tier_with_live_slot_is_restamped_to_zero_and_reaped for
-        the case where a slot DOES exist and IS restamped before the reap."""
-        from paramem.memory.store import MemoryStore
-
-        store = MemoryStore(replay_enabled=True)
-        store.registry("episodic").add("graph1")
-
-        adapter_dir = tmp_path / "adapters"
-        tier_root = adapter_dir / "episodic"
-        tier_root.mkdir(parents=True)
-
-        result = erase_keys_and_restamp_manifest(
-            store=store, adapter_dir=adapter_dir, keys=["graph1"]
-        )
-
-        assert result == {"episodic": tier_root}
-        assert not store.registry("episodic").knows("graph1")
-
-    def test_emptied_tier_with_live_slot_is_restamped_to_zero_and_reaped(self, tmp_path):
-        """When an emptied tier DOES have a matching live slot, the door's
-        step 3 (restamp_tier_manifest) restamps it to key_count=0 BEFORE the
-        emptied-tier decision is made -- and the tier is still returned in
-        emptied_tiers for the caller to reap. A crash between the restamp
-        and the reap leaves a self-consistent empty tier, not an ambiguous
-        one (the documented delta on restamp_tier_manifest's emptied-tier
-        note)."""
-        from paramem.adapters.manifest import (
-            MANIFEST_SCHEMA_VERSION,
-            AdapterManifest,
-            BaseModelFingerprint,
-            LoRAShape,
-            TokenizerFingerprint,
-            find_live_slot,
-            read_manifest,
-            write_manifest,
-        )
-        from paramem.memory.store import MemoryStore
-
-        tier_name = "episodic"
-        store = MemoryStore(replay_enabled=True)
-        reg = store.registry(tier_name)
-        reg.add("graph1")
-
-        adapter_dir = tmp_path / "adapters"
-        tier_root = adapter_dir / tier_name
-        tier_root.mkdir(parents=True)
-
-        h_old = hashlib.sha256(reg.save_bytes()).hexdigest()
-        reg.save(tier_root / "indexed_key_registry.json")
-
-        slot_dir = tier_root / "20260612-000000"
-        slot_dir.mkdir()
-        write_manifest(
-            slot_dir,
-            AdapterManifest(
-                schema_version=MANIFEST_SCHEMA_VERSION,
-                name=tier_name,
-                trained_at="2026-06-12T00:00:00Z",
-                base_model=BaseModelFingerprint(
-                    repo="hf/model", sha="abc123", hash="sha256:deadbeef"
-                ),
-                tokenizer=TokenizerFingerprint(
-                    name_or_path="hf/model", vocab_size=32000, merges_hash="cafebabe"
-                ),
-                lora=LoRAShape(rank=8, alpha=16, dropout=0.0, target_modules=("q_proj",)),
-                registry_sha256=h_old,
-                key_count=1,
-            ),
-        )
-        assert find_live_slot(tier_root, h_old) == slot_dir
-
-        result = erase_keys_and_restamp_manifest(
-            store=store, adapter_dir=adapter_dir, keys=["graph1"]
-        )
-
-        assert result == {"episodic": tier_root}
-
-        h_new = hashlib.sha256(reg.save_bytes()).hexdigest()
-        assert find_live_slot(tier_root, h_new) == slot_dir
-        restamped = read_manifest(slot_dir)
-        assert restamped.key_count == 0
-
-    def test_survivor_restamp_makes_slot_mountable(self, tmp_path):
-        """After the helper runs on a surviving slot, find_live_slot accepts
-        the re-stamped meta.json against the rewritten registry's hash and
-        rejects the pre-erase hash — the fix for the "slot unmountable after
-        an out-of-fold registry mutation" failure mode."""
-        from paramem.adapters.manifest import (
-            MANIFEST_SCHEMA_VERSION,
-            AdapterManifest,
-            BaseModelFingerprint,
-            LoRAShape,
-            TokenizerFingerprint,
-            find_live_slot,
-            write_manifest,
-        )
-        from paramem.memory.store import MemoryStore
-
-        tier_name = "episodic"
-        store = MemoryStore(replay_enabled=True)
-        reg = store.registry(tier_name)
-        reg.add("graph1")
-        reg.add("graph2")
-
-        adapter_dir = tmp_path / "adapters"
-        tier_root = adapter_dir / tier_name
-        tier_root.mkdir(parents=True)
-
-        h_old = hashlib.sha256(reg.save_bytes()).hexdigest()
-        reg.save(tier_root / "indexed_key_registry.json")
-
-        slot_dir = tier_root / "20260612-000000"
-        slot_dir.mkdir()
-        manifest = AdapterManifest(
-            schema_version=MANIFEST_SCHEMA_VERSION,
-            name=tier_name,
-            trained_at="2026-06-12T00:00:00Z",
-            base_model=BaseModelFingerprint(repo="hf/model", sha="abc123", hash="sha256:deadbeef"),
-            tokenizer=TokenizerFingerprint(
-                name_or_path="hf/model", vocab_size=32000, merges_hash="cafebabe"
-            ),
-            lora=LoRAShape(rank=8, alpha=16, dropout=0.0, target_modules=("q_proj", "v_proj")),
-            registry_sha256=h_old,
-            key_count=2,
-        )
-        write_manifest(slot_dir, manifest)
-        assert find_live_slot(tier_root, h_old) == slot_dir
-
-        result = erase_keys_and_restamp_manifest(
-            store=store, adapter_dir=adapter_dir, keys=["graph1"]
-        )
-
-        assert result == {}
-        h_new = hashlib.sha256(reg.save_bytes()).hexdigest()
-        assert find_live_slot(tier_root, h_new) == slot_dir
-        assert find_live_slot(tier_root, h_old) is None
-
-    def test_survivor_restamp_refreshes_key_count(self, tmp_path):
-        """The re-stamped manifest's key_count reflects the post-erase
-        survivor count, not the pre-erase value carried over from the old
-        manifest."""
-        from paramem.adapters.manifest import (
-            MANIFEST_SCHEMA_VERSION,
-            AdapterManifest,
-            BaseModelFingerprint,
-            LoRAShape,
-            TokenizerFingerprint,
-            find_live_slot,
-            read_manifest,
-            write_manifest,
-        )
-        from paramem.memory.store import MemoryStore
-
-        tier_name = "episodic"
-        store = MemoryStore(replay_enabled=True)
-        reg = store.registry(tier_name)
-        reg.add("graph1")
-        reg.add("graph2")
-
-        adapter_dir = tmp_path / "adapters"
-        tier_root = adapter_dir / tier_name
-        tier_root.mkdir(parents=True)
-
-        h_old = hashlib.sha256(reg.save_bytes()).hexdigest()
-        reg.save(tier_root / "indexed_key_registry.json")
-
-        slot_dir = tier_root / "20260612-000000"
-        slot_dir.mkdir()
-        manifest = AdapterManifest(
-            schema_version=MANIFEST_SCHEMA_VERSION,
-            name=tier_name,
-            trained_at="2026-06-12T00:00:00Z",
-            base_model=BaseModelFingerprint(repo="hf/model", sha="abc123", hash="sha256:deadbeef"),
-            tokenizer=TokenizerFingerprint(
-                name_or_path="hf/model", vocab_size=32000, merges_hash="cafebabe"
-            ),
-            lora=LoRAShape(rank=8, alpha=16, dropout=0.0, target_modules=("q_proj", "v_proj")),
-            registry_sha256=h_old,
-            key_count=2,
-        )
-        write_manifest(slot_dir, manifest)
-
-        result = erase_keys_and_restamp_manifest(
-            store=store, adapter_dir=adapter_dir, keys=["graph1"]
-        )
-
-        assert result == {}
-        h_new = hashlib.sha256(reg.save_bytes()).hexdigest()
-        live_slot = find_live_slot(tier_root, h_new)
-        assert live_slot == slot_dir
-
-        restamped = read_manifest(live_slot)
-        assert restamped.key_count == 1, (
-            "key_count must be refreshed to the post-erase survivor count "
-            f"(1), not carried over from the pre-erase manifest; got "
-            f"{restamped.key_count}"
-        )
-
-    def test_restamp_with_zero_active_but_stale_survivors_carries_int_zero(self, tmp_path):
-        """A tier reduced to zero ACTIVE keys but still holding a stale key
-        is a surviving tier (``list_known()`` is active ∪ stale, non-empty)
-        — it IS re-stamped, and the re-stamped key_count is int 0, not
-        UNKNOWN.
-
-        ``graph1`` is active and gets erased; ``graph2`` is already stale
-        before the erase and is untouched by it (erase only removes the
-        keys named in the call). After the erase the tier has zero active
-        keys and one stale key, so the emptied-tier branch (gated on
-        ``list_known()``) is not taken.
-        """
-        from paramem.adapters.manifest import (
-            MANIFEST_SCHEMA_VERSION,
-            AdapterManifest,
-            BaseModelFingerprint,
-            LoRAShape,
-            TokenizerFingerprint,
-            find_live_slot,
-            read_manifest,
-            write_manifest,
-        )
-        from paramem.memory.store import MemoryStore
-
-        tier_name = "episodic"
-        store = MemoryStore(replay_enabled=True)
-        reg = store.registry(tier_name)
-        reg.add("graph1")
-        reg.add("graph2")
-        reg.stale("graph2")
-
-        adapter_dir = tmp_path / "adapters"
-        tier_root = adapter_dir / tier_name
-        tier_root.mkdir(parents=True)
-
-        h_old = hashlib.sha256(reg.save_bytes()).hexdigest()
-        reg.save(tier_root / "indexed_key_registry.json")
-
-        slot_dir = tier_root / "20260612-000000"
-        slot_dir.mkdir()
-        manifest = AdapterManifest(
-            schema_version=MANIFEST_SCHEMA_VERSION,
-            name=tier_name,
-            trained_at="2026-06-12T00:00:00Z",
-            base_model=BaseModelFingerprint(repo="hf/model", sha="abc123", hash="sha256:deadbeef"),
-            tokenizer=TokenizerFingerprint(
-                name_or_path="hf/model", vocab_size=32000, merges_hash="cafebabe"
-            ),
-            lora=LoRAShape(rank=8, alpha=16, dropout=0.0, target_modules=("q_proj", "v_proj")),
-            registry_sha256=h_old,
-            key_count=1,
-        )
-        write_manifest(slot_dir, manifest)
-        assert find_live_slot(tier_root, h_old) == slot_dir
-
-        result = erase_keys_and_restamp_manifest(
-            store=store, adapter_dir=adapter_dir, keys=["graph1"]
-        )
-
-        # Not returned as emptied — the stale survivor keeps the tier "known".
-        assert result == {}
-        assert not reg.knows("graph1")
-        assert reg.knows("graph2")
-        assert reg.list_active() == []
-
-        h_new = hashlib.sha256(reg.save_bytes()).hexdigest()
-        live_slot = find_live_slot(tier_root, h_new)
-        assert live_slot == slot_dir
-
-        restamped = read_manifest(live_slot)
-        assert restamped.key_count == 0, (
-            f"key_count must be the int 0 active-key count, not UNKNOWN or "
-            f"carried over; got {restamped.key_count!r}"
-        )
-
-    def test_malformed_interim_tier_name_raises_before_mutation(self, tmp_path):
-        """A malformed interim tier name raises ValueError BEFORE
-        store.discard_keys runs — the store is left untouched."""
-        from paramem.memory.interim_adapter import INTERIM_NAME_PREFIX
-        from paramem.memory.store import MemoryStore
-
-        tier_name = f"{INTERIM_NAME_PREFIX}foo"  # does not parse as a stamp
-        store = MemoryStore(replay_enabled=True)
-        reg = store.registry(tier_name)
-        reg.add("graph1")
-
-        with pytest.raises(ValueError):
-            erase_keys_and_restamp_manifest(
-                store=store, adapter_dir=tmp_path / "adapters", keys=["graph1"]
-            )
-
-        assert reg.knows("graph1")
-
-    def test_no_weight_slot_skips_restamp_without_error(self, tmp_path, caplog):
-        """Simulate venue: a non-empty on-disk registry but no weight-slot
-        manifest anywhere under the tier root — no ERROR is logged and the
-        tier is reported as a survivor."""
-        import logging
-
-        from paramem.memory.store import MemoryStore
-
-        tier_name = "episodic"
-        store = MemoryStore(replay_enabled=True)
-        reg = store.registry(tier_name)
-        reg.add("graph1")
-        reg.add("graph2")
-
-        adapter_dir = tmp_path / "adapters"
-        tier_root = adapter_dir / tier_name
-        tier_root.mkdir(parents=True)
-        reg.save(tier_root / "indexed_key_registry.json")
-
-        caplog.set_level(logging.DEBUG, logger="paramem.memory.persistence")
-        result = erase_keys_and_restamp_manifest(
-            store=store, adapter_dir=adapter_dir, keys=["graph1"]
-        )
-
-        assert result == {}
-        error_records = [r for r in caplog.records if r.levelno == logging.ERROR]
-        assert error_records == []
-        debug_messages = [r.getMessage() for r in caplog.records if r.levelno == logging.DEBUG]
-        assert any("no on-disk weight slot" in msg for msg in debug_messages)
-
-    def test_empty_pre_erase_hash_skips_restamp(self, tmp_path, caplog):
-        """A tier with in-memory keys but no on-disk registry (pre-erase
-        hash == "") is not re-stamped and never consults find_live_slot; a
-        WARNING is logged instead of an ERROR."""
-        import logging
-        from unittest.mock import patch
-
-        from paramem.adapters.manifest import (
-            MANIFEST_SCHEMA_VERSION,
-            AdapterManifest,
-            BaseModelFingerprint,
-            LoRAShape,
-            TokenizerFingerprint,
-            write_manifest,
-        )
-        from paramem.memory.store import MemoryStore
-
-        tier_name = "episodic"
-        store = MemoryStore(replay_enabled=True)
-        reg = store.registry(tier_name)
-        reg.add("graph1")
-        reg.add("graph2")
-        # Deliberately NOT saved to disk — tier_registry_sha256 reads "".
-
-        adapter_dir = tmp_path / "adapters"
-        tier_root = adapter_dir / tier_name
-
-        # A weight-slot manifest must exist for the pre_sha == "" branch to be
-        # reached at all — with zero slot candidates the venue gate fires
-        # first (see test_no_weight_slot_skips_restamp_without_error). Its
-        # registry_sha256 is irrelevant: find_live_slot is never consulted
-        # for a "" pre-erase hash.
-        slot_dir = tier_root / "20260101-000000"
-        slot_dir.mkdir(parents=True)
-        write_manifest(
-            slot_dir,
-            AdapterManifest(
-                schema_version=MANIFEST_SCHEMA_VERSION,
-                name=tier_name,
-                trained_at="2026-01-01T00:00:00Z",
-                base_model=BaseModelFingerprint(
-                    repo="hf/model", sha="abc123", hash="sha256:deadbeef"
-                ),
-                tokenizer=TokenizerFingerprint(
-                    name_or_path="hf/model", vocab_size=32000, merges_hash="cafebabe"
-                ),
-                lora=LoRAShape(rank=8, alpha=16, dropout=0.0, target_modules=("q_proj",)),
-                registry_sha256="unrelated" * 8,
-                key_count=0,
-            ),
-        )
-
-        caplog.set_level(logging.WARNING, logger="paramem.memory.persistence")
-        with patch("paramem.adapters.manifest.find_live_slot") as mock_find_live_slot:
-            result = erase_keys_and_restamp_manifest(
-                store=store, adapter_dir=adapter_dir, keys=["graph1"]
-            )
-
-        assert result == {}
-        mock_find_live_slot.assert_not_called()
-        warning_messages = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
-        assert any("had no readable pre-write registry" in msg for msg in warning_messages)
-
-    def test_orphaned_slot_logs_error_without_raising(self, tmp_path, caplog):
-        """A pre-erase hash that no on-disk slot matches (already orphaned,
-        e.g. from a prior crash) logs an ERROR but does not raise — the
-        forget must still succeed."""
-        import logging
-
-        from paramem.adapters.manifest import (
-            MANIFEST_SCHEMA_VERSION,
-            AdapterManifest,
-            BaseModelFingerprint,
-            LoRAShape,
-            TokenizerFingerprint,
-            write_manifest,
-        )
-        from paramem.memory.store import MemoryStore
-
-        tier_name = "episodic"
-        store = MemoryStore(replay_enabled=True)
-        reg = store.registry(tier_name)
-        reg.add("graph1")
-        reg.add("graph2")
-
-        adapter_dir = tmp_path / "adapters"
-        tier_root = adapter_dir / tier_name
-        tier_root.mkdir(parents=True)
-        reg.save(tier_root / "indexed_key_registry.json")
-
-        # A slot exists, but its registry_sha256 does not match the pre-erase
-        # hash — find_live_slot returns None for it.
-        slot_dir = tier_root / "20260612-000000"
-        slot_dir.mkdir()
-        write_manifest(
-            slot_dir,
-            AdapterManifest(
-                schema_version=MANIFEST_SCHEMA_VERSION,
-                name=tier_name,
-                trained_at="2026-06-12T00:00:00Z",
-                base_model=BaseModelFingerprint(
-                    repo="hf/model", sha="abc123", hash="sha256:deadbeef"
-                ),
-                tokenizer=TokenizerFingerprint(
-                    name_or_path="hf/model", vocab_size=32000, merges_hash="cafebabe"
-                ),
-                lora=LoRAShape(rank=8, alpha=16, dropout=0.0, target_modules=("q_proj",)),
-                registry_sha256="deadbeef" * 8,
-                key_count=1,
-            ),
-        )
-
-        caplog.set_level(logging.ERROR, logger="paramem.memory.persistence")
-        result = erase_keys_and_restamp_manifest(
-            store=store, adapter_dir=adapter_dir, keys=["graph1"]
-        )
-
-        assert result == {}
-        error_messages = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
-        assert any("slot already orphaned" in msg for msg in error_messages)
-
-    def test_erase_door_still_reaps_an_emptied_tier(self, tmp_path):
-        """Through erase_keys_and_restamp_manifest, a tier the erase reduces
-        to zero known keys is still returned in the result for the caller to
-        reap, and its graph.json has had the erased key's edge removed --
-        unaffected by routing the registry-write + manifest-restamp step
-        through restamp_tier_manifest."""
-        from paramem.memory.store import MemoryStore
-
-        store = MemoryStore(replay_enabled=True)
-        store.registry("episodic").add("graph1")
-
-        adapter_dir = tmp_path / "adapters"
-        tier_root = adapter_dir / "episodic"
-        tier_root.mkdir(parents=True)
-
-        g = nx.MultiDiGraph()
-        _add_keyed_edge(
-            g, "Alice", "Berlin", indexed_key="graph1", predicate="lives_in", speaker_id="S0"
-        )
-        save_memory_to_disk(g, tier_root / "graph.json")
-
-        result = erase_keys_and_restamp_manifest(
-            store=store, adapter_dir=adapter_dir, keys=["graph1"]
-        )
-
-        assert result == {"episodic": tier_root}
-        g2 = load_memory_from_disk(tier_root / "graph.json")
-        assert list(iter_entries(g2)) == []
-
-    def test_erase_door_raises_on_a_malformed_tier_name_before_any_write(self, tmp_path):
-        """The pre-mutation raise (adapter_slot_root_for_name on a malformed
-        interim tier name) is unchanged: the door still resolves slot roots
-        AND captures each tier's pre-erase hash in its own pre-loop, before
-        store.discard_keys runs -- no registry file is ever written and the
-        store is left untouched."""
-        from paramem.memory.interim_adapter import INTERIM_NAME_PREFIX
-        from paramem.memory.store import MemoryStore
-
-        tier_name = f"{INTERIM_NAME_PREFIX}foo"  # does not parse as a stamp
-        store = MemoryStore(replay_enabled=True)
-        reg = store.registry(tier_name)
-        reg.add("graph1")
-
-        adapter_dir = tmp_path / "adapters"
-        with pytest.raises(ValueError):
-            erase_keys_and_restamp_manifest(store=store, adapter_dir=adapter_dir, keys=["graph1"])
-
-        assert reg.knows("graph1")
-        assert not adapter_dir.exists()
-
-    def test_second_tier_hash_read_raises_before_any_mutation(self, tmp_path):
-        """Regression pin: the door captures EVERY affected tier's pre-erase
-        hash in its own pre-loop, before store.discard_keys runs for ANY
-        tier -- so a decrypt/read failure on the SECOND tier's on-disk
-        registry raises before the FIRST tier's KeyRegistry (in-RAM or on
-        disk) is touched at all. Not mid-loop after an earlier tier has
-        already committed."""
-        from unittest.mock import patch
-
-        from paramem.adapters.manifest import tier_registry_sha256 as _real_tier_registry_sha256
-        from paramem.memory.store import MemoryStore
-        from paramem.training.key_registry import KeyRegistry
-
-        store = MemoryStore(replay_enabled=True)
-        ep_reg = store.registry("episodic")
-        ep_reg.add("graph1")
-        sem_reg = store.registry("semantic")
-        sem_reg.add("graph2")
-
-        adapter_dir = tmp_path / "adapters"
-        ep_root = adapter_dir / "episodic"
-        sem_root = adapter_dir / "semantic"
-        ep_root.mkdir(parents=True)
-        sem_root.mkdir(parents=True)
-        ep_reg.save(ep_root / "indexed_key_registry.json")
-        sem_reg.save(sem_root / "indexed_key_registry.json")
-
-        def _raising_for_semantic(tier_root):
-            if tier_root.name == "semantic":
-                raise RuntimeError("simulated decrypt failure")
-            return _real_tier_registry_sha256(tier_root)
-
-        with patch(
-            "paramem.adapters.manifest.tier_registry_sha256",
-            side_effect=_raising_for_semantic,
-        ):
-            with pytest.raises(RuntimeError, match="simulated decrypt failure"):
-                erase_keys_and_restamp_manifest(
-                    store=store, adapter_dir=adapter_dir, keys=["graph1", "graph2"]
-                )
-
-        # Both tiers' in-RAM registries still know their keys -- discard_keys
-        # never ran (the raise happened inside the pre-loop, before it).
-        assert ep_reg.knows("graph1")
-        assert sem_reg.knows("graph2")
-
-        # Both on-disk registries unchanged.
-        on_disk_ep = KeyRegistry.load(ep_root / "indexed_key_registry.json")
-        assert on_disk_ep.knows("graph1")
-        on_disk_sem = KeyRegistry.load(sem_root / "indexed_key_registry.json")
-        assert on_disk_sem.knows("graph2")
-
-        # No manifest anywhere -- restamp_tier_manifest was never called.
-        assert not any(ep_root.glob("*/meta.json"))
-        assert not any(sem_root.glob("*/meta.json"))
-
-
-# ---------------------------------------------------------------------------
-# restamp_tier_manifest — the no-retrain commit primitive extracted from
-# erase_keys_and_restamp_manifest. Fold-reusable: persists a registry, then
-# rebinds the tier's live weight-slot manifest.
-# ---------------------------------------------------------------------------
-
-
-class TestRestampTierManifest:
-    def _write_manifest_for(self, slot_dir: Path, tier_name: str, sha: str, key_count: int):
-        from paramem.adapters.manifest import (
-            MANIFEST_SCHEMA_VERSION,
-            AdapterManifest,
-            BaseModelFingerprint,
-            LoRAShape,
-            TokenizerFingerprint,
-            write_manifest,
-        )
-
-        slot_dir.mkdir(parents=True, exist_ok=True)
-        manifest = AdapterManifest(
-            schema_version=MANIFEST_SCHEMA_VERSION,
-            name=tier_name,
-            trained_at="2026-06-12T00:00:00Z",
-            base_model=BaseModelFingerprint(repo="hf/model", sha="abc123", hash="sha256:deadbeef"),
-            tokenizer=TokenizerFingerprint(
-                name_or_path="hf/model", vocab_size=32000, merges_hash="cafebabe"
-            ),
-            lora=LoRAShape(rank=8, alpha=16, dropout=0.0, target_modules=("q_proj",)),
-            registry_sha256=sha,
-            key_count=key_count,
-        )
-        write_manifest(slot_dir, manifest)
-        return manifest
-
-    def test_restamps_matching_slot(self, tmp_path):
-        """The matching guard: the slot whose manifest carries the pre-write
-        hash is re-stamped with the new hash and the new active count."""
-        from paramem.adapters.manifest import find_live_slot, read_manifest
-        from paramem.memory.persistence import RESTAMPED, restamp_tier_manifest
-        from paramem.training.key_registry import KeyRegistry
-
-        tier_root = tmp_path / "episodic"
-        tier_root.mkdir(parents=True)
-        reg = KeyRegistry()
-        reg.add("graph1")
-        reg.add("graph2")
-        h_old = hashlib.sha256(reg.save_bytes()).hexdigest()
-        reg.save(tier_root / "indexed_key_registry.json")
-
-        slot_dir = tier_root / "20260612-000000"
-        self._write_manifest_for(slot_dir, "episodic", h_old, key_count=2)
-
-        reg.remove("graph1")
-        result = restamp_tier_manifest(tier_root, registry=reg)
-
-        assert result.status == RESTAMPED
-        assert result.slot == slot_dir
-
-        h_new = hashlib.sha256(reg.save_bytes()).hexdigest()
-        assert find_live_slot(tier_root, h_new) == slot_dir
-        assert find_live_slot(tier_root, h_old) is None
-
-        restamped = read_manifest(slot_dir)
-        assert restamped.key_count == 1
-        assert restamped.registry_sha256 == h_new
-
-    def test_no_weight_slot_candidate_skips_with_debug_log(self, tmp_path, caplog):
-        """The venue guard: no on-disk weight-slot candidate at all (simulate
-        venue / never-trained tier) -- registry is still written, restamp
-        skipped, DEBUG (not WARNING/ERROR) logged."""
-        import logging
-
-        from paramem.memory.persistence import NO_WEIGHT_SLOT, restamp_tier_manifest
-        from paramem.training.key_registry import KeyRegistry
-
-        tier_root = tmp_path / "episodic"
-        tier_root.mkdir(parents=True)
-        reg = KeyRegistry()
-        reg.add("graph1")
-
-        caplog.set_level(logging.DEBUG, logger="paramem.memory.persistence")
-        result = restamp_tier_manifest(tier_root, registry=reg)
-
-        assert result.status == NO_WEIGHT_SLOT
-        assert result.slot is None
-        assert (tier_root / "indexed_key_registry.json").exists()
-        debug_messages = [r.getMessage() for r in caplog.records if r.levelno == logging.DEBUG]
-        assert any("no on-disk weight slot" in msg for msg in debug_messages)
-
-    def test_empty_pre_write_hash_refuses_with_warning(self, tmp_path, caplog):
-        """The empty-hash guard: no readable registry existed on disk before
-        this call -- registry is still written, restamp REFUSED (not bound
-        to a stray ""-stamped slot), WARNING logged."""
-        import logging
-
-        from paramem.memory.persistence import NO_PRE_WRITE_HASH, restamp_tier_manifest
-        from paramem.training.key_registry import KeyRegistry
-
-        tier_root = tmp_path / "episodic"
-        reg = KeyRegistry()
-        reg.add("graph1")
-        # Deliberately NOT saved to disk before the call -- tier_registry_sha256
-        # reads "" for a tier root that does not exist yet.
-
-        # A weight-slot manifest must exist for the pre_sha == "" branch to be
-        # reached at all -- with zero slot candidates the venue gate fires first.
-        self._write_manifest_for(
-            tier_root / "20260101-000000", "episodic", "unrelated" * 8, key_count=0
-        )
-
-        caplog.set_level(logging.WARNING, logger="paramem.memory.persistence")
-        result = restamp_tier_manifest(tier_root, registry=reg)
-
-        assert result.status == NO_PRE_WRITE_HASH
-        assert result.slot is None
-        assert (tier_root / "indexed_key_registry.json").exists()
-        warning_messages = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
-        assert any("had no readable pre-write registry" in msg for msg in warning_messages)
-
-    def test_no_matching_slot_errors_without_writing_manifest(self, tmp_path, caplog):
-        """The orphan guard: a pre-write hash no on-disk slot matches --
-        registry is still written, ERROR logged, no manifest write (the slot
-        is already orphaned and must not be adopted)."""
-        import logging
-
-        from paramem.adapters.manifest import read_manifest
-        from paramem.memory.persistence import SLOT_ORPHANED, restamp_tier_manifest
-        from paramem.training.key_registry import KeyRegistry
-
-        tier_root = tmp_path / "episodic"
-        tier_root.mkdir(parents=True)
-        reg = KeyRegistry()
-        reg.add("graph1")
-        reg.save(tier_root / "indexed_key_registry.json")
-
-        slot_dir = tier_root / "20260612-000000"
-        stray = self._write_manifest_for(slot_dir, "episodic", "deadbeef" * 8, key_count=1)
-
-        caplog.set_level(logging.ERROR, logger="paramem.memory.persistence")
-        result = restamp_tier_manifest(tier_root, registry=reg)
-
-        assert result.status == SLOT_ORPHANED
-        assert result.slot is None
-        assert read_manifest(slot_dir) == stray
-        error_messages = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
-        assert any("slot already orphaned" in msg for msg in error_messages)
-
-    def test_key_count_is_active_only_and_sha_matches_written_file(self, tmp_path):
-        """Domain pin: with active AND stale keys present, the restamped
-        key_count is the ACTIVE count (not active+stale), and the stamped
-        registry_sha256 equals tier_registry_sha256 of the file this call
-        just wrote."""
-        from paramem.adapters.manifest import read_manifest, tier_registry_sha256
-        from paramem.memory.persistence import RESTAMPED, restamp_tier_manifest
-        from paramem.training.key_registry import KeyRegistry
-
-        tier_root = tmp_path / "episodic"
-        tier_root.mkdir(parents=True)
-        reg = KeyRegistry()
-        reg.add("graph1")
-        reg.add("graph2")
-        reg.add("graph3")
-        reg.stale("graph3")
-        h_old = hashlib.sha256(reg.save_bytes()).hexdigest()
-        reg.save(tier_root / "indexed_key_registry.json")
-
-        slot_dir = tier_root / "20260612-000000"
-        self._write_manifest_for(slot_dir, "episodic", h_old, key_count=2)
-
-        result = restamp_tier_manifest(tier_root, registry=reg)
-
-        assert result.status == RESTAMPED
-        restamped = read_manifest(slot_dir)
-        assert restamped.key_count == 2, (
-            "key_count must be the ACTIVE count (graph1, graph2), excluding "
-            f"the stale graph3; got {restamped.key_count!r}"
-        )
-        assert restamped.registry_sha256 == tier_registry_sha256(tier_root)
-
-    def test_emptied_registry_is_restamped_to_zero(self, tmp_path):
-        """A registry reduced to zero KNOWN keys (active and stale both
-        gone) still restamps -- there is no emptied-tier rule inside the
-        primitive; key_count lands as the int 0 active count."""
-        from paramem.adapters.manifest import read_manifest
-        from paramem.memory.persistence import RESTAMPED, restamp_tier_manifest
-        from paramem.training.key_registry import KeyRegistry
-
-        tier_root = tmp_path / "episodic"
-        tier_root.mkdir(parents=True)
-        reg = KeyRegistry()
-        reg.add("graph1")
-        h_old = hashlib.sha256(reg.save_bytes()).hexdigest()
-        reg.save(tier_root / "indexed_key_registry.json")
-
-        slot_dir = tier_root / "20260612-000000"
-        self._write_manifest_for(slot_dir, "episodic", h_old, key_count=1)
-
-        reg.remove("graph1")
-        assert reg.list_known() == []
-
-        result = restamp_tier_manifest(tier_root, registry=reg)
-
-        assert result.status == RESTAMPED
-        restamped = read_manifest(slot_dir)
-        assert restamped.key_count == 0
+        assert on_disk.list_stale() == ["graph1"]
+        assert "graph1" not in on_disk
+        assert on_disk.knows("graph1")

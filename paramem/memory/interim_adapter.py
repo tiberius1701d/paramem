@@ -26,8 +26,11 @@ tier walk (:func:`iter_tier_roots`), and the interim-slot enumeration
 Callers (wiring schedule):
   Scheduled consolidation path — calls create_interim_adapter when run_consolidation_cycle
       mints a new interim adapter slot during an interim training tick.
-  Full consolidation fold (ConsolidationLoop.consolidate) — calls
-      unload_interim_adapters as phase 3 of the atomic finalize sequence.
+  paramem.training.go_live.publish_bundle — calls unload_interim_adapters to
+      reap the absorbed interim slots after adopt_increments and the router
+      reload; every step of publish_bundle is individually idempotent (see
+      that module's own docstring), so a crash before this call and a resume
+      simply re-run it.
   POST /interim/discard (paramem.server.app) — calls unload_interim_adapters
       to reap the ring without folding it into the main tiers first.
 
@@ -140,9 +143,9 @@ def interim_tiers_newest_first(store) -> list[str]:
     :func:`interim_stamp_from_name`; this function does not re-declare the
     name shape.
 
-    A ``None`` *store* (no registry — replay-disabled) yields an empty list,
-    which is what makes interim slots silently unreachable in that
-    configuration.
+    A ``None`` *store* (the store step quarantined — cloud-only mode still
+    constructs a store with no model resident) yields an empty list, which
+    is what makes interim slots silently unreachable while quarantined.
     """
     if store is None:
         return []
@@ -177,54 +180,66 @@ def interim_dir_for_name(adapter_dir: Path, name: str) -> Path:
     return adapter_dir / "episodic" / f"{INTERIM_DIR_PREFIX}{stamp}"
 
 
-def slot_payload_kind(path: Path) -> str | None:
-    """Classify the payload one adapter slot directory carries.
+def has_unbound_payload(path: Path) -> bool:
+    """Return ``True`` when *path* carries a payload file with no bound slot to read it from.
 
-    ``"train"`` when *path* (or any of its own subdirectories) carries
-    adapter weights (``adapter_model.safetensors`` anywhere beneath *path*),
-    ``"simulate"`` when it carries only a ``graph.json``, and ``None`` when
-    it carries neither. Weights win over a co-resident ``graph.json`` — a
-    slot only ever legitimately holds one venue's payload, so this ordering
-    exists to make an accidental mix classify sanely rather than to choose
-    between two valid shapes.
+    ``True`` when *path* (or any of its own subdirectories) carries either
+    payload filename — adapter weights (``adapter_model.safetensors``) or a
+    projected graph (``graph.json``) — anywhere beneath it, ``False``
+    otherwise. Venue-blind by design: a simulate tier with unbound debris is
+    exactly as torn as a train one (see ``paramem.backup.backup``'s
+    ``torn_slot`` marker), so this predicate never distinguishes which
+    payload kind it found.
 
-    The weights scan prunes ``interim_*`` children before descending into
-    them, so a MAIN tier root's signal (``<adapter_dir>/<tier>/``) is never
-    satisfied by a sibling interim slot living underneath it — an episodic
-    root with no weights of its own reads as payload-less even when a child
-    ``interim_<stamp>/`` carries weights, because that child is a distinct
-    tier. The prune is a no-op for an interim slot root
+    Used ONLY by the backup capture (:mod:`paramem.backup.backup`), at the
+    point where :func:`~paramem.adapters.manifest.find_live_slot` has
+    already failed to resolve a bound slot for the tier — by definition
+    there is no manifest left to read a ``payload.kind`` from, so the
+    question this answers is narrower than a slot classification: "is there
+    debris here at all, regardless of venue."
+
+    The scan prunes ``interim_*`` children before descending into them, so a
+    MAIN tier root's signal (``<adapter_dir>/<tier>/``) is never satisfied
+    by a sibling interim slot living underneath it — an episodic root with
+    no payload of its own reads as clean even when a child
+    ``interim_<stamp>/`` carries one, because that child is a distinct tier.
+    The prune is a no-op for an interim slot root
     (``<adapter_dir>/episodic/interim_<stamp>/``), which never nests another
     ``interim_*`` directory, so this one predicate applies to both shapes.
 
-    THE single "does this slot carry content" predicate — both
-    :func:`iter_interim_dirs`'s ``mode`` filter and the boot-time
-    keyless-tier sweep
-    (:func:`paramem.server.app._sweep_keyless_tier_artifacts`) read this,
-    not a re-derived ``rglob``/``.exists()`` pair, so the venue -> payload
-    mapping cannot drift between the two callers.
+    Dot-prefixed directories (``.pending``, the write envelope's staging
+    directory) are also pruned before descending, matching
+    :func:`~paramem.adapters.manifest.iter_slot_candidates`'s rule
+    (``manifest.py:499-500``) — an interrupted write's
+    ``.pending/<ts>/<payload>`` is mid-write scratch, not a torn slot, and
+    must never read as one.
 
     Args:
-        path: Slot root directory to classify.
+        path: Slot root directory to scan.
 
     Returns:
-        ``"train"``, ``"simulate"``, or ``None``.
+        ``True`` when a payload file exists anywhere beneath *path*
+        (ignoring ``interim_*`` and dot-prefixed children); ``False``
+        otherwise.
     """
     import os
 
+    from paramem.adapters.slot import payload_filename
+
+    payload_names = {payload_filename("train"), payload_filename("simulate")}
     for _root, dirnames, filenames in os.walk(path):
-        dirnames[:] = [d for d in dirnames if not d.startswith(INTERIM_DIR_PREFIX)]
-        if "adapter_model.safetensors" in filenames:
-            return "train"
-    if (path / "graph.json").exists():
-        return "simulate"
-    return None
+        dirnames[:] = [
+            d for d in dirnames if not d.startswith(INTERIM_DIR_PREFIX) and not d.startswith(".")
+        ]
+        if payload_names & set(filenames):
+            return True
+    return False
 
 
 def iter_interim_dirs(
     adapter_dir: Path,
     *,
-    mode: str | None = None,
+    payload_only: bool = False,
 ) -> Iterator[tuple[str, Path]]:
     """Yield ``(adapter_name, dir_path)`` for interim slots on disk.
 
@@ -234,29 +249,23 @@ def iter_interim_dirs(
     An interim *directory* is not the same thing as an interim slot that holds
     *content*: a slot whose payload write never landed (crash between the
     directory creation and the payload flush) is an empty shell that carries
-    nothing to fold.  ``mode`` selects which of the two sets the caller wants;
-    the venue -> payload classification itself is :func:`slot_payload_kind`,
-    called from here so no caller has to re-implement it.
+    nothing to fold.  ``payload_only`` selects which of the two sets the
+    caller wants — payload-bearing is venue-blind: ``True`` for a slot
+    carrying either venue's payload, checked via
+    :func:`~paramem.adapters.manifest.count_slot_candidates` (a slot
+    candidate is present — presence-only, no registry-hash binding check)
+    rather than which venue it is.
 
     Args:
         adapter_dir: Adapter root (``config.adapter_dir``).
-        mode: Payload filter.
-
-            * ``None`` (default) — every interim directory on disk, regardless
-              of payload.  Required by the reaper, backup, registry hydration
-              and every other caller that must see the whole on-disk set.
-            * ``"simulate"`` — only slots :func:`slot_payload_kind` classifies
-              ``"simulate"`` (the simulate venue's payload).
-            * ``"train"`` — only slots :func:`slot_payload_kind` classifies
-              ``"train"`` (the train venue's payload).
-
-    Raises:
-        ValueError: On an unknown *mode* string.  Silently degrading to the
-            unfiltered set would let a typo re-open the payload-blind
-            behaviour this parameter exists to close.
+        payload_only: ``False`` (default) — every interim directory on disk,
+            regardless of payload.  Required by the reaper, backup, registry
+            hydration and every other caller that must see the whole
+            on-disk set.  ``True`` — only interim families that carry a
+            written payload slot, either venue.  The schedule gate uses this
+            and never asks which venue the payload belongs to.
     """
-    if mode not in (None, "simulate", "train"):
-        raise ValueError(f"iter_interim_dirs: unknown mode {mode!r} (expected None/simulate/train)")
+    from paramem.adapters.manifest import count_slot_candidates
 
     episodic = adapter_dir / "episodic"
     if not episodic.is_dir():
@@ -264,12 +273,8 @@ def iter_interim_dirs(
     for path in sorted(episodic.glob(f"{INTERIM_DIR_PREFIX}*")):
         if not path.is_dir():
             continue
-        if mode is not None:
-            kind = slot_payload_kind(path)
-            if mode == "simulate" and kind != "simulate":
-                continue
-            if mode == "train" and kind != "train":
-                continue
+        if payload_only and count_slot_candidates(path) == 0:
+            continue
         stamp = path.name[len(INTERIM_DIR_PREFIX) :]
         yield f"{INTERIM_NAME_PREFIX}{stamp}", path
 
@@ -441,9 +446,11 @@ def create_interim_adapter(
 def unload_interim_adapters(model, adapter_dir: Path) -> list[str]:
     """Reap every interim slot: the PEFT adapters (when any) and the on-disk dirs.
 
-    This is phase 3 of the consolidation finalize sequence.  It must run AFTER
-    the registry rewrite that rebooks interim keys onto the main tiers, so no
-    live registry still points at a slot this call removes.
+    Called from ``paramem.training.go_live.publish_bundle`` after
+    ``adopt_increments`` has rebooked interim keys onto the main tiers, so no
+    live registry still points at a slot this call removes; also called from
+    the ``POST /interim/discard`` door to reap the ring without folding it
+    into the main tiers first.
 
     **Both fold venues call this.**  The weights venue has PEFT interim adapters
     mounted and an on-disk slot dir per adapter; the disk venue has only the

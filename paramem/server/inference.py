@@ -1047,24 +1047,27 @@ def _probe_and_reason(
 
     Builds a ``keys_by_adapter`` dict from the routing plan's steps
     (preserving router order: procedural → episodic → semantic → session
-    adapters newest-first), dispatches to ``MemoryStore.probe`` for cache
-    resolution + on-miss source delegation, then reassembles per-layer
-    facts for context augmentation.
+    adapters newest-first), then reads it through exactly one of the two
+    serving doors, forked once on ``config.inference.preload_cache`` — the
+    ``True`` arm calls :meth:`~paramem.memory.store.MemoryStore.probe_cache`
+    (a plain RAM-mirror lookup, no source built); the ``False`` arm builds
+    the :class:`~paramem.memory.source.MemorySource` via
+    :func:`~paramem.memory.source.build_memory_source` and calls
+    :meth:`~paramem.memory.store.MemoryStore.probe_source` (one grouped
+    weight/disk probe, gated by the store's own SimHash confidence check).
+    Results then reassemble into per-layer facts for context augmentation.
 
-    Cache hits return in O(1).  On cache miss the :class:`MemorySource` built
-    by :func:`~paramem.memory.source.build_memory_source` resolves the entry and
-    the result is memoized back into the cache when
-    ``config.inference.preload_cache`` is True.
-
-    After weight probing, restores the model to the ``episodic`` adapter so
-    the next query starts from a predictable state — this restore runs only
-    on the paths that actually probed; the zero-survivor date-selection path
-    below returns before probing and never touches adapter state, and the
-    reasoning generate that follows (here or on that path) restores its own
-    adapter state via ``base_model_inference`` regardless. The reasoning
-    phase uses ``model.disable_adapter()`` so the active adapter during
-    generation does not matter — only the post-probe state (restored here,
-    when reached) does.
+    After weight probing (the ``preload_cache=False`` arm only — the cache
+    arm never touches the model), restores the model to the ``episodic``
+    adapter so the next query starts from a predictable state — this
+    restore runs only on the paths that actually probed the weights; the
+    zero-survivor date-selection path below returns before probing and
+    never touches adapter state, and the reasoning generate that follows
+    (here or on that path) restores its own adapter state via
+    ``base_model_inference`` regardless. The reasoning phase uses
+    ``model.disable_adapter()`` so the active adapter during generation
+    does not matter — only the post-probe state (restored here, when
+    reached) does.
 
     Privacy gate: ``is_personal`` flows through to every internal cloud
     fallback site (no-layers branch, base-model fallthrough, post-reason
@@ -1135,7 +1138,7 @@ def _probe_and_reason(
             last_seen_by_key: dict[str, object] = {}
             for step in plan.steps:
                 for key in step.keys_to_probe:
-                    bookkeeping = memory_store.bookkeeping_for_key(key) or {}
+                    bookkeeping = memory_store.bookkeeping_for_key(key)
                     last_seen_by_key[key] = bookkeeping.get("last_seen")
 
             # Single parse of every key's raw bookkeeping value for this
@@ -1245,43 +1248,44 @@ def _probe_and_reason(
         for step in active_steps:
             keys_by_adapter[step.adapter_name] = list(step.keys_to_probe)
 
-        # Mode-aware on-miss source from the one factory.  The MemoryStore cache is
-        # RAM-only and is the fast path; the source is the slow-path fallback when a
-        # key isn't already cached.  ``None`` (train mode, no model) leaves the probe
-        # cache-only.
-        _active_mode = effective_mode if effective_mode else config.consolidation.mode
-        source = build_memory_source(
-            mode=_active_mode,
-            adapter_dir=config.adapter_dir,
-            batch_size=config.consolidation.recall_probe_batch_size,
-            model=model,
-            tokenizer=tokenizer,
-            # Per-turn probe only: reuse the process-wide simhash-registry cache
-            # instead of re-reading and re-parsing every tier's
-            # indexed_key_registry.json from disk on every personal turn.
-            # QueryRouter.reload() invalidates the cache after every
-            # registry-mutating cycle, so this never serves stale fingerprints.
-            cached_registry=True,
-        )
+        # Fork once on inference.preload_cache — the two serving read doors
+        # are exclusive, never layered.  The cache arm never builds a
+        # source and never touches the model; the source arm builds it
+        # here and owns the post-probe adapter restore (the cache arm's
+        # reasoning generate restores its own adapter state via
+        # base_model_inference regardless — nothing to undo here).
+        if config.inference.preload_cache:
+            probe_results = memory_store.probe_cache(keys_by_adapter)
+        else:
+            _active_mode = effective_mode if effective_mode else config.consolidation.mode
+            source = build_memory_source(
+                mode=_active_mode,
+                adapter_dir=config.adapter_dir,
+                batch_size=config.consolidation.recall_probe_batch_size,
+                model=model,
+                tokenizer=tokenizer,
+                # Per-turn probe only: reuse the process-wide simhash-registry cache
+                # instead of re-reading and re-parsing every tier's
+                # indexed_key_registry.json from disk on every personal turn.
+                # QueryRouter.reload() invalidates the cache after every
+                # registry-mutating cycle, so this never serves stale fingerprints.
+                cached_registry=True,
+            )
 
-        probe_results = memory_store.probe(
-            keys_by_adapter,
-            source=source,
-            memoize=config.inference.preload_cache,
-        )
+            probe_results = memory_store.probe_source(keys_by_adapter, source=source)
 
-        # Restore predictable adapter state after weight probing: episodic is
-        # the main adapter for PM inference.  The reasoning phase uses
-        # disable_adapter() so the active adapter during generation does not
-        # matter — only the post-return state (restored here) does.  No-op in
-        # simulate mode where probing didn't touch the model.
-        if (
-            _active_mode != "simulate"
-            and model is not None
-            and hasattr(model, "peft_config")
-            and "episodic" in model.peft_config
-        ):
-            switch_adapter(model, "episodic")
+            # Restore predictable adapter state after weight probing: episodic is
+            # the main adapter for PM inference.  The reasoning phase uses
+            # disable_adapter() so the active adapter during generation does not
+            # matter — only the post-return state (restored here) does.  No-op in
+            # simulate mode where probing didn't touch the model.
+            if (
+                _active_mode != "simulate"
+                and model is not None
+                and hasattr(model, "peft_config")
+                and "episodic" in model.peft_config
+            ):
+                switch_adapter(model, "episodic")
 
         # Reassemble per-step facts so each adapter's results go to its layer.
         # Each fact retains its originating key (rather than a pre-rendered

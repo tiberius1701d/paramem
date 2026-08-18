@@ -59,7 +59,7 @@ def _make_state(tmp_path, *, mode: str = "local", cloud_only_reason=None) -> dic
             "config": _make_config(),
             "mode": mode,
             "cloud_only_reason": cloud_only_reason,
-            "session_buffer": SessionBuffer(tmp_path / "sessions", tmp_path / "state", debug=False),
+            "session_buffer": SessionBuffer(tmp_path / "sessions", debug=False),
             "speaker_store": None,
             "ha_client": None,
             "cloud_agent": MagicMock(),

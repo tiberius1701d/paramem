@@ -55,6 +55,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -97,8 +98,8 @@ class Incident:
         used by ``ack_incident``.
     type:
         Discriminator string (e.g. ``"vram_exhausted"``,
-        ``"consolidation_retry_exhausted"``).  Extensible: new failure types
-        add a ``type`` without a schema bump.
+        ``"consolidation_crash"``).  Extensible: new failure types add a
+        ``type`` without a schema bump.
     severity:
         One of ``"info"``, ``"warning"``, ``"failed"``.  Passed through
         verbatim as ``AttentionItem.level`` by ``_collect_incident_items``
@@ -237,6 +238,7 @@ def record_incident(
     severity: str,
     summary: str,
     detail: dict,
+    fields_for_existing: "Callable[[dict | None], tuple[str, str, dict]] | None" = None,
 ) -> Incident:
     """Record a failure event, deduplicating by ``(type, key)``.
 
@@ -261,11 +263,24 @@ def record_incident(
         Per-type dedup key (e.g. a session id or phase name).  The incident
         ``id`` is ``f"{type}:{key}"``.
     severity:
-        ``"info"``, ``"warning"``, or ``"failed"``.
+        ``"info"``, ``"warning"``, or ``"failed"``. Superseded by
+        *fields_for_existing*'s return value when that callback is given.
     summary:
-        Human-readable one-line description (≤ ~80 chars).
+        Human-readable one-line description (≤ ~80 chars). Superseded by
+        *fields_for_existing*'s return value when that callback is given.
     detail:
-        Arbitrary JSON-serialisable dict for structured context.
+        Arbitrary JSON-serialisable dict for structured context. Superseded
+        by *fields_for_existing*'s return value when that callback is given.
+    fields_for_existing:
+        Optional callback invoked, UNDER THE SAME LOCK as the write, with
+        the currently-stored raw row for this exact ``(type, key)`` (or
+        ``None`` when none exists yet). When given, its return value
+        ``(severity, summary, detail)`` replaces the literal arguments
+        above for this write. Lets a caller make a field's value depend on
+        the row's current on-disk state without a separate pre-lock read —
+        a lock-free read-then-decide-then-write sequence races a concurrent
+        writer between the read and this call, silently losing whichever
+        write lands second.
 
     Returns
     -------
@@ -278,6 +293,10 @@ def record_incident(
     def _mutate(current: dict | None) -> dict:
         _version, rows = _parse_store(current)
         now = _now_iso()
+        existing_row = next((r for r in rows if r.get("id") == incident_id), None)
+        eff_severity, eff_summary, eff_detail = severity, summary, detail
+        if fields_for_existing is not None:
+            eff_severity, eff_summary, eff_detail = fields_for_existing(existing_row)
         found = False
         new_rows = []
         for row in rows:
@@ -286,9 +305,9 @@ def record_incident(
                 new_row = dict(row)
                 new_row["count"] = row.get("count", 0) + 1
                 new_row["last_seen"] = now
-                new_row["summary"] = summary
-                new_row["detail"] = detail
-                new_row["severity"] = severity
+                new_row["summary"] = eff_summary
+                new_row["detail"] = eff_detail
+                new_row["severity"] = eff_severity
                 if row.get("status") == "resolved":
                     new_row["status"] = "active"
                 # A bump means the row is live again regardless of the
@@ -308,13 +327,13 @@ def record_incident(
                 {
                     "id": incident_id,
                     "type": type,
-                    "severity": severity,
+                    "severity": eff_severity,
                     "first_seen": now,
                     "last_seen": now,
                     "count": 1,
                     "status": "active",
-                    "summary": summary,
-                    "detail": detail,
+                    "summary": eff_summary,
+                    "detail": eff_detail,
                 }
             )
         result_incident = next(r for r in new_rows if r["id"] == incident_id)
@@ -354,7 +373,14 @@ def read_incidents(state_dir: Path) -> list[Incident]:
     return [Incident.from_dict(r) for r in rows]
 
 
-def resolve_incident(state_dir: Path, type: str, key: str, *, reason: str | None = None) -> bool:
+def resolve_incident(
+    state_dir: Path,
+    type: str,
+    key: str,
+    *,
+    reason: str | None = None,
+    skip_if: "Callable[[dict], bool] | None" = None,
+) -> bool:
     """Resolve the incident matching ``(type, key)``.
 
     Idempotent: returns ``False`` if no matching incident is found (normal
@@ -374,12 +400,21 @@ def resolve_incident(state_dir: Path, type: str, key: str, *, reason: str | None
         the row as ``resolved_reason``.  ``None`` (default) leaves the field
         untouched — a success-path resolve never needs one, and every
         existing call site keeps its exact prior behaviour by omitting it.
+    skip_if:
+        Optional predicate invoked, UNDER THE SAME LOCK as the write, with
+        the currently-stored raw row for this exact ``(type, key)`` (only
+        called when a not-yet-resolved row exists). When given and it
+        returns ``True``, the resolve is skipped — the row is left exactly
+        as-is instead of transitioning to resolved. Lets a caller make the
+        resolve conditional on the row's current on-disk state without a
+        separate pre-lock read — a lock-free read-then-decide-then-resolve
+        sequence races a concurrent writer between the read and this call.
 
     Returns
     -------
     bool
         ``True`` if a matching incident was found and resolved; ``False``
-        otherwise.
+        otherwise (including when *skip_if* vetoed the resolve).
     """
     # Nothing to resolve without a store, and a success path must not create
     # one: every clean op calls a resolver, so writing here would materialise
@@ -396,7 +431,7 @@ def resolve_incident(state_dir: Path, type: str, key: str, *, reason: str | None
         new_rows = []
         for row in rows:
             if row.get("id") == incident_id:
-                if row.get("status") != "resolved":
+                if row.get("status") != "resolved" and not (skip_if is not None and skip_if(row)):
                     # Actual transition: flip status and record the change.
                     found_holder[0] = True
                     new_row = dict(row)
@@ -406,9 +441,10 @@ def resolve_incident(state_dir: Path, type: str, key: str, *, reason: str | None
                         new_row["resolved_reason"] = reason
                     new_rows.append(new_row)
                 else:
-                    # Already resolved — idempotent no-op; return False to signal
-                    # no transition occurred (matching resolve_incidents_by_type
-                    # counting semantics so callers can trust the boolean).
+                    # Already resolved, or skip_if vetoed the transition —
+                    # idempotent no-op; return False to signal no transition
+                    # occurred (matching resolve_incidents_by_type counting
+                    # semantics so callers can trust the boolean).
                     new_rows.append(row)
             else:
                 new_rows.append(row)

@@ -1,6 +1,5 @@
 """Tests for the staging adapter flow (in_training slot for on-the-fly training)."""
 
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -9,10 +8,10 @@ from peft import PeftModel
 
 from paramem.memory.store import MemoryStore as _MS
 from paramem.models.loader import (
-    atomic_save_adapter,
     copy_adapter_weights,
     drop_adapter_slot,
 )
+from paramem.utils.config import AdapterConfig, TrainingConfig
 
 
 class _FakeParam:
@@ -234,140 +233,6 @@ class TestDropAdapterSlot:
         assert model.delete_adapter_calls == ["in_training"]
         assert "in_training" not in model.peft_config
         assert model.active_adapter == "episodic"
-
-
-class TestAtomicSaveAdapter:
-    def test_creates_target_directory(self, tmp_path):
-        """atomic_save_adapter creates target_dir and a timestamped slot under it.
-
-        Under the timestamped-slot layout: adapter files live in target_dir/<ts>/,
-        not in target_dir itself.  Verify the slot exists and contains the adapter files.
-        """
-        model = MagicMock()
-
-        def fake_save(path, selected_adapters):
-            Path(path).mkdir(parents=True, exist_ok=True)
-            (Path(path) / "adapter_model.safetensors").write_bytes(b"fake weights")
-            (Path(path) / "adapter_config.json").write_text("{}")
-
-        model.save_pretrained.side_effect = fake_save
-
-        target = tmp_path / "episodic"
-        slot = atomic_save_adapter(model, target, "episodic")
-
-        # target_dir itself exists
-        assert target.exists()
-        # Slot is a direct child of target_dir
-        assert slot.parent == target
-        assert (slot / "adapter_model.safetensors").exists()
-        # No stale tmp or old dirs
-        leftovers = list(tmp_path.glob("episodic.*"))
-        assert leftovers == []
-
-    def test_replaces_existing_directory(self, tmp_path):
-        """Slot-dir layout preserves history — old slot is NOT removed.
-
-        Semantic change from the old flat layout: the old slot is retained
-        alongside the new slot.  Retention/pruning happens separately via the pruner.
-        The new slot must contain the new file; both slots are visible.
-        """
-        model = MagicMock()
-        target = tmp_path / "episodic"
-
-        # Create a pre-existing slot that looks like an old save
-        old_slot = target / "20260420-000000"
-        old_slot.mkdir(parents=True)
-        (old_slot / "old_file").write_text("old")
-
-        def fake_save(path, selected_adapters):
-            Path(path).mkdir(parents=True, exist_ok=True)
-            (Path(path) / "new_file").write_text("new")
-
-        model.save_pretrained.side_effect = fake_save
-
-        new_slot = atomic_save_adapter(model, target, "episodic")
-
-        # New slot has the new file
-        assert (new_slot / "new_file").exists()
-        # Old slot is RETAINED (slot-dir preserves history)
-        assert (old_slot / "old_file").exists()
-        # No .old backup dirs (old codepath gone)
-        assert not (tmp_path / "episodic.old").exists()
-
-    def test_cleans_stale_tmp_before_write(self, tmp_path):
-        """Stale .pending/<ts>/ dirs from prior crashes are cleaned by sweep_orphan_pending.
-
-        The old .tmp.{pid} codepath is gone; .pending/<ts>/ is the new staging
-        area.  Verify that a stale pending slot does not prevent a new save and
-        that sweep_orphan_pending removes it.
-        """
-        from paramem.backup.backup import sweep_orphan_pending
-
-        model = MagicMock()
-        target = tmp_path / "episodic"
-        target.mkdir()
-
-        # Simulate a stale pending slot from a prior crash
-        stale_pending = target / ".pending" / "20260420-120000"
-        stale_pending.mkdir(parents=True)
-        (stale_pending / "junk").write_text("junk")
-
-        # sweep_orphan_pending should remove the stale slot
-        sweep_orphan_pending(target)
-        assert not stale_pending.exists()
-
-        def fake_save(path, selected_adapters):
-            Path(path).mkdir(parents=True, exist_ok=True)
-            (Path(path) / "adapter_model.safetensors").write_bytes(b"x")
-
-        model.save_pretrained.side_effect = fake_save
-        slot = atomic_save_adapter(model, target, "episodic")
-
-        assert slot.exists()
-        assert (slot / "adapter_model.safetensors").exists()
-
-    def test_peft_nested_subdir_flatten_inside_pending_slot(self, tmp_path):
-        """Verify PEFT-nested subdir is flattened INSIDE .pending before outer rename.
-
-        This guards against: (1) flattening too early (before save_pretrained),
-        (2) flattening too late (after outer rename).  The flatten must happen
-        at step 3 of the six-step sequence, inside the pending slot.
-        """
-        pending_state: dict = {}
-        original_rename = Path.rename
-
-        def _intercept_rename(self_path, target_):
-            # Intercept only the outer rename from .pending/<ts>/ to final slot
-            if (
-                ".pending" in str(self_path)
-                and self_path.is_dir()
-                and self_path.parent.name == ".pending"
-            ):
-                pending_state["files"] = [f.name for f in self_path.iterdir()]
-                pending_state["has_nested"] = (self_path / "episodic").exists()
-            return original_rename(self_path, target_)
-
-        def fake_save_nested(path, selected_adapters):
-            nested = Path(path) / "episodic"
-            nested.mkdir(parents=True, exist_ok=True)
-            (nested / "adapter_model.safetensors").write_bytes(b"weights")
-            (nested / "adapter_config.json").write_text("{}")
-
-        model = MagicMock()
-        model.save_pretrained.side_effect = fake_save_nested
-
-        with patch.object(Path, "rename", _intercept_rename):
-            final_slot = atomic_save_adapter(model, tmp_path / "episodic", "episodic")
-
-        # Flatten must have run before outer rename
-        assert not pending_state.get("has_nested", True), (
-            "Nested subdir must be absent inside pending slot at rename time"
-        )
-        assert "adapter_model.safetensors" in pending_state.get("files", [])
-
-        # Final slot must also be flat
-        assert (final_slot / "adapter_model.safetensors").exists()
-        assert not (final_slot / "episodic").exists()
 
 
 class TestStagedWeightsDisposalGuard:
@@ -656,7 +521,7 @@ class TestStaleInTrainingCleanup:
             training_config=TrainingConfig(),
             episodic_adapter_config=AdapterConfig(),
             semantic_adapter_config=AdapterConfig(),
-            memory_store=_MS(replay_enabled=False),
+            memory_store=_MS(),
             output_dir=tmp_path,
             extraction_scrub={"person name"},
             extraction_max_tokens=8192,
@@ -696,3 +561,256 @@ class TestFirstCycleEdgeCase:
                 assert torch.all(p.data == 0.0), (
                     f"Zero copy failed: {name} still has non-zero values"
                 )
+
+
+def _make_train_adapter_model():
+    """Fake PeftModel-like object exercising ``train_adapter``'s real
+    staging-init decision table (``_ensure_staging_slot`` / ``create_adapter``
+    / ``copy_adapter_weights`` / ``drop_adapter_slot`` /
+    ``lora_b_frobenius_norm`` all run for real against it) -- no GPU, no real
+    PEFT model.  ``__class__ = PeftModel`` (mirrors
+    ``tests/test_loader.py::_make_fake_backup_model``) so ``create_adapter``
+    takes the ``add_adapter`` path rather than a real ``get_peft_model()``
+    wrap.
+    """
+    model = MagicMock()
+    model.__class__ = PeftModel
+    model.peft_config = {}
+    params: dict = {}
+
+    def _seed(name, lora_b_value=0.0):
+        model.peft_config[name] = MagicMock(base_model_name_or_path=None)
+        params[f"base_model.model.layer0.q_proj.lora_A.{name}.weight"] = MagicMock(
+            data=torch.ones(2, 2)
+        )
+        params[f"base_model.model.layer0.q_proj.lora_B.{name}.weight"] = MagicMock(
+            data=torch.full((2, 2), float(lora_b_value))
+        )
+
+    def _add_adapter(name, lora_config):
+        # Mirrors real PEFT: a freshly created adapter starts LoRA-B at zero.
+        _seed(name, lora_b_value=0.0)
+
+    def _set_adapter(name):
+        model.active_adapter = name
+
+    def _delete_adapter(name):
+        model.peft_config.pop(name, None)
+        for key in [k for k in params if f".{name}." in k]:
+            del params[key]
+
+    model.add_adapter.side_effect = _add_adapter
+    model.set_adapter.side_effect = _set_adapter
+    model.delete_adapter.side_effect = _delete_adapter
+    model.named_parameters.side_effect = lambda: list(params.items())
+    model.parameters.side_effect = lambda: [p.data for p in params.values()]
+    model.get_base_model.return_value.config._name_or_path = "fake/base-model"
+    model._params = params
+    model._seed = _seed
+    return model
+
+
+def _null_trainer_patches():
+    """The three HF-Trainer-boundary patches every real-``train_adapter``
+    test in this class needs (mirrors
+    ``tests/test_background_trainer.py::TestTrainAdapterAbortReturn``): no
+    HF Trainer construction, no ``TrainingArguments`` validation, no real
+    checkpoint encryption callback."""
+
+    class _NullTrainer:
+        def __init__(self, **kwargs):
+            pass
+
+        def train(self, resume_from_checkpoint=None):
+            return MagicMock(metrics={"train_loss": 0.1})
+
+    return (
+        patch("paramem.training.trainer.ParamemTrainer", new=_NullTrainer),
+        patch("paramem.training.trainer.TrainingArguments", return_value=MagicMock()),
+        patch(
+            "paramem.training.encrypted_checkpoint_callback.EncryptCheckpointCallback",
+            MagicMock,
+        ),
+    )
+
+
+class TestTrainAdapterStagingInitTable:
+    """``train_adapter``'s own four-way staging-init decision table: the
+    staging slot's starting weights are decided once, between
+    ``_ensure_staging_slot`` and ``model.set_adapter(STAGING_ADAPTER)`` --
+    nothing here ever writes the production tier (*adapter_name*)."""
+
+    def _training_config(self):
+        return TrainingConfig(
+            num_epochs=1, gradient_checkpointing=False, batch_size=1, warmup_steps=0
+        )
+
+    def _dataset(self):
+        return [{"input_ids": [1], "labels": [1], "attention_mask": [1]}]
+
+    def _run(self, model, adapter_config, tmp_path, **kwargs):
+        from paramem.training.trainer import STAGING_ADAPTER, train_adapter
+
+        p1, p2, p3 = _null_trainer_patches()
+        with p1, p2, p3:
+            metrics = train_adapter(
+                model=model,
+                tokenizer=MagicMock(),
+                train_dataset=self._dataset(),
+                adapter_name="episodic",
+                training_config=self._training_config(),
+                adapter_config=adapter_config,
+                output_dir=tmp_path,
+                **kwargs,
+            )
+        return metrics, STAGING_ADAPTER
+
+    def test_cold_start_trains_staging_from_lora_zero_without_touching_the_tier(self, tmp_path):
+        """warm_start=False on a tier with prior trained (warm) weights:
+        staging starts cold, and the tier's own weights never move.  A
+        generic ``train_adapter`` parameter -- no production caller passes
+        ``False`` (warm start is uniform across every event kind, including
+        a reconcile); this pins the boolean's own behaviour directly."""
+        model = _make_train_adapter_model()
+        model._seed("episodic", lora_b_value=7.0)  # prior trained (warm) weights
+        before = model._params["base_model.model.layer0.q_proj.lora_B.episodic.weight"].data.clone()
+
+        ac = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
+        metrics, staging = self._run(model, ac, tmp_path, warm_start=False)
+
+        assert metrics["init"] == "cold"
+        staging_b = model._params[f"base_model.model.layer0.q_proj.lora_B.{staging}.weight"].data
+        assert torch.all(staging_b == 0.0)
+        after = model._params["base_model.model.layer0.q_proj.lora_B.episodic.weight"].data
+        assert torch.equal(before, after)
+
+    def test_warm_start_copies_production_into_staging(self, tmp_path):
+        model = _make_train_adapter_model()
+        model._seed("episodic", lora_b_value=7.0)
+        before = model._params["base_model.model.layer0.q_proj.lora_B.episodic.weight"].data.clone()
+
+        ac = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
+        metrics, staging = self._run(model, ac, tmp_path, warm_start=True)
+
+        assert metrics["init"] == "warm"
+        staging_b = model._params[f"base_model.model.layer0.q_proj.lora_B.{staging}.weight"].data
+        assert torch.all(staging_b == 7.0)
+        after = model._params["base_model.model.layer0.q_proj.lora_B.episodic.weight"].data
+        assert torch.equal(before, after)
+
+    def test_warm_start_wins_over_a_donor_checkpoint_for_a_prior_trained_tier(self, tmp_path):
+        """Table precedence: a tier with prior trained weights never seeds
+        from a donor, even when one is supplied."""
+        model = _make_train_adapter_model()
+        model._seed("episodic", lora_b_value=7.0)
+
+        ac = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
+        with patch("paramem.training.donor.load_donor_into_transient_slot") as mock_load:
+            metrics, _ = self._run(
+                model, ac, tmp_path, warm_start=True, donor_checkpoint_dir=tmp_path / "donor"
+            )
+
+        assert metrics["init"] == "warm"
+        assert not mock_load.called
+
+    def test_no_prior_weights_no_donor_trains_from_lora_zero(self, tmp_path):
+        model = _make_train_adapter_model()
+        model._seed("episodic", lora_b_value=0.0)  # resident but cold (never trained)
+
+        ac = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
+        metrics, staging = self._run(
+            model, ac, tmp_path, warm_start=True, donor_checkpoint_dir=None
+        )
+
+        assert metrics["init"] == "cold"
+        staging_b = model._params[f"base_model.model.layer0.q_proj.lora_B.{staging}.weight"].data
+        assert torch.all(staging_b == 0.0)
+
+    def test_donor_seeding_initialises_staging_never_the_tier(self, tmp_path):
+        model = _make_train_adapter_model()
+        model._seed("episodic", lora_b_value=0.0)  # no prior trained weights
+        before = model._params["base_model.model.layer0.q_proj.lora_B.episodic.weight"].data.clone()
+
+        def _fake_load(model, checkpoint_dir, transient_name):
+            model._seed(transient_name, lora_b_value=42.0)
+
+        ac = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
+        with patch("paramem.training.donor.load_donor_into_transient_slot", side_effect=_fake_load):
+            metrics, staging = self._run(
+                model, ac, tmp_path, warm_start=True, donor_checkpoint_dir=tmp_path / "donor"
+            )
+
+        assert metrics["init"] == "donor"
+        staging_b = model._params[f"base_model.model.layer0.q_proj.lora_B.{staging}.weight"].data
+        assert torch.all(staging_b == 42.0)
+        after = model._params["base_model.model.layer0.q_proj.lora_B.episodic.weight"].data
+        assert torch.equal(before, after)
+        assert "_donor_seed" not in model.peft_config, (
+            "the transient donor-load slot must be dropped after copy"
+        )
+
+    def test_donor_load_failure_degrades_to_cold_and_drops_the_transient(self, tmp_path):
+        """Seeding is an optimization over LoRA-zero -- a load/copy failure
+        costs the seed, never the fold, and the transient slot is still
+        cleaned up."""
+        model = _make_train_adapter_model()
+        model._seed("episodic", lora_b_value=0.0)
+
+        def _fake_load(model, checkpoint_dir, transient_name):
+            model._seed(transient_name, lora_b_value=42.0)
+
+        ac = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
+        with (
+            patch("paramem.training.donor.load_donor_into_transient_slot", side_effect=_fake_load),
+            patch(
+                "paramem.models.loader.copy_adapter_weights",
+                side_effect=RuntimeError("shape mismatch"),
+            ),
+        ):
+            metrics, staging = self._run(
+                model, ac, tmp_path, warm_start=True, donor_checkpoint_dir=tmp_path / "donor"
+            )
+
+        assert metrics["init"] == "cold"
+        assert "_donor_seed" not in model.peft_config
+
+    def test_cold_start_failure_mid_call_leaves_the_tier_untouched(self, tmp_path):
+        """An exception raised mid-training (``warm_start=False``) never
+        reaches the tier: nothing in the staging-init path writes
+        *adapter_name*, so there is nothing for a crash to corrupt there."""
+        model = _make_train_adapter_model()
+        model._seed("episodic", lora_b_value=7.0)
+        before = model._params["base_model.model.layer0.q_proj.lora_B.episodic.weight"].data.clone()
+
+        class _RaisingTrainer:
+            def __init__(self, **kwargs):
+                pass
+
+            def train(self, resume_from_checkpoint=None):
+                raise RuntimeError("boom")
+
+        ac = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
+        from paramem.training.trainer import train_adapter
+
+        with (
+            patch("paramem.training.trainer.ParamemTrainer", new=_RaisingTrainer),
+            patch("paramem.training.trainer.TrainingArguments", return_value=MagicMock()),
+            patch(
+                "paramem.training.encrypted_checkpoint_callback.EncryptCheckpointCallback",
+                MagicMock,
+            ),
+            pytest.raises(RuntimeError, match="boom"),
+        ):
+            train_adapter(
+                model=model,
+                tokenizer=MagicMock(),
+                train_dataset=self._dataset(),
+                adapter_name="episodic",
+                training_config=self._training_config(),
+                adapter_config=ac,
+                output_dir=tmp_path,
+                warm_start=False,
+            )
+
+        after = model._params["base_model.model.layer0.q_proj.lora_B.episodic.weight"].data
+        assert torch.equal(before, after)

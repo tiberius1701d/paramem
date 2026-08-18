@@ -31,6 +31,58 @@ def _sha256(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()
 
 
+def _write_fake_bundle_manifest(
+    bundle_slot: Path, *, weightless: dict[str, str] | None = None
+) -> None:
+    """Write a schema-valid ``bundle.meta.json`` into a fake ``write_bundle`` return slot.
+
+    Every base-swap orchestration test mocks ``write_bundle`` to return a
+    bare directory rather than running the real capture; the fresh-start
+    rollback-anchor gate (``_run_base_swap_orchestration``) reads that
+    slot's manifest immediately after ``write_bundle`` returns, so the
+    mocked slot needs a real, schema-valid manifest to stand in for it.
+    Mirrors :class:`~paramem.backup.types.BundleManifest`'s ``adapters``
+    shape (only ``weightless_cause`` matters to the gate; the other
+    per-adapter fields are placeholders).
+
+    Parameters
+    ----------
+    bundle_slot:
+        Directory to write ``bundle.meta.json`` into.  Must already exist.
+    weightless:
+        Optional ``{adapter_name: weightless_cause}`` map — every named
+        adapter's record carries that cause; every other tracked tier
+        (``episodic``, ``semantic``, ``procedural``) is recorded as an
+        ordinary (non-weightless) capture.  ``None`` (default) writes a
+        fully-bound manifest with no weightless tiers.
+    """
+    from paramem.backup.types import BUNDLE_SCHEMA_VERSION
+
+    weightless = weightless or {}
+    adapters = {
+        name: {
+            "slot_source": "",
+            "registry_sha256": "",
+            "key_count": 0,
+            "indexed_key_registry_present": False,
+            "keyed_pairs_present": False,
+            "weightless_cause": weightless.get(name),
+        }
+        for name in ("episodic", "semantic", "procedural")
+    }
+    manifest = {
+        "bundle_schema_version": BUNDLE_SCHEMA_VERSION,
+        "created_at": "2026-05-24T00:00:00+00:00",
+        "tier": "pre_base_swap",
+        "label": "pre_base_swap_test",
+        "base_model": {},
+        "files": [],
+        "adapters": adapters,
+        "excluded": [],
+    }
+    (bundle_slot / "bundle.meta.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+
 def _make_state(tmp_path: Path) -> dict:
     """Build a STAGING _state with a real candidate file."""
     live_yaml = tmp_path / "server.yaml"
@@ -45,7 +97,6 @@ def _make_state(tmp_path: Path) -> dict:
     config.paths.data.mkdir(parents=True, exist_ok=True)
     config.adapter_dir = tmp_path / "data" / "ha" / "adapters"
     config.adapter_dir.mkdir(parents=True, exist_ok=True)
-    config.key_metadata_path = tmp_path / "data" / "ha" / "key_metadata.json"
 
     loop_mock = MagicMock()
     loop_mock.merger.save_bytes.return_value = b'{"nodes":[],"links":[]}'
@@ -351,14 +402,12 @@ class TestConfirmStepFailures:
 class TestConfirmTrialAdapterDirUnderStateDir:
     """Verify confirm stores trial_adapter_dir under state_dir (not state_dir.parent).
 
-    (2026-04-22 E2E baseline): the confirm handler computed
-    ``(state_dir.parent / "trial_adapter")`` which resolves to
-    ``data/ha/trial_adapter`` (missing the ``state/`` segment).  Gate 3
-    looked for quads.json at that wrong path and emitted a false FAIL
-    on every real trial.
-
-    Fix: use ``(state_dir / "trial_adapter")`` so the path is
-    ``data/ha/state/trial_adapter``.
+    The confirm handler mints ``trial_adapter_dir`` as
+    ``state_dir / "trial" / "adapters"`` — always a descendant of
+    ``state_dir``, never a sibling (``state_dir.parent / "trial_adapter"``,
+    the historical regression this class guards against: gate 3 looked for
+    quads.json at the wrong path and emitted a false FAIL on every real
+    trial).
     """
 
     def test_trial_adapter_dir_under_state_dir_after_confirm(self, client, state, tmp_path):
@@ -1052,9 +1101,6 @@ class TestRunBaseSwapPhaseA:
         config = MagicMock()
         config.paths.data = tmp_path / "data"
         config.paths.data.mkdir(parents=True, exist_ok=True)
-        config.paths.key_metadata = tmp_path / "data" / "key_metadata.json"
-        config.paths.key_metadata.parent.mkdir(parents=True, exist_ok=True)
-        config.key_metadata_path = config.paths.key_metadata  # mirror the real property
         config.adapter_dir = tmp_path / "adapters"
         config.adapter_dir.mkdir(parents=True, exist_ok=True)
         config.model_name = "mistral"
@@ -1106,6 +1152,7 @@ class TestRunBaseSwapPhaseA:
         resume_phase: str = "",
         use_thread_submit: bool = False,
         phase_a_migrate_error: Exception | None = None,
+        weightless_adapters: dict[str, str] | None = None,
     ):
         """Helper: run _run_base_swap_orchestration with mocks via asyncio.run().
 
@@ -1141,6 +1188,10 @@ class TestRunBaseSwapPhaseA:
         propagate through the fake synchronous submit".
         ``phase_a_migrate_error`` — when given, the Phase A ``migrate()``
         call (first call) raises this instead of returning a result.
+        ``weightless_adapters`` — when given, the fake bundle's manifest
+        marks these ``{adapter_name: weightless_cause}`` pairs instead of a
+        fully-bound capture — exercises the fresh-start rollback-anchor
+        gate's refusal path.
         """
         import asyncio
         import contextlib
@@ -1160,6 +1211,7 @@ class TestRunBaseSwapPhaseA:
 
         bundle_slot = tmp_path / "bundle_slot_dir"
         bundle_slot.mkdir()
+        _write_fake_bundle_manifest(bundle_slot, weightless=weightless_adapters)
 
         call_order: list[str] = []
         rename_calls: list = []
@@ -1851,6 +1903,102 @@ class TestBaseSwapSetupFailure:
         assert "resolve_incidents_by_type" in caplog.text
 
 
+class TestBaseSwapRollbackAnchorGate:
+    """The fresh-start rollback-anchor gate refuses a swap whose just-written
+    bundle marks any tier ``weightless_cause`` (torn train slot).
+
+    Composes ``TestRunBaseSwapPhaseA``'s helpers via ``self._phase_a`` — same
+    pattern as ``TestBaseSwapSetupFailure``.  Every test passes
+    ``patch_gates=False`` so ``_finish_base_swap`` runs for real and
+    ``_state["migration"]`` reflects the actual reset.
+    """
+
+    _phase_a = TestRunBaseSwapPhaseA()
+
+    def test_weightless_capture_refuses_swap_before_mutation(self, tmp_path, monkeypatch):
+        """A weightless-marked tier in the fresh capture ends the swap
+        setup_failed before Phase A ever submits, names the tier/cause/
+        remedy in the gates report, surfaces the bundle path, leaves the
+        live config untouched, and never renamed the candidate config."""
+        state = self._phase_a._make_phase_a_state(tmp_path)
+        live_yaml_bytes_before = b"model: mistral\n"
+
+        call_order, rename_calls, _, _, state_dir = self._phase_a._run_phase_a(
+            state,
+            monkeypatch,
+            tmp_path,
+            patch_gates=False,
+            weightless_adapters={"episodic": "torn_train_slot"},
+        )
+
+        # Refused before any mutation: Phase A never submitted, config never
+        # promoted.
+        assert call_order == ["bundle"]
+        assert rename_calls == []
+
+        # Classified setup_failed via the existing setup-failure machinery.
+        assert state["migration"]["state"] == "LIVE"
+        gates = state["migration"]["trial"]["gates"]
+        assert gates["status"] == "setup_failed"
+
+        # Gates report names the torn tier, its cause, and the remedy.
+        exc_text = gates["exception"]
+        assert "episodic" in exc_text
+        assert "torn_train_slot" in exc_text
+        assert "repair the store" in exc_text
+        assert "retry the swap" in exc_text
+
+        # Bundle path surfaced — the capture is preserved, not discarded.
+        assert gates["bundle_path"] == str((tmp_path / "bundle_slot_dir").resolve())
+        assert Path(gates["bundle_path"]).exists()
+
+        # Live config untouched — immediately retryable.
+        assert (tmp_path / "server.yaml").read_bytes() == live_yaml_bytes_before
+
+        # No trial marker was ever written (setup failure, pre-marker).
+        assert read_trial_marker(state_dir) is None
+
+        # Exactly one active migration_phase_failed incident recorded.
+        from paramem.server.incidents import read_incidents
+
+        incidents = [i for i in read_incidents(state_dir) if i.status == "active"]
+        matching = [i for i in incidents if i.id == "migration_phase_failed:setup_failed"]
+        assert len(matching) == 1, f"expected exactly one active incident; got {incidents}"
+
+    def test_weightless_capture_multiple_tiers_named_in_report(self, tmp_path, monkeypatch):
+        """Every marked tier is named in the gates report, not just the first."""
+        state = self._phase_a._make_phase_a_state(tmp_path)
+
+        _, _, _, _, _ = self._phase_a._run_phase_a(
+            state,
+            monkeypatch,
+            tmp_path,
+            patch_gates=False,
+            weightless_adapters={
+                "episodic": "torn_train_slot",
+                "semantic": "torn_train_slot",
+            },
+        )
+
+        gates = state["migration"]["trial"]["gates"]
+        assert gates["status"] == "setup_failed"
+        assert "episodic" in gates["exception"]
+        assert "semantic" in gates["exception"]
+
+    def test_unmarked_capture_proceeds_past_the_gate(self, tmp_path, monkeypatch):
+        """A fully-bound capture (no weightless tiers) is unaffected by the
+        gate — Phase A submits and the swap completes normally."""
+        state = self._phase_a._make_phase_a_state(tmp_path)
+
+        call_order, _, gates_received, _, _ = self._phase_a._run_phase_a(
+            state, monkeypatch, tmp_path, succeed=True, reload_mode="local"
+        )
+
+        assert "phase_a_submit" in call_order
+        assert "phase_b_submit" in call_order
+        assert gates_received[-1]["status"] == "pass"
+
+
 # ---------------------------------------------------------------------------
 # Reload-deferred path + Phase B ordering
 # ---------------------------------------------------------------------------
@@ -1868,9 +2016,6 @@ class TestBaseSwapOrchestration:
         config = MagicMock()
         config.paths.data = tmp_path / "data"
         config.paths.data.mkdir(parents=True, exist_ok=True)
-        config.paths.key_metadata = tmp_path / "data" / "key_metadata.json"
-        config.paths.key_metadata.parent.mkdir(parents=True, exist_ok=True)
-        config.key_metadata_path = config.paths.key_metadata  # mirror the real property
         config.adapter_dir = tmp_path / "adapters"
         config.adapter_dir.mkdir(parents=True, exist_ok=True)
         config.model_name = "mistral"
@@ -1956,6 +2101,7 @@ class TestBaseSwapOrchestration:
 
         bundle_slot = tmp_path / "bundle_slot_dir"
         bundle_slot.mkdir()
+        _write_fake_bundle_manifest(bundle_slot)
 
         call_order: list[str] = []
         gates_received: list[dict] = []
@@ -2210,6 +2356,7 @@ class TestBaseSwapOrchestration:
         backups_root.mkdir(parents=True, exist_ok=True)
         bundle_slot = tmp_path / "bundle_slot_dir"
         bundle_slot.mkdir()
+        _write_fake_bundle_manifest(bundle_slot)
 
         markers_at_submit: list[str] = []
         submit_count = [0]
@@ -2456,6 +2603,7 @@ class TestBaseSwapOrchestration:
 
         bundle_slot = tmp_path / "bundle_slot_dir"
         bundle_slot.mkdir()
+        _write_fake_bundle_manifest(bundle_slot)
 
         call_order: list[str] = []
         gates_received: list[dict] = []
@@ -2593,9 +2741,6 @@ class TestBaseSwapResumePhaseAware:
         config = MagicMock()
         config.paths.data = tmp_path / "data"
         config.paths.data.mkdir(parents=True, exist_ok=True)
-        config.paths.key_metadata = tmp_path / "data" / "key_metadata.json"
-        config.paths.key_metadata.parent.mkdir(parents=True, exist_ok=True)
-        config.key_metadata_path = config.paths.key_metadata  # mirror the real property
         config.adapter_dir = tmp_path / "adapters"
         config.adapter_dir.mkdir(parents=True, exist_ok=True)
         config.model_name = model_name
@@ -2711,6 +2856,7 @@ class TestBaseSwapResumePhaseAware:
 
         real_bundle_slot = tmp_path / "real_bundle_slot_dir"
         real_bundle_slot.mkdir()
+        _write_fake_bundle_manifest(real_bundle_slot)
 
         bundle_call_count = [0]
         submit_calls: list[str] = []
@@ -3042,9 +3188,6 @@ class TestBaseSwapStep3ResumeReload:
         config = MagicMock()
         config.paths.data = tmp_path / "data"
         config.paths.data.mkdir(parents=True, exist_ok=True)
-        config.paths.key_metadata = tmp_path / "data" / "key_metadata.json"
-        config.paths.key_metadata.parent.mkdir(parents=True, exist_ok=True)
-        config.key_metadata_path = config.paths.key_metadata  # mirror the real property
         config.adapter_dir = tmp_path / "adapters"
         config.adapter_dir.mkdir(parents=True, exist_ok=True)
         config.model_name = model_name
@@ -3130,6 +3273,7 @@ class TestBaseSwapStep3ResumeReload:
 
         bundle_slot = tmp_path / "bundle_slot_dir"
         bundle_slot.mkdir()
+        _write_fake_bundle_manifest(bundle_slot)
         self._write_phase_a_done_marker(state_dir, str(bundle_slot))
 
         apply_called: list[bool] = []
@@ -3671,7 +3815,6 @@ class TestBaseSwapActiveFlag:
         state_config = MagicMock()
         state_config.paths.data = tmp_path / "data"
         state_config.paths.data.mkdir(parents=True, exist_ok=True)
-        state_config.paths.key_metadata = tmp_path / "data" / "key_metadata.json"
         state_config.adapter_dir = tmp_path / "adapters"
         state_config.adapter_dir.mkdir(parents=True, exist_ok=True)
         adapters_cfg = MagicMock()
@@ -3712,6 +3855,7 @@ class TestBaseSwapActiveFlag:
         backups_root.mkdir(parents=True, exist_ok=True)
         bundle_slot = tmp_path / "bundle_slot_dir"
         bundle_slot.mkdir()
+        _write_fake_bundle_manifest(bundle_slot)
 
         submit_count = [0]
 
@@ -4167,9 +4311,6 @@ class TestPhaseBModelIdentityGuard:
         config = MagicMock()
         config.paths.data = tmp_path / "data"
         config.paths.data.mkdir(parents=True, exist_ok=True)
-        config.paths.key_metadata = tmp_path / "data" / "key_metadata.json"
-        config.paths.key_metadata.parent.mkdir(parents=True, exist_ok=True)
-        config.key_metadata_path = config.paths.key_metadata  # mirror the real property
         config.adapter_dir = tmp_path / "adapters"
         config.adapter_dir.mkdir(parents=True, exist_ok=True)
         # model_name is set to the currently-loaded model.  After a successful
@@ -4240,6 +4381,7 @@ class TestPhaseBModelIdentityGuard:
 
         bundle_slot = tmp_path / "bundle_slot_dir"
         bundle_slot.mkdir()
+        _write_fake_bundle_manifest(bundle_slot)
 
         migrate_call_count = [0]
         gates_received: list[dict] = []
@@ -4477,6 +4619,7 @@ class TestPhaseBModelIdentityGuard:
         backups_root.mkdir(parents=True, exist_ok=True)
         bundle_slot = tmp_path / "bundle_slot_dir"
         bundle_slot.mkdir()
+        _write_fake_bundle_manifest(bundle_slot)
 
         migrate_call_count = [0]
         gates_received: list[dict] = []

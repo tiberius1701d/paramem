@@ -3,7 +3,6 @@
 Covers:
   - TrainingJob.inference_fallback_adapter field defaults to "episodic".
   - abort_for_inference() returns False when idle, sets abort event, quiesces.
-  - abort_requested() returns False when idle, True when abort event is set.
   - training_hooks_for_job ORs shutdown_requested, abort flag, and caller gate.
   - Per-job abort events do not leak across jobs.
   - on_shutdown_check fires at step_end via TrainingHooks.
@@ -248,6 +247,34 @@ class TestAbortForInference:
 
         bt._active_abort.set()
         assert hooks.on_shutdown_check() is True
+
+
+class TestSetIsTrainingAPI:
+    """BackgroundTrainer._set_is_training(value) overwrites _is_training."""
+
+    def test_set_is_training_true(self) -> None:
+        model = _make_stub_model("episodic", "in_training")
+        bt = BackgroundTrainer(
+            model=model,
+            tokenizer=MagicMock(),
+            training_config=_minimal_training_config(),
+            output_dir="/tmp/test_set_is_training",
+        )
+        bt._is_training = False
+        bt._set_is_training(True)
+        assert bt._is_training is True
+
+    def test_set_is_training_false(self) -> None:
+        model = _make_stub_model("episodic", "in_training")
+        bt = BackgroundTrainer(
+            model=model,
+            tokenizer=MagicMock(),
+            training_config=_minimal_training_config(),
+            output_dir="/tmp/test_set_is_training2",
+        )
+        bt._is_training = True
+        bt._set_is_training(False)
+        assert bt._is_training is False
 
 
 # ---------------------------------------------------------------------------
@@ -1031,74 +1058,3 @@ class TestWorkerJobBoundary:
             f"_shutdown_requested must be False at job start even after being set True "
             f"before submit; got {observed_at_job_start}"
         )
-
-
-# ---------------------------------------------------------------------------
-# Test — abort_requested() (phase-2 re-probe abort gate)
-# ---------------------------------------------------------------------------
-
-
-class TestAbortRequested:
-    """abort_requested() exposes the per-job abort flag without leaking privates."""
-
-    def test_returns_false_when_no_active_job(self) -> None:
-        """abort_requested() returns False when _active_abort is None."""
-        bt = BackgroundTrainer(
-            model=_make_stub_model("episodic"),
-            tokenizer=MagicMock(),
-            training_config=_minimal_training_config(),
-            output_dir="/tmp/test_abort_requested_idle",
-        )
-        assert bt._active_abort is None
-        assert bt.abort_requested() is False
-
-    def test_returns_false_when_active_but_not_set(self) -> None:
-        """abort_requested() returns False when an abort event exists but is not set."""
-        bt = BackgroundTrainer(
-            model=_make_stub_model("episodic"),
-            tokenizer=MagicMock(),
-            training_config=_minimal_training_config(),
-            output_dir="/tmp/test_abort_requested_not_set",
-        )
-        with bt._active_state_lock:
-            bt._active_abort = threading.Event()
-            bt._active_quiesced = threading.Event()
-
-        assert bt.abort_requested() is False
-
-    def test_returns_true_after_abort_event_set(self) -> None:
-        """abort_requested() returns True once the abort event is set."""
-        bt = BackgroundTrainer(
-            model=_make_stub_model("episodic"),
-            tokenizer=MagicMock(),
-            training_config=_minimal_training_config(),
-            output_dir="/tmp/test_abort_requested_set",
-        )
-        with bt._active_state_lock:
-            bt._active_abort = threading.Event()
-            bt._active_quiesced = threading.Event()
-
-        bt._active_abort.set()
-        assert bt.abort_requested() is True
-
-    def test_returns_false_after_event_cleared(self) -> None:
-        """abort_requested() returns False once the abort event is cleared."""
-        bt = BackgroundTrainer(
-            model=_make_stub_model("episodic"),
-            tokenizer=MagicMock(),
-            training_config=_minimal_training_config(),
-            output_dir="/tmp/test_abort_requested_cleared",
-        )
-        with bt._active_state_lock:
-            bt._active_abort = threading.Event()
-            bt._active_quiesced = threading.Event()
-
-        bt._active_abort.set()
-        assert bt.abort_requested() is True
-
-        # Simulate job teardown clearing the event.
-        with bt._active_state_lock:
-            bt._active_abort = None
-            bt._active_quiesced = None
-
-        assert bt.abort_requested() is False

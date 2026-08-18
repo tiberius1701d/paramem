@@ -290,10 +290,9 @@ class TestAttributeDisplaySurfaceSeparation:
 class TestAttributeGateDoesNotReachUpsertRelation:
     def test_no_upsert_relation_side_effects(self):
         """An attribute relation must never touch the Case-1/2/3 machinery
-        (collapsed/removal_ledger stay empty)."""
+        (removal_ledger stays empty)."""
         merger = GraphMerger()
         merger.merge(_session(_attr_relation()))
-        assert merger.collapsed == []
         assert merger.removal_ledger == {}
 
     def test_existing_subject_reinforcement_count_unchanged(self):

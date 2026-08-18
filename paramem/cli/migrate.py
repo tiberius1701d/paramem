@@ -460,8 +460,10 @@ def _poll_until_healthy(server_url: str) -> bool:
     """Poll ``GET /status`` until the server is healthy or the timeout expires.
 
     Tolerates ``ServerUnreachable`` (connection refused during the bounce
-    window).  Returns ``True`` when the server responds and does not report
-    ``boot_degraded``.  Returns ``False`` on timeout.
+    window).  Returns ``True`` once the server responds with a ``mode`` —
+    the poll's only healthy condition; a quarantined-but-otherwise-healthy
+    server still answers ``mode`` and is not itself a restart-poll failure.
+    Returns ``False`` on timeout.
 
     Parameters
     ----------
@@ -479,7 +481,7 @@ def _poll_until_healthy(server_url: str) -> bool:
     while _time.monotonic() < deadline:
         try:
             status = http_client.get_json(f"{server_url}/status")
-            if status.get("mode") and not status.get("boot_degraded"):
+            if status.get("mode"):
                 return True
         except http_client.ServerUnreachable:
             pass  # expected during the bounce window

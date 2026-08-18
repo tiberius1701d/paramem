@@ -2115,7 +2115,7 @@ class TestContractCarriedFactsParity:
         """Session-tier counterpart: with ``scrub=set()``
         (operator opt-out), ``anonymize()``'s opt-out branch carries the
         input facts verbatim in ``payload.facts`` (regression
-        guard: a ``facts=[]`` opt-out would silently withhold every fact
+        guard: a ``facts=[]`` opt-out would silently drop every fact
         from a payload the operator asked to egress unmasked) — so
         ``stage_enrich``'s ``anon_facts`` derivation is non-empty, not
         ``[]``."""
@@ -2155,7 +2155,7 @@ class TestContractCarriedFactsParity:
             )
 
         assert captured, "expected request_enrichment to be called"
-        assert captured[0] != [], "opt-out anon_facts must not be silently withheld"
+        assert captured[0] != [], "opt-out anon_facts must not be silently dropped"
         assert len(captured[0]) == 1
         assert captured[0][0]["subject"] == "Alex"
 

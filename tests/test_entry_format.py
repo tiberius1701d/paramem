@@ -346,8 +346,8 @@ class TestContentOnlyEntry:
     fresh fold and a resumed fold write the identical entry shape."""
 
     def test_drops_provenance_fields(self):
-        """speaker_id, relation_type, and any other extra field (e.g. the
-        _new mint sentinel) are dropped; only the four content fields survive."""
+        """speaker_id, relation_type, and any other extra field (e.g.
+        confidence) are dropped; only the four content fields survive."""
         entry = {
             "key": "graph1",
             "subject": "Alice",
@@ -355,7 +355,7 @@ class TestContentOnlyEntry:
             "object": "Berlin",
             "speaker_id": "speaker0",
             "relation_type": "factual",
-            "_new": True,
+            "confidence": 0.9,
         }
         assert content_only_entry(entry) == {
             "key": "graph1",

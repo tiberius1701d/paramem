@@ -208,7 +208,6 @@ class GraphConfig:
 class ConsolidationConfig:
     promotion_threshold: int = 3
     decay_window: int = 10
-    indexed_key_replay: bool = True
     # Ship-safe posture: base defaults OFF (no refinement). Operator YAMLs
     # (fixture/local) opt in explicitly.
     # The cloud master switch is NOT here: it is `cloud.enabled`
@@ -232,13 +231,15 @@ class ConsolidationConfig:
     # when REPLACE is returned.  Applied uniformly at ingest, interim, and fold;
     # no positional fork.  off|on.
     refinement_contradiction: str = "off"
-    # Minimum recall fraction (0, 1] that every recall gate must reach before the
-    # adapter fold is accepted.  Applied to: post-save disk-integrity probes
-    # (_verify_saved_adapter_from_disk), interim-cycle training
-    # (run_consolidation_cycle), the full fold (ConsolidationLoop.consolidate),
-    # and simulate→train migration (_migrate_tier_simulate_to_train).
-    # 1.0 = sharp recall (all keys must be recalled, no tolerance); lower only with
-    # empirical evidence and explicit operator acknowledgment.
+    # Minimum recall fraction (0, 1] the simulate->train migration probe must
+    # reach before promoting staged weights
+    # (paramem.server.active_store_migration._migrate_tier_simulate_to_train,
+    # read via loop.config.recall_sanity_threshold).  The interim-cycle and
+    # full-fold recall gates (ConsolidationLoop._assert_tier_recall) do not
+    # read this field — they are hardcoded to require exact 100% recall (see
+    # _assert_tier_recall's docstring).  1.0 = sharp recall (all keys must be
+    # recalled, no tolerance); lower only with empirical evidence and
+    # explicit operator acknowledgment.
     recall_sanity_threshold: float = 1.0
 
     def __post_init__(self) -> None:

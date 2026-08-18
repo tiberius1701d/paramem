@@ -612,7 +612,7 @@ class TestTrainAdapterSavePath:
         """``train_adapter`` is responsible only for training.
 
         The canonical encrypted slot-dir save is the orchestrator's job
-        (``ConsolidationLoop._save_adapters`` → ``atomic_save_adapter`` →
+        (``paramem.memory.persistence.commit_tier_slot`` → ``atomic_save_adapter`` →
         ``_encrypt_adapter_safetensors``).  Writing here would duplicate
         the canonical save AND leave a plaintext
         ``adapter_model.safetensors`` inside ``data/ha/adapters/`` which

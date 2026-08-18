@@ -14,61 +14,44 @@ The in-process reload primitive must, per the cloud-only VRAM-leak fix:
     than leaking the partial allocation.
 
 These exercise the function directly (no app lifespan). The release, the
-load, the VRAM check, and ``_build_config_derived_state`` are mocked — the
+load, the VRAM check, and ``_build_runtime_components`` are mocked — the
 contract under test is the control flow and the resulting ``_state``
 mode/reason, not real CUDA.
 
-``_live_reload_base_model`` calls ``_build_config_derived_state`` after a
+``_live_reload_base_model`` calls ``_build_runtime_components`` after a
 successful model load (to rebuild router, exemplar banks, etc.).  Existing
-tests mock ``_build_config_derived_state`` so they exercise the same
+tests mock ``_build_runtime_components`` so they exercise the same
 control-flow contract without triggering real STT/HA/cloud construction.
 
 Additional tests cover the config-refresh path:
 - ``refresh_config_from_disk=True`` calls ``load_server_config`` BEFORE
   ``_release_base_model_in_process``.
-- Mode is not set to ``local`` until AFTER ``_build_config_derived_state``.
+- Mode is not set to ``local`` until AFTER ``_build_runtime_components``.
 - A rebuild failure leaves mode=cloud-only with reason ``apply_failed``.
-  A partial preload (boot_degraded) now stays local — recall self-heals.
-- ``_build_config_derived_state`` is NOT passed ``check_post_load_budget``
+- ``_build_runtime_components`` is NOT passed ``check_post_load_budget``
   (the build-once VRAM gate must stay lifespan-only; in-process reload must
   not re-run the post-load budget check on every reclaim).
 - ``_preload_memory_store`` source selection is driven by
   ``config.consolidation.mode``, not ``_state["mode"]``.
-- ``boot_degraded`` is cleared on full hydration and on ``preload_cache=False``;
-  set on partial hydration.
+
+Mode → MemorySource selection (simulate → DiskMemorySource, train →
+WeightMemorySource) against real ``TierBinding`` shapes is covered in
+``tests/test_mode_fork_guard.py`` and ``tests/test_server.py``;
+``_hydrate_memory_store_in_place`` against a real binding is covered in
+``tests/test_memory_persistence.py`` and ``tests/test_memory_store.py``.
+``test_hydrate_clears_stale_entries_and_reloads`` below stays scoped to this
+file: it patches ``verify_adapter_tree`` to return an empty dict, with no
+dependency on binding shape.
 """
 
 from __future__ import annotations
 
 import logging
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from paramem.adapters.registry_binding import VERIFIED, TierBinding
 from paramem.server.config import load_server_config
-
-
-def _verified_bindings(registry_map: dict) -> dict:
-    """Wrap a ``{tier: registry}`` map into the ``{tier: TierBinding}`` shape
-    ``verify_adapter_tree`` returns, with every tier VERIFIED and publishable
-    — the boot/hydrate-path equivalent of the pre-refactor
-    ``read_registries_from_disk`` return value these tests used to patch."""
-    return {
-        tier: TierBinding(
-            tier=tier,
-            tier_root=Path(f"/fake/{tier}"),
-            status=VERIFIED,
-            registry=reg,
-            registry_present=True,
-            slot=None,
-            manifest=None,
-            candidate_count=0,
-            detail="",
-        )
-        for tier, reg in registry_map.items()
-    }
 
 
 def _server_config(consolidation_mode="train", preload_cache=True):
@@ -90,7 +73,7 @@ def _server_config(consolidation_mode="train", preload_cache=True):
 
 
 # ---------------------------------------------------------------------------
-# Existing VRAM-guard tests (updated to mock _build_config_derived_state)
+# Existing VRAM-guard tests (updated to mock _build_runtime_components)
 # ---------------------------------------------------------------------------
 
 
@@ -119,7 +102,7 @@ def test_preflight_declines_when_gate_reports_no_room():
         patch("paramem.server.app.torch.cuda.is_available", return_value=True),
         patch.object(app_module, "_wait_for_gpu_drain", return_value=False) as mock_gate,
         patch.object(app_module, "_load_model_into_state") as mock_load,
-        patch.object(app_module, "_build_config_derived_state") as mock_build,
+        patch.object(app_module, "_build_runtime_components") as mock_build,
     ):
         app_module._live_reload_base_model()
 
@@ -196,7 +179,7 @@ def test_preflight_skipped_when_no_boot_assessment():
     budget check, defer to the live load gate. torch.cuda.mem_get_info is not
     consulted (no assessment to compare against).
 
-    _build_config_derived_state is called once (to rebuild the router +
+    _build_runtime_components is called once (to rebuild the router +
     classifier) on the plain-reclaim path.
     """
     from paramem.server import app as app_module
@@ -213,14 +196,14 @@ def test_preflight_skipped_when_no_boot_assessment():
         patch.object(app_module, "_release_base_model_in_process"),
         patch("paramem.server.app.torch.cuda.mem_get_info") as mock_mem_get_info,
         patch.object(app_module, "_load_model_into_state") as mock_load,
-        patch.object(app_module, "_build_config_derived_state") as mock_build,
+        patch.object(app_module, "_build_runtime_components") as mock_build,
     ):
         app_module._live_reload_base_model()
 
         # With topology_assessment=None, mem_get_info must NOT be called.
         mock_mem_get_info.assert_not_called()
         mock_load.assert_called_once()
-        # plain-reclaim path calls _build_config_derived_state once
+        # plain-reclaim path calls _build_runtime_components once
         # (rebuild_session_buffer=False, cloud_only=False).
         mock_build.assert_called_once()
         assert app_module._state["mode"] == "local"
@@ -230,7 +213,7 @@ def test_preflight_skipped_when_no_boot_assessment():
 def test_successful_reload_sets_local():
     """Gate reports room and the load succeeds → mode local.
 
-    _build_config_derived_state is called once on the plain-reclaim path.
+    _build_runtime_components is called once on the plain-reclaim path.
     """
     from paramem.server import app as app_module
 
@@ -250,15 +233,115 @@ def test_successful_reload_sets_local():
         patch("paramem.server.app.torch.cuda.is_available", return_value=True),
         patch.object(app_module, "_wait_for_gpu_drain", return_value=True),
         patch.object(app_module, "_load_model_into_state") as mock_load,
-        patch.object(app_module, "_build_config_derived_state") as mock_build,
+        patch.object(app_module, "_build_runtime_components") as mock_build,
     ):
         app_module._live_reload_base_model()
 
         mock_load.assert_called_once()
-        # _build_config_derived_state called once on plain-reclaim path.
+        # _build_runtime_components called once on plain-reclaim path.
         mock_build.assert_called_once()
         assert app_module._state["mode"] == "local"
         assert app_module._state["cloud_only_reason"] is None
+
+
+def test_component_rebuild_runs_before_mode_flips_to_local():
+    """The store-preload fill lives inside _build_runtime_components — the
+    reclaim gate fires the fill BEFORE the process reports itself local, so
+    a client that sees mode="local" never races an in-flight fill: a plain
+    reclaim over a cold store (the re-probe gate armed by
+    ``store_preload_complete=False``, ``memory_store=None``) still runs the
+    fill first and only then flips mode.
+
+    Exercises the REAL ``_build_runtime_components`` (the plain-reclaim
+    path always calls it with ``full_rebuild=False``, so the only substituted
+    collaborator is ``_preload_memory_store`` — the store-preload fill this
+    test's ordering claim is about; every other full_rebuild=False step
+    (Router rebuild, ``set_classifier_model``) runs for real)."""
+    from paramem.memory.store import MemoryStore
+    from paramem.server import app as app_module
+
+    fake_assessment = MagicMock(name="assessment")
+    fake_assessment.required_bytes = int(6 * 2**30)
+
+    state_patch = {
+        "mode": "cloud-only",
+        "cloud_only_reason": "released",
+        "config": _server_config(),
+        "topology_assessment": fake_assessment,
+        "store_preload_complete": False,
+        "memory_store": None,
+        "model": None,
+        "tokenizer": None,
+        "ha_graph": None,
+    }
+
+    mode_at_fill_time = []
+    fill_calls: list[int] = []
+
+    def _fake_preload(_cfg, *, model, tokenizer):
+        fill_calls.append(1)
+        mode_at_fill_time.append(app_module._state["mode"])
+        return MemoryStore()
+
+    with (
+        patch.dict(app_module._state, state_patch, clear=False),
+        patch.object(app_module, "_release_base_model_in_process"),
+        patch("paramem.server.app.torch.cuda.is_available", return_value=True),
+        patch.object(app_module, "_wait_for_gpu_drain", return_value=True),
+        patch.object(app_module, "_load_model_into_state"),
+        patch.object(app_module, "_preload_memory_store", side_effect=_fake_preload),
+    ):
+        app_module._live_reload_base_model()
+
+    assert fill_calls == [1], f"the store-preload fill must run exactly once; got {fill_calls}"
+    assert mode_at_fill_time == ["cloud-only"], (
+        "the store-preload fill (inside the real _build_runtime_components) must "
+        f"see the process still cloud-only, never already local; got {mode_at_fill_time}"
+    )
+    assert app_module._state["mode"] == "local", "mode flips to local only after the rebuild"
+
+
+def test_component_rebuild_skips_fill_when_store_already_warm():
+    """The re-probe gate inside the real _build_runtime_components skips the
+    store-preload fill when the store already completed a fill
+    (``store_preload_complete=True`` and a non-``None`` ``memory_store``) —
+    the plain reclaim still rebuilds the Router against the warm store and
+    mode still flips to local, just without paying the probe cost again."""
+    from paramem.memory.store import MemoryStore
+    from paramem.server import app as app_module
+
+    fake_assessment = MagicMock(name="assessment")
+    fake_assessment.required_bytes = int(6 * 2**30)
+
+    warm_store = MemoryStore()
+
+    state_patch = {
+        "mode": "cloud-only",
+        "cloud_only_reason": "released",
+        "config": _server_config(),
+        "topology_assessment": fake_assessment,
+        "store_preload_complete": True,
+        "memory_store": warm_store,
+        "model": None,
+        "tokenizer": None,
+        "ha_graph": None,
+    }
+
+    with (
+        patch.dict(app_module._state, state_patch, clear=False),
+        patch.object(app_module, "_release_base_model_in_process"),
+        patch("paramem.server.app.torch.cuda.is_available", return_value=True),
+        patch.object(app_module, "_wait_for_gpu_drain", return_value=True),
+        patch.object(app_module, "_load_model_into_state"),
+        patch.object(app_module, "_preload_memory_store") as mock_preload,
+    ):
+        app_module._live_reload_base_model()
+
+        mock_preload.assert_not_called()
+        assert app_module._state["memory_store"] is warm_store, (
+            "the warm store must survive the reclaim unchanged"
+        )
+        assert app_module._state["mode"] == "local", "mode still flips to local on the warm path"
 
 
 def test_plain_reclaim_voice_restore_failure_is_non_fatal(caplog):
@@ -300,7 +383,7 @@ def test_plain_reclaim_voice_restore_failure_is_non_fatal(caplog):
         patch("paramem.server.app.torch.cuda.is_available", return_value=True),
         patch.object(app_module, "_wait_for_gpu_drain", return_value=True),
         patch.object(app_module, "_load_model_into_state"),
-        patch.object(app_module, "_build_config_derived_state"),
+        patch.object(app_module, "_build_runtime_components"),
         patch.object(app_module, "_set_voice_pipeline_profile", side_effect=fake_voice_profile),
     ):
         caplog.set_level(logging.WARNING, logger="paramem.server.app")
@@ -347,7 +430,7 @@ def test_plain_reclaim_success_eagerly_creates_consolidation_loop():
         patch("paramem.server.app.torch.cuda.is_available", return_value=True),
         patch.object(app_module, "_wait_for_gpu_drain", return_value=True),
         patch.object(app_module, "_load_model_into_state"),
-        patch.object(app_module, "_build_config_derived_state"),
+        patch.object(app_module, "_build_runtime_components"),
         patch.object(app_module, "_set_voice_pipeline_profile"),
         patch.object(app_module, "_eager_create_consolidation_loop") as mock_eager,
     ):
@@ -381,7 +464,7 @@ def test_reload_failure_paths_do_not_eagerly_create_consolidation_loop():
             "_load_model_into_state",
             side_effect=RuntimeError("CUDA out of memory"),
         ),
-        patch.object(app_module, "_build_config_derived_state"),
+        patch.object(app_module, "_build_runtime_components"),
         patch.object(app_module, "_eager_create_consolidation_loop") as mock_eager,
     ):
         app_module._live_reload_base_model()
@@ -395,7 +478,7 @@ def test_load_failure_releases_and_stays_cloud_only():
     (a second release pass) and the server stays cloud-only with reason
     ``reload_failed`` — no leak, no false 'local'.
 
-    _build_config_derived_state must NOT be called when the load fails.
+    _build_runtime_components must NOT be called when the load fails.
     """
     from paramem.server import app as app_module
 
@@ -420,7 +503,7 @@ def test_load_failure_releases_and_stays_cloud_only():
             "_load_model_into_state",
             side_effect=RuntimeError("CUDA out of memory"),
         ),
-        patch.object(app_module, "_build_config_derived_state") as mock_build,
+        patch.object(app_module, "_build_runtime_components") as mock_build,
     ):
         app_module._live_reload_base_model()
 
@@ -452,7 +535,6 @@ def test_handled_failure_return_value_matches_state_reason(scenario):
         "cloud_only_reason": "released",
         "config": _server_config(),
         "topology_assessment": fake_assessment,
-        "boot_degraded": None,
     }
 
     patches = [
@@ -484,7 +566,7 @@ def test_handled_failure_return_value_matches_state_reason(scenario):
         patches.append(
             patch.object(
                 app_module,
-                "_build_config_derived_state",
+                "_build_runtime_components",
                 side_effect=RuntimeError("ha_client init failed"),
             )
         )
@@ -535,7 +617,6 @@ def test_refresh_config_from_disk_loads_config_before_release():
         "config": _server_config(),
         "config_path": "configs/server.yaml",
         "topology_assessment": None,
-        "boot_degraded": None,
     }
 
     with (
@@ -543,7 +624,7 @@ def test_refresh_config_from_disk_loads_config_before_release():
         patch.object(app_module, "load_server_config", side_effect=fake_load_server_config),
         patch.object(app_module, "_release_base_model_in_process", side_effect=fake_release),
         patch.object(app_module, "_load_model_into_state"),
-        patch.object(app_module, "_build_config_derived_state"),
+        patch.object(app_module, "_build_runtime_components"),
     ):
         app_module._live_reload_base_model(refresh_config_from_disk=True)
 
@@ -554,16 +635,36 @@ def test_refresh_config_from_disk_loads_config_before_release():
 
 def test_refresh_config_mode_not_local_until_after_build():
     """When refresh_config_from_disk=True: mode is NOT set to 'local' until
-    AFTER _build_config_derived_state succeeds.
+    AFTER the store-preload fill inside the real _build_runtime_components
+    (full_rebuild=True, the config-apply path) completes.
+
+    Exercises the REAL routine rather than a wholesale mock: the store-
+    preload fill (``_preload_memory_store``) is substituted with a
+    mode-recording side effect — the collaborator this ordering claim is
+    about — and the encoder-backed exemplar loads (intent / sentence_type /
+    personal_referent) are substituted too, since a real load would pull in
+    a sentence-transformers model (network- and, per
+    ``intent.encoder_device: auto``, potentially GPU-dependent) that has
+    nothing to do with the ordering under test.  Every other full_rebuild=True
+    step (speaker_store, STT/TTS, cloud_agent, ha_client, Router,
+    set_classifier_model) runs for real against the disabled/unconfigured
+    fixture config, which is a no-op for each of them.
 
     If the build is not called (or raises), mode stays cloud-only.
     """
+    import paramem.server.intent as intent_mod
+    import paramem.server.personal_referent as personal_referent_mod
+    import paramem.server.sentence_type as sentence_type_mod
+    from paramem.memory.store import MemoryStore
     from paramem.server import app as app_module
 
-    mode_at_build_call = []
+    mode_at_fill_time = []
+    fill_calls: list[int] = []
 
-    def fake_build(config, *, cloud_only, rebuild_session_buffer=True, full_rebuild=True):
-        mode_at_build_call.append(app_module._state.get("mode"))
+    def _fake_preload(_cfg, *, model, tokenizer):
+        fill_calls.append(1)
+        mode_at_fill_time.append(app_module._state.get("mode"))
+        return MemoryStore()
 
     state_patch = {
         "mode": "cloud-only",
@@ -571,7 +672,11 @@ def test_refresh_config_mode_not_local_until_after_build():
         "config": _server_config(),
         "config_path": "configs/server.yaml",
         "topology_assessment": None,
-        "boot_degraded": None,
+        "store_preload_complete": False,
+        "memory_store": None,
+        "model": None,
+        "tokenizer": None,
+        "ha_graph": None,
     }
 
     with (
@@ -579,24 +684,27 @@ def test_refresh_config_mode_not_local_until_after_build():
         patch.object(app_module, "load_server_config", return_value=_server_config()),
         patch.object(app_module, "_release_base_model_in_process"),
         patch.object(app_module, "_load_model_into_state"),
-        patch.object(app_module, "_build_config_derived_state", side_effect=fake_build),
+        patch.object(app_module, "_preload_memory_store", side_effect=_fake_preload),
+        patch.object(intent_mod, "load_encoder", return_value=None),
+        patch.object(sentence_type_mod, "load_exemplars", return_value=None),
+        patch.object(personal_referent_mod, "load_exemplars", return_value=None),
     ):
         app_module._live_reload_base_model(refresh_config_from_disk=True)
 
-        # mode must be cloud-only while build is executing, then local after.
-        # Assertions are inside the with-block because patch.dict restores
-        # _state["mode"] to its pre-test value on exit — reading it outside
-        # would see the pre-test value, not the post-reload value.
-        assert mode_at_build_call, "_build_config_derived_state was not called"
-        assert mode_at_build_call[0] == "cloud-only", (
-            f"mode should be cloud-only during build; got {mode_at_build_call[0]}"
+        # mode must be cloud-only while the fill is executing, then local
+        # after.  Assertions are inside the with-block because patch.dict
+        # restores _state["mode"] to its pre-test value on exit — reading it
+        # outside would see the pre-test value, not the post-reload value.
+        assert fill_calls == [1], f"the store-preload fill must run exactly once; got {fill_calls}"
+        assert mode_at_fill_time == ["cloud-only"], (
+            f"mode should be cloud-only during the fill; got {mode_at_fill_time}"
         )
         assert app_module._state["mode"] == "local", "mode should be local after successful rebuild"
 
 
 def test_refresh_config_rebuild_failure_stays_cloud_only():
     """When refresh_config_from_disk=True: a rebuild failure in
-    _build_config_derived_state leaves mode=cloud-only with reason
+    _build_runtime_components leaves mode=cloud-only with reason
     'apply_failed' (partial-rebuild recovery — the server must not silently
     enter local mode with a broken derived state).
     """
@@ -608,7 +716,6 @@ def test_refresh_config_rebuild_failure_stays_cloud_only():
         "config": _server_config(),
         "config_path": "configs/server.yaml",
         "topology_assessment": None,
-        "boot_degraded": None,
     }
 
     with (
@@ -618,7 +725,7 @@ def test_refresh_config_rebuild_failure_stays_cloud_only():
         patch.object(app_module, "_load_model_into_state"),
         patch.object(
             app_module,
-            "_build_config_derived_state",
+            "_build_runtime_components",
             side_effect=RuntimeError("ha_client init failed"),
         ),
     ):
@@ -628,58 +735,6 @@ def test_refresh_config_rebuild_failure_stays_cloud_only():
             "mode must stay cloud-only when rebuild fails"
         )
         assert app_module._state["cloud_only_reason"] == "apply_failed"
-
-
-def test_refresh_config_preload_partial_stays_local():
-    """When refresh_config_from_disk=True: if _build_config_derived_state
-    succeeds but sets boot_degraded (partial preload), the server stays LOCAL.
-
-    A partial preload is not a failure — recall self-heals via on-miss weight
-    probing and the cache re-warms on demand. The base model must NOT be
-    released; boot_degraded stays set as a signal (surfaced in /status
-    attention) until a later preload fully hydrates.
-    """
-    from paramem.server import app as app_module
-
-    def fake_build_sets_degraded(
-        config, *, cloud_only, rebuild_session_buffer=True, full_rebuild=True
-    ):
-        # Simulate a partial preload — _preload_memory_store sets boot_degraded.
-        app_module._state["boot_degraded"] = {
-            "reason": "preload_partial",
-            "hits": 5,
-            "total": 10,
-            "missed_by_tier": {},
-            "source": "WeightMemorySource",
-        }
-
-    state_patch = {
-        "mode": "cloud-only",
-        "cloud_only_reason": "released",
-        "config": _server_config(),
-        "config_path": "configs/server.yaml",
-        "topology_assessment": None,
-        "boot_degraded": None,
-    }
-
-    with (
-        patch.dict(app_module._state, state_patch, clear=False),
-        patch.object(app_module, "load_server_config", return_value=_server_config()),
-        patch.object(app_module, "_release_base_model_in_process"),
-        patch.object(app_module, "_load_model_into_state") as mock_load,
-        patch.object(
-            app_module, "_build_config_derived_state", side_effect=fake_build_sets_degraded
-        ),
-    ):
-        app_module._live_reload_base_model(refresh_config_from_disk=True)
-
-        # Stays local with the model reloaded (a degrade path would have set
-        # cloud_only_reason='preload_failed' and returned before mode=local);
-        # boot_degraded is retained as a signal.
-        assert app_module._state["mode"] == "local"
-        assert app_module._state["cloud_only_reason"] is None
-        mock_load.assert_called_once()
-        assert app_module._state["boot_degraded"] is not None
 
 
 def test_plain_reclaim_does_not_call_load_server_config():
@@ -693,7 +748,6 @@ def test_plain_reclaim_does_not_call_load_server_config():
         "cloud_only_reason": "released",
         "config": _server_config(),
         "topology_assessment": None,
-        "boot_degraded": None,
     }
 
     with (
@@ -701,7 +755,7 @@ def test_plain_reclaim_does_not_call_load_server_config():
         patch.object(app_module, "load_server_config") as mock_lsc,
         patch.object(app_module, "_release_base_model_in_process"),
         patch.object(app_module, "_load_model_into_state"),
-        patch.object(app_module, "_build_config_derived_state"),
+        patch.object(app_module, "_build_runtime_components"),
     ):
         app_module._live_reload_base_model()  # refresh_config_from_disk=False (default)
 
@@ -710,7 +764,7 @@ def test_plain_reclaim_does_not_call_load_server_config():
 
 def test_post_load_gate_not_called_from_reload():
     """The post-load VRAM gate (check_post_load_budget) must NOT be called
-    from _live_reload_base_model or _build_config_derived_state.
+    from _live_reload_base_model or _build_runtime_components.
 
     Reload owns its own pre-load drain-wait + load-exception fallback; running
     the boot-only post-load gate here would double-count headroom and surface a
@@ -727,7 +781,6 @@ def test_post_load_gate_not_called_from_reload():
         "cloud_only_reason": "released",
         "config": _server_config(),
         "topology_assessment": fake_assessment,
-        "boot_degraded": None,
     }
 
     with (
@@ -736,7 +789,7 @@ def test_post_load_gate_not_called_from_reload():
         patch("paramem.server.app.torch.cuda.is_available", return_value=True),
         patch.object(app_module, "_wait_for_gpu_drain", return_value=True),
         patch.object(app_module, "_load_model_into_state"),
-        patch.object(app_module, "_build_config_derived_state"),
+        patch.object(app_module, "_build_runtime_components"),
         patch.object(app_module, "check_post_load_budget") as mock_post_gate,
     ):
         app_module._live_reload_base_model(refresh_config_from_disk=False)
@@ -751,7 +804,7 @@ def test_post_load_gate_not_called_from_reload():
 
 
 # ---------------------------------------------------------------------------
-# _preload_memory_store source selection + boot_degraded lifecycle
+# _preload_memory_store source selection
 # ---------------------------------------------------------------------------
 
 
@@ -763,296 +816,17 @@ def _fake_memory_store():
     return store
 
 
-def test_preload_source_selection_simulate_mode():
-    """preload_cache=True + consolidation.mode='simulate' → DiskMemorySource selected.
-
-    Source selection now lives in _build_store_contents (called by
-    _hydrate_memory_store_in_place, called by _preload_memory_store).
-    Selection uses config.consolidation.mode, NOT _state["mode"].
-    """
-    from paramem.server import app as app_module
-
-    config = _server_config(consolidation_mode="simulate", preload_cache=True)
-    config.consolidation.indexed_key_replay = False
-    config.consolidation.recall_probe_batch_size = 16
-
-    state_patch = {
-        "mode": "cloud-only",  # _state["mode"] is cloud-only; consolidation.mode is simulate
-        "boot_degraded": None,
-        "model": MagicMock(),
-        "tokenizer": MagicMock(),
-    }
-
-    disk_source_calls = []
-    weight_source_calls = []
-
-    class FakeDiskSource:
-        def __init__(self, _adapter_dir):
-            disk_source_calls.append("init")
-
-        def probe(self, keys_by_tier, should_abort=None):
-            # SPO shape -- every production source's content-only result shape.
-            return {
-                "graph1": {
-                    "key": "graph1",
-                    "subject": "s",
-                    "predicate": "p",
-                    "object": "o",
-                }
-            }
-
-    class FakeWeightSource:
-        def __init__(self, model, tokenizer, *, batch_size, registry=None, **kw):
-            weight_source_calls.append("init")
-
-        def probe(self, keys_by_tier, should_abort=None):
-            return {}
-
-    import paramem.adapters.registry_binding as registry_binding_mod
-    import paramem.memory.source as src_mod
-    import paramem.memory.store as store_mod
-
-    # Build a fake registry with one active key so the source-selection branch is entered.
-    fake_reg = MagicMock()
-    fake_reg.list_active.return_value = ["graph1"]
-    fake_registry_map = {"episodic": fake_reg}
-
-    fake_store = MagicMock()
-
-    with (
-        patch.dict(app_module._state, state_patch, clear=False),
-        # Constructor returns fake_store; verify_adapter_tree returns fake bindings.
-        patch.object(store_mod, "MemoryStore", return_value=fake_store),
-        patch.object(
-            registry_binding_mod,
-            "verify_adapter_tree",
-            return_value=_verified_bindings(fake_registry_map),
-        ) as mock_verify_tree,
-        patch.object(src_mod, "DiskMemorySource", FakeDiskSource),
-        patch.object(src_mod, "WeightMemorySource", FakeWeightSource),
-    ):
-        app_module._preload_memory_store(
-            config,
-            model=app_module._state.get("model"),
-            tokenizer=app_module._state.get("tokenizer"),
-        )
-
-    mock_verify_tree.assert_called_once()
-    assert disk_source_calls, "DiskMemorySource should be used when consolidation.mode='simulate'"
-    assert not weight_source_calls, "WeightMemorySource must not be used in simulate mode"
-    # Full probe succeeded → boot_degraded should be cleared.
-    assert app_module._state.get("boot_degraded") is None
-
-
-def test_preload_source_selection_train_mode_uses_weight_source():
-    """preload_cache=True + consolidation.mode='train' + model present
-    → WeightMemorySource selected (NOT DiskMemorySource), regardless of
-    _state["mode"] (which might be cloud-only on the apply path).
-
-    Source selection now lives in _build_store_contents (called by
-    _hydrate_memory_store_in_place, called by _preload_memory_store).
-    """
-    from paramem.server import app as app_module
-
-    config = _server_config(consolidation_mode="train", preload_cache=True)
-    config.consolidation.indexed_key_replay = False
-    config.consolidation.recall_probe_batch_size = 16
-
-    state_patch = {
-        "mode": "cloud-only",  # runtime mode cloud-only; must use weight source for train
-        "boot_degraded": None,
-        "model": MagicMock(),
-        "tokenizer": MagicMock(),
-    }
-
-    disk_source_calls = []
-    weight_source_calls = []
-
-    class FakeDiskSource:
-        def __init__(self, _adapter_dir):
-            disk_source_calls.append("init")
-
-        def probe(self, keys_by_tier, should_abort=None):
-            return {}
-
-    class FakeWeightSource:
-        def __init__(self, model, tokenizer, *, batch_size, registry=None, **kw):
-            weight_source_calls.append("init")
-
-        def probe(self, keys_by_tier, should_abort=None):
-            # SPO shape -- every production source's content-only result shape.
-            return {
-                "graph1": {
-                    "key": "graph1",
-                    "subject": "s",
-                    "predicate": "p",
-                    "object": "o",
-                }
-            }
-
-    import paramem.adapters.registry_binding as registry_binding_mod
-    import paramem.memory.source as src_mod
-    import paramem.memory.store as store_mod
-
-    # Build a fake registry with one active key so the source-selection branch is entered.
-    fake_reg = MagicMock()
-    fake_reg.list_active.return_value = ["graph1"]
-    fake_registry_map = {"episodic": fake_reg}
-
-    fake_store = MagicMock()
-
-    with (
-        patch.dict(app_module._state, state_patch, clear=False),
-        # Constructor returns fake_store; verify_adapter_tree returns fake bindings.
-        patch.object(store_mod, "MemoryStore", return_value=fake_store),
-        patch.object(
-            registry_binding_mod,
-            "verify_adapter_tree",
-            return_value=_verified_bindings(fake_registry_map),
-        ) as mock_verify_tree,
-        patch.object(src_mod, "DiskMemorySource", FakeDiskSource),
-        patch.object(src_mod, "WeightMemorySource", FakeWeightSource),
-    ):
-        app_module._preload_memory_store(
-            config,
-            model=app_module._state.get("model"),
-            tokenizer=app_module._state.get("tokenizer"),
-        )
-
-    mock_verify_tree.assert_called_once()
-    assert weight_source_calls, "WeightMemorySource should be used when consolidation.mode='train'"
-    assert not disk_source_calls, "DiskMemorySource must not be used in train mode"
-    assert app_module._state.get("boot_degraded") is None
-
-
-def test_preload_cache_false_clears_boot_degraded():
-    """preload_cache=False (intentional opt-out): boot_degraded is CLEARED
-    (not set) after an apply on preload-off deployments — recall takes the
-    per-key source path on every miss (correction #5 boot_degraded lifecycle).
-    """
-    from paramem.server import app as app_module
-
-    config = _server_config(preload_cache=False)
-    config.consolidation.indexed_key_replay = False
-
-    fake_store = MagicMock()
-    fake_store.load_registries_from_disk.return_value = None
-    fake_store.load_bookkeeping_from_disk.return_value = {
-        "loaded": 0,
-        "orphaned": 0,
-    }
-
-    state_patch = {
-        "boot_degraded": {"reason": "preload_partial", "hits": 0, "total": 5},
-        "model": MagicMock(),
-        "tokenizer": MagicMock(),
-    }
-
-    import paramem.memory.store as store_mod
-
-    with (
-        patch.dict(app_module._state, state_patch, clear=False),
-        patch.object(store_mod, "MemoryStore", return_value=fake_store),
-    ):
-        app_module._preload_memory_store(
-            config,
-            model=app_module._state.get("model"),
-            tokenizer=app_module._state.get("tokenizer"),
-        )
-
-    assert app_module._state["boot_degraded"] is None, (
-        "boot_degraded must be cleared when preload_cache=False"
-    )
-
-
-def test_preload_partial_sets_boot_degraded(tmp_path):
-    """When some active keys cannot be materialised (mounted-but-failed, or the
-    registry-sha256 binding-bug: slot present but unmounted → probe None):
-    boot_degraded is SET.  This is the normal (non-swap) path — tmp_path has no
-    base-swap marker, so the invalidity gate does not fire.
-
-    Source enumeration now comes from the fresh registry returned by
-    _build_store_contents (via verify_adapter_tree), not from the live store
-    instance methods.
-    """
-    from paramem.server import app as app_module
-
-    config = _server_config(consolidation_mode="train", preload_cache=True)
-    config.paths.data = tmp_path  # no base-swap marker here → gate inactive
-    config.consolidation.indexed_key_replay = False
-    config.consolidation.recall_probe_batch_size = 16
-
-    state_patch = {
-        "boot_degraded": None,
-        "model": MagicMock(),
-        "tokenizer": MagicMock(),
-    }
-
-    # Probe returns only one of two keys → partial hydration of a backed tier.
-    class FakeWeightSource:
-        def __init__(self, model, tokenizer, *, batch_size, registry=None, **kw):
-            pass
-
-        def probe(self, keys_by_tier, should_abort=None):
-            # Only graph1 found, graph2 missing.  SPO shape (subject/
-            # predicate/object) — every production source's content-only
-            # result shape; a result missing one of these four fields is
-            # itself a miss under the widened miss predicate.
-            return {
-                "graph1": {
-                    "key": "graph1",
-                    "subject": "s",
-                    "predicate": "p",
-                    "object": "o",
-                }
-            }
-
-    import paramem.adapters.registry_binding as registry_binding_mod
-    import paramem.memory.source as src_mod
-    import paramem.memory.store as store_mod
-
-    # Registry reports two active keys; the probe will only return one.
-    fake_reg = MagicMock()
-    fake_reg.list_active.return_value = ["graph1", "graph2"]
-    fake_registry_map = {"episodic": fake_reg}
-
-    fake_store = MagicMock()
-
-    with (
-        patch.dict(app_module._state, state_patch, clear=False),
-        patch.object(store_mod, "MemoryStore", return_value=fake_store),
-        patch.object(
-            registry_binding_mod,
-            "verify_adapter_tree",
-            return_value=_verified_bindings(fake_registry_map),
-        ) as mock_verify_tree,
-        patch.object(src_mod, "WeightMemorySource", FakeWeightSource),
-    ):
-        app_module._preload_memory_store(
-            config,
-            model=app_module._state.get("model"),
-            tokenizer=app_module._state.get("tokenizer"),
-        )
-
-        mock_verify_tree.assert_called_once()
-        degraded = app_module._state.get("boot_degraded")
-        assert degraded is not None, "boot_degraded must be set on partial hydration"
-        assert degraded["hits"] == 1
-        assert degraded["total"] == 2
-
-
 def test_preload_skips_registry_during_base_swap(tmp_path):
     """While a base-model swap is in flight (a ``base_swap`` marker is present),
     the on-disk registry describes the PREVIOUS model and is invalid for the loaded
-    one.  preload must NOT load it — it returns an empty store with boot_degraded
-    cleared, so the new model starts knowing nothing until Phase B retrains it.
-    The registry files are left untouched (Phase B / rollback use them).
+    one.  preload must NOT load it — it returns an empty store, so the new
+    model starts knowing nothing until Phase B retrains it.  The registry
+    files are left untouched (Phase B / rollback use them).
     """
     from paramem.server import app as app_module
 
     config = _server_config(consolidation_mode="train", preload_cache=True)
     config.paths.data = tmp_path
-    config.consolidation.indexed_key_replay = False
 
     fake_store = MagicMock()
     # The registry must NOT be loaded into the live store during a base-swap.
@@ -1065,7 +839,6 @@ def test_preload_skips_registry_during_base_swap(tmp_path):
     fake_marker.base_swap_phase = "phaseA_done"
 
     state_patch = {
-        "boot_degraded": {"reason": "stale"},  # must be cleared by the gate
         "model": MagicMock(),
         "tokenizer": MagicMock(),
     }
@@ -1085,9 +858,6 @@ def test_preload_skips_registry_during_base_swap(tmp_path):
 
     assert result is fake_store, "an (empty) store must still be returned"
     fake_store.load_registries_from_disk.assert_not_called()
-    assert app_module._state.get("boot_degraded") is None, (
-        "boot_degraded must be cleared while a base-swap is in flight"
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -1297,11 +1067,11 @@ def test_boot_drain_fail_degrades_to_cloud_only_and_arms_reclaim(tmp_path):
             ),
             patch.object(app_module, "apply_process_cap"),
             patch("transformers.AutoConfig.from_pretrained") as mock_cfg,
-            # Short-circuit after _build_config_derived_state so we don't need
-            # the full component tree — raise Sentinel at _build_config_derived_state.
+            # Short-circuit after _build_runtime_components so we don't need
+            # the full component tree — raise Sentinel at _build_runtime_components.
             patch.object(
                 app_module,
-                "_build_config_derived_state",
+                "_build_runtime_components",
                 side_effect=_Sentinel("short-circuit"),
             ),
         ):
@@ -1484,7 +1254,7 @@ def test_reclaim_fitcheck_uses_mem_get_info_not_nvidia_smi():
         patch("paramem.server.app.time.monotonic", side_effect=fake_monotonic),
         patch("paramem.server.app.time.sleep"),
         patch.object(app_module, "_load_model_into_state") as mock_load,
-        patch.object(app_module, "_build_config_derived_state") as mock_build,
+        patch.object(app_module, "_build_runtime_components") as mock_build,
         # subprocess.run must NOT be called (no nvidia-smi in reclaim path).
         patch.object(subprocess, "run") as mock_subprocess,
     ):
@@ -1514,7 +1284,6 @@ def test_reclaim_fitcheck_cuda_unavailable_skips_check():
         "cloud_only_reason": "released",
         "config": _server_config(),
         "topology_assessment": fake_assessment,
-        "boot_degraded": None,
     }
 
     with (
@@ -1523,7 +1292,7 @@ def test_reclaim_fitcheck_cuda_unavailable_skips_check():
         patch("paramem.server.app.torch.cuda.is_available", return_value=False),
         patch("paramem.server.app.torch.cuda.mem_get_info") as mock_mem_get_info,
         patch.object(app_module, "_load_model_into_state") as mock_load,
-        patch.object(app_module, "_build_config_derived_state"),
+        patch.object(app_module, "_build_runtime_components"),
     ):
         app_module._live_reload_base_model()
 
@@ -1715,7 +1484,7 @@ def test_lifespan_sets_vram_overflow_warning_when_required_exceeds_usable(tmp_pa
             patch("transformers.AutoConfig.from_pretrained") as mock_cfg,
             patch.object(
                 app_module,
-                "_build_config_derived_state",
+                "_build_runtime_components",
                 side_effect=_Sentinel("short-circuit"),
             ),
         ):
@@ -1827,7 +1596,6 @@ def test_refresh_config_from_disk_arms_mode_switch():
         "config": _server_config(consolidation_mode="simulate"),
         "config_path": "configs/server.yaml",
         "topology_assessment": None,
-        "boot_degraded": None,
     }
 
     with (
@@ -1836,7 +1604,7 @@ def test_refresh_config_from_disk_arms_mode_switch():
         patch.object(app_module, "_arm_active_store_migration") as mock_arm,
         patch.object(app_module, "_release_base_model_in_process"),
         patch.object(app_module, "_load_model_into_state"),
-        patch.object(app_module, "_build_config_derived_state"),
+        patch.object(app_module, "_build_runtime_components"),
     ):
         app_module._live_reload_base_model(refresh_config_from_disk=True)
 
@@ -1871,7 +1639,6 @@ def test_voice_drain_called_before_release_when_gpu():
         "cloud_only_reason": "released",
         "config": _server_config(),
         "topology_assessment": None,
-        "boot_degraded": None,
         "voice_profile": "gpu",
     }
 
@@ -1880,7 +1647,7 @@ def test_voice_drain_called_before_release_when_gpu():
         patch.object(app_module, "_set_voice_pipeline_profile", side_effect=_fake_set_voice),
         patch.object(app_module, "_release_base_model_in_process", side_effect=_fake_release),
         patch.object(app_module, "_load_model_into_state"),
-        patch.object(app_module, "_build_config_derived_state"),
+        patch.object(app_module, "_build_runtime_components"),
     ):
         app_module._live_reload_base_model(refresh_config_from_disk=False, lock_held=False)
 
@@ -1915,7 +1682,6 @@ def test_voice_drain_not_called_when_already_cpu():
         "cloud_only_reason": "released",
         "config": _server_config(),
         "topology_assessment": None,
-        "boot_degraded": None,
         "voice_profile": "cpu",
     }
 
@@ -1924,7 +1690,7 @@ def test_voice_drain_not_called_when_already_cpu():
         patch.object(app_module, "_set_voice_pipeline_profile", side_effect=_fake_set_voice),
         patch.object(app_module, "_release_base_model_in_process"),
         patch.object(app_module, "_load_model_into_state"),
-        patch.object(app_module, "_build_config_derived_state"),
+        patch.object(app_module, "_build_runtime_components"),
     ):
         app_module._live_reload_base_model(refresh_config_from_disk=False)
 
@@ -1954,7 +1720,6 @@ def test_voice_restore_called_on_partial_success():
         "cloud_only_reason": "released",
         "config": _server_config(),
         "topology_assessment": fake_assessment,
-        "boot_degraded": None,
         "voice_profile": "gpu",
     }
 
@@ -1965,7 +1730,7 @@ def test_voice_restore_called_on_partial_success():
         patch("paramem.server.app.torch.cuda.is_available", return_value=True),
         patch.object(app_module, "_wait_for_gpu_drain", return_value=True),
         patch.object(app_module, "_load_model_into_state"),
-        patch.object(app_module, "_build_config_derived_state"),
+        patch.object(app_module, "_build_runtime_components"),
     ):
         app_module._live_reload_base_model(refresh_config_from_disk=False, lock_held=True)
 
@@ -1982,7 +1747,7 @@ def test_voice_restore_called_on_partial_success():
 
 def test_voice_not_restored_on_full_path():
     """On the full-rebuild path (refresh_config_from_disk=True), the primitive
-    does NOT restore voice to gpu — _build_config_derived_state handles it.
+    does NOT restore voice to gpu — _build_runtime_components handles it.
 
     Adding a restore here would double-load the STT/TTS pair.
     """
@@ -2000,7 +1765,6 @@ def test_voice_not_restored_on_full_path():
         "config": _server_config(),
         "config_path": "configs/server.yaml",
         "topology_assessment": None,
-        "boot_degraded": None,
         "voice_profile": "gpu",
     }
 
@@ -2010,14 +1774,14 @@ def test_voice_not_restored_on_full_path():
         patch.object(app_module, "_set_voice_pipeline_profile", side_effect=_fake_set_voice),
         patch.object(app_module, "_release_base_model_in_process"),
         patch.object(app_module, "_load_model_into_state"),
-        patch.object(app_module, "_build_config_derived_state"),
+        patch.object(app_module, "_build_runtime_components"),
         patch.object(app_module, "_arm_active_store_migration", return_value=False),
     ):
         app_module._live_reload_base_model(refresh_config_from_disk=True, lock_held=True)
 
     assert not gpu_restore_calls, (
         "primitive must NOT restore voice to gpu on the full path "
-        f"(_build_config_derived_state owns that); calls={gpu_restore_calls}"
+        f"(_build_runtime_components owns that); calls={gpu_restore_calls}"
     )
 
 
@@ -2041,7 +1805,6 @@ def test_voice_not_restored_on_failure_paths():
         "cloud_only_reason": "released",
         "config": _server_config(),
         "topology_assessment": fake_assessment,
-        "boot_degraded": None,
         "voice_profile": "gpu",
     }
 
@@ -2085,7 +1848,6 @@ def test_voice_not_restored_on_load_failure():
         "cloud_only_reason": "released",
         "config": _server_config(),
         "topology_assessment": None,  # skip preflight gate
-        "boot_degraded": None,
         "voice_profile": "gpu",
     }
 
@@ -2098,7 +1860,7 @@ def test_voice_not_restored_on_load_failure():
             "_load_model_into_state",
             side_effect=RuntimeError("simulated OOM"),
         ),
-        patch.object(app_module, "_build_config_derived_state") as mock_build,
+        patch.object(app_module, "_build_runtime_components") as mock_build,
     ):
         app_module._live_reload_base_model(refresh_config_from_disk=False)
 
@@ -2114,7 +1876,7 @@ def test_voice_not_restored_on_load_failure():
 def test_voice_not_restored_on_rebuild_failure_partial_path():
     """On the rebuild-failure branch of the partial path (app.py:4340-4344), voice stays on CPU.
 
-    When ``_build_config_derived_state`` raises after a successful model load on
+    When ``_build_runtime_components`` raises after a successful model load on
     the ``refresh_config_from_disk=False`` path, the primitive releases the
     partial allocation and returns without calling ``_set_voice_pipeline_profile("gpu")``.
     The server ends cloud-only with reason="reload_failed".
@@ -2132,7 +1894,6 @@ def test_voice_not_restored_on_rebuild_failure_partial_path():
         "cloud_only_reason": "released",
         "config": _server_config(),
         "topology_assessment": None,  # skip preflight gate
-        "boot_degraded": None,
         "voice_profile": "gpu",
     }
 
@@ -2143,7 +1904,7 @@ def test_voice_not_restored_on_rebuild_failure_partial_path():
         patch.object(app_module, "_load_model_into_state"),  # load succeeds
         patch.object(
             app_module,
-            "_build_config_derived_state",
+            "_build_runtime_components",
             side_effect=RuntimeError("simulated rebuild failure"),
         ),
     ):
@@ -2171,7 +1932,6 @@ def test_lock_held_forwarded_to_voice_drain():
         "cloud_only_reason": "released",
         "config": _server_config(),
         "topology_assessment": None,
-        "boot_degraded": None,
         "voice_profile": "gpu",
     }
 
@@ -2180,7 +1940,7 @@ def test_lock_held_forwarded_to_voice_drain():
         patch.object(app_module, "_set_voice_pipeline_profile", side_effect=_fake_set_voice),
         patch.object(app_module, "_release_base_model_in_process"),
         patch.object(app_module, "_load_model_into_state"),
-        patch.object(app_module, "_build_config_derived_state"),
+        patch.object(app_module, "_build_runtime_components"),
     ):
         app_module._live_reload_base_model(lock_held=True)
 
@@ -2195,11 +1955,11 @@ def test_lock_held_forwarded_to_voice_drain():
 # ---------------------------------------------------------------------------
 
 
-def _make_real_store(replay_enabled=True):
+def _make_real_store():
     """Return a real MemoryStore populated with a few stale entries for testing."""
     from paramem.memory.store import MemoryStore
 
-    store = MemoryStore(replay_enabled=replay_enabled)
+    store = MemoryStore()
     # Seed stale entries that the hydration should clear.
     store.put(
         "episodic",
@@ -2219,14 +1979,13 @@ def _make_real_store(replay_enabled=True):
 class FakeWeightSourceHydrate:
     """Minimal WeightMemorySource stand-in for hydration tests.
 
-    Signature matches WeightMemorySource: batch_size is keyword-only;
-    probe accepts the optional should_abort keyword forwarded by _build_store_contents.
+    Signature matches WeightMemorySource: batch_size is keyword-only.
     """
 
     def __init__(self, model, tokenizer, *, batch_size, registry=None, **kw):
         self.probed = []
 
-    def probe(self, keys_by_tier, should_abort=None):
+    def probe(self, keys_by_tier):
         results = {}
         for _tier, keys in keys_by_tier.items():
             for key in keys:
@@ -2256,12 +2015,9 @@ def test_hydrate_clears_stale_entries_and_reloads():
     assert len(store) == 2, "precondition: store has 2 stale entries"
 
     config = _server_config(consolidation_mode="train", preload_cache=True)
-    config.consolidation.indexed_key_replay = False
     config.consolidation.recall_probe_batch_size = 16
 
-    state_patch = {
-        "boot_degraded": None,
-    }
+    state_patch: dict = {}
 
     # Empty bindings map → no active keys → new_entries stays {} → swap clears the store.
     with (
@@ -2285,484 +2041,3 @@ def test_hydrate_clears_stale_entries_and_reloads():
         )
         # Verification happened (the new builder path).
         mock_verify_tree.assert_called_once()
-
-
-def test_hydrate_registers_active_keys_when_source_hits():
-    """When preload_cache=True and the source returns entries, they are written
-    into the store (via store.swap()).  The stale pre-call entries are replaced by
-    the source results.
-
-    _build_store_contents enumerates active keys from the fresh bindings returned
-    by verify_adapter_tree, probes them, then publishes via swap().
-    """
-    import paramem.adapters.registry_binding as registry_binding_mod
-    import paramem.memory.source as src_mod
-    from paramem.server import app as app_module
-
-    store = _make_real_store()
-
-    config = _server_config(consolidation_mode="train", preload_cache=True)
-    config.consolidation.indexed_key_replay = False
-    config.consolidation.recall_probe_batch_size = 16
-
-    state_patch = {"boot_degraded": None}
-
-    # Registry reports two active keys; the weight source will return both.
-    fake_reg = MagicMock()
-    fake_reg.list_active.return_value = ["new_key1", "new_key2"]
-    fake_registry_map = {"episodic": fake_reg}
-
-    with (
-        patch.dict(app_module._state, state_patch, clear=False),
-        patch.object(
-            registry_binding_mod,
-            "verify_adapter_tree",
-            return_value=_verified_bindings(fake_registry_map),
-        ) as mock_verify_tree,
-        patch.object(src_mod, "WeightMemorySource", FakeWeightSourceHydrate),
-    ):
-        app_module._hydrate_memory_store_in_place(
-            store,
-            config,
-            model=MagicMock(),
-            tokenizer=MagicMock(),
-        )
-
-    mock_verify_tree.assert_called_once()
-    # After hydration the store holds the two newly-probed keys, not the two stale ones.
-    assert len(store) == 2
-    assert store.get("new_key1") is not None
-    assert store.get("new_key2") is not None
-    assert store.get("stale_key1") is None
-    assert store.get("stale_key2") is None
-    assert app_module._state["boot_degraded"] is None
-
-
-def test_hydrate_sets_boot_degraded_on_partial_probe():
-    """When some active keys cannot be materialised, boot_degraded is set
-    (same lifecycle as the boot-path partial preload).
-
-    _build_store_contents enumerates keys from the fresh bindings returned by
-    verify_adapter_tree; when the probe returns fewer entries than the total
-    active key count, stats["boot_degraded"] is set and propagated to
-    _state by _hydrate_memory_store_in_place.
-    """
-    import paramem.adapters.registry_binding as registry_binding_mod
-    import paramem.memory.source as src_mod
-    from paramem.server import app as app_module
-
-    class _PartialSource:
-        def __init__(self, model, tokenizer, *, batch_size, registry=None, **kw):
-            pass
-
-        def probe(self, keys_by_tier, should_abort=None):
-            # Only return one of the two requested keys.
-            return {"key_a": {"key": "key_a", "subject": "s", "predicate": "p", "object": "o"}}
-
-    store = _make_real_store()
-    config = _server_config(consolidation_mode="train", preload_cache=True)
-    config.consolidation.indexed_key_replay = False
-    config.consolidation.recall_probe_batch_size = 16
-
-    state_patch = {"boot_degraded": None}
-
-    # Registry reports two active keys; the probe will only return one.
-    fake_reg = MagicMock()
-    fake_reg.list_active.return_value = ["key_a", "key_b"]
-    fake_registry_map = {"episodic": fake_reg}
-
-    with (
-        patch.dict(app_module._state, state_patch, clear=False),
-        patch.object(
-            registry_binding_mod,
-            "verify_adapter_tree",
-            return_value=_verified_bindings(fake_registry_map),
-        ) as mock_verify_tree,
-        patch.object(src_mod, "WeightMemorySource", _PartialSource),
-    ):
-        app_module._hydrate_memory_store_in_place(
-            store,
-            config,
-            model=MagicMock(),
-            tokenizer=MagicMock(),
-        )
-
-        mock_verify_tree.assert_called_once()
-        # Read inside the with block so patch.dict hasn't restored _state yet.
-        degraded = app_module._state.get("boot_degraded")
-        assert degraded is not None, "boot_degraded must be set on partial hydration"
-        assert degraded["hits"] == 1
-        assert degraded["total"] == 2
-
-
-def test_hydrate_clears_boot_degraded_on_preload_cache_false():
-    """preload_cache=False: boot_degraded is cleared, store stays entry-empty
-    (intentional opt-out — same lifecycle as the boot path).
-    """
-    from paramem.server import app as app_module
-
-    store = _make_real_store()
-    config = _server_config(preload_cache=False)
-    config.consolidation.indexed_key_replay = False
-
-    state_patch = {
-        "boot_degraded": {"reason": "preload_partial", "hits": 0, "total": 5},
-    }
-
-    with (
-        patch.dict(app_module._state, state_patch, clear=False),
-        patch.object(store, "load_registries_from_disk"),
-        patch.object(
-            store,
-            "load_bookkeeping_from_disk",
-            return_value={"loaded": 0, "orphaned": 0},
-        ),
-    ):
-        app_module._hydrate_memory_store_in_place(
-            store,
-            config,
-            model=MagicMock(),
-            tokenizer=MagicMock(),
-        )
-
-    assert app_module._state["boot_degraded"] is None
-    # Stale entries are still cleared even when preload is off.
-    assert len(store) == 0
-
-
-def test_hydrate_publishes_nothing_for_an_unverified_tier(tmp_path):
-    """A tier whose registry binding fails verification is excluded from the
-    published registry; the swap itself still runs UNCONDITIONALLY — there is
-    no global degrade flag any more, only a per-tier one.
-
-    NEW CONTRACT (per-tier data-integrity guard): _hydrate_memory_store_in_place
-    always calls store.swap(); an unverified tier simply contributes nothing
-    to the published registry/entries, so a reader asking for that tier
-    afterward gets a fresh, empty one — every other tier still publishes.
-    """
-    import paramem.adapters.registry_binding as registry_binding_mod
-    from paramem.adapters.registry_binding import REGISTRY_UNREADABLE, TierBinding
-    from paramem.server import app as app_module
-
-    store = _make_real_store()
-    pre_call_size = len(store)
-    assert pre_call_size == 2, "precondition: store has 2 entries"
-
-    config = _server_config(preload_cache=False)
-    config.consolidation.indexed_key_replay = False
-    # Redirect incident writes away from the shared tests/fixtures/sandbox
-    # tree — this test's unverified tier writes a real incident.
-    config.paths.data = tmp_path
-
-    state_patch = {"boot_degraded": None}
-
-    swap_calls = []
-    original_swap = store.swap
-
-    def spy_swap(*args, **kwargs):
-        swap_calls.append(True)
-        return original_swap(*args, **kwargs)
-
-    fake_bindings = {
-        "episodic": TierBinding(
-            tier="episodic",
-            tier_root=Path("/fake/episodic"),
-            status=REGISTRY_UNREADABLE,
-            registry=None,
-            registry_present=True,
-            slot=None,
-            manifest=None,
-            candidate_count=0,
-            detail="simulated decrypt failure",
-        ),
-    }
-
-    with (
-        patch.dict(app_module._state, state_patch, clear=False),
-        patch.object(registry_binding_mod, "verify_adapter_tree", return_value=fake_bindings),
-        patch.object(store, "swap", side_effect=spy_swap),
-    ):
-        app_module._hydrate_memory_store_in_place(
-            store,
-            config,
-            model=MagicMock(),
-            tokenizer=MagicMock(),
-        )
-
-        # Critical: swap DOES run — the unverified tier is simply absent
-        # from the payload it publishes.
-        assert swap_calls, "store.swap() must run even when one tier is unverified"
-
-    # ABSENT from the published registry map — checked BEFORE any
-    # .registry(tier) call, which allocates a fresh empty registry via
-    # setdefault and would mask the very thing under test (an empty
-    # PUBLISHED registry would also satisfy list_active() == []).
-    assert not store.has_registry("episodic"), (
-        "an unverified tier must be ABSENT from the published registry map"
-    )
-
-    from paramem.server.incidents import read_incidents
-
-    incidents = read_incidents(tmp_path / "state")
-    assert any(i.id == "tier_registry_unverified:episodic" for i in incidents)
-
-
-def test_hydrate_weight_source_is_frame_local():
-    """The WeightMemorySource must be dropped (set to None) before _build_store_contents
-    returns — verified by confirming no reference to it leaks out of the call.
-
-    This guards the no-base-model-pinning invariant: a surviving reference would
-    re-introduce the cloud-only VRAM leak (fixed 2026-05-21).
-
-    The source is created inside _build_store_contents (frame-local, set to None
-    before return per BASE-MODEL HOLDER invariant).  The test patches
-    src_mod.WeightMemorySource to a capturing fake, triggers the path via
-    _hydrate_memory_store_in_place, and confirms exactly one source was created,
-    its probe was called (entry is in the store), and no persistent _state or
-    module-global reference was established.
-    """
-    import paramem.adapters.registry_binding as registry_binding_mod
-    import paramem.memory.source as src_mod
-    from paramem.server import app as app_module
-
-    sources_created = []
-
-    class FakeWeightSourceCapture:
-        def __init__(self, model, tokenizer, *, batch_size, registry=None, **kw):
-            sources_created.append(self)
-
-        def probe(self, keys_by_tier, should_abort=None):
-            return {
-                "live_key": {"key": "live_key", "subject": "s", "predicate": "p", "object": "o"}
-            }
-
-    store = _make_real_store()
-    config = _server_config(consolidation_mode="train", preload_cache=True)
-    config.consolidation.indexed_key_replay = False
-    config.consolidation.recall_probe_batch_size = 16
-
-    state_patch = {"boot_degraded": None}
-
-    # Registry reports one active key so the source-creation branch is entered.
-    fake_reg = MagicMock()
-    fake_reg.list_active.return_value = ["live_key"]
-    fake_registry_map = {"episodic": fake_reg}
-
-    with (
-        patch.dict(app_module._state, state_patch, clear=False),
-        patch.object(
-            registry_binding_mod,
-            "verify_adapter_tree",
-            return_value=_verified_bindings(fake_registry_map),
-        ),
-        patch.object(src_mod, "WeightMemorySource", FakeWeightSourceCapture),
-    ):
-        app_module._hydrate_memory_store_in_place(
-            store,
-            config,
-            model=MagicMock(),
-            tokenizer=MagicMock(),
-        )
-
-    # Exactly one source was created inside _build_store_contents.
-    assert len(sources_created) == 1
-    # The source object itself is NOT pinned by the function's closure or any
-    # persistent attribute — the only reference is sources_created[0] (held by
-    # this test).  We verify the function completed; the lack of a module-global
-    # or _state reference is structural (no persistent attribute exists to bind it).
-    # If this test passes, the function ran and returned without storing the source.
-    assert store.get("live_key") is not None, "entry must be in the store after hydration"
-
-
-# ---------------------------------------------------------------------------
-# _finalize_full entry-cache reconciliation
-# ---------------------------------------------------------------------------
-
-
-def test_finalize_full_swaps_store_when_replay_enabled_and_staged_present():
-    """_finalize_full publishes the staged store contents on a clean success.
-
-    Exercises the REAL ``app_module._finalize_full`` directly — it is a
-    module-level function taking ``(loop, result, staged, *, absorbed_interims)``
-    as explicit parameters (no closure captures), so the test calls
-    production code rather than a hand-copied mirror. ``store.swap`` is the
-    atomic-publish primitive; it must fire exactly once with the staged
-    payload when replay is enabled and a staged build is present — publish
-    now runs unconditionally (per-tier verification already excluded any
-    unverified tier from the staged dicts).
-    """
-    from paramem.server import app as app_module
-
-    fake_store = MagicMock()
-    fake_store.replay_enabled = True
-    fake_store.all_active_keys.return_value = ["k1", "k2"]
-    swap_calls = []
-    fake_store.swap.side_effect = lambda e, r, b: swap_calls.append((e, r, b))
-
-    fake_loop = MagicMock()
-    fake_loop.store = fake_store
-
-    fake_result = {"rolled_back": False, "tiers_rebuilt": ["episodic"], "graph_drift_count": 0}
-    staged_e = {"episodic": {}}
-    staged_r = {"episodic": MagicMock()}
-    staged_b = {}
-    staged_stats = {"boot_degraded": False, "tier_bindings": {}}
-    staged = (staged_e, staged_r, staged_b, staged_stats)
-
-    state_patch = {
-        "router": MagicMock(),
-        "last_consolidation": None,
-        "consolidating": True,
-        "event_loop": None,
-        "config": _server_config(),
-    }
-
-    with (
-        patch.dict(app_module._state, state_patch, clear=False),
-        patch.object(app_module, "_revalidate_adapter_manifests"),
-    ):
-        app_module._finalize_full(
-            fake_loop,
-            fake_result,
-            staged,
-            absorbed_interims=True,
-        )
-
-        # Assertions on _state must run INSIDE the patch.dict block — it
-        # restores the dict to its pre-with-block contents on exit, which
-        # would discard the mutations made by _finalize_full.
-        assert swap_calls == [(staged_e, staged_r, staged_b)], (
-            f"store.swap must be called once with the staged payload; got {swap_calls}"
-        )
-        assert app_module._state["boot_degraded"] is False
-        assert app_module._state["consolidating"] is False
-
-
-def test_finalize_full_raising_incident_store_does_not_prevent_consolidating_clear(caplog):
-    """A raising incident store (record/resolve/read) inside
-    _record_unverified_tier_incidents must not wedge _finalize_full —
-    _state["consolidating"] must still clear, _revalidate_adapter_manifests
-    and router.reload() must still run, and the fault must be logged as an
-    ERROR, never silently swallowed."""
-    import logging
-
-    from paramem.server import app as app_module
-
-    fake_store = MagicMock()
-    fake_store.replay_enabled = True
-    fake_store.all_active_keys.return_value = ["k1"]
-    swap_calls = []
-    fake_store.swap.side_effect = lambda e, r, b: swap_calls.append((e, r, b))
-
-    fake_loop = MagicMock()
-    fake_loop.store = fake_store
-
-    fake_result = {"rolled_back": False, "tiers_rebuilt": ["episodic"], "graph_drift_count": 0}
-    staged_stats = {"boot_degraded": None, "tier_bindings": {}}
-    staged = ({"episodic": {}}, {"episodic": MagicMock()}, {}, staged_stats)
-
-    fake_router = MagicMock()
-    state_patch = {
-        "router": fake_router,
-        "last_consolidation": None,
-        "consolidating": True,
-        "event_loop": None,
-        "config": _server_config(),
-    }
-
-    with (
-        patch.dict(app_module._state, state_patch, clear=False),
-        patch.object(app_module, "_revalidate_adapter_manifests") as mock_revalidate,
-        patch.object(
-            app_module,
-            "_record_unverified_tier_incidents",
-            side_effect=RuntimeError("simulated incident store fault"),
-        ),
-        caplog.at_level(logging.ERROR, logger="paramem.server.app"),
-    ):
-        app_module._finalize_full(fake_loop, fake_result, staged, absorbed_interims=True)
-
-        # The fault must not prevent the swap that already happened, nor
-        # any step after the protected region.
-        assert swap_calls, "store.swap must still have run before the fault"
-        mock_revalidate.assert_called_once()
-        fake_router.reload.assert_called_once()
-        assert app_module._state["consolidating"] is False, (
-            "a raising incident store must not wedge the finalizer before consolidating clears"
-        )
-
-    error_messages = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
-    assert any("tier-incident" in msg for msg in error_messages), (
-        f"expected the fault logged as an ERROR, got: {error_messages}"
-    )
-
-
-def test_finalize_full_with_staged_none_preserves_boot_degraded():
-    """staged=None (the worker-thread rebuild itself raised) preserves the
-    live store: no swap runs, and _state["boot_degraded"] keeps its PRIOR
-    value — a failed rebuild proves nothing about cache warmth, so it must
-    not be silently cleared."""
-    from paramem.server import app as app_module
-
-    fake_store = MagicMock()
-    fake_store.replay_enabled = True
-    fake_store.all_active_keys.return_value = []
-
-    fake_loop = MagicMock()
-    fake_loop.store = fake_store
-
-    fake_result = {"rolled_back": False, "tiers_rebuilt": ["episodic"], "graph_drift_count": 0}
-
-    _prior_boot_degraded = {"reason": "preload_partial", "hits": 1, "total": 2}
-    state_patch = {
-        "router": MagicMock(),
-        "last_consolidation": None,
-        "consolidating": True,
-        "event_loop": None,
-        "config": _server_config(),
-        "boot_degraded": _prior_boot_degraded,
-    }
-
-    with (
-        patch.dict(app_module._state, state_patch, clear=False),
-        patch.object(app_module, "_revalidate_adapter_manifests"),
-    ):
-        app_module._finalize_full(fake_loop, fake_result, None, absorbed_interims=True)
-
-        fake_store.swap.assert_not_called()
-        assert app_module._state["boot_degraded"] is _prior_boot_degraded
-        assert app_module._state["consolidating"] is False
-
-
-def test_finalize_full_skips_swap_when_replay_disabled():
-    """store.swap must NOT be called when replay is disabled.
-
-    There are no registries to publish when replay is off.
-    """
-    from paramem.server import app as app_module
-
-    fake_store = MagicMock()
-    fake_store.replay_enabled = False
-    fake_store.all_active_keys.return_value = []
-
-    fake_loop = MagicMock()
-    fake_loop.store = fake_store
-
-    fake_result = {"rolled_back": False, "tiers_rebuilt": ["episodic"], "graph_drift_count": 0}
-
-    state_patch = {
-        "router": MagicMock(),
-        "last_consolidation": None,
-        "consolidating": True,
-        "event_loop": None,
-        "config": _server_config(),
-    }
-
-    with (
-        patch.dict(app_module._state, state_patch, clear=False),
-        patch.object(app_module, "_revalidate_adapter_manifests"),
-    ):
-        app_module._finalize_full(fake_loop, fake_result, None, absorbed_interims=True)
-
-        fake_store.swap.assert_not_called()
-        assert app_module._state["consolidating"] is False

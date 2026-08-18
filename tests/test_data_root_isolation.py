@@ -101,14 +101,13 @@ def test_default_paths_config_never_addresses_the_live_store():
 
 
 def test_default_server_config_derived_paths_never_address_the_live_store():
-    """The derived accessors (adapters, registry, key_metadata) follow the
-    redirect too — those are the exact paths the memory source reads."""
+    """The derived accessors (adapters) follow the redirect too — those are
+    the exact paths the memory source reads.  Per-tier bookkeeping
+    (``<tier_root>/key_metadata.json``) is not a separate accessor; it
+    derives from ``adapter_dir``, already checked below."""
     config = ServerConfig()
     for value in (
         config.adapter_dir,
-        config.registry_path,
-        config.key_metadata_path,
-        config.paths.registry_dir,
         config.paths.calibration_prompts,
         config.paths.calibration_artifacts,
     ):

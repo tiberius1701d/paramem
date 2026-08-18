@@ -137,7 +137,9 @@ def main(argv=None) -> int:
         logger.error("Failed to load server config: %s", exc)
         return 1
 
-    state_dir = (server_config.paths.data / "state").resolve()
+    from paramem.training.stage_ledger import data_state_dir
+
+    state_dir = data_state_dir(server_config.paths.data).resolve()
     backups_root = (server_config.paths.data / "backups").resolve()
 
     # Schedule guard — matches run_scheduled_backup's no-op so the state file

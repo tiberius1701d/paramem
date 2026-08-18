@@ -52,13 +52,14 @@ class TrainingJob:
         adapter_name: Name of the production adapter being trained (e.g.
             ``"episodic"`` or ``"episodic_interim_20260418T1430"``).
         adapter_config: LoRA config for the adapter.
-        inference_fallback_adapter: Adapter to activate when training is paused
-            for inference.  Must be a **committed** adapter slot with stable
-            weights — never the mid-training ``in_training`` staging slot.
-
-            For interim-adapter jobs: ``"episodic"`` (the stable main).
-            For main consolidation refresh jobs: the backed-up prior main
-            adapter name.
+        inference_fallback_adapter: Adapter name recorded for bookkeeping
+            only — installed on the sentinel ``TrainingJob`` at
+            ``self._current_job`` while a job runs.  Nothing reads it back to
+            restore an adapter: model generation always runs under
+            ``model.disable_adapter()`` at inference sites, so no production
+            abort branch needs to reactivate a specific adapter.  Must still
+            name a **committed** adapter slot with stable weights — never the
+            mid-training ``in_training`` staging slot.
 
             Defaults to ``"episodic"`` so existing callers that create
             ``TrainingJob`` without this field continue to work correctly.
@@ -95,7 +96,6 @@ class BackgroundTrainer:
         training_config: TrainingConfig,
         output_dir: str | Path = "data/ha/adapters",
         thermal_policy: ThermalPolicy | None = None,
-        preload_cache: bool = False,
     ):
         # BASE-MODEL HOLDER (BackgroundTrainer): released via
         # _state["background_trainer"]=None + _stop_callable_worker() in
@@ -111,13 +111,6 @@ class BackgroundTrainer:
         # don't override the default get fast unthrottled runs by
         # construction.  Live-server only when a non-zero limit is set.
         self._thermal_policy = thermal_policy
-        # When preload_cache=True (InferenceConfig default), recall is served
-        # from MemoryStore pre-loaded at boot.  In the abort branch, switching
-        # the adapter back to the production slot is unnecessary because model
-        # generation always uses model.disable_adapter() at inference sites.
-        # Skip the adapter swap to save a PEFT call; eval +
-        # gradient_checkpointing_disable still run regardless.
-        self._preload_cache = preload_cache
 
         # Per-job abort state.  Recreated at the start of each job
         # (_run_callable_queue); cleared in their finally blocks.
@@ -152,21 +145,6 @@ class BackgroundTrainer:
     @property
     def is_training(self) -> bool:
         return self._is_training
-
-    def abort_requested(self) -> bool:
-        """Return True when the per-job abort event has been set.
-
-        Called by the post-fold re-probe (``_build_store_contents``) to yield
-        the GPU to a waiting ``/chat`` between adapter groups.  A partial probe
-        is safe: registry and bookkeeping are always complete; the partial
-        entries self-heal via on-miss probing on the next query.
-
-        Returns False when no job is active (no-op case) or the abort flag has
-        not been set.
-        """
-        with self._active_state_lock:
-            abort = self._active_abort
-        return abort is not None and abort.is_set()
 
     def abort_for_inference(self, timeout: float = 30.0) -> bool:
         """Signal the active training job to stop at the next step boundary.
@@ -210,10 +188,10 @@ class BackgroundTrainer:
         ``abort_for_inference()``.
 
         ``inference_fallback_adapter`` is stored as a sentinel
-        :class:`TrainingJob` on ``self._current_job`` for bookkeeping.
-        The abort branch reads it only when ``preload_cache=False``; when
-        ``preload_cache=True`` (the default) the adapter swap is skipped
-        because recall is served from MemoryStore.
+        :class:`TrainingJob` on ``self._current_job`` for bookkeeping only —
+        no adapter swap reads it back.  Model generation always uses
+        ``model.disable_adapter()`` at inference sites, so there is no
+        production abort branch that needs to restore a specific adapter.
 
         The callable worker thread is started once on the first
         :meth:`submit` call and lives for the process lifetime (persistent
@@ -224,8 +202,9 @@ class BackgroundTrainer:
 
         Args:
             fn: Zero-argument callable to execute under the GPU lock.
-            inference_fallback_adapter: Adapter to activate if ``pause()``
-                is called while ``fn`` is executing.  Must name a committed
+            inference_fallback_adapter: Recorded for bookkeeping only on the
+                sentinel ``TrainingJob`` while ``fn`` runs — nothing reads it
+                back (see :class:`TrainingJob`).  Must still name a committed
                 adapter slot with stable weights.  Defaults to ``"episodic"``.
         """
         self._job_queue.put((fn, inference_fallback_adapter))
@@ -257,9 +236,9 @@ class BackgroundTrainer:
 
         Args:
             fn: Zero-argument callable to execute under the GPU lock.
-            inference_fallback_adapter: Adapter to activate if ``pause()``
-                is called while *fn* is executing.  Defaults to
-                ``"episodic"``.
+            inference_fallback_adapter: Recorded for bookkeeping only on the
+                sentinel ``TrainingJob`` while *fn* runs — nothing reads it
+                back (see :class:`TrainingJob`).  Defaults to ``"episodic"``.
 
         Raises:
             Exception: Re-raises the first exception raised inside *fn*.
@@ -391,7 +370,6 @@ class BackgroundTrainer:
         self,
         *,
         base_shutdown_predicate: Callable[[], bool] | None = None,
-        on_step_yield: Callable[[int], None] | None = None,
         on_epoch_persist: Callable[[int, str], None] | None = None,
         on_save_persist: Callable[[int, str], None] | None = None,
     ) -> TrainingHooks:
@@ -413,10 +391,6 @@ class BackgroundTrainer:
             base_shutdown_predicate: Additional shutdown gate.  When ``None``
                 (the default), only ``_shutdown_requested`` and the abort flag
                 are checked.
-            on_step_yield: Passed through to ``TrainingHooks`` unchanged.
-                The inference-yield hook is no longer needed by
-                ``BackgroundTrainer`` (abort replaced it) but consolidation
-                callers may still supply one.
             on_epoch_persist: Passed through to ``TrainingHooks`` unchanged.
             on_save_persist: Passed through to ``TrainingHooks`` unchanged.
 
@@ -436,7 +410,6 @@ class BackgroundTrainer:
             return evt is not None and evt.is_set()
 
         return TrainingHooks(
-            on_step_yield=on_step_yield,
             on_epoch_persist=on_epoch_persist,
             on_save_persist=on_save_persist,
             on_shutdown_check=_shutdown_or_abort,

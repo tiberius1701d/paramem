@@ -32,7 +32,7 @@ def _make_server_config(
 ) -> ServerConfig:
     """Build a minimal ServerConfig pointing at tmp_path (no adapter dirs)."""
     if artifacts is None:
-        artifacts = ["config", "graph", "registry"]
+        artifacts = ["config", "graph"]
     config = ServerConfig.__new__(ServerConfig)
     paths = PathsConfig(
         data=tmp_path / "ha",
@@ -155,7 +155,6 @@ def _run(
     loop=None,
     max_total_disk_gb: float = 20.0,
     config_content: bytes | None = b"model: mistral\n",
-    write_registry: bool = True,
 ) -> tuple[ScheduledBackupResult, ServerConfig, Path, Path]:
     """Run the backup runner and return (result, config, state_dir, backups_root)."""
     config = _make_server_config(
@@ -176,12 +175,6 @@ def _run(
     if config_content is not None:
         live_config_path.write_bytes(config_content)
 
-    # Write registry if requested.
-    key_metadata_path = config.paths.key_metadata
-    key_metadata_path.parent.mkdir(parents=True, exist_ok=True)
-    if write_registry:
-        key_metadata_path.write_text('{"keys": {}}', encoding="utf-8")
-
     result = run_scheduled_backup(
         server_config=config,
         loop=loop,
@@ -198,12 +191,12 @@ def _run(
 
 
 class TestRunnerSuccess:
-    def test_runner_writes_three_artifacts_on_success(self, tmp_path):
-        """Default config + mock loop → 3 slots written, prune ran."""
+    def test_runner_writes_default_artifacts_on_success(self, tmp_path):
+        """Default config + mock loop → config+graph slots written, prune ran."""
         loop = _mock_loop()
         result, _, _, backups_root = _run(tmp_path, loop=loop)
         assert result.success
-        assert set(result.written_slots.keys()) == {"config", "graph", "registry"}
+        assert set(result.written_slots.keys()) == {"config", "graph"}
         # Each slot dir exists.
         for name, path_str in result.written_slots.items():
             assert Path(path_str).exists(), f"{name} slot not on disk"
@@ -234,8 +227,6 @@ class TestRunnerSuccess:
         config.paths.data.mkdir(parents=True, exist_ok=True)
         live_config = tmp_path / "server.yaml"
         live_config.write_bytes(b"model: mistral\n")
-        config.paths.key_metadata.parent.mkdir(parents=True, exist_ok=True)
-        config.paths.key_metadata.write_text("{}", encoding="utf-8")
         result = run_scheduled_backup(
             server_config=config,
             loop=None,
@@ -258,22 +249,13 @@ class TestRunnerSuccess:
 
 class TestRunnerSkipPaths:
     def test_runner_skips_graph_when_loop_none(self, tmp_path):
-        """loop=None → graph in skipped_artifacts; config + registry written."""
+        """loop=None → graph in skipped_artifacts; config written."""
         result, _, _, _ = _run(tmp_path, loop=None)
         assert result.success
         assert "graph" in {a for a, _ in result.skipped_artifacts}
         assert "config" in result.written_slots
-        assert "registry" in result.written_slots
         skip_reasons = {a: r for a, r in result.skipped_artifacts}
         assert "unavailable" in skip_reasons["graph"].lower()
-
-    def test_runner_skips_registry_when_missing(self, tmp_path):
-        """key_metadata.json absent → registry skipped with reason."""
-        result, _, _, _ = _run(tmp_path, loop=None, write_registry=False)
-        assert result.success
-        assert "registry" in {a for a, _ in result.skipped_artifacts}
-        skip_reasons = {a: r for a, r in result.skipped_artifacts}
-        assert "registry" in skip_reasons["registry"].lower()
 
     def test_runner_schedule_off_returns_noop(self, tmp_path):
         """schedule="off" → success=True, written_slots empty."""
@@ -291,7 +273,7 @@ class TestRunnerSkipPaths:
 
 class TestRunnerFailurePaths:
     def test_runner_aborts_after_first_failure(self, tmp_path):
-        """Force backup_write to raise on config → registry skipped with 'aborted'."""
+        """Force backup_write to raise on config → graph skipped with 'aborted'."""
         loop = _mock_loop()
 
         def _raise(*args, **kwargs):
@@ -322,8 +304,6 @@ class TestRunnerFailurePaths:
         live_config = tmp_path / "server.yaml"
         live_config.write_bytes(b"model: mistral\n")
         config.paths.data.mkdir(parents=True, exist_ok=True)
-        config.paths.key_metadata.parent.mkdir(parents=True, exist_ok=True)
-        config.paths.key_metadata.write_text("{}")
 
         br = (config.paths.data / "backups").resolve()
         result = run_scheduled_backup(
@@ -360,14 +340,13 @@ class TestRunnerFailurePaths:
             return under if calls["n"] == 1 else over
 
         with patch("paramem.backup.retention.compute_disk_usage", side_effect=_usage_side_effect):
-            result, _, _, _ = _run(tmp_path, artifacts=["config", "graph", "registry"], loop=loop)
+            result, _, _, _ = _run(tmp_path, artifacts=["config", "graph"], loop=loop)
 
         assert "config" in result.written_slots, (
             "the first artifact's slot must not be lost by the later refusal"
         )
         skip_reasons = dict(result.skipped_artifacts)
         assert skip_reasons.get("graph") == "disk_pressure"
-        assert skip_reasons.get("registry") == "disk_pressure"
         assert "aborted after prior failure" not in skip_reasons.values()
         assert result.success is False
         assert "disk_pressure" in (result.error or "")
@@ -441,8 +420,6 @@ class TestRunnerSkipsEmissionWhenKeepIsZero:
 
         live_config = tmp_path / "server.yaml"
         live_config.write_bytes(b"model: mistral\n")
-        config.paths.key_metadata.parent.mkdir(parents=True, exist_ok=True)
-        config.paths.key_metadata.write_text('{"keys": {}}', encoding="utf-8")
 
         loop = _mock_loop()
         result = run_scheduled_backup(
@@ -506,10 +483,12 @@ class TestRunnerBundlePath:
         live_config = tmp_path / "server.yaml"
         live_config.write_bytes(b"model: mistral\n")
 
-        # key_metadata.json (global registry — does not drive slot resolution for
-        # the bundle, but write_bundle captures it as "registry/key_metadata.json").
-        config.paths.key_metadata.parent.mkdir(parents=True, exist_ok=True)
-        config.paths.key_metadata.write_text('{"keys": {}}', encoding="utf-8")
+        # key_metadata.json (per-tier bookkeeping — does not drive slot
+        # resolution for the bundle, but write_bundle captures it under the
+        # tier's own "adapters/episodic/key_metadata.json" path).
+        tier_dir = config.adapter_dir / "episodic"
+        tier_dir.mkdir(parents=True, exist_ok=True)
+        (tier_dir / "key_metadata.json").write_text('{"keys": {}}', encoding="utf-8")
 
         # Seed episodic adapter slot so write_bundle can find the live slot.
         indexed_key_content = b'{"keys": {"k1": "v1"}}'
@@ -649,8 +628,9 @@ class TestRunnerBundlePath:
         live_config = tmp_path / "server.yaml"
         live_config.write_bytes(b"model: mistral\n")
         config.paths.data.mkdir(parents=True, exist_ok=True)
-        config.paths.key_metadata.parent.mkdir(parents=True, exist_ok=True)
-        config.paths.key_metadata.write_text("{}")
+        tier_dir = config.adapter_dir / "episodic"
+        tier_dir.mkdir(parents=True, exist_ok=True)
+        (tier_dir / "key_metadata.json").write_text("{}")
 
         result = run_scheduled_backup(
             server_config=config,
@@ -684,8 +664,9 @@ class TestRunnerBundlePath:
         live_config = tmp_path / "server.yaml"
         live_config.write_bytes(b"model: mistral\n")
         config.paths.data.mkdir(parents=True, exist_ok=True)
-        config.paths.key_metadata.parent.mkdir(parents=True, exist_ok=True)
-        config.paths.key_metadata.write_text("{}")
+        tier_dir = config.adapter_dir / "episodic"
+        tier_dir.mkdir(parents=True, exist_ok=True)
+        (tier_dir / "key_metadata.json").write_text("{}")
 
         result = run_scheduled_backup(
             server_config=config,

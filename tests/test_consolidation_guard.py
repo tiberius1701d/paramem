@@ -1,6 +1,6 @@
-"""Tests for ConsolidationLoop.guard_trial_state and TrialActiveError.
+"""Tests for the server-side consolidation-endpoint TRIAL guard.
 
-No GPU — all tests use mocked ConsolidationLoop instances.
+No GPU — endpoints are exercised via TestClient without a model load.
 """
 
 from __future__ import annotations
@@ -8,59 +8,6 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 
 import pytest
-
-from paramem.training.consolidation import ConsolidationLoop, TrialActiveError
-
-
-def _make_loop() -> ConsolidationLoop:
-    """Build a ConsolidationLoop without loading any model or GPU resources."""
-    loop = ConsolidationLoop.__new__(ConsolidationLoop)
-    # Provide just enough attributes for guard_trial_state.
-    loop.state_provider = None
-    return loop
-
-
-# ---------------------------------------------------------------------------
-# guard_trial_state behaviour
-# ---------------------------------------------------------------------------
-
-
-class TestGuardTrialState:
-    def test_guard_trial_state_raises_when_trial_active(self):
-        """state["migration"]["state"] == "TRIAL" → TrialActiveError."""
-        loop = _make_loop()
-        state = {"migration": {"state": "TRIAL"}}
-        with pytest.raises(TrialActiveError):
-            loop.guard_trial_state(state)
-
-    def test_guard_trial_state_noop_when_live(self):
-        """LIVE → no exception."""
-        loop = _make_loop()
-        state = {"migration": {"state": "LIVE"}}
-        loop.guard_trial_state(state)  # must not raise
-
-    def test_guard_trial_state_noop_when_staging(self):
-        """STAGING → no exception."""
-        loop = _make_loop()
-        state = {"migration": {"state": "STAGING"}}
-        loop.guard_trial_state(state)
-
-    def test_guard_trial_state_noop_when_state_none(self):
-        """state=None (experiment path) → no exception."""
-        loop = _make_loop()
-        loop.guard_trial_state(None)  # must not raise
-
-    def test_guard_trial_state_noop_when_migration_missing(self):
-        """state without 'migration' key → no exception."""
-        loop = _make_loop()
-        loop.guard_trial_state({"foo": "bar"})  # must not raise
-
-    def test_guard_trial_state_error_message_is_human_readable(self):
-        """TrialActiveError message mentions rollback."""
-        loop = _make_loop()
-        state = {"migration": {"state": "TRIAL"}}
-        with pytest.raises(TrialActiveError, match="rollback"):
-            loop.guard_trial_state(state)
 
 
 class TestEndpointGuards:

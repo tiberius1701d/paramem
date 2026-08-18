@@ -64,7 +64,7 @@ if [[ "${1:-}" == "--config" ]]; then
 
 Walks the dataclass tree, converts Path objects and dataclass instances
 to plain dict / str, and dumps via yaml.safe_dump.  Skips ``@property``
-attrs (adapter_dir, registry_dir, etc.) — those are computed, not
+attrs (adapter_dir, session_dir, etc.) — those are computed, not
 configured, and surfacing them would conflate config with derivation.
 """
 import sys
@@ -296,9 +296,10 @@ def fmt_result(r):
     # RunRecord.detail (see paramem/server/run_status.py::RunRecord.to_dict),
     # not at the top level of the record — only op_type/outcome/summary/at/
     # detail are top-level. Writer sites (paramem/server/app.py):
-    # _finalize_simulate ("simulated"), _finalize_interim ("trained"/etc.),
+    # _finalize_interim (every interim-shaped outcome, "trained"/"simulated"/
+    # etc. -- the outcome string alone selects the render branch below),
     # _finalize_no_facts ("no_facts"), _finalize_full
-    # ("full_trained"/"rolled_back"), _finalize_full_status_only
+    # ("full_trained"), _finalize_full_status_only
     # ("aborted"/"noop"), _finalize_migration ("migration_complete"/
     # "migration_partial"), interim_discard ("interim_discarded").
     detail = r.get("detail") or {}
@@ -319,12 +320,11 @@ def fmt_result(r):
         )
     if status == "no_facts":
         return f"no facts from {detail.get('sessions') or 0} sessions"
-    if status in ("full_trained", "rolled_back"):
+    if status == "full_trained":
         tiers = ",".join(detail.get("tiers_rebuilt") or []) or "-"
-        extra = f", rollback={detail.get('rollback_tier')}" if detail.get("rollback_tier") else ""
         return (
             f"{status} {detail.get('total_keys') or 0} keys "
-            f"(tiers={tiers}, drift={detail.get('graph_drift_count') or 0}{extra})"
+            f"(tiers={tiers})"
         )
     if status == "interim_discarded":
         tiers = ",".join(detail.get("discarded_tiers") or []) or "-"
@@ -489,13 +489,17 @@ for s in d.get("speakers", []):
         s.get("embeddings", 0), s.get("pending", 0),
         s.get("enroll_method", "unknown"),
     ))
-# Attention block lines: ATTN<TAB>kind<TAB>level<TAB>summary<TAB>action_hint<TAB>age_seconds
+# Attention block lines: ATTN|kind|level|summary|action_hint|age_seconds
+# NOTE: Uses | as separator (not \t) so IFS='|' read preserves empty fields.
+# IFS=$'\t' with consecutive empty tabs collapses them (bash whitespace rule),
+# causing wrong variable assignment when action_hint is None (age_seconds
+# would shift into the action_hint slot).
 for item in (d.get("attention") or {}).get("items", []) or []:
-    print("ATTN\t{}\t{}\t{}\t{}\t{}".format(
+    print("ATTN|{}|{}|{}|{}|{}".format(
         item.get("kind", "?"),
         item.get("level", "info"),
-        (item.get("summary") or "").replace("\t", " ").replace("\n", " "),
-        (item.get("action_hint") or "").replace("\t", " ").replace("\n", " "),
+        (item.get("summary") or "").replace("|", "-").replace("\t", " ").replace("\n", " "),
+        (item.get("action_hint") or "").replace("|", "-").replace("\t", " ").replace("\n", " "),
         item.get("age_seconds") if item.get("age_seconds") is not None else "",
     ))
 # Migrate footer: MIGRATE<TAB>state<TAB>config_rev<TAB>applied_date
@@ -555,7 +559,7 @@ IFS='|' read -r mode cloud_only_reason model model_id_short model_device \
 speaker_lines=$(echo "$parsed" | awk '/^SPK\t/')
 adapter_spec_lines=$(echo "$parsed" | awk '/^ADPT\t/')
 # Parse attention items, migrate footer, and new observability lines.
-attention_lines=$(echo "$parsed" | awk '/^ATTN\t/')
+attention_lines=$(echo "$parsed" | awk '/^ATTN\|/')
 migrate_line=$(echo "$parsed" | awk '/^MIGRATE\t/' | head -1)
 vram_comp_lines=$(echo "$parsed" | awk '/^VRAM_COMP\t/')
 oldest_interim_stamp=$(echo "$parsed" | awk '/^OLDEST_INTERIM\t/' | head -1 | cut -f2)
@@ -791,7 +795,7 @@ if [[ -n "$attention_lines" ]]; then
     # Determine banner color: red (✗) if any item is level="failed", else yellow (⚠).
     banner_color="$YELLOW"
     banner_glyph="⚠"
-    while IFS=$'\t' read -r _attn_marker _akind alevel _asummary _ahint _aage; do
+    while IFS='|' read -r _attn_marker _akind alevel _asummary _ahint _aage; do
         [[ -z "$alevel" ]] && continue
         if [[ "$alevel" == "failed" ]]; then
             banner_color="$RED"
@@ -804,7 +808,7 @@ if [[ -n "$attention_lines" ]]; then
     echo -e "  ${banner_color}${banner_glyph}  ATTENTION — USER ACTION REQUIRED${RESET}"
     echo "  ────────────────────────────────────────"
 
-    while IFS=$'\t' read -r _attn_marker akind alevel asummary ahint aage; do
+    while IFS='|' read -r _attn_marker akind alevel asummary ahint aage; do
         [[ -z "$akind" ]] && continue
         case "$alevel" in
             failed)          row_color="$RED"    ;;

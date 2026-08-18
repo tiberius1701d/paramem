@@ -42,13 +42,16 @@ from pathlib import Path
 
 from paramem.adapters.manifest import (
     MANIFEST_SCHEMA_VERSION,
+    UNKNOWN,
     AdapterManifest,
     BaseModelFingerprint,
     LoRAShape,
+    PayloadFingerprint,
     TokenizerFingerprint,
     is_slot_name,
     write_manifest,
 )
+from paramem.backup.hashing import plaintext_sha256
 from paramem.training.donor import DONOR_META_FILENAME, donor_store_dir
 
 logger = logging.getLogger(__name__)
@@ -109,24 +112,30 @@ def _manifest_for(
     ``lora`` comes from the slot's own ``adapter_config.json``; ``key_count``
     from the donor's recorded triple set; ``trained_at`` from the slot stamp.
     ``registry_sha256`` is empty because a donor carries no key registry —
-    the value ``find_live_slot`` matches a donor slot on.
+    the value ``find_live_slot`` matches a donor slot on. ``payload.sha256``
+    is the plaintext SHA-256 of *slot*'s own ``adapter_model.safetensors``
+    (:func:`~paramem.backup.hashing.plaintext_sha256` — the same primitive
+    and regime the seal envelope stamps), computed at *slot*'s legacy
+    location, before the caller moves it.
     """
     adapter_config = json.loads((slot / "adapter_config.json").read_text())
     stamp = slot.name  # YYYYMMDD-HHMMSS
     trained_at = (
         f"{stamp[0:4]}-{stamp[4:6]}-{stamp[6:8]}T{stamp[9:11]}:{stamp[11:13]}:{stamp[13:15]}Z"
     )
+    payload_sha256 = plaintext_sha256(slot / "adapter_model.safetensors")
     return AdapterManifest(
         schema_version=MANIFEST_SCHEMA_VERSION,
         name=slot.parent.name,
         trained_at=trained_at,
+        payload=PayloadFingerprint(kind="train", sha256=payload_sha256),
         base_model=BaseModelFingerprint(
             repo=base_model["repo"], sha=base_model["sha"], hash=base_model["hash"]
         ),
         tokenizer=TokenizerFingerprint(
             name_or_path=tokenizer.get("name_or_path", base_model["repo"]),
-            vocab_size=tokenizer.get("vocab_size", "UNKNOWN"),
-            merges_hash=tokenizer.get("merges_hash", "UNKNOWN"),
+            vocab_size=tokenizer.get("vocab_size", UNKNOWN),
+            merges_hash=tokenizer.get("merges_hash", UNKNOWN),
         ),
         lora=LoRAShape(
             rank=int(adapter_config["r"]),
@@ -188,9 +197,17 @@ def relocate(adapter_dir: Path, *, dry_run: bool = False) -> tuple[int, int]:
             continue
 
         manifest = _manifest_for(slot, donor_meta, base_model, tokenizer)
-        # Drop the base model and LoRA shape from donor_meta: they now live in
-        # the manifest, and a second recorded copy is a drift source.
-        trimmed = {k: v for k, v in donor_meta.items() if k not in ("base_model_id", "lora_shape")}
+        # Drop the base model, LoRA shape and the legacy ciphertext weights
+        # digest from donor_meta: base model/LoRA shape now live in the
+        # manifest (a second recorded copy is a drift source), and
+        # weights_sha256 is a retired field -- the manifest's own
+        # payload.sha256 (plaintext, survives rotate-daily) is what
+        # donor_slot_valid verifies weights against.
+        trimmed = {
+            k: v
+            for k, v in donor_meta.items()
+            if k not in ("base_model_id", "lora_shape", "weights_sha256")
+        }
 
         logger.info("%s → %s", slot, dst)
         if dry_run:

@@ -304,7 +304,6 @@ class TestPreviewKeepsSecretsOutOfEverything:
         config.adapter_dir = tmp_path / "data" / "ha" / "adapters"
         config.adapter_dir.mkdir(parents=True, exist_ok=True)
         config.security.backups.max_total_disk_gb = 20.0
-        config.paths.key_metadata = tmp_path / "data" / "ha" / "registry" / "key_metadata.json"
         fresh = {
             "model": None,
             "config": config,

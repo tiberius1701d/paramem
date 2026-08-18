@@ -24,7 +24,7 @@ def _make_config(max_total_disk_gb: float = 20.0) -> ServerBackupsConfig:
     return ServerBackupsConfig(
         max_total_disk_gb=max_total_disk_gb,
         schedule="daily 04:00",
-        artifacts=["config", "graph", "registry"],
+        artifacts=["snapshot_bundle"],
         retention=RetentionConfig(
             daily=RetentionTierConfig(keep=7),
             manual=RetentionTierConfig(keep="unlimited", max_disk_gb=5.0),
@@ -39,7 +39,8 @@ def _make_bundle_slot(slot_dir: Path, *, adapter_size_bytes: int = 100_000) -> P
       <slot_dir>/
         bundle.meta.json              (top-level manifest, small)
         config/server.yaml            (small)
-        registry/key_metadata.json    (small)
+        extra/key_metadata.json       (small; a nested sidecar, tests the
+                                        recursive walk beyond adapters/)
         adapters/episodic/
           adapter_model.safetensors   (large — the bulk of the bundle)
           adapter_config.json         (small)
@@ -58,7 +59,6 @@ def _make_bundle_slot(slot_dir: Path, *, adapter_size_bytes: int = 100_000) -> P
         "created_at": "2026-05-20T20:55:00Z",
         "tier": "manual",
         "label": None,
-        "key_metadata_sha256": "a" * 64,
         "base_model": {},
         "files": [],
         "adapters": {},
@@ -71,10 +71,11 @@ def _make_bundle_slot(slot_dir: Path, *, adapter_size_bytes: int = 100_000) -> P
     config_dir.mkdir()
     (config_dir / "server.yaml").write_bytes(b"model: mistral\n")
 
-    # Registry subdir
-    registry_dir = slot_dir / "registry"
-    registry_dir.mkdir()
-    (registry_dir / "key_metadata.json").write_bytes(b"{}")
+    # An arbitrary nested subdir — proves the recursive walk isn't hardcoded
+    # to the "adapters/" path specifically.
+    extra_dir = slot_dir / "extra"
+    extra_dir.mkdir()
+    (extra_dir / "key_metadata.json").write_bytes(b"{}")
 
     # Adapter subdir with large weight file
     adapter_dir = slot_dir / "adapters" / "episodic"

@@ -47,6 +47,12 @@ from paramem.server.inference import (
 )
 from paramem.server.temporal import weekday_name
 from tests._guard_utils import call_inside_context_manager, find_function
+from tests._serving_door import (
+    forbid_both_read_doors,
+    live_door_config,
+    seed_live_door_fingerprints,
+    stub_live_door_probe,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -232,7 +238,11 @@ class TestMaybeEscalateTrimApplication:
 
 class _PlanBuilder:
     """Shared plan/model builders, mirroring
-    tests/test_server.py::TestProbeAndReasonDispatch's pattern."""
+    tests/test_server.py::TestProbeAndReasonDispatch's pattern.
+
+    The serving read door every ``_probe_and_reason`` test here runs
+    through is named per test via ``tests._serving_door``.
+    """
 
     @staticmethod
     def make_plan(steps):
@@ -250,32 +260,13 @@ class _PlanBuilder:
         model.peft_config = {name: MagicMock() for name in adapter_names}
         return model
 
-    @staticmethod
-    def stub_probe(monkeypatch):
-        def fake_grouped(model, tokenizer, keys_by_adapter, **kwargs):
-            results = {}
-            for keys in keys_by_adapter.values():
-                for k in keys:
-                    results[k] = {"key": k, "fact_text": f"fact about {k}", "confidence": 1.0}
-            return results
-
-        monkeypatch.setattr("paramem.memory.probe.probe_keys_grouped_by_adapter", fake_grouped)
-        monkeypatch.setattr("paramem.models.loader.switch_adapter", lambda model, name: None)
-        monkeypatch.setattr(
-            "paramem.memory.store.MemoryStore.read_simhash_registry_from_disk",
-            staticmethod(lambda path, cached=False: {}),
-        )
-        monkeypatch.setattr(
-            "paramem.server.inference.is_self_referential", lambda text, **kwargs: False
-        )
-
 
 class TestTokenBudgetPin(_PlanBuilder):
     """max_new_tokens is fed by config.inference.max_response_tokens — the
     plan's explicit gap: no test pinned this before the tail collapse."""
 
     def test_probe_and_reason_uses_configured_max_response_tokens(self, monkeypatch):
-        self.stub_probe(monkeypatch)
+        stub_live_door_probe(monkeypatch)
         captured = {}
 
         def fake_generate(model, tokenizer, prompt, **kwargs):
@@ -284,14 +275,35 @@ class TestTokenBudgetPin(_PlanBuilder):
 
         monkeypatch.setattr("paramem.server.inference.generate_answer", fake_generate)
 
+        def exploding_base_model(*args, **kwargs):
+            raise AssertionError(
+                "the generate under test is the reasoning leg over recalled facts, "
+                "not the no-recall base-model fallback"
+            )
+
+        monkeypatch.setattr("paramem.server.inference._base_model_answer", exploding_base_model)
+
         tokenizer = MagicMock()
         tokenizer.apply_chat_template = lambda msgs, **kwargs: "prompt"
         model = self.make_model(["episodic"])
 
-        config = ServerConfig()
+        config = live_door_config()
         config.inference.max_response_tokens = 64
 
         plan = self.make_plan([("episodic", ["e1"])])
+
+        # The temporal-selection stage (on by default) reads bookkeeping for
+        # every probed key -- a known key always carries a full row.
+        memory_store = _MS()
+        memory_store.set_bookkeeping(
+            "e1",
+            speaker_id="speaker0",
+            relation_type="factual",
+            first_seen="2026-08-01T09:00:00",
+            last_seen="2026-08-01T09:00:00",
+            promoted=False,
+        )
+        seed_live_door_fingerprints(memory_store, plan)
 
         _probe_and_reason(
             text="What do I like?",
@@ -300,7 +312,7 @@ class TestTokenBudgetPin(_PlanBuilder):
             model=model,
             tokenizer=tokenizer,
             config=config,
-            memory_store=_MS(replay_enabled=False),
+            memory_store=memory_store,
         )
 
         assert captured["max_new_tokens"] == 64
@@ -499,30 +511,17 @@ class TestTemporalSelectionWiring(_PlanBuilder):
     ``_probe_and_reason`` calls — so no test loads a model or touches the
     GPU. Bookkeeping-dependent tests use a real ``MemoryStore`` (never a
     ``MagicMock`` store, which would fabricate ``bookkeeping_for_key``).
+
+    Every test names the serving read door it runs through
+    (``config.inference.preload_cache``) instead of inheriting the
+    ``ServerConfig`` default: the stage's observable here is the key set
+    that reaches the probe, so these tests take the live door
+    (``preload_cache=False``, the arm that calls
+    :meth:`~paramem.memory.store.MemoryStore.probe_source` over the
+    stubbed grouped probe).  The zero-survivor pair is the exception —
+    nothing is probed there at all, so it pins the production default and
+    forbids BOTH doors.
     """
-
-    @staticmethod
-    def stub_probe_capturing(monkeypatch, fact_prefix: str = "fact about"):
-        """Stub the grouped-probe primitive, returning a dict the caller
-        can read ``["keys_by_adapter"]`` from after ``_probe_and_reason``
-        returns — the exact set of keys the probe call received."""
-        captured: dict = {}
-
-        def fake_grouped(model, tokenizer, keys_by_adapter, **kwargs):
-            captured["keys_by_adapter"] = {k: list(v) for k, v in keys_by_adapter.items()}
-            results = {}
-            for keys in keys_by_adapter.values():
-                for k in keys:
-                    results[k] = {"key": k, "fact_text": f"{fact_prefix} {k}", "confidence": 1.0}
-            return results
-
-        monkeypatch.setattr("paramem.memory.probe.probe_keys_grouped_by_adapter", fake_grouped)
-        monkeypatch.setattr("paramem.models.loader.switch_adapter", lambda model, name: None)
-        monkeypatch.setattr(
-            "paramem.memory.store.MemoryStore.read_simhash_registry_from_disk",
-            staticmethod(lambda path, cached=False: {}),
-        )
-        return captured
 
     @staticmethod
     def stub_generate_local_reply(monkeypatch, reply: str = "a reply."):
@@ -543,7 +542,7 @@ class TestTemporalSelectionWiring(_PlanBuilder):
         """temporal_selection_enabled=False: no clock read, no bookkeeping
         read, no selection call — the context string and the probe's
         keys_by_adapter are byte-identical to the pre-feature shape."""
-        probed = self.stub_probe_capturing(monkeypatch)
+        probed = stub_live_door_probe(monkeypatch)
         generated = self.stub_generate_local_reply(monkeypatch, reply="final answer.")
 
         def exploding_select(*args, **kwargs):
@@ -555,13 +554,15 @@ class TestTemporalSelectionWiring(_PlanBuilder):
         tokenizer.apply_chat_template = lambda msgs, **kwargs: "prompt"
         model = self.make_model(["episodic"])
 
-        config = ServerConfig()
+        config = live_door_config()
         config.inference.temporal_selection_enabled = False
 
-        memory_store = _MS(replay_enabled=False)
+        memory_store = _MS()
         # Bookkeeping deliberately left unseeded — the disabled stage must
-        # never read it.
+        # never read it.  Fingerprints are not bookkeeping: the live door
+        # needs them to serve the probed fact at all.
         plan = self.make_plan([("episodic", ["e1"])])
+        seed_live_door_fingerprints(memory_store, plan)
 
         result = _probe_and_reason(
             text="What do I like?",
@@ -587,7 +588,7 @@ class TestTemporalSelectionWiring(_PlanBuilder):
         per-fact date headers."""
         from paramem.server.temporal_selection import DateSelection
 
-        probed = self.stub_probe_capturing(monkeypatch)
+        probed = stub_live_door_probe(monkeypatch)
         generated = self.stub_generate_local_reply(monkeypatch)
 
         def fake_select(text, date_by_key, *, model, tokenizer, config, today):
@@ -599,17 +600,19 @@ class TestTemporalSelectionWiring(_PlanBuilder):
         tokenizer.apply_chat_template = lambda msgs, **kwargs: "prompt"
         model = self.make_model(["episodic"])
 
-        config = ServerConfig()
+        config = live_door_config()
 
-        memory_store = _MS(replay_enabled=False)
+        memory_store = _MS()
         memory_store.set_bookkeeping(
             "e1",
             speaker_id="speaker0",
             relation_type="factual",
             first_seen="2026-08-01T09:00:00",
             last_seen="2026-08-01T09:00:00",
+            promoted=False,
         )
         plan = self.make_plan([("episodic", ["e1"])])
+        seed_live_door_fingerprints(memory_store, plan)
 
         _probe_and_reason(
             text="What do you know about me?",
@@ -639,7 +642,7 @@ class TestTemporalSelectionWiring(_PlanBuilder):
         from paramem.server.temporal import DateWindow
         from paramem.server.temporal_selection import DateSelection
 
-        probed = self.stub_probe_capturing(monkeypatch)
+        probed = stub_live_door_probe(monkeypatch)
         self.stub_generate_local_reply(monkeypatch)
 
         def fake_select(text, date_by_key, *, model, tokenizer, config, today):
@@ -655,15 +658,16 @@ class TestTemporalSelectionWiring(_PlanBuilder):
         tokenizer.apply_chat_template = lambda msgs, **kwargs: "prompt"
         model = self.make_model(["episodic"])
 
-        config = ServerConfig()
+        config = live_door_config()
 
-        memory_store = _MS(replay_enabled=False)
+        memory_store = _MS()
         memory_store.set_bookkeeping(
             "e_match",
             speaker_id="speaker0",
             relation_type="factual",
             first_seen="2026-08-05T09:00:00",
             last_seen="2026-08-05T09:00:00",
+            promoted=False,
         )
         memory_store.set_bookkeeping(
             "e_other_day",
@@ -671,6 +675,7 @@ class TestTemporalSelectionWiring(_PlanBuilder):
             relation_type="factual",
             first_seen="2026-08-01T09:00:00",
             last_seen="2026-08-01T09:00:00",
+            promoted=False,
         )
         memory_store.set_bookkeeping(
             "e_undated",
@@ -678,8 +683,10 @@ class TestTemporalSelectionWiring(_PlanBuilder):
             relation_type="factual",
             first_seen="",
             last_seen="",
+            promoted=False,
         )
         plan = self.make_plan([("episodic", ["e_match", "e_other_day", "e_undated"])])
+        seed_live_door_fingerprints(memory_store, plan)
 
         _probe_and_reason(
             text="What did we discuss on August 5th?",
@@ -699,7 +706,7 @@ class TestTemporalSelectionWiring(_PlanBuilder):
         from paramem.server.temporal import DateWindow
         from paramem.server.temporal_selection import DateSelection
 
-        probed = self.stub_probe_capturing(monkeypatch)
+        probed = stub_live_door_probe(monkeypatch)
         self.stub_generate_local_reply(monkeypatch)
 
         def fake_select(text, date_by_key, *, model, tokenizer, config, today):
@@ -715,15 +722,16 @@ class TestTemporalSelectionWiring(_PlanBuilder):
         tokenizer.apply_chat_template = lambda msgs, **kwargs: "prompt"
         model = self.make_model(["episodic"])
 
-        config = ServerConfig()
+        config = live_door_config()
 
-        memory_store = _MS(replay_enabled=False)
+        memory_store = _MS()
         memory_store.set_bookkeeping(
             "e_match",
             speaker_id="speaker0",
             relation_type="factual",
             first_seen="2026-08-05T09:00:00",
             last_seen="2026-08-05T09:00:00",
+            promoted=False,
         )
         memory_store.set_bookkeeping(
             "e_undated",
@@ -731,8 +739,10 @@ class TestTemporalSelectionWiring(_PlanBuilder):
             relation_type="factual",
             first_seen="",
             last_seen="",
+            promoted=False,
         )
         plan = self.make_plan([("episodic", ["e_match", "e_undated"])])
+        seed_live_door_fingerprints(memory_store, plan)
 
         _probe_and_reason(
             text="What did we discuss on August 5th, and what's my job?",
@@ -755,10 +765,7 @@ class TestTemporalSelectionWiring(_PlanBuilder):
         from paramem.server.temporal import DateWindow
         from paramem.server.temporal_selection import DateSelection
 
-        def exploding_probe(self, *args, **kwargs):
-            raise AssertionError("MemoryStore.probe must not be called when zero keys survive")
-
-        monkeypatch.setattr("paramem.memory.store.MemoryStore.probe", exploding_probe)
+        forbid_both_read_doors(monkeypatch)
 
         for name in ("_escalate_to_ha_agent", "answer_via_cloud", "_base_model_answer"):
 
@@ -782,15 +789,20 @@ class TestTemporalSelectionWiring(_PlanBuilder):
         tokenizer.apply_chat_template = lambda msgs, **kwargs: "prompt"
         model = self.make_model(["episodic"])
 
+        # The production default door — pinned to state that the path
+        # short-circuits ahead of the fork under the shipping
+        # configuration, not merely under the other arm.
         config = ServerConfig()
+        config.inference.preload_cache = True
 
-        memory_store = _MS(replay_enabled=False)
+        memory_store = _MS()
         memory_store.set_bookkeeping(
             "e1",
             speaker_id="speaker0",
             relation_type="factual",
             first_seen="2026-08-01T09:00:00",
             last_seen="2026-08-01T09:00:00",
+            promoted=False,
         )
         plan = self.make_plan([("episodic", ["e1"])])
 
@@ -819,10 +831,7 @@ class TestTemporalSelectionWiring(_PlanBuilder):
         from paramem.server.temporal import DateWindow
         from paramem.server.temporal_selection import DateSelection
 
-        def exploding_probe(self, *args, **kwargs):
-            raise AssertionError("MemoryStore.probe must not be called when zero keys survive")
-
-        monkeypatch.setattr("paramem.memory.store.MemoryStore.probe", exploding_probe)
+        forbid_both_read_doors(monkeypatch)
 
         def exploding_base_model(*args, **kwargs):
             raise AssertionError("_base_model_answer must not be called on the zero-survivor path")
@@ -856,15 +865,20 @@ class TestTemporalSelectionWiring(_PlanBuilder):
         tokenizer.apply_chat_template = lambda msgs, **kwargs: "prompt"
         model = self.make_model(["episodic"])
 
+        # The production default door — pinned to state that the path
+        # short-circuits ahead of the fork under the shipping
+        # configuration, not merely under the other arm.
         config = ServerConfig()
+        config.inference.preload_cache = True
 
-        memory_store = _MS(replay_enabled=False)
+        memory_store = _MS()
         memory_store.set_bookkeeping(
             "e1",
             speaker_id="speaker0",
             relation_type="factual",
             first_seen="2026-08-01T09:00:00",
             last_seen="2026-08-01T09:00:00",
+            promoted=False,
         )
         plan = self.make_plan([("episodic", ["e1"])])
 
@@ -893,7 +907,7 @@ class TestTemporalSelectionWiring(_PlanBuilder):
         from paramem.server.temporal import DateWindow
         from paramem.server.temporal_selection import DateSelection
 
-        probed = self.stub_probe_capturing(monkeypatch)
+        probed = stub_live_door_probe(monkeypatch)
         generated = self.stub_generate_local_reply(monkeypatch)
 
         def fake_select(text, date_by_key, *, model, tokenizer, config, today):
@@ -909,15 +923,16 @@ class TestTemporalSelectionWiring(_PlanBuilder):
         tokenizer.apply_chat_template = lambda msgs, **kwargs: "prompt"
         model = self.make_model(["episodic"])
 
-        config = ServerConfig()
+        config = live_door_config()
 
-        memory_store = _MS(replay_enabled=False)
+        memory_store = _MS()
         memory_store.set_bookkeeping(
             "e_dated",
             speaker_id="speaker0",
             relation_type="factual",
             first_seen="2026-08-01T09:00:00",
             last_seen="2026-08-01T09:00:00",
+            promoted=False,
         )
         memory_store.set_bookkeeping(
             "e_undated",
@@ -925,8 +940,10 @@ class TestTemporalSelectionWiring(_PlanBuilder):
             relation_type="factual",
             first_seen="",
             last_seen="",
+            promoted=False,
         )
         plan = self.make_plan([("episodic", ["e_dated", "e_undated"])])
+        seed_live_door_fingerprints(memory_store, plan)
 
         _probe_and_reason(
             text="What did we discuss on August 10th, and what's my job?",
@@ -950,7 +967,7 @@ class TestTemporalSelectionWiring(_PlanBuilder):
         group and raises nothing."""
         from paramem.server.temporal_selection import DateSelection
 
-        probed = self.stub_probe_capturing(monkeypatch)
+        probed = stub_live_door_probe(monkeypatch)
         self.stub_generate_local_reply(monkeypatch)
 
         def fake_select(text, date_by_key, *, model, tokenizer, config, today):
@@ -963,15 +980,16 @@ class TestTemporalSelectionWiring(_PlanBuilder):
         tokenizer.apply_chat_template = lambda msgs, **kwargs: "prompt"
         model = self.make_model(["episodic"])
 
-        config = ServerConfig()
+        config = live_door_config()
 
-        memory_store = _MS(replay_enabled=False)
+        memory_store = _MS()
         memory_store.set_bookkeeping(
             "e_none",
             speaker_id="speaker0",
             relation_type="factual",
             first_seen="",
             last_seen=None,
+            promoted=False,
         )
         memory_store.set_bookkeeping(
             "e_int",
@@ -979,8 +997,10 @@ class TestTemporalSelectionWiring(_PlanBuilder):
             relation_type="factual",
             first_seen="",
             last_seen=12345,
+            promoted=False,
         )
         plan = self.make_plan([("episodic", ["e_none", "e_int"])])
+        seed_live_door_fingerprints(memory_store, plan)
 
         result = _probe_and_reason(
             text="What do you know about me?",
@@ -1001,7 +1021,7 @@ class TestTemporalSelectionWiring(_PlanBuilder):
         semantic) is preserved."""
         from paramem.server.temporal_selection import DateSelection
 
-        probed = self.stub_probe_capturing(monkeypatch)
+        probed = stub_live_door_probe(monkeypatch)
         generated = self.stub_generate_local_reply(monkeypatch)
 
         def fake_select(text, date_by_key, *, model, tokenizer, config, today):
@@ -1013,15 +1033,16 @@ class TestTemporalSelectionWiring(_PlanBuilder):
         tokenizer.apply_chat_template = lambda msgs, **kwargs: "prompt"
         model = self.make_model(["procedural", "episodic", "semantic"])
 
-        config = ServerConfig()
+        config = live_door_config()
 
-        memory_store = _MS(replay_enabled=False)
+        memory_store = _MS()
         memory_store.set_bookkeeping(
             "p1",
             speaker_id="speaker0",
             relation_type="preference",
             first_seen="2026-08-02T09:00:00",
             last_seen="2026-08-02T09:00:00",
+            promoted=False,
         )
         memory_store.set_bookkeeping(
             "e1",
@@ -1029,6 +1050,7 @@ class TestTemporalSelectionWiring(_PlanBuilder):
             relation_type="factual",
             first_seen="2026-08-02T09:00:00",
             last_seen="2026-08-02T09:00:00",
+            promoted=False,
         )
         memory_store.set_bookkeeping(
             "s1",
@@ -1036,6 +1058,7 @@ class TestTemporalSelectionWiring(_PlanBuilder):
             relation_type="factual",
             first_seen="2026-08-01T09:00:00",
             last_seen="2026-08-01T09:00:00",
+            promoted=False,
         )
         plan = self.make_plan(
             [
@@ -1044,6 +1067,7 @@ class TestTemporalSelectionWiring(_PlanBuilder):
                 ("semantic", ["s1"]),
             ]
         )
+        seed_live_door_fingerprints(memory_store, plan)
 
         _probe_and_reason(
             text="What do you know about me?",
@@ -1089,7 +1113,7 @@ class TestTemporalSelectionWiring(_PlanBuilder):
 
         from paramem.server.temporal_selection import DateSelection
 
-        self.stub_probe_capturing(monkeypatch)
+        stub_live_door_probe(monkeypatch)
         self.stub_generate_local_reply(monkeypatch)
 
         def fake_select(text, date_by_key, *, model, tokenizer, config, today):
@@ -1101,17 +1125,19 @@ class TestTemporalSelectionWiring(_PlanBuilder):
         tokenizer.apply_chat_template = lambda msgs, **kwargs: "prompt"
         model = self.make_model(["episodic"])
 
-        config = ServerConfig()
+        config = live_door_config()
 
-        memory_store = _MS(replay_enabled=False)
+        memory_store = _MS()
         memory_store.set_bookkeeping(
             "e1",
             speaker_id="speaker0",
             relation_type="factual",
             first_seen="2026-08-01T09:00:00",
             last_seen="2026-08-01T09:00:00",
+            promoted=False,
         )
         plan = self.make_plan([("episodic", ["e1"])])
+        seed_live_door_fingerprints(memory_store, plan)
 
         with caplog.at_level(logging.INFO, logger="paramem.server.inference"):
             _probe_and_reason(
@@ -1137,7 +1163,7 @@ class TestTemporalSelectionWiring(_PlanBuilder):
 
         from paramem.server.temporal_selection import DateSelection
 
-        self.stub_probe_capturing(monkeypatch)
+        stub_live_door_probe(monkeypatch)
         self.stub_generate_local_reply(monkeypatch)
 
         def fake_select(text, date_by_key, *, model, tokenizer, config, today):
@@ -1149,17 +1175,19 @@ class TestTemporalSelectionWiring(_PlanBuilder):
         tokenizer.apply_chat_template = lambda msgs, **kwargs: "prompt"
         model = self.make_model(["episodic"])
 
-        config = ServerConfig()
+        config = live_door_config()
 
-        memory_store = _MS(replay_enabled=False)
+        memory_store = _MS()
         memory_store.set_bookkeeping(
             "e1",
             speaker_id="speaker0",
             relation_type="factual",
             first_seen="2026-08-01T09:00:00",
             last_seen="2026-08-01T09:00:00",
+            promoted=False,
         )
         plan = self.make_plan([("episodic", ["e1"])])
+        seed_live_door_fingerprints(memory_store, plan)
 
         with caplog.at_level(logging.INFO, logger="paramem.server.inference"):
             _probe_and_reason(

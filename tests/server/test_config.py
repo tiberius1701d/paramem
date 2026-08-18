@@ -207,41 +207,6 @@ class TestSecurityRequireEncryptionLoader:
             load_server_config(yaml_file)
 
 
-class TestPathsConfigKeyMetadata:
-    """Canonical Paths.key_metadata must match the on-disk layout.
-
-    Pins the path so the multi-site hardcoded-workaround pattern cannot recur.
-    The consolidation writer uses config.key_metadata_path (→ paths.key_metadata),
-    and all read sites must use the same canonical property.
-    """
-
-    def test_paths_key_metadata_matches_consolidation_writer_layout(self):
-        """Canonical Paths.key_metadata must equal data/registry/key_metadata.json.
-
-        Matching the path the consolidation writer (server/consolidation.py) uses.
-        Prevents the multi-site hardcoded-workaround pattern from recurring.
-        """
-        cfg = PathsConfig(data=Path("/some/data"))
-        assert cfg.key_metadata == Path("/some/data/registry/key_metadata.json")
-
-    def test_paths_registry_is_distinct_from_key_metadata(self):
-        """``paths.registry`` and ``paths.key_metadata`` are TWO different files,
-        not aliases. ``registry`` carries the combined SimHash dict (read by
-        inference for hallucination detection); ``key_metadata`` carries
-        per-key metadata (read by gates / attention / restore). Aliasing them
-        would silently regress inference's SimHash reads.
-        """
-        cfg = PathsConfig(data=Path("/some/data"))
-        assert cfg.registry == Path("/some/data/registry.json")
-        assert cfg.key_metadata == Path("/some/data/registry/key_metadata.json")
-        assert cfg.registry != cfg.key_metadata
-
-    def test_paths_registry_dir_is_parent_of_key_metadata(self):
-        """paths.registry_dir must be the parent directory of paths.key_metadata."""
-        cfg = PathsConfig(data=Path("/some/data"))
-        assert cfg.registry_dir == cfg.key_metadata.parent
-
-
 # ---------------------------------------------------------------------------
 # PathsConfig.data=None raises ValueError on property access
 # ---------------------------------------------------------------------------
@@ -255,29 +220,13 @@ class TestPathsConfigNoneGuard:
     property and the missing prerequisite.
     """
 
-    def test_key_metadata_raises_when_data_is_none(self):
-        """paths.key_metadata raises ValueError when data is None."""
+    def test_adapters_raises_when_data_is_none(self):
+        """paths.adapters raises ValueError when data is None."""
         import pytest
 
         cfg = PathsConfig(data=None)
         with pytest.raises(ValueError, match="paths.data must be set"):
-            _ = cfg.key_metadata
-
-    def test_registry_raises_when_data_is_none(self):
-        """paths.registry raises ValueError when data is None."""
-        import pytest
-
-        cfg = PathsConfig(data=None)
-        with pytest.raises(ValueError, match="paths.data must be set"):
-            _ = cfg.registry
-
-    def test_registry_dir_raises_when_data_is_none(self):
-        """paths.registry_dir raises ValueError when data is None."""
-        import pytest
-
-        cfg = PathsConfig(data=None)
-        with pytest.raises(ValueError, match="paths.data must be set"):
-            _ = cfg.registry_dir
+            _ = cfg.adapters
 
 
 class TestBucketTableGovernsUnclamped:
@@ -397,6 +346,50 @@ class TestRetiredConsolidationKeysRejected:
             """,
         )
         with pytest.raises(TypeError, match="tier_fast_start"):
+            load_server_config(yaml_file)
+
+
+class TestRetiredIndexedKeyReplayKeyRejected:
+    """``consolidation.indexed_key_replay`` was retired: the memory-key
+    lifecycle registry is unconditional, with no disabled state. Unlike the
+    plain-dataclass-strictness retirements above, this key has a dedicated
+    named guard in ``load_server_config`` (same convention as the
+    ``training_save_strategy_bg`` / ``training_save_steps_bg`` guard
+    immediately above it in ``paramem/server/config.py``) that pops the key
+    and raises a targeted ``ValueError`` naming it, rather than falling
+    through to the dataclass constructor's ``TypeError``.
+    """
+
+    def test_stale_indexed_key_replay_key_raises_named_value_error(self, tmp_path):
+        yaml_file = _write_yaml(
+            tmp_path,
+            """\
+            model: mistral
+            consolidation:
+              indexed_key_replay: false
+            """,
+        )
+        with pytest.raises(ValueError, match="consolidation.indexed_key_replay"):
+            load_server_config(yaml_file)
+
+
+class TestRetiredConsolidationRetryCapKeyRejected:
+    """``consolidation.consolidation_retry_cap`` was retired: a resumed
+    consolidation event reads its own stage ledger rather than retrying a
+    bounded number of times.  Same dedicated named-guard convention as
+    ``indexed_key_replay`` immediately above it in ``paramem/server/config.py``.
+    """
+
+    def test_stale_consolidation_retry_cap_key_raises_named_value_error(self, tmp_path):
+        yaml_file = _write_yaml(
+            tmp_path,
+            """\
+            model: mistral
+            consolidation:
+              consolidation_retry_cap: 3
+            """,
+        )
+        with pytest.raises(ValueError, match="consolidation.consolidation_retry_cap"):
             load_server_config(yaml_file)
 
 

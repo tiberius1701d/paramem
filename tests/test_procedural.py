@@ -9,7 +9,8 @@ Key invariants verified here:
 - Procedural interim keys are minted into the store only after successful
   training (deferred-write atomicity mirrors the episodic path).
 - Simulate mode registers procedural interim keys immediately (mirrors episodic).
-- Recall-failed NEW preference keeps its source session pending.
+- The unified recall gate is all-or-nothing: one failing key among a mixed
+  batch rejects the whole increment and commits nothing.
 - The _run_indexed_key_procedural and _prepare_procedural_keys_for_tier
   per-cycle helper functions no longer exist (deleted when procedural folded
   into the unified interim slot).
@@ -18,11 +19,10 @@ Key invariants verified here:
 from __future__ import annotations
 
 import ast
-from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-import networkx as nx
+import pytest
 
 _PROJECT_ROOT = Path(__file__).parent.parent
 
@@ -67,159 +67,73 @@ class TestDeletedHelpers:
 # ---------------------------------------------------------------------------
 
 
-def _make_minimal_loop(tmp_path):
-    """Return a ConsolidationLoop stub with enough state for procedural-unified-interim tests.
-
-    Bypasses __init__ (object.__new__) to avoid model/GPU requirements.
-    Mirrors the pattern used by TestAbortSkipsCommit._make_minimal_loop.
-    """
-    from peft import PeftModel
-
-    from paramem.memory.store import MemoryStore
-    from paramem.training.consolidation import ConsolidationLoop
-    from paramem.utils.config import AdapterConfig, ConsolidationConfig, TrainingConfig
-
-    loop = object.__new__(ConsolidationLoop)
-    loop.model = MagicMock()
-    loop.model.__class__ = PeftModel
-    loop.model.peft_config = {
-        "episodic": MagicMock(),
-        "semantic": MagicMock(),
-        "procedural": MagicMock(),
-        "in_training": MagicMock(),
-    }
-    loop.tokenizer = MagicMock()
-    loop.config = ConsolidationConfig()
-    loop.training_config = TrainingConfig(num_epochs=1, gradient_checkpointing=False)
-    loop.episodic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
-    loop.semantic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
-    loop.procedural_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
-    loop.wandb_config = None
-    loop._thermal_policy = None
-    loop.output_dir = tmp_path
-    loop.store = MemoryStore(replay_enabled=True)
-    loop.promoted_keys = set()
-    loop.cycle_count = 0
-    loop.episodic_simhash = {}
-    loop.semantic_simhash = {}
-    loop.procedural_simhash = {}
-    loop._procedural_next_index = 0
-    loop._procedural_tentative_next_index = 0
-    loop.merger = MagicMock()
-    loop.merger.graph.nodes = {}
-    loop._bg_trainer = None
-    loop.shutdown_requested = False
-    loop._early_stop_callback = None
-    loop.fingerprint_cache = None
-    loop._keep_prior_slots = 2
-    loop._debug_base = None
-    loop.save_cycle_snapshots = False
-    loop.snapshot_dir = None
-    loop._indexed_next_index = 0
-    loop._indexed_ep_interim = {}
-    return loop
-
-
 def _probe(passing_keys):
     """Build a RecallProbe whose passing_keys is exactly *passing_keys*.
 
-    Stands in for ``loop._probe_recall(...)``'s return value — the interim
-    commit reads only ``probe.passing_keys`` for its per-key registration
-    gate, never the individual record content.
+    Stands in for ``loop._probe_recall(...)``'s return value — consumed by
+    the single all-or-nothing recall gate (``_assert_tier_recall``), which
+    reads only ``probe.passing_keys`` against ``probe.distinct_total``,
+    never the individual record content.
     """
     from paramem.training.recall_eval import RecallProbe
 
     return RecallProbe(per_key=tuple({"key": k, "exact_match": True} for k in passing_keys))
 
 
-def _common_patches(loop):
-    """Return the context-manager list shared across cycle-level tests.
-
-    Stubs out GPU-touching and PEFT-slot helpers that are not under test.
-    """
-    from paramem.training.consolidation import ConsolidationLoop
-
-    return [
-        patch("paramem.training.trainer.TrainingArguments", return_value=MagicMock()),
-        patch(
-            "paramem.training.encrypted_checkpoint_callback.EncryptCheckpointCallback",
-            MagicMock,
-        ),
-        patch.object(
-            ConsolidationLoop,
-            "_resolve_target_slot",
-            return_value="episodic_interim_20260417T0000",
-        ),
-        patch.object(ConsolidationLoop, "_refine_consolidation_graph", return_value=None),
-        patch.object(ConsolidationLoop, "_enable_gradient_checkpointing", return_value=None),
-        patch.object(ConsolidationLoop, "_disable_gradient_checkpointing", return_value=None),
-        patch.object(ConsolidationLoop, "_maybe_make_recall_callback", return_value=(None, None)),
-        patch("paramem.training.consolidation.switch_adapter"),
-        # staged_weights/promote_staging_adapter (the interim commit's own
-        # probe-then-promote sequence) resolve copy_adapter_weights and
-        # switch_adapter fresh from paramem.models.loader at call time —
-        # the paramem.training.consolidation.switch_adapter patch above
-        # covers only consolidation.py's own direct calls, not these.
-        patch("paramem.models.loader.switch_adapter"),
-        patch("paramem.models.loader.copy_adapter_weights"),
-        patch(
-            "paramem.training.consolidation.format_entry_training",
-            return_value=[{"input_ids": [1], "labels": [1]}],
-        ),
-        patch(
-            "paramem.memory.interim_adapter.create_interim_adapter",
-            side_effect=lambda m, cfg, stamp: m,
-        ),
-    ]
-
-
 # ---------------------------------------------------------------------------
-# Test 1: proc_graph gap-regression (unified interim slot)
+# Shared fixture helpers for the run_consolidation_cycle-level tests below —
+# a real GraphMerger/MemoryStore, a fake model for the write/publish
+# primitives (mirrors tests/test_fold_build_driver.py's own pattern), and
+# only the GPU-touching collaborators (training, the recall probe, the
+# backup scope) faked.
 # ---------------------------------------------------------------------------
 
+_INTERIM_STAMP = "20260417T0000"
+_INTERIM_SLOT = f"episodic_interim_{_INTERIM_STAMP}"
 
-class TestProcGraphMergeGap:
-    """Gap-regression: proc_graph merged into merger.graph reaches _tier_keyed["procedural"].
 
-    Before the unified-interim refactor, the proc_graph from run_procedural() was extracted but
-    NEVER merged into merger.graph, so procedural-typed edges never reached
-    _build_all_edge_entries_into's graph-walk.  This test proves the gap is
-    closed: a keyless edge with relation_type="preference" in merger.graph
-    ends up in _tier_keyed["procedural"] when _build_all_edge_entries_into
-    is called with defer=True.
+def _make_cycle_loop(tmp_path):
+    """A loop wired for a real ``run_consolidation_cycle`` train-mode pass.
+
+    Reuses the shared ``tests._fold_fixtures._make_loop`` (real
+    ``GraphMerger``/``MemoryStore``, fake PEFT-touching model) with the
+    interim slot itself pre-resident — the derive/build/publish driver then
+    takes the warm ``ensure_adapter_matching`` path instead of minting a
+    fresh adapter (which needs a real ``peft.PeftModel``, out of scope for
+    this fake).
     """
+    from tests._fold_fixtures import _make_loop
 
-    def test_proc_graph_edge_reaches_tier_keyed_procedural(self, tmp_path):
-        """A procedural-typed keyless edge in merger.graph appears in _tier_keyed["procedural"]."""
-        loop = _make_minimal_loop(tmp_path)
+    return _make_loop(tmp_path, procedural=True, resident_tiers=(_INTERIM_SLOT,))
 
-        # Simulate the result of merger.merge(proc_graph, ...):
-        # one procedural-typed edge in merger.graph.
-        g = nx.MultiDiGraph()
-        g.add_node("alice", speaker_id="speaker0", display_name="Alice")
-        g.add_node("tea", display_name="Tea")
-        g.add_edge("alice", "tea", predicate="prefers", relation_type="preference")
-        loop.merger.graph = g
 
-        tier_keyed: dict = {"episodic": [], "procedural": [], "semantic": []}
-        _, deferred = loop._build_all_edge_entries_into(
-            tier_keyed,
-            defer=True,
-            tag_new=True,
-        )
+def _wire_cycle_fakes(loop, monkeypatch, *, probe_recall=None, assert_tier_recall=True):
+    """Fake exactly the GPU-touching collaborators a train-mode cycle needs.
 
-        assert tier_keyed["procedural"], (
-            "procedural-typed edge in merger.graph must appear in _tier_keyed['procedural']"
-        )
-        assert not tier_keyed["episodic"], "preference-typed edge must NOT land in episodic"
-        # Exactly one deferred write for the procedural tier.
-        proc_deferred = [r for r in deferred if r["tier"] == "procedural"]
-        assert len(proc_deferred) == 1, (
-            f"Expected 1 deferred procedural write; got {len(proc_deferred)}"
-        )
-        assert proc_deferred[0]["entry"]["key"].startswith("proc"), (
-            f"Procedural key must start with 'proc'; got {proc_deferred[0]['entry']['key']}"
-        )
+    ``_train_tier_adapter`` and ``tier_backup_scope`` are always faked (no
+    real GPU training in this suite). ``_probe_recall`` takes the caller's
+    stand-in (default: a probe where every entry passes). The recall GATE
+    itself (``_assert_tier_recall``) stays REAL unless a test's own subject
+    is something else — the all-or-nothing gate test below is the one
+    exception, since real gate evaluation is exactly what it pins.
+    """
+    from paramem.models import loader as loader_mod
+    from tests._fold_fixtures import _fake_tier_backup_scope
+
+    def _fake_train(entries, **kwargs):
+        if not entries:
+            return None, None
+        return {"aborted": False, "train_loss": 0.01}, None
+
+    loop._train_tier_adapter = MagicMock(side_effect=_fake_train)
+    loop._probe_recall = MagicMock(
+        side_effect=probe_recall
+        if probe_recall is not None
+        else (lambda adapter_name, entries: _probe({e["key"] for e in entries}))
+    )
+    if assert_tier_recall:
+        loop._assert_tier_recall = MagicMock()
+    monkeypatch.setattr(loader_mod, "tier_backup_scope", _fake_tier_backup_scope)
 
 
 # ---------------------------------------------------------------------------
@@ -236,51 +150,37 @@ class TestProceduralRoutedToInterim:
     """
 
     def test_procedural_edge_trains_on_interim_not_main(self, monkeypatch, tmp_path):
-        """train_adapter is called with adapter_name=interim slot, not 'procedural'."""
-        from paramem.training.consolidation import ConsolidationLoop
+        """The funnel is called with adapter_name=interim slot, not 'procedural'."""
+        loop = _make_cycle_loop(tmp_path)
+        _wire_cycle_fakes(loop, monkeypatch)
 
-        loop = _make_minimal_loop(tmp_path)
+        loop.merger.graph.add_edge("bob", "jazz", predicate="likes", relation_type="preference")
+        loop.merger.graph.nodes["bob"]["speaker_id"] = "speaker0"
 
-        g = nx.MultiDiGraph()
-        g.add_node("bob", speaker_id="speaker0", display_name="Bob")
-        g.add_node("jazz", display_name="Jazz")
-        g.add_edge("bob", "jazz", predicate="likes", relation_type="preference")
-        loop.merger.graph = g
-
-        train_calls: list[str] = []
-
-        def _capture_train(**kwargs):
-            train_calls.append(kwargs.get("adapter_name", "UNKNOWN"))
-            return {"train_loss": 0.1, "aborted": False}
-
-        patches = _common_patches(loop) + [
-            patch("paramem.training.trainer.train_adapter", side_effect=_capture_train),
-            patch("paramem.memory.persistence.commit_tier_slot"),
-            patch.object(ConsolidationLoop, "_probe_recall", return_value=_probe({"proc1"})),
-        ]
-
-        with _stack(patches):
-            loop.run_consolidation_cycle(
-                [
-                    {
-                        "subject": "Bob",
-                        "predicate": "likes",
-                        "object": "Jazz",
-                        "relation_type": "preference",
-                        "speaker_id": "speaker0",
-                    }
-                ],
-                [],
-                speaker_id="speaker0",
-                mode="train",
-                run_label="test_interim_route",
-                stamp="20260417T0000",
-            )
+        loop.run_consolidation_cycle(
+            [
+                {
+                    "subject": "Bob",
+                    "predicate": "likes",
+                    "object": "Jazz",
+                    "relation_type": "preference",
+                    "speaker_id": "speaker0",
+                }
+            ],
+            [],
+            speaker_id="speaker0",
+            mode="train",
+            run_label="test_interim_route",
+            stamp=_INTERIM_STAMP,
+        )
 
         # Training must have fired exactly once, on the interim adapter.
-        assert len(train_calls) == 1, f"Expected 1 train call; got {train_calls}"
-        assert train_calls[0] == "episodic_interim_20260417T0000", (
-            f"Procedural facts must train on interim slot; adapter was {train_calls[0]}"
+        assert loop._train_tier_adapter.call_count == 1, (
+            f"Expected 1 train call; got {loop._train_tier_adapter.call_args_list}"
+        )
+        train_adapter_name = loop._train_tier_adapter.call_args.kwargs.get("adapter_name")
+        assert train_adapter_name == _INTERIM_SLOT, (
+            f"Procedural facts must train on interim slot; adapter was {train_adapter_name}"
         )
 
     def test_interim_probe_targets_staging_adapter_before_promote(self, monkeypatch, tmp_path):
@@ -291,50 +191,32 @@ class TestProceduralRoutedToInterim:
         read whatever was resident there before this cycle rather than the
         weights this cycle just trained.
         """
-        from paramem.training.consolidation import ConsolidationLoop
         from paramem.training.trainer import STAGING_ADAPTER
 
-        loop = _make_minimal_loop(tmp_path)
+        loop = _make_cycle_loop(tmp_path)
+        _wire_cycle_fakes(loop, monkeypatch)
 
-        g = nx.MultiDiGraph()
-        g.add_node("bob", speaker_id="speaker0", display_name="Bob")
-        g.add_node("jazz", display_name="Jazz")
-        g.add_edge("bob", "jazz", predicate="likes", relation_type="preference")
-        loop.merger.graph = g
+        loop.merger.graph.add_edge("bob", "jazz", predicate="likes", relation_type="preference")
+        loop.merger.graph.nodes["bob"]["speaker_id"] = "speaker0"
 
-        probe_calls: list[str] = []
+        loop.run_consolidation_cycle(
+            [
+                {
+                    "subject": "Bob",
+                    "predicate": "likes",
+                    "object": "Jazz",
+                    "relation_type": "preference",
+                    "speaker_id": "speaker0",
+                }
+            ],
+            [],
+            speaker_id="speaker0",
+            mode="train",
+            run_label="test_interim_probe_target",
+            stamp=_INTERIM_STAMP,
+        )
 
-        def _capture_probe(adapter_name, entries):
-            probe_calls.append(adapter_name)
-            return _probe({e["key"] for e in entries})
-
-        patches = _common_patches(loop) + [
-            patch(
-                "paramem.training.trainer.train_adapter",
-                return_value={"train_loss": 0.1, "aborted": False},
-            ),
-            patch("paramem.memory.persistence.commit_tier_slot"),
-            patch.object(ConsolidationLoop, "_probe_recall", side_effect=_capture_probe),
-        ]
-
-        with _stack(patches):
-            loop.run_consolidation_cycle(
-                [
-                    {
-                        "subject": "Bob",
-                        "predicate": "likes",
-                        "object": "Jazz",
-                        "relation_type": "preference",
-                        "speaker_id": "speaker0",
-                    }
-                ],
-                [],
-                speaker_id="speaker0",
-                mode="train",
-                run_label="test_interim_probe_target",
-                stamp="20260417T0000",
-            )
-
+        probe_calls = [c.args[0] for c in loop._probe_recall.call_args_list]
         assert probe_calls == [STAGING_ADAPTER], (
             f"expected exactly one probe of {STAGING_ADAPTER!r}; got {probe_calls}"
         )
@@ -354,15 +236,98 @@ class TestSimulateModeRegistersProceduralKeys:
     """
 
     def test_simulate_mode_puts_proc_key_in_store(self, tmp_path):
-        """simulate mode: minted proc-key appears in the interim store tier."""
-        loop = _make_minimal_loop(tmp_path)
-        loop.config.mode = "simulate"
+        """simulate mode: minted proc-key appears in the interim store tier.
 
-        g = nx.MultiDiGraph()
-        g.add_node("carol", speaker_id="speaker0", display_name="Carol")
-        g.add_node("cycling", display_name="Cycling")
-        g.add_edge("carol", "cycling", predicate="enjoys", relation_type="preference")
-        loop.merger.graph = g
+        Simulate touches no PEFT adapter at all (no mint, no probe, no
+        backup scope) — only the derive/write-to-graph.json/publish spine, so
+        this needs no GPU-collaborator fakes.  Registration is now a
+        wholesale registry rebind (``MemoryStore.adopt_increments``), not a
+        per-key ``store.put`` call — the postcondition to check is presence
+        in the tier's active-key set, not a spied write call.
+        """
+        loop = _make_cycle_loop(tmp_path)
+
+        loop.merger.graph.add_edge(
+            "carol", "cycling", predicate="enjoys", relation_type="preference"
+        )
+        loop.merger.graph.nodes["carol"]["speaker_id"] = "speaker0"
+
+        result = loop.run_consolidation_cycle(
+            [
+                {
+                    "subject": "Carol",
+                    "predicate": "enjoys",
+                    "object": "Cycling",
+                    "relation_type": "preference",
+                    "speaker_id": "speaker0",
+                }
+            ],
+            [],
+            speaker_id="speaker0",
+            mode="simulate",
+            run_label="test_simulate",
+            stamp=_INTERIM_STAMP,
+        )
+
+        # The proc-key must appear in the interim slot (adapter_name), not "procedural" main.
+        # Store tier must equal weight residence: proc keys are trained into the interim
+        # adapter, so they must be registered there.
+        interim_active = loop.store.active_keys_in_tier(_INTERIM_SLOT)
+        proc_keys = [k for k in interim_active if k.startswith("proc")]
+        assert proc_keys, (
+            "simulate mode must register procedural keys in the interim tier; "
+            f"active keys there: {interim_active}"
+        )
+        proc_main_active = loop.store.active_keys_in_tier("procedural")
+        assert not any(k.startswith("proc") for k in proc_main_active), (
+            f"Procedural key must NOT be registered in 'procedural' main during "
+            f"simulate; active keys there: {proc_main_active}"
+        )
+
+        assert result.get("mode") == "simulated", (
+            f"Expected mode='simulated'; got {result.get('mode')}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Test 4: Unified recall gate — all-or-nothing, no soft return, no partial write
+# ---------------------------------------------------------------------------
+
+
+class TestProceduralRecallGateAllOrNothing:
+    """The interim commit's recall gate is one all-or-nothing verdict.
+
+    ``_assert_tier_recall`` (paramem/training/consolidation.py) compares
+    ``passing == total`` over the interim slot's full key set — there is no
+    per-key acceptance and no soft ``recall_failed_session_ids`` return
+    value.  A single failing key raises ``RecallGateRejected`` out of
+    ``run_consolidation_cycle`` before any key — passing or failing — is
+    written to the store, so a rejected increment leaves the store exactly
+    as it found it.
+    """
+
+    def test_one_failing_key_among_two_rejects_the_whole_increment(self, tmp_path, monkeypatch):
+        """A probe where one of two procedural keys fails raises
+        RecallGateRejected and leaves the store without either key — the
+        passing key is not partially committed."""
+        from paramem.training.consolidation import RecallGateRejected
+        from paramem.training.recall_eval import RecallProbe
+
+        loop = _make_cycle_loop(tmp_path)
+
+        def _one_key_fails(adapter_name, entries):
+            # Mark exactly the first probed key as passing; every other key
+            # (there is at least one more, given the two edges below) fails.
+            per_key = [{"key": e["key"], "exact_match": i == 0} for i, e in enumerate(entries)]
+            return RecallProbe(per_key=tuple(per_key))
+
+        # This test's own subject IS the real gate — keep _assert_tier_recall
+        # unfaked so it genuinely evaluates the controlled probe above.
+        _wire_cycle_fakes(loop, monkeypatch, probe_recall=_one_key_fails, assert_tier_recall=False)
+
+        loop.merger.graph.add_edge("henry", "chess", predicate="plays", relation_type="preference")
+        loop.merger.graph.add_edge("henry", "golf", predicate="plays", relation_type="preference")
+        loop.merger.graph.nodes["henry"]["speaker_id"] = "speaker0"
 
         store_put_calls: list[tuple] = []
         original_put = loop.store.put
@@ -371,139 +336,46 @@ class TestSimulateModeRegistersProceduralKeys:
             store_put_calls.append((tier, key))
             return original_put(tier, key, entry, **kwargs)
 
-        from paramem.training.consolidation import ConsolidationLoop
-
-        patches = [
-            patch.object(
-                ConsolidationLoop,
-                "_resolve_target_slot",
-                return_value="episodic_interim_20260417T0000",
-            ),
-            patch.object(ConsolidationLoop, "_refine_consolidation_graph", return_value=None),
-            patch.object(ConsolidationLoop, "_enable_gradient_checkpointing", return_value=None),
-            patch.object(ConsolidationLoop, "_disable_gradient_checkpointing", return_value=None),
-            patch("paramem.training.consolidation.switch_adapter"),
-            patch(
-                "paramem.training.consolidation.format_entry_training",
-                return_value=[{"input_ids": [1], "labels": [1]}],
-            ),
+        with (
             patch.object(loop.store, "put", side_effect=_spy_put),
-            patch("paramem.memory.persistence.commit_tier_slot"),
-        ]
-
-        with _stack(patches):
-            result = loop.run_consolidation_cycle(
+            pytest.raises(RecallGateRejected),
+        ):
+            loop.run_consolidation_cycle(
                 [
                     {
-                        "subject": "Carol",
-                        "predicate": "enjoys",
-                        "object": "Cycling",
+                        "subject": "Henry",
+                        "predicate": "plays",
+                        "object": "Chess",
                         "relation_type": "preference",
                         "speaker_id": "speaker0",
-                    }
-                ],
-                [],
-                speaker_id="speaker0",
-                mode="simulate",
-                run_label="test_simulate",
-                stamp="20260417T0000",
-            )
-
-        # The proc-key must appear in the interim slot (adapter_name), not "procedural" main.
-        # Store tier must equal weight residence: proc keys are trained into the interim
-        # adapter, so they must be registered there.
-        interim_slot = "episodic_interim_20260417T0000"
-        proc_puts = [(t, k) for t, k in store_put_calls if k.startswith("proc")]
-        assert proc_puts, "simulate mode must store.put procedural keys; no proc-prefix put found"
-        for tier, key in proc_puts:
-            assert tier == interim_slot, (
-                f"Procedural key '{key}' must go into interim tier '{interim_slot}' in simulate; "
-                f"got {tier!r} — store tier must equal weight residence"
-            )
-
-        assert result.get("mode") == "simulated", (
-            f"Expected mode='simulated'; got {result.get('mode')}"
-        )
-
-
-# ---------------------------------------------------------------------------
-# Test 4: Durability — recall-failed preference keeps session pending
-# ---------------------------------------------------------------------------
-
-
-class TestProceduralSessionPending:
-    """Durability: a recall-failed procedural key keeps its source session pending.
-
-    session_ids carried on the edge (from merger.graph via proc_graph merge)
-    must flow: proc_graph relation → edge["sessions"] → rec["session_ids"]
-    → result["recall_failed_session_ids"] when training passes but recall check fails.
-
-    The edge's ``sessions`` set is preserved through the materialize pass because
-    the merger's ``_upsert_relation`` appends each Relation's ``session_ids`` onto
-    the graph edge (merger.py:627-629).  The ``_SYNTHETIC_SESSION_IDS`` sentinel
-    ``"__interim_pending_sessions__"`` is stripped by the deferred-write builder,
-    leaving the real session ids.
-    """
-
-    def test_recall_failed_proc_key_session_kept_pending(self, tmp_path):
-        """A proc-key whose training fails recall probe keeps its session_id pending."""
-        from paramem.training.consolidation import ConsolidationLoop
-
-        loop = _make_minimal_loop(tmp_path)
-
-        session_id = "session-proc-b7"
-        g = nx.MultiDiGraph()
-        g.add_node("dave", speaker_id="speaker0", display_name="Dave")
-        g.add_node("hiking", display_name="Hiking")
-        g.add_edge(
-            "dave",
-            "hiking",
-            predicate="loves",
-            relation_type="preference",
-            sessions={session_id},
-        )
-        loop.merger.graph = g
-
-        # Train succeeds but probe admits NO keys (simulates recall failure).
-        # Patching ConsolidationLoop._probe_recall so it returns a probe whose
-        # passing() set is empty for every key, causing them to be excluded
-        # from store.put and their session_ids to accumulate in
-        # _recall_failed_session_ids.
-        patches = _common_patches(loop) + [
-            patch(
-                "paramem.training.trainer.train_adapter",
-                return_value={"train_loss": 0.1, "aborted": False},
-            ),
-            patch("paramem.memory.persistence.commit_tier_slot"),
-            # Probe passes nothing — all new keys "fail" recall.
-            patch.object(ConsolidationLoop, "_probe_recall", return_value=_probe(set())),
-        ]
-
-        with _stack(patches):
-            result = loop.run_consolidation_cycle(
-                [
+                    },
                     {
-                        "subject": "Dave",
-                        "predicate": "loves",
-                        "object": "Hiking",
+                        "subject": "Henry",
+                        "predicate": "plays",
+                        "object": "Golf",
                         "relation_type": "preference",
                         "speaker_id": "speaker0",
-                    }
+                    },
                 ],
                 [],
                 speaker_id="speaker0",
                 mode="train",
-                run_label="test_b7",
-                stamp="20260417T0000",
+                run_label="test_all_or_nothing",
+                stamp=_INTERIM_STAMP,
             )
 
-        # The session that produced the failing proc-key must be in keep-pending set.
-        # recall_failed_session_ids is returned in the result dict (local variable,
-        # not an instance attribute) — callers use result.get("recall_failed_session_ids", []).
-        failed_ids = result.get("recall_failed_session_ids", [])
-        assert session_id in failed_ids, (
-            f"Session '{session_id}' must be in result['recall_failed_session_ids'] "
-            f"after proc-key recall failure; got {failed_ids}"
+        assert not store_put_calls, (
+            "a rejected increment must not partially commit the passing key; "
+            f"got puts: {store_put_calls}"
+        )
+        assert not list(loop.store.active_keys_in_tier(_INTERIM_SLOT)), (
+            "a rejected increment must leave the interim tier with no active keys"
+        )
+        ledger_path = loop._fold_state_dir / "stage_ledger.json"
+        assert not ledger_path.exists(), (
+            "a rejected increment must dispose the event's ledger so the next "
+            "same-window attempt re-derives from scratch instead of resuming "
+            "the rejected assignment"
         )
 
 
@@ -524,197 +396,126 @@ class TestProceduralKeyRegisteredInInterimTier:
     This test FAILS on the old code (``_store_tier = "procedural"``).
     """
 
-    def test_train_mode_proc_key_registered_in_interim_slot(self, tmp_path):
-        """train mode: proc-key store tier == interim adapter name, not 'procedural'."""
-        from paramem.training.consolidation import ConsolidationLoop
+    def test_train_mode_proc_key_registered_in_interim_slot(self, monkeypatch, tmp_path):
+        """train mode: proc-key store tier == interim adapter name, not 'procedural'.
 
-        loop = _make_minimal_loop(tmp_path)
+        Registration is a wholesale registry rebind
+        (``MemoryStore.adopt_increments``), not a per-key ``store.put`` call —
+        the postcondition is presence in the tier's active-key set.
+        """
+        loop = _make_cycle_loop(tmp_path)
+        _wire_cycle_fakes(loop, monkeypatch)
 
-        g = nx.MultiDiGraph()
-        g.add_node("eve", speaker_id="speaker0", display_name="Eve")
-        g.add_node("running", display_name="Running")
-        g.add_edge("eve", "running", predicate="enjoys", relation_type="preference")
-        loop.merger.graph = g
+        loop.merger.graph.add_edge("eve", "running", predicate="enjoys", relation_type="preference")
+        loop.merger.graph.nodes["eve"]["speaker_id"] = "speaker0"
 
-        store_put_calls: list[tuple] = []
-        original_put = loop.store.put
-
-        def _spy_put(tier, key, entry, **kwargs):
-            store_put_calls.append((tier, key))
-            return original_put(tier, key, entry, **kwargs)
-
-        interim_slot = "episodic_interim_20260417T0000"
-        patches = _common_patches(loop) + [
-            patch(
-                "paramem.training.trainer.train_adapter",
-                return_value={"train_loss": 0.05, "aborted": False},
-            ),
-            patch("paramem.memory.persistence.commit_tier_slot"),
-            patch.object(ConsolidationLoop, "_probe_recall", return_value=_probe({"proc0"})),
-            patch.object(loop.store, "put", side_effect=_spy_put),
-        ]
-
-        with _stack(patches):
-            loop.run_consolidation_cycle(
-                [
-                    {
-                        "subject": "Eve",
-                        "predicate": "enjoys",
-                        "object": "Running",
-                        "relation_type": "preference",
-                        "speaker_id": "speaker0",
-                    }
-                ],
-                [],
-                speaker_id="speaker0",
-                mode="train",
-                run_label="test_tier_regression",
-                stamp="20260417T0000",
-            )
-
-        proc_puts = [(t, k) for t, k in store_put_calls if k.startswith("proc")]
-        assert proc_puts, "train mode must store.put the proc key after successful training"
-        for tier, key in proc_puts:
-            assert tier == interim_slot, (
-                f"Proc key '{key}' registered in tier '{tier}'; expected '{interim_slot}'. "
-                "Store tier must equal weight residence (the interim adapter)."
-            )
-
-        # Also verify that the key is NOT registered in the "procedural" main tier.
-        proc_main_puts = [(t, k) for t, k in store_put_calls if t == "procedural"]
-        assert not proc_main_puts, (
-            f"No key must be stored in 'procedural' main during an interim cycle; "
-            f"got: {proc_main_puts}"
+        loop.run_consolidation_cycle(
+            [
+                {
+                    "subject": "Eve",
+                    "predicate": "enjoys",
+                    "object": "Running",
+                    "relation_type": "preference",
+                    "speaker_id": "speaker0",
+                }
+            ],
+            [],
+            speaker_id="speaker0",
+            mode="train",
+            run_label="test_tier_regression",
+            stamp=_INTERIM_STAMP,
         )
 
-    def test_train_mode_proc_key_has_preference_bookkeeping(self, tmp_path):
+        interim_active = loop.store.active_keys_in_tier(_INTERIM_SLOT)
+        proc_keys = [k for k in interim_active if k.startswith("proc")]
+        assert proc_keys, (
+            "train mode must register the proc key in the interim tier after "
+            f"successful training; active keys there: {interim_active}"
+        )
+
+        # Also verify that the key is NOT registered in the "procedural" main tier.
+        proc_main_active = loop.store.active_keys_in_tier("procedural")
+        assert not any(k.startswith("proc") for k in proc_main_active), (
+            f"No key must be registered in 'procedural' main during an interim "
+            f"cycle; active keys there: {proc_main_active}"
+        )
+
+    def test_train_mode_proc_key_has_preference_bookkeeping(self, monkeypatch, tmp_path):
         """bookkeeping relation_type is 'preference' so COMMAND filter classifies it correctly."""
-        from paramem.training.consolidation import ConsolidationLoop
+        loop = _make_cycle_loop(tmp_path)
+        _wire_cycle_fakes(loop, monkeypatch)
 
-        loop = _make_minimal_loop(tmp_path)
+        loop.merger.graph.add_edge("frank", "chess", predicate="plays", relation_type="preference")
+        loop.merger.graph.nodes["frank"]["speaker_id"] = "speaker0"
 
-        g = nx.MultiDiGraph()
-        g.add_node("frank", speaker_id="speaker0", display_name="Frank")
-        g.add_node("chess", display_name="Chess")
-        g.add_edge("frank", "chess", predicate="plays", relation_type="preference")
-        loop.merger.graph = g
+        loop.run_consolidation_cycle(
+            [
+                {
+                    "subject": "Frank",
+                    "predicate": "plays",
+                    "object": "Chess",
+                    "relation_type": "preference",
+                    "speaker_id": "speaker0",
+                }
+            ],
+            [],
+            speaker_id="speaker0",
+            mode="train",
+            run_label="test_bk_preference",
+            stamp=_INTERIM_STAMP,
+        )
 
-        bk_calls: list[dict] = []
-        original_bk = loop.store.set_bookkeeping
-
-        def _spy_bk(key, **kwargs):
-            bk_calls.append({"key": key, **kwargs})
-            return original_bk(key, **kwargs)
-
-        patches = _common_patches(loop) + [
-            patch(
-                "paramem.training.trainer.train_adapter",
-                return_value={"train_loss": 0.05, "aborted": False},
-            ),
-            patch("paramem.memory.persistence.commit_tier_slot"),
-            patch.object(ConsolidationLoop, "_probe_recall", return_value=_probe({"proc0"})),
-            patch.object(loop.store, "set_bookkeeping", side_effect=_spy_bk),
+        proc_keys = [
+            k for k in loop.store.active_keys_in_tier(_INTERIM_SLOT) if k.startswith("proc")
         ]
-
-        with _stack(patches):
-            loop.run_consolidation_cycle(
-                [
-                    {
-                        "subject": "Frank",
-                        "predicate": "plays",
-                        "object": "Chess",
-                        "relation_type": "preference",
-                        "speaker_id": "speaker0",
-                    }
-                ],
-                [],
-                speaker_id="speaker0",
-                mode="train",
-                run_label="test_bk_preference",
-                stamp="20260417T0000",
-            )
-
-        proc_bk = [c for c in bk_calls if c["key"].startswith("proc")]
-        assert proc_bk, "set_bookkeeping must be called for the proc key"
-        for call in proc_bk:
-            assert call.get("relation_type") == "preference", (
+        assert proc_keys, "the proc key must be active in the interim tier"
+        for key in proc_keys:
+            bk = loop.store.bookkeeping_for_key(key)
+            assert bk is not None, f"bookkeeping must exist for proc key {key!r}"
+            assert bk.get("relation_type") == "preference", (
                 f"Proc key bookkeeping must carry relation_type='preference'; "
-                f"got {call.get('relation_type')!r}"
+                f"got {bk.get('relation_type')!r}"
             )
 
-    def test_interim_active_keys_includes_proc_key(self, tmp_path):
+    def test_interim_active_keys_includes_proc_key(self, monkeypatch, tmp_path):
         """After an interim cycle, proc key is active in the interim tier (not procedural main).
 
         This is the router-level regression: active_keys_in_tier(interim_slot) returns
         the proc key; active_keys_in_tier("procedural") does NOT.
         """
-        from paramem.training.consolidation import ConsolidationLoop
+        loop = _make_cycle_loop(tmp_path)
+        _wire_cycle_fakes(loop, monkeypatch)
 
-        loop = _make_minimal_loop(tmp_path)
+        loop.merger.graph.add_edge(
+            "gwen", "yoga", predicate="practices", relation_type="preference"
+        )
+        loop.merger.graph.nodes["gwen"]["speaker_id"] = "speaker0"
 
-        g = nx.MultiDiGraph()
-        g.add_node("gwen", speaker_id="speaker0", display_name="Gwen")
-        g.add_node("yoga", display_name="Yoga")
-        g.add_edge("gwen", "yoga", predicate="practices", relation_type="preference")
-        loop.merger.graph = g
+        loop.run_consolidation_cycle(
+            [
+                {
+                    "subject": "Gwen",
+                    "predicate": "practices",
+                    "object": "Yoga",
+                    "relation_type": "preference",
+                    "speaker_id": "speaker0",
+                }
+            ],
+            [],
+            speaker_id="speaker0",
+            mode="train",
+            run_label="test_active_keys",
+            stamp=_INTERIM_STAMP,
+        )
 
-        interim_slot = "episodic_interim_20260417T0000"
-        patches = _common_patches(loop) + [
-            patch(
-                "paramem.training.trainer.train_adapter",
-                return_value={"train_loss": 0.05, "aborted": False},
-            ),
-            patch("paramem.memory.persistence.commit_tier_slot"),
-            patch.object(ConsolidationLoop, "_probe_recall", return_value=_probe({"proc0"})),
-        ]
-
-        with _stack(patches):
-            loop.run_consolidation_cycle(
-                [
-                    {
-                        "subject": "Gwen",
-                        "predicate": "practices",
-                        "object": "Yoga",
-                        "relation_type": "preference",
-                        "speaker_id": "speaker0",
-                    }
-                ],
-                [],
-                speaker_id="speaker0",
-                mode="train",
-                run_label="test_active_keys",
-                stamp="20260417T0000",
-            )
-
-        interim_active = list(loop.store.active_keys_in_tier(interim_slot))
+        interim_active = list(loop.store.active_keys_in_tier(_INTERIM_SLOT))
         proc_main_active = list(loop.store.active_keys_in_tier("procedural"))
 
         assert any(k.startswith("proc") for k in interim_active), (
-            f"Proc key must be active in interim tier '{interim_slot}'; "
+            f"Proc key must be active in interim tier '{_INTERIM_SLOT}'; "
             f"active keys there: {interim_active}"
         )
         assert not any(k.startswith("proc") for k in proc_main_active), (
             f"Proc key must NOT appear in 'procedural' main during an interim cycle; "
             f"active keys there: {proc_main_active}"
         )
-
-
-# ---------------------------------------------------------------------------
-# Helper: stack multiple context managers from a list
-# ---------------------------------------------------------------------------
-
-
-def _stack(patches):
-    """Enter all patches in the list; return a single combined context manager."""
-
-    class _MultiCtx:
-        def __enter__(self):
-            self._stack = ExitStack()
-            for p in patches:
-                self._stack.enter_context(p)
-            return self
-
-        def __exit__(self, *exc):
-            return self._stack.__exit__(*exc)
-
-    return _MultiCtx()

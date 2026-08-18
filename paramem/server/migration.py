@@ -47,8 +47,10 @@ from typing import Any, Literal, TypedDict
 import yaml
 
 from paramem.adapters.registry_binding import (
+    KEYS_WITHOUT_SLOT,
     NO_CANDIDATES,
     NO_MATCHING_SLOT,
+    PAYLOAD_MISMATCH,
     REGISTRY_ABSENT_WITH_SLOTS,
     REGISTRY_UNREADABLE,
     verify_tier_binding,
@@ -526,16 +528,24 @@ def compute_shape_changes(
     2. :data:`~paramem.adapters.registry_binding.REGISTRY_UNREADABLE` — log
        WARN and append a warning naming the adapter and the read/decrypt
        failure; no row emitted.
-    3. :data:`~paramem.adapters.registry_binding.NO_CANDIDATES` — the adapter
-       has never been trained; skip silently, no warning.
-    4. :data:`~paramem.adapters.registry_binding.NO_MATCHING_SLOT` or
-       :data:`~paramem.adapters.registry_binding.REGISTRY_ABSENT_WITH_SLOTS`
+    3. :data:`~paramem.adapters.registry_binding.NO_CANDIDATES` — no
+       candidate slot AND no active key in the registry: the adapter has
+       never been trained; skip silently, no warning.
+    4. :data:`~paramem.adapters.registry_binding.NO_MATCHING_SLOT`,
+       :data:`~paramem.adapters.registry_binding.REGISTRY_ABSENT_WITH_SLOTS`,
+       :data:`~paramem.adapters.registry_binding.KEYS_WITHOUT_SLOT`, or
+       :data:`~paramem.adapters.registry_binding.PAYLOAD_MISMATCH`
        — one or more candidate slots exist but none matched (every manifest
        unreadable, none stamped with the live hash, or the registry itself
-       is absent); log WARN and append a warning naming the adapter kind and
-       candidate count.
+       is absent), the registry holds active keys with no slot candidate at
+       all, or the bound slot's payload digest disagrees with its manifest;
+       log WARN and append a warning with PER-VERDICT wording (the four
+       shapes are not interchangeable — ``KEYS_WITHOUT_SLOT`` has zero
+       candidates, ``PAYLOAD_MISMATCH`` has a matched slot whose payload
+       digest disagrees) naming the adapter, the candidate count where it
+       applies, and ``binding.detail``.
     5. Read ``binding.manifest`` — already parsed inside
-       :func:`~paramem.adapters.registry_binding.verify_tier_binding` step 1;
+       :func:`~paramem.adapters.registry_binding.verify_tier_binding` step 6;
        never re-read here (a second read of the same slot could observe a
        DIFFERENT file than the one the verdict was computed from). A manifest
        read failure can only happen INSIDE ``verify_tier_binding`` at this
@@ -546,6 +556,9 @@ def compute_shape_changes(
        ``dropout`` is NOT compared here — it is not a shape field (see
        ``_SHAPE_CONSEQUENCE``'s module comment); an operator dropout edit
        never carries the weight-discard consequence a real shape change does.
+       A ``simulate`` payload (``manifest.lora is None``) has no LoRA shape
+       to compare against a YAML config change at all; log WARN and append a
+       warning naming the adapter, rather than skipping silently.
 
     Parameters
     ----------
@@ -561,9 +574,12 @@ def compute_shape_changes(
         ``(changes, warnings)``. ``changes`` holds all detected shape changes,
         ordered by adapter name then field name. ``warnings`` holds one
         human-readable string per adapter skipped because its tier registry
-        or manifest could not be read, or because every on-disk candidate
-        slot failed to match — the same substance as the WARNING logged at
-        each skip site. A tier with zero weight-slot candidates (never
+        could not be read, because no on-disk candidate slot matched (or
+        active keys exist with no candidate at all, or the bound slot's
+        payload digest disagreed), or because the bound slot's payload is a
+        simulate (knowledge-graph) payload with no LoRA shape to compare —
+        the same substance as the WARNING logged at each skip site. A tier
+        with zero written payload slot candidates AND no active key (never
         trained) contributes no warning.
     """
     adapters_cfg = candidate_yaml.get("adapters", {})
@@ -600,24 +616,63 @@ def compute_shape_changes(
             # Not yet trained — skip silently.
             continue
 
-        if binding.status in (NO_MATCHING_SLOT, REGISTRY_ABSENT_WITH_SLOTS):
+        if binding.status in (
+            NO_MATCHING_SLOT,
+            REGISTRY_ABSENT_WITH_SLOTS,
+            KEYS_WITHOUT_SLOT,
+            PAYLOAD_MISMATCH,
+        ):
+            # Per-verdict wording — the prior generalized "none readable/
+            # matching" text was false for KEYS_WITHOUT_SLOT (zero
+            # candidates — there is nothing to "not match") and
+            # PAYLOAD_MISMATCH (a slot DID match by hash; only its payload
+            # bytes disagree with the manifest digest).
+            if binding.status == KEYS_WITHOUT_SLOT:
+                reason = "registry holds active keys but no candidate slot exists"
+            elif binding.status == REGISTRY_ABSENT_WITH_SLOTS:
+                reason = (
+                    f"{binding.candidate_count} candidate slot(s) present but no "
+                    "indexed_key_registry.json exists for this tier"
+                )
+            elif binding.status == PAYLOAD_MISMATCH:
+                reason = "matched slot's payload no longer matches its manifest digest"
+            else:  # NO_MATCHING_SLOT
+                reason = (
+                    f"{binding.candidate_count} candidate slot(s) present, none "
+                    "readable/matching the live registry hash"
+                )
             logger.warning(
-                "compute_shape_changes: skipping adapter %r — %d candidate "
-                "slot(s) in %s, none readable/matching the live registry hash",
+                "compute_shape_changes: skipping adapter %r — %s (%s) in %s: %s",
                 adapter_name,
-                binding.candidate_count,
+                reason,
+                binding.status,
                 kind_dir,
+                binding.detail,
             )
             warnings.append(
-                f"adapter {adapter_name!r}: {binding.candidate_count} candidate slot(s) in "
-                f"{kind_dir}, none readable/matching — skipped shape-change check"
+                f"adapter {adapter_name!r}: {reason} ({binding.status}) in {kind_dir}: "
+                f"{binding.detail} — skipped shape-change check"
             )
             continue
 
         # binding.status in (VERIFIED, KEY_COUNT_MISMATCH) — key count is
         # irrelevant to a LoRA shape comparison; both proceed. Both statuses
-        # guarantee binding.manifest is set (see verify_tier_binding step 5).
+        # guarantee binding.manifest is set (see verify_tier_binding step 6).
         manifest = binding.manifest
+
+        if manifest.lora is None:
+            # simulate-payload manifest — no LoRA shape to compare against
+            # a YAML config change.
+            logger.warning(
+                "compute_shape_changes: skipping adapter %r — bound slot's payload "
+                "is a simulate (knowledge-graph) payload with no LoRA shape to compare",
+                adapter_name,
+            )
+            warnings.append(
+                f"adapter {adapter_name!r}: bound slot's payload is a simulate "
+                "payload with no LoRA shape to compare — skipped shape-change check"
+            )
+            continue
 
         # Compare each shape field. `dropout` is intentionally excluded — see
         # the module comment above `_SHAPE_CONSEQUENCE`.
