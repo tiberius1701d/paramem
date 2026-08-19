@@ -1568,6 +1568,137 @@ class TestCrossSliceMappingMerge:
         assert minted == "Thing_1"
 
 
+class TestAnonymizedContractNewFields:
+    """Normalize-drop attribution
+    (``AnonymizedContract.norm_dropped_entries``) and the anonymizer
+    self-inconsistency measurement (``.injected_tokens``)."""
+
+    def test_norm_dropped_entries_accumulates_across_slices(self):
+        facts = [
+            {"subject": "Alex", "predicate": "knows", "object": "Riley"},
+            {"subject": "Jordan", "predicate": "knows", "object": "Casey"},
+        ]
+
+        def _fake(slice_facts, *args, **kwargs):
+            names = {f["subject"] for f in slice_facts}
+            if "Alex" in names:
+                # One valid entry, one genuinely ambiguous (neither side shaped).
+                return ({"Alex": "Person_1", "junk one": "junk two"}, "", "raw1")
+            return ({"Jordan": "Person_2", "junk three": "junk four"}, "", "raw2")
+
+        with (
+            patch(
+                "paramem.cloud.anonymize._slice_facts_to_envelope",
+                return_value=[[facts[0]], [facts[1]]],
+            ),
+            patch("paramem.cloud.anonymize.anonymize_transcript", side_effect=_fake),
+        ):
+            payload = anonymize(
+                facts,
+                model=object(),
+                tokenizer=_stub_tokenizer(),
+                transcript="",
+                scrub={"person name"},
+                user_prompt_template="",
+                system_prompt="",
+            )
+
+        assert payload.status == "ok"
+        assert payload.norm_stats["dropped"] == 2
+        assert len(payload.norm_dropped_entries) == 2
+        # placeholder_side="value" (CORE default): `text` is the value
+        # side — the side declared as the placeholder.
+        assert {e["text"] for e in payload.norm_dropped_entries} == {"junk two", "junk four"}
+
+    def test_norm_dropped_entries_threaded_onto_failed_contract(self):
+        """A totally fail-closed call (parse failure) still populates the
+        new fields with their empty default rather than omitting them."""
+        with patch("paramem.cloud.anonymize.anonymize_transcript", return_value=(None, "", "raw")):
+            payload = anonymize(
+                [{"subject": "Alex", "predicate": "knows", "object": "Riley"}],
+                model=object(),
+                tokenizer=_stub_tokenizer(),
+                transcript="hello",
+                scrub={"person name"},
+                user_prompt_template="",
+                system_prompt="",
+            )
+        assert payload.status == "failed"
+        assert payload.norm_dropped_entries == []
+        assert payload.injected_tokens == frozenset()
+
+    def test_opted_out_contract_leaves_new_fields_at_defaults(self):
+        from paramem.cloud.anonymize import opted_out_contract
+
+        payload = opted_out_contract("hello", facts=[])
+        assert payload.norm_dropped_entries == []
+        assert payload.injected_tokens == frozenset()
+
+    def test_injected_tokens_contains_speaker_seed_when_model_never_named_speaker(self):
+        """The speaker-name seed (``_build_anonymization_mapping``) mints
+        a placeholder for the speaker's display name the model never
+        proposed — the pipeline-injected mint site."""
+        with patch(
+            "paramem.cloud.anonymize.anonymize_transcript",
+            return_value=({}, "Bob went home.", "raw"),
+        ):
+            payload = anonymize(
+                [{"subject": "Bob", "predicate": "lives_in", "object": "Millfield"}],
+                model=object(),
+                tokenizer=_stub_tokenizer(),
+                transcript="Bob went home.",
+                scrub={"person name"},
+                speaker_name="Bob",
+                user_prompt_template="",
+                system_prompt="",
+            )
+        assert payload.status == "ok"
+        assert payload.injected_tokens == {payload.forward["Bob"]}
+
+    def test_injected_tokens_contains_remint_on_placeholder_collision(self):
+        """Two different real values sharing the SAME model-proposed
+        placeholder — the second is re-minted onto a fresh token, which
+        the model itself never proposed under its final value."""
+        facts = [
+            {"subject": "Alice", "predicate": "knows", "object": "Riley"},
+            {"subject": "Pat", "predicate": "knows", "object": "Casey"},
+        ]
+        with patch(
+            "paramem.cloud.anonymize.anonymize_transcript",
+            return_value=({"Alice": "Person_1", "Pat": "Person_1"}, "", "raw"),
+        ):
+            payload = anonymize(
+                facts,
+                model=object(),
+                tokenizer=_stub_tokenizer(),
+                transcript="Alice and Pat.",
+                scrub={"person name"},
+                user_prompt_template="",
+                system_prompt="",
+            )
+        assert payload.status == "ok"
+        reminted = payload.forward["Pat"]
+        assert reminted != "Person_1"
+        assert reminted in payload.injected_tokens
+
+    def test_injected_tokens_empty_when_every_token_model_proposed(self):
+        with patch(
+            "paramem.cloud.anonymize.anonymize_transcript",
+            return_value=({"Alex": "Person_1"}, "Alex knows Riley.", "raw"),
+        ):
+            payload = anonymize(
+                [{"subject": "Alex", "predicate": "knows", "object": "Riley"}],
+                model=object(),
+                tokenizer=_stub_tokenizer(),
+                transcript="Alex knows Riley.",
+                scrub={"person name"},
+                user_prompt_template="",
+                system_prompt="",
+            )
+        assert payload.status == "ok"
+        assert payload.injected_tokens == frozenset()
+
+
 # ---------------------------------------------------------------------------
 # Per-slice fail-closed
 # ---------------------------------------------------------------------------

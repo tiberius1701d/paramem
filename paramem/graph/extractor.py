@@ -105,9 +105,11 @@ class ExtractionFailed(RuntimeError):
 # figure and must be updated together.
 #
 # Plausibility output couples to chunk density. The filter's contract
-# (configs/prompts/cloud_plausibility.txt) is "Return ONLY a JSON array of
-# surviving facts, schema unchanged" — so its output volume scales with
-# the surviving-fact count, which scales with chunk density. Lowering the
+# (configs/prompts/cloud_plausibility.txt) is a small ``{"drop": [...]}``
+# object listing the indices (each optionally annotated with the rule
+# that matched) — so its output volume scales with the number of rule
+# matches, not with the surviving-fact count, but the number of rule
+# matches itself scales with chunk density on a dense input. Lowering the
 # cap independently for plausibility was attempted and reverted: a 2048
 # cap truncated the JSON array on dense chunks, the parse failed, and the
 # caller fell back to passing the unfiltered set forward. KV-cache
@@ -1276,7 +1278,10 @@ def _fallback_plausibility_on_raw(
        real-name, un-anonymized ``graph.relations`` — no placeholder
        vocabulary exists at this point (nothing was ever anonymized on
        this path), so there is nothing to sweep here.
-    2. If non-empty, run local plausibility filter; keep raw on None return.
+    2. If non-empty and model/tokenizer are available, run the local
+       plausibility filter (site ``"fallback"``); keep raw on a parse
+       failure. Otherwise record why the judge didn't run — see
+       :func:`record_plausibility_state`.
     3. Rebuild Relations via :func:`~paramem.graph.relation_build.build_relations`
        — the ONE ``Relation``-construction site — and filter entities down
        to the surviving endpoints.
@@ -1308,9 +1313,16 @@ def _fallback_plausibility_on_raw(
         for r in graph.relations
     ]
 
-    # Local plausibility filter (uses real names).
-    if raw_facts and model is not None and tokenizer is not None:
-        filtered, _raw = judge_plausibility(
+    # Local plausibility filter (uses real names). No ``ctx.plausibility_judge``
+    # gate on this recovery path — unlike the deanon/anon sites, this
+    # judge runs whenever there is something to judge and a model to run
+    # it with, so there is no ``off`` state here, only ``skipped``.
+    if not raw_facts:
+        record_plausibility_state(graph, "fallback", PLAUSIBILITY_SKIPPED, reason="no_facts")
+    elif model is None or tokenizer is None:
+        record_plausibility_state(graph, "fallback", PLAUSIBILITY_SKIPPED, reason="no_model")
+    else:
+        verdict, _raw = judge_plausibility(
             raw_facts,
             transcript,
             model,
@@ -1319,17 +1331,11 @@ def _fallback_plausibility_on_raw(
             temperature=_DEFAULT_FILTER_TEMPERATURE,
             seed=seed,
         )
-        if filtered is not None:
-            pre = len(raw_facts)
-            raw_facts = filtered
-            dropped_count = pre - len(raw_facts)
-            if dropped_count:
-                # Own key: this judge, the anon-stage judge and the
-                # deanon-stage judge used to share
-                # ``plausibility_dropped``, so whichever ran last decided
-                # what the number meant.
-                graph.diagnostics["plausibility_dropped_fallback"] = dropped_count
-                graph.diagnostics["plausibility_judge_actual"] = "local_fallback"
+        if verdict is not None:
+            raw_facts = verdict.kept
+            record_plausibility_verdict(graph, "fallback", verdict, judge="local_fallback")
+        else:
+            record_plausibility_state(graph, "fallback", PLAUSIBILITY_FAILED, reason="parse_failed")
 
     # Rebuild Relations from surviving raw facts.
     kept_relations = build_relations(graph, raw_facts, speaker_id=speaker_id)
@@ -1370,10 +1376,11 @@ def _record_binding_diagnostics(graph: SessionGraph, result: DeanonResult) -> No
     always informational (a binding for a token cloud was shown is inert
     under CORE-LAST precedence), never a rejection signal.
 
-    Writes are guarded exactly as the primitive's were: an EMPTY list
-    writes no key at all, so ``"cloud_binding_collisions" not in
-    graph.diagnostics`` keeps its established meaning ("the scan found
-    nothing"), distinct from a present-but-empty value.
+    **Write posture (2026-08-19).** ``cloud_binding_collisions`` is now
+    written on EVERY call, empty list included — reversing the prior
+    guard, which conflated "the scan ran and found nothing" with "the
+    scan never reached this site". A present ``[]`` now means the
+    former; total absence of the key means the latter.
 
     Args:
         graph: The graph the delta is being applied to — the session graph
@@ -1381,8 +1388,7 @@ def _record_binding_diagnostics(graph: SessionGraph, result: DeanonResult) -> No
             graph for graph-tier enrichment.
         result: The ``DeanonResult`` just returned for that delta.
     """
-    if result.collisions:
-        graph.diagnostics["cloud_binding_collisions"] = result.collisions
+    graph.diagnostics["cloud_binding_collisions"] = result.collisions
 
 
 # The provider tables (PROVIDER_KEY_ENV, OPENAI_COMPAT_ENDPOINTS,
@@ -1612,12 +1618,17 @@ def request_enrichment(
     the indexed input facts. KEEP is the default; unnamed input facts pass
     through unchanged.
 
-    ``delta.bindings`` maps each new braced placeholder cloud introduced
-    (key without braces, e.g. ``"Event_1"``) to the exact transcript span
-    it stands for. Cloud already knows the binding the moment it mints
-    each placeholder, so emitting it explicitly removes the
-    transcript-diff reconstruction step the previous "echo every fact"
-    protocol relied on.
+    ``delta.bindings`` maps each new placeholder cloud introduced (e.g.
+    ``"Event_1"``) to the exact transcript span it stands for. The wire
+    key arrives BRACED (``"{Event_1}"`` — the ``cloud_enrichment.txt``
+    contract), matching the form cloud used in the fact itself; the
+    normalize boundary inside :func:`_parse_enrichment_delta` strips that
+    brace before this dataclass is built, so ``delta.bindings`` here is
+    always POST-normalize and bare, like every other internal consumer of
+    the placeholder vocabulary. Cloud already knows the binding the
+    moment it mints each placeholder, so emitting it explicitly removes
+    the transcript-diff reconstruction step the previous "echo every
+    fact" protocol relied on.
 
     ``info`` is a dict with diagnostic flags the caller persists into
     ``graph.diagnostics``:
@@ -2039,21 +2050,95 @@ def _cloud_facing_payload(facts: list[dict], anon_transcript: str | None) -> tup
     return _render_indexed_facts(facts), anon_transcript or "(not available)"
 
 
-def _parse_drop_set(raw: str | None, n_facts: int) -> set[int] | None:
+# Rule-string cap in a parsed drop record — a diagnostic sample, not a
+# redaction: rules are short judge-cited identifiers (``"R1"``), never
+# fact content.
+_MAX_RULE_CHARS: int = 32
+
+# Judge-state vocabulary: ``ran`` (judge called, drop set parsed and
+# applied — 0 drops included), ``failed`` (judge called, output
+# unparseable — fail-open, all facts kept), ``skipped`` (a precondition
+# didn't hold), ``off`` (operator disabled the judge). One shared
+# vocabulary for all three plausibility sites so the absence of a
+# ``plausibility_dropped_<site>`` key never has to be interpreted.
+PLAUSIBILITY_RAN: str = "ran"
+PLAUSIBILITY_FAILED: str = "failed"
+PLAUSIBILITY_SKIPPED: str = "skipped"
+PLAUSIBILITY_OFF: str = "off"
+_PLAUSIBILITY_STATES: frozenset[str] = frozenset(
+    {PLAUSIBILITY_RAN, PLAUSIBILITY_FAILED, PLAUSIBILITY_SKIPPED, PLAUSIBILITY_OFF}
+)
+
+# The three plausibility judge sites — deanon (local judge, real names),
+# anon (cloud judge, anonymized facts), fallback (local judge, raw facts
+# on the anonymize-failed recovery path). Matches the suffixes the
+# existing ``plausibility_dropped_<site>`` counters already use.
+PLAUSIBILITY_SITES: tuple[str, ...] = ("anon", "deanon", "fallback")
+
+
+@dataclass(frozen=True)
+class DropSet:
+    """A plausibility judge's parsed drop-set output.
+
+    ``rules`` maps an in-range dropped index to the judge-cited rule
+    (``None`` when the judge emitted a bare index, no annotation).
+    ``out_of_range`` carries every index the judge cited that fell
+    outside ``[0, n_facts)`` — recorded, never applied, since there is no
+    fact at that position to drop.
+    """
+
+    rules: dict[int, str | None]
+    out_of_range: list[dict]
+
+
+@dataclass(frozen=True)
+class PlausibilityVerdict:
+    """The result of applying a :class:`DropSet` to the judge's input facts.
+
+    ``kept`` preserves input order. ``dropped`` is one record per dropped
+    fact — ``{"index": int, "rule": str | None, "fact": dict}`` — in
+    ascending index order, nested rather than merged into the fact dict so
+    no fact field can ever collide with the attribution fields.
+    ``out_of_range`` is :attr:`DropSet.out_of_range` carried through
+    unchanged.
+    """
+
+    kept: list[dict]
+    dropped: list[dict]
+    out_of_range: list[dict]
+
+
+def _drop_rule(entry: dict) -> str | None:
+    """The rule a drop-set entry cited, or ``None`` when it named none.
+
+    The first non-empty string among ``"rule"`` then ``"reason"`` (the
+    accepted alias), stripped and truncated to :data:`_MAX_RULE_CHARS`. A
+    non-string value under either key reads as ``None``.
+    """
+    for key in ("rule", "reason"):
+        value = entry.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()[:_MAX_RULE_CHARS]
+    return None
+
+
+def _parse_drop_set(raw: str | None, n_facts: int) -> DropSet | None:
     """Parse the plausibility judge's drop-set output.
 
     Accepts these shapes (most permissive — all are observed in practice):
 
-    * ``{"drop": [0, 2, 5]}`` — the prompt's preferred shape.
-    * ``[0, 2, 5]`` — bare integer array; some models drop the wrapper.
+    * ``{"drop": [0, 2, 5]}`` — bare integer array.
+    * ``[0, 2, 5]`` — the wrapper dropped; some models emit this.
     * ``{"drop": [{"index": 0, "rule": "R1"}, ...]}`` — the model
-      annotated each drop with its rule reason.  Indices are extracted;
-      rules are ignored at parse time.
+      annotated each drop with its rule reason (the prompt's preferred
+      shape — see ``configs/prompts/cloud_plausibility.txt``).
 
-    Returns the drop set on success; ``None`` on parse failure (caller
-    fail-opens — keep all facts).  Indices outside ``[0, n_facts)`` are
-    skipped with a warning rather than failing the parse — a single bad
-    index shouldn't void an otherwise-valid drop set.
+    Returns the parsed :class:`DropSet` on success; ``None`` on parse
+    failure (caller fail-opens — keep all facts). An index outside
+    ``[0, n_facts)`` lands in :attr:`DropSet.out_of_range` instead of
+    being counted and discarded — there is no fact at that position to
+    drop, so it is never applied, but a single bad index doesn't void an
+    otherwise-valid drop set.
     """
     if raw is None or not raw.strip():
         return None
@@ -2087,44 +2172,121 @@ def _parse_drop_set(raw: str | None, n_facts: int) -> set[int] | None:
     else:
         logger.warning("plaus drop-set unexpected shape: %s", type(parsed).__name__)
         return None
-    drop: set[int] = set()
-    out_of_range = 0
+    rules: dict[int, str | None] = {}
+    out_of_range: list[dict] = []
     for c in candidates:
+        rule: str | None = None
         if isinstance(c, dict):
             idx = c.get("index")
             if isinstance(idx, bool) or not isinstance(idx, int):
                 continue
+            rule = _drop_rule(c)
         elif isinstance(c, bool) or not isinstance(c, int):
             continue
         else:
             idx = c
         if 0 <= idx < n_facts:
-            drop.add(idx)
+            rules[idx] = rule
         else:
-            out_of_range += 1
+            out_of_range.append({"index": idx, "input_count": n_facts, "rule": rule})
     if out_of_range:
         logger.warning(
-            "plaus drop-set: %d index(es) out of range [0, %d) — skipped",
-            out_of_range,
+            "plaus drop-set: %d index(es) out of range [0, %d) — indices=%s",
+            len(out_of_range),
             n_facts,
+            [r["index"] for r in out_of_range],
         )
-    return drop
+    return DropSet(rules=rules, out_of_range=out_of_range)
 
 
-def _apply_drop_set(facts: list[dict], raw: str | None) -> list[dict] | None:
+def _apply_drop_set(facts: list[dict], raw: str | None) -> PlausibilityVerdict | None:
     """Apply the judge's drop-set output to the input facts.
 
     Returns ``None`` on parse failure so the caller can fail-open
-    (matches the prior contract: ``filtered_list is None`` → the caller
-    (e.g. the ``enrich`` stage) keeps all input facts unchanged and logs a
-    warning).  Empty drop set → input list returned unchanged.
+    (matches the prior contract: a ``None`` return → the caller (e.g. the
+    ``enrich`` stage) keeps all input facts unchanged and logs a warning).
+    Empty drop set → ``kept == list(facts)``, ``dropped == []``.
     """
-    drop = _parse_drop_set(raw, len(facts))
-    if drop is None:
+    drop_set = _parse_drop_set(raw, len(facts))
+    if drop_set is None:
         return None
-    if not drop:
-        return list(facts)
-    return [f for i, f in enumerate(facts) if i not in drop]
+    kept = [f for i, f in enumerate(facts) if i not in drop_set.rules]
+    dropped = [
+        {"index": i, "rule": drop_set.rules[i], "fact": facts[i]} for i in sorted(drop_set.rules)
+    ]
+    return PlausibilityVerdict(kept=kept, dropped=dropped, out_of_range=drop_set.out_of_range)
+
+
+def record_plausibility_verdict(
+    graph: SessionGraph, site: str, verdict: PlausibilityVerdict, *, judge: str
+) -> None:
+    """Ran-path telemetry for one judge site.
+
+    Writes ``plausibility_dropped_<site>`` (int, always),
+    ``plausibility_dropped_<site>_facts`` (only when non-empty — bulky),
+    ``plausibility_out_of_range_<site>`` (list, always),
+    ``plausibility_state_<site> = {"state": "ran", "reason": None}``, and
+    ``plausibility_judge_actual = judge``.
+
+    Args:
+        graph: The session graph whose ``diagnostics`` receives the write.
+        site: One of :data:`PLAUSIBILITY_SITES`.
+        verdict: The judge's :class:`PlausibilityVerdict` for this call.
+        judge: The judge label to record under ``plausibility_judge_actual``
+            (``"local"``/``"local_fallback"`` for the local sites, the
+            provider name for the cloud site).
+
+    Raises:
+        ValueError: ``site`` is not in :data:`PLAUSIBILITY_SITES`.
+    """
+    if site not in PLAUSIBILITY_SITES:
+        raise ValueError(f"unknown plausibility site: {site!r}")
+    graph.diagnostics[f"plausibility_dropped_{site}"] = len(verdict.dropped)
+    if verdict.dropped:
+        graph.diagnostics[f"plausibility_dropped_{site}_facts"] = verdict.dropped
+    graph.diagnostics[f"plausibility_out_of_range_{site}"] = verdict.out_of_range
+    graph.diagnostics[f"plausibility_state_{site}"] = {"state": PLAUSIBILITY_RAN, "reason": None}
+    graph.diagnostics["plausibility_judge_actual"] = judge
+
+
+def record_plausibility_state(
+    graph: SessionGraph, site: str, state: str, *, reason: str | None = None
+) -> None:
+    """Record a non-ran plausibility state for one judge site.
+
+    Writes ``plausibility_state_<site> = {"state": state, "reason": reason}``.
+
+    Args:
+        graph: The session graph whose ``diagnostics`` receives the write.
+        site: One of :data:`PLAUSIBILITY_SITES`.
+        state: One of ``PLAUSIBILITY_FAILED``/``PLAUSIBILITY_SKIPPED``/
+            ``PLAUSIBILITY_OFF``. ``PLAUSIBILITY_RAN`` is REJECTED —
+            :func:`record_plausibility_verdict` is the only writer of the
+            ran state, since only it carries the full verdict payload
+            (dropped facts, out-of-range indices, the judge label) the
+            ran state implies; this function has no verdict to pair it
+            with, so the invariant "ran state <=> full verdict payload
+            present" is enforced structurally, not left to the caller's
+            discipline.
+        reason: A short reason token from the closed vocabulary above,
+            or ``None`` (always ``None`` for ``PLAUSIBILITY_OFF``).
+
+    Raises:
+        ValueError: ``site`` is not in :data:`PLAUSIBILITY_SITES`, ``state``
+            is not a recognized plausibility state, or ``state`` is
+            ``PLAUSIBILITY_RAN``.
+    """
+    if site not in PLAUSIBILITY_SITES:
+        raise ValueError(f"unknown plausibility site: {site!r}")
+    if state not in _PLAUSIBILITY_STATES:
+        raise ValueError(f"unknown plausibility state: {state!r}")
+    if state == PLAUSIBILITY_RAN:
+        raise ValueError(
+            "record_plausibility_state does not accept PLAUSIBILITY_RAN — "
+            "use record_plausibility_verdict, which carries the verdict "
+            "payload the ran state requires"
+        )
+    graph.diagnostics[f"plausibility_state_{site}"] = {"state": state, "reason": reason}
 
 
 @dataclass(frozen=True)
@@ -2144,9 +2306,11 @@ class EnrichmentDelta:
             indexed input fact (``fields`` already restricted to
             :data:`_FACT_FIELDS`).
         drop: Zero-based indices to remove from the input.
-        bindings: New braced placeholders cloud introduced (key without
-            braces, e.g. ``"Event_1"``) mapped to the exact
-            anonymized-transcript span they stand for.
+        bindings: New placeholders cloud introduced (e.g. ``"Event_1"``)
+            mapped to the exact anonymized-transcript span they stand
+            for. The wire key arrives braced; already bare here — see
+            :func:`request_enrichment`'s docstring for the normalize
+            boundary that strips it.
     """
 
     add: list[dict]
@@ -2526,21 +2690,23 @@ def request_plausibility(
     temperature: float = _DEFAULT_FILTER_TEMPERATURE,
     timeout_seconds: float = _DEFAULT_FILTER_TIMEOUT_SECONDS,
     prompts_dir: str | Path | None = None,
-) -> tuple[list[dict] | None, str | None]:
+) -> tuple[PlausibilityVerdict | None, str | None]:
     """Cloud plausibility filter — drops invalid relations only.
 
     No additions, no modifications. See cloud_plausibility.txt for the
     drop criteria (self-loops, tautologies, role leaks, etc.).
 
-    The judge emits a small ``{"drop": [<index>, ...]}`` object; this
-    helper applies the drop-set to the input facts and returns the
-    survivors.  Output is bounded and tiny by construction, so the
-    truncation failure mode that hit the previous "echo every fact"
-    protocol cannot recur on long inputs.
+    The judge emits a small ``{"drop": [<index>, ...]}`` object (each
+    entry optionally annotated with the rule that matched); this helper
+    applies the drop-set to the input facts and returns the
+    :class:`PlausibilityVerdict`. Output is bounded and tiny by
+    construction, so the truncation failure mode that hit the previous
+    "echo every fact" protocol cannot recur on long inputs.
 
-    Returns `(facts, raw_response)`. Raw response is preserved so callers
-    can inspect the judge's verdict when questioning drop decisions.
-    ``raw_response`` is ``None`` on a network/HTTP-level failure (the
+    Returns `(verdict, raw_response)`. Raw response is preserved so
+    callers can inspect the judge's verdict when questioning drop
+    decisions. ``raw_response`` is ``None`` on a network/HTTP-level
+    failure (the
     cloud call itself never returned) — the explicit branch below
     short-circuits on that case rather than relying on
     :func:`_apply_drop_set`/:func:`_parse_drop_set`'s own ``raw is None``
@@ -2587,16 +2753,16 @@ def judge_plausibility(
     seed: int | None = None,
     prompts_dir: str | Path | None = None,
     prompt_filename: str = "cloud_plausibility.txt",
-) -> tuple[list[dict] | None, str]:
+) -> tuple[PlausibilityVerdict | None, str]:
     """Local-model plausibility filter — drops invalid relations only.
 
     Same prompt as the cloud plausibility filter, executed by a local model.
     Caller decides what data to pass: anonymized facts (placeholder strings)
     or de-anonymized facts (real names). The prompt is stage-agnostic.
 
-    Returns ``(filtered_list, raw_output)``.  ``filtered_list`` is ``None``
-    on parse failure (caller falls back).  The raw model output is the
-    second element so calibration can capture it via phase_trace without
+    Returns ``(verdict, raw_output)``.  ``verdict`` is ``None`` on parse
+    failure (caller falls back).  The raw model output is the second
+    element so calibration can capture it via phase_trace without
     re-running the call; an empty string indicates no raw response was
     obtained.
 

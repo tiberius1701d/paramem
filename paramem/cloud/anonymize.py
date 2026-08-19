@@ -631,6 +631,25 @@ class AnonymizedContract:
     atomic and never sliced); ``slices_failed`` is how many of those
     calls were dropped fail-closed (parse or guard) and therefore
     contributed none of their facts to ``facts``.
+
+    ``norm_dropped_entries`` accumulates, across every slice,
+    :func:`~paramem.cloud.placeholders._normalize_anonymization_mapping`'s
+    per-entry ``dropped_entries`` payload (``norm_stats["dropped"]`` is
+    its count) — a NEW field rather than widening ``norm_stats`` into a
+    mixed-type bag, so every existing ``norm_stats={"inverted": ...,
+    "dropped": ...}`` literal (production and test) stays valid unchanged.
+
+    ``injected_tokens`` is the set of forward-map tokens the PIPELINE
+    itself minted rather than the model proposing them — a placeholder-
+    value re-mint on collision, or the speaker-name seed — derived once
+    as ``set(forward.values()) - model_proposed`` (every slice's
+    post-normalize mapping values). These tokens can never appear in the
+    model's own transcript rewrite, so a consumer measuring
+    self-inconsistency must exclude them first.
+
+    Both fields are populated on the ``"failed"`` and ``"ok"`` returns;
+    :func:`opted_out_contract` leaves both at their defaults (no
+    anonymizer call, no table, no drops, no mints).
     """
 
     status: Literal["ok", "opted_out", "failed"]
@@ -645,6 +664,8 @@ class AnonymizedContract:
     facts: list[dict] = field(default_factory=list)
     slices: int = 1
     slices_failed: int = 0
+    norm_dropped_entries: list[dict] = field(default_factory=list)
+    injected_tokens: frozenset[str] = frozenset()
 
 
 def opted_out_contract(transcript: str, *, facts: list[dict]) -> AnonymizedContract:
@@ -881,6 +902,10 @@ def anonymize(
     4. :func:`~paramem.cloud.placeholders._normalize_anonymization_mapping`
        — per slice; ``norm_stats`` accumulates across every slice and is
        a LIVE signal callers persist (``{"inverted": N, "dropped": N}``).
+       This slice's own post-normalize mapping VALUES are also folded into
+       the model-proposed vocabulary the terminal ``injected_tokens``
+       field is computed against, and its ``dropped_entries`` payload
+       accumulates onto :attr:`AnonymizedContract.norm_dropped_entries`.
     5. **Identity reconciliation** (only when ``identity_domain is not
        None`` — the graph tier's pre-step, generalized as data), per
        slice, via :func:`_reconcile_to_domain` against the domain index
@@ -995,6 +1020,8 @@ def anonymize(
     guard_failures = 0
     norm_inverted = 0
     norm_dropped = 0
+    norm_dropped_entries: list[dict] = []
+    model_proposed: set[str] = set()
     rekey_dropped_total = 0
     raw_parts: list[str] = []
     model_anon_transcript = ""
@@ -1024,6 +1051,13 @@ def anonymize(
         mapping, norm_stats = _normalize_anonymization_mapping(llm_mapping)
         norm_inverted += norm_stats["inverted"]
         norm_dropped += norm_stats["dropped"]
+        norm_dropped_entries.extend(norm_stats["dropped_entries"])
+        # Model-proposed vocabulary: every post-normalize mapping value
+        # this slice's LOCAL MODEL itself produced (before reconciliation
+        # or the placeholder-collision re-mint below) — the baseline
+        # `injected_tokens` is computed against on the terminal "ok"
+        # return.
+        model_proposed.update(mapping.values())
 
         if identity_domain is not None:
             mapping, dropped = _reconcile_to_domain(mapping, canon_to_domain, ambiguous_canon)
@@ -1106,6 +1140,8 @@ def anonymize(
             facts=[],
             slices=len(slices),
             slices_failed=slices_failed,
+            norm_dropped_entries=norm_dropped_entries,
+            injected_tokens=frozenset(),
         )
 
     forward, reverse = _build_anonymization_mapping(merged, speaker_name=speaker_name)
@@ -1126,4 +1162,6 @@ def anonymize(
         facts=accepted_facts,
         slices=len(slices),
         slices_failed=slices_failed,
+        norm_dropped_entries=norm_dropped_entries,
+        injected_tokens=frozenset(forward.values()) - model_proposed,
     )

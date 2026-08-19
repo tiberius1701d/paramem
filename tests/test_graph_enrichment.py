@@ -2299,15 +2299,15 @@ class TestGraphEnrichWithCloudUnit:
         assert dropped_count == 1
         assert new_rels == []
         assert same_as == []
-        # No cloud_bindings in the response -> the collision scan found
-        # nothing -> no key at all (never a present-but-empty list).
-        assert "cloud_binding_collisions" not in graph.diagnostics
+        # No cloud_bindings in the response -> the collision scan ran and
+        # found nothing -> an empty list, written unconditionally now.
+        assert graph.diagnostics["cloud_binding_collisions"] == []
 
     def test_accepted_chunk_reports_zero_dropped_relations(self):
         """The guard conditions are preserved end-to-end: an accepted
-        delta reports a zero dropped-relation count and leaves the
-        collision diagnostic key ABSENT rather than writing an empty
-        list."""
+        delta reports a zero dropped-relation count and writes the
+        collision diagnostic key as an empty list (the scan ran and found
+        nothing), never omits it."""
         from paramem.graph.extractor import request_graph_enrichment
 
         triples = [
@@ -2331,8 +2331,7 @@ class TestGraphEnrichWithCloudUnit:
 
         assert result is not None
         assert result[3] == 0
-        assert "cloud_binding_collisions" not in graph.diagnostics
-        assert "cloud_binding_collisions" not in graph.diagnostics
+        assert graph.diagnostics["cloud_binding_collisions"] == []
 
 
 class TestInterimEnrichmentHook:

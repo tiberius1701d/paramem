@@ -14,8 +14,22 @@ unexpected fallback path fires.
 
 from unittest.mock import patch
 
+from paramem.graph.extractor import PlausibilityVerdict
 from paramem.graph.schema import Entity, SessionGraph
 from tests._cloud_flow import enrichment_side_effect, run_cloud_stages
+
+
+def _verdict_dropping(facts: list[dict], predicates: set[str]) -> PlausibilityVerdict:
+    """Build a :class:`PlausibilityVerdict` dropping every fact whose
+    predicate is in ``predicates`` — the mock judge shape this module's
+    tests need in place of a real drop-set round trip."""
+    kept = [f for f in facts if f.get("predicate") not in predicates]
+    dropped = [
+        {"index": i, "rule": None, "fact": f}
+        for i, f in enumerate(facts)
+        if f.get("predicate") in predicates
+    ]
+    return PlausibilityVerdict(kept=kept, dropped=dropped, out_of_range=[])
 
 
 def _make_graph_from_spec(
@@ -105,7 +119,7 @@ class TestAlignmentSmoke:
 
         # Plausibility filter drops the known-bad predicates
         def fake_plaus_filter(facts, transcript, model, tokenizer, **kwargs):
-            return [f for f in facts if f.get("predicate") not in _KNOWN_BAD_PREDICATES], ""
+            return _verdict_dropping(facts, _KNOWN_BAD_PREDICATES), ""
 
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
@@ -156,7 +170,7 @@ class TestAlignmentSmoke:
 
         def fake_plaus_filter(facts, transcript, model, tokenizer, **kwargs):
             # Drop 2 known-bad facts
-            return [f for f in facts if f.get("predicate") not in _KNOWN_BAD_PREDICATES], ""
+            return _verdict_dropping(facts, _KNOWN_BAD_PREDICATES), ""
 
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),

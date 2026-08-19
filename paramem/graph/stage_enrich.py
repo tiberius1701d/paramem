@@ -21,10 +21,15 @@ from paramem.graph.empty_cause import CAUSE_ANON_JUDGE, CAUSE_CLOUD_EMPTY
 from paramem.graph.entity_correction import correct_entity_surfaces
 from paramem.graph.extractor import (
     _DEFAULT_FILTER_TEMPERATURE,
+    PLAUSIBILITY_FAILED,
+    PLAUSIBILITY_OFF,
+    PLAUSIBILITY_SKIPPED,
     ExtractionFailed,
     _apply_enrichment_delta,
     _cloud_facing_payload,
     _wait_for_gpu_ready,
+    record_plausibility_state,
+    record_plausibility_verdict,
     request_enrichment,
     request_plausibility,
 )
@@ -70,6 +75,12 @@ def _stage_enrich(ctx: StageContext, state: StageState) -> StageState:
     ``_cloud_pipeline``, which was reachable as a bare function outside the
     flow and re-checked defensively; ``_stage_enrich`` only runs via
     ``run_flow``, which already gated it).
+
+    Every reachable path through the anon-stage judge gate records its
+    state onto ``graph.diagnostics["plausibility_state_anon"]`` (the
+    ``paramem.graph.extractor`` PLAUSIBILITY_* vocabulary), and a
+    ``cloud_enrich`` run also writes ``declared_unobserved_tokens`` — the
+    anonymizer's declared tokens cloud was never shown at all.
     """
     graph = state.graph
     payload = state.payload
@@ -334,6 +345,15 @@ def _stage_enrich(ctx: StageContext, state: StageState) -> StageState:
             if not enriched_anon:
                 logger.info("cloud enrichment removed all relations")
                 empty_cause = CAUSE_CLOUD_EMPTY
+        # Legality-domain view, both branches above ("degraded" and the
+        # normal path both bind `scope`): which of the anonymizer's own
+        # CORE declared tokens were never shown to cloud at all. Read from
+        # `payload.declared` (the CORE vocabulary), never `scope.declared`
+        # (the union with cloud's own minted binding keys, which would
+        # report every cloud mint as "unobserved" by construction). One
+        # write here, not at either `CloudScope.response` call site above —
+        # those would be the same write twice.
+        graph.diagnostics["declared_unobserved_tokens"] = sorted(payload.declared - scope.observed)
     if chain_stopped():
         # Calibration short-circuit: Cloud enrichment block recorded,
         # downstream (anon_plausibility, deanon, deanon_plausibility) skipped.
@@ -343,14 +363,22 @@ def _stage_enrich(ctx: StageContext, state: StageState) -> StageState:
 
     # Step 3a: Plausibility on anonymized data (cloud judge, stage="anon").
     # Only runs when: explicit cloud provider, plausibility_stage=="anon",
-    # and enriched_anon is non-empty.
+    # and enriched_anon is non-empty. Every branch records its judge state
+    # (paramem.graph.extractor's PLAUSIBILITY_* vocabulary) so the absence
+    # of plausibility_dropped_anon never has to be interpreted.
     # Guard: use `plausibility_judge in PROVIDER_KEY_ENV` (NOT != "off") —
     # "auto" is not a provider and would crash PROVIDER_KEY_ENV.get("auto").
-    if (
-        ctx.plausibility_stage == "anon"
-        and ctx.plausibility_judge in PROVIDER_KEY_ENV
-        and enriched_anon
-    ):
+    if ctx.plausibility_judge == "off":
+        record_plausibility_state(graph, "anon", PLAUSIBILITY_OFF)
+    elif ctx.plausibility_stage != "anon":
+        record_plausibility_state(graph, "anon", PLAUSIBILITY_SKIPPED, reason="stage_not_anon")
+    elif ctx.plausibility_judge not in PROVIDER_KEY_ENV:
+        record_plausibility_state(
+            graph, "anon", PLAUSIBILITY_SKIPPED, reason="judge_not_a_provider"
+        )
+    elif not enriched_anon:
+        record_plausibility_state(graph, "anon", PLAUSIBILITY_SKIPPED, reason="no_facts")
+    else:
         with phase_trace("anon_plausibility") as t:
             judge_verdict = evaluate_cloud_egress(
                 cloud_enabled=True,
@@ -361,11 +389,14 @@ def _stage_enrich(ctx: StageContext, state: StageState) -> StageState:
             if not judge_verdict.permitted:
                 reason = "; ".join(judge_verdict.gaps)
                 t.set_outcome("skipped", reason=reason)
+                record_plausibility_state(
+                    graph, "anon", PLAUSIBILITY_SKIPPED, reason="not_permitted"
+                )
                 logger.warning(
                     "Anon-stage plausibility (%s) skipped — %s", ctx.plausibility_judge, reason
                 )
             else:
-                plaus_facts, plaus_raw = request_plausibility(
+                verdict, plaus_raw = request_plausibility(
                     enriched_anon,
                     judge_verdict.api_key,
                     provider=judge_verdict.provider,
@@ -382,19 +413,14 @@ def _stage_enrich(ctx: StageContext, state: StageState) -> StageState:
                 # local plausibility filter that follows below.
                 _wait_for_gpu_ready()
                 t.set_raw(plaus_raw or "")
-                if plaus_facts is not None:
+                if verdict is not None:
                     pre_plaus = len(enriched_anon)
-                    enriched_anon = plaus_facts
-                    dropped_plaus = pre_plaus - len(enriched_anon)
+                    enriched_anon = verdict.kept
+                    dropped_plaus = len(verdict.dropped)
                     graph.diagnostics["plausibility"] = "anon"
-                    # Own key: the three plausibility writers (this one,
-                    # the deanon judge, and the raw-fallback judge) used
-                    # to share ``plausibility_dropped`` with three
-                    # different semantics — a plain overwrite here, an
-                    # accumulate there — so its final value was
-                    # order-dependent and uninterpretable.
-                    graph.diagnostics["plausibility_dropped_anon"] = dropped_plaus
-                    graph.diagnostics["plausibility_judge_actual"] = ctx.plausibility_judge
+                    record_plausibility_verdict(
+                        graph, "anon", verdict, judge=ctx.plausibility_judge
+                    )
                     if not enriched_anon:
                         empty_cause = CAUSE_ANON_JUDGE
                     if plaus_raw:
@@ -405,6 +431,8 @@ def _stage_enrich(ctx: StageContext, state: StageState) -> StageState:
                             "input_count": pre_plaus,
                             "kept_count": len(enriched_anon),
                             "dropped_count": dropped_plaus,
+                            "dropped_facts": verdict.dropped,
+                            "out_of_range": verdict.out_of_range,
                         }
                     )
                     logger.info(
@@ -416,6 +444,9 @@ def _stage_enrich(ctx: StageContext, state: StageState) -> StageState:
                     )
                 else:
                     t.set_outcome("failed", reason="plausibility call returned None")
+                    record_plausibility_state(
+                        graph, "anon", PLAUSIBILITY_FAILED, reason="parse_failed"
+                    )
                     t.set_parsed(
                         {
                             "judge": ctx.plausibility_judge,

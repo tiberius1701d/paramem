@@ -9,27 +9,27 @@ You may introduce new placeholders for entities the extractor missed (an event, 
 
 Every new braced placeholder MUST appear in BOTH:
 - a fact in `add` (or in a `modify` `fields` block), under subject or object.
-- `bindings` — a dict entry `"Prefix_N": "<exact transcript span>"` (key WITHOUT braces).
+- `bindings` — a dict entry `"{{Prefix_N}}": "<exact transcript span>"` (key BRACED, same form as in the fact).
 
 Type-appropriate prefixes: Person, City, Country, Org, Event, Topic, Location, Thing, Role. Allocate the smallest free index above every value you can see — the input facts below and the transcript above are the whole of what you were shown, so counting both bare and braced occurrences there is always enough; you never need to guess an index used elsewhere.
 
 POSITIVE — transcript: `"...Person_1 led the agile transformation initiative at Org_1..."`
 → add: `[{{"subject": "Person_1", "predicate": "led", "object": "{{Event_1}}", "relation_type": "factual", "confidence": 0.9}}, {{"subject": "Person_1", "predicate": "works_at", "object": "Org_1", "relation_type": "factual", "confidence": 0.9}}]`
-→ bindings: `{{"Event_1": "the agile transformation initiative"}}`
+→ bindings: `{{"{{Event_1}}": "the agile transformation initiative"}}`
 
 POSITIVE (role-instance — bind co-temporal attributes to ONE entity, not flat triples on {speaker_id}) — transcript: `"...I was Senior Engineer at Org_1 in City_1 from Jan 2014 to Sep 2017..."`
 → add: `[{{"subject": "{speaker_id}", "predicate": "held_role", "object": "{{Role_1}}", "relation_type": "factual", "confidence": 0.9}}, {{"subject": "{{Role_1}}", "predicate": "at_company", "object": "Org_1", "relation_type": "factual", "confidence": 0.9}}, {{"subject": "{{Role_1}}", "predicate": "in_location", "object": "City_1", "relation_type": "factual", "confidence": 0.9}}, {{"subject": "{{Role_1}}", "predicate": "start_date", "object": "Jan 2014", "relation_type": "temporal", "confidence": 0.9}}, {{"subject": "{{Role_1}}", "predicate": "end_date", "object": "Sep 2017", "relation_type": "temporal", "confidence": 0.9}}]`
-→ bindings: `{{"Role_1": "Senior Engineer"}}`
+→ bindings: `{{"{{Role_1}}": "Senior Engineer"}}`
 
 NEGATIVE — same transcript:
 - WRONG: `add: [{{"subject":"Person_1","predicate":"led","object":"Project_1",...}}]` — bare `Project_1` looks like an anonymizer placeholder but isn't in the input mapping → this fact alone is silently dropped, never reaching memory.
 - WRONG: `add: [{{"subject":"Person_1","predicate":"led","object":"{{Event_1}}",...}}]` with `Event_1` missing from `bindings` → no binding to substitute → this fact alone is dropped.
-- WRONG: `bindings: {{"{{Event_1}}": "..."}}` — key includes braces → lookup misses → every fact naming `Event_1` is dropped (a `modify` reverts to its pre-enrichment original instead).
+- WRONG: `bindings: {{"{{Role_1}}": "Senior Engineer at {{Org_9}}"}}` — the binding's VALUE carries another placeholder that resolves to nothing, so the binding is pruned and every fact naming `Role_1` is dropped.
 - WRONG (role flattened onto {speaker_id}): `add: [{{"subject":"{speaker_id}","predicate":"held_role","object":"Senior Engineer",...}}, {{"subject":"{speaker_id}","predicate":"worked_at","object":"Org_1",...}}, {{"subject":"{speaker_id}","predicate":"start_date","object":"Jan 2014",...}}, {{"subject":"{speaker_id}","predicate":"end_date","object":"Sep 2017",...}}]` — co-temporal attributes orphan from the role. With multiple roles in one transcript the dates cannot be paired back to a title; downstream reasoning over "what title did {speaker_id} hold in 2015?" fails.
 
 Existing bare anonymizer placeholders (`Person_1`, `City_1`, `Org_1`, etc.) stay bare. Do NOT re-brace them. Leave them exactly as the extractor emitted them.
 
-Before returning: every `{{Prefix_N}}` you wrote in `add`/`modify` MUST have a matching `bindings` entry (key without braces) whose value is an exact transcript span — a descriptor phrase ("my father", "the workshop last spring") counts as an exact span, not only a proper name. If you cannot bind it to ANY exact transcript span, do NOT introduce the placeholder — write the entity surface inline instead. A single unbound placeholder is still a hard loss: the `add` carrying it is dropped outright, or the `modify` carrying it is reverted, discarding the very fact or edit you just wrote — bind every placeholder, or don't mint it.
+Before returning: every `{{Prefix_N}}` you wrote in `add`/`modify` MUST have a matching `bindings` entry (key braced, exactly as you wrote it in the fact) whose value is an exact transcript span — a descriptor phrase ("my father", "the workshop last spring") counts as an exact span, not only a proper name. If you cannot bind it to ANY exact transcript span, do NOT introduce the placeholder — write the entity surface inline instead. A single unbound placeholder is still a hard loss: the `add` carrying it is dropped outright, or the `modify` carrying it is reverted, discarding the very fact or edit you just wrote — bind every placeholder, or don't mint it.
 
 
 ## Speaker identity
@@ -41,18 +41,18 @@ Before returning: every `{{Prefix_N}}` you wrote in `add`/`modify` MUST have a m
 
 Few-shot — "my wife is also a teacher"
 → add: `[{{"subject":"{speaker_id}","predicate":"married_to","object":"{{Person_1}}","relation_type":"social","confidence":0.9,"symmetric":true}}, {{"subject":"{{Person_1}}","predicate":"profession","object":"teacher","relation_type":"factual","confidence":0.9,"symmetric":false}}]`
-→ bindings: `{{"Person_1": "my wife"}}`
+→ bindings: `{{"{{Person_1}}": "my wife"}}`
 
 Few-shot — "we went there last summer" (context: {speaker_id} + Person_1 + Location_1 — `Person_1` here is already an anonymizer placeholder for a named third party, not something you mint)
 → add: `[{{"subject":"{speaker_id}","predicate":"visited","object":"Location_1","relation_type":"factual","confidence":0.9,"symmetric":false}}, {{"subject":"Person_1","predicate":"visited","object":"Location_1","relation_type":"factual","confidence":0.9,"symmetric":false}}]`.
 
 Few-shot — "my sister's husband"
 → add: `[{{"subject":"{speaker_id}","predicate":"sister_of","object":"{{Person_2}}","relation_type":"social","confidence":0.9,"symmetric":true}}, {{"subject":"{{Person_2}}","predicate":"married_to","object":"{{Person_3}}","relation_type":"social","confidence":0.9,"symmetric":true}}]`
-→ bindings: `{{"Person_2": "my sister", "Person_3": "my sister's husband"}}`
+→ bindings: `{{"{{Person_2}}": "my sister", "{{Person_3}}": "my sister's husband"}}`
 
 Few-shot — "my father is also an engineer" (descriptor, no name given — a binding span may be a descriptor, not only a name)
 → add: `[{{"subject":"{speaker_id}","predicate":"child_of","object":"{{Person_4}}","relation_type":"social","confidence":0.9,"symmetric":false}}, {{"subject":"{{Person_4}}","predicate":"profession","object":"engineer","relation_type":"factual","confidence":0.9,"symmetric":false}}]`
-→ bindings: `{{"Person_4": "my father"}}`
+→ bindings: `{{"{{Person_4}}": "my father"}}`
 
 
 ## Compound fact splitting
@@ -105,7 +105,7 @@ Return ONLY a single JSON object with these four optional keys:
 - `add` — array of new facts to append. Each fact: `{{"subject", "predicate", "object", "relation_type", "confidence", "symmetric"}}`. New entities appear as `{{Prefix_N}}`.
 - `modify` — array of partial updates against the indexed input facts. Each entry: `{{"index": <int>, "fields": {{<partial fact dict — only the keys you want to change>}}}}`. Include `"symmetric"` in `fields` when you are asserting or correcting it for an existing fact.
 - `drop` — array of zero-based integer indices to drop from the input facts.
-- `bindings` — dict mapping each NEW braced placeholder you used in `add` (key WITHOUT braces) to its exact transcript span. Empty `{{}}` if you minted no new entities.
+- `bindings` — dict mapping each NEW braced placeholder you used in `add` (key braced, same form) to its exact transcript span. Empty `{{}}` if you minted no new entities.
 
 `symmetric`: `true` when the SAME predicate holds in both directions between subject and object by MEANING — swap subject and object and the sentence stays true (e.g. a marriage, a friendship, a sibling relationship). `false` for directional relations where the two endpoints are not interchangeable (e.g. parent/child, manages/reports_to, employer/employee, likes, profession, location facts). Judge from meaning; do not rely on a fixed predicate list.
 
@@ -113,6 +113,6 @@ Confidence: 0.9 for coreference-resolved facts, 0.8 for inferred facts. Do not e
 
 Example clean input where you have nothing to do: `{{}}`
 Example with one synonym dedup: `{{"drop": [7]}}`
-Example with coreference resolution and a new entity: `{{"add": [{{"subject":"{speaker_id}","predicate":"married_to","object":"{{Person_1}}","relation_type":"social","confidence":0.9,"symmetric":true}}, {{"subject":"{speaker_id}","predicate":"led","object":"{{Event_1}}","relation_type":"factual","confidence":0.9,"symmetric":false}}], "bindings": {{"Person_1": "my wife", "Event_1": "the agile transformation initiative"}}}}`
+Example with coreference resolution and a new entity: `{{"add": [{{"subject":"{speaker_id}","predicate":"married_to","object":"{{Person_1}}","relation_type":"social","confidence":0.9,"symmetric":true}}, {{"subject":"{speaker_id}","predicate":"led","object":"{{Event_1}}","relation_type":"factual","confidence":0.9,"symmetric":false}}], "bindings": {{"{{Person_1}}": "my wife", "{{Event_1}}": "the agile transformation initiative"}}}}`
 
 Do NOT wrap the output in backticks, code fences, or any other prose.

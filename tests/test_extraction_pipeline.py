@@ -5,8 +5,33 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from paramem.graph.extractor import _extract_json_block
+from paramem.graph.extractor import PlausibilityVerdict, _extract_json_block
+from paramem.graph.phase_trace import extraction_trace
 from paramem.graph.schema import Entity, Relation, SessionGraph
+
+
+def _kept_verdict(facts: list[dict]) -> PlausibilityVerdict:
+    """A :class:`PlausibilityVerdict` keeping every input fact —
+    the mock-judge shape for tests exercising the plausibility call
+    sites' plumbing (prompts_dir threading, provider dispatch, ...)
+    without exercising the drop-set contract itself."""
+    return PlausibilityVerdict(kept=list(facts), dropped=[], out_of_range=[])
+
+
+def _verdict_dropping(facts: list[dict], predicates: set[str]) -> PlausibilityVerdict:
+    """A :class:`PlausibilityVerdict` dropping every input fact whose
+    predicate is in ``predicates`` — ``dropped`` is built from the facts
+    actually removed, at their input-relative indices, so ``kept`` and
+    ``dropped`` are never independently hand-typed into an unsatisfiable
+    pair. Mirrors ``tests/test_extraction_alignment_smoke.py``'s helper
+    of the same name."""
+    kept = [f for f in facts if f.get("predicate") not in predicates]
+    dropped = [
+        {"index": i, "rule": None, "fact": f}
+        for i, f in enumerate(facts)
+        if f.get("predicate") in predicates
+    ]
+    return PlausibilityVerdict(kept=kept, dropped=dropped, out_of_range=[])
 
 
 def _make_graph(relations, entities=None):
@@ -183,13 +208,15 @@ class TestParseExtractionShapes:
 
 class TestPlausibilityDropSet:
     """The plausibility judge emits ``{"drop": [<index>, ...]}`` — a small
-    JSON object listing which input facts to drop by zero-based index.
-    ``_apply_drop_set`` parses that output and returns the surviving facts.
+    JSON object listing which input facts to drop by zero-based index,
+    each entry optionally annotated with the rule that matched.
+    ``_apply_drop_set`` parses that output and returns a
+    ``PlausibilityVerdict`` (``kept``/``dropped``/``out_of_range``).
 
     This class covers the parser tolerance and the drop application:
     happy path, alternative output shapes the model might produce, edge
-    cases (out-of-range, duplicates, malformed), and the fail-open
-    contract on parse failure.
+    cases (out-of-range, duplicates, malformed), the rule-attribution
+    payload, and the fail-open contract on parse failure.
     """
 
     def _facts(self, n: int) -> list[dict]:
@@ -202,7 +229,9 @@ class TestPlausibilityDropSet:
 
         facts = self._facts(5)
         out = _apply_drop_set(facts, '{"drop": []}')
-        assert out == facts
+        assert out.kept == facts
+        assert out.dropped == []
+        assert out.out_of_range == []
 
     def test_single_index_dropped(self):
         from paramem.graph.extractor import _apply_drop_set
@@ -210,7 +239,7 @@ class TestPlausibilityDropSet:
         facts = self._facts(5)
         out = _apply_drop_set(facts, '{"drop": [2]}')
         assert out is not None
-        assert [f["subject"] for f in out] == ["S0", "S1", "S3", "S4"]
+        assert [f["subject"] for f in out.kept] == ["S0", "S1", "S3", "S4"]
 
     def test_multiple_indices_dropped_unordered(self):
         from paramem.graph.extractor import _apply_drop_set
@@ -218,7 +247,7 @@ class TestPlausibilityDropSet:
         facts = self._facts(6)
         out = _apply_drop_set(facts, '{"drop": [4, 0, 2]}')
         assert out is not None
-        assert [f["subject"] for f in out] == ["S1", "S3", "S5"]
+        assert [f["subject"] for f in out.kept] == ["S1", "S3", "S5"]
 
     def test_duplicate_indices_dedupped(self):
         from paramem.graph.extractor import _apply_drop_set
@@ -226,17 +255,20 @@ class TestPlausibilityDropSet:
         facts = self._facts(5)
         out = _apply_drop_set(facts, '{"drop": [1, 1, 1]}')
         assert out is not None
-        assert [f["subject"] for f in out] == ["S0", "S2", "S3", "S4"]
+        assert [f["subject"] for f in out.kept] == ["S0", "S2", "S3", "S4"]
 
     def test_out_of_range_indices_skipped(self):
         """A bad index shouldn't void an otherwise-valid drop set —
-        skip with a warning rather than fail-open the entire gate."""
+        it lands in ``out_of_range`` (never applied) rather than
+        fail-opening the entire gate."""
         from paramem.graph.extractor import _apply_drop_set
 
         facts = self._facts(3)
         out = _apply_drop_set(facts, '{"drop": [0, 99, -1, 2]}')
         assert out is not None
-        assert [f["subject"] for f in out] == ["S1"]
+        assert [f["subject"] for f in out.kept] == ["S1"]
+        assert {r["index"] for r in out.out_of_range} == {99, -1}
+        assert all(r["input_count"] == 3 for r in out.out_of_range)
 
     def test_bare_array_shape_accepted(self):
         """Some models drop the ``{"drop": ...}`` wrapper and emit a bare
@@ -246,19 +278,56 @@ class TestPlausibilityDropSet:
         facts = self._facts(4)
         out = _apply_drop_set(facts, "[1, 3]")
         assert out is not None
-        assert [f["subject"] for f in out] == ["S0", "S2"]
+        assert [f["subject"] for f in out.kept] == ["S0", "S2"]
 
     def test_object_index_with_rule_annotation(self):
         """Some models annotate each drop with the rule that fired:
-        ``{"drop": [{"index": 2, "rule": "R1"}, ...]}``.  Index extracted;
-        rule ignored at parse time (could land in diagnostics later)."""
+        ``{"drop": [{"index": 2, "rule": "R1"}, ...]}``.  Index and rule
+        are both extracted and land on the dropped-record."""
         from paramem.graph.extractor import _apply_drop_set
 
         facts = self._facts(5)
         raw = '{"drop": [{"index": 1, "rule": "R3"}, {"index": 4, "rule": "R5"}]}'
         out = _apply_drop_set(facts, raw)
         assert out is not None
-        assert [f["subject"] for f in out] == ["S0", "S2", "S3"]
+        assert [f["subject"] for f in out.kept] == ["S0", "S2", "S3"]
+        assert out.dropped == [
+            {"index": 1, "rule": "R3", "fact": facts[1]},
+            {"index": 4, "rule": "R5", "fact": facts[4]},
+        ]
+
+    def test_bare_integer_drops_carry_no_rule(self):
+        from paramem.graph.extractor import _apply_drop_set
+
+        facts = self._facts(3)
+        out = _apply_drop_set(facts, '{"drop": [1]}')
+        assert out.dropped == [{"index": 1, "rule": None, "fact": facts[1]}]
+
+    def test_reason_key_accepted_as_rule_alias(self):
+        from paramem.graph.extractor import _apply_drop_set
+
+        facts = self._facts(3)
+        out = _apply_drop_set(facts, '{"drop": [{"index": 0, "reason": "R2"}]}')
+        assert out.dropped == [{"index": 0, "rule": "R2", "fact": facts[0]}]
+
+    def test_non_string_rule_reads_as_none(self):
+        from paramem.graph.extractor import _apply_drop_set
+
+        facts = self._facts(3)
+        out = _apply_drop_set(facts, '{"drop": [{"index": 0, "rule": 5}]}')
+        assert out.dropped == [{"index": 0, "rule": None, "fact": facts[0]}]
+
+    def test_rule_longer_than_32_chars_truncated(self):
+        import json
+
+        from paramem.graph.extractor import _MAX_RULE_CHARS, _apply_drop_set
+
+        facts = self._facts(3)
+        long_rule = "x" * (_MAX_RULE_CHARS + 18)
+        raw = json.dumps({"drop": [{"index": 0, "rule": long_rule}]})
+        out = _apply_drop_set(facts, raw)
+        assert out.dropped[0]["rule"] == long_rule[:_MAX_RULE_CHARS]
+        assert len(out.dropped[0]["rule"]) == _MAX_RULE_CHARS
 
     def test_alternate_key_drop_indices(self):
         """``"drop_indices"`` is a common synonym a model might pick.
@@ -268,7 +337,7 @@ class TestPlausibilityDropSet:
         facts = self._facts(3)
         out = _apply_drop_set(facts, '{"drop_indices": [0]}')
         assert out is not None
-        assert [f["subject"] for f in out] == ["S1", "S2"]
+        assert [f["subject"] for f in out.kept] == ["S1", "S2"]
 
     def test_code_fenced_output_is_unwrapped(self):
         """Models often wrap structured output in ```json``` fences.
@@ -279,7 +348,7 @@ class TestPlausibilityDropSet:
         raw = '```json\n{"drop": [2]}\n```'
         out = _apply_drop_set(facts, raw)
         assert out is not None
-        assert [f["subject"] for f in out] == ["S0", "S1", "S3"]
+        assert [f["subject"] for f in out.kept] == ["S0", "S1", "S3"]
 
     def test_single_backtick_inline_code_is_unwrapped(self):
         """Live-probe regression: when the prompt itself uses inline-code
@@ -294,12 +363,12 @@ class TestPlausibilityDropSet:
         raw = '`{"drop": [2]}`'
         out = _apply_drop_set(facts, raw)
         assert out is not None
-        assert [f["subject"] for f in out] == ["S0", "S1", "S3"]
+        assert [f["subject"] for f in out.kept] == ["S0", "S1", "S3"]
 
     def test_malformed_output_returns_none(self):
         """Parse failure must return ``None`` — caller fail-opens by
         keeping all input facts.  This matches the prior contract:
-        ``filtered_list is None`` → the caller (e.g. the ``enrich`` stage)
+        a ``None`` return → the caller (e.g. the ``enrich`` stage)
         logs a warning and continues with the unfiltered input."""
         from paramem.graph.extractor import _apply_drop_set
 
@@ -316,11 +385,13 @@ class TestPlausibilityDropSet:
     def test_empty_input_with_empty_drop(self):
         """``_apply_drop_set([], '{"drop": []}')`` is the most common
         plausibility outcome on an extraction that produced no facts —
-        must succeed and return an empty list."""
+        must succeed and return an empty verdict."""
         from paramem.graph.extractor import _apply_drop_set
 
         out = _apply_drop_set([], '{"drop": []}')
-        assert out == []
+        assert out.kept == []
+        assert out.dropped == []
+        assert out.out_of_range == []
 
     def test_drop_set_with_non_int_entries_skipped(self):
         """Stray strings / null / booleans inside the array don't void the
@@ -330,7 +401,7 @@ class TestPlausibilityDropSet:
         facts = self._facts(4)
         out = _apply_drop_set(facts, '{"drop": [1, "junk", null, 3, true]}')
         assert out is not None
-        assert [f["subject"] for f in out] == ["S0", "S2"]
+        assert [f["subject"] for f in out.kept] == ["S0", "S2"]
 
     def test_envelope_wrapped_in_one_element_list_is_unwrapped(self):
         """A judge that wraps the whole ``{"drop": [...]}`` envelope in a
@@ -345,7 +416,32 @@ class TestPlausibilityDropSet:
         raw = '[{"drop": [1, 3]}]'
         out = _apply_drop_set(facts, raw)
         assert out is not None
-        assert [f["subject"] for f in out] == ["S0", "S2", "S4"]
+        assert [f["subject"] for f in out.kept] == ["S0", "S2", "S4"]
+
+    def test_out_of_range_annotated_form_carries_rule(self):
+        from paramem.graph.extractor import _apply_drop_set
+
+        facts = self._facts(1)
+        out = _apply_drop_set(facts, '{"drop": [{"index": 1, "rule": "R2"}]}')
+        assert out.kept == facts
+        assert out.dropped == []
+        assert out.out_of_range == [{"index": 1, "input_count": 1, "rule": "R2"}]
+
+    def test_out_of_range_negative_index_recorded(self):
+        from paramem.graph.extractor import _apply_drop_set
+
+        facts = self._facts(1)
+        out = _apply_drop_set(facts, '{"drop": [-1]}')
+        assert out.out_of_range == [{"index": -1, "input_count": 1, "rule": None}]
+
+    def test_mixed_valid_and_invalid_indices_records_both_sides(self):
+        from paramem.graph.extractor import _apply_drop_set
+
+        facts = self._facts(2)
+        out = _apply_drop_set(facts, '{"drop": [0, 7]}')
+        assert [f["subject"] for f in out.kept] == ["S1"]
+        assert out.dropped == [{"index": 0, "rule": None, "fact": facts[0]}]
+        assert out.out_of_range == [{"index": 7, "input_count": 2, "rule": None}]
 
 
 class TestRenderIndexedFacts:
@@ -1262,7 +1358,7 @@ class TestPipelinePromptsDirThreading:
 
         def fake_plaus(facts, api_key, **kwargs):
             captured.append(kwargs.get("prompts_dir"))
-            return facts, "raw"
+            return _kept_verdict(facts), "raw"
 
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
@@ -1314,7 +1410,7 @@ class TestPipelinePromptsDirThreading:
 
         def fake_local_plaus(facts, transcript, model, tokenizer, **kwargs):
             captured.append(kwargs.get("prompts_dir"))
-            return facts, ""
+            return _kept_verdict(facts), ""
 
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
@@ -1376,7 +1472,7 @@ class TestPipelinePromptsDirThreading:
 
         def fake_plaus(facts, api_key, **kwargs):
             captured["anon_plausibility"] = kwargs.get("prompts_dir")
-            return facts, "raw"
+            return _kept_verdict(facts), "raw"
 
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
@@ -1437,7 +1533,7 @@ class TestPipelinePromptsDirThreading:
 
         def fake_local_plaus(facts, transcript, model, tokenizer, **kwargs):
             captured["deanon_plausibility"] = kwargs.get("prompts_dir")
-            return facts, ""
+            return _kept_verdict(facts), ""
 
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
@@ -1893,8 +1989,9 @@ class TestCloudEnrichmentProvider:
         ):
             result, raw = judge_plausibility(facts, "transcript", MagicMock(), tokenizer)
         assert result is not None
-        assert len(result) == 1
-        assert result[0] == facts[0]  # input fact returned unchanged
+        assert len(result.kept) == 1
+        assert result.kept[0] == facts[0]  # input fact returned unchanged
+        assert result.dropped == [{"index": 1, "rule": None, "fact": facts[1]}]
         assert raw == drop_response
 
     def test_normalize_anonymization_mapping_inverts_placeholder_keys(self):
@@ -1904,7 +2001,7 @@ class TestCloudEnrichmentProvider:
         wrong_direction = {"Person_1": "Alex", "City_1": "Millfield"}
         normalized, stats = _normalize_anonymization_mapping(wrong_direction)
         assert normalized == {"Alex": "Person_1", "Millfield": "City_1"}
-        assert stats == {"inverted": 2, "dropped": 0}
+        assert stats == {"inverted": 2, "dropped": 0, "dropped_entries": []}
 
     def test_normalize_anonymization_mapping_keeps_canonical(self):
         """Mapping already in {real: placeholder} canonical form passes through."""
@@ -1913,14 +2010,14 @@ class TestCloudEnrichmentProvider:
         canonical = {"Alex": "Person_1", "Millfield": "City_1"}
         normalized, stats = _normalize_anonymization_mapping(canonical)
         assert normalized == canonical
-        assert stats == {"inverted": 0, "dropped": 0}
+        assert stats == {"inverted": 0, "dropped": 0, "dropped_entries": []}
 
     def test_normalize_anonymization_mapping_empty(self):
         from paramem.cloud.placeholders import _normalize_anonymization_mapping
 
         normalized, stats = _normalize_anonymization_mapping({})
         assert normalized == {}
-        assert stats == {"inverted": 0, "dropped": 0}
+        assert stats == {"inverted": 0, "dropped": 0, "dropped_entries": []}
 
     def test_entity_type_to_prefix_closed_vocab_and_derivations(self):
         """Pin the contract for ``entity_type_to_prefix``: closed-vocabulary
@@ -1963,7 +2060,7 @@ class TestCloudEnrichmentProvider:
         out, stats = _normalize_anonymization_mapping(mixed)
         # Both pairs end up canonical: keys are real, values are placeholders.
         assert out == {"Alex": "Person_1", "Millfield": "Person_2"}
-        assert stats == {"inverted": 1, "dropped": 0}
+        assert stats == {"inverted": 1, "dropped": 0, "dropped_entries": []}
 
     def test_entity_correction_call_site_wired_into_pipeline(self):
         """Integration coverage for the entity_correction phase call site.
@@ -3423,13 +3520,14 @@ class TestPlausibilityTupleReturn:
         fake_raw = '{"drop": []}'
         input_fact = {"subject": "A", "predicate": "knows", "object": "B"}
         with patch("paramem.graph.extractor._cloud_call", return_value=fake_raw):
-            facts, raw = request_plausibility(
+            verdict, raw = request_plausibility(
                 [input_fact],
                 api_key="k",
                 provider="anthropic",
                 anon_transcript="A knows B.",
             )
-        assert facts == [input_fact]
+        assert verdict.kept == [input_fact]
+        assert verdict.dropped == []
         assert raw == fake_raw
 
     def test_plausibility_with_cloud_none_on_api_failure(self):
@@ -4164,8 +4262,9 @@ class TestPlausibilityAnon:
         ]
         mapping = {"Alex": "Person_1", "Millfield": "City_1"}
 
-        # Plausibility filter keeps only the lives_in fact
-        kept_anon = [{"subject": "Person_1", "predicate": "lives_in", "object": "City_1"}]
+        # Plausibility filter drops the role-leak fact, keeps lives_in.
+        def fake_plaus(facts, api_key, **kwargs):
+            return _verdict_dropping(facts, {"has_role"}), "raw"
 
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
@@ -4179,7 +4278,7 @@ class TestPlausibilityAnon:
             ),
             patch(
                 "paramem.graph.stage_enrich.request_plausibility",
-                return_value=(kept_anon, "raw"),
+                side_effect=fake_plaus,
             ),
         ):
             result = run_cloud_stages(
@@ -4198,6 +4297,7 @@ class TestPlausibilityAnon:
         assert len(result.relations) == 1
         assert result.relations[0].predicate == "lives_in"
         assert result.diagnostics.get("plausibility") == "anon"
+        assert result.diagnostics["plausibility_dropped_anon"] == 1
 
     def test_anon_stage_plausibility_receives_post_enrichment_transcript(self):
         """FIX 2: the anon-stage judge must see `updated_anon_transcript`
@@ -4237,7 +4337,7 @@ class TestPlausibilityAnon:
 
         def fake_plaus(facts, api_key, **kwargs):
             plaus_calls.append(kwargs.get("anon_transcript"))
-            return facts, "raw"
+            return _kept_verdict(facts), "raw"
 
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
@@ -4307,14 +4407,12 @@ class TestPlausibilityDeanon:
         ]
         mapping = {"Alex": "Person_1", "Millfield": "City_1"}
 
-        # Local plausibility drops the tautology, keeps lives_in
-        kept_deanon = [{"subject": "Alex", "predicate": "lives_in", "object": "Millfield"}]
-
         local_plaus_calls = []
 
         def fake_local_plaus(facts, transcript, model, tokenizer, **kwargs):
             local_plaus_calls.append((list(facts), transcript))
-            return kept_deanon, ""
+            # Local plausibility drops the tautology, keeps lives_in.
+            return _verdict_dropping(facts, {"has_name"}), ""
 
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
@@ -4355,6 +4453,7 @@ class TestPlausibilityDeanon:
             "Deanon-stage plausibility must receive original transcript, not anon_transcript"
         )
         assert result.diagnostics.get("plausibility") == "deanon"
+        assert result.diagnostics["plausibility_dropped_deanon"] == 1
 
 
 class TestAnonFailureFallback:
@@ -4686,7 +4785,24 @@ class TestAllDroppedSafetyNet:
             ),
             patch(
                 "paramem.graph.flows.judge_plausibility",
-                return_value=([], ""),
+                return_value=(
+                    PlausibilityVerdict(
+                        kept=[],
+                        dropped=[
+                            {
+                                "index": 0,
+                                "rule": None,
+                                "fact": {
+                                    "subject": "Alex",
+                                    "predicate": "lives_in",
+                                    "object": "Millfield",
+                                },
+                            }
+                        ],
+                        out_of_range=[],
+                    ),
+                    "",
+                ),
             ),
             patch(
                 "paramem.graph.flows._fallback_plausibility_on_raw",
@@ -5131,7 +5247,7 @@ class TestDiagnosticsKeys:
         mapping = {"Alex": "Person_1", "Millfield": "City_1"}
 
         def fake_local_plaus(facts, transcript, model, tokenizer, **kwargs):
-            return facts, ""  # keep all
+            return _kept_verdict(facts), ""  # keep all
 
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
@@ -5164,6 +5280,8 @@ class TestDiagnosticsKeys:
         assert "plausibility_dropped_deanon" in result.diagnostics
         assert "plausibility_judge_actual" in result.diagnostics
         assert "anonymize" in result.diagnostics
+        assert result.diagnostics["plausibility_state_deanon"] == {"state": "ran", "reason": None}
+        assert result.diagnostics["plausibility_out_of_range_deanon"] == []
 
     def test_diagnostics_anonymize_key_populated_on_success(self):
         """diagnostics['anonymize']='ok' when anonymization succeeds."""
@@ -5448,9 +5566,10 @@ class TestRecordBindingDiagnostics:
     ``DeanonResult`` no longer carries a ``verdict`` field (retired
     2026-07-22 cloud-admission redesign — nothing gates on a whole-delta
     orphan list any more), so ``cloud_pending_orphans`` is never written.
-    Only ``cloud_binding_collisions`` survives, guarded exactly as before:
-    an EMPTY list writes NO key, so ``"cloud_binding_collisions" not in
-    diagnostics`` keeps meaning "the scan found nothing".
+    ``cloud_binding_collisions`` is written on EVERY call now (2026-08-19):
+    a present ``[]`` means the scan ran and found nothing; the key's
+    total absence would mean the scan never reached this site (a state
+    this function can no longer produce, since it always writes).
     """
 
     @staticmethod
@@ -5464,15 +5583,16 @@ class TestRecordBindingDiagnostics:
             residual_dropped=[],
         )
 
-    def test_empty_collisions_writes_no_key(self):
-        """Mutation: drop the ``if`` guard -> an accepted delta starts
-        writing an empty-list key, and every ``"..." not in
-        diagnostics`` assertion in the suite flips meaning."""
+    def test_empty_collisions_writes_empty_list(self):
+        """Mutation: reintroduce the retired ``if`` guard -> an accepted
+        delta starts omitting the key again, and every
+        ``diagnostics["cloud_binding_collisions"] == []`` assertion in
+        the suite starts raising KeyError."""
         from paramem.graph.extractor import _record_binding_diagnostics
 
         graph = _make_graph([])
         _record_binding_diagnostics(graph, self._result([]))
-        assert "cloud_binding_collisions" not in graph.diagnostics
+        assert graph.diagnostics["cloud_binding_collisions"] == []
 
     def test_collisions_land_under_their_key(self):
         from paramem.graph.extractor import _record_binding_diagnostics
@@ -6210,3 +6330,664 @@ class TestFilterOpenaiCompatBoundaryErrors:
                 "prompt", "test-key", "test-model", "groq", endpoint="https://example.test"
             )
         assert result is None
+
+
+class TestBracedBindingKeysEndToEnd:
+    """The cloud enrichment wire shape's binding keys are braced;
+    the table normalizer boundary canonicalizes them to bare, and bare
+    keys stay accepted (no migration). Exercised through
+    ``request_enrichment``'s real parse (mocking only ``_cloud_call``) so
+    the production double-normalize path
+    (``_parse_enrichment_delta`` then ``CloudScope.response``) is real,
+    not bypassed by constructing an ``EnrichmentDelta`` directly."""
+
+    def _graph_and_mapping(self):
+        graph = _make_graph(
+            [("Alex", "works_at", "Acme")],
+            entities=[
+                Entity(name="Alex", entity_type="person"),
+                Entity(name="Acme", entity_type="organization"),
+            ],
+        )
+        mapping = {"Alex": "Person_1", "Acme": "Org_1"}
+        return graph, mapping
+
+    def _run(self, graph, mapping, raw_delta_json):
+        from tests._cloud_flow import run_cloud_stages
+
+        with (
+            patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
+            patch(
+                "paramem.cloud.anonymize.anonymize_transcript",
+                return_value=(mapping, "anonymized transcript", ""),
+            ),
+            patch("paramem.graph.extractor._cloud_call", return_value=raw_delta_json),
+        ):
+            return run_cloud_stages(
+                graph,
+                "Alex works at Acme.",
+                None,
+                None,
+                speaker_id="speaker0",
+                correction_entity_types=set(),
+                scrub={"person name", "organization"},
+            )
+
+    def test_braced_binding_key_resolves_add_fact_to_real_name(self):
+        graph, mapping = self._graph_and_mapping()
+        raw = json.dumps(
+            {
+                "add": [
+                    {
+                        "subject": "Person_1",
+                        "predicate": "led",
+                        "object": "{Event_1}",
+                        "relation_type": "factual",
+                        "confidence": 0.9,
+                    }
+                ],
+                "modify": [],
+                "drop": [],
+                "bindings": {"{Event_1}": "the agile transformation initiative"},
+            }
+        )
+        result = self._run(graph, mapping, raw)
+        led = next((r for r in result.relations if r.predicate == "led"), None)
+        assert led is not None, (
+            f"led fact must survive with the braced binding resolved; got "
+            f"{[(r.subject, r.predicate, r.object) for r in result.relations]}"
+        )
+        assert led.subject == "Alex"
+        assert led.object == "the agile transformation initiative"
+
+    def test_bare_binding_key_still_resolves(self):
+        """Backward compatibility: the boundary still accepts the old
+        bare-key shape, no migration needed."""
+        graph, mapping = self._graph_and_mapping()
+        raw = json.dumps(
+            {
+                "add": [
+                    {
+                        "subject": "Person_1",
+                        "predicate": "led",
+                        "object": "{Event_1}",
+                        "relation_type": "factual",
+                        "confidence": 0.9,
+                    }
+                ],
+                "modify": [],
+                "drop": [],
+                "bindings": {"Event_1": "the agile transformation initiative"},
+            }
+        )
+        result = self._run(graph, mapping, raw)
+        led = next((r for r in result.relations if r.predicate == "led"), None)
+        assert led is not None
+        assert led.subject == "Alex"
+        assert led.object == "the agile transformation initiative"
+
+
+class TestPlausibilityJudgeStateIntegration:
+    """Every reachable path through the deanon-stage and
+    anon-stage plausibility gates records an explicit judge state, and
+    the ran-path attribution (rule per drop, out-of-range indices)
+    reaches both ``graph.diagnostics`` and the phase-trace ``parsed``
+    payload."""
+
+    def _graph_and_mapping(self):
+        graph = _make_graph(
+            [("Alex", "lives_in", "Millfield")],
+            entities=[
+                Entity(name="Alex", entity_type="person"),
+                Entity(name="Millfield", entity_type="place"),
+            ],
+        )
+        mapping = {"Alex": "Person_1", "Millfield": "City_1"}
+        anon_facts = [{"subject": "Person_1", "predicate": "lives_in", "object": "City_1"}]
+        return graph, mapping, anon_facts
+
+    def _run(self, graph, mapping, anon_facts, **kwargs):
+        from tests._cloud_flow import enrichment_side_effect, run_cloud_stages
+
+        with (
+            patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
+            patch(
+                "paramem.cloud.anonymize.anonymize_transcript",
+                return_value=(mapping, "anonymized transcript", ""),
+            ),
+            patch(
+                "paramem.graph.stage_enrich.request_enrichment",
+                side_effect=enrichment_side_effect(anon_facts),
+            ),
+        ):
+            return run_cloud_stages(
+                graph,
+                "Alex lives in Millfield.",
+                kwargs.pop("model", MagicMock()),
+                kwargs.pop("tokenizer", MagicMock()),
+                speaker_id="speaker0",
+                correction_entity_types=set(),
+                scrub={"person name"},
+                **kwargs,
+            )
+
+    def test_deanon_ran_with_rule_and_out_of_range(self):
+        graph, mapping, anon_facts = self._graph_and_mapping()
+
+        def fake_local_plaus(facts, transcript, model, tokenizer, **kwargs):
+            verdict = PlausibilityVerdict(
+                kept=[],
+                dropped=[{"index": 0, "rule": "R1", "fact": facts[0]}],
+                out_of_range=[{"index": 3, "input_count": 1, "rule": None}],
+            )
+            return verdict, "raw"
+
+        with extraction_trace() as trace:
+            with patch("paramem.graph.flows.judge_plausibility", side_effect=fake_local_plaus):
+                result = self._run(
+                    graph,
+                    mapping,
+                    anon_facts,
+                    plausibility_judge="auto",
+                    plausibility_stage="deanon",
+                )
+
+        assert result.diagnostics["plausibility_dropped_deanon"] == 1
+        assert result.diagnostics["plausibility_dropped_deanon_facts"][0]["rule"] == "R1"
+        assert result.diagnostics["plausibility_out_of_range_deanon"] == [
+            {"index": 3, "input_count": 1, "rule": None}
+        ]
+        assert result.diagnostics["plausibility_state_deanon"] == {"state": "ran", "reason": None}
+        deanon_plaus = next(p for p in trace.records if p.name == "deanon_plausibility")
+        assert deanon_plaus.parsed["dropped_facts"][0]["rule"] == "R1"
+        assert deanon_plaus.parsed["out_of_range"] == [{"index": 3, "input_count": 1, "rule": None}]
+
+    def test_deanon_judge_returning_none_fails_open(self):
+        graph, mapping, anon_facts = self._graph_and_mapping()
+
+        with extraction_trace() as trace:
+            with patch(
+                "paramem.graph.flows.judge_plausibility",
+                return_value=(None, "unparseable"),
+            ):
+                result = self._run(
+                    graph,
+                    mapping,
+                    anon_facts,
+                    plausibility_judge="auto",
+                    plausibility_stage="deanon",
+                )
+
+        assert result.diagnostics["plausibility_state_deanon"] == {
+            "state": "failed",
+            "reason": "parse_failed",
+        }
+        assert len(result.relations) == 1  # fail-open: fact kept
+        deanon_plaus = next(p for p in trace.records if p.name == "deanon_plausibility")
+        assert deanon_plaus.outcome == "failed"
+
+    @pytest.mark.parametrize(
+        ("kwargs", "expected_state"),
+        [
+            (
+                {"plausibility_judge": "off", "plausibility_stage": "deanon"},
+                {"state": "off", "reason": None},
+            ),
+            (
+                {"plausibility_judge": "auto", "plausibility_stage": "anon"},
+                {"state": "skipped", "reason": "stage_not_deanon"},
+            ),
+        ],
+    )
+    def test_deanon_off_and_stage_mismatch_states(self, kwargs, expected_state):
+        graph, mapping, anon_facts = self._graph_and_mapping()
+        with extraction_trace() as trace:
+            result = self._run(graph, mapping, anon_facts, **kwargs)
+        assert result.diagnostics["plausibility_state_deanon"] == expected_state
+        assert not any(p.name == "deanon_plausibility" for p in trace.records), (
+            "No phase record is emitted on a skip/off path — the diagnostics "
+            "state key carries this instead."
+        )
+
+    def test_deanon_no_model_state(self):
+        graph, mapping, anon_facts = self._graph_and_mapping()
+        with extraction_trace() as trace:
+            result = self._run(
+                graph,
+                mapping,
+                anon_facts,
+                model=None,
+                tokenizer=None,
+                plausibility_judge="auto",
+                plausibility_stage="deanon",
+            )
+        assert result.diagnostics["plausibility_state_deanon"] == {
+            "state": "skipped",
+            "reason": "no_model",
+        }
+        assert not any(p.name == "deanon_plausibility" for p in trace.records)
+
+    def test_anon_not_permitted_state(self):
+        """The anon-stage judge's ``not_permitted`` branch keeps its
+        EXISTING phase-trace behaviour (record emitted, free-text gap
+        reason) while gaining the new closed-vocabulary diagnostics key.
+        The ran-arm's calibration short-circuit POSITION is pinned
+        separately, by
+        ``test_anon_ran_arm_stop_at_returns_before_deanonymize`` below."""
+        graph, mapping, anon_facts = self._graph_and_mapping()
+        with (
+            extraction_trace() as trace,
+            patch.dict("os.environ", {}, clear=True),
+        ):
+            result = self._run(
+                graph,
+                mapping,
+                anon_facts,
+                plausibility_judge="openai",
+                plausibility_stage="anon",
+            )
+        assert result.diagnostics["plausibility_state_anon"] == {
+            "state": "skipped",
+            "reason": "not_permitted",
+        }
+        anon_plaus = next(p for p in trace.records if p.name == "anon_plausibility")
+        assert anon_plaus.outcome == "skipped"
+        assert anon_plaus.reason  # the existing free-text gap reason survives
+
+    def test_anon_judge_not_a_provider_state(self):
+        graph, mapping, anon_facts = self._graph_and_mapping()
+        with extraction_trace() as trace:
+            result = self._run(
+                graph,
+                mapping,
+                anon_facts,
+                plausibility_judge="auto",
+                plausibility_stage="anon",
+            )
+        assert result.diagnostics["plausibility_state_anon"] == {
+            "state": "skipped",
+            "reason": "judge_not_a_provider",
+        }
+        assert not any(p.name == "anon_plausibility" for p in trace.records)
+
+    def test_anon_stage_mismatch_state(self):
+        """Mirrors the deanon site's own stage-mismatch coverage: an
+        otherwise-valid provider does not run the anon judge when
+        ``plausibility_stage`` names a different stage."""
+        graph, mapping, anon_facts = self._graph_and_mapping()
+
+        def fake_local_plaus(facts, transcript, model, tokenizer, **kwargs):
+            return _kept_verdict(facts), ""
+
+        with extraction_trace() as trace:
+            with patch("paramem.graph.flows.judge_plausibility", side_effect=fake_local_plaus):
+                result = self._run(
+                    graph,
+                    mapping,
+                    anon_facts,
+                    plausibility_judge="anthropic",
+                    plausibility_stage="deanon",
+                )
+        assert result.diagnostics["plausibility_state_anon"] == {
+            "state": "skipped",
+            "reason": "stage_not_anon",
+        }
+        assert not any(p.name == "anon_plausibility" for p in trace.records)
+
+    def test_anon_no_facts_state(self):
+        """Mirrors the deanon site's no-facts skip: an empty
+        ``enriched_anon`` (cloud enrichment dropped everything) skips the
+        anon judge before it is ever called."""
+        graph, mapping, _anon_facts = self._graph_and_mapping()
+        with extraction_trace() as trace:
+            result = self._run(
+                graph,
+                mapping,
+                [],  # cloud enrichment leaves enriched_anon empty
+                plausibility_judge="anthropic",
+                plausibility_stage="anon",
+            )
+        assert result.diagnostics["plausibility_state_anon"] == {
+            "state": "skipped",
+            "reason": "no_facts",
+        }
+        assert not any(p.name == "anon_plausibility" for p in trace.records)
+
+    def test_anon_judge_returning_none_fails_open(self):
+        """Mirrors ``test_deanon_judge_returning_none_fails_open``: a
+        parse failure at the anon judge fails open (facts kept) and
+        records state ``failed``/``parse_failed``."""
+        graph, mapping, anon_facts = self._graph_and_mapping()
+        with extraction_trace() as trace:
+            with patch(
+                "paramem.graph.stage_enrich.request_plausibility",
+                return_value=(None, "unparseable"),
+            ):
+                result = self._run(
+                    graph,
+                    mapping,
+                    anon_facts,
+                    plausibility_judge="anthropic",
+                    plausibility_stage="anon",
+                )
+        assert result.diagnostics["plausibility_state_anon"] == {
+            "state": "failed",
+            "reason": "parse_failed",
+        }
+        assert len(result.relations) == 1  # fail-open: fact kept
+        anon_plaus = next(p for p in trace.records if p.name == "anon_plausibility")
+        assert anon_plaus.outcome == "failed"
+
+    def test_anon_ran_with_rule_and_out_of_range(self):
+        """Mirrors ``test_deanon_ran_with_rule_and_out_of_range``: a real
+        drop with a cited rule, plus an out-of-range index, reaches both
+        ``graph.diagnostics`` and the ``anon_plausibility`` phase's
+        ``parsed`` payload."""
+        graph, mapping, anon_facts = self._graph_and_mapping()
+
+        def fake_plaus(facts, api_key, **kwargs):
+            verdict = PlausibilityVerdict(
+                kept=[],
+                dropped=[{"index": 0, "rule": "R1", "fact": facts[0]}],
+                out_of_range=[{"index": 3, "input_count": 1, "rule": None}],
+            )
+            return verdict, "raw"
+
+        with extraction_trace() as trace:
+            with patch("paramem.graph.stage_enrich.request_plausibility", side_effect=fake_plaus):
+                result = self._run(
+                    graph,
+                    mapping,
+                    anon_facts,
+                    plausibility_judge="anthropic",
+                    plausibility_stage="anon",
+                )
+
+        assert result.diagnostics["plausibility_dropped_anon"] == 1
+        assert result.diagnostics["plausibility_dropped_anon_facts"][0]["rule"] == "R1"
+        assert result.diagnostics["plausibility_out_of_range_anon"] == [
+            {"index": 3, "input_count": 1, "rule": None}
+        ]
+        assert result.diagnostics["plausibility_state_anon"] == {"state": "ran", "reason": None}
+        anon_plaus = next(p for p in trace.records if p.name == "anon_plausibility")
+        assert anon_plaus.parsed["dropped_facts"][0]["rule"] == "R1"
+        assert anon_plaus.parsed["out_of_range"] == [{"index": 3, "input_count": 1, "rule": None}]
+
+    def test_anon_ran_arm_stop_at_returns_before_deanonymize(self):
+        """``stop_at("anon_plausibility")`` must return right after the
+        ``with phase_trace(...)`` block in the ran-arm —
+        ``deanonymize``/``rebuild`` must not run. Drives the judge
+        through its actual ran arm (a real ``request_plausibility`` call
+        that returns successfully), not just the ``not_permitted`` skip
+        branch that already had a phase-trace record for unrelated
+        reasons."""
+        from paramem.graph.phase_trace import stop_at
+
+        graph, mapping, anon_facts = self._graph_and_mapping()
+
+        def fake_plaus(facts, api_key, **kwargs):
+            return _kept_verdict(facts), "raw"
+
+        with extraction_trace() as trace:
+            with (
+                stop_at("anon_plausibility"),
+                patch("paramem.graph.stage_enrich.request_plausibility", side_effect=fake_plaus),
+            ):
+                result = self._run(
+                    graph,
+                    mapping,
+                    anon_facts,
+                    plausibility_judge="anthropic",
+                    plausibility_stage="anon",
+                )
+
+        phase_names = [p.name for p in trace.records]
+        assert phase_names[-1] == "anon_plausibility", (
+            f"stop_at('anon_plausibility') must stop the chain right after that "
+            f"phase records; got {phase_names!r}"
+        )
+        assert "deanon" not in phase_names
+        assert "deanon_plausibility" not in phase_names
+        # The early return preserves the local-extract (real-name) graph —
+        # deanonymize/rebuild never ran to overwrite it either way.
+        assert result.relations[0].subject == "Alex"
+
+
+class TestDeclaredUnobservedAndSelfInconsistencyIntegration:
+    """``declared_unobserved_tokens`` (cloud_enrich phase) and
+    ``anonymizer_unapplied_tokens``/``pipeline_injected_tokens``
+    (anonymize stage), exercised end-to-end through the real ``anonymize``
+    chain (only ``anonymize_transcript`` is mocked)."""
+
+    def _graph_and_mapping(self):
+        graph = _make_graph(
+            [("Alex", "lives_in", "Millfield")],
+            entities=[
+                Entity(name="Alex", entity_type="person"),
+                Entity(name="Millfield", entity_type="place"),
+            ],
+        )
+        mapping = {"Alex": "Person_1", "Millfield": "City_1"}
+        anon_facts = [{"subject": "Person_1", "predicate": "lives_in", "object": "City_1"}]
+        return graph, mapping, anon_facts
+
+    def _run(self, graph, mapping, anon_facts, *, enrichment_result=None, **kwargs):
+        from tests._cloud_flow import enrichment_side_effect, run_cloud_stages
+
+        enrichment_patch = (
+            patch("paramem.graph.stage_enrich.request_enrichment", return_value=enrichment_result)
+            if enrichment_result is not None
+            else patch(
+                "paramem.graph.stage_enrich.request_enrichment",
+                side_effect=enrichment_side_effect(anon_facts),
+            )
+        )
+        with (
+            patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
+            patch(
+                "paramem.cloud.anonymize.anonymize_transcript",
+                return_value=(mapping, "Person_1 lives in City_1.", ""),
+            ),
+            enrichment_patch,
+        ):
+            return run_cloud_stages(
+                graph,
+                "Alex lives in Millfield.",
+                kwargs.pop("model", None),
+                kwargs.pop("tokenizer", None),
+                speaker_id="speaker0",
+                correction_entity_types=set(),
+                scrub={"person name"},
+                **kwargs,
+            )
+
+    def test_declared_unobserved_and_self_inconsistency_empty_on_clean_run(self):
+        """Every declared CORE token (Person_1, City_1) appears in the
+        rendered facts cloud was shown -> nothing unobserved; and the
+        anonymizer's own rewrite is self-consistent -> no unapplied or
+        pipeline-injected tokens. Both properties hold on the same clean
+        run, so one call to the pipeline proves both."""
+        graph, mapping, anon_facts = self._graph_and_mapping()
+        result = self._run(graph, mapping, anon_facts)
+        assert result.diagnostics["declared_unobserved_tokens"] == []
+        assert result.diagnostics["anonymizer_unapplied_tokens"] == []
+        assert result.diagnostics["pipeline_injected_tokens"] == []
+
+    def test_declared_unobserved_present_on_degraded_branch(self):
+        """The cloud_enrich phase's degraded (unparseable response)
+        branch also writes declared_unobserved_tokens — both branches of
+        the if/else share the write, after the join."""
+        graph, mapping, anon_facts = self._graph_and_mapping()
+        result = self._run(
+            graph,
+            mapping,
+            anon_facts,
+            enrichment_result=(None, "not json", {"parse_path": "failed", "attempts": 3}),
+        )
+        assert "declared_unobserved_tokens" in result.diagnostics
+
+    def test_anonymizer_unapplied_names_self_inconsistent_token_not_pipeline_mint(self):
+        """A token the anonymizer declares but never applies to its own
+        rewrite lands in ``anonymizer_unapplied_tokens``; the
+        pipeline-minted speaker-seed token lands in
+        ``pipeline_injected_tokens`` instead, never in the first list."""
+        from tests._cloud_flow import enrichment_side_effect, run_cloud_stages
+
+        graph = _make_graph(
+            [("Bob", "lives_in", "Millfield"), ("Alex", "knows", "Bob")],
+            entities=[
+                Entity(name="Bob", entity_type="person"),
+                Entity(name="Alex", entity_type="person"),
+                Entity(name="Millfield", entity_type="place"),
+            ],
+        )
+        # The model declares Alex -> Person_2 but its own transcript
+        # rewrite never actually contains Person_2 (self-inconsistency).
+        # Bob is the speaker; the model never names Bob at all, so the
+        # pipeline seeds Person_1 for the speaker (a pipeline mint).
+        mapping = {"Alex": "Person_2"}
+        anon_facts = [
+            {"subject": "Person_1", "predicate": "lives_in", "object": "City_1"},
+            {"subject": "Person_1", "predicate": "knows", "object": "Person_1"},
+        ]
+
+        with (
+            patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
+            patch(
+                "paramem.cloud.anonymize.anonymize_transcript",
+                return_value=(mapping, "the speaker knows someone.", ""),
+            ),
+            patch(
+                "paramem.graph.stage_enrich.request_enrichment",
+                side_effect=enrichment_side_effect(anon_facts),
+            ),
+        ):
+            result = run_cloud_stages(
+                graph,
+                "Bob lives in Millfield. Alex knows Bob.",
+                None,
+                None,
+                speaker_id="speaker0",
+                speaker_name="Bob",
+                correction_entity_types=set(),
+                scrub={"person name"},
+            )
+
+        assert "Person_2" in result.diagnostics["anonymizer_unapplied_tokens"]
+        assert "Person_2" not in result.diagnostics["pipeline_injected_tokens"]
+        # The speaker-seed mint (whichever index it landed on — minting
+        # always picks the next free index above every value already in
+        # scope, never a specific hardcoded one) is a pipeline mint, never
+        # a self-inconsistency: present in pipeline_injected_tokens,
+        # absent from anonymizer_unapplied_tokens.
+        injected = result.diagnostics["pipeline_injected_tokens"]
+        assert injected, "the speaker-name seed mint must appear here"
+        assert "Person_2" not in injected
+        assert not set(injected) & set(result.diagnostics["anonymizer_unapplied_tokens"])
+
+
+class TestLossCounterReachIntegration:
+    """Every loss counter reaches ``graph.diagnostics`` present at
+    ``0``/``[]`` on a clean fold, distinguishing "site not reached" from
+    "site reached, nothing lost"; and ``mapping_ambiguous_dropped``'s
+    write posture across the anonymize-failed / opted-out branches."""
+
+    def _graph(self):
+        return _make_graph(
+            [("Alex", "lives_in", "Millfield")],
+            entities=[
+                Entity(name="Alex", entity_type="person"),
+                Entity(name="Millfield", entity_type="place"),
+            ],
+        )
+
+    def test_clean_fold_all_counters_present_at_zero(self):
+        from tests._cloud_flow import enrichment_side_effect, run_cloud_stages
+
+        graph = self._graph()
+        mapping = {"Alex": "Person_1", "Millfield": "City_1"}
+        anon_facts = [{"subject": "Person_1", "predicate": "lives_in", "object": "City_1"}]
+
+        with (
+            patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
+            patch(
+                "paramem.cloud.anonymize.anonymize_transcript",
+                return_value=(mapping, "Person_1 lives in City_1.", ""),
+            ),
+            patch(
+                "paramem.graph.stage_enrich.request_enrichment",
+                side_effect=enrichment_side_effect(anon_facts),
+            ),
+        ):
+            result = run_cloud_stages(
+                graph,
+                "Alex lives in Millfield.",
+                MagicMock(),
+                MagicMock(),
+                speaker_id="speaker0",
+                plausibility_judge="off",
+                correction_entity_types=set(),
+                scrub={"person name"},
+            )
+
+        diag = result.diagnostics
+        assert diag["mapping_ambiguous_dropped"] == 0
+        assert diag["predicate_placeholder_dropped"] == 0
+        assert diag["residual_dropped"] == 0
+        assert diag["cloud_binding_collisions"] == []
+        assert diag["plausibility_state_deanon"] == {"state": "off", "reason": None}
+        assert diag["plausibility_state_anon"] == {"state": "off", "reason": None}
+
+    def test_mapping_ambiguous_dropped_present_on_anonymize_failed_path(self):
+        from tests._cloud_flow import run_cloud_stages
+
+        graph = self._graph()
+        with (
+            patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
+            patch(
+                "paramem.cloud.anonymize.anonymize_transcript",
+                return_value=(None, "", "unparseable"),
+            ),
+        ):
+            result = run_cloud_stages(
+                graph,
+                "Alex lives in Millfield.",
+                MagicMock(),
+                MagicMock(),
+                speaker_id="speaker0",
+                plausibility_judge="off",
+                correction_entity_types=set(),
+                scrub={"person name"},
+            )
+
+        assert "mapping_ambiguous_dropped" in result.diagnostics
+        assert result.diagnostics["fallback_path"] == "anon_failed"
+
+    def test_mapping_ambiguous_dropped_absent_on_opted_out_path(self):
+        from paramem.graph.extractor import EnrichmentDelta
+        from tests._cloud_flow import run_cloud_stages
+
+        graph = self._graph()
+        with (
+            patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
+            patch(
+                "paramem.graph.stage_enrich.request_enrichment",
+                return_value=(
+                    EnrichmentDelta(add=[], modify=[], drop=set(), bindings={}),
+                    "raw",
+                    {},
+                ),
+            ),
+        ):
+            result = run_cloud_stages(
+                graph,
+                "Alex lives in Millfield.",
+                None,
+                None,
+                speaker_id="speaker0",
+                correction_entity_types=set(),
+                plausibility_judge="off",
+                scrub=set(),  # operator opt-out
+            )
+        assert "mapping_ambiguous_dropped" not in result.diagnostics
+        assert result.diagnostics.get("anonymize") == "opted_out"

@@ -104,10 +104,10 @@ def test_plausibility_prompt_llm_compliance(loaded_model, fixture_data):
     from paramem.models.loader import base_model_inference
 
     with base_model_inference(model):
-        survivors, raw = judge_plausibility(judge_input, transcript, model, tokenizer)
-    assert survivors is not None, f"Judge returned None (parse failure). Raw output: {raw!r}"
+        verdict, raw = judge_plausibility(judge_input, transcript, model, tokenizer)
+    assert verdict is not None, f"Judge returned None (parse failure). Raw output: {raw!r}"
 
-    survivor_keys = {_fact_key(f) for f in survivors}
+    survivor_keys = {_fact_key(f) for f in verdict.kept}
 
     matches = []
     mismatches = []

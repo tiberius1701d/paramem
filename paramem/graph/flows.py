@@ -60,11 +60,16 @@ from paramem.graph.extractor import (
     _DEFAULT_FILTER_TEMPERATURE,
     DEFAULT_SYSTEM_PROMPT_FILENAME,
     DEFAULT_USER_PROMPT_FILENAME,
+    PLAUSIBILITY_FAILED,
+    PLAUSIBILITY_OFF,
+    PLAUSIBILITY_SKIPPED,
     _fallback_plausibility_on_raw,
     _record_binding_diagnostics,
     _run_local_extraction,
     _vram_snapshot,
     judge_plausibility,
+    record_plausibility_state,
+    record_plausibility_verdict,
 )
 from paramem.graph.flow import StageContext, StageSpec, StageState, run_flow
 from paramem.graph.phase_trace import chain_seed, chain_stopped, extraction_trace, phase_trace
@@ -343,7 +348,11 @@ def _stage_deanonymize(ctx: StageContext, state: StageState) -> StageState:
     2. The deanon-stage plausibility judge (local model, real names),
        which receives the ORIGINAL real-name transcript — it runs
        locally on de-anonymized facts, so there is no reason to hand it
-       the anonymized text.
+       the anonymized text. Every reachable path through the gate records
+       its state onto ``graph.diagnostics["plausibility_state_deanon"]``
+       (the ``paramem.graph.extractor`` PLAUSIBILITY_* vocabulary), and
+       ``predicate_placeholder_dropped``/``residual_dropped`` (step 1's
+       two loss counters) are written unconditionally.
 
     The mid-stage ``chain_stopped()`` check after the ``deanon`` phase is
     the one the imperative version made: a calibration caller stopping at
@@ -377,13 +386,19 @@ def _stage_deanonymize(ctx: StageContext, state: StageState) -> StageState:
         # unresolved placeholder after substitution (step 3).  The two
         # categories are returned already partitioned — no caller-side
         # recomputation.
+        # Loss counters are written unconditionally (0 when nothing was
+        # lost) so absence means exactly one thing — the site was not
+        # reached; the fact-dict payload lists beside them stay
+        # conditional (bulky). ``predicate_placeholder_dropped``'s
+        # accumulate-onto-prior-value pattern is preserved verbatim.
+        graph.diagnostics["predicate_placeholder_dropped"] = graph.diagnostics.get(
+            "predicate_placeholder_dropped", 0
+        ) + len(predicate_dropped)
         if predicate_dropped:
             graph.diagnostics["predicate_placeholder_dropped_facts"] = (
                 graph.diagnostics.get("predicate_placeholder_dropped_facts", []) + predicate_dropped
             )
-            graph.diagnostics["predicate_placeholder_dropped"] = graph.diagnostics.get(
-                "predicate_placeholder_dropped", 0
-            ) + len(predicate_dropped)
+        graph.diagnostics["residual_dropped"] = len(residual_dropped)
         if residual_dropped:
             graph.diagnostics["residual_dropped_facts"] = residual_dropped
         dropped_facts = predicate_dropped + residual_dropped
@@ -430,17 +445,22 @@ def _stage_deanonymize(ctx: StageContext, state: StageState) -> StageState:
     # Plausibility on de-anonymized data (local judge, stage="deanon").
     # Runs when plausibility_judge != "off" AND plausibility_stage == "deanon"
     # AND model/tokenizer are available (guard against tests that pass None).
-    # "auto" resolves to the local model.
-    if (
-        ctx.plausibility_stage == "deanon"
-        and ctx.plausibility_judge != "off"
-        and deanon_facts
-        and ctx.model is not None
-        and ctx.tokenizer is not None
-    ):
+    # "auto" resolves to the local model. Every branch records its judge
+    # state (paramem.graph.extractor's PLAUSIBILITY_* vocabulary) so the
+    # absence of plausibility_dropped_deanon never has to be interpreted.
+    judge_label = ctx.plausibility_judge if ctx.plausibility_judge != "auto" else "local"
+    if ctx.plausibility_judge == "off":
+        record_plausibility_state(graph, "deanon", PLAUSIBILITY_OFF)
+    elif ctx.plausibility_stage != "deanon":
+        record_plausibility_state(graph, "deanon", PLAUSIBILITY_SKIPPED, reason="stage_not_deanon")
+    elif not deanon_facts:
+        record_plausibility_state(graph, "deanon", PLAUSIBILITY_SKIPPED, reason="no_facts")
+    elif ctx.model is None or ctx.tokenizer is None:
+        record_plausibility_state(graph, "deanon", PLAUSIBILITY_SKIPPED, reason="no_model")
+    else:
         with phase_trace("deanon_plausibility") as t:
             _vram_snapshot(f"before_plausibility_deanon session={graph.session_id}")
-            filtered_deanon, plaus_raw = judge_plausibility(
+            verdict, plaus_raw = judge_plausibility(
                 deanon_facts,
                 ctx.transcript,  # original real-name transcript — intentional, see docstring
                 ctx.model,
@@ -451,29 +471,22 @@ def _stage_deanonymize(ctx: StageContext, state: StageState) -> StageState:
                 prompts_dir=ctx.prompts_dir,
             )
             t.set_raw(plaus_raw)
-            if filtered_deanon is not None:
+            if verdict is not None:
                 pre_deanon = len(deanon_facts)
-                deanon_facts = filtered_deanon
-                dropped_deanon = pre_deanon - len(deanon_facts)
+                deanon_facts = verdict.kept
+                dropped_deanon = len(verdict.dropped)
                 graph.diagnostics["plausibility"] = "deanon"
-                # Own key: the three plausibility writers (anon judge,
-                # this one, and the raw-fallback judge) used to share
-                # ``plausibility_dropped`` with three different
-                # semantics, making its final value order-dependent.
-                graph.diagnostics["plausibility_dropped_deanon"] = dropped_deanon
-                graph.diagnostics["plausibility_judge_actual"] = (
-                    ctx.plausibility_judge if ctx.plausibility_judge != "auto" else "local"
-                )
+                record_plausibility_verdict(graph, "deanon", verdict, judge=judge_label)
                 if pre_deanon and not deanon_facts:
                     empty_cause = CAUSE_DEANON_JUDGE
                 t.set_parsed(
                     {
-                        "judge": (
-                            ctx.plausibility_judge if ctx.plausibility_judge != "auto" else "local"
-                        ),
+                        "judge": judge_label,
                         "input_count": pre_deanon,
                         "kept_count": len(deanon_facts),
                         "dropped_count": dropped_deanon,
+                        "dropped_facts": verdict.dropped,
+                        "out_of_range": verdict.out_of_range,
                     }
                 )
                 logger.info(
@@ -484,11 +497,12 @@ def _stage_deanonymize(ctx: StageContext, state: StageState) -> StageState:
                 )
             else:
                 t.set_outcome("failed", reason="plausibility parse returned None")
+                record_plausibility_state(
+                    graph, "deanon", PLAUSIBILITY_FAILED, reason="parse_failed"
+                )
                 t.set_parsed(
                     {
-                        "judge": (
-                            ctx.plausibility_judge if ctx.plausibility_judge != "auto" else "local"
-                        ),
+                        "judge": judge_label,
                         "input_count": len(deanon_facts),
                         "kept_count": len(deanon_facts),
                         "dropped_count": 0,

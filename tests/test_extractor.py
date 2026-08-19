@@ -5,21 +5,39 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from paramem.cloud.deanonymize import CloudScope
+from paramem.cloud.deanonymize import CloudScope, DeanonResult
 from paramem.graph.extractor import (
     LOCAL_EXTRACTION_PHASES,
+    PLAUSIBILITY_OFF,
+    PLAUSIBILITY_RAN,
+    PLAUSIBILITY_SITES,
+    PLAUSIBILITY_SKIPPED,
+    PlausibilityVerdict,
     _extract_json_block,
     _fallback_plausibility_on_raw,
     _normalize_extraction,
     _parse_extraction,
+    _record_binding_diagnostics,
     _stamp_speaker_entity,
     extract_procedural_graph,
     local_parse_failure,
+    record_plausibility_state,
+    record_plausibility_verdict,
 )
 from paramem.graph.flow import StageContext, StageState
 from paramem.graph.flows import _stage_rebuild, extract_graph
 from paramem.graph.phase_trace import PhaseRecord, extraction_trace, get_phases, stop_at
 from paramem.graph.schema import Entity, Relation, SessionGraph
+
+
+def _make_graph(relations, entities=None):
+    """Module-level helper: minimal SessionGraph for diagnostics-writer tests."""
+    return SessionGraph(
+        session_id="test",
+        timestamp="2026-01-01T00:00:00Z",
+        entities=entities if entities is not None else [],
+        relations=relations,
+    )
 
 
 class TestExtractJsonBlock:
@@ -1700,9 +1718,10 @@ class TestFallbackRebuildRecordsValidationDrops:
                 "relation_type": "not_a_real_type",
             },
         ]
+        judged_verdict = PlausibilityVerdict(kept=judged, dropped=[], out_of_range=[])
         with patch(
             "paramem.graph.extractor.judge_plausibility",
-            return_value=(judged, "raw"),
+            return_value=(judged_verdict, "raw"),
         ):
             out = _fallback_plausibility_on_raw(
                 graph,
@@ -1737,3 +1756,216 @@ class TestFallbackRebuildRecordsValidationDrops:
         assert len(out.relations) == 2
         assert {r.speaker_id for r in out.relations} == {"speaker7"}
         assert "pydantic_validation_dropped" not in out.diagnostics
+
+
+class TestRecordPlausibilityVerdict:
+    """``record_plausibility_verdict`` — the ran-path telemetry writer
+    shared by all three plausibility sites."""
+
+    def _verdict(self, dropped: list[dict], out_of_range: list[dict] | None = None):
+        return PlausibilityVerdict(
+            kept=[{"subject": "Alex", "predicate": "lives_in", "object": "Millfield"}],
+            dropped=dropped,
+            out_of_range=out_of_range or [],
+        )
+
+    def test_writes_all_documented_keys(self):
+        graph = _make_graph([])
+        dropped = [{"index": 0, "rule": "R1", "fact": {"subject": "Alex"}}]
+        verdict = self._verdict(
+            dropped, out_of_range=[{"index": 3, "input_count": 1, "rule": None}]
+        )
+        record_plausibility_verdict(graph, "deanon", verdict, judge="local")
+        assert graph.diagnostics["plausibility_dropped_deanon"] == 1
+        assert graph.diagnostics["plausibility_dropped_deanon_facts"] == dropped
+        assert graph.diagnostics["plausibility_out_of_range_deanon"] == [
+            {"index": 3, "input_count": 1, "rule": None}
+        ]
+        assert graph.diagnostics["plausibility_state_deanon"] == {"state": "ran", "reason": None}
+        assert graph.diagnostics["plausibility_judge_actual"] == "local"
+
+    def test_omits_facts_key_when_nothing_dropped(self):
+        graph = _make_graph([])
+        verdict = self._verdict([])
+        record_plausibility_verdict(graph, "anon", verdict, judge="anthropic")
+        assert graph.diagnostics["plausibility_dropped_anon"] == 0
+        assert "plausibility_dropped_anon_facts" not in graph.diagnostics
+        assert graph.diagnostics["plausibility_out_of_range_anon"] == []
+
+    def test_unknown_site_raises(self):
+        graph = _make_graph([])
+        with pytest.raises(ValueError):
+            record_plausibility_verdict(graph, "bogus", self._verdict([]), judge="local")
+
+    @pytest.mark.parametrize("site", PLAUSIBILITY_SITES)
+    def test_every_declared_site_accepted(self, site):
+        graph = _make_graph([])
+        record_plausibility_verdict(graph, site, self._verdict([]), judge="local")
+        assert graph.diagnostics[f"plausibility_state_{site}"]["state"] == PLAUSIBILITY_RAN
+
+
+class TestRecordPlausibilityState:
+    """``record_plausibility_state`` — the non-ran-path judge-state writer."""
+
+    def test_writes_state_and_reason(self):
+        graph = _make_graph([])
+        record_plausibility_state(graph, "deanon", PLAUSIBILITY_SKIPPED, reason="no_facts")
+        assert graph.diagnostics["plausibility_state_deanon"] == {
+            "state": "skipped",
+            "reason": "no_facts",
+        }
+
+    def test_off_state_defaults_reason_to_none(self):
+        graph = _make_graph([])
+        record_plausibility_state(graph, "anon", PLAUSIBILITY_OFF)
+        assert graph.diagnostics["plausibility_state_anon"] == {"state": "off", "reason": None}
+
+    def test_unknown_site_raises(self):
+        graph = _make_graph([])
+        with pytest.raises(ValueError):
+            record_plausibility_state(graph, "bogus", PLAUSIBILITY_OFF)
+
+    def test_unknown_state_raises(self):
+        graph = _make_graph([])
+        with pytest.raises(ValueError):
+            record_plausibility_state(graph, "fallback", "not_a_real_state")
+
+    def test_ran_state_rejected(self):
+        """The ran state carries a verdict payload
+        (record_plausibility_verdict is its only writer) — this function
+        has no verdict to pair it with, so PLAUSIBILITY_RAN must raise
+        rather than silently write a state with no attribution."""
+        graph = _make_graph([])
+        with pytest.raises(ValueError):
+            record_plausibility_state(graph, "fallback", PLAUSIBILITY_RAN)
+
+
+class TestFallbackPlausibilityStates:
+    """``_fallback_plausibility_on_raw`` records a ``"fallback"``-site
+    judge state on every path — ``ran`` with a real drop count when the
+    judge ran and dropped nothing, ``skipped``/``no_model`` when
+    model/tokenizer are ``None``, ``failed`` on a ``None`` verdict."""
+
+    def _graph(self) -> SessionGraph:
+        return SessionGraph(
+            session_id="s0",
+            timestamp="2026-07-21T00:00:00Z",
+            entities=[Entity(name="Alex", entity_type="person")],
+            relations=[
+                Relation(
+                    subject="Alex",
+                    predicate="lives_in",
+                    object="Millfield",
+                    relation_type="factual",
+                    confidence=1.0,
+                    speaker_id="speaker0",
+                ),
+            ],
+        )
+
+    def test_ran_with_nothing_dropped(self):
+        graph = self._graph()
+        raw_facts = [
+            {
+                "subject": r.subject,
+                "predicate": r.predicate,
+                "object": r.object,
+                "relation_type": r.relation_type,
+                "confidence": r.confidence,
+                "symmetric": r.symmetric,
+            }
+            for r in graph.relations
+        ]
+        verdict = PlausibilityVerdict(kept=raw_facts, dropped=[], out_of_range=[])
+        with patch(
+            "paramem.graph.extractor.judge_plausibility",
+            return_value=(verdict, "raw"),
+        ):
+            out = _fallback_plausibility_on_raw(
+                graph,
+                "[user] I live in Millfield.",
+                MagicMock(),
+                MagicMock(),
+                "all_dropped",
+                speaker_id="speaker0",
+            )
+        assert out.diagnostics["plausibility_state_fallback"] == {"state": "ran", "reason": None}
+        assert out.diagnostics["plausibility_dropped_fallback"] == 0
+        assert out.diagnostics["plausibility_judge_actual"] == "local_fallback"
+
+    def test_skipped_no_model(self):
+        graph = self._graph()
+        out = _fallback_plausibility_on_raw(
+            graph,
+            "[user] I live in Millfield.",
+            None,
+            None,
+            "anon_failed",
+            speaker_id="speaker0",
+        )
+        assert out.diagnostics["plausibility_state_fallback"] == {
+            "state": "skipped",
+            "reason": "no_model",
+        }
+
+    def test_skipped_no_facts(self):
+        graph = SessionGraph(
+            session_id="s1",
+            timestamp="2026-07-21T00:00:00Z",
+            entities=[],
+            relations=[],
+        )
+        out = _fallback_plausibility_on_raw(
+            graph,
+            "[user] empty session.",
+            MagicMock(),
+            MagicMock(),
+            "anon_failed",
+            speaker_id="speaker0",
+        )
+        assert out.diagnostics["plausibility_state_fallback"] == {
+            "state": "skipped",
+            "reason": "no_facts",
+        }
+
+    def test_failed_on_none_verdict(self):
+        graph = self._graph()
+        with patch(
+            "paramem.graph.extractor.judge_plausibility",
+            return_value=(None, "unparseable"),
+        ):
+            out = _fallback_plausibility_on_raw(
+                graph,
+                "[user] I live in Millfield.",
+                MagicMock(),
+                MagicMock(),
+                "all_dropped",
+                speaker_id="speaker0",
+            )
+        assert out.diagnostics["plausibility_state_fallback"] == {
+            "state": "failed",
+            "reason": "parse_failed",
+        }
+        # Fail-open: every fact is still kept when the judge can't be parsed.
+        assert len(out.relations) == 1
+
+
+class TestRecordBindingDiagnosticsWritesAlways:
+    """``_record_binding_diagnostics`` writes ``cloud_binding_collisions``
+    unconditionally now — an empty list means the scan ran and found
+    nothing, distinct from total absence (the scan never reached this
+    site)."""
+
+    def test_writes_empty_list_when_no_collisions(self):
+        graph = _make_graph([])
+        result = DeanonResult(facts=[], collisions=[], predicate_dropped=[], residual_dropped=[])
+        _record_binding_diagnostics(graph, result)
+        assert graph.diagnostics["cloud_binding_collisions"] == []
+
+    def test_writes_the_collisions_list_when_present(self):
+        graph = _make_graph([])
+        result = DeanonResult(
+            facts=[], collisions=["Person_2"], predicate_dropped=[], residual_dropped=[]
+        )
+        _record_binding_diagnostics(graph, result)
+        assert graph.diagnostics["cloud_binding_collisions"] == ["Person_2"]

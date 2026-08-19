@@ -12,6 +12,7 @@ unit-test time.
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 
 import pytest
@@ -739,6 +740,36 @@ class TestExtractionSecondOrderPromptContract:
             )
 
 
+# First-person-pronoun selector shared by the two coreference tests below
+# (TestEnrichmentPromptContract.test_first_person_few_shots_resolve_to_speaker0
+# / .test_non_speaker_cast_as_person_1): a block is a first-person FEW-SHOT
+# iff one of the double-quoted spans on its FIRST line — the few-shot's
+# transcript excerpt, never the JSON keys/values below it — matches a
+# first-person pronoun. Restricted to blocks carrying a `→ add`/`→
+# bindings` example body (never a bare prose paragraph that happens to
+# quote a first-person pronoun as an illustration, e.g. the "Speaker
+# identity" section's `` `"I"` / `"me"` / `"my"` `` or the binding-span
+# rule's `("my father", "the workshop last spring")`) — that narrowing is
+# what makes "first line is the transcript excerpt" true in the first
+# place.
+_FIRST_PERSON_PRONOUN_RE = re.compile(r"\b(I|me|my|we|our)\b", re.IGNORECASE)
+
+
+def _first_person_blocks(rendered: str) -> list[str]:
+    blocks = re.split(r"\n\s*\n", rendered)
+    selected = []
+    for block in blocks:
+        if "WRONG" in block or block.lstrip().startswith("NEGATIVE"):
+            continue
+        if "→ add" not in block and "→ bindings" not in block:
+            continue
+        first_line = block.split("\n", 1)[0]
+        quoted_spans = re.findall(r'"([^"]*)"', first_line)
+        if any(_FIRST_PERSON_PRONOUN_RE.search(span) for span in quoted_spans):
+            selected.append(block)
+    return selected
+
+
 class TestEnrichmentPromptContract:
     def test_renders_without_format_errors(self):
         """No stray single-brace placeholders that collide with .format()."""
@@ -918,40 +949,47 @@ class TestEnrichmentPromptContract:
         )
 
     def test_first_person_few_shots_resolve_to_speaker0(self):
-        """The 'my wife' / 'my sister's husband' / 'my father' coreference
-        few-shots must bind the speaker to 'speaker0' — not a Person_N —
-        in the delta they actually emit.  The subject is now the
-        RENDERED ``{speaker_id}`` slot (per-session speaker binding), so this
-        renders with ``speaker_id="speaker0"`` before checking, rather
-        than scanning the raw (un-rendered) template text."""
+        """STRUCTURAL — every first-person few-shot block (selected by
+        :func:`_first_person_blocks`, not a hardcoded anchor list, so
+        tuning a few-shot's wording cannot silently drop it from this
+        scan) must bind the speaker to 'speaker0' — not a Person_N — in
+        the delta it actually emits.  The subject is now the RENDERED
+        ``{speaker_id}`` slot (per-session speaker binding), so this
+        renders with ``speaker_id="speaker0"`` before checking."""
         tmpl = _load_prompt("cloud_enrichment.txt")
         rendered = tmpl.format(transcript="x", facts_json="[]", speaker_id="speaker0")
-        for anchor in (
-            '"my wife is also a teacher"',
-            '"my sister\'s husband"',
-            '"my father is also an engineer"',
-        ):
-            idx = rendered.index(anchor)
-            window = rendered[idx : idx + 400]
-            assert '"subject":"speaker0"' in window or '"subject": "speaker0"' in window, (
-                f"First-person few-shot {anchor!r} must bind the speaker "
-                f"to 'speaker0', not a positionally-guessed Person_N: {window!r}"
+        blocks = _first_person_blocks(rendered)
+        checked_any = False
+        for block in blocks:
+            checked_any = True
+            assert '"subject":"speaker0"' in block or '"subject": "speaker0"' in block, (
+                f"First-person few-shot block must bind the speaker to "
+                f"'speaker0', not a positionally-guessed Person_N: {block!r}"
             )
+        assert checked_any, (
+            "No first-person few-shot blocks were found to check — the "
+            "selector likely drifted from the prompt format."
+        )
 
     def test_non_speaker_cast_as_person_1(self):
-        """At least one few-shot must show Person_1 naming someone OTHER
-        than the speaker, so the model cannot re-derive 'Person_1 = me'
-        positionally even without an explicit rule saying so.  Checked
-        on the RENDERED prompt (``speaker_id="speaker0"``) since the
-        subject is now the ``{speaker_id}`` slot."""
+        """STRUCTURAL — at least one first-person few-shot block must show
+        Person_1 naming someone OTHER than the speaker, so the model
+        cannot re-derive 'Person_1 = me' positionally even without an
+        explicit rule saying so.  Checked on the RENDERED prompt
+        (``speaker_id="speaker0"``) since the subject is now the
+        ``{speaker_id}`` slot; the existence assertion is its own
+        non-vacuity guard."""
         tmpl = _load_prompt("cloud_enrichment.txt")
         rendered = tmpl.format(transcript="x", facts_json="[]", speaker_id="speaker0")
-        idx = rendered.index('"we went there last summer"')
-        window = rendered[idx : idx + 400]
-        assert "speaker0" in window, "Example must still ground the speaker as speaker0."
-        assert '"subject":"Person_1"' in window or '"subject": "Person_1"' in window, (
-            "Example must cast Person_1 as a THIRD PARTY (not the speaker) "
-            "so Person_1 cannot be re-derived as 'the speaker' positionally."
+        blocks = _first_person_blocks(rendered)
+        assert any(
+            ("speaker0" in block)
+            and ('"subject":"Person_1"' in block or '"subject": "Person_1"' in block)
+            for block in blocks
+        ), (
+            "At least one first-person few-shot must cast Person_1 as a "
+            "THIRD PARTY (not the speaker) so Person_1 cannot be "
+            "re-derived as 'the speaker' positionally."
         )
 
     def test_every_positive_mint_has_a_binding(self):
@@ -982,9 +1020,9 @@ class TestEnrichmentPromptContract:
             mints = {m[0] for m in PLACEHOLDER_TOKEN_RE.findall(block) if m[0]}
             for key in mints:
                 checked_any = True
-                assert f'"{key}"' in block and "bindings" in block, (
+                assert f'"{{{key}}}"' in block and "bindings" in block, (
                     f"Positive example block mints {{{key}}} without a "
-                    f"matching bindings entry in the same block: {block!r}"
+                    f"matching BRACED bindings key in the same block: {block!r}"
                 )
         assert checked_any, (
             "No positive-example mints were found to check — the scan "
@@ -1097,6 +1135,29 @@ class TestPlausibilityPromptContract:
             "without this the model defaults to verbose echo and triggers the "
             "Mistral-7B EOS-mid-array truncation."
         )
+
+    def test_output_contract_instructs_the_annotated_drop_form(self):
+        """The Output section instructs the annotated ``{"index", "rule"}``
+        drop-entry form — both
+        ``"index"`` and ``"rule"`` appear in the output contract, and the
+        worked example renders as parseable JSON after ``.format()``. The
+        pin that stops a future prompt edit from silently reverting rule
+        capture (the parser still tolerates the bare-integer form, but the
+        judge is never asked to emit it)."""
+        tmpl = _load_prompt("cloud_plausibility.txt")
+        output_section = tmpl[tmpl.index("## Output") :]
+        assert '"index"' in output_section
+        assert '"rule"' in output_section
+
+        rendered = tmpl.format(transcript="Person_1 said hi.", facts_json="[]")
+        example_match = re.search(r"Example with two drops:\s*(\{.*\})", rendered)
+        assert example_match, "Could not locate the two-drop worked example in the rendered prompt."
+        parsed = json.loads(example_match.group(1))
+        assert parsed["drop"], "Worked example must be non-empty."
+        for entry in parsed["drop"]:
+            assert set(entry) == {"index", "rule"}
+            assert isinstance(entry["index"], int)
+            assert isinstance(entry["rule"], str)
 
     def test_r4_carve_out_for_speaker_tokens_is_explicit(self):
         """R4 ("conversation-role reference") lexically targets the

@@ -157,6 +157,27 @@ def braced(token: str) -> str:
     return f"{{{token}}}"
 
 
+def unbraced(token: str) -> str:
+    """Inverse of :func:`braced`: strip one surrounding ``{...}`` pair.
+
+    ``"{Person_1}"`` -> ``"Person_1"``; a string that does not both start
+    with ``{`` and end with ``}`` is returned unchanged. No whitespace
+    trimming — a real-name side is a substitution key and must survive
+    byte-identical. Idempotent for the shapes this module produces: a
+    bare token passes through unchanged, and a doubly-braced token
+    (``"{{Person_1}}"``) has only its outer pair removed per call, so a
+    second call on the already-stripped result is a no-op once no
+    surrounding pair remains.
+
+    THE only place a candidate table-entry string is stripped of its
+    placeholder braces before shape validation — see
+    :func:`_normalize_anonymization_mapping`.
+    """
+    if len(token) >= 2 and token.startswith("{") and token.endswith("}"):
+        return token[1:-1]
+    return token
+
+
 # ---------------------------------------------------------------------------
 # Substitution — word-boundary text substitution over a {key: value} table.
 # ---------------------------------------------------------------------------
@@ -278,6 +299,31 @@ def insert_placeholders(facts: list[dict], mapping: dict[str, str]) -> list[dict
 # CORE anonymizer table and the cloud `bindings` table.
 # ---------------------------------------------------------------------------
 
+# Longest raw candidate string recorded in a dropped-entry payload — a
+# diagnostic sample, not a redaction: the surviving substring is still
+# whatever the caller's mapping entry actually was, just capped so one
+# oversized entry cannot bloat a session snapshot.
+_MAX_MAPPING_TEXT_CHARS: int = 64
+
+
+def _dropped_mapping_entry(placeholder_side: str, key_str: str, value_str: str) -> dict:
+    """Build one ``dropped_entries`` record for
+    :func:`_normalize_anonymization_mapping`.
+
+    ``side`` is the caller's declared ``placeholder_side`` — which half of
+    the pair was supposed to carry the placeholder. ``text`` is that
+    side's raw string (neither side matched the placeholder shape, so it
+    is necessarily malformed on the declared side too), truncated to
+    :data:`_MAX_MAPPING_TEXT_CHARS`. ``counterpart_len`` is a length only
+    — the other (presumed real) side's content is never logged.
+    """
+    text, counterpart = (key_str, value_str) if placeholder_side == "key" else (value_str, key_str)
+    return {
+        "side": placeholder_side,
+        "text": text[:_MAX_MAPPING_TEXT_CHARS],
+        "counterpart_len": len(counterpart),
+    }
+
 
 def _normalize_anonymization_mapping(
     mapping: dict, *, placeholder_side: str = "value"
@@ -292,13 +338,18 @@ def _normalize_anonymization_mapping(
     since a binding maps a placeholder cloud minted to the real span it
     stands for.
 
-    Per-entry classification: whichever side of the pair matches
-    :data:`PLACEHOLDER_SHAPE_RE` becomes ``placeholder_side`` in the
-    output. When BOTH sides match (a real-world name that happens to be
-    PascalCase_N-shaped, e.g. ``GPT_4``, ``COVID_19``), the caller's
-    declared ``placeholder_side`` breaks the tie — the entry is kept
-    as-is, not dropped. Only NEITHER side matching is genuinely
-    ambiguous and dropped (logging).
+    Each candidate side is passed through :func:`unbraced` before shape
+    validation, so a braced candidate (``{Event_1}``, the cloud binding
+    mint shape) validates exactly as its bare form would. Whichever side
+    then matches :data:`PLACEHOLDER_SHAPE_RE` becomes ``placeholder_side``
+    in the output, stored BARE (the unbraced form); the other (real) side
+    is stored VERBATIM, braces and all — it is a substitution key and must
+    match the transcript exactly. When BOTH sides match (a real-world name
+    that happens to be PascalCase_N-shaped, e.g. ``GPT_4``, ``COVID_19``),
+    the caller's declared ``placeholder_side`` breaks the tie — the entry
+    is kept as-is, not dropped. Only NEITHER side matching (after
+    unbracing) is genuinely ambiguous and dropped (logging, and recorded
+    per-entry in ``dropped_entries`` — see the return contract below).
 
     ``placeholder_side="value"`` ALSO accepts a speaker-id-shaped VALUE
     (:func:`~paramem.utils.identity.is_speaker_id`) as placeholder-shaped,
@@ -316,9 +367,13 @@ def _normalize_anonymization_mapping(
     the identity anchor).
 
     Returns ``(canonical_mapping, stats)`` where ``stats`` has
-    ``{inverted, dropped}`` counts — surfaces the mapping-quality signal
-    to callers so they can persist it in diagnostics (ambiguous-drop can
-    otherwise silently void real entities or cloud-minted entries).
+    ``{inverted, dropped, dropped_entries}`` — ``inverted``/``dropped`` are
+    counts, ``dropped_entries`` is a ``list[dict]`` (see
+    :func:`_dropped_mapping_entry`) with one record per dropped pair,
+    ``len(dropped_entries) == dropped``. Surfaces the mapping-quality
+    signal to callers so they can persist it in diagnostics
+    (ambiguous-drop can otherwise silently void real entities or
+    cloud-minted entries).
 
     THE only normalizer for either table.
 
@@ -334,14 +389,16 @@ def _normalize_anonymization_mapping(
     ``stats`` is not currently surfaced to a diagnostic by either.
     """
     if not mapping:
-        return mapping, {"inverted": 0, "dropped": 0}
+        return mapping, {"inverted": 0, "dropped": 0, "dropped_entries": []}
     out: dict = {}
     inverted = 0
-    dropped = 0
+    dropped_entries: list[dict] = []
     for k, v in mapping.items():
-        k_match = bool(PLACEHOLDER_SHAPE_RE.match(str(k)))
-        v_match = bool(PLACEHOLDER_SHAPE_RE.match(str(v)))
-        if placeholder_side == "value" and not v_match and is_speaker_id(str(v)):
+        k_str, v_str = str(k), str(v)
+        k_bare, v_bare = unbraced(k_str), unbraced(v_str)
+        k_match = bool(PLACEHOLDER_SHAPE_RE.match(k_bare))
+        v_match = bool(PLACEHOLDER_SHAPE_RE.match(v_bare))
+        if placeholder_side == "value" and not v_match and is_speaker_id(v_str):
             # A speaker id (e.g. "speaker0") never matches
             # PLACEHOLDER_SHAPE_RE (no PascalCase prefix, no underscore
             # before the digit) but IS a legitimate placeholder-shaped
@@ -358,31 +415,41 @@ def _normalize_anonymization_mapping(
             # treat a speaker id as a valid KEY placeholder — a cloud model
             # is not authorized to bind new content onto the identity
             # anchor, so a binding shaped that way stays genuinely
-            # ambiguous/rejected, not silently accepted.
+            # ambiguous/rejected, not silently accepted.  (No `v_bare`
+            # reassignment needed here: a speaker id is never braced, so
+            # `unbraced(v_str)` above already left `v_bare == v_str`.)
             v_match = True
-        if placeholder_side == "key":
-            wants_invert = v_match and not k_match
-            # Both sides matching the shape (e.g. a binding onto a
-            # real-world name that also happens to be PascalCase_N-shaped,
-            # like "GPT_4") is a genuine tie, not an unresolvable
-            # ambiguity: the caller already told us which side is
-            # DECLARED as the placeholder via `placeholder_side`, so trust
-            # it rather than dropping the entry.
-            keep_as_is = k_match
+
+        # Which side the shape test says is the placeholder; a tie (both
+        # match — e.g. a real-world name that also happens to be
+        # PascalCase_N-shaped, like "GPT_4") is broken toward the
+        # caller's declared side, not dropped.
+        if k_match and v_match:
+            placeholder_on_key = placeholder_side == "key"
+        elif k_match:
+            placeholder_on_key = True
+        elif v_match:
+            placeholder_on_key = False
         else:
-            wants_invert = k_match and not v_match
-            keep_as_is = v_match
-        if wants_invert:
-            out[v] = k
+            # Neither side matches the placeholder shape (even after
+            # unbracing) — we cannot tell which side is the placeholder.
+            # Dropping is safer than keeping: retaining would corrupt the
+            # resolution map with a real-to-real entry.
+            dropped_entries.append(_dropped_mapping_entry(placeholder_side, k_str, v_str))
+            continue
+
+        # Write in the canonical direction: the placeholder side stored
+        # bare, the real side stored verbatim.
+        if placeholder_on_key:
+            placeholder_str, real_str = k_bare, v_str
+        else:
+            placeholder_str, real_str = v_bare, k_str
+        if placeholder_on_key != (placeholder_side == "key"):
             inverted += 1
-        elif keep_as_is:
-            out[k] = v
+        if placeholder_side == "key":
+            out[placeholder_str] = real_str
         else:
-            # Neither side matches the placeholder shape — we cannot tell
-            # which side is the placeholder. Dropping is safer than
-            # keeping: retaining would corrupt the resolution map with a
-            # real-to-real entry.
-            dropped += 1
+            out[real_str] = placeholder_str
     if inverted:
         logger.info(
             "Anonymization table: inverted %d/%d pair(s) to canonical "
@@ -391,15 +458,19 @@ def _normalize_anonymization_mapping(
             len(mapping),
             placeholder_side,
         )
-    if dropped:
+    if dropped_entries:
         logger.warning(
-            "Anonymization table: dropped %d/%d ambiguous pair(s) (both or "
-            "neither side matches the placeholder shape); affected entries "
-            "will not resolve.",
-            dropped,
+            "Anonymization table: dropped %d/%d ambiguous pair(s) (neither "
+            "side matches the placeholder shape, even after unbracing); "
+            "affected entries will not resolve.",
+            len(dropped_entries),
             len(mapping),
         )
-    return out, {"inverted": inverted, "dropped": dropped}
+    return out, {
+        "inverted": inverted,
+        "dropped": len(dropped_entries),
+        "dropped_entries": dropped_entries,
+    }
 
 
 # ---------------------------------------------------------------------------

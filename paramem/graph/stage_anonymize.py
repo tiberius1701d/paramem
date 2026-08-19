@@ -68,6 +68,14 @@ def _stage_anonymize(ctx: StageContext, state: StageState) -> StageState:
     ``payload=None`` — the stage's ``terminal_when`` — so ``enrich`` does
     not run on a payload that was never produced.
 
+    On the ``ctx.scrub``-non-empty branch (whether the call ends up
+    ``"ok"`` or ``"failed"``), this stage also writes
+    ``mapping_ambiguous_dropped``/``mapping_ambiguous_dropped_entries``
+    (the table normalizer's own drop count and per-entry attribution) and
+    the anonymizer self-inconsistency measurement,
+    ``anonymizer_unapplied_tokens``/``pipeline_injected_tokens`` — see
+    :attr:`~paramem.cloud.anonymize.AnonymizedContract.injected_tokens`.
+
     This stage body deliberately does NOT check ``chain_stopped()``
     itself, though an earlier version of this code did and returned early
     on a satisfied ``stop_at("anonymize")`` request. That check is gone
@@ -165,6 +173,28 @@ def _stage_anonymize(ctx: StageContext, state: StageState) -> StageState:
             elif not graph.relations:
                 t.set_outcome("no_input", reason="graph has 0 relations")
         _vram_snapshot(f"after_anonymize session={graph.session_id}")
+        # ``payload.norm_stats``/``norm_dropped_entries`` are LIVE signals
+        # from the one normalize call in the chain (see
+        # paramem.cloud.anonymize) — written unconditionally, and BEFORE
+        # the fail-closed return below, so a guard-failure fold (every
+        # entry dropped by shape validation) still records what happened
+        # instead of the key being silently absent.
+        graph.diagnostics["mapping_ambiguous_dropped"] = payload.norm_stats["dropped"]
+        if payload.norm_dropped_entries:
+            graph.diagnostics["mapping_ambiguous_dropped_entries"] = payload.norm_dropped_entries
+        # Anonymizer self-inconsistency telemetry (measurement only — see
+        # AnonymizedContract.injected_tokens): which declared tokens the
+        # anonymizer never applied to its own rewrite, kept distinct from
+        # the tokens the PIPELINE minted (which can never appear in that
+        # rewrite by construction).
+        graph.diagnostics["anonymizer_unapplied_tokens"] = sorted(
+            tok
+            for tok in payload.declared
+            if tok not in payload.anon_transcript and tok not in payload.injected_tokens
+        )
+        graph.diagnostics["pipeline_injected_tokens"] = sorted(
+            payload.injected_tokens & payload.declared
+        )
         if payload.status == "failed":
             # Fail-closed: parse failure OR a missing/empty
             # anonymized_transcript.  Never fall back to raw plausibility
@@ -188,11 +218,6 @@ def _stage_anonymize(ctx: StageContext, state: StageState) -> StageState:
                 payload=None,
                 original_relation_count=original_count,
             )
-        # ``payload.norm_stats`` is the LIVE signal — reaches
-        # ``mapping_ambiguous_dropped`` unconditionally now (this is the
-        # only normalize call in the chain; see paramem.cloud.anonymize).
-        if payload.norm_stats["dropped"]:
-            graph.diagnostics["mapping_ambiguous_dropped"] = payload.norm_stats["dropped"]
 
         # CORE-map diagnostic.  The CORE map is never otherwise
         # persisted — ``anonymize.parsed.mapping`` above is the LLM HINT map,

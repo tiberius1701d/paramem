@@ -27,9 +27,9 @@ Enriched facts (numbered):
 
 ## Output
 
-Return ONLY a single JSON object with the key "drop", whose value is an array of zero-based integer indices.
+Return ONLY a single JSON object with the key "drop", whose value is an array of objects. Each object has "index" — the fact's zero-based integer index — and "rule" — the identifier of the rule that matched, e.g. "R1".
 
-Example with two drops: {{"drop": [3, 5]}}
+Example with two drops: {{"drop": [{{"index": 3, "rule": "R1"}}, {{"index": 5, "rule": "R4"}}]}}
 Example for a clean input where nothing matches a rule: {{"drop": []}}
 
 Do NOT wrap the output in backticks, code fences, or any other prose.

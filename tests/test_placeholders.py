@@ -20,8 +20,10 @@ taxonomy (``configs/schema.yaml``).
 from __future__ import annotations
 
 import inspect
+import logging
 
 from paramem.cloud.placeholders import (
+    _MAX_MAPPING_TEXT_CHARS,
     PLACEHOLDER_SHAPE_RE,
     PLACEHOLDER_TOKEN_RE,
     _build_anonymization_mapping,
@@ -34,6 +36,7 @@ from paramem.cloud.placeholders import (
     invert_forward_mapping,
     mint_placeholder,
     placeholder_prefix,
+    unbraced,
 )
 from paramem.config.taxonomy import (
     entity_type_to_prefix,
@@ -184,7 +187,7 @@ class TestNormalizeAndValidateTableBothDirections:
     def test_core_table_default_direction_unchanged(self):
         mapping, stats = _normalize_anonymization_mapping({"Alex": "Person_1"})
         assert mapping == {"Alex": "Person_1"}
-        assert stats == {"inverted": 0, "dropped": 0}
+        assert stats == {"inverted": 0, "dropped": 0, "dropped_entries": []}
 
     def test_core_table_inverted_pair_is_corrected(self):
         mapping, stats = _normalize_anonymization_mapping({"Person_1": "Alex"})
@@ -196,7 +199,7 @@ class TestNormalizeAndValidateTableBothDirections:
             {"Event_1": "the agile transformation initiative"}, placeholder_side="key"
         )
         assert mapping == {"Event_1": "the agile transformation initiative"}
-        assert stats == {"inverted": 0, "dropped": 0}
+        assert stats == {"inverted": 0, "dropped": 0, "dropped_entries": []}
 
     def test_bindings_table_inverted_pair_is_corrected(self):
         """The exact bug this generalization closes: an inverted binding
@@ -223,14 +226,14 @@ class TestNormalizeAndValidateTableBothDirections:
             {"Model_1": "GPT_4"}, placeholder_side="key"
         )
         assert mapping == {"Model_1": "GPT_4"}
-        assert stats == {"inverted": 0, "dropped": 0}
+        assert stats == {"inverted": 0, "dropped": 0, "dropped_entries": []}
 
     def test_core_table_both_sides_shaped_ties_to_declared_value_side(self):
         """Same tie-break, CORE table direction (`placeholder_side="value"`,
         the default)."""
         mapping, stats = _normalize_anonymization_mapping({"Person_2": "Windows_11"})
         assert mapping == {"Person_2": "Windows_11"}
-        assert stats == {"inverted": 0, "dropped": 0}
+        assert stats == {"inverted": 0, "dropped": 0, "dropped_entries": []}
 
 
 class TestSpeakerIdValueCarveIn:
@@ -507,7 +510,7 @@ class TestMultiSegmentPlaceholderShape:
             {"123 Main Street": "Home_Address_1", "AB-123-CD": "Car_Plate_1"}
         )
         assert mapping == {"123 Main Street": "Home_Address_1", "AB-123-CD": "Car_Plate_1"}
-        assert stats == {"inverted": 0, "dropped": 0}
+        assert stats == {"inverted": 0, "dropped": 0, "dropped_entries": []}
 
     def test_multi_segment_placeholder_survives_normalization_inverted(self):
         """Same entries handed in inverted (placeholder-as-key) direction
@@ -929,3 +932,110 @@ class TestReverseMapInversionAgreement:
         forward, reverse = _build_anonymization_mapping({"RealName": "speaker0"}, speaker_name=None)
         assert "speaker0" not in reverse
         assert forward.get("RealName") == "speaker0"
+
+
+class TestUnbraced:
+    """``unbraced`` — the inverse of :func:`braced`, one surrounding
+    ``{...}`` pair removed."""
+
+    def test_removes_one_surrounding_pair(self):
+        assert unbraced("{Person_1}") == "Person_1"
+
+    def test_no_pair_returned_verbatim(self):
+        assert unbraced("Person_1") == "Person_1"
+
+    def test_unbalanced_brace_returned_verbatim(self):
+        assert unbraced("{Person_1") == "{Person_1"
+        assert unbraced("Person_1}") == "Person_1}"
+
+    def test_empty_string(self):
+        assert unbraced("") == ""
+
+    def test_only_outer_pair_removed(self):
+        """A doubly-braced token loses only the OUTER pair per call."""
+        assert unbraced("{{Person_1}}") == "{Person_1}"
+
+    def test_no_whitespace_trimming(self):
+        assert unbraced("{ Person_1 }") == " Person_1 "
+
+
+class TestNormalizeAnonymizationMappingBracedCandidates:
+    """One token shape per surface, canonicalized at the
+    normalizer boundary. A braced candidate is stripped via
+    :func:`unbraced` before shape validation and stored bare on the
+    placeholder side; the real side is stored verbatim (braces and all)."""
+
+    def test_braced_binding_key_honored(self):
+        """The cloud enrichment wire shape: a braced binding key."""
+        mapping, stats = _normalize_anonymization_mapping(
+            {"{Event_1}": "the agile transformation initiative"}, placeholder_side="key"
+        )
+        assert mapping == {"Event_1": "the agile transformation initiative"}
+        assert stats["dropped"] == 0
+
+    def test_braced_core_value_honored(self):
+        """A braced CORE anonymizer-table value."""
+        mapping, stats = _normalize_anonymization_mapping({"Jane Doe": "{Person_1}"})
+        assert mapping == {"Jane Doe": "Person_1"}
+        assert stats["dropped"] == 0
+
+    def test_idempotent_on_the_double_normalize_production_path(self):
+        """``_parse_enrichment_delta`` (extractor.py) then
+        ``CloudScope.response`` (deanonymize.py) both normalize the same
+        cloud ``bindings`` table — normalizing an already-normalized
+        table a second time must be a no-op."""
+        first, _ = _normalize_anonymization_mapping(
+            {"{Event_1}": "the agile transformation initiative"}, placeholder_side="key"
+        )
+        second, stats2 = _normalize_anonymization_mapping(first, placeholder_side="key")
+        assert second == first
+        assert stats2["dropped"] == 0
+
+    def test_real_side_keeps_braces_and_whitespace_verbatim(self):
+        mapping, _stats = _normalize_anonymization_mapping({"{Jane}": "Person_1"})
+        assert mapping == {"{Jane}": "Person_1"}
+
+    def test_double_braced_placeholder_strips_once_and_still_drops(self):
+        mapping, stats = _normalize_anonymization_mapping(
+            {"{{Person_1}}": "x"}, placeholder_side="key"
+        )
+        assert mapping == {}
+        assert stats["dropped"] == 1
+
+    def test_dropped_entries_payload_shape_key_side(self):
+        mapping, stats = _normalize_anonymization_mapping(
+            {"{some phrase}": "a value"}, placeholder_side="key"
+        )
+        assert mapping == {}
+        [entry] = stats["dropped_entries"]
+        assert entry["side"] == "key"
+        assert entry["text"] == "{some phrase}"
+        assert entry["counterpart_len"] == len("a value")
+
+    def test_dropped_entries_payload_shape_value_side(self):
+        mapping, stats = _normalize_anonymization_mapping({"Jane": "{some phrase}"})
+        assert mapping == {}
+        [entry] = stats["dropped_entries"]
+        assert entry["side"] == "value"
+        assert entry["text"] == "{some phrase}"
+        assert entry["counterpart_len"] == len("Jane")
+
+    def test_dropped_entries_text_truncated(self):
+        long_junk = "x" * 200
+        mapping, stats = _normalize_anonymization_mapping(
+            {long_junk: "also junk"}, placeholder_side="key"
+        )
+        assert mapping == {}
+        [entry] = stats["dropped_entries"]
+        assert len(entry["text"]) == _MAX_MAPPING_TEXT_CHARS
+        assert entry["text"] == long_junk[:_MAX_MAPPING_TEXT_CHARS]
+
+    def test_warning_log_line_carries_counts_only(self, caplog):
+        """The privacy-relevant half: the WARNING log for a dropped entry
+        must never carry the offending text as a substring."""
+        caplog.set_level(logging.WARNING, logger="paramem.cloud.placeholders")
+        secret = "a-genuinely-unshaped-junk-string-Q7z"
+        _normalize_anonymization_mapping({secret: "also junk"}, placeholder_side="key")
+        log_text = caplog.text
+        assert secret not in log_text
+        assert "dropped" in log_text.lower()
