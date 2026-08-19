@@ -1,0 +1,1 @@
+[Document provided by {speaker_name} ({speaker_id}). Extract every fact in the document. When a statement describes {speaker_name} themselves, use {speaker_id} as the subject; when it describes another person, organization, or project, use that entity as the subject.]

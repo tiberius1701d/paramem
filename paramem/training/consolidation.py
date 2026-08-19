@@ -18,8 +18,9 @@ from torch.utils.data import Dataset
 from paramem.cloud.admission import evaluate_cloud_egress
 from paramem.config.taxonomy import fallback_relation_type, relation_types
 from paramem.graph.extraction_pipeline import ExtractionConfig, ExtractionPipeline
+from paramem.graph.extractor import ExtractionFailed, local_parse_failure
 from paramem.graph.merger import GraphMerger, min_nonempty, node_display
-from paramem.graph.phase_trace import extraction_trace, phase_trace
+from paramem.graph.phase_trace import ExtractionTrace, extraction_trace, phase_trace
 from paramem.graph.relation_prep import (
     attr_predicate,
     partition_relations,
@@ -79,17 +80,6 @@ logger = logging.getLogger(__name__)
 # Pydantic Relation schema (_RelationType = Literal[relation_types()]).
 _VALID_RTYPES: frozenset[str] = frozenset(relation_types())
 _FALLBACK_RTYPE: str = fallback_relation_type()
-
-# Ownership cue prepended to the local extraction slot for document sources
-# with a known speaker name — a soft, in-prompt signal raising first-pass
-# model compliance with the exact-full-name speaker rewrite that
-# _stamp_speaker_entity applies deterministically regardless (extractor.py).
-# Not a prompt file: this is a caller-layer prepend onto the slot content,
-# per the single-topology one-prompt-pair design (extraction_pipeline.py
-# kwargs() docstring).
-OWNERSHIP_CUE = (
-    "[Document provided by {name} ({sid}). Statements describing {name} are facts about {sid}.]\n\n"
-)
 
 
 def _relation_to_entry_dict(r: "Relation") -> dict:
@@ -1346,10 +1336,14 @@ class ConsolidationLoop:
                 in the user template for narrator binding.
             source_type: ``"transcript"`` (default) for voice/chat sessions;
                 ``"document"`` for written documents fed through the ingest
-                pipeline.  Selects both the system prompt and the user
-                template.  Narrator binding for document sources uses the
-                same ``build_speaker_context`` mechanism as transcripts — no
-                separate ``doc_title`` or context string is needed.
+                pipeline.  Selects the ``{document_context}`` rendering
+                (:func:`~paramem.graph.extractor.build_document_context`)
+                and gates the document-only exact-full-name speaker
+                rewrite.  The system prompt and user template are the same
+                for every source type; narrator binding for document
+                sources uses the same ``build_speaker_context`` mechanism
+                as transcripts — no separate ``doc_title`` or context
+                string is needed.
             event_time: Session-start assertion time (ISO 8601), typically
                 the session's ``started_at``. Forwarded to the extraction
                 chokepoint as ``timestamp`` so a NEW fact's edge
@@ -1357,20 +1351,19 @@ class ConsolidationLoop:
                 extraction ran. ``None`` (default) falls back to ``now()``
                 at the extractor layer — preserves behaviour for callers
                 that don't yet have a real session-start time.
+
+        Raises:
+            ExtractionFailed: A local-extraction pass (``local_extract``,
+                ``second_order_extract``, or ``procedural_extract``) failed
+                to parse its output, or the cloud ``cloud_enrich`` stage
+                failed. Raised before this session's merge, so no partial
+                content reaches ``self.merger.graph`` for the failing pass;
+                the merger graph is also reset before the exception leaves
+                this method, invalidating the fold's accumulated
+                extraction state (including any earlier session already
+                merged this fold).
         """
         logger.info("=== Extraction (session=%s) ===", session_id)
-
-        # Ownership cue: a soft, in-prompt compliance aid for document
-        # sources with a known speaker name — see OWNERSHIP_CUE. Built as a
-        # LOCAL extraction-only variable; session_transcript itself is left
-        # unmodified because it is reused below for STT anchoring / traces.
-        # The deterministic exact-full-name rewrite in _stamp_speaker_entity
-        # does not depend on this cue; it only raises first-pass compliance.
-        extraction_input = session_transcript
-        if source_type == "document" and speaker_name:
-            extraction_input = (
-                OWNERSHIP_CUE.format(name=speaker_name, sid=speaker_id) + session_transcript
-            )
 
         # Outer extraction_trace scope wraps the whole session body so the
         # orchestrator phases (merge_into_cumulative, procedural_extract,
@@ -1378,105 +1371,122 @@ class ConsolidationLoop:
         # extract_procedural_graph calls — those traces nest-no-op into this
         # one.  The final attach_to(...) calls below capture the complete
         # phase history on each session graph before it is dumped.
-        with extraction_trace() as trace:
-            # --- EXTRACT ---
-            session_graph = self.extraction.run(
-                extraction_input,
-                session_id,
-                source_type=source_type,
-                enrichment_provider=enrichment_provider,
-                enrichment_provider_model=enrichment_provider_model,
-                enrichment_provider_endpoint=enrichment_provider_endpoint,
-                speaker_name=speaker_name,
-                speaker_id=speaker_id,
-                plausibility_judge=plausibility_judge,
-                plausibility_stage=plausibility_stage,
-                timestamp=event_time,
-            )
-
-            logger.info(
-                "Extracted %d entities, %d relations",
-                len(session_graph.entities),
-                len(session_graph.relations),
-            )
-
-            # --- MERGE ---
-            with phase_trace("merge_into_cumulative") as t:
-                # Always merge into the cumulative graph.  resolve_contradictions
-                # is driven by refinement_contradiction config: when "off", Case-2
-                # cardinality resolution is skipped (no model call, no edge removal).
-                # When "on", the model may supersede older edges via the recency rule.
-                # Disable gradient checkpointing: merger.merge may call
-                # model.generate() when a model is present and
-                # resolve_contradictions=True.  HF silently disables the KV cache
-                # when checkpointing is active (CLAUDE.md rule).
-                self._disable_gradient_checkpointing()
-                try:
-                    self.merger.merge(
-                        session_graph,
-                        resolve_contradictions=(self.config.refinement_contradiction == "on"),
-                    )
-                finally:
-                    self._enable_gradient_checkpointing()
-                t.add("triples_added", len(session_graph.relations))
-
-            # --- BUILD ENTRY RELATION DICTS ---
-            # Single entry point for graph → entries.  Builds relation dicts
-            # directly from session_graph with no model.generate calls.
-            episodic_rels, procedural_rels = self._entries_from_graph(
-                session_graph,
-                procedural_enabled=self.procedural_config is not None,
-            )
-
-            # --- PROCEDURAL: separate extraction pass ---
-            # extract_procedural_graph self-traces the "procedural_extract"
-            # phase (nest-no-ops onto this outer extraction_trace scope) via
-            # the shared _run_local_extraction primitive, so no wrapper is
-            # needed here.
-            proc_graph: SessionGraph | None = None
-            if self.procedural_config is not None:
-                proc_graph = self.extraction.run_procedural(
-                    extraction_input,
+        #
+        # ONE invalidation site for BOTH ExtractionFailed raise origins — the
+        # local-parse abort detected by _abort_on_local_parse_failure below,
+        # and the existing cloud_enrich raise from inside self.extraction.run.
+        # extract_session is the single common ancestor of every caller (both
+        # consolidation callers, the trial path, experiment callers), so the
+        # merger-graph reset lives here, never duplicated per caller.
+        # VramExhausted is deliberately NOT caught — per-chunk isolation
+        # keeps the batch's earlier merges intact.
+        try:
+            with extraction_trace() as trace:
+                # --- EXTRACT ---
+                _mark = len(trace.records)
+                session_graph = self.extraction.run(
+                    session_transcript,
                     session_id,
-                    speaker_name=speaker_name,
                     source_type=source_type,
+                    enrichment_provider=enrichment_provider,
+                    enrichment_provider_model=enrichment_provider_model,
+                    enrichment_provider_endpoint=enrichment_provider_endpoint,
+                    speaker_name=speaker_name,
                     speaker_id=speaker_id,
+                    plausibility_judge=plausibility_judge,
+                    plausibility_stage=plausibility_stage,
                     timestamp=event_time,
                 )
-                procedural_rels.extend(_relation_to_entry_dict(r) for r in proc_graph.relations)
-                # Merge proc_graph into the cumulative graph so its relations
-                # reach the unified keying surface (stage_event's working-copy
-                # keyed walk, _build_working_keyed_walk) at the next
-                # run_consolidation_cycle call.  Same
-                # resolve_contradictions flag and gradient-checkpointing discipline
-                # as the session_graph merge above — merger.merge may call
-                # model.generate() when a model is present (CLAUDE.md rule).
-                self._disable_gradient_checkpointing()
-                try:
-                    self.merger.merge(
-                        proc_graph,
-                        resolve_contradictions=(self.config.refinement_contradiction == "on"),
+                self._abort_on_local_parse_failure(trace, _mark)
+
+                logger.info(
+                    "Extracted %d entities, %d relations",
+                    len(session_graph.entities),
+                    len(session_graph.relations),
+                )
+
+                # --- MERGE ---
+                with phase_trace("merge_into_cumulative") as t:
+                    # Always merge into the cumulative graph.  resolve_contradictions
+                    # is driven by refinement_contradiction config: when "off", Case-2
+                    # cardinality resolution is skipped (no model call, no edge removal).
+                    # When "on", the model may supersede older edges via the recency rule.
+                    # Disable gradient checkpointing: merger.merge may call
+                    # model.generate() when a model is present and
+                    # resolve_contradictions=True.  HF silently disables the KV cache
+                    # when checkpointing is active (CLAUDE.md rule).
+                    self._disable_gradient_checkpointing()
+                    try:
+                        self.merger.merge(
+                            session_graph,
+                            resolve_contradictions=(self.config.refinement_contradiction == "on"),
+                        )
+                    finally:
+                        self._enable_gradient_checkpointing()
+                    t.add("triples_added", len(session_graph.relations))
+
+                # --- BUILD ENTRY RELATION DICTS ---
+                # Single entry point for graph → entries.  Builds relation dicts
+                # directly from session_graph with no model.generate calls.
+                episodic_rels, procedural_rels = self._entries_from_graph(
+                    session_graph,
+                    procedural_enabled=self.procedural_config is not None,
+                )
+
+                # --- PROCEDURAL: separate extraction pass ---
+                # extract_procedural_graph self-traces the "procedural_extract"
+                # phase (nest-no-ops onto this outer extraction_trace scope) via
+                # the shared _run_local_extraction primitive, so no wrapper is
+                # needed here.
+                proc_graph: SessionGraph | None = None
+                if self.procedural_config is not None:
+                    _mark = len(trace.records)
+                    proc_graph = self.extraction.run_procedural(
+                        session_transcript,
+                        session_id,
+                        speaker_name=speaker_name,
+                        source_type=source_type,
+                        speaker_id=speaker_id,
+                        timestamp=event_time,
                     )
-                finally:
-                    self._enable_gradient_checkpointing()
+                    self._abort_on_local_parse_failure(trace, _mark)
+                    procedural_rels.extend(_relation_to_entry_dict(r) for r in proc_graph.relations)
+                    # Merge proc_graph into the cumulative graph so its relations
+                    # reach the unified keying surface (stage_event's working-copy
+                    # keyed walk, _build_working_keyed_walk) at the next
+                    # run_consolidation_cycle call.  Same
+                    # resolve_contradictions flag and gradient-checkpointing discipline
+                    # as the session_graph merge above — merger.merge may call
+                    # model.generate() when a model is present (CLAUDE.md rule).
+                    self._disable_gradient_checkpointing()
+                    try:
+                        self.merger.merge(
+                            proc_graph,
+                            resolve_contradictions=(self.config.refinement_contradiction == "on"),
+                        )
+                    finally:
+                        self._enable_gradient_checkpointing()
 
-            # Unified dedup (identical policy across every consolidation caller).
-            with phase_trace("dedup_episodic") as t:
-                episodic_rels = self.dedup_episodic(episodic_rels)
-                t.add("count", len(episodic_rels))
-            with phase_trace("dedup_procedural") as t:
-                procedural_rels = self.dedup_procedural(procedural_rels)
-                t.add("count", len(procedural_rels))
+                # Unified dedup (identical policy across every consolidation caller).
+                with phase_trace("dedup_episodic") as t:
+                    episodic_rels = self.dedup_episodic(episodic_rels)
+                    t.add("count", len(episodic_rels))
+                with phase_trace("dedup_procedural") as t:
+                    procedural_rels = self.dedup_procedural(procedural_rels)
+                    t.add("count", len(procedural_rels))
 
-            # Attach the complete trace (extraction + orchestrator phases) to
-            # each session graph before dumping so diagnostics["phases"] holds
-            # everything that fired this session.
-            trace.attach_to(session_graph)
-            with self._artifact_scope():
-                on_session_extracted(session_graph, session_id, "graph")
-                if proc_graph is not None:
-                    trace.attach_to(proc_graph)
-                    on_session_extracted(proc_graph, session_id, "procedural_graph")
+                # Attach the complete trace (extraction + orchestrator phases) to
+                # each session graph before dumping so diagnostics["phases"] holds
+                # everything that fired this session.
+                trace.attach_to(session_graph)
+                with self._artifact_scope():
+                    on_session_extracted(session_graph, session_id, "graph")
+                    if proc_graph is not None:
+                        trace.attach_to(proc_graph)
+                        on_session_extracted(proc_graph, session_id, "procedural_graph")
+        except ExtractionFailed:
+            self.merger.reset_graph()
+            raise
 
         self.last_session_graph = session_graph
 
@@ -1506,6 +1516,41 @@ class ConsolidationLoop:
             pass
 
         return episodic_rels, procedural_rels
+
+    def _abort_on_local_parse_failure(self, trace: "ExtractionTrace", mark: int) -> None:
+        """Raise :class:`~paramem.graph.extractor.ExtractionFailed` when a
+        local-extraction phase recorded since *mark* failed to parse.
+
+        Reads ``trace.records[mark:]`` — the phase records appended by the
+        single extraction call the caller just made — via
+        :func:`~paramem.graph.extractor.local_parse_failure`, the one
+        implementation of this read. A slice, not the whole trace, is
+        required: ``extraction_trace`` nests as a no-op and
+        ``tests/conftest.py::_extraction_trace_scope`` wraps every test, so
+        ``trace.records`` also carries records from earlier in the same
+        scope.
+
+        A no-op when nothing in the slice failed — a legitimately-empty
+        extraction (no failed record) is not mistaken for a failure here.
+
+        Args:
+            trace: The active :class:`~paramem.graph.phase_trace.ExtractionTrace`
+                (``extract_session``'s own ``with extraction_trace() as
+                trace:`` scope).
+            mark: ``len(trace.records)`` captured immediately before the
+                extraction call this guard follows — both parameters are
+                call-local, produced two lines above each call site.
+
+        Raises:
+            ExtractionFailed: With ``phase`` set to the failing
+                local-extraction phase name and ``reason`` from the phase
+                record (falling back to a one-line description when the
+                record carries none).
+        """
+        record = local_parse_failure(trace.records[mark:])
+        if record is None:
+            return
+        raise ExtractionFailed(record.name, record.reason or f"{record.name} failed to parse")
 
     def _arbitrate_session_enrichment_incidents(
         self, session_graph: SessionGraph, session_id: str

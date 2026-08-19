@@ -2718,7 +2718,7 @@ async def lifespan(app: FastAPI):
     # packaged; a repo checkout always has them. Runs before anything expensive.
     from paramem.graph.prompts import ensure_prompt_assets
 
-    ensure_prompt_assets()
+    ensure_prompt_assets(prompts_dir=config.prompts_dir)
 
     from paramem.backup.encryption import (
         assert_mode_consistency as _assert_mode,
@@ -18992,9 +18992,18 @@ def _extract_pending_sessions(loop, *, lock_held: bool) -> _PendingExtraction:
       pending.
     - ``ExtractionFailed`` aborts the WHOLE batch: the extractor actively
       refused to bake a degraded snapshot, and proceeding with the other chunks
-      would silently commit a partial CV / document set.  Everything extracted
-      so far is dropped, ALL sessions stay pending, an ``extraction_failed``
-      incident is recorded, and the abort is RETURNED in
+      would silently commit a partial CV / document set.  Two origins reach
+      here — the cloud ``cloud_enrich`` stage, and (since the fail-loud
+      document-extraction design) a local-extraction pass
+      (``local_extract``/``second_order_extract``/``procedural_extract``)
+      whose output could not be parsed, detected inside
+      ``loop.extract_session`` before that session's merge.  By the time the
+      exception arrives here, ``loop.extract_session`` has already reset the
+      merger graph, so nothing this batch extracted — including any chunk
+      that merged successfully earlier in the same batch — survives in
+      ``loop.merger.graph``.  Everything extracted so far is dropped, ALL
+      sessions stay pending, an ``extraction_failed`` incident is recorded
+      keyed by the failing phase, and the abort is RETURNED in
       :attr:`_PendingExtraction.aborted` — never raised, so the caller can still
       see :attr:`_PendingExtraction.evicted_voice` and restore voice itself.
 

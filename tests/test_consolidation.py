@@ -338,55 +338,13 @@ class TestExtractionPathParity:
 
         return _f
 
-    def test_document_ownership_cue_prepended(self, monkeypatch, tmp_path):
-        """source_type='document' + speaker_name → the local extraction slot
-        (both extract_graph and extract_procedural_graph) is prefixed with the
-        ownership cue; session_transcript itself is untouched."""
-        from paramem.graph.schema import Entity, Relation, SessionGraph
-        from paramem.training.consolidation import OWNERSHIP_CUE
-
-        session_graph = SessionGraph(
-            session_id="s001",
-            timestamp="2026-01-01T00:00:00Z",
-            entities=[Entity(name="speaker0", entity_type="person")],
-            relations=[
-                Relation(
-                    subject="speaker0",
-                    predicate="leads",
-                    object="the team",
-                    relation_type="factual",
-                    speaker_id="speaker0",
-                )
-            ],
-        )
-        procedural_graph = SessionGraph(session_id="s001", timestamp="2026-01-01T00:00:00Z")
-
-        captured_graph: list[str] = []
-        captured_procedural: list[str] = []
-        loop = self._build_loop(
-            monkeypatch,
-            tmp_path,
-            procedural_enabled=True,
-            extract_graph_spy=self._capture_transcript_spy(captured_graph, session_graph),
-            extract_procedural_spy=self._capture_transcript_spy(
-                captured_procedural, procedural_graph
-            ),
-        )
-        body = "Alex Walker led the platform team."
-        loop.extract_session(
-            session_transcript=body,
-            session_id="s001",
-            speaker_id="speaker0",
-            speaker_name="Alex Walker",
-            source_type="document",
-        )
-
-        expected_cue = OWNERSHIP_CUE.format(name="Alex Walker", sid="speaker0")
-        assert captured_graph == [expected_cue + body]
-        assert captured_procedural == [expected_cue + body]
-
-    def test_transcript_source_no_cue(self, monkeypatch, tmp_path):
-        """source_type='transcript' → the extraction slot is the unmodified body."""
+    @pytest.mark.parametrize("source_type", ["transcript", "document"])
+    def test_transcript_reaches_extraction_unmodified(self, monkeypatch, tmp_path, source_type):
+        """``extract_session`` passes ``session_transcript`` straight through
+        to the extraction call, byte-for-byte, for every ``source_type`` —
+        the document-provenance directive is a TEMPLATE slot rendered by
+        :func:`~paramem.graph.extractor.build_document_context`, never a
+        prepend onto the transcript value itself."""
         from paramem.graph.schema import Entity, Relation, SessionGraph
 
         session_graph = SessionGraph(
@@ -419,54 +377,16 @@ class TestExtractionPathParity:
             session_id="s001",
             speaker_id="speaker0",
             speaker_name="Alex Walker",
-            source_type="transcript",
-        )
-
-        assert captured_graph == [body]
-
-    def test_anonymous_document_no_cue(self, monkeypatch, tmp_path):
-        """source_type='document' but speaker_name is None (anonymous speaker)
-        → no cue is prepended; nothing to bind the name to."""
-        from paramem.graph.schema import Entity, Relation, SessionGraph
-
-        session_graph = SessionGraph(
-            session_id="s001",
-            timestamp="2026-01-01T00:00:00Z",
-            entities=[Entity(name="Alex Walker", entity_type="person")],
-            relations=[
-                Relation(
-                    subject="Alex Walker",
-                    predicate="leads",
-                    object="the team",
-                    relation_type="factual",
-                    speaker_id="speaker0",
-                )
-            ],
-        )
-        procedural_graph = SessionGraph(session_id="s001", timestamp="2026-01-01T00:00:00Z")
-
-        captured_graph: list[str] = []
-        loop = self._build_loop(
-            monkeypatch,
-            tmp_path,
-            procedural_enabled=True,
-            extract_graph_spy=self._capture_transcript_spy(captured_graph, session_graph),
-            extract_procedural_spy=self._capture_transcript_spy([], procedural_graph),
-        )
-        body = "Alex Walker led the platform team."
-        loop.extract_session(
-            session_transcript=body,
-            session_id="s001",
-            speaker_id="speaker0",
-            speaker_name=None,
-            source_type="document",
+            source_type=source_type,
         )
 
         assert captured_graph == [body]
 
     def test_extraction_pipeline_forwards_source_type(self):
         """ExtractionPipeline.kwargs forwards source_type into the returned
-        dict so extract_graph receives Guard B (guards the Edit 5 wiring)."""
+        dict so extract_graph receives what it needs to select the
+        ``{document_context}`` rendering and gate the document-only
+        exact-full-name speaker rewrite."""
         from unittest.mock import MagicMock
 
         from paramem.graph.extraction_pipeline import ExtractionConfig, ExtractionPipeline
@@ -478,6 +398,266 @@ class TestExtractionPathParity:
         )
         result = pipeline.kwargs(source_type="document", speaker_id="speaker0")
         assert result["source_type"] == "document"
+
+
+class TestLocalParseFailureAbortsFold:
+    """A local-extraction parse failure detected via
+    ``ConsolidationLoop._abort_on_local_parse_failure`` raises
+    ``ExtractionFailed`` before that session's merge, and the merger graph
+    is reset before the exception leaves ``extract_session`` — the
+    fail-loud document-extraction design. A legitimately-empty extraction
+    (no failed phase record) is not mistaken for a failure."""
+
+    def _build_loop(self, monkeypatch, tmp_path, procedural_enabled: bool = False):
+        from peft import PeftModel
+
+        from paramem.graph.schema import SessionGraph
+        from paramem.memory.store import MemoryStore as _MS
+        from paramem.utils.config import AdapterConfig, ConsolidationConfig, TrainingConfig
+
+        model = MagicMock()
+        model.__class__ = PeftModel
+        model.peft_config = {"episodic": MagicMock(), "semantic": MagicMock()}
+        if procedural_enabled:
+            model.peft_config["procedural"] = MagicMock()
+        procedural_adapter = AdapterConfig() if procedural_enabled else None
+
+        # extract_graph / extract_procedural_graph are never reached in
+        # these tests — every call goes through loop.extraction.run /
+        # loop.extraction.run_procedural, patched per-test below — but the
+        # module bindings must still resolve at ConsolidationLoop
+        # construction time.
+        monkeypatch.setattr(
+            "paramem.graph.extraction_pipeline.extract_graph",
+            lambda *a, **kw: SessionGraph(session_id="unused", timestamp="2026-01-01T00:00:00Z"),
+        )
+        monkeypatch.setattr(
+            "paramem.graph.extraction_pipeline.extract_procedural_graph",
+            lambda *a, **kw: SessionGraph(session_id="unused", timestamp="2026-01-01T00:00:00Z"),
+        )
+
+        loop = ConsolidationLoop(
+            model=model,
+            tokenizer=MagicMock(),
+            consolidation_config=ConsolidationConfig(),
+            training_config=TrainingConfig(),
+            episodic_adapter_config=AdapterConfig(),
+            semantic_adapter_config=AdapterConfig(),
+            memory_store=_MS(),
+            procedural_adapter_config=procedural_adapter,
+            output_dir=tmp_path,
+            extraction_scrub={"person name"},
+            extraction_max_tokens=8192,
+            extraction_plausibility_max_tokens=8192,
+            extraction_anonymize_token_envelope=8192,
+        )
+        loop.fingerprint_cache = None
+        return loop
+
+    def _populated_session_graph(self, session_id: str = "s1"):
+        from paramem.graph.schema import Entity, Relation, SessionGraph
+
+        return SessionGraph(
+            session_id=session_id,
+            timestamp="2026-01-01T00:00:00Z",
+            entities=[
+                Entity(name="Alex", entity_type="person"),
+                Entity(name="Millfield", entity_type="place"),
+            ],
+            relations=[
+                Relation(
+                    subject="Alex",
+                    predicate="lives_in",
+                    object="Millfield",
+                    relation_type="factual",
+                    speaker_id="speaker0",
+                ),
+            ],
+        )
+
+    def _empty_graph(self, session_id: str = "s1"):
+        from paramem.graph.schema import SessionGraph
+
+        return SessionGraph(session_id=session_id, timestamp="2026-01-01T00:00:00Z")
+
+    def _failed_phase_side_effect(self, phase_name: str, session_id: str = "s1"):
+        """Build an ``extraction.run``/``run_procedural`` replacement that
+        records a ``"failed"`` phase — matching exactly what
+        ``_run_local_extraction`` itself does on an unparseable raw
+        output — and returns an empty graph."""
+        from paramem.graph.phase_trace import phase_trace
+
+        def _run(*args, **kwargs):
+            with phase_trace(phase_name) as t:
+                t.set_outcome("failed", reason="ValueError: bad json")
+            return self._empty_graph(session_id)
+
+        return _run
+
+    def test_local_extract_failure_raises_and_skips_merge(self, monkeypatch, tmp_path):
+        """An episodic-pass parse failure (``local_extract``) raises before
+        the LATER procedural pass ever runs, and before either graph
+        reaches ``merger.merge`` — ``procedural_enabled=True`` here is the
+        crux: it proves the abort gates the procedural stage, not merely
+        the episodic merge that happens to sit next to it."""
+        from unittest.mock import patch
+
+        from paramem.graph.extractor import ExtractionFailed
+
+        loop = self._build_loop(monkeypatch, tmp_path, procedural_enabled=True)
+        with patch.object(
+            loop.extraction, "run", side_effect=self._failed_phase_side_effect("local_extract")
+        ):
+            with patch.object(loop.extraction, "run_procedural") as mock_run_procedural:
+                with patch.object(loop.merger, "merge") as mock_merge:
+                    with pytest.raises(ExtractionFailed) as exc_info:
+                        loop.extract_session("t", "s1", speaker_id="speaker0")
+        assert exc_info.value.phase == "local_extract"
+        mock_run_procedural.assert_not_called()
+        mock_merge.assert_not_called()
+
+    def test_second_order_extract_failure_raises_and_skips_merge(self, monkeypatch, tmp_path):
+        from unittest.mock import patch
+
+        from paramem.graph.extractor import ExtractionFailed
+
+        loop = self._build_loop(monkeypatch, tmp_path)
+        with patch.object(
+            loop.extraction,
+            "run",
+            side_effect=self._failed_phase_side_effect("second_order_extract"),
+        ):
+            with patch.object(loop.merger, "merge") as mock_merge:
+                with pytest.raises(ExtractionFailed) as exc_info:
+                    loop.extract_session("t", "s1", speaker_id="speaker0")
+        assert exc_info.value.phase == "second_order_extract"
+        mock_merge.assert_not_called()
+
+    def test_procedural_extract_failure_raises_and_procedural_graph_never_merges(
+        self, monkeypatch, tmp_path
+    ):
+        from unittest.mock import patch
+
+        from paramem.graph.extractor import ExtractionFailed
+
+        loop = self._build_loop(monkeypatch, tmp_path, procedural_enabled=True)
+        session_graph = self._populated_session_graph()
+        with (
+            patch.object(loop.extraction, "run", return_value=session_graph),
+            patch.object(
+                loop.extraction,
+                "run_procedural",
+                side_effect=self._failed_phase_side_effect("procedural_extract"),
+            ),
+            patch.object(loop.merger, "merge", wraps=loop.merger.merge) as mock_merge,
+        ):
+            with pytest.raises(ExtractionFailed) as exc_info:
+                loop.extract_session("t", "s1", speaker_id="speaker0", speaker_name=None)
+        assert exc_info.value.phase == "procedural_extract"
+        # Only the episodic session_graph reached merger.merge — the empty,
+        # failed procedural graph never did.
+        mock_merge.assert_called_once()
+        merged_graph = mock_merge.call_args[0][0]
+        assert merged_graph is session_graph
+
+    def test_legitimately_empty_extraction_does_not_raise(self, monkeypatch, tmp_path):
+        from unittest.mock import patch
+
+        from paramem.graph.phase_trace import phase_trace
+
+        loop = self._build_loop(monkeypatch, tmp_path)
+
+        def _ok_empty(*args, **kwargs):
+            with phase_trace("local_extract"):
+                pass
+            return self._empty_graph()
+
+        with patch.object(loop.extraction, "run", side_effect=_ok_empty):
+            episodic, procedural = loop.extract_session("t", "s1", speaker_id="speaker0")
+        assert episodic == []
+        assert procedural == []
+
+    def test_merger_graph_reset_on_local_parse_failure_abort(self, monkeypatch, tmp_path):
+        from unittest.mock import patch
+
+        from paramem.graph.extractor import ExtractionFailed
+
+        loop = self._build_loop(monkeypatch, tmp_path)
+        session_graph = self._populated_session_graph(session_id="s1")
+        with patch.object(loop.extraction, "run", return_value=session_graph):
+            loop.extract_session("t1", "s1", speaker_id="speaker0")
+        assert loop.merger.graph.number_of_nodes() > 0, (
+            "sanity: the first session must have merged before the abort"
+        )
+
+        with patch.object(
+            loop.extraction,
+            "run",
+            side_effect=self._failed_phase_side_effect("local_extract", session_id="s2"),
+        ):
+            with pytest.raises(ExtractionFailed):
+                loop.extract_session("t2", "s2", speaker_id="speaker0")
+
+        assert loop.merger.graph.number_of_nodes() == 0
+        assert loop._capture_pending_relations() == []
+
+    def test_merger_graph_reset_on_cloud_enrich_origin_abort(self, monkeypatch, tmp_path):
+        """The same reset fires for the OTHER ``ExtractionFailed`` origin —
+        a raise from inside ``ExtractionPipeline.run`` itself (the
+        pre-existing ``cloud_enrich`` abort) — one invalidation site
+        covering both raise origins."""
+        from unittest.mock import patch
+
+        from paramem.graph.extractor import ExtractionFailed
+
+        loop = self._build_loop(monkeypatch, tmp_path)
+        session_graph = self._populated_session_graph(session_id="s1")
+        with patch.object(loop.extraction, "run", return_value=session_graph):
+            loop.extract_session("t1", "s1", speaker_id="speaker0")
+        assert loop.merger.graph.number_of_nodes() > 0, (
+            "sanity: the first session must have merged before the abort"
+        )
+
+        def _raise_cloud_enrich(*args, **kwargs):
+            raise ExtractionFailed("cloud_enrich", "cloud boom")
+
+        with patch.object(loop.extraction, "run", side_effect=_raise_cloud_enrich):
+            with pytest.raises(ExtractionFailed):
+                loop.extract_session("t2", "s2", speaker_id="speaker0")
+
+        assert loop.merger.graph.number_of_nodes() == 0
+        assert loop._capture_pending_relations() == []
+
+    def test_vram_exhausted_escapes_extract_session_uncaught(self, monkeypatch, tmp_path):
+        """``VramExhausted`` is deliberately NOT caught by ``extract_session``'s
+        ``except ExtractionFailed`` — per-chunk isolation means it must
+        propagate straight through, uncaught and unwidened, and must NOT
+        trigger the merger-graph reset that ``ExtractionFailed`` does: an
+        earlier session already merged this fold survives. Pins the scope
+        of the handler so a future edit cannot silently widen it to also
+        swallow/reset on ``VramExhausted``."""
+        from unittest.mock import patch
+
+        from paramem.utils.vram_guard import VramExhausted
+
+        loop = self._build_loop(monkeypatch, tmp_path)
+        session_graph = self._populated_session_graph(session_id="s1")
+        with patch.object(loop.extraction, "run", return_value=session_graph):
+            loop.extract_session("t1", "s1", speaker_id="speaker0")
+        assert loop.merger.graph.number_of_nodes() > 0, (
+            "sanity: the first session must have merged before the VramExhausted raise"
+        )
+
+        def _raise_vram(*args, **kwargs):
+            raise VramExhausted("s2")
+
+        with patch.object(loop.extraction, "run", side_effect=_raise_vram):
+            with pytest.raises(VramExhausted):
+                loop.extract_session("t2", "s2", speaker_id="speaker0")
+
+        # Per-chunk isolation, unlike the ExtractionFailed abort tests above:
+        # the first session's merge is NOT reset.
+        assert loop.merger.graph.number_of_nodes() > 0
 
 
 class TestInterimRefinementGate:

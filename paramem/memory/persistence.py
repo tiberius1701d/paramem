@@ -1398,9 +1398,10 @@ def commit_tier_slot(
 
     from paramem.memory.interim_adapter import adapter_slot_root_for_name
 
-    # Store keys are written under the adapter NAME (per
-    # MemoryStore.put(tier=adapter_name, ...) in run_consolidation_cycle), so
-    # registry / simhash / graph projections must read under the same key.
+    # Store keys are written under the adapter NAME (the go-live adoption
+    # installs each increment under ``inc.tier`` == adapter name, see
+    # MemoryStore.adopt_increments), so registry / simhash / graph
+    # projections must read under the same key.
     # `tier` is retained for log messages and the on-disk slot hierarchy via
     # adapter_slot_root_for_name (which dispatches by adapter_name internally).
     # registry() always returns a KeyRegistry (setdefault auto-creates on first

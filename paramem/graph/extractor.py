@@ -4,6 +4,7 @@ import contextlib
 import json
 import logging
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -33,7 +34,7 @@ from paramem.config.taxonomy import (
     relation_types,
 )
 from paramem.evaluation.recall import generate_answer
-from paramem.graph.phase_trace import extraction_trace, phase_trace
+from paramem.graph.phase_trace import PhaseRecord, extraction_trace, phase_trace
 from paramem.graph.prompts import _load_prompt
 from paramem.graph.relation_build import build_relations
 from paramem.graph.schema import SessionGraph
@@ -46,24 +47,33 @@ logger = logging.getLogger(__name__)
 
 
 class ExtractionFailed(RuntimeError):
-    """Raised when a load-bearing extraction phase fails and the cycle
-    must be aborted for this session.
+    """Raised to abort the whole extraction batch for the current fold.
 
-    Currently raised from the ``cloud_enrich`` phase when the cloud
-    enrichment call fails (parse failure or upstream non-2xx — including
-    Anthropic 529 overloaded), because falling back to pre-enrichment
-    facts silently bakes a degraded snapshot into the cumulative graph.
+    Two raise origins: the ``cloud_enrich`` stage
+    (``paramem/graph/stage_enrich.py``) when the cloud enrichment call
+    fails (parse failure or upstream non-2xx — including Anthropic 529
+    overloaded), and a local-extraction parse failure detected at the
+    :meth:`~paramem.training.consolidation.ConsolidationLoop.extract_session`
+    boundary (a ``local_extract``, ``second_order_extract``, or
+    ``procedural_extract`` phase recorded ``outcome="failed"`` — see
+    :func:`local_parse_failure`).
 
-    The per-session caller (``_extract_and_start_training`` /
-    ``_extract_and_start_training`` in ``app.py``) catches this and
-    treats it like ``VramExhausted``: log, leave the session pending
-    (skip ``mark_consolidated``), continue with the next session.  The
-    cumulative graph is unmodified because the failure propagates
-    BEFORE :meth:`ConsolidationLoop.extract_session` reaches the merge
-    call.
+    On an ``ExtractionFailed`` abort — this exception specifically, not
+    any abort — ``extract_session`` resets the merger graph before the
+    exception leaves the method, so the fold's accumulated extraction
+    state is invalidated: nothing the aborted session (or an earlier
+    session already merged into this fold) contributed can leak into a
+    later fold via ``_capture_pending_relations``.
+
+    The per-session caller (``_extract_pending_sessions`` in ``app.py``)
+    catches this, records a durable incident keyed by ``phase``, sets
+    :attr:`_PendingExtraction.aborted`, and retires nothing — every
+    session in the batch, including ones extracted earlier in the same
+    batch, stays pending for the next tick.
 
     ``phase`` names the extraction phase that failed (e.g.
-    ``"cloud_enrich"``).  ``reason`` is a short operator-facing string.
+    ``"cloud_enrich"``, ``"local_extract"``).  ``reason`` is a short
+    operator-facing string.
     """
 
     def __init__(self, phase: str, reason: str) -> None:
@@ -325,13 +335,19 @@ def _wait_for_gpu_ready(*, pre_settle_seconds: float = 10.0) -> None:
 # extraction-prompt source of truth.  The transcript prompt-pair is
 # used for every source_type; document chunks land in the same
 # ``{transcript}`` slot at the chat-template layer.  Per-source
-# extension goes via overrides or by prepending/appending content to
-# the slot at the caller layer — never via parallel file pairs.  The
-# old DOCUMENT_*_FILENAME constants and their backing files are
-# retired (would silently drift on schema-shape rules).
+# extension is a TEMPLATE slot (``{document_context}``, rendered by
+# :func:`build_document_context`) fed from ``source_type`` plus the
+# speaker fields already threaded through every local-extraction call
+# — never a prepend/append onto the slot content, and never a parallel
+# file pair.  The old DOCUMENT_*_FILENAME constants and their backing
+# files are retired (would silently drift on schema-shape rules).
 DEFAULT_SYSTEM_PROMPT_FILENAME = "extraction_system.txt"
 DEFAULT_USER_PROMPT_FILENAME = "extraction.txt"
 DEFAULT_PROCEDURAL_USER_PROMPT_FILENAME = "extraction_procedural.txt"
+# Loaded by :func:`build_document_context` — the document-provenance
+# directive slotted into ``{document_context}`` for a document-source
+# extraction pass with a known speaker.
+DEFAULT_DOCUMENT_CONTEXT_PROMPT_FILENAME: str = "document_directive.txt"
 
 
 def build_speaker_context(
@@ -373,6 +389,57 @@ def build_speaker_context(
     # context so the placeholder reference is consistent throughout.
     effective_name = speaker_name or speaker_id
     return "\n" + template.format(speaker_id=speaker_id, speaker_name=effective_name) + "\n"
+
+
+def build_document_context(
+    source_type: str,
+    speaker_id: str | None,
+    speaker_name: str | None,
+    *,
+    prompts_dir: str | Path | None = None,
+    model: str | None = None,
+) -> str:
+    """Render the document-provenance directive for the ``{document_context}``
+    slot every extraction user template declares immediately before
+    ``{transcript}``.
+
+    Loads ``configs/prompts/document_directive.txt`` (per-file, per-model
+    resolution — see :func:`~paramem.graph.prompts._load_prompt`) and slots
+    in ``{speaker_id}`` / ``{speaker_name}``, so a document chunk narrated
+    in the third person (e.g. a CV: "Alex Walker led the team") carries an
+    explicit instruction binding the provider's own facts onto the stable
+    speaker id.
+
+    Returns ``""`` unless ``source_type == "document"`` and both
+    ``speaker_id`` and ``speaker_name`` are non-empty — the exact guard the
+    retired caller-layer prepend used, plus the id requirement the
+    template's ``{speaker_id}`` slot implies.  The guard runs BEFORE the
+    prompt load, so a non-document (or nameless) pass records no
+    provenance entry for a fragment that never rendered.
+
+    On the rendering path, the loaded template is ``.format()``-ed with
+    ``speaker_id``/``speaker_name`` and ``"\\n\\n"`` is appended — the
+    identical separator the retired prepend used — so the slot renders
+    immediately before ``{transcript}`` with no gap or overlap.
+
+    Args:
+        source_type: ``"transcript"`` or ``"document"``.  Only
+            ``"document"`` can render non-empty content.
+        speaker_id: Stable speaker id (e.g. ``"speaker0"``).  Empty/``None``
+            suppresses the directive.
+        speaker_name: Display name of the speaker.  Empty/``None``
+            suppresses the directive — an anonymous provider has no name to
+            bind facts to.
+        prompts_dir: Forwarded to :func:`~paramem.graph.prompts._load_prompt`
+            for per-deployment prompt overrides.
+        model: Model alias forwarded to :func:`~paramem.graph.prompts._load_prompt`
+            for per-model prompt overrides.
+    """
+    if source_type != "document" or not speaker_id or not speaker_name:
+        return ""
+    pd = Path(prompts_dir) if prompts_dir else None
+    template = _load_prompt(DEFAULT_DOCUMENT_CONTEXT_PROMPT_FILENAME, prompts_dir=pd, model=model)
+    return template.format(speaker_id=speaker_id, speaker_name=speaker_name) + "\n\n"
 
 
 def load_extraction_prompts(
@@ -490,7 +557,9 @@ def extract_procedural_graph(
         source_type: ``"transcript"`` (default) or ``"document"``. Forwarded
             to :func:`_stamp_speaker_entity` as the Guard B gate for the
             document-only exact-full-name rewrite of third-person speaker
-            mentions onto ``speaker_id``.
+            mentions onto ``speaker_id``, and to :func:`build_document_context`
+            to select the ``{document_context}`` rendering (non-empty only
+            for ``"document"`` with a known speaker; empty otherwise).
     """
     with extraction_trace() as trace:
         graph = _run_local_extraction(
@@ -558,12 +627,20 @@ def _run_local_extraction(
     — mirrors pre-carve-out ``local_extract`` behaviour. The caller decides
     what an empty result means (``local_extract``'s caller returns
     immediately; ``second_order_extract``'s caller has nothing to union).
+    The empty graph's phase record carries the parse error as ``reason``
+    and the raw output intact; ``ConsolidationLoop.extract_session`` reads
+    that record via :func:`local_parse_failure` and aborts the fold, while
+    ``/calibrate/extract`` and the cloud-egress caller (``anonymize_turn``)
+    keep the empty-graph contract unchanged — a parse failure is not
+    load-bearing for either of those callers, so this function never raises
+    on it itself; only the consolidation boundary escalates.
 
     Args:
         extra_slots: Additional ``.format()`` kwargs for the user prompt
-            template, beyond the always-supplied ``transcript`` and
-            ``speaker_context``. ``None`` (default) supplies none — every
-            existing caller is unaffected. ``second_order_extract`` passes
+            template, beyond the always-supplied ``transcript``,
+            ``speaker_context`` and ``document_context``. ``None`` (default)
+            supplies none — every existing caller is unaffected.
+            ``second_order_extract`` passes
             ``{"named_people": ...}`` to thread its gate-derived closed
             target set into ``extraction_second_order.txt``'s
             ``{named_people}`` slot.
@@ -597,6 +674,7 @@ def _run_local_extraction(
             seed=seed,
             vram_label=vram_label,
             extra_slots=extra_slots,
+            source_type=source_type,
         )
         t.set_raw(raw_output)
         logger.debug("Raw extraction output (%s): %s", phase_name, raw_output[:500])
@@ -627,6 +705,40 @@ def _run_local_extraction(
     return graph
 
 
+# The three ``phase_name`` values :func:`_run_local_extraction` is invoked
+# with — owned here because this function is what sets their ``outcome``.
+LOCAL_EXTRACTION_PHASES: frozenset[str] = frozenset(
+    {"local_extract", "second_order_extract", "procedural_extract"}
+)
+
+
+def local_parse_failure(records: Iterable[PhaseRecord]) -> PhaseRecord | None:
+    """First local-extraction phase record in *records* that failed to parse.
+
+    Reads the phase-trace outcome :func:`_run_local_extraction` already
+    sets on a parse failure (``outcome="failed"``) — the single
+    implementation of this read; callers (currently
+    :meth:`~paramem.training.consolidation.ConsolidationLoop.extract_session`)
+    never re-derive it. Only records whose ``name`` is in
+    :data:`LOCAL_EXTRACTION_PHASES` are eligible — a ``"failed"`` outcome
+    on any other phase (e.g. ``cloud_enrich``, which already raises
+    :class:`ExtractionFailed` itself) is out of scope for this check.
+
+    Args:
+        records: Phase records to scan, in the order they fired — typically
+            a slice of :attr:`~paramem.graph.phase_trace.ExtractionTrace.records`
+            covering one extraction call.
+
+    Returns:
+        The first matching failed :class:`~paramem.graph.phase_trace.PhaseRecord`,
+        or ``None`` when none of *records* is a failed local-extraction phase.
+    """
+    for record in records:
+        if record.name in LOCAL_EXTRACTION_PHASES and record.outcome == "failed":
+            return record
+    return None
+
+
 def _generate_extraction(
     model,
     tokenizer,
@@ -643,6 +755,7 @@ def _generate_extraction(
     seed: int | None = None,
     vram_label: str = "extract_main",
     extra_slots: dict[str, str] | None = None,
+    source_type: str = "transcript",
 ) -> str:
     """Generate graph extraction output from the model. Called once.
 
@@ -652,6 +765,10 @@ def _generate_extraction(
     ``speaker_id`` (e.g. ``"speaker0"``) as the subject of every extracted
     speaker-fact, with the display ``speaker_name`` supplied as comprehension
     context so the model maps self-references onto the id.
+
+    The ``{document_context}`` placeholder is always supplied too, via
+    :func:`build_document_context` — rendered directive content for a
+    document-source pass with a known speaker, empty string otherwise.
 
     The system prompt is passed verbatim — no slot substitution is performed
     on it.  One prompt-pair serves every source type — document chunks land
@@ -671,16 +788,17 @@ def _generate_extraction(
     ``"procedural"``) override it.
 
     ``extra_slots`` supplies additional **user**-template ``.format()``
-    kwargs alongside ``transcript``/``speaker_context`` — e.g.
-    ``second_order_extract`` supplies ``{"named_people": ...}`` for
+    kwargs alongside ``transcript``/``speaker_context``/``document_context``
+    — e.g. ``second_order_extract`` supplies ``{"named_people": ...}`` for
     ``extraction_second_order.txt``'s ``{named_people}`` slot. ``None``
     (default) adds nothing; a caller whose template references a slot not
     supplied here or by ``extra_slots`` raises ``KeyError`` at
     ``.format()`` time. A key in ``extra_slots`` that collides with
-    ``transcript``/``speaker_context`` raises ``TypeError`` (``dict()``'s
-    own "got multiple values for keyword argument" — the kwargs dict is
-    built as ``dict(transcript=..., speaker_context=..., **extra_slots)``)
-    rather than silently overwriting either always-supplied slot.
+    ``transcript``/``speaker_context``/``document_context`` raises
+    ``TypeError`` (``dict()``'s own "got multiple values for keyword
+    argument" — the kwargs dict is built as ``dict(transcript=...,
+    speaker_context=..., document_context=..., **(extra_slots or {}))``)
+    rather than silently overwriting any always-supplied slot.
     """
     system, prompt = load_extraction_prompts(
         prompts_dir,
@@ -689,9 +807,13 @@ def _generate_extraction(
         model=model_alias,
     )
     speaker_context = build_speaker_context(speaker_id, speaker_name)
+    document_context = build_document_context(
+        source_type, speaker_id, speaker_name, prompts_dir=prompts_dir, model=model_alias
+    )
     format_kwargs = dict(
         transcript=transcript,
         speaker_context=speaker_context,
+        document_context=document_context,
         **(extra_slots or {}),
     )
     messages = [

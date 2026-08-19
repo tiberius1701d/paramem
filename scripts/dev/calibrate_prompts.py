@@ -131,7 +131,7 @@ def _load_chunks(path: Path, source_type_override: str | None) -> tuple[list[dic
 
 
 _STAGE_PROMPTS: dict[str, tuple[str, ...]] = {
-    "extract": ("extract_user", "extract_system"),
+    "extract": ("extract_user", "extract_system", "document_directive"),
     "anonymize": ("anonymize",),
     "enrich": ("enrich",),
     "plausibility": ("plausibility",),
@@ -589,6 +589,7 @@ _STAGE_FILENAME = {
     # a runtime gate-default flag but no longer selects prompt files.
     "extract_user": "extraction.txt",
     "extract_system": "extraction_system.txt",
+    "document_directive": "document_directive.txt",
     "anonymize": "anonymization.txt",
     "enrich": "cloud_enrichment.txt",
     "plausibility": "cloud_plausibility.txt",

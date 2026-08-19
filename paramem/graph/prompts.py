@@ -75,6 +75,7 @@ _REQUIRED_PROMPT_FILES = (
     "extraction.txt",
     "extraction_system.txt",
     "extraction_procedural.txt",
+    "document_directive.txt",
     "speaker_directive.txt",
     "trained_recall.txt",
     "serving_system.txt",
@@ -84,9 +85,27 @@ _REQUIRED_PROMPT_FILES = (
     "recall_selection.txt",
 )
 
+# The extraction user templates — every one of these local-extraction call
+# sites always supplies every slot in _ALWAYS_SUPPLIED_EXTRACTION_SLOTS (see
+# paramem.graph.extractor._generate_extraction).  A per-model or operator
+# copy that drops one is a config-load failure (str.format ignores surplus
+# kwargs, so the drop would silently revert that copy to cue-less/context-
+# less extraction), not a runtime surprise — checked by ensure_prompt_assets.
+_EXTRACTION_USER_TEMPLATES = (
+    "extraction.txt",
+    "extraction_second_order.txt",
+    "extraction_procedural.txt",
+)
+# {named_people} is deliberately NOT here: it is an extra_slots member
+# supplied by one caller (second_order_extract) and has its own existing
+# guard (TestSecondOrderExtractionPromptRenderAllVariants).
+_ALWAYS_SUPPLIED_EXTRACTION_SLOTS = ("{transcript}", "{speaker_context}", "{document_context}")
 
-def ensure_prompt_assets() -> None:
-    """Fail loudly when the shared prompt assets are missing at startup.
+
+def ensure_prompt_assets(*, prompts_dir: Path | None = None) -> None:
+    """Fail loudly when the shared prompt assets are missing at startup, or
+    when a resolvable extraction user template drops a slot every
+    local-extraction call always supplies.
 
     ParaMem deploys from a repo checkout (editable install under systemd), so
     ``configs/prompts/`` — the guaranteed final fallback in ``_load_prompt``'s
@@ -95,9 +114,32 @@ def ensure_prompt_assets() -> None:
     (prompts are not shipped as package data). Surface that at boot instead of
     letting the extraction pipeline silently load empty prompts.
 
+    The slot gate walks ``([prompts_dir] if prompts_dir is not None else [])
+    + [_DEFAULT_PROMPT_DIR]`` and each walked directory's immediate
+    subdirectories (per-model override dirs). Roots are deduped by
+    ``resolve()`` before walking — the default deployment has
+    ``paths.prompts`` equal to the shipped dir, so without the dedupe the
+    identical tree would be walked twice and every missing-slot report
+    would appear duplicated. For every :data:`_EXTRACTION_USER_TEMPLATES`
+    file that exists in a walked directory, every
+    :data:`_ALWAYS_SUPPLIED_EXTRACTION_SLOTS` literal must appear in its
+    raw text — a template silently missing the cue slot is a config-load
+    failure, not a runtime surprise (``str.format`` ignores surplus
+    kwargs, so a per-model copy without the slot would silently revert
+    that model to cue-less document extraction).
+
+    Args:
+        prompts_dir: Operator-configured ``paths.prompts`` override
+            (``ServerConfig.prompts_dir``), passed by the server's lifespan
+            startup at its one call site. ``None`` (default — tests, any
+            caller with no config) checks only the shipped
+            ``configs/prompts/`` tree; the walk never constructs ``Path(None)``.
+
     Raises:
-        RuntimeError: When ``_DEFAULT_PROMPT_DIR`` is not a directory, or a
-            required prompt file is absent from it.
+        RuntimeError: When ``_DEFAULT_PROMPT_DIR`` is not a directory, a
+            required prompt file is absent from it, or an extraction user
+            template resolvable under the walked directories is missing one
+            of the slots every local-extraction call always supplies.
     """
     if not _DEFAULT_PROMPT_DIR.is_dir():
         raise RuntimeError(
@@ -110,6 +152,37 @@ def ensure_prompt_assets() -> None:
         raise RuntimeError(
             f"Required prompt file(s) missing from {_DEFAULT_PROMPT_DIR}: "
             f"{', '.join(missing)}. Restore configs/prompts/ from the repository."
+        )
+
+    search_roots = ([prompts_dir] if prompts_dir is not None else []) + [_DEFAULT_PROMPT_DIR]
+    walked: list[Path] = []
+    seen_resolved: set[Path] = set()
+    for root in search_roots:
+        if not root.is_dir():
+            continue
+        resolved = root.resolve()
+        if resolved in seen_resolved:
+            # The default deployment has paths.prompts == the shipped dir
+            # (both resolve to the same tree) — walking it twice would
+            # duplicate every missing-slot report below.
+            continue
+        seen_resolved.add(resolved)
+        walked.append(root)
+        walked.extend(d for d in root.iterdir() if d.is_dir())
+
+    slot_failures: list[str] = []
+    for directory in walked:
+        for filename in _EXTRACTION_USER_TEMPLATES:
+            path = directory / filename
+            if not path.is_file():
+                continue
+            content = path.read_text(encoding="utf-8")
+            missing_slots = [s for s in _ALWAYS_SUPPLIED_EXTRACTION_SLOTS if s not in content]
+            if missing_slots:
+                slot_failures.append(f"{path}: missing {', '.join(missing_slots)}")
+    if slot_failures:
+        raise RuntimeError(
+            "Extraction user template(s) missing a required slot: " + "; ".join(slot_failures)
         )
 
 
@@ -198,9 +271,10 @@ def _load_prompt(
 
     Single chokepoint for ALL model-facing prompt text in the codebase
     (extraction.txt, extraction_system.txt, extraction_procedural.txt,
-    anonymization.txt, cloud_enrichment.txt, cloud_plausibility.txt,
-    trained_recall.txt, serving_system.txt, …). No inline prompt literals
-    live in Python; every string a model sees resolves through here.
+    document_directive.txt, anonymization.txt, cloud_enrichment.txt,
+    cloud_plausibility.txt, trained_recall.txt, serving_system.txt, …). No
+    inline prompt literals live in Python; every string a model sees
+    resolves through here.
 
     Resolution is per-file, per-model.  When *model* is provided, the
     search order is::

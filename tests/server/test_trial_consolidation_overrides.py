@@ -809,3 +809,53 @@ class TestRunTrialConsolidationMissingConfig:
         assert gates["status"] == "trial_exception"
         assert "exception" in gates
         assert "_state['config'] is missing" in gates["exception"]
+
+
+class TestRunExtractionPhasePropagatesExtractionFailed:
+    """``_run_extraction_phase`` (the trial path's own extract-all, a
+    near-duplicate of ``_extract_pending_sessions`` that bypasses
+    ``retirable``) has no per-chunk isolation and no abort-reporting
+    result field for ``ExtractionFailed`` — unlike ``_extract_pending_sessions``,
+    it does not catch it at all, so a local-extraction parse failure must
+    propagate straight to the caller. Its only production caller passes
+    ``mark_sessions=False`` and wraps the call in its own
+    ``except Exception as _exc: exc_captured = _exc`` (the trial dispatch's
+    gate machinery, exercised end-to-end elsewhere in this module) — this
+    test pins the propagation itself, directly, so a future ``except``
+    added inside ``_run_extraction_phase`` cannot silently reinstate a
+    swallow."""
+
+    def test_local_extraction_failure_propagates_uncaught(self, tmp_path, monkeypatch):
+        from unittest.mock import MagicMock, patch
+
+        from paramem.graph.extractor import ExtractionFailed
+        from paramem.server.config import PathsConfig, ServerConfig
+        from paramem.server.session_buffer import SessionBuffer
+
+        config = ServerConfig()
+        ha = tmp_path / "ha"
+        config.paths = PathsConfig(data=ha, sessions=ha / "sessions", debug=ha / "debug")
+        (ha / "adapters").mkdir(parents=True, exist_ok=True)
+
+        buffer = SessionBuffer(ha / "sessions", debug=False)
+        buffer.set_speaker("s1", "speaker0", "speaker0")
+        buffer.append("s1", "user", "Hello, this is a test session.")
+
+        loop = MagicMock()
+        loop.shutdown_requested = False
+        loop.extract_session = MagicMock(
+            side_effect=ExtractionFailed("local_extract", "ValueError: bad json")
+        )
+
+        no_lock = MagicMock()
+        no_lock.__enter__ = MagicMock(return_value=None)
+        no_lock.__exit__ = MagicMock(return_value=False)
+
+        state = {"config": config, "session_buffer": buffer, "speaker_store": None}
+        monkeypatch.setattr(app_module, "_state", state)
+
+        with patch("paramem.server.app.vram_scope", return_value=no_lock):
+            with pytest.raises(ExtractionFailed) as exc_info:
+                app_module._run_extraction_phase(loop, mark_sessions=False)
+
+        assert exc_info.value.phase == "local_extract"

@@ -3798,6 +3798,195 @@ class TestSpeakerContextInjection:
         )
 
 
+class TestDocumentContextInjection:
+    """``build_document_context`` renders the document-provenance directive
+    into the ``{document_context}`` slot every extraction user template
+    declares immediately before ``{transcript}`` — the externalized
+    replacement for the retired caller-layer transcript prepend."""
+
+    def test_document_source_with_display_name_renders_directive(self):
+        """source_type='document' with both speaker_id and speaker_name
+        renders the directive naming both."""
+        from paramem.graph.extractor import build_document_context
+
+        out = build_document_context("document", "speaker0", "Alex Walker")
+        assert "speaker0" in out
+        assert "Alex Walker" in out
+        assert out.endswith("\n\n")
+
+    def test_transcript_source_renders_nothing(self):
+        """source_type='transcript' never renders the directive, even with
+        a fully-known speaker — nothing to bind a first-person transcript
+        to."""
+        from paramem.graph.extractor import build_document_context
+
+        assert build_document_context("transcript", "speaker0", "Alex Walker") == ""
+
+    def test_anonymous_document_renders_nothing(self):
+        """source_type='document' with no display name (anonymous
+        provider) renders nothing — there is no name to bind facts to."""
+        from paramem.graph.extractor import build_document_context
+
+        assert build_document_context("document", "speaker0", None) == ""
+
+    def test_document_source_with_no_speaker_id_renders_nothing(self):
+        from paramem.graph.extractor import build_document_context
+
+        assert build_document_context("document", None, "Alex Walker") == ""
+        assert build_document_context("document", "", "Alex Walker") == ""
+
+    def test_suppressed_paths_load_no_prompt_file(self):
+        """Neither the transcript-source nor the anonymous-document path
+        loads ``document_directive.txt`` — the guard runs BEFORE the load,
+        so no provenance entry is recorded for a fragment that never
+        rendered."""
+        from paramem.graph.extractor import build_document_context
+        from paramem.graph.phase_trace import extraction_trace, phase_trace
+
+        with extraction_trace() as trace:
+            with phase_trace("local_extract"):
+                build_document_context("transcript", "speaker0", "Alex Walker")
+                build_document_context("document", "speaker0", None)
+            record = trace.records[-1]
+
+        paths = [p["path"] for p in (record.prompts or [])]
+        assert not any("document_directive.txt" in p for p in paths), (
+            f"document_directive.txt must not be loaded on a suppressed path, got paths={paths!r}"
+        )
+
+    def test_generate_extraction_records_document_directive_provenance(self):
+        """A document-mode ``_generate_extraction`` call earns its own
+        ``{path, sha, template}`` provenance line for
+        ``document_directive.txt`` — the same recording chokepoint
+        (``_load_prompt`` → ``record_prompt``) every other extraction
+        prompt file already uses. A transcript-mode call, which never
+        renders the directive, records none."""
+        from unittest.mock import MagicMock, patch
+
+        from paramem.graph.extractor import _generate_extraction
+        from paramem.graph.phase_trace import extraction_trace, phase_trace
+
+        with (
+            patch("paramem.graph.extractor.render_chat_prompt", return_value="formatted"),
+            patch("paramem.graph.extractor.generate_answer", return_value="{}"),
+        ):
+            with extraction_trace() as trace:
+                with phase_trace("local_extract"):
+                    _generate_extraction(
+                        MagicMock(),
+                        MagicMock(),
+                        "TRANSCRIPT_BODY",
+                        0.0,
+                        100,
+                        speaker_id="speaker0",
+                        speaker_name="Alex Walker",
+                        source_type="document",
+                    )
+                document_record = trace.records[-1]
+
+            with extraction_trace() as trace:
+                with phase_trace("local_extract"):
+                    _generate_extraction(
+                        MagicMock(),
+                        MagicMock(),
+                        "TRANSCRIPT_BODY",
+                        0.0,
+                        100,
+                        speaker_id="speaker0",
+                        speaker_name="Alex Walker",
+                        source_type="transcript",
+                    )
+                transcript_record = trace.records[-1]
+
+        doc_entries = [
+            p for p in (document_record.prompts or []) if "document_directive.txt" in p["path"]
+        ]
+        assert len(doc_entries) == 1, (
+            f"expected exactly one document_directive.txt provenance entry, "
+            f"got {document_record.prompts!r}"
+        )
+        assert doc_entries[0]["sha"], "recorded sha must be non-empty"
+        assert doc_entries[0]["template"], "recorded template must be non-empty"
+
+        transcript_paths = [p["path"] for p in (transcript_record.prompts or [])]
+        assert not any("document_directive.txt" in p for p in transcript_paths), (
+            f"transcript-mode call must record no document_directive.txt provenance, "
+            f"got paths={transcript_paths!r}"
+        )
+
+    def test_generate_extraction_renders_document_context_for_document_source(self):
+        """``_generate_extraction`` threads ``build_document_context``'s
+        output into the rendered user message, immediately before the
+        transcript, only for a document-source pass with a known speaker."""
+        from unittest.mock import MagicMock, patch
+
+        from paramem.graph.extractor import _generate_extraction
+
+        captured: dict = {}
+
+        def fake_render(messages, tokenizer, **kwargs):
+            captured["messages"] = messages
+            return "formatted"
+
+        with (
+            patch("paramem.graph.extractor.render_chat_prompt", side_effect=fake_render),
+            patch("paramem.graph.extractor.generate_answer", return_value="{}"),
+        ):
+            _generate_extraction(
+                MagicMock(),
+                MagicMock(),
+                "TRANSCRIPT_BODY",
+                0.0,
+                100,
+                speaker_id="speaker0",
+                speaker_name="Alex Walker",
+                source_type="document",
+            )
+
+        user_content = captured["messages"][1]["content"]
+        # Pin adjacency and the exact separator, not just relative ordering:
+        # the rendered directive must be immediately followed by "\n\n" and
+        # then the transcript body, byte-for-byte reproducing the retired
+        # prepend's surface. Built from build_document_context itself so
+        # this stays accurate through a future content-tuning edit to
+        # document_directive.txt.
+        from paramem.graph.extractor import build_document_context
+
+        rendered_directive = build_document_context("document", "speaker0", "Alex Walker")
+        assert f"{rendered_directive}TRANSCRIPT_BODY" in user_content
+
+    def test_generate_extraction_renders_no_document_context_for_transcript_source(self):
+        """A transcript-source pass never carries the directive text, even
+        with the same known speaker."""
+        from unittest.mock import MagicMock, patch
+
+        from paramem.graph.extractor import _generate_extraction
+
+        captured: dict = {}
+
+        def fake_render(messages, tokenizer, **kwargs):
+            captured["messages"] = messages
+            return "formatted"
+
+        with (
+            patch("paramem.graph.extractor.render_chat_prompt", side_effect=fake_render),
+            patch("paramem.graph.extractor.generate_answer", return_value="{}"),
+        ):
+            _generate_extraction(
+                MagicMock(),
+                MagicMock(),
+                "TRANSCRIPT_BODY",
+                0.0,
+                100,
+                speaker_id="speaker0",
+                speaker_name="Alex Walker",
+                source_type="transcript",
+            )
+
+        user_content = captured["messages"][1]["content"]
+        assert "Document provided by" not in user_content
+
+
 # --- Background Trainer ---
 
 

@@ -322,6 +322,7 @@ class TestExtractionPrompt:
         rendered = tmpl.format(
             transcript="[user] hello",
             speaker_context=build_speaker_context(None, None),
+            document_context="",
         )
         assert "{transcript}" not in rendered
         assert "{speaker_context}" not in rendered
@@ -334,6 +335,7 @@ class TestExtractionPrompt:
         rendered = tmpl.format(
             transcript="[user] hello",
             speaker_context=build_speaker_context("speaker0", "Alex"),
+            document_context="",
         )
         # The directive must mention the speaker id as the required subject.
         assert "speaker0" in rendered
@@ -346,6 +348,7 @@ class TestExtractionPrompt:
         rendered = tmpl.format(
             transcript="[user] hello",
             speaker_context=build_speaker_context("speaker0", None),
+            document_context="",
         )
         assert "speaker0" in rendered
         assert "{speaker_id}" not in rendered
@@ -1137,6 +1140,7 @@ class TestProceduralPrompt:
         rendered = tmpl.format(
             transcript="[user] Play some jazz.",
             speaker_context=build_speaker_context(None, None),
+            document_context="",
         )
         assert "{transcript}" not in rendered
         assert "{speaker_context}" not in rendered
@@ -1155,6 +1159,7 @@ class TestProceduralPrompt:
         rendered = tmpl.format(
             transcript="[user] Play some jazz.",
             speaker_context=build_speaker_context("speaker0", "Alex"),
+            document_context="",
         )
         # The directive must mention the speaker id as the required subject.
         assert "speaker0" in rendered

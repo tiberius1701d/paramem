@@ -45,6 +45,6 @@ Extract: NONE — assistant suggestions in response to advice queries are not pr
 
 
 Transcript:
-{transcript}
+{document_context}{transcript}
 
 Extract preferences as JSON. If no preferences are present, return {{"entities": [], "relations": [], "summary": "No preferences found."}}.

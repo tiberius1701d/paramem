@@ -242,9 +242,10 @@ class ExtractionPipeline:
             return fallback if val is None else val
 
         # Single prompt-pair regardless of source_type.  Per-source
-        # extension goes via overrides (system_prompt_filename /
-        # user_prompt_filename) or via prepend/append on the slot
-        # content at the caller layer — never via a parallel file pair.
+        # extension is a TEMPLATE slot (``{document_context}``) fed from
+        # source_type plus the speaker fields this method already forwards
+        # — never a prepend/append onto the slot value, and never a
+        # parallel file pair.
         system_prompt_filename = DEFAULT_SYSTEM_PROMPT_FILENAME
         user_prompt_filename = DEFAULT_USER_PROMPT_FILENAME
 

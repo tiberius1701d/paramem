@@ -153,6 +153,6 @@ Extract: NONE — page numbers are structural noise.
 
 
 Transcript:
-{transcript}
+{document_context}{transcript}
 
 Extract personal facts as JSON. If no personal facts are present, return {{"entities": [], "relations": [], "summary": "No personal facts found."}}.

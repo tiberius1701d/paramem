@@ -1025,7 +1025,7 @@ class TestExtractionFailedAbortsCycle:
     unrelated chunks).
     """
 
-    def _make_state(self, tmp_path):
+    def _make_state(self, tmp_path, *, phase: str = "cloud_enrich", reason: str = "cloud 529"):
         from unittest.mock import MagicMock
 
         from paramem.server.config import PathsConfig, ServerConfig
@@ -1060,7 +1060,7 @@ class TestExtractionFailedAbortsCycle:
 
         def _extract(transcript, sid, **kwargs):
             if sid == "doc-bbb":
-                raise ExtractionFailed("cloud_enrich", "cloud 529")
+                raise ExtractionFailed(phase, reason)
             return ([], [])
 
         loop.extract_session = MagicMock(side_effect=_extract)
@@ -1162,6 +1162,69 @@ class TestExtractionFailedAbortsCycle:
 
             # Consolidating flag cleared.
             assert app_module._state["consolidating"] is False
+        finally:
+            for k, v in prior_state.items():
+                app_module._state[k] = v
+
+    def test_local_parse_failure_abort_via_extract_pending_sessions(self, tmp_path):
+        """The same abort contract from the OTHER ``ExtractionFailed``
+        origin — a local-extraction parse failure detected inside
+        ``loop.extract_session`` — exercised directly against
+        ``_extract_pending_sessions`` (the stage ``_extract_and_start_training``
+        wraps): ``aborted`` is set, ``completed_session_ids(...)`` is empty,
+        an ``extraction_failed`` incident is recorded keyed by the failing
+        phase, and ``mark_consolidated`` is never called."""
+        from unittest.mock import MagicMock, patch
+
+        from paramem.server import app as app_module
+        from paramem.server.incidents import read_incidents
+
+        config, buffer, loop = self._make_state(
+            tmp_path, phase="local_extract", reason="ValueError: bad json"
+        )
+        # Wire real document-chunk metadata so retirable() enforces the
+        # document-atomic rule: doc-ccc is a chunk of the SAME document
+        # (chunk_count=3) but the batch aborts before it is even attempted,
+        # so completed_session_ids must hold back doc-aaa/doc-bbb too —
+        # the real "half a CV" scenario the fail-loud design targets.
+        for sid in ("doc-aaa", "doc-bbb", "doc-ccc"):
+            buffer.set_document_metadata(sid, doc_id="doc-cv", chunk_count=3)
+        state_dir = config.paths.data / "state"
+
+        marked: list[list[str]] = []
+        buffer.mark_consolidated = lambda ids, **kw: marked.append(list(ids))
+
+        prior_state = {k: app_module._state.get(k) for k in app_module._state}
+        try:
+            app_module._state["config"] = config
+            app_module._state["session_buffer"] = buffer
+            app_module._state["speaker_store"] = None
+
+            no_lock = MagicMock()
+            no_lock.__enter__ = MagicMock(return_value=None)
+            no_lock.__exit__ = MagicMock(return_value=False)
+
+            with (
+                patch("paramem.server.gpu_lock.gpu_lock_sync", return_value=no_lock),
+                patch("paramem.server.app._set_voice_pipeline_profile"),
+                patch("paramem.server.app.check_vram_headroom"),
+                patch("paramem.server.app.vram_scope", return_value=no_lock),
+            ):
+                result = app_module._extract_pending_sessions(loop, lock_held=True)
+
+            assert result.aborted is not None
+            assert result.aborted.phase == "local_extract"
+            assert result.completed_session_ids(buffer) == []
+            assert marked == [], "mark_consolidated must never be called on an aborted batch"
+
+            incidents = read_incidents(state_dir)
+            ef_incidents = [
+                i for i in incidents if i.type == "extraction_failed" and i.status == "active"
+            ]
+            assert len(ef_incidents) >= 1, (
+                f"Expected at least one active extraction_failed incident; got {incidents}"
+            )
+            assert ef_incidents[0].detail["phase"] == "local_extract"
         finally:
             for k, v in prior_state.items():
                 app_module._state[k] = v

@@ -768,7 +768,10 @@ def extract_graph(
         source_type: ``"transcript"`` (default) or ``"document"``. Forwarded
             to :func:`_parse_extraction` / :func:`_stamp_speaker_entity` as
             the Guard B gate for the document-only exact-full-name rewrite
-            of third-person speaker mentions onto ``speaker_id``.
+            of third-person speaker mentions onto ``speaker_id``, and to
+            :func:`build_document_context` to select the
+            ``{document_context}`` rendering (non-empty only for
+            ``"document"`` with a known speaker; empty otherwise).
         anonymize_token_envelope: Total (prompt + output) token budget the
             ``anonymize`` stage's local ``generate()`` call(s) may occupy —
             forwarded to :func:`~paramem.cloud.anonymize.anonymize` as

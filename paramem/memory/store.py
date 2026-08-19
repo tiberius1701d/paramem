@@ -73,8 +73,10 @@ per-tier file now, not a single global one.  Never enters
 Every ``_entries`` slot — whether written by the boot fill or by go-live
 adoption (:meth:`adopt_increments`) — carries exactly
 ``{key, subject, predicate, object}``, projected via
-:func:`~paramem.memory.entry.content_only_entry` at every ``store.put`` call
-site.  Per-key provenance (``speaker_id``, ``relation_type``, ...) lives
+:func:`~paramem.memory.entry.content_only_entry` by every writer before the
+entry reaches the store — the boot fill, the increment build feeding go-live
+adoption (``paramem.memory.increment.build_tier_increment``), and the
+migration's ``store.put`` site.  Per-key provenance (``speaker_id``, ``relation_type``, ...) lives
 exclusively in :attr:`MemoryStore._bookkeeping`:
 :func:`~paramem.memory.persistence.build_tier_graph_from_store` reads
 ``speaker_id`` from ``store.bookkeeping_for_key``, never from the entry.

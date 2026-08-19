@@ -7,16 +7,18 @@ import pytest
 
 from paramem.cloud.deanonymize import CloudScope
 from paramem.graph.extractor import (
+    LOCAL_EXTRACTION_PHASES,
     _extract_json_block,
     _fallback_plausibility_on_raw,
     _normalize_extraction,
     _parse_extraction,
     _stamp_speaker_entity,
     extract_procedural_graph,
+    local_parse_failure,
 )
 from paramem.graph.flow import StageContext, StageState
 from paramem.graph.flows import _stage_rebuild, extract_graph
-from paramem.graph.phase_trace import extraction_trace, get_phases, stop_at
+from paramem.graph.phase_trace import PhaseRecord, extraction_trace, get_phases, stop_at
 from paramem.graph.schema import Entity, Relation, SessionGraph
 
 
@@ -1552,6 +1554,91 @@ class TestAttributeTypedFactsSurviveTheFlow:
     def test_all_dropped_cause_not_recorded(self):
         state = self._run()
         assert "all_dropped_cause" not in state.graph.diagnostics
+
+
+class TestLocalParseFailureDetection:
+    """``local_parse_failure`` reads the phase-trace outcome
+    ``_run_local_extraction`` already sets on a parse failure — the single
+    implementation of this read, consumed by
+    ``ConsolidationLoop.extract_session``'s abort guard."""
+
+    def test_finds_failed_local_extract_record(self):
+        records = [PhaseRecord(name="local_extract", outcome="failed", reason="bad json")]
+        found = local_parse_failure(records)
+        assert found is not None
+        assert found.name == "local_extract"
+        assert found.reason == "bad json"
+
+    def test_ignores_ok_records(self):
+        records = [PhaseRecord(name="local_extract", outcome="ok")]
+        assert local_parse_failure(records) is None
+
+    def test_ignores_failed_records_outside_local_extraction_phases(self):
+        """A failed ``cloud_enrich`` record (which already raises
+        ``ExtractionFailed`` itself, from a different call site) is out of
+        scope for this check."""
+        records = [PhaseRecord(name="cloud_enrich", outcome="failed", reason="boom")]
+        assert local_parse_failure(records) is None
+
+    def test_returns_first_matching_failure_in_order(self):
+        records = [
+            PhaseRecord(name="local_extract", outcome="ok"),
+            PhaseRecord(name="second_order_extract", outcome="failed", reason="a"),
+            PhaseRecord(name="procedural_extract", outcome="failed", reason="b"),
+        ]
+        found = local_parse_failure(records)
+        assert found is not None
+        assert found.name == "second_order_extract"
+
+    def test_no_failure_among_empty_records_returns_none(self):
+        assert local_parse_failure([]) is None
+
+    def test_local_extraction_phases_names_the_three_local_passes(self):
+        assert LOCAL_EXTRACTION_PHASES == frozenset(
+            {"local_extract", "second_order_extract", "procedural_extract"}
+        )
+
+    def test_local_extract_parse_failure_is_readable_end_to_end(self):
+        """``extract_graph``'s ``local_extract`` phase, on an unparseable
+        raw output, leaves a ``"failed"`` record that ``local_parse_failure``
+        finds — the real integration this guard depends on, not just the
+        pure-function unit behaviour above."""
+        with patch(
+            "paramem.graph.extractor._generate_extraction",
+            return_value="not valid json",
+        ):
+            graph = extract_graph(
+                model=None,
+                tokenizer=None,
+                transcript="Some transcript text.",
+                session_id="s001",
+                speaker_id="speaker0",
+                scrub={"person name"},
+            )
+        assert graph.relations == []
+        found = local_parse_failure(get_phases(graph))
+        assert found is not None
+        assert found.name == "local_extract"
+
+    def test_procedural_extract_parse_failure_is_readable_end_to_end(self):
+        """Same integration proof for the independently-run
+        ``procedural_extract`` pass."""
+        with extraction_trace() as trace:
+            with patch(
+                "paramem.graph.extractor.generate_answer",
+                return_value="not valid json",
+            ):
+                graph = extract_procedural_graph(
+                    model=MagicMock(),
+                    tokenizer=MagicMock(),
+                    transcript="I like tea.",
+                    session_id="s001",
+                    speaker_id="speaker0",
+                )
+        assert graph.relations == []
+        found = local_parse_failure(trace.records)
+        assert found is not None
+        assert found.name == "procedural_extract"
 
 
 class TestFallbackRebuildRecordsValidationDrops:

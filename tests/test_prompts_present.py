@@ -29,6 +29,17 @@ class TestPromptFilesPresent:
     def test_extraction_procedural_txt_exists(self):
         assert (_PROMPTS_DIR / "extraction_procedural.txt").exists()
 
+    def test_document_directive_txt_exists(self):
+        """The externalized document-provenance directive, rendered into
+        the ``{document_context}`` slot by
+        :func:`paramem.graph.extractor.build_document_context`."""
+        assert (_PROMPTS_DIR / "document_directive.txt").exists()
+
+    def test_document_directive_txt_has_speaker_placeholders(self):
+        content = (_PROMPTS_DIR / "document_directive.txt").read_text()
+        assert "{speaker_id}" in content
+        assert "{speaker_name}" in content
+
     def test_anonymization_speaker_anchor_txt_exists(self):
         """Companion prompt fragment split out of ``anonymization.txt``
         2026-08-02 — the fold-onto-token speaker-anchor rule + worked
@@ -48,6 +59,10 @@ class TestPromptFilesPresent:
     def test_extraction_txt_has_speaker_context_placeholder(self):
         content = (_PROMPTS_DIR / "extraction.txt").read_text()
         assert "{speaker_context}" in content
+
+    def test_extraction_txt_has_document_context_placeholder(self):
+        content = (_PROMPTS_DIR / "extraction.txt").read_text()
+        assert "{document_context}" in content
 
     def test_extraction_procedural_txt_has_transcript_placeholder(self):
         content = (_PROMPTS_DIR / "extraction_procedural.txt").read_text()
@@ -102,13 +117,15 @@ class TestPromptFilesPresent:
         factual ``extraction.txt`` to drop those slots).  Schema
         coverage is now carried by the few-shot examples.
 
-        ``{speaker_context}`` and ``{transcript}`` ARE required — the
-        call site at :func:`paramem.graph.extractor.extract_procedural_graph`
-        passes those values, and missing placeholders mean the
-        speaker directive / chunk text never reach the model.
+        ``{speaker_context}``, ``{document_context}``, and ``{transcript}``
+        ARE required — the call site at
+        :func:`paramem.graph.extractor.extract_procedural_graph` (via
+        ``_generate_extraction``) passes those values, and missing
+        placeholders mean the speaker directive / document cue / chunk
+        text never reach the model.
         """
         content = (_PROMPTS_DIR / "extraction_procedural.txt").read_text()
-        required = ("{speaker_context}", "{transcript}")
+        required = ("{speaker_context}", "{document_context}", "{transcript}")
         for placeholder in required:
             assert placeholder in content, (
                 f"extraction_procedural.txt missing placeholder {placeholder!r} — "
@@ -141,9 +158,9 @@ class TestPromptFilesPresent:
         assert (_PROMPTS_DIR / "extraction_second_order.txt").exists()
 
     def test_extraction_second_order_txt_has_required_placeholders(self):
-        """The second-order user template requires ``{transcript}`` and
-        ``{speaker_context}`` (same call-site contract as
-        ``extraction.txt``/``extraction_procedural.txt``) plus
+        """The second-order user template requires ``{transcript}``,
+        ``{speaker_context}``, and ``{document_context}`` (same call-site
+        contract as ``extraction.txt``/``extraction_procedural.txt``) plus
         ``{named_people}`` — the gate-derived closed target set threaded
         via ``extra_slots`` (:func:`paramem.graph.flows._stage_second_order_extract`).
         A missing ``{named_people}`` slot means the phase silently reverts
@@ -151,7 +168,7 @@ class TestPromptFilesPresent:
         the double-derivation defect this slot exists to close.
         """
         content = (_PROMPTS_DIR / "extraction_second_order.txt").read_text()
-        required = ("{transcript}", "{speaker_context}", "{named_people}")
+        required = ("{transcript}", "{speaker_context}", "{document_context}", "{named_people}")
         for placeholder in required:
             assert placeholder in content, (
                 f"extraction_second_order.txt missing placeholder {placeholder!r} — "
@@ -518,3 +535,77 @@ class TestEnsurePromptAssets:
         monkeypatch.setattr(prompts_mod, "_DEFAULT_PROMPT_DIR", tmp_path)
         with pytest.raises(RuntimeError, match="Required prompt file"):
             prompts_mod.ensure_prompt_assets()
+
+    def test_raises_when_document_directive_missing(self, monkeypatch, tmp_path):
+        """``document_directive.txt`` is required with no fallback — its
+        absence must surface at boot, not at the first document ingest."""
+        import paramem.graph.prompts as prompts_mod
+
+        for filename in prompts_mod._REQUIRED_PROMPT_FILES:
+            if filename == "document_directive.txt":
+                continue
+            (tmp_path / filename).write_text("placeholder")
+        monkeypatch.setattr(prompts_mod, "_DEFAULT_PROMPT_DIR", tmp_path)
+        with pytest.raises(RuntimeError, match="document_directive.txt"):
+            prompts_mod.ensure_prompt_assets()
+
+    def test_passes_with_operator_prompts_dir_argument(self, tmp_path):
+        """An operator ``prompts_dir`` with no local overrides falls
+        through to the shipped tree for every slot check — no false
+        positive from a directory that legitimately provides nothing."""
+        from paramem.graph.prompts import ensure_prompt_assets
+
+        ensure_prompt_assets(prompts_dir=tmp_path)
+
+    def _write_required_files(self, prompts_mod, tmp_path):
+        """Populate *tmp_path* with every required prompt file — the two
+        extraction user templates that are also always-supplied-slot
+        gated (``extraction.txt``, ``extraction_procedural.txt``) carry
+        every slot; the rest are arbitrary placeholder content (not
+        slot-checked)."""
+        slotted_template = "Transcript:\n{document_context}{speaker_context}{transcript}"
+        for filename in prompts_mod._REQUIRED_PROMPT_FILES:
+            content = (
+                slotted_template
+                if filename in prompts_mod._EXTRACTION_USER_TEMPLATES
+                else "placeholder"
+            )
+            (tmp_path / filename).write_text(content)
+
+    def test_raises_when_model_override_drops_a_required_slot(self, monkeypatch, tmp_path):
+        """A per-model copy of an extraction user template that omits one
+        of the always-supplied slots is a config-load failure: ``str.format``
+        ignores surplus kwargs, so the drop would otherwise silently revert
+        that model to cue-less/context-less extraction."""
+        import paramem.graph.prompts as prompts_mod
+
+        self._write_required_files(prompts_mod, tmp_path)
+        model_dir = tmp_path / "some-model"
+        model_dir.mkdir()
+        # Drops {document_context} — every other required slot present.
+        (model_dir / "extraction.txt").write_text("Transcript:\n{speaker_context}{transcript}")
+        monkeypatch.setattr(prompts_mod, "_DEFAULT_PROMPT_DIR", tmp_path)
+        with pytest.raises(RuntimeError, match="document_context"):
+            prompts_mod.ensure_prompt_assets()
+
+    def test_passes_when_model_override_carries_every_required_slot(self, monkeypatch, tmp_path):
+        import paramem.graph.prompts as prompts_mod
+
+        self._write_required_files(prompts_mod, tmp_path)
+        model_dir = tmp_path / "some-model"
+        model_dir.mkdir()
+        (model_dir / "extraction.txt").write_text(
+            "Transcript:\n{document_context}{speaker_context}{transcript}"
+        )
+        monkeypatch.setattr(prompts_mod, "_DEFAULT_PROMPT_DIR", tmp_path)
+        prompts_mod.ensure_prompt_assets()
+
+    def test_passes_against_the_real_shipped_tree(self):
+        """The real shipped ``configs/prompts/`` tree — base plus every
+        per-model directory (``qwen3-4b/``) — carries every required slot
+        on every extraction user template that exists there. Calls with
+        ``prompts_dir=None`` — the shipped-tree-only case; the operator-dir
+        case is :meth:`test_passes_with_operator_prompts_dir_argument`."""
+        from paramem.graph.prompts import ensure_prompt_assets
+
+        ensure_prompt_assets(prompts_dir=None)

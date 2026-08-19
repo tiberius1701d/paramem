@@ -19,6 +19,6 @@ POSITIVE example — speaker id is "speaker0", transcript: "[user] My colleague 
  "summary": "Dana passed her PMP certification exam."}}
 
 Transcript:
-{transcript}
+{document_context}{transcript}
 
 Extract every fact about each named non-speaker person as JSON. If none, return {{"entities": [], "relations": [], "summary": "No personal facts found."}}.

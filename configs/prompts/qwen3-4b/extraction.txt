@@ -188,6 +188,6 @@ POSITIVE example — speaker id is "speaker0", transcript: "[user] I completed m
 
 
 Transcript:
-{transcript}
+{document_context}{transcript}
 
 Extract personal facts as JSON. If no personal facts are present, return {{"entities": [], "relations": [], "summary": "No personal facts found."}}.

@@ -42,6 +42,21 @@ _LEFTOVER_PLACEHOLDER = re.compile(r"(?<!\{)\{[A-Za-z_]+\}(?!\})")
 _INTENTIONAL_LITERALS = {"{SPEAKER_NAME}", "{N}"}
 
 
+def _variant_paths_for(filename: str) -> list[Path]:
+    """Every resolvable copy of ``filename`` under ``configs/prompts/``.
+
+    Returns the shared base file plus every per-model override directory,
+    discovered by glob so a future model alias is covered automatically
+    without a test edit. Shared by every "render across all template
+    variants" guard in this module so there is exactly one enumeration of
+    "every copy of a template" to keep in sync with the on-disk layout.
+    """
+    base = _DEFAULT_PROMPT_DIR / filename
+    assert base.is_file(), f"base prompt template missing: {base}"
+    overrides = sorted(_DEFAULT_PROMPT_DIR.glob(f"*/{filename}"))
+    return [base, *overrides]
+
+
 class TestExtractionPromptRender:
     def setup_method(self):
         reset_cache()
@@ -52,6 +67,7 @@ class TestExtractionPromptRender:
         rendered = prompt.format(
             transcript="sample",
             speaker_context="",
+            document_context="",
         )
         assert isinstance(rendered, str)
 
@@ -60,6 +76,7 @@ class TestExtractionPromptRender:
         rendered = prompt.format(
             transcript="sample",
             speaker_context="",
+            document_context="",
         )
         leftover = [
             m for m in _LEFTOVER_PLACEHOLDER.findall(rendered) if m not in _INTENTIONAL_LITERALS
@@ -85,6 +102,7 @@ class TestExtractionPromptRender:
         rendered = prompt.format(
             transcript="sample",
             speaker_context="",
+            document_context="",
         )
         allowed = set(entity_types())
         used = set(re.findall(r'"entity_type":\s*"([^"]+)"', rendered))
@@ -105,6 +123,7 @@ class TestExtractionPromptRender:
         rendered = prompt.format(
             transcript="sample",
             speaker_context="",
+            document_context="",
         )
         allowed = set(relation_types())
         used = set(re.findall(r'"relation_type":\s*"([^"]+)"', rendered))
@@ -125,6 +144,7 @@ class TestProceduralPromptRender:
         rendered = prompt.format(
             transcript="sample",
             speaker_context="",
+            document_context="",
         )
         assert isinstance(rendered, str)
 
@@ -133,6 +153,7 @@ class TestProceduralPromptRender:
         rendered = prompt.format(
             transcript="sample",
             speaker_context="",
+            document_context="",
         )
         leftover = [
             m for m in _LEFTOVER_PLACEHOLDER.findall(rendered) if m not in _INTENTIONAL_LITERALS
@@ -144,6 +165,7 @@ class TestProceduralPromptRender:
         rendered = prompt.format(
             transcript="sample",
             speaker_context="",
+            document_context="",
         )
         assert "person" in rendered
         assert "preference" in rendered
@@ -175,6 +197,7 @@ class TestSecondOrderExtractionPromptRender:
         return tmpl.format(
             transcript="sample",
             speaker_context="",
+            document_context="",
             named_people="Dana, Riley",
         )
 
@@ -196,7 +219,7 @@ class TestSecondOrderExtractionPromptRender:
         into the model prompt."""
         tmpl = self._load()
         with pytest.raises(KeyError):
-            tmpl.format(transcript="sample", speaker_context="")
+            tmpl.format(transcript="sample", speaker_context="", document_context="")
 
 
 class TestSecondOrderExtractionPromptRenderAllVariants:
@@ -219,10 +242,7 @@ class TestSecondOrderExtractionPromptRenderAllVariants:
     """
 
     def _variant_paths(self) -> list[Path]:
-        base = _DEFAULT_PROMPT_DIR / "extraction_second_order.txt"
-        overrides = sorted(_DEFAULT_PROMPT_DIR.glob("*/extraction_second_order.txt"))
-        assert base.is_file(), f"base second-order prompt missing: {base}"
-        return [base, *overrides]
+        return _variant_paths_for("extraction_second_order.txt")
 
     def test_at_least_the_base_and_one_override_are_covered(self):
         paths = self._variant_paths()
@@ -236,6 +256,7 @@ class TestSecondOrderExtractionPromptRenderAllVariants:
             rendered = tmpl.format(
                 transcript="sample",
                 speaker_context="",
+                document_context="",
                 named_people="Dana, Riley",
             )
             assert "Dana, Riley" in rendered, (
@@ -249,6 +270,7 @@ class TestSecondOrderExtractionPromptRenderAllVariants:
             rendered = tmpl.format(
                 transcript="sample",
                 speaker_context="",
+                document_context="",
                 named_people="Dana, Riley",
             )
             leftover = [
@@ -260,7 +282,71 @@ class TestSecondOrderExtractionPromptRenderAllVariants:
         for path in self._variant_paths():
             tmpl = path.read_text(encoding="utf-8")
             with pytest.raises(KeyError):
-                tmpl.format(transcript="sample", speaker_context="")
+                tmpl.format(transcript="sample", speaker_context="", document_context="")
+
+
+class TestDocumentContextSlotAllVariants:
+    """Render-with-slots guard for the ``{document_context}`` slot across
+    EVERY extraction user template family (``extraction.txt``,
+    ``extraction_second_order.txt``, ``extraction_procedural.txt``) — the
+    shared base file plus every per-model override directory under
+    ``configs/prompts/``, discovered by glob so a future model alias is
+    covered automatically without a test edit.
+
+    Mirrors :class:`TestSecondOrderExtractionPromptRenderAllVariants`'s
+    pattern, generalized to all three template families:
+    ``paramem.graph.extractor._generate_extraction`` always supplies
+    ``{document_context}`` on every local-extraction call, so an override
+    that drops the slot silently reverts that model to cue-less document
+    extraction (``str.format`` ignores surplus kwargs) — a mismatch this
+    test catches at CI time. ``ensure_prompt_assets`` (see
+    ``tests/test_prompts_present.py::TestEnsurePromptAssets``) enforces the
+    same invariant at server startup; this test enforces it against the
+    real shipped tree at CI time.
+    """
+
+    _TEMPLATE_FAMILIES = (
+        "extraction.txt",
+        "extraction_second_order.txt",
+        "extraction_procedural.txt",
+    )
+
+    def _variant_paths(self) -> list[Path]:
+        paths: list[Path] = []
+        for filename in self._TEMPLATE_FAMILIES:
+            paths.extend(_variant_paths_for(filename))
+        return paths
+
+    def _render_kwargs(self, path: Path) -> dict:
+        kwargs = {"transcript": "sample", "speaker_context": "", "document_context": ""}
+        if path.name == "extraction_second_order.txt":
+            kwargs["named_people"] = "Dana, Riley"
+        return kwargs
+
+    def test_at_least_one_variant_per_family_is_covered(self):
+        paths = self._variant_paths()
+        assert len(paths) >= len(self._TEMPLATE_FAMILIES)
+
+    def test_every_variant_renders_with_document_context_threaded(self):
+        sentinel = "SENTINEL-DOCUMENT-CONTEXT"
+        for path in self._variant_paths():
+            tmpl = path.read_text(encoding="utf-8")
+            kwargs = self._render_kwargs(path)
+            kwargs["document_context"] = sentinel
+            rendered = tmpl.format(**kwargs)
+            assert sentinel in rendered, (
+                f"{path}: {{document_context}} slot did not reach the rendered "
+                "prompt — override dropped the slot, silently reverting to "
+                "cue-less document extraction."
+            )
+
+    def test_every_variant_omitted_document_context_slot_raises_key_error(self):
+        for path in self._variant_paths():
+            tmpl = path.read_text(encoding="utf-8")
+            kwargs = self._render_kwargs(path)
+            del kwargs["document_context"]
+            with pytest.raises(KeyError):
+                tmpl.format(**kwargs)
 
 
 class TestAnonymizationPromptRender:
