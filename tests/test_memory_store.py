@@ -973,57 +973,12 @@ class TestReadRegistriesFromDisk:
 
 
 class TestSetBookkeepingGuard:
-    """set_bookkeeping raises on an empty speaker_id unless the caller opts out.
+    """set_bookkeeping always raises on an empty speaker_id.
 
     ``MemoryStore.set_bookkeeping`` rejects ``speaker_id=""`` with ValueError
-    (no-unattributed-keys invariant) unless ``allow_empty_speaker=True`` is
-    passed — the carve-out reserved for reload paths and keyless concept-node
-    edges that genuinely have no speaker.
+    via :func:`~paramem.memory.bookkeeping.bookkeeping_row` (no-unattributed-
+    keys invariant) — there is no opt-out.
     """
-
-    def test_empty_speaker_id_raises_without_allow_flag(self):
-        """set_bookkeeping(speaker_id='') raises ValueError by default."""
-        s = MemoryStore()
-        with pytest.raises(ValueError, match="no-unattributed-keys invariant"):
-            s.set_bookkeeping(
-                "graph1",
-                speaker_id="",
-                relation_type="factual",
-                first_seen="",
-                promoted=False,
-            )
-
-    def test_empty_speaker_id_allowed_with_flag(self):
-        """set_bookkeeping(speaker_id='', allow_empty_speaker=True) succeeds."""
-        s = MemoryStore()
-        s.set_bookkeeping(
-            "graph2",
-            speaker_id="",
-            relation_type="factual",
-            allow_empty_speaker=True,
-            first_seen="",
-            promoted=False,
-        )
-        bk = s.bookkeeping_for_key("graph2")
-        assert bk is not None
-        assert bk["speaker_id"] == ""
-
-    def test_nonempty_speaker_id_succeeds_without_flag(self):
-        """Non-empty speaker_id always succeeds (no flag needed).
-
-        A cased ``Speaker0`` is accepted and normalized to lowercase ``speaker0``
-        by :meth:`set_bookkeeping`'s ``is_speaker_id`` gate."""
-        s = MemoryStore()
-        s.set_bookkeeping(
-            "graph3",
-            speaker_id="Speaker0",
-            relation_type="factual",
-            first_seen="",
-            promoted=False,
-        )
-        bk = s.bookkeeping_for_key("graph3")
-        assert bk is not None
-        assert bk["speaker_id"] == "speaker0"
 
     def test_cased_speaker_id_normalized_to_lowercase(self):
         """set_bookkeeping normalizes is_speaker_id values to lowercase.
@@ -1041,21 +996,6 @@ class TestSetBookkeepingGuard:
             "set_bookkeeping must lowercase Speaker0 → speaker0 to match the router index."
         )
 
-    def test_empty_speaker_id_passes_through_with_flag(self):
-        """Empty speaker_id passes through (allow_empty_speaker=True); not lowercased."""
-        s = MemoryStore()
-        s.set_bookkeeping(
-            "g2",
-            speaker_id="",
-            relation_type="factual",
-            allow_empty_speaker=True,
-            first_seen="",
-            promoted=False,
-        )
-        bk = s.bookkeeping_for_key("g2")
-        assert bk is not None
-        assert bk["speaker_id"] == ""
-
     def test_non_speaker_value_passes_through_unchanged(self):
         """A non-speaker_id value that is non-empty passes through without lowercasing."""
         s = MemoryStore()
@@ -1065,6 +1005,31 @@ class TestSetBookkeepingGuard:
         bk = s.bookkeeping_for_key("g3")
         assert bk is not None
         assert bk["speaker_id"] == "alice"
+
+    def test_empty_speaker_id_raises_value_error(self):
+        """There is no carve-out: set_bookkeeping(speaker_id="") raises via
+        bookkeeping_row's own guard, and the key is never installed."""
+        s = MemoryStore()
+        with pytest.raises(ValueError):
+            s.set_bookkeeping(
+                "g4", speaker_id="", relation_type="factual", first_seen="", promoted=False
+            )
+        assert s.bookkeeping_for_key("g4") is None
+
+    def test_allow_empty_speaker_kwarg_no_longer_exists(self):
+        """The former escape hatch is deleted, not merely unused — passing
+        it raises TypeError (unexpected keyword argument), never silently
+        accepted and ignored."""
+        s = MemoryStore()
+        with pytest.raises(TypeError):
+            s.set_bookkeeping(
+                "g5",
+                speaker_id="",
+                relation_type="factual",
+                first_seen="",
+                promoted=False,
+                allow_empty_speaker=True,
+            )
 
     def test_router_routes_by_legacy_cased_speaker_id_after_normalization(self, monkeypatch):
         """Cased-bookkeeping → normalized → routable: ``QueryRouter``'s

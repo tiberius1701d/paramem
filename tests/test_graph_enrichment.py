@@ -194,7 +194,11 @@ def _populate_graph(graph: nx.MultiDiGraph, n_persons: int = 10) -> None:
         first_seen="s000",
         last_seen="s000",
     )
-    # Wire edges: every person works_at acmecorp
+    # Wire edges: every person works_at acmecorp. speaker_id="speaker0" on
+    # every edge — the merger stamps a real speaker_id on every Case-3
+    # insert (merger.py), so an edge with none is not a state production
+    # ever produces; the enrichment attribution pass reads exactly this
+    # field as its evidence.
     for i in range(n_persons):
         graph.add_edge(
             f"person{i}",
@@ -204,6 +208,7 @@ def _populate_graph(graph: nx.MultiDiGraph, n_persons: int = 10) -> None:
             confidence=1.0,
             source="extraction",
             sessions=["s000"],
+            speaker_id="speaker0",
         )
 
 
@@ -225,6 +230,11 @@ def _populate_disjoint_clusters(
     Used by the multi-chunk VRAM-degrade tests, which need to assert that a
     fault on chunk 2 of 3 keeps chunk 1's already-merged relations and never
     reaches chunk 3.
+
+    Every leaf-hub edge carries a ``speaker_id`` — one speaker per cluster
+    (``f"speaker{c}"``), since a cluster is exactly one chunk here and the
+    merger never leaves a real edge unattributed (Case-3 insert,
+    ``merger.py``); this is the enrichment attribution pass's evidence.
     """
     for c in range(n_clusters):
         hub = f"hub{c}"
@@ -256,6 +266,7 @@ def _populate_disjoint_clusters(
                 confidence=1.0,
                 source="extraction",
                 sessions=[f"s{c}{j:02d}"],
+                speaker_id=f"speaker{c}",
             )
 
 
@@ -810,7 +821,11 @@ class TestSymmetricPredicateCanonicalized:
         _populate_graph(graph, n_persons=10)
 
         # Both directions of colleague_of with symmetric=true.
-        # Nodes are canonical-keyed (lowercase); neither carries speaker_id.
+        # Nodes are canonical-keyed (lowercase); neither is a speaker node
+        # (no ``speaker_id`` node attribute), but they ARE wired together by
+        # a real, speaker-attributed edge below — attribution evidence for
+        # the enrichment pass, matching what the merger always stamps on a
+        # real edge.
         rels = [
             {
                 "subject": "Zhang",
@@ -829,16 +844,31 @@ class TestSymmetricPredicateCanonicalized:
                 "symmetric": True,
             },
         ]
+        # reinforcement_count=50 outranks every _populate_graph hub node
+        # (max 10), so zhang's ego-graph — {zhang, xiaoxiu}, its only
+        # connection — is the sole chunk this graph's node count builds
+        # (chunk_cap=1).
         for name in ("zhang", "xiaoxiu"):
             graph.add_node(
                 name,
                 entity_type="person",
                 attributes={},
-                reinforcement_count=2,
+                reinforcement_count=50,
                 sessions=["s040"],
                 first_seen="s040",
                 last_seen="s040",
             )
+        graph.add_edge(
+            "zhang",
+            "xiaoxiu",
+            predicate="acquainted with",
+            relation_type="social",
+            confidence=1.0,
+            speaker_id="speaker0",
+            sessions=["s040"],
+            first_seen="s040",
+            last_seen="s040",
+        )
 
         canned_result = (rels, [], "raw", 0)
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
@@ -889,16 +919,33 @@ class TestSymmetricPredicateCanonicalized:
                 "symmetric": False,
             },
         ]
+        # reinforcement_count=50 outranks every _populate_graph hub node
+        # (max 10), so ming's ego-graph — {ming, xinxin}, its only
+        # connection — is the sole chunk this graph's node count builds
+        # (chunk_cap=1); the edge below is the enrichment pass's
+        # attribution evidence, matching what the merger always stamps on
+        # a real edge.
         for name in ("ming", "xinxin"):
             graph.add_node(
                 name,
                 entity_type="person",
                 attributes={},
-                reinforcement_count=2,
+                reinforcement_count=50,
                 sessions=["s041"],
                 first_seen="s041",
                 last_seen="s041",
             )
+        graph.add_edge(
+            "ming",
+            "xinxin",
+            predicate="acquainted with",
+            relation_type="social",
+            confidence=1.0,
+            speaker_id="speaker0",
+            sessions=["s041"],
+            first_seen="s041",
+            last_seen="s041",
+        )
 
         canned_result = (rels, [], "raw", 0)
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
@@ -940,11 +987,18 @@ class TestCorefRemapBeforeEdgeInsert:
             first_seen="s050",
             last_seen="s050",
         )
+        # reinforcement_count=50 outranks every _populate_graph hub node
+        # (max 10), so alex's ego-graph — {alex, acme}, its only
+        # connection — is the sole chunk this graph's node count builds
+        # (chunk_cap=1). The alex-acme edge below carries speaker_id, the
+        # enrichment pass's attribution evidence for the works_at relation
+        # remapped onto "alexander" through the coref chain — matching what
+        # the merger always stamps on a real edge.
         graph.add_node(
             "alex",
             entity_type="person",
             display_name="Alex",
-            reinforcement_count=1,
+            reinforcement_count=50,
             sessions=["s051"],
             first_seen="s051",
             last_seen="s051",
@@ -957,6 +1011,17 @@ class TestCorefRemapBeforeEdgeInsert:
             sessions=["s050"],
             first_seen="s050",
             last_seen="s050",
+        )
+        graph.add_edge(
+            "alex",
+            "acme",
+            predicate="interned at",
+            relation_type="factual",
+            confidence=1.0,
+            speaker_id="speaker0",
+            sessions=["s051"],
+            first_seen="s051",
+            last_seen="s051",
         )
 
         # cloud response: same_as merges Alex→Alexander (cloud returns surface names;
@@ -3267,17 +3332,35 @@ class TestEnrichmentThroughMergerComposition:
         for tier in ("episodic", "semantic", "procedural"):
             loop.store.load_registry(tier, KeyRegistry())
 
-        # Two concept nodes for the enrichment relation.
+        # Two concept nodes for the enrichment relation, wired by a real
+        # (speaker-attributed) edge. reinforcement_count=50 outranks every
+        # _populate_graph hub node (max 10), so alpha's ego-graph — {alpha,
+        # beta}, since that edge is their only connection — is the sole
+        # chunk this graph's node count builds (chunk_cap=1); the
+        # enrichment pass then has real source-fact evidence to inherit
+        # attribution from, matching what the merger always stamps on a
+        # real edge (Case-3 insert) rather than an edge with no speaker_id.
         for name in ("alpha", "beta"):
             loop.merger.graph.add_node(
                 name,
                 entity_type="person",
                 display_name=name.capitalize(),
-                reinforcement_count=2,
+                reinforcement_count=50,
                 sessions=["s099"],
                 first_seen="s099",
                 last_seen="s099",
             )
+        loop.merger.graph.add_edge(
+            "alpha",
+            "beta",
+            predicate="acquainted with",
+            relation_type="social",
+            confidence=1.0,
+            speaker_id="speaker0",
+            sessions=["s099"],
+            first_seen="s099",
+            last_seen="s099",
+        )
 
         rels = [
             {
@@ -3316,13 +3399,19 @@ class TestEnrichmentThroughMergerComposition:
         for tier in ("episodic", "semantic", "procedural"):
             loop.store.load_registry(tier, KeyRegistry())
 
-        # Pre-insert an extraction edge for alpha→beta colleague_of.
+        # Pre-insert an extraction edge for alpha→beta colleague_of, carrying
+        # speaker_id like every real edge does (Case-3 insert, merger.py).
+        # reinforcement_count=50 outranks every _populate_graph hub node
+        # (max 10), so alpha's ego-graph — {alpha, beta}, its only
+        # connection — is the sole chunk this graph's node count builds
+        # (chunk_cap=1), giving the enrichment pass real evidence to
+        # attribute the duplicate relation from.
         for name in ("alpha", "beta"):
             loop.merger.graph.add_node(
                 name,
                 entity_type="person",
                 display_name=name.capitalize(),
-                reinforcement_count=1,
+                reinforcement_count=50,
                 sessions=["s001"],
                 first_seen="s001",
                 last_seen="s001",
@@ -3337,6 +3426,7 @@ class TestEnrichmentThroughMergerComposition:
             last_seen="s001",
             reinforcement_count=1,
             sessions=["s001"],
+            speaker_id="speaker0",
         )
         edges_before = loop.merger.graph.number_of_edges()
 
@@ -3366,6 +3456,308 @@ class TestEnrichmentThroughMergerComposition:
         )
         # result['new_edges'] must be 0 (delta is 0).
         assert result["new_edges"] == 0, f"new_edges must be 0 for a dup; got {result['new_edges']}"
+
+
+class TestEnrichmentSpeakerAttributionFromSourceFacts:
+    """Enrichment inherits speaker attribution from its source facts, never
+    from graph topology: a relation's speaker is the union of its two
+    (resolved) endpoints' evidence, collected from the chunk's own edges —
+    exactly one attributes, zero or several drop and are counted.
+    """
+
+    def test_single_speaker_chunk_stamps_that_speaker(self, tmp_path, monkeypatch):
+        """Both endpoints' evidence names exactly one speaker (speaker0,
+        via _populate_graph's works-at edges) -> the relation is stamped
+        with that speaker and reaches merge_relations."""
+        from paramem.training.key_registry import KeyRegistry
+
+        loop = _make_loop(tmp_path)
+        _populate_graph(loop.merger.graph, n_persons=10)
+        for tier in ("episodic", "semantic", "procedural"):
+            loop.store.load_registry(tier, KeyRegistry())
+
+        rels = [
+            {
+                "subject": "Person0",
+                "predicate": "colleague_of",
+                "object": "Person1",
+                "relation_type": "social",
+                "confidence": 0.9,
+                "symmetric": False,
+            }
+        ]
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        with (
+            patch(
+                "paramem.training.graph_enrich.request_graph_enrichment",
+                return_value=(rels, [], "raw", 0),
+            ),
+            patch.object(
+                loop.merger, "merge_relations", wraps=loop.merger.merge_relations
+            ) as spy_merge_relations,
+        ):
+            result = _refiner_for(loop).run_enrichment()
+
+        assert not result["skipped"]
+        assert result["stamped_relations"] == 1
+        assert result["unattributed_dropped"] == 0
+        assert result["multi_speaker_dropped"] == 0
+        assert spy_merge_relations.called, "the attributed relation must reach merge_relations"
+        (captured_relations,), _kwargs = spy_merge_relations.call_args
+        assert len(captured_relations) == 1
+        assert captured_relations[0].speaker_id == "speaker0"
+
+    def test_two_speaker_endpoints_drop_and_never_reach_merge(self, tmp_path, monkeypatch):
+        """Endpoints whose evidence names two DIFFERENT speakers -> the
+        relation is dropped and counted, and never reaches merge_relations
+        (a fact synthesised across two speakers is not expressible in
+        one-speaker-per-row bookkeeping — guessing one would mis-attribute).
+
+        Mutation: pick either endpoint's speaker arbitrarily instead of
+        checking the union's size -> this test's ``multi_speaker_dropped``
+        assertion fails and ``merge_relations`` gets called.
+        """
+        from paramem.training.key_registry import KeyRegistry
+
+        loop = _make_loop(tmp_path)
+        graph = loop.merger.graph
+        _populate_graph(graph, n_persons=10)
+        for tier in ("episodic", "semantic", "procedural"):
+            loop.store.load_registry(tier, KeyRegistry())
+
+        # person0's own works-at edge is asserted by speaker1; every other
+        # person (including person1) stays on speaker0 (_populate_graph's
+        # default). Both route through the shared acmecorp hub inside the
+        # one chunk this graph's node count builds (chunk_cap=1), so the
+        # chunk's own source facts genuinely name two distinct speakers.
+        for _, _, key, data in graph.out_edges("person0", keys=True, data=True):
+            if data.get("predicate") == "works at":
+                graph["person0"]["acmecorp"][key]["speaker_id"] = "speaker1"
+
+        rels = [
+            {
+                "subject": "Person0",
+                "predicate": "colleague_of",
+                "object": "Person1",
+                "relation_type": "social",
+                "confidence": 0.9,
+                "symmetric": False,
+            }
+        ]
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        with (
+            patch(
+                "paramem.training.graph_enrich.request_graph_enrichment",
+                return_value=(rels, [], "raw", 0),
+            ),
+            patch.object(
+                loop.merger, "merge_relations", wraps=loop.merger.merge_relations
+            ) as spy_merge_relations,
+        ):
+            result = _refiner_for(loop).run_enrichment()
+
+        assert not result["skipped"]
+        assert result["multi_speaker_dropped"] == 1
+        assert result["stamped_relations"] == 0
+        assert result["unattributed_dropped"] == 0
+        spy_merge_relations.assert_not_called()
+
+    def test_zero_speaker_evidence_drops_and_never_reaches_merge(self, tmp_path, monkeypatch):
+        """Neither endpoint's source edges name any speaker at all (the
+        union of both endpoints' evidence is empty) -> the relation is
+        dropped and counted as unattributed, never guessed from graph
+        topology and never merged.
+
+        Mutation: fall back to a topological guess (e.g. picking the first
+        edge's speaker regardless of emptiness) when the union is empty,
+        instead of dropping -> this test's ``unattributed_dropped``
+        assertion fails and ``merge_relations`` gets called.
+        """
+        from paramem.training.key_registry import KeyRegistry
+
+        loop = _make_loop(tmp_path)
+        graph = loop.merger.graph
+        _populate_graph(graph, n_persons=10)
+        for tier in ("episodic", "semantic", "procedural"):
+            loop.store.load_registry(tier, KeyRegistry())
+
+        # High reinforcement_count isolates {lonea, loneb} as the sole
+        # chunk this graph's node count builds (mirrors the coref test's
+        # chaina isolation below) -- their only edge carries NO speaker_id
+        # at all, so both endpoints' provenance evidence is empty.
+        graph.add_node(
+            "lonea",
+            entity_type="person",
+            reinforcement_count=100,
+            sessions=["s061"],
+            first_seen="s061",
+            last_seen="s061",
+        )
+        graph.add_node(
+            "loneb",
+            entity_type="person",
+            reinforcement_count=1,
+            sessions=["s061"],
+            first_seen="s061",
+            last_seen="s061",
+        )
+        graph.add_edge(
+            "lonea",
+            "loneb",
+            predicate="linked to",
+            relation_type="factual",
+            confidence=1.0,
+            speaker_id="",
+            sessions=["s061"],
+            first_seen="s061",
+            last_seen="s061",
+        )
+
+        rels = [
+            {
+                "subject": "lonea",
+                "predicate": "knows",
+                "object": "loneb",
+                "relation_type": "factual",
+                "confidence": 0.9,
+                "symmetric": False,
+            }
+        ]
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        with (
+            patch(
+                "paramem.training.graph_enrich.request_graph_enrichment",
+                return_value=(rels, [], "raw", 0),
+            ),
+            patch.object(
+                loop.merger, "merge_relations", wraps=loop.merger.merge_relations
+            ) as spy_merge_relations,
+        ):
+            result = _refiner_for(loop).run_enrichment()
+
+        assert not result["skipped"]
+        assert result["unattributed_dropped"] == 1
+        assert result["stamped_relations"] == 0
+        assert result["multi_speaker_dropped"] == 0
+        spy_merge_relations.assert_not_called()
+
+    def test_two_hop_coref_chain_inherits_provenance(self, tmp_path, monkeypatch):
+        """A node reached only via a two-hop same_as chain (a→b, b→c)
+        still contributes its pre-contraction speaker evidence to the
+        surviving node c: the fold must follow the FULL coref chain via
+        resolve_to_node_key, not a single drop→keep pass that would only
+        see one hop.
+
+        Mutation: replace the fold's ``resolve_to_node_key(...)`` call with
+        a one-shot ``coref_map.get(k, k)`` lookup (no chain-follow) ->
+        "chaina"'s evidence folds onto "chainb" instead of "chainc" (the
+        relation's actual, fully-resolved subject endpoint after both
+        contractions), the endpoint lookup misses, and this test's
+        ``stamped_relations`` assertion fails (dropped as unattributed
+        instead).
+        """
+        from paramem.training.key_registry import KeyRegistry
+
+        loop = _make_loop(tmp_path)
+        graph = loop.merger.graph
+        _populate_graph(graph, n_persons=10)
+        for tier in ("episodic", "semantic", "procedural"):
+            loop.store.load_registry(tier, KeyRegistry())
+
+        # reinforcement_count=100 outranks every _populate_graph hub node
+        # (max 10) and every other node added below, so chaina's ego-graph —
+        # {chaina, chainanchor}, its only connection — is the sole chunk
+        # this graph's node count builds (chunk_cap=1). Names avoid
+        # underscores/spaces so canonical() is a no-op on them and the
+        # membership-shortcut / canonical-fallback resolution paths agree.
+        graph.add_node(
+            "chaina",
+            entity_type="person",
+            reinforcement_count=100,
+            sessions=["s060"],
+            first_seen="s060",
+            last_seen="s060",
+        )
+        graph.add_node(
+            "chainb",
+            entity_type="person",
+            reinforcement_count=1,
+            sessions=["s060"],
+            first_seen="s060",
+            last_seen="s060",
+        )
+        graph.add_node(
+            "chainc",
+            entity_type="person",
+            reinforcement_count=1,
+            sessions=["s060"],
+            first_seen="s060",
+            last_seen="s060",
+        )
+        graph.add_node(
+            "chainanchor",
+            entity_type="concept",
+            reinforcement_count=1,
+            sessions=["s060"],
+            first_seen="s060",
+            last_seen="s060",
+        )
+        graph.add_edge(
+            "chaina",
+            "chainanchor",
+            predicate="linked to",
+            relation_type="factual",
+            confidence=1.0,
+            speaker_id="speaker9",
+            sessions=["s060"],
+            first_seen="s060",
+            last_seen="s060",
+        )
+
+        canned_rels = [
+            {
+                "subject": "chaina",
+                "predicate": "knows",
+                "object": "chainanchor",
+                "relation_type": "factual",
+                "confidence": 0.9,
+            }
+        ]
+        # Two-hop same_as chain: chaina drops into chainb, then chainb
+        # itself drops into chainc — the relation's subject ("chaina") must
+        # resolve through BOTH hops to land on the surviving "chainc".
+        canned_same_as = [["chainb", "chaina"], ["chainc", "chainb"]]
+
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        with (
+            patch(
+                "paramem.training.graph_enrich.request_graph_enrichment",
+                return_value=(canned_rels, canned_same_as, "raw", 0),
+            ),
+            patch(
+                "paramem.training.graph_enrich._safe_to_merge_surface",
+                return_value=True,
+            ),
+            patch.object(
+                loop.merger, "merge_relations", wraps=loop.merger.merge_relations
+            ) as spy_merge_relations,
+        ):
+            result = _refiner_for(loop).run_enrichment()
+
+        assert not result["skipped"]
+        assert result["same_as_merges"] == 2
+        assert "chaina" not in graph.nodes
+        assert "chainb" not in graph.nodes
+        assert "chainc" in graph.nodes
+        assert result["stamped_relations"] == 1, (
+            f"chaina's speaker9 evidence must survive the 2-hop fold onto "
+            f"chainc; got stamped_relations={result['stamped_relations']} "
+            f"unattributed_dropped={result['unattributed_dropped']}"
+        )
+        assert spy_merge_relations.called
+        (captured_relations,), _kwargs = spy_merge_relations.call_args
+        assert len(captured_relations) == 1
+        assert captured_relations[0].speaker_id == "speaker9"
 
 
 # ---------------------------------------------------------------------------
@@ -3526,78 +3918,6 @@ class TestEnrichmentVerbatimSpeakerKeyResolution:
             u == "speaker0" and d.get("predicate") == "knows"
             for u, _v, d in loop.merger.graph.edges(data=True)
         ), "knows edge must move onto the 'speaker0' speaker node after contraction"
-
-
-# ---------------------------------------------------------------------------
-# Tests for _unique_speaker_predecessor (pure unit + integration)
-# ---------------------------------------------------------------------------
-
-
-class TestUniqueSpeakerPredecessor:
-    """Direct unit tests for ConsolidationLoop._unique_speaker_predecessor.
-
-    Uses a minimal loop with a manually-populated merger.graph (nx.MultiDiGraph).
-    No enrichment, no cloud calls.
-    """
-
-    def test_zero_predecessors_returns_empty(self, tmp_path):
-        """An isolated node with no predecessors → ''."""
-        loop = _make_loop(tmp_path)
-        loop.merger.graph.add_node("concept", attributes={})
-
-        assert loop._unique_speaker_predecessor("concept") == ""
-
-    def test_one_speaker_predecessor_returns_sid(self, tmp_path):
-        """Exactly one predecessor with a non-empty speaker_id → that sid."""
-        loop = _make_loop(tmp_path)
-        loop.merger.graph.add_node(
-            "speaker0",
-            entity_type="person",
-            speaker_id="speaker0",
-        )
-        loop.merger.graph.add_node("concept", attributes={})
-        loop.merger.graph.add_edge("speaker0", "concept", predicate="held role")
-
-        assert loop._unique_speaker_predecessor("concept") == "speaker0"
-
-    def test_two_speaker_predecessors_returns_empty(self, tmp_path):
-        """Two distinct speakers → '' (ambiguous — never mis-attribute)."""
-        loop = _make_loop(tmp_path)
-        loop.merger.graph.add_node("speaker0", speaker_id="speaker0")
-        loop.merger.graph.add_node("speaker1", speaker_id="speaker1")
-        loop.merger.graph.add_node("concept", attributes={})
-        loop.merger.graph.add_edge("speaker0", "concept", predicate="held role")
-        loop.merger.graph.add_edge("speaker1", "concept", predicate="held role")
-
-        assert loop._unique_speaker_predecessor("concept") == ""
-
-    def test_no_transitive_inheritance(self, tmp_path):
-        """Chain A(speaker_id='S0') → B(concept) → C(concept): query on C returns ''
-        because B carries no speaker_id — inheritance is 1-hop only."""
-        loop = _make_loop(tmp_path)
-        loop.merger.graph.add_node("speaker0", speaker_id="speaker0")
-        loop.merger.graph.add_node("B", attributes={})
-        loop.merger.graph.add_node("C", attributes={})
-        loop.merger.graph.add_edge("speaker0", "B", predicate="held role")
-        loop.merger.graph.add_edge("B", "C", predicate="related to")
-
-        # B is C's predecessor, but B has no speaker_id → does not propagate.
-        assert loop._unique_speaker_predecessor("C") == ""
-
-    def test_node_not_in_graph_returns_empty(self, tmp_path):
-        """Querying a node that is not in the graph returns ''."""
-        loop = _make_loop(tmp_path)
-        assert loop._unique_speaker_predecessor("nonexistent_node") == ""
-
-    def test_predecessor_with_empty_speaker_id_filtered(self, tmp_path):
-        """A predecessor whose speaker_id attribute is '' is not counted as a speaker."""
-        loop = _make_loop(tmp_path)
-        loop.merger.graph.add_node("NoSid", speaker_id="")
-        loop.merger.graph.add_node("concept", attributes={})
-        loop.merger.graph.add_edge("NoSid", "concept", predicate="related to")
-
-        # '' is not a speaker — no non-empty speaker predecessor → ''.
-        assert loop._unique_speaker_predecessor("concept") == ""
 
 
 # ---------------------------------------------------------------------------
@@ -4113,6 +4433,8 @@ def _populate_untyped_graph(graph: nx.MultiDiGraph, n_persons: int = 10) -> None
         first_seen="s000",
         last_seen="s000",
     )
+    # speaker_id="speaker0" on every edge — see _populate_graph's identical
+    # comment; the production merger never leaves a real edge unattributed.
     for i in range(n_persons):
         graph.add_edge(
             f"person{i}",
@@ -4122,6 +4444,7 @@ def _populate_untyped_graph(graph: nx.MultiDiGraph, n_persons: int = 10) -> None
             confidence=1.0,
             source="extraction",
             sessions=["s000"],
+            speaker_id="speaker0",
         )
 
 

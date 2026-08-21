@@ -177,9 +177,8 @@ import threading
 from collections.abc import Iterable, Iterator
 from typing import TYPE_CHECKING, NoReturn
 
-from paramem.memory.bookkeeping import credit_reinforcement
+from paramem.memory.bookkeeping import bookkeeping_row, credit_reinforcement
 from paramem.training.key_registry import KeyRegistry
-from paramem.utils.identity import canonical, is_speaker_id
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -530,58 +529,15 @@ class MemoryStore:
         reinforcement_count: int = 1,
         last_reinforced_cycle: int = 0,
         last_seen: str = "",
-        allow_empty_speaker: bool = False,
     ) -> None:
-        """Store or update the bookkeeping record for *key*.
+        """Store or replace the bookkeeping record for *key*.
 
-        All seven fields are mandatory in the persisted schema (one mandatory
-        tier, zero optional buckets).  ``first_seen`` and ``promoted`` carry
-        no Python default — every call site must pass them explicitly.  The
-        ``reinforcement_count``, ``last_reinforced_cycle``, and ``last_seen``
-        params carry Python defaults solely as a legacy-fill convenience for
-        new-key sites and boot-reload callers that do not yet know the
-        values.  The stored dict always contains all seven keys.
-
-        ``speaker_id``: the speaker who first introduced this key.
-        ``relation_type``: the model-assigned relation type from extraction
-        (e.g. ``"factual"``, ``"preference"``, ``"temporal"``, ``"social"``).
-        ``first_seen``: ISO 8601 wall-clock timestamp of the earliest session
-        that contained this fact.  Paired with ``last_seen`` to give each fact
-        its true assertion window ``[first_seen, last_seen]``.  Mandatory —
-        no runtime fallback; callers must supply the real value.
-        ``reinforcement_count``: the fact's durable maturity — how many
-        separately-timed sightings it has accumulated, plus whatever it
-        inherited from keys merged into it.  Only :meth:`reinforce` may change
-        it after minting; see there for the exact rule.  Default 1 (a new key
-        has been seen once).
-        ``last_reinforced_cycle``: the most recent consolidation cycle at which
-        this key's fact was reinforced (cycle counter; drives promotion/decay).
-        Default 0 (unknown).
-        ``last_seen``: ISO 8601 wall-clock timestamp of the most recent session
-        that contained this fact.  Drives contradiction detection and temporal
-        reasoning.  Default ``""`` (unknown).
-        ``promoted``: whether this key has already been promoted from episodic
-        to semantic.  Mandatory, no default — the flag replaces the former
-        event-level ``promoted_keys`` array: it sits on the key's own row, so
-        the promotion cannot exist without the registry move it describes
-        having been published with the same tier state.  Every new-key call
-        site passes ``promoted=False``; the live writer that flips it to
-        ``True`` is ``ConsolidationLoop._promote_working_keys`` (via the
-        working row it hands to :meth:`adopt_increments` at go-live) at the
-        point it moves a key from episodic to semantic.
-        ``allow_empty_speaker``: when ``True``, suppresses the empty-speaker_id
-        guard and allows ``speaker_id=""`` to be stored.  Required for keyless
-        concept-node edges whose subject has no speaker attribution.  Default
-        ``False``; omit this flag for all new-key production writes where a
-        real speaker_id must be present (no-unattributed-keys invariant).
-        Boot reload (:meth:`load_bookkeeping_from_disk`) does NOT pass this
-        flag — a persisted row with an empty ``speaker_id`` fails the same
-        guard at boot as it would at mint time; there is no reload-time
-        carve-out for legacy unattributed keys.
-
-        Raises:
-            ValueError: when ``speaker_id`` is empty and ``allow_empty_speaker``
-                is ``False`` — unattributed keys are not recallable by speaker.
+        Builds the row via :func:`~paramem.memory.bookkeeping.bookkeeping_row`
+        — see there for the seven-field contract, the speaker
+        canonicalisation, and the empty-speaker ``ValueError`` (there is no
+        carve-out here: every call site, including boot reload via
+        :meth:`load_bookkeeping_from_disk`, must supply a real speaker_id —
+        the no-unattributed-keys invariant).
 
         **Callers that need to update ONE field on an existing key must use
         :meth:`reinforce` (for reinforcement/last_seen/first_seen updates)
@@ -596,34 +552,22 @@ class MemoryStore:
         Does NOT touch ``_entries`` — bookkeeping presence MUST NOT
         manufacture a content cache hit.
 
-        ``speaker_id`` is canonicalized via
-        :func:`~paramem.utils.identity.canonical` when it matches the
-        ``speaker{N}`` pattern (``is_speaker_id``) so legacy-loaded and
-        runtime-set data both match the casing the router's
-        ``_speaker_key_index`` (:meth:`~paramem.server.router.QueryRouter.reload`,
-        the sole privacy boundary) is built from: legacy cased ``Speaker0``
-        from a tier's ``key_metadata.json`` is silently coerced to
-        ``speaker0`` at boot via the :meth:`load_bookkeeping_from_disk` →
-        :meth:`set_bookkeeping` path, self-healing on the next save.  Empty
-        strings and non-speaker values pass through unchanged."""
-        if is_speaker_id(speaker_id):
-            speaker_id = canonical(speaker_id)
-        if not speaker_id and not allow_empty_speaker:
-            raise ValueError(
-                f"set_bookkeeping: empty speaker_id for key {key!r} without "
-                f"allow_empty_speaker=True — unattributed keys are not recallable "
-                f"by speaker (no-unattributed-keys invariant)."
-            )
+        Raises:
+            ValueError: propagated from :func:`~paramem.memory.bookkeeping.bookkeeping_row`
+                when ``speaker_id`` is empty.
+        """
+        row = bookkeeping_row(
+            key,
+            speaker_id=speaker_id,
+            relation_type=relation_type,
+            first_seen=first_seen,
+            promoted=promoted,
+            reinforcement_count=reinforcement_count,
+            last_reinforced_cycle=last_reinforced_cycle,
+            last_seen=last_seen,
+        )
         with self._lock:
-            self._bookkeeping[key] = {
-                "speaker_id": speaker_id,
-                "relation_type": relation_type,
-                "reinforcement_count": reinforcement_count,
-                "last_reinforced_cycle": last_reinforced_cycle,
-                "last_seen": last_seen,
-                "first_seen": first_seen,
-                "promoted": promoted,
-            }
+            self._bookkeeping[key] = row
 
     def reinforce(
         self,
@@ -1472,10 +1416,11 @@ class MemoryStore:
         presence MUST NOT manufacture a content cache hit.
 
         Each persisted record is splatted whole into :meth:`set_bookkeeping`
-        (``self.set_bookkeeping(key, **key_meta)`` — no
-        ``allow_empty_speaker``; a persisted row with an empty ``speaker_id``
-        fails :meth:`set_bookkeeping`'s guard here exactly as it would at
-        mint time).  The write side (the per-tier commit primitive,
+        (``self.set_bookkeeping(key, **key_meta)``) — a persisted row with an
+        empty ``speaker_id`` fails :func:`~paramem.memory.bookkeeping.bookkeeping_row`'s
+        guard here exactly as it would at mint time; there is no reload-time
+        carve-out for legacy unattributed keys.  The write side (the per-tier
+        commit primitive,
         :func:`~paramem.memory.persistence.commit_tier_slot`) persists
         ``dict(bk)`` from :meth:`bookkeeping_for_key` verbatim, so the
         on-disk record always carries exactly the fields
@@ -1617,7 +1562,19 @@ class MemoryStore:
            ``increment.bookkeeping``.  A gap raises
            :class:`~paramem.memory.store.BookkeepingInvariantViolation` via
            :func:`raise_bookkeeping_invariant_violation`, before any
-           mutation, same as the entry-cache check above.
+           mutation, same as the entry-cache check above.  This pass ALSO
+           validates every increment's rows: each ``increment.bookkeeping``
+           entry is rebuilt through
+           :func:`~paramem.memory.bookkeeping.bookkeeping_row` (``rows_bytes``
+           is on-disk bytes, on the crash-resume path written by a
+           *different process*, so it needs the same schema and
+           empty-speaker guard a fresh mint does) into a local ``validated``
+           map, keyed by the row's own key.  A row carrying an unexpected or
+           missing field raises ``TypeError`` from the splat — a schema
+           refusal at go-live, before any mutation, changing that resume
+           path's failure mode from a silent bad row to a raise.  Pass 2
+           installs from ``validated``, never from the increment's raw row
+           dict — one construction, one copy.
         1. **Drop.** For every member tier, read its OUTGOING registry's
            ``list_known()`` (active ∪ stale) BEFORE any rebind, and drop
            every one of those keys' bookkeeping rows.  Same for every
@@ -1663,6 +1620,7 @@ class MemoryStore:
         """
         with self._lock:
             # --- 0. Check: every member, before any mutation ---
+            validated: dict[str, dict] = {}
             for inc in increments:
                 if inc.rebuilt:
                     missing = [k for k in inc.registry.list_active() if k not in inc.entries]
@@ -1673,6 +1631,8 @@ class MemoryStore:
                     raise_bookkeeping_invariant_violation(
                         inc.tier, missing_rows, "adopt_increments bookkeeping completeness"
                     )
+                for key, row in inc.bookkeeping.items():
+                    validated[key] = bookkeeping_row(key, **row)
 
             # --- 1. Drop ---
             drop_keys: set[str] = set()
@@ -1692,8 +1652,8 @@ class MemoryStore:
                 self._registry[inc.tier] = inc.registry
                 if inc.rebuilt:
                     self._entries[inc.tier] = dict(inc.entries)
-                for key, row in inc.bookkeeping.items():
-                    self._bookkeeping[key] = dict(row)
+                for key in inc.bookkeeping:
+                    self._bookkeeping[key] = validated[key]
 
             for tier in absorbed_tiers:
                 self._entries.pop(tier, None)

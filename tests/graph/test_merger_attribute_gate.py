@@ -1,15 +1,18 @@
 """Unit tests for GraphMerger's ``relation_type == "attribute"`` gate.
 
-Covers the merger-gate authority relocation: a relation the model
-tags ``relation_type="attribute"`` folds onto the SUBJECT node's
-``attributes`` dict instead of becoming an edge to a (potentially
-colliding) concept node. Pure graph-state assertions — no model, no
-tokenizer, no cloud.
+Covers the merger-gate authority relocation: a relation the model tags
+``relation_type="attribute"`` folds onto the SUBJECT node's ``attributes``
+dict instead of becoming an edge to a (potentially colliding) concept node,
+plus the provenance-bearing node-attribute record: the two merger
+primitives (``reconcile_provenance``, ``attribute_fact``) and the rewritten
+gate's net-new record shape, same-value reconciliation, and the
+value-change-starts-a-new-lifetime rule. Pure graph-state assertions — no
+model, no tokenizer, no cloud.
 """
 
 from __future__ import annotations
 
-from paramem.graph.merger import GraphMerger, _strip_has_prefix
+from paramem.graph.merger import GraphMerger, attribute_fact, node_display, reconcile_provenance
 from paramem.graph.schema import Entity, Relation, SessionGraph
 
 
@@ -30,6 +33,9 @@ def _attr_relation(
     obj="alex@example.com",
     speaker_id="speaker0",
     indexed_key: str | None = None,
+    first_seen="",
+    last_seen="",
+    edge_source="",
 ) -> Relation:
     return Relation(
         subject=subject,
@@ -39,35 +45,13 @@ def _attr_relation(
         confidence=1.0,
         speaker_id=speaker_id,
         indexed_key=indexed_key,
+        first_seen=first_seen,
+        last_seen=last_seen,
+        edge_source=edge_source,
     )
 
 
-class TestStripHasPrefix:
-    def test_strips_underscore_prefix(self):
-        assert _strip_has_prefix("has_email") == "email"
-
-    def test_strips_space_prefix(self):
-        assert _strip_has_prefix("has certification") == "certification"
-
-    def test_strips_only_one_occurrence(self):
-        """A doubled prefix degrades to a single strip, never both."""
-        assert _strip_has_prefix("has_has_email") == "has_email"
-
-    def test_no_prefix_passthrough(self):
-        assert _strip_has_prefix("works_at") == "works_at"
-
-    def test_bare_has_word_not_stripped(self):
-        """'has' alone (no trailing separator) is not a prefix match."""
-        assert _strip_has_prefix("has") == "has"
-
-
 class TestAttributeGateFoldsOntoNode:
-    def test_attribute_relation_becomes_node_attribute(self):
-        merger = GraphMerger()
-        merger.merge(_session(_attr_relation()))
-        node = merger.graph.nodes["speaker0"]
-        assert node["attributes"]["email"] == "alex@example.com"
-
     def test_no_edge_created(self):
         merger = GraphMerger()
         merger.merge(_session(_attr_relation()))
@@ -81,37 +65,6 @@ class TestAttributeGateFoldsOntoNode:
         assert "speaker0" in merger.graph
         assert "alex@example.com" not in merger.graph
 
-    def test_value_stored_verbatim_case_preserved(self):
-        """object canonicalization is mode='spaces' — case/diacritics survive."""
-        merger = GraphMerger()
-        merger.merge(_session(_attr_relation(obj="+1 555 123 4567")))
-        node = merger.graph.nodes["speaker0"]
-        assert node["attributes"]["email"] == "+1 555 123 4567"
-
-    def test_value_blank_runs_folded_to_space(self):
-        """object canonicalization is mode='spaces': underscore/blank runs
-        collapse to a single space, case is preserved."""
-        merger = GraphMerger()
-        merger.merge(_session(_attr_relation(predicate="has_title", obj="Lead_Systems  Engineer")))
-        node = merger.graph.nodes["speaker0"]
-        assert node["attributes"]["title"] == "Lead Systems Engineer"
-
-    def test_predicate_without_has_prefix_still_canonicalized(self):
-        """Works_At -> attribute key 'works at' (general canonicalization path,
-        not limited to has_-prefixed predicates). The OBJECT keeps its case
-        (mode='spaces' does not casefold)."""
-        merger = GraphMerger()
-        merger.merge(_session(_attr_relation(predicate="Works_At", obj="Acme")))
-        node = merger.graph.nodes["speaker0"]
-        assert node["attributes"]["works at"] == "Acme"
-
-    def test_has_prefix_stripped_once_no_has_has(self):
-        merger = GraphMerger()
-        merger.merge(_session(_attr_relation(predicate="has_has_email")))
-        node = merger.graph.nodes["speaker0"]
-        # canonical() space-folds the underscore left after a single strip.
-        assert node["attributes"]["has email"] == "alex@example.com"
-
     def test_subject_node_display_name_seeded_from_surface(self):
         merger = GraphMerger()
         merger.merge(_session(_attr_relation(subject="Alex Morgan", obj="x@y.com")))
@@ -120,52 +73,7 @@ class TestAttributeGateFoldsOntoNode:
         assert merger.graph.nodes[node_key]["display_name"] == "Alex Morgan"
 
 
-class TestAttributeGateNoCollision:
-    def test_two_subjects_same_value_stay_separate_nodes(self):
-        """The whole point of the relocation: two subjects holding the SAME
-        literal value never collapse onto one shared concept node."""
-        merger = GraphMerger()
-        merger.merge(
-            _session(
-                _attr_relation(
-                    subject="speaker0", predicate="has_certification", obj="SAE Level 3"
-                ),
-                _attr_relation(
-                    subject="speaker1", predicate="has_certification", obj="SAE Level 3"
-                ),
-            )
-        )
-        assert merger.graph.number_of_nodes() == 2
-        assert merger.graph.nodes["speaker0"]["attributes"]["certification"] == "SAE Level 3"
-        assert merger.graph.nodes["speaker1"]["attributes"]["certification"] == "SAE Level 3"
-        assert merger.graph.number_of_edges() == 0
-
-
-class TestAttributeKeysBookkeeping:
-    def test_indexed_key_set_populates_attribute_keys(self):
-        merger = GraphMerger()
-        merger.merge(_session(_attr_relation(indexed_key="graph7")))
-        node = merger.graph.nodes["speaker0"]
-        assert node["attribute_keys"]["email"] == "graph7"
-
-    def test_indexed_key_none_leaves_attribute_keys_absent(self):
-        merger = GraphMerger()
-        merger.merge(_session(_attr_relation(indexed_key=None)))
-        node = merger.graph.nodes["speaker0"]
-        assert "attribute_keys" not in node or "email" not in node.get("attribute_keys", {})
-
-    def test_attribute_keys_round_trips_through_node_link_serialization(self):
-        """attribute_keys is an unknown top-level node field to
-        nx.node_link_data and must survive a save/load round trip
-        (cumulative-graph / backup-artifact venue)."""
-        import networkx as nx
-
-        merger = GraphMerger()
-        merger.merge(_session(_attr_relation(indexed_key="graph7")))
-        data = nx.node_link_data(merger.graph)
-        reloaded = nx.node_link_graph(data, multigraph=True, directed=True)
-        assert reloaded.nodes["speaker0"]["attribute_keys"]["email"] == "graph7"
-
+class TestAttributeGateDisplayNameRoundTrip:
     def test_display_name_round_trips_through_node_link_serialization(self):
         """display_name is an unknown top-level node field to
         nx.node_link_data and must survive a save/load round trip — the RAM
@@ -187,27 +95,6 @@ class TestAttributeKeySupersession:
     the new key) so it is not silently dropped from the fold's accounting.
     """
 
-    def test_superseded_attribute_key_is_ledgered_with_a_survivor(self):
-        merger = GraphMerger()
-        merger.merge(_session(_attr_relation(indexed_key="graph_old"), session_id="s0"))
-        merger.merge(_session(_attr_relation(indexed_key="graph_new"), session_id="s1"))
-
-        node = merger.graph.nodes["speaker0"]
-        assert node["attribute_keys"]["email"] == "graph_new", (
-            "the new key must win the attribute_keys slot"
-        )
-        assert "graph_old" in merger.removal_ledger, (
-            f"the displaced key must be ledgered; got {list(merger.removal_ledger)}"
-        )
-        entry = merger.removal_ledger["graph_old"]
-        assert entry["reason"] == "attribute_key_superseded", (
-            f"expected reason='attribute_key_superseded'; got {entry['reason']!r}"
-        )
-        assert entry["survivor_key"] == "graph_new", (
-            f"expected survivor_key='graph_new'; got {entry.get('survivor_key')!r}"
-        )
-        assert "graph_new" not in merger.removal_ledger, "the surviving key must not be ledgered"
-
     def test_repeated_merge_of_the_same_key_does_not_ledger(self):
         """Re-merging the SAME indexed key onto the same attribute is a no-op
         overwrite, not a supersession — nothing to ledger."""
@@ -215,31 +102,6 @@ class TestAttributeKeySupersession:
         merger.merge(_session(_attr_relation(indexed_key="graph7"), session_id="s0"))
         merger.merge(_session(_attr_relation(indexed_key="graph7"), session_id="s1"))
         assert merger.removal_ledger == {}
-
-    def test_superseded_attribute_key_with_a_different_value_omits_the_survivor(self):
-        """A DIFFERENT value winning the same (subject, attribute) slot is the
-        contradiction shape, not a carry-forward: the displaced key is still
-        ledgered (so it still counts as an intended removal, never a genuine
-        loss) but the entry must NOT carry survivor_key, and must instead
-        record old_object/new_object — mirroring an edge-level contradiction.
-        """
-        merger = GraphMerger()
-        old_rel = _attr_relation(indexed_key="graph_old", obj="old@example.com")
-        new_rel = _attr_relation(indexed_key="graph_new", obj="new@example.com")
-        merger.merge(_session(old_rel, session_id="s0"))
-        merger.merge(_session(new_rel, session_id="s1"))
-
-        node = merger.graph.nodes["speaker0"]
-        assert node["attribute_keys"]["email"] == "graph_new"
-        entry = merger.removal_ledger["graph_old"]
-        assert entry["reason"] == "attribute_key_superseded", (
-            f"expected reason='attribute_key_superseded'; got {entry['reason']!r}"
-        )
-        assert "survivor_key" not in entry, (
-            f"a different-value overwrite must NOT carry survivor_key; got {entry}"
-        )
-        assert entry["old_object"] == "old@example.com", f"got {entry}"
-        assert entry["new_object"] == "new@example.com", f"got {entry}"
 
     def test_same_value_carry_forward_survives_speaker_refresh_between_merges(self):
         """A same-value `has name` carry-forward on a speaker node must still
@@ -260,31 +122,6 @@ class TestAttributeKeySupersession:
             "reason": "attribute_key_superseded",
             "survivor_key": "graph_new",
         }
-
-
-class TestAttributeDisplaySurfaceSeparation:
-    """`display_name` and the trained `attributes["name"]` fact are
-    independent node fields: a fact can never clobber the first-seen display
-    surface, and the display surface is never read as a fact."""
-
-    def test_first_seen_display_survives_a_later_name_fact(self):
-        merger = GraphMerger()
-        edge_rel = Relation(
-            subject="Alex Morgan",
-            predicate="lives_in",
-            object="Berlin",
-            relation_type="factual",
-            speaker_id="",
-        )
-        name_rel = _attr_relation(
-            subject="Alex Morgan", predicate="has_name", obj="Alexandra Morgan", speaker_id=""
-        )
-        merger.merge_relations([edge_rel], session_id="s0", log_label="edge")
-        merger.merge_relations([name_rel], session_id="s1", log_label="name fact")
-
-        node = merger.graph.nodes["alex morgan"]
-        assert node["display_name"] == "Alex Morgan"
-        assert node["attributes"]["name"] == "Alexandra Morgan"
 
 
 class TestAttributeGateDoesNotReachUpsertRelation:
@@ -316,3 +153,359 @@ class TestAttributeGateDoesNotReachUpsertRelation:
         merger.merge(_session(_attr_relation(), session_id="s1"))
         node = merger.graph.nodes["speaker0"]
         assert node["reinforcement_count"] == 1
+
+
+# ---------------------------------------------------------------------------
+# reconcile_provenance
+# ---------------------------------------------------------------------------
+
+
+class TestReconcileProvenance:
+    def test_empty_target_reproduces_net_new(self):
+        """An empty target degenerates to the net-new stamp: relation's
+        speaker_id, and last_seen/first_seen fall back to timestamp."""
+        target: dict = {}
+        rel = Relation(
+            subject="alex",
+            predicate="has email",
+            object="a@b.com",
+            relation_type="attribute",
+            speaker_id="speaker0",
+        )
+        reconcile_provenance(target, rel, "2026-01-01T00:00:00Z")
+        assert target["speaker_id"] == "speaker0"
+        assert target["last_seen"] == "2026-01-01T00:00:00Z"
+        assert target["first_seen"] == "2026-01-01T00:00:00Z"
+        assert "edge_source" not in target
+
+    def test_widens_window_in_both_directions(self):
+        target = {
+            "speaker_id": "speaker0",
+            "first_seen": "2026-03-01T00:00:00Z",
+            "last_seen": "2026-03-01T00:00:00Z",
+        }
+        earlier = Relation(
+            subject="a",
+            predicate="p",
+            object="b",
+            relation_type="attribute",
+            speaker_id="speaker0",
+            first_seen="2026-01-01T00:00:00Z",
+            last_seen="2026-01-01T00:00:00Z",
+        )
+        reconcile_provenance(target, earlier, "")
+        assert target["first_seen"] == "2026-01-01T00:00:00Z", "must widen first_seen earlier"
+        assert target["last_seen"] == "2026-03-01T00:00:00Z", "must not narrow last_seen"
+
+        later = Relation(
+            subject="a",
+            predicate="p",
+            object="b",
+            relation_type="attribute",
+            speaker_id="speaker0",
+            first_seen="2026-06-01T00:00:00Z",
+            last_seen="2026-06-01T00:00:00Z",
+        )
+        reconcile_provenance(target, later, "")
+        assert target["last_seen"] == "2026-06-01T00:00:00Z", "must widen last_seen later"
+        assert target["first_seen"] == "2026-01-01T00:00:00Z", "must not narrow first_seen"
+
+    def test_speaker_id_untouched_when_already_present(self):
+        target = {"speaker_id": "speaker0"}
+        rel = Relation(
+            subject="a",
+            predicate="p",
+            object="b",
+            relation_type="attribute",
+            speaker_id="speaker9",
+        )
+        reconcile_provenance(target, rel, "")
+        assert target["speaker_id"] == "speaker0", "first-non-empty-wins must not overwrite"
+
+    def test_incoming_empty_first_seen_never_wins_the_min(self):
+        target = {"first_seen": "2026-01-01T00:00:00Z"}
+        rel = Relation(
+            subject="a",
+            predicate="p",
+            object="b",
+            relation_type="attribute",
+            speaker_id="speaker0",
+            first_seen="",
+        )
+        # timestamp="" too, so relation.first_seen or timestamp == ""
+        reconcile_provenance(target, rel, "")
+        assert target["first_seen"] == "2026-01-01T00:00:00Z"
+
+    def test_edge_source_written_only_when_relation_carries_one_and_target_has_none(self):
+        target: dict = {}
+        rel_no_source = Relation(
+            subject="a",
+            predicate="p",
+            object="b",
+            relation_type="attribute",
+            speaker_id="speaker0",
+        )
+        reconcile_provenance(target, rel_no_source, "")
+        assert "edge_source" not in target
+
+        rel_with_source = Relation(
+            subject="a",
+            predicate="p",
+            object="b",
+            relation_type="attribute",
+            speaker_id="speaker0",
+            edge_source="graph_enrichment",
+        )
+        reconcile_provenance(target, rel_with_source, "")
+        assert target["edge_source"] == "graph_enrichment"
+
+        # A second, different edge_source must not overwrite the first.
+        rel_second_source = Relation(
+            subject="a",
+            predicate="p",
+            object="b",
+            relation_type="attribute",
+            speaker_id="speaker0",
+            edge_source="other_source",
+        )
+        reconcile_provenance(target, rel_second_source, "")
+        assert target["edge_source"] == "graph_enrichment"
+
+
+# ---------------------------------------------------------------------------
+# attribute_fact
+# ---------------------------------------------------------------------------
+
+
+class TestAttributeFact:
+    def test_uses_display_surface_when_present(self):
+        node_data = {"display_name": "Alex Morgan"}
+        record = {
+            "value": "alex@example.com",
+            "speaker_id": "speaker0",
+            "first_seen": "2026-01-01T00:00:00Z",
+            "last_seen": "2026-02-01T00:00:00Z",
+            "ik_key": "graph5",
+        }
+        fact = attribute_fact(node_data, "alex morgan", "email", record)
+        assert fact == {
+            "subject": "Alex Morgan",
+            "predicate": "has email",
+            "object": "alex@example.com",
+            "speaker_id": "speaker0",
+            "first_seen": "2026-01-01T00:00:00Z",
+            "last_seen": "2026-02-01T00:00:00Z",
+            "ik_key": "graph5",
+        }
+
+    def test_falls_back_to_node_key_when_no_display_name(self):
+        fact = attribute_fact({}, "alex morgan", "email", {"value": "x"})
+        assert fact["subject"] == "alex morgan"
+
+    def test_ik_key_defaults_to_empty_string_for_keyless_record(self):
+        fact = attribute_fact({}, "alex", "email", {"value": "x", "speaker_id": "speaker0"})
+        assert fact["ik_key"] == ""
+
+    def test_subject_matches_node_display_helper(self):
+        """Both existing callers must agree with node_display's own resolution."""
+        node_data = {"display_name": "Alex"}
+        fact = attribute_fact(node_data, "alex", "email", {"value": "x"})
+        assert fact["subject"] == node_display(node_data, "alex")
+
+    def test_does_not_mutate_inputs(self):
+        node_data = {"display_name": "Alex"}
+        record = {"value": "x", "speaker_id": "speaker0"}
+        node_data_before = dict(node_data)
+        record_before = dict(record)
+        attribute_fact(node_data, "alex", "email", record)
+        assert node_data == node_data_before
+        assert record == record_before
+
+
+# ---------------------------------------------------------------------------
+# The attribute gate's record shape and lifetime rules
+# ---------------------------------------------------------------------------
+
+
+class TestAttributeGateNetNewRecord:
+    def test_net_new_record_carries_value_speaker_and_window(self):
+        merger = GraphMerger()
+        merger.merge(
+            _session(
+                _attr_relation(
+                    speaker_id="speaker0",
+                    first_seen="2026-01-01T00:00:00Z",
+                    last_seen="2026-01-01T00:00:00Z",
+                )
+            )
+        )
+        record = merger.graph.nodes["speaker0"]["attributes"]["email"]
+        assert record["value"] == "alex@example.com"
+        assert record["speaker_id"] == "speaker0"
+        assert record["first_seen"] == "2026-01-01T00:00:00Z"
+        assert record["last_seen"] == "2026-01-01T00:00:00Z"
+        assert "ik_key" not in record
+
+    def test_net_new_record_carries_ik_key_when_relation_is_keyed(self):
+        merger = GraphMerger()
+        merger.merge(_session(_attr_relation(indexed_key="graph7")))
+        record = merger.graph.nodes["speaker0"]["attributes"]["email"]
+        assert record["ik_key"] == "graph7"
+
+    def test_placeholder_value_is_skipped_and_writes_no_record_and_no_node(self):
+        merger = GraphMerger()
+        merger.merge(_session(_attr_relation(obj="N/A")))
+        assert merger.graph.number_of_nodes() == 0
+        assert merger.removal_ledger == {}
+
+
+class TestAttributeGateSameValueReconciles:
+    def test_re_merge_widens_window_without_changing_speaker_id(self):
+        merger = GraphMerger()
+        merger.merge(
+            _session(
+                _attr_relation(
+                    speaker_id="speaker0",
+                    first_seen="2026-03-01T00:00:00Z",
+                    last_seen="2026-03-01T00:00:00Z",
+                ),
+                session_id="s0",
+            )
+        )
+        merger.merge(
+            _session(
+                _attr_relation(
+                    speaker_id="speaker9",  # different asserter — must not win
+                    first_seen="2026-01-01T00:00:00Z",
+                    last_seen="2026-06-01T00:00:00Z",
+                ),
+                session_id="s1",
+            )
+        )
+        record = merger.graph.nodes["speaker0"]["attributes"]["email"]
+        assert record["speaker_id"] == "speaker0", "first-non-empty-wins: original speaker kept"
+        assert record["first_seen"] == "2026-01-01T00:00:00Z", "window must widen earlier"
+        assert record["last_seen"] == "2026-06-01T00:00:00Z", "window must widen later"
+
+    def test_keyed_same_value_carry_forward_ledgers_with_survivor_key(self):
+        merger = GraphMerger()
+        old_rel = _attr_relation(obj="Alex", predicate="has_name", indexed_key="graph_old")
+        new_rel = _attr_relation(obj="Alex", predicate="has_name", indexed_key="graph_new")
+        merger.merge_relations([old_rel], session_id="s0", log_label="name facts")
+        merger.merge_relations([new_rel], session_id="s1", log_label="name facts")
+
+        assert merger.removal_ledger["graph_old"] == {
+            "reason": "attribute_key_superseded",
+            "survivor_key": "graph_new",
+        }
+        record = merger.graph.nodes["speaker0"]["attributes"]["name"]
+        assert record["ik_key"] == "graph_new"
+
+    def test_repeated_merge_of_the_same_key_does_not_ledger(self):
+        merger = GraphMerger()
+        merger.merge(_session(_attr_relation(indexed_key="graph7"), session_id="s0"))
+        merger.merge(_session(_attr_relation(indexed_key="graph7"), session_id="s1"))
+        assert merger.removal_ledger == {}
+
+
+class TestAttributeGateValueChangeStartsNewLifetime:
+    """A different value never reconciles onto the incumbent record — it
+    starts a new record lifetime with the new relation's own speaker and
+    window."""
+
+    def test_keyless_value_change_supersedes_bound_key_no_survivor(self):
+        merger = GraphMerger()
+        merger.merge(
+            _session(
+                _attr_relation(
+                    obj="alex@example.com",
+                    indexed_key="graph5",
+                    speaker_id="speaker0",
+                    first_seen="2026-01-01T00:00:00Z",
+                    last_seen="2026-01-01T00:00:00Z",
+                ),
+                session_id="s0",
+            )
+        )
+        merger.merge(
+            _session(
+                _attr_relation(
+                    obj="alex-new@example.com",  # different value, no indexed_key
+                    speaker_id="speaker1",
+                    first_seen="2026-06-01T00:00:00Z",
+                    last_seen="2026-06-01T00:00:00Z",
+                ),
+                session_id="s1",
+            )
+        )
+        record = merger.graph.nodes["speaker0"]["attributes"]["email"]
+        assert record["value"] == "alex-new@example.com"
+        assert record["speaker_id"] == "speaker1"
+        assert record["first_seen"] == "2026-06-01T00:00:00Z"
+        assert record["last_seen"] == "2026-06-01T00:00:00Z"
+        assert "ik_key" not in record, "new value has no key yet — the keyed walk mints one"
+
+        assert merger.removal_ledger["graph5"] == {
+            "reason": "attribute_key_superseded",
+            "old_object": "alex@example.com",
+            "new_object": "alex-new@example.com",
+        }
+
+    def test_keyless_value_change_with_no_bound_key_ledgers_nothing(self):
+        """Inline check: speaker0 asserts a value keyless, speaker1
+        re-asserts a DIFFERENT value keyless (later date) — no key was ever
+        bound, so nothing is ledgered, but the record still carries
+        speaker1 and speaker1's own dates as BOTH first_seen and last_seen —
+        never speaker0's, never blended."""
+        merger = GraphMerger()
+        merger.merge(
+            _session(
+                _attr_relation(
+                    obj="a@b.com",
+                    speaker_id="speaker0",
+                    first_seen="2026-01-01T00:00:00Z",
+                    last_seen="2026-01-01T00:00:00Z",
+                ),
+                session_id="s0",
+            )
+        )
+        merger.merge(
+            _session(
+                _attr_relation(
+                    obj="c@d.com",
+                    speaker_id="speaker1",
+                    first_seen="2026-06-01T00:00:00Z",
+                    last_seen="2026-06-01T00:00:00Z",
+                ),
+                session_id="s1",
+            )
+        )
+        record = merger.graph.nodes["speaker0"]["attributes"]["email"]
+        assert record["value"] == "c@d.com"
+        assert record["speaker_id"] == "speaker1"
+        assert record["first_seen"] == "2026-06-01T00:00:00Z"
+        assert record["last_seen"] == "2026-06-01T00:00:00Z"
+        assert "ik_key" not in record
+        assert merger.removal_ledger == {}, "no key was ever bound — nothing to ledger"
+
+    def test_keyed_value_change_keeps_two_arm_ledger_and_binds_new_key(self):
+        """The keyed case (relation.indexed_key set, incumbent key
+        different) keeps its current two-arm behaviour: a different value
+        winning ledgers old_object/new_object with no survivor_key."""
+        merger = GraphMerger()
+        merger.merge(
+            _session(_attr_relation(obj="alex@example.com", indexed_key="graph5"), session_id="s0")
+        )
+        merger.merge(
+            _session(
+                _attr_relation(obj="alex-new@example.com", indexed_key="graph6"), session_id="s1"
+            )
+        )
+        record = merger.graph.nodes["speaker0"]["attributes"]["email"]
+        assert record["value"] == "alex-new@example.com"
+        assert record["ik_key"] == "graph6"
+        assert merger.removal_ledger["graph5"] == {
+            "reason": "attribute_key_superseded",
+            "old_object": "alex@example.com",
+            "new_object": "alex-new@example.com",
+        }

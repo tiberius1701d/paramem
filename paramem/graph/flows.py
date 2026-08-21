@@ -708,7 +708,16 @@ def extract_graph(
     4. De-anonymize (substitute real names back, scalar partition,
        deanon-stage plausibility)
     5. Rebuild (schema-validate relations, all-dropped recovery gate,
-       entity surface + scalar-attribute projection)
+       entity surface filtering)
+
+    The entity scalar-attribute projection (an entity's ``attributes``
+    dict rendered into attribute-typed relations) does NOT run inside this
+    flow — it runs once, after this whole chain returns, in
+    :meth:`~paramem.graph.extraction_pipeline.ExtractionPipeline._run_extractor`,
+    outside the ``base_model_inference`` scope. That placement is what lets
+    a calibration ``dispatch_chain`` call
+    (:func:`~paramem.server.calibrate.dispatch_chain`) see the same
+    projected relations the fold merges, including under ``stop_at``.
 
     All filters fail gracefully — extraction result is preserved on any failure.
 

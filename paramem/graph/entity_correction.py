@@ -9,8 +9,11 @@ The judgement "is this value a misspelled well-known place/organization/
 concept, and if so what is the correct spelling" is independent of WHERE
 the value lives — a reverse-anonymization-map placeholder value, or a
 free-form ``graph.entities[*].attributes`` value (e.g. ``current_location``,
-which extraction stores as a speaker attribute, not a relation, and which
-the reverse map never reaches). That single judgement is implemented ONCE
+which extraction stores as an entity attribute — projected into an
+attribute-typed relation only later, by
+:func:`paramem.graph.relation_prep.attribute_relations`, after this stage
+has already run — and which the reverse map never reaches). That single
+judgement is implemented ONCE
 in :func:`_verdict`, which is the only place the prompt is loaded, the model
 is called, the JSON response is parsed, and the ``kind`` enum is normalized.
 Everything else in :func:`correct_entity_surfaces` is source-specific

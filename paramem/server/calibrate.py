@@ -404,7 +404,8 @@ def resolve_prompt_variants(state: dict, variants: dict[str, str]) -> dict[str, 
 
 def _relations_from_snapshot(snapshot_path: str) -> list[dict]:
     """Load a NetworkX node-link ``graph_merged_snapshot.json`` into flat
-    ``{subject, predicate, object, relation_type, speaker_id}`` dicts.
+    ``{subject, predicate, object, relation_type}`` dicts, plus
+    ``speaker_id`` only when the edge carries one.
 
     THE one snapshot-to-relations reader — shared by
     :func:`validate_normalize` and :func:`validate_anonymize_facts` so a
@@ -413,7 +414,13 @@ def _relations_from_snapshot(snapshot_path: str) -> list[dict]:
 
     NetworkX node-link format: ``{"nodes": [...], "links": [...]}`` where
     each link is ``{source, target, key, ...edge_data...}``. Edges missing
-    a ``predicate`` key are skipped (non-relation edges, if any). Raises
+    a ``predicate`` key are skipped (non-relation edges, if any). An edge
+    with no ``speaker_id`` (or an empty one) omits the key entirely rather
+    than emitting ``""`` — :func:`dispatch_normalize`'s structural
+    ``rel.get("speaker_id", "speaker0")`` placeholder then applies, the
+    same as an inline-supplied relation that omits the field.
+    :func:`dispatch_anonymize_facts` never indexes a fact's
+    ``speaker_id``, so omitting the key is safe there too. Raises
     :class:`~fastapi.HTTPException` (400) when the path does not exist or
     is not valid JSON — this is a guard-time check, called before any
     model call.
@@ -442,15 +449,16 @@ def _relations_from_snapshot(snapshot_path: str) -> list[dict]:
         pred = link.get("predicate")
         if not pred:
             continue
-        relations.append(
-            {
-                "subject": str(link.get("source", "")),
-                "predicate": str(pred),
-                "object": str(link.get("target", "")),
-                "relation_type": str(link.get("relation_type", "factual")),
-                "speaker_id": str(link.get("speaker_id", "")),
-            }
-        )
+        relation: dict[str, Any] = {
+            "subject": str(link.get("source", "")),
+            "predicate": str(pred),
+            "object": str(link.get("target", "")),
+            "relation_type": str(link.get("relation_type", "factual")),
+        }
+        speaker_id = link.get("speaker_id")
+        if speaker_id:
+            relation["speaker_id"] = str(speaker_id)
+        relations.append(relation)
     return relations
 
 
@@ -1097,9 +1105,10 @@ def dispatch_normalize(
     # The pass reads subject/predicate/object and the edge bookkeeping
     # the merger itself stamps; ``relation_type``/``speaker_id`` are
     # required by the schema but never consulted by it, so an injected
-    # triple that omits them gets a structural placeholder rather than
-    # forcing the operator to supply provenance the calibration does
-    # not use.
+    # triple that omits them — or supplies an explicit empty
+    # ``speaker_id``, inline or snapshot-sourced — gets a structural
+    # placeholder rather than forcing the operator to supply provenance
+    # the calibration does not use.
     merger.merge_relations(
         [
             Relation(
@@ -1107,7 +1116,7 @@ def dispatch_normalize(
                 predicate=str(rel.get("predicate", "")),
                 object=str(rel.get("object", "")),
                 relation_type=rel.get("relation_type", "factual"),
-                speaker_id=rel.get("speaker_id", "speaker0"),
+                speaker_id=rel.get("speaker_id") or "speaker0",
             )
             for rel in resolved["relations"]
         ],

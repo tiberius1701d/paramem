@@ -42,7 +42,7 @@ from paramem.memory.entry import entry_simhash
 from paramem.memory.interim_adapter import adapter_slot_root_for_name
 from paramem.training.consolidation import interim_outcome_label
 from paramem.training.key_registry import KeyRegistry
-from tests._fold_fixtures import _make_loop, _wire_fakes, _write_graph
+from tests._fold_fixtures import _make_loop, _rel, _wire_fakes, _write_graph
 
 # ---------------------------------------------------------------------------
 # Shared fact fixture — the ONE definition both venues seed from, so a drift
@@ -224,6 +224,76 @@ class TestConsolidateVenueParity:
             _tier_state(train_loop, "semantic")["bookkeeping"]
             == _tier_state(sim_loop, "semantic")["bookkeeping"]
         )
+
+
+class TestFreshMultiSpeakerIngestPublishesAttributedRows:
+    """Full-arc integration: a fresh multi-speaker pending batch -- one
+    factual fact asserted by speaker0, one scalar attribute about a third
+    party (acme corp) asserted by speaker1 -- goes through a real
+    (fake-model) train-venue fold end to end (stage -> build -> publish ->
+    adopt_increments) and is written to disk. A FRESH MemoryStore's own
+    boot hydration (load_registries_from_disk then
+    load_bookkeeping_from_disk) then reads every minted row back without
+    raising -- which is only possible if no row anywhere in the published
+    tiers carries an empty speaker_id, since a single one would raise
+    ValueError from bookkeeping_row inside set_bookkeeping mid-boot -- and
+    the attribute key's row is attributed to the speaker who actually
+    asserted it, never the other speaker present in the same batch.
+    """
+
+    def test_fresh_multi_speaker_ingest_publishes_attributed_rows_boot_loads_clean(
+        self, tmp_path, monkeypatch
+    ):
+        from paramem.memory.store import MemoryStore
+        from paramem.training.consolidation import PendingRelations
+
+        loop = _make_loop(tmp_path, resident_tiers=["episodic", "semantic"])
+        _wire_fakes(loop, monkeypatch)
+        monkeypatch.setattr("paramem.server.gpu_lock.gpu_lock_is_held", lambda: True)
+
+        pending = PendingRelations(
+            episodic=[
+                _rel("speaker0", "lives_in", "berlin", speaker_id="speaker0"),
+                _rel(
+                    "acme corp",
+                    "has_founder",
+                    "Jane Doe",
+                    relation_type="attribute",
+                    speaker_id="speaker1",
+                    first_seen="2026-03-01T00:00:00Z",
+                    last_seen="2026-03-01T00:00:00Z",
+                ),
+            ],
+            procedural=[],
+        )
+        result = loop.consolidate(mode="train", pending=pending, session_ids=["s1", "s2"])
+        assert result["aborted"] is False
+        assert result["completed"] is True
+
+        episodic_entries = loop.store.entries_in_tier("episodic")
+        attr_key = next(
+            key for key, entry in episodic_entries.items() if entry["predicate"] == "has founder"
+        )
+        lives_key = next(
+            key for key, entry in episodic_entries.items() if entry["predicate"] == "lives in"
+        )
+
+        fresh_store = MemoryStore()
+        fresh_store.load_registries_from_disk(loop.output_dir)
+        boot = fresh_store.load_bookkeeping_from_disk(loop.output_dir)
+        assert boot["orphaned"] == 0
+
+        for tier in ("episodic", "semantic"):
+            for key in fresh_store.registry(tier).list_active():
+                row = fresh_store.bookkeeping_for_key(key)
+                assert row is not None
+                assert row["speaker_id"] != "", (
+                    f"key {key!r} in tier {tier!r} loaded with an empty speaker_id"
+                )
+
+        assert fresh_store.bookkeeping_for_key(attr_key)["speaker_id"] == "speaker1"
+        assert fresh_store.bookkeeping_for_key(attr_key)["first_seen"] == "2026-03-01T00:00:00Z"
+        assert fresh_store.bookkeeping_for_key(lives_key)["speaker_id"] == "speaker0"
 
 
 class TestConsolidateModeGuard:

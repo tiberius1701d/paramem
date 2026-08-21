@@ -269,28 +269,6 @@ class TestSessionTracking:
         assert "s001" in sessions
         assert "s002" in sessions
 
-    def test_attribute_merge(self, merger):
-        g1 = SessionGraph(
-            session_id="s001",
-            timestamp="2026-03-10T10:00:00Z",
-            entities=[Entity(name="Alex", entity_type="person", attributes={"age": "29"})],
-            relations=[],
-        )
-        g2 = SessionGraph(
-            session_id="s002",
-            timestamp="2026-03-11T10:00:00Z",
-            entities=[Entity(name="Alex", entity_type="person", attributes={"role": "engineer"})],
-            relations=[],
-        )
-        merger.merge(g1)
-        merger.merge(g2)
-        # Node key is canonical: "alex"; display name on the node's display_name field
-        attrs = merger.graph.nodes["alex"]["attributes"]
-        assert attrs["age"] == "29"
-        assert attrs["role"] == "engineer"
-        # Display name preserved on the dedicated node field
-        assert merger.graph.nodes["alex"]["display_name"] == "Alex"
-
 
 class TestPersistence:
     def test_save_and_load(self, merger, session_graph_1):
@@ -445,279 +423,53 @@ class TestSpeakerIdDedup:
         # Node key is canonical: canonical("Portland") == "portland"
         assert m.graph.nodes["portland"]["reinforcement_count"] == 2
 
-    def test_speaker_attributes_merged_from_later_session(self):
-        """Attributes from a later session (e.g. has_last_name disclosure) must
-        be merged into the existing speaker node."""
-        m = GraphMerger(similarity_threshold=85.0)
-        sg1 = SessionGraph(
-            session_id="s1",
-            timestamp="2026-01-01T00:00:00Z",
-            entities=[
-                Entity(
-                    name="Alex",
-                    entity_type="person",
-                    attributes={"role": "engineer"},
-                    speaker_id="speaker0",
-                )
-            ],
-            relations=[],
-        )
-        sg2 = SessionGraph(
-            session_id="s2",
-            timestamp="2026-01-02T00:00:00Z",
-            entities=[
-                Entity(
-                    name="Alex",
-                    entity_type="person",
-                    attributes={"has_last_name": "Kim"},
-                    speaker_id="speaker0",
-                )
-            ],
-            relations=[],
-        )
-        m.merge(sg1)
-        m.merge(sg2)
-        # Speaker entity is keyed by casefolded speaker_id ("speaker0"); the
-        # display name lives on the dedicated node field, separate from the
-        # merged role / last_name attributes.
-        node = m.graph.nodes["speaker0"]
-        attrs = node["attributes"]
-        assert attrs.get("role") == "engineer"
-        assert attrs.get("has_last_name") == "Kim"
-        assert node.get("display_name") == "Alex"
 
-
-class TestEmptyAttributeValueDoesNotOverwrite:
-    """A non-empty attribute value captured in one chunk must NOT be
-    overwritten by an LLM-emitted empty / "N/A" / "Unknown" placeholder
-    from a later chunk. This is a known LLM-compliance failure mode where
-    the extractor enumerates every advertised attribute key even when the
-    source has no value for it."""
-
-    def test_empty_string_does_not_overwrite(self):
-        from paramem.graph.merger import GraphMerger
-
-        m = GraphMerger()
-        sg1 = SessionGraph(
-            session_id="s1",
-            timestamp="2026-01-01T00:00:00Z",
-            entities=[
-                Entity(
-                    name="Alex",
-                    entity_type="person",
-                    attributes={"has_email": "alex@example.com"},
-                    speaker_id="speaker0",
-                )
-            ],
-            relations=[],
-        )
-        sg2 = SessionGraph(
-            session_id="s2",
-            timestamp="2026-01-02T00:00:00Z",
-            entities=[
-                Entity(
-                    name="Alex",
-                    entity_type="person",
-                    attributes={"has_email": ""},
-                    speaker_id="speaker0",
-                )
-            ],
-            relations=[],
-        )
-        m.merge(sg1)
-        m.merge(sg2)
-        assert m.graph.nodes["speaker0"]["attributes"]["has_email"] == "alex@example.com"
-
-    def test_na_placeholder_does_not_overwrite(self):
-        from paramem.graph.merger import GraphMerger
-
-        m = GraphMerger()
-        sg1 = SessionGraph(
-            session_id="s1",
-            timestamp="2026-01-01T00:00:00Z",
-            entities=[
-                Entity(
-                    name="Alex",
-                    entity_type="person",
-                    attributes={"has_phone": "+1 555 123 4567"},
-                    speaker_id="speaker0",
-                )
-            ],
-            relations=[],
-        )
-        sg2 = SessionGraph(
-            session_id="s2",
-            timestamp="2026-01-02T00:00:00Z",
-            entities=[
-                Entity(
-                    name="Alex",
-                    entity_type="person",
-                    attributes={"has_phone": "N/A"},
-                    speaker_id="speaker0",
-                )
-            ],
-            relations=[],
-        )
-        m.merge(sg1)
-        m.merge(sg2)
-        assert m.graph.nodes["speaker0"]["attributes"]["has_phone"] == "+1 555 123 4567"
-
-    def test_real_value_supersedes_existing_empty(self):
-        """Reverse direction: if first chunk emits empty, second chunk
-        emits real value, the real value wins."""
-        from paramem.graph.merger import GraphMerger
-
-        m = GraphMerger()
-        sg1 = SessionGraph(
-            session_id="s1",
-            timestamp="2026-01-01T00:00:00Z",
-            entities=[
-                Entity(
-                    name="Alex",
-                    entity_type="person",
-                    attributes={"has_email": "N/A"},
-                    speaker_id="speaker0",
-                )
-            ],
-            relations=[],
-        )
-        sg2 = SessionGraph(
-            session_id="s2",
-            timestamp="2026-01-02T00:00:00Z",
-            entities=[
-                Entity(
-                    name="Alex",
-                    entity_type="person",
-                    attributes={"has_email": "alex@example.com"},
-                    speaker_id="speaker0",
-                )
-            ],
-            relations=[],
-        )
-        m.merge(sg1)
-        m.merge(sg2)
-        assert m.graph.nodes["speaker0"]["attributes"]["has_email"] == "alex@example.com"
-
-
-class TestMultiUserNameCollision:
-    """Two distinct disclosed speakers with the same display name must NOT
-    collapse into one graph node.
-
-    This is the multi-user PA case: speaker0 (Alex Walker) and
-    speaker1 (a different Alex) both enrol with display name
-    ``Alex``.  Without a guard, ``_resolve_entity`` Tier 1 (exact
-    name match) returns speaker0's node when speaker1's entity arrives,
-    and ``_upsert_entity`` happily folds speaker1's facts into
-    speaker0's node — corrupting both speakers' graphs.
-
-    Tier 0 (positive speaker_id match) was already in place; this
-    class guards the missing NEGATIVE: name collision across distinct
-    ``speaker_id`` values must produce two separate nodes.
+class TestUpsertEntityWritesNoAttributes:
+    """_upsert_entity no longer folds Entity.attributes onto the graph node
+    at all -- that channel is now attribute_relations' projection into the
+    merger's relation_type == "attribute" gate (test_merger_attribute_gate),
+    never a direct entity-merge write.
     """
 
-    def _build_speaker_session(
-        self,
-        session_id: str,
-        speaker_id: str,
-        last_name: str,
-        place: str,
-    ) -> SessionGraph:
-        return SessionGraph(
-            session_id=session_id,
-            timestamp="2026-05-06T00:00:00Z",
+    def test_entity_with_attributes_merged_alone_leaves_node_attributes_empty(self):
+        m = GraphMerger(similarity_threshold=85.0)
+        sg = SessionGraph(
+            session_id="s1",
+            timestamp="2026-01-01T00:00:00Z",
             entities=[
                 Entity(
                     name="Alex",
                     entity_type="person",
-                    attributes={"last_name": last_name},
-                    speaker_id=speaker_id,
-                ),
-                Entity(name=place, entity_type="place"),
-            ],
-            relations=[
-                Relation(
-                    subject="Alex",
-                    predicate="lives in",
-                    object=place,
-                    relation_type="factual",
-                    speaker_id=speaker_id,
-                ),
-            ],
-        )
-
-    def test_two_speakers_same_first_name_get_separate_nodes(self):
-        """Two enrolled speakers both named "Alex" must produce two
-        graph nodes with their own attributes and relations.
-        """
-        m = GraphMerger(similarity_threshold=85.0)
-        m.merge(self._build_speaker_session("s001", "speaker0", "Walker", "Portland"))
-        m.merge(self._build_speaker_session("s002", "speaker1", "Schmidt", "Munich"))
-
-        # Two speaker nodes — separate identities.
-        speaker_nodes = [
-            (node, data)
-            for node, data in m.graph.nodes(data=True)
-            if data.get("speaker_id") in {"speaker0", "speaker1"}
-        ]
-        speaker_ids = {data["speaker_id"] for _, data in speaker_nodes}
-        assert speaker_ids == {"speaker0", "speaker1"}, (
-            f"Expected separate nodes for speaker0 and speaker1, got "
-            f"speaker_ids={speaker_ids} on nodes "
-            f"{[(n, d.get('speaker_id'), d.get('attributes', {})) for n, d in speaker_nodes]}"
-        )
-
-        # Each carries its own last_name — no cross-contamination.
-        by_sid = {data["speaker_id"]: (node, data) for node, data in speaker_nodes}
-        speaker0_node, speaker0_data = by_sid["speaker0"]
-        speaker1_node, speaker1_data = by_sid["speaker1"]
-        assert speaker0_data["attributes"].get("last_name") == "Walker", (
-            f"speaker0's last_name attribute corrupted: got {speaker0_data['attributes']!r}"
-        )
-        assert speaker1_data["attributes"].get("last_name") == "Schmidt", (
-            f"speaker1's last_name attribute corrupted: got {speaker1_data['attributes']!r}"
-        )
-
-        # Each speaker's lives_in relation points to the right place.
-        # Place node keys are canonical: "portland", "munich".
-        s0_neighbors = list(m.graph.successors(speaker0_node))
-        s1_neighbors = list(m.graph.successors(speaker1_node))
-        assert "portland" in s0_neighbors and "munich" not in s0_neighbors
-        assert "munich" in s1_neighbors and "portland" not in s1_neighbors
-
-    def test_third_party_mention_with_speaker_id_unset_is_separate(self):
-        """A later session emits a third-party ``"Alex"`` entity with
-        ``speaker_id`` unset (he's not the speaker of that session).
-
-        The name namespace and the speaker-ID namespace are disjoint by
-        construction: speaker IDs follow the ``speaker{N}`` pattern
-        produced by the speaker pool, so a display name like
-        ``"Alex"`` will never collide with a casefolded speaker-id node key.
-        The third-party Alex becomes a separate node keyed by
-        ``"alex"`` (canonical form); speaker0's node is keyed by
-        ``"speaker0"`` (its speaker-id node key) with its own attributes intact.
-        """
-        m = GraphMerger(similarity_threshold=85.0)
-        m.merge(self._build_speaker_session("s001", "speaker0", "Walker", "Portland"))
-        third_party = SessionGraph(
-            session_id="s002",
-            timestamp="2026-05-06T00:00:00Z",
-            entities=[
-                Entity(name="Alex", entity_type="person", attributes={}),
+                    attributes={"role": "engineer", "has_last_name": "Kim"},
+                )
             ],
             relations=[],
         )
-        m.merge(third_party)
+        m.merge(sg)
+        assert m.graph.nodes["alex"]["attributes"] == {}
 
-        # speaker0 is keyed by the casefolded speaker_id ("speaker0");
-        # third-party Alex is keyed by canonical name "alex" — disjoint
-        # namespaces, two separate nodes.
-        assert "speaker0" in m.graph.nodes
-        assert "alex" in m.graph.nodes
-        assert m.graph.nodes["speaker0"]["speaker_id"] == "speaker0"
-        assert m.graph.nodes["alex"].get("speaker_id") is None
-        # speaker0's last_name attribute is untouched by the third-party
-        # merge (different node, different namespace).
-        assert m.graph.nodes["speaker0"]["attributes"]["last_name"] == "Walker"
+    def test_second_session_entity_attributes_still_do_not_land_on_the_node(self):
+        """A later session's entity attributes on an ALREADY-EXISTING node
+        (the update branch of _upsert_entity, not the create branch) must
+        also leave attributes untouched."""
+        m = GraphMerger(similarity_threshold=85.0)
+        sg1 = SessionGraph(
+            session_id="s1",
+            timestamp="2026-01-01T00:00:00Z",
+            entities=[Entity(name="Alex", entity_type="person")],
+            relations=[],
+        )
+        sg2 = SessionGraph(
+            session_id="s2",
+            timestamp="2026-01-02T00:00:00Z",
+            entities=[
+                Entity(name="Alex", entity_type="person", attributes={"has_last_name": "Kim"})
+            ],
+            relations=[],
+        )
+        m.merge(sg1)
+        m.merge(sg2)
+        assert m.graph.nodes["alex"]["attributes"] == {}
 
 
 class TestPromptsDirOverride:
@@ -2754,7 +2506,7 @@ class TestMergerEdgeStamps:
             predicate="colleague of",
             object="a_node",
             relation_type="social",
-            speaker_id="",
+            speaker_id="speaker0",
             symmetric=True,
         )
         m._upsert_relation("z_node", "a_node", rel, "s1", "2026-01-01T00:00:00Z")
@@ -2874,7 +2626,7 @@ class TestMergerEdgeStamps:
             predicate="friend of",
             object="bob",
             relation_type="social",
-            speaker_id="",
+            speaker_id="speaker0",
             symmetric=True,
         )
         rel_bob_nadia = Relation(
@@ -2882,7 +2634,7 @@ class TestMergerEdgeStamps:
             predicate="friend of",
             object="nadia",
             relation_type="social",
-            speaker_id="",
+            speaker_id="speaker0",
             symmetric=True,
         )
         m._upsert_relation("nadia", "bob", rel_nadia_bob, "s1", "2026-01-01T00:00:00Z")

@@ -334,17 +334,6 @@ class TestEntriesFromGraph:
         subjects = [r["subject"] for r in episodic]
         assert "Alice" in subjects
 
-    def test_attribute_projection_canary(self):
-        """email attribute must appear as a relation dict in the output."""
-        loop = _make_loop()
-        graph = self._make_session_graph(with_attributes=True)
-        episodic, _ = loop._entries_from_graph(graph, procedural_enabled=False)
-        # _flatten_entity_attributes projects email → "has email" relation
-        predicates = [r["predicate"] for r in episodic]
-        assert any("email" in p for p in predicates), (
-            "email attribute not projected into relation set — scalar-PII keying silently dropped"
-        )
-
     def test_no_model_generate_called(self):
         """_entries_from_graph must not call model.generate."""
         loop = _make_loop()
@@ -364,22 +353,3 @@ class TestEntriesFromGraph:
         predicates = [r["predicate"] for r in episodic if r["subject"] == "Alice"]
         assert "lives in" in predicates
         assert "lives_in" not in predicates
-
-    def test_attribute_relation_and_entity_attribute_no_double_emit(self):
-        """A ``relation_type="attribute"`` Relation and an Entity.attributes
-        entry for the SAME (subject, predicate) pair (both surfaces an
-        extractor may emit) must be deduplicated by exclude_pairs — never
-        two entries for the one fact."""
-        loop = _make_loop()
-        graph = self._make_session_graph()
-        # Replace the standard relation with an attribute-typed one whose
-        # canonical predicate matches _flatten_entity_attributes's surface
-        # exactly ("has email").
-        graph.relations[0].predicate = "has_email"
-        graph.relations[0].object = "alice@example.com"
-        graph.relations[0].relation_type = "attribute"
-        graph.entities[0].attributes = {"email": "alice@example.com"}
-
-        episodic, _ = loop._entries_from_graph(graph, procedural_enabled=False)
-        has_email_entries = [r for r in episodic if r["predicate"] == "has email"]
-        assert len(has_email_entries) == 1

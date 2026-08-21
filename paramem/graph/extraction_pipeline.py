@@ -60,6 +60,7 @@ from paramem.graph.extractor import (
     extract_procedural_graph,
 )
 from paramem.graph.flows import extract_graph
+from paramem.graph.relation_prep import attribute_relations
 from paramem.models.loader import base_model_inference
 
 if TYPE_CHECKING:
@@ -174,12 +175,15 @@ class ExtractionPipeline:
       never the adapter being trained) and gradient checkpointing (HF
       silently disables the KV cache when checkpointing is active; the
       cache is required for ``model.generate()``) for the call, then
-      restores both to their pre-scope state on exit.
+      restores both to their pre-scope state on exit.  The returned
+      graph's ``relations`` include the projected entity-attribute
+      relations (see :meth:`_run_extractor`).
 
     - :meth:`run_procedural(transcript, session_id, *, speaker_id, ...)
       -> SessionGraph` — procedural-extraction sibling.  Same
-      adapter-guard + checkpointing discipline.  ``source_type``
-      selects between dialogue and document procedural prompts.
+      adapter-guard + checkpointing discipline, and the same projected-
+      attribute-relations return contract.  ``source_type`` selects
+      between dialogue and document procedural prompts.
 
     Not in scope
     ------------
@@ -307,15 +311,31 @@ class ExtractionPipeline:
         model, never the adapter being trained), and restores both to their
         entry state on exit.  ``extract_fn`` is ``extract_graph`` or
         ``extract_procedural_graph``.
+
+        After that scope exits, extends the returned graph's ``relations``
+        with :func:`~paramem.graph.relation_prep.attribute_relations` —
+        the projection of ``graph.entities[*].attributes`` into
+        attribute-typed relations, attributed to
+        ``call_kwargs["speaker_id"]`` (required non-empty on both the
+        ``run`` and ``run_procedural`` paths).  This is the ONE place either
+        entry projects entity attributes into relations; both :meth:`run`
+        and :meth:`run_procedural` return a graph whose ``relations``
+        already include them.  Placed outside the ``base_model_inference``
+        scope deliberately: the projection is a pure ``SessionGraph`` read
+        (no ``model.generate``, no adapter state), so it has no business
+        inside a scope whose purpose is disabling gradient checkpointing
+        and the active LoRA adapter for the duration of a generate call.
         """
         with base_model_inference(self.model):
-            return extract_fn(
+            graph = extract_fn(
                 self.model,
                 self.tokenizer,
                 session_transcript,
                 session_id,
                 **call_kwargs,
             )
+        graph.relations.extend(attribute_relations(graph, speaker_id=call_kwargs["speaker_id"]))
+        return graph
 
     def run(
         self,
@@ -333,6 +353,10 @@ class ExtractionPipeline:
         caller wraps this call in
         :func:`paramem.graph.phase_trace.stop_at` to request an early
         return — that mechanism is independent of this method's kwargs.
+        The returned graph's ``relations`` include the entity-attribute
+        relations projected by :meth:`_run_extractor`, including for a
+        ``stop_at``-truncated chain (projected from whatever entities the
+        truncated chain produced).
         """
         kwargs = self.kwargs(source_type=source_type, **overrides)
         return self._run_extractor(extract_graph, session_transcript, session_id, kwargs)
@@ -372,6 +396,10 @@ class ExtractionPipeline:
         preserves the pre-existing production behaviour (``self.prompts_dir``,
         no seed, the two ``DEFAULT_*`` prompt filenames) unchanged for every
         existing caller.
+
+        The returned graph's ``relations`` include the entity-attribute
+        relations projected by :meth:`_run_extractor`, attributed to this
+        call's ``speaker_id``.
         """
         if not speaker_id:
             raise ValueError(

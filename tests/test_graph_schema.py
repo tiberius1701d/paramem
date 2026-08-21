@@ -109,6 +109,29 @@ class TestRelation:
                 speaker_id="speaker0",
             )
 
+    def test_empty_speaker_id_rejected(self):
+        """Relation.speaker_id enforces non-emptiness at construction —
+        the invariant is a schema constraint, not prose (see the class
+        docstring)."""
+        with pytest.raises(ValidationError):
+            Relation(
+                subject="A",
+                predicate="p",
+                object="B",
+                relation_type="factual",
+                speaker_id="",
+            )
+
+    def test_nonempty_speaker_id_constructs(self):
+        rel = Relation(
+            subject="A",
+            predicate="p",
+            object="B",
+            relation_type="factual",
+            speaker_id="speaker3",
+        )
+        assert rel.speaker_id == "speaker3"
+
     def test_session_ids_defaults_to_empty_list(self):
         """Relation.session_ids defaults to [] when not supplied."""
         rel = Relation(

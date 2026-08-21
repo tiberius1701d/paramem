@@ -105,6 +105,24 @@ class TestBuildRelations:
         assert kept[0].confidence == 1.0
         assert kept[0].symmetric is False
 
+    def test_empty_speaker_id_drops_every_fact_and_records_every_drop(self):
+        """An empty speaker_id fails ``Relation``'s own ``min_length=1``
+        constraint at construction -- every fact in the batch fails the
+        same way and is recorded, never raised past this boundary (the
+        fail-soft the cloud-rebuild caller relies on, since
+        ``ctx.speaker_id`` is otherwise always non-empty)."""
+        graph = _graph()
+        kept = build_relations(
+            graph,
+            [_fact(), _fact(obj="Berlin")],
+            speaker_id="",
+        )
+        assert kept == []
+        dropped = graph.diagnostics["pydantic_validation_dropped"]
+        assert len(dropped) == 2
+        assert dropped[0]["subject"] == "Alex"
+        assert dropped[0]["reason"]
+
 
 class TestApplyRebuild:
     def _relation(self, subject: str, obj: str) -> Relation:

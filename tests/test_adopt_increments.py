@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import threading
 
+import pytest
+
 from paramem.memory.increment import TierIncrement
 from paramem.memory.store import MemoryStore
 from paramem.training.key_registry import KeyRegistry
@@ -320,6 +322,40 @@ class TestBookkeepingCompletenessPostcondition:
 
         # Nothing mutated -- the check runs before any install.
         assert store.active_keys_in_tier("episodic") == []
+
+    def test_a_row_with_an_empty_speaker_id_raises_before_any_mutation(self):
+        """Pass 0 rebuilds every increment row through
+        ``bookkeeping_row(key, **row)`` -- an on-disk row carrying
+        ``speaker_id=""`` (written by a crashed prior process, or a
+        producer regression) raises ``ValueError`` there, before the
+        drop/install passes run, leaving the store byte-for-byte as it
+        was.  Entry-cache and bookkeeping-completeness are otherwise
+        satisfied, isolating this raise to the row-validation construction
+        itself."""
+        store = MemoryStore()
+        seed_reg = KeyRegistry()
+        seed_reg.add("prior_key")
+        store.load_registry("episodic", seed_reg)
+        store.put("episodic", "prior_key", _content_entry("prior_key"), register=False)
+        store.set_bookkeeping("prior_key", **_row())
+
+        bad_inc = _increment(
+            "episodic",
+            active_keys=["graph1"],
+            entries={"graph1": _content_entry("graph1")},
+            bookkeeping={"graph1": _row(speaker_id="")},
+        )
+        with pytest.raises(ValueError):
+            store.adopt_increments([bad_inc])
+
+        # Nothing mutated: the prior registry/entries/bookkeeping survive
+        # byte-for-byte, and the registry object itself was never rebound.
+        assert store.registry("episodic") is seed_reg
+        assert store.active_keys_in_tier("episodic") == ["prior_key"]
+        assert store.get("prior_key") == _content_entry("prior_key")
+        assert store.bookkeeping_for_key("prior_key") == _row()
+        assert store.get("graph1") is None
+        assert store.bookkeeping_for_key("graph1") is None
 
     def test_rows_only_member_with_a_missing_row_also_raises(self):
         """A rows-only member (``rebuilt=False``) is checked too -- closing

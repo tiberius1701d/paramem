@@ -154,8 +154,9 @@ class TestProceduralRoutedToInterim:
         loop = _make_cycle_loop(tmp_path)
         _wire_cycle_fakes(loop, monkeypatch)
 
-        loop.merger.graph.add_edge("bob", "jazz", predicate="likes", relation_type="preference")
-        loop.merger.graph.nodes["bob"]["speaker_id"] = "speaker0"
+        loop.merger.graph.add_edge(
+            "bob", "jazz", predicate="likes", relation_type="preference", speaker_id="speaker0"
+        )
 
         pending = loop.take_pending_relations()
         loop.run_consolidation_cycle(
@@ -198,8 +199,9 @@ class TestProceduralRoutedToInterim:
         loop = _make_cycle_loop(tmp_path)
         _wire_cycle_fakes(loop, monkeypatch)
 
-        loop.merger.graph.add_edge("bob", "jazz", predicate="likes", relation_type="preference")
-        loop.merger.graph.nodes["bob"]["speaker_id"] = "speaker0"
+        loop.merger.graph.add_edge(
+            "bob", "jazz", predicate="likes", relation_type="preference", speaker_id="speaker0"
+        )
 
         pending = loop.take_pending_relations()
         loop.run_consolidation_cycle(
@@ -252,9 +254,12 @@ class TestSimulateModeRegistersProceduralKeys:
         loop = _make_cycle_loop(tmp_path)
 
         loop.merger.graph.add_edge(
-            "carol", "cycling", predicate="enjoys", relation_type="preference"
+            "carol",
+            "cycling",
+            predicate="enjoys",
+            relation_type="preference",
+            speaker_id="speaker0",
         )
-        loop.merger.graph.nodes["carol"]["speaker_id"] = "speaker0"
 
         pending = loop.take_pending_relations()
         result = loop.run_consolidation_cycle(
@@ -331,9 +336,12 @@ class TestProceduralRecallGateAllOrNothing:
         # unfaked so it genuinely evaluates the controlled probe above.
         _wire_cycle_fakes(loop, monkeypatch, probe_recall=_one_key_fails, assert_tier_recall=False)
 
-        loop.merger.graph.add_edge("henry", "chess", predicate="plays", relation_type="preference")
-        loop.merger.graph.add_edge("henry", "golf", predicate="plays", relation_type="preference")
-        loop.merger.graph.nodes["henry"]["speaker_id"] = "speaker0"
+        loop.merger.graph.add_edge(
+            "henry", "chess", predicate="plays", relation_type="preference", speaker_id="speaker0"
+        )
+        loop.merger.graph.add_edge(
+            "henry", "golf", predicate="plays", relation_type="preference", speaker_id="speaker0"
+        )
 
         store_put_calls: list[tuple] = []
         original_put = loop.store.put
@@ -414,8 +422,9 @@ class TestProceduralKeyRegisteredInInterimTier:
         loop = _make_cycle_loop(tmp_path)
         _wire_cycle_fakes(loop, monkeypatch)
 
-        loop.merger.graph.add_edge("eve", "running", predicate="enjoys", relation_type="preference")
-        loop.merger.graph.nodes["eve"]["speaker_id"] = "speaker0"
+        loop.merger.graph.add_edge(
+            "eve", "running", predicate="enjoys", relation_type="preference", speaker_id="speaker0"
+        )
 
         pending = loop.take_pending_relations()
         loop.run_consolidation_cycle(
@@ -455,8 +464,9 @@ class TestProceduralKeyRegisteredInInterimTier:
         loop = _make_cycle_loop(tmp_path)
         _wire_cycle_fakes(loop, monkeypatch)
 
-        loop.merger.graph.add_edge("frank", "chess", predicate="plays", relation_type="preference")
-        loop.merger.graph.nodes["frank"]["speaker_id"] = "speaker0"
+        loop.merger.graph.add_edge(
+            "frank", "chess", predicate="plays", relation_type="preference", speaker_id="speaker0"
+        )
 
         pending = loop.take_pending_relations()
         loop.run_consolidation_cycle(
@@ -499,9 +509,12 @@ class TestProceduralKeyRegisteredInInterimTier:
         _wire_cycle_fakes(loop, monkeypatch)
 
         loop.merger.graph.add_edge(
-            "gwen", "yoga", predicate="practices", relation_type="preference"
+            "gwen",
+            "yoga",
+            predicate="practices",
+            relation_type="preference",
+            speaker_id="speaker0",
         )
-        loop.merger.graph.nodes["gwen"]["speaker_id"] = "speaker0"
 
         pending = loop.take_pending_relations()
         loop.run_consolidation_cycle(

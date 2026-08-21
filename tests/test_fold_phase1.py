@@ -415,29 +415,6 @@ class TestStageEventMintsAndPersists:
         assert keyed[0]["relation_type"] == "preference"
         assert keyed[0]["object"] == "acme radio"
 
-    def test_new_attribute_relation_mints_into_an_interim_shaped_primary_tier(self, tmp_path):
-        """The node-attribute mint branch has the same destination logic as
-        the edge-walk mint branch, and the same defect: a new attribute fact
-        must land in an interim tick's own primary tier.
-        """
-        loop = _make_loop(tmp_path)
-        result = loop.stage_event(
-            recalled_entries=_recalled_entries_from_store(loop),
-            event="interim",
-            venue="weights",
-            stamp="20260101T0000",
-            primary_tiers={"episodic_interim_20260101T0000": "episodic_interim_20260101T0000"},
-            episodic_rels=[
-                _rel("alex", "has_email", "alex@example.com", relation_type="attribute")
-            ],
-        )
-        assert result is not None
-        shadow = _shadow_dir(loop, "interim", "episodic_interim_20260101T0000")
-        keyed = json.loads((shadow / "keyed.json").read_text())
-        assert len(keyed) == 1
-        assert keyed[0]["object"] == "alex@example.com"
-        assert keyed[0]["relation_type"] == "attribute"
-
     def test_build_tier_increment_reads_back_the_shadow_tree(self, tmp_path):
         loop = _make_loop(tmp_path)
         result = loop.stage_event(
@@ -496,6 +473,163 @@ class TestStageEventReplaysExistingContent:
         keyed = json.loads((_shadow_dir(loop, "full", "episodic") / "keyed.json").read_text())
         assert [row["key"] for row in keyed] == ["graph1"]
         assert keyed[0]["object"] == "berlin"
+
+
+class TestStageEventAttributeKeyedWalk:
+    """The keyed walk's node-attribute pass
+    (``ConsolidationLoop._build_working_keyed_walk``): a keyless attribute
+    mints a row carrying the RECORD's own speaker_id/window (never a
+    node-level fallback), a keyed attribute replays from its owning
+    working tier without minting again, and a keyless value change onto a
+    recalled keyed record mints a NEW key under the NEW value's speaker
+    and window -- never the superseded assertion's."""
+
+    def test_keyless_attribute_mint_carries_the_records_speaker_and_window(self, tmp_path):
+        """The subject ("acme corp") is not a speaker node, so it carries
+        no top-level ``speaker_id`` node attribute at all -- if the mint
+        ever fell back to reading one (the deleted node/enrichment
+        fallback chain), ``bookkeeping_row`` would raise ValueError on the
+        empty string instead of succeeding with the relation's own
+        speaker_id."""
+        loop = _make_loop(tmp_path)
+        rel = _rel(
+            "acme corp",
+            "has_founder",
+            "Jane Doe",
+            relation_type="attribute",
+            speaker_id="speaker2",
+            first_seen="2026-02-01T00:00:00Z",
+            last_seen="2026-02-01T00:00:00Z",
+        )
+        result = loop.stage_event(
+            recalled_entries=_recalled_entries_from_store(loop),
+            event="interim",
+            venue="weights",
+            stamp="stampA",
+            primary_tiers={"episodic": "episodic"},
+            episodic_rels=[rel],
+            session_ids=["s1"],
+        )
+        assert result is not None
+        shadow = _shadow_dir(loop, "interim", "episodic")
+        keyed = json.loads((shadow / "keyed.json").read_text())
+        assert len(keyed) == 1
+        assert keyed[0]["predicate"] == "has founder"
+        assert keyed[0]["object"] == "Jane Doe"
+        minted_key = keyed[0]["key"]
+
+        rows = json.loads((shadow / "key_metadata.json").read_text())["keys"]
+        row = rows[minted_key]
+        assert row["speaker_id"] == "speaker2"
+        assert row["first_seen"] == "2026-02-01T00:00:00Z"
+        assert row["last_seen"] == "2026-02-01T00:00:00Z"
+
+    def test_keyed_attribute_replays_without_minting_a_new_key(self, tmp_path):
+        loop = _make_loop(tmp_path)
+        loop.store.registry("episodic").add("graph1")
+        loop.store.set_bookkeeping(
+            "graph1",
+            speaker_id="speaker0",
+            relation_type="attribute",
+            reinforcement_count=1,
+            last_reinforced_cycle=0,
+            last_seen="2026-01-01T00:00:00Z",
+            first_seen="2026-01-01T00:00:00Z",
+            promoted=False,
+        )
+        loop.store.put(
+            "episodic",
+            "graph1",
+            {"key": "graph1", "subject": "alex", "predicate": "has email", "object": "a@b.com"},
+            register=False,
+        )
+
+        result = loop.stage_event(
+            recalled_entries=_recalled_entries_from_store(loop),
+            event="full",
+            venue="weights",
+            stamp="stampF",
+            primary_tiers={"episodic": "episodic", "semantic": "semantic"},
+        )
+        assert result is not None
+        keyed = json.loads((_shadow_dir(loop, "full", "episodic") / "keyed.json").read_text())
+        assert [row["key"] for row in keyed] == ["graph1"], (
+            "a keyed attribute replays from its owning working tier -- it must "
+            "never mint a second key for the same fact"
+        )
+        assert keyed[0]["object"] == "a@b.com"
+
+    def test_keyless_value_change_after_recall_mints_a_new_key_with_the_new_speaker_and_window(
+        self, tmp_path
+    ):
+        """graph1 (speakerA, 2026-01-01) is recalled first (registry-true
+        recall precedes the pending merge), establishing the node's
+        attribute record with ik_key="graph1"; the pending relation then
+        re-observes the SAME predicate keyless with a DIFFERENT value from
+        a DIFFERENT speaker at a LATER date -- the merger's value-change
+        branch supersedes graph1 (no survivor) and the keyed walk mints a
+        brand new key carrying the new value's own speaker and window,
+        never graph1's."""
+        loop = _make_loop(tmp_path)
+        loop.store.registry("episodic").add("graph1")
+        loop.store.set_bookkeeping(
+            "graph1",
+            speaker_id="speakerA",
+            relation_type="attribute",
+            reinforcement_count=1,
+            last_reinforced_cycle=0,
+            last_seen="2026-01-01T00:00:00Z",
+            first_seen="2026-01-01T00:00:00Z",
+            promoted=False,
+        )
+        loop.store.put(
+            "episodic",
+            "graph1",
+            {
+                "key": "graph1",
+                "subject": "alex",
+                "predicate": "has email",
+                "object": "old@example.com",
+            },
+            register=False,
+        )
+        # _make_loop hardcodes _indexed_next_index=1 (production derives it
+        # from existing keys via _derive_key_counters, __init__-only); bump
+        # it past the pre-seeded "graph1" so the new mint below gets its own
+        # identity instead of colliding with the key this same event retires.
+        loop._indexed_next_index = 2
+
+        result = loop.stage_event(
+            recalled_entries=_recalled_entries_from_store(loop),
+            event="full",
+            venue="weights",
+            stamp="stampV",
+            primary_tiers={"episodic": "episodic"},
+            episodic_rels=[
+                _rel(
+                    "alex",
+                    "has_email",
+                    "new@example.com",
+                    relation_type="attribute",
+                    speaker_id="speakerB",
+                    first_seen="2026-06-01T00:00:00Z",
+                    last_seen="2026-06-01T00:00:00Z",
+                )
+            ],
+        )
+        assert result is not None
+        shadow = _shadow_dir(loop, "full", "episodic")
+        keyed = json.loads((shadow / "keyed.json").read_text())
+        assert len(keyed) == 1
+        assert keyed[0]["key"] != "graph1", "the superseded key must not carry forward"
+        assert keyed[0]["object"] == "new@example.com"
+
+        rows = json.loads((shadow / "key_metadata.json").read_text())["keys"]
+        assert "graph1" not in rows, "the superseded key's row must not survive the fold"
+        new_row = rows[keyed[0]["key"]]
+        assert new_row["speaker_id"] == "speakerB", "never the superseded assertion's speaker"
+        assert new_row["first_seen"] == "2026-06-01T00:00:00Z"
+        assert new_row["last_seen"] == "2026-06-01T00:00:00Z"
 
 
 class TestPromotion:
@@ -1360,203 +1494,6 @@ class TestBuildWorkingKeyedWalkDerivesRebuiltSetFromMembers:
         assert set(tier_keyed) == {"episodic"}
 
 
-class TestNodeAttributeWalk:
-    def test_new_attribute_relation_mints_a_key_via_the_node_attribute_walk(self, tmp_path):
-        loop = _make_loop(tmp_path)
-        result = loop.stage_event(
-            recalled_entries=_recalled_entries_from_store(loop),
-            event="interim",
-            venue="weights",
-            stamp="stamp1",
-            primary_tiers={"episodic": "episodic"},
-            episodic_rels=[
-                _rel("alex", "has_email", "alex@example.com", relation_type="attribute")
-            ],
-        )
-        assert result is not None
-        keyed = json.loads((_shadow_dir(loop, "interim", "episodic") / "keyed.json").read_text())
-        assert len(keyed) == 1
-        assert keyed[0]["object"] == "alex@example.com"
-        assert keyed[0]["relation_type"] == "attribute"
-        assert "email" in keyed[0]["predicate"]
-
-        registry = KeyRegistry.load(
-            _shadow_dir(loop, "interim", "episodic") / "indexed_key_registry.json"
-        )
-        assert registry.list_active() == [keyed[0]["key"]]
-
-    def test_existing_attribute_key_is_replayed_via_the_node_attribute_walk(self, tmp_path):
-        loop = _make_loop(tmp_path)
-        loop.store.registry("episodic").add("graph1")
-        loop.store.set_bookkeeping(
-            "graph1",
-            speaker_id="speaker0",
-            relation_type="attribute",
-            reinforcement_count=1,
-            last_reinforced_cycle=0,
-            last_seen="2026-01-01T00:00:00Z",
-            first_seen="2026-01-01T00:00:00Z",
-            promoted=False,
-        )
-        loop.store.put(
-            "episodic",
-            "graph1",
-            {
-                "key": "graph1",
-                "subject": "alex",
-                "predicate": "has email",
-                "object": "alex@example.com",
-            },
-            register=False,
-        )
-
-        result = loop.stage_event(
-            recalled_entries=_recalled_entries_from_store(loop),
-            event="full",
-            venue="weights",
-            stamp="stampF",
-            primary_tiers={"episodic": "episodic", "semantic": "semantic"},
-        )
-        assert result is not None
-        keyed = json.loads((_shadow_dir(loop, "full", "episodic") / "keyed.json").read_text())
-        assert [row["key"] for row in keyed] == ["graph1"]
-        assert keyed[0]["object"] == "alex@example.com"
-        assert keyed[0]["relation_type"] == "attribute"
-
-
-class TestCrossRepresentationDedup:
-    """A fact carried as both a graph edge and a node attribute (same
-    subject, same predicate) yields exactly one key through
-    ``ConsolidationLoop._build_working_keyed_walk`` -- the node-attribute
-    pass skips any ``(subject, predicate)`` pair the edge pass already
-    emitted this event, rather than minting a second key for the same
-    fact.
-    """
-
-    def test_edge_and_attribute_duplicate_yields_exactly_one_key(self, tmp_path):
-        loop = _make_loop(tmp_path)
-        result = loop.stage_event(
-            recalled_entries=_recalled_entries_from_store(loop),
-            event="interim",
-            venue="weights",
-            stamp="stamp1",
-            primary_tiers={"episodic": "episodic"},
-            episodic_rels=[
-                _rel("alex", "has phone", "555-1234", relation_type="factual"),
-                _rel("alex", "phone", "555-1234", relation_type="attribute"),
-            ],
-        )
-        assert result is not None
-        keyed = json.loads((_shadow_dir(loop, "interim", "episodic") / "keyed.json").read_text())
-        phone_rows = [row for row in keyed if row["predicate"] == "has phone"]
-        assert len(phone_rows) == 1
-
-
-class TestSpeakerFallbackViaUniquePredecessor:
-    """Direct unit tests of the enrichment-edge speaker fallback inside
-    ``ConsolidationLoop._build_working_keyed_walk``'s edge walk (via
-    ``_unique_speaker_predecessor``).  The merger graph is built directly
-    (bypassing the merge step) so the fallback's three outcomes (unique
-    predecessor, ambiguous predecessors, non-enrichment edge) can be
-    exercised in isolation.
-    """
-
-    def test_enrichment_edge_inherits_speaker_id_from_unique_predecessor(self, tmp_path):
-        from paramem.memory.persistence import _EDGE_SOURCE_ATTR
-
-        loop = _make_loop(tmp_path)
-        g = loop.merger.graph
-        g.add_node("speaker0", speaker_id="speaker0", attributes={}, display_name="speaker0")
-        g.add_node("senior pm", attributes={}, display_name="Senior PM")
-        g.add_node("award x", attributes={}, display_name="Award X")
-        g.add_edge(
-            "speaker0",
-            "senior pm",
-            predicate="held role",
-            relation_type="factual",
-            speaker_id="speaker0",
-        )
-        g.add_edge(
-            "senior pm",
-            "award x",
-            predicate="achievement",
-            relation_type="factual",
-            **{_EDGE_SOURCE_ATTR: "graph_enrichment"},
-        )
-
-        working = loop._recall_working_tiers(
-            {"episodic": "episodic"}, {}, _recalled_entries_from_store(loop)
-        )
-        tier_keyed = loop._build_working_keyed_walk(working, exclude_keys=set())
-        achievement = [row for row in tier_keyed["episodic"] if row["predicate"] == "achievement"]
-        assert achievement
-        assert achievement[0]["speaker_id"] == "speaker0"
-
-    def test_ambiguous_predecessors_stay_unattributed(self, tmp_path):
-        from paramem.memory.persistence import _EDGE_SOURCE_ATTR
-
-        loop = _make_loop(tmp_path)
-        g = loop.merger.graph
-        g.add_node("speaker0", speaker_id="speaker0", attributes={}, display_name="speaker0")
-        g.add_node("speaker1", speaker_id="speaker1", attributes={}, display_name="speaker1")
-        g.add_node("engineer", attributes={}, display_name="Engineer")
-        g.add_node("y", attributes={}, display_name="Y")
-        g.add_edge(
-            "speaker0",
-            "engineer",
-            predicate="held role",
-            relation_type="factual",
-            speaker_id="speaker0",
-        )
-        g.add_edge(
-            "speaker1",
-            "engineer",
-            predicate="held role",
-            relation_type="factual",
-            speaker_id="speaker1",
-        )
-        g.add_edge(
-            "engineer",
-            "y",
-            predicate="attr",
-            relation_type="factual",
-            **{_EDGE_SOURCE_ATTR: "graph_enrichment"},
-        )
-
-        working = loop._recall_working_tiers(
-            {"episodic": "episodic"}, {}, _recalled_entries_from_store(loop)
-        )
-        tier_keyed = loop._build_working_keyed_walk(working, exclude_keys=set())
-        attr_rows = [row for row in tier_keyed["episodic"] if row["predicate"] == "attr"]
-        assert attr_rows
-        assert attr_rows[0]["speaker_id"] == ""
-
-    def test_non_enrichment_edge_does_not_get_the_fallback(self, tmp_path):
-        loop = _make_loop(tmp_path)
-        g = loop.merger.graph
-        g.add_node("speaker0", speaker_id="speaker0", attributes={}, display_name="speaker0")
-        g.add_node("acme corp", attributes={}, display_name="Acme Corp")
-        g.add_node("berlin", attributes={}, display_name="Berlin")
-        g.add_edge(
-            "speaker0",
-            "acme corp",
-            predicate="works at",
-            relation_type="factual",
-            speaker_id="speaker0",
-        )
-        # Ordinary extraction edge, no edge_source stamp -- must NOT inherit,
-        # even though "acme corp" has exactly one speaker predecessor.
-        g.add_edge("acme corp", "berlin", predicate="located in", relation_type="factual")
-
-        working = loop._recall_working_tiers(
-            {"episodic": "episodic"}, {}, _recalled_entries_from_store(loop)
-        )
-        tier_keyed = loop._build_working_keyed_walk(working, exclude_keys=set())
-        located = [row for row in tier_keyed["episodic"] if row["predicate"] == "located in"]
-        assert located
-        assert located[0]["speaker_id"] == ""
-
-
 class TestClassifyPartialBuild:
     def _increment(self, tmp_path, *, pre_sha: str):
         from paramem.memory.increment import TierIncrement
@@ -1764,91 +1701,6 @@ class TestDeriveKeyCounters:
         minted = [row for row in keyed if row["key"] != donor_high_water_key]
         assert len(minted) == 1
         assert minted[0]["key"] == f"graph{DONOR_KEY_FLOOR + 6}"
-
-
-class TestSpeakerFallbackNeverOverwritesAnExistingAttribution:
-    def test_a_subject_nodes_own_speaker_id_wins_over_a_unique_predecessor(self, tmp_path):
-        """A subject node that already carries its own ``speaker_id`` (a
-        genuine, direct attribution -- not the fallback) must keep it even
-        when it also has exactly one speaker predecessor of a DIFFERENT
-        identity and the edge is enrichment-sourced: the fallback only ever
-        fires when the subject carries NO speaker_id of its own."""
-        from paramem.memory.persistence import _EDGE_SOURCE_ATTR
-
-        loop = _make_loop(tmp_path)
-        g = loop.merger.graph
-        # "engineer" already carries its OWN direct attribution (speaker0) --
-        # not derived from any predecessor.
-        g.add_node("speaker0", speaker_id="speaker0", attributes={}, display_name="speaker0")
-        g.add_node("speaker1", speaker_id="speaker1", attributes={}, display_name="speaker1")
-        g.add_node("engineer", speaker_id="speaker0", attributes={}, display_name="Engineer")
-        g.add_node("y", attributes={}, display_name="Y")
-        # speaker1 is engineer's only INCOMING speaker predecessor -- were
-        # the fallback to run, it would wrongly attribute to speaker1.
-        g.add_edge(
-            "speaker1",
-            "engineer",
-            predicate="held role",
-            relation_type="factual",
-            speaker_id="speaker1",
-        )
-        g.add_edge(
-            "engineer",
-            "y",
-            predicate="attr",
-            relation_type="factual",
-            **{_EDGE_SOURCE_ATTR: "graph_enrichment"},
-        )
-
-        working = loop._recall_working_tiers(
-            {"episodic": "episodic"}, {}, _recalled_entries_from_store(loop)
-        )
-        tier_keyed = loop._build_working_keyed_walk(working, exclude_keys=set())
-        attr_rows = [row for row in tier_keyed["episodic"] if row["predicate"] == "attr"]
-        assert attr_rows
-        assert attr_rows[0]["speaker_id"] == "speaker0", (
-            "the subject's own existing attribution must not be overwritten "
-            "by the unique-predecessor fallback"
-        )
-
-    def test_an_explicit_edge_speaker_id_wins_over_a_unique_predecessor(self, tmp_path):
-        """The edge's own ``speaker_id`` (set directly on the relation) is
-        an existing attribution too -- it must win even when the subject
-        node itself carries none and a unique predecessor of a different
-        identity exists."""
-        from paramem.memory.persistence import _EDGE_SOURCE_ATTR
-
-        loop = _make_loop(tmp_path)
-        g = loop.merger.graph
-        g.add_node("speaker1", speaker_id="speaker1", attributes={}, display_name="speaker1")
-        # "engineer" carries no speaker_id of its own.
-        g.add_node("engineer", attributes={}, display_name="Engineer")
-        g.add_node("y", attributes={}, display_name="Y")
-        g.add_edge(
-            "speaker1",
-            "engineer",
-            predicate="held role",
-            relation_type="factual",
-            speaker_id="speaker1",
-        )
-        # This edge already carries its OWN explicit speaker_id, distinct
-        # from the unique predecessor -- the fallback must never run.
-        g.add_edge(
-            "engineer",
-            "y",
-            predicate="attr",
-            relation_type="factual",
-            speaker_id="speaker0",
-            **{_EDGE_SOURCE_ATTR: "graph_enrichment"},
-        )
-
-        working = loop._recall_working_tiers(
-            {"episodic": "episodic"}, {}, _recalled_entries_from_store(loop)
-        )
-        tier_keyed = loop._build_working_keyed_walk(working, exclude_keys=set())
-        attr_rows = [row for row in tier_keyed["episodic"] if row["predicate"] == "attr"]
-        assert attr_rows
-        assert attr_rows[0]["speaker_id"] == "speaker0"
 
 
 class TestInterimMintCarriesTheRelationsOwnSpeakerId:

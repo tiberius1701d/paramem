@@ -18,9 +18,9 @@ class Entity(BaseModel):
     the canonical graph identity. ``name`` is folded onto the merger node's
     ``display_name`` field (anonymous "speaker0" → disclosed "Alex") without
     re-keying the graph; a model-emitted ``attributes["name"]``, if present,
-    is instead an ordinary trained fact. For non-speaker entities (places,
-    organisations, concepts), ``speaker_id`` stays ``None`` and identity is
-    ``name``.
+    is instead an ordinary trained fact via the ``attributes`` projection
+    (see below). For non-speaker entities (places, organisations, concepts),
+    ``speaker_id`` stays ``None`` and identity is ``name``.
     """
 
     name: str = Field(description="Canonical name (or display name when speaker_id is set)")
@@ -35,7 +35,18 @@ class Entity(BaseModel):
     )
     attributes: dict[str, str] = Field(
         default_factory=dict,
-        description="Key-value attributes (e.g. age, role, has_first_name, has_last_name)",
+        description=(
+            "Key-value attributes (e.g. age, role, has_first_name, "
+            "has_last_name) — the model's extraction-output channel for "
+            "scalar facts about this entity, also written by the "
+            "entity-surface-correction stage. This field never reaches the "
+            "merged graph directly: it is consumed exactly once, by "
+            "paramem.graph.relation_prep.attribute_relations, which "
+            "projects it into attribute-typed Relations at the end of "
+            "extraction (ExtractionPipeline._run_extractor). Those "
+            "relations, not this dict, are what GraphMerger.merge() folds "
+            "onto a node's provenance-bearing attribute record."
+        ),
     )
     speaker_id: str | None = Field(
         default=None,
@@ -53,9 +64,12 @@ class Relation(BaseModel):
 
     Every relation carries a ``speaker_id`` recording which speaker
     contributed the fact (provenance). For unknown speakers, the speaker
-    store's anonymous group ID (``speaker0``, ``speaker1``, …) is used —
-    there is never an absent ``speaker_id``. The router and recall layers
-    read this field to scope retrieval per speaker.
+    store's anonymous group ID (``speaker0``, ``speaker1``, …) is used.
+    The invariant that there is never an absent ``speaker_id`` is enforced
+    here, at the one construction point every relation crosses
+    (``Field(min_length=1)`` below), rather than asserted in prose or
+    caught at a downstream door. The router and recall layers read this
+    field to scope retrieval per speaker.
 
     ``indexed_key`` is a transient merge-DTO carry-slot populated ONLY by
     the full-consolidation fold (the key-propagation re-merge pass inside
@@ -72,10 +86,14 @@ class Relation(BaseModel):
     relation_type: _RelationType = Field(description="Category of relation")
     confidence: float = Field(default=1.0, ge=0.0)
     speaker_id: str = Field(
+        min_length=1,
         description=(
             "Speaker store ID of the speaker who contributed this fact. "
             "Mandatory; for unknown speakers this is the anonymous-group ID "
-            "from SpeakerStore.register_anonymous (e.g. 'speaker7')."
+            "from SpeakerStore.register_anonymous (e.g. 'speaker7'). "
+            "Never empty: the invariant is enforced here, at the one "
+            "construction point every relation crosses, rather than at a "
+            "downstream door."
         ),
     )
     indexed_key: str | None = Field(
@@ -138,9 +156,9 @@ class Relation(BaseModel):
             "Transient wall-clock timestamp carry-slot (ISO 8601). Populated by "
             "ConsolidationLoop._working_registry_true_relations from "
             "bookkeeping['last_seen'] so the value travels through "
-            "GraphMerger.merge() onto the merged graph edge. Empty for "
-            "extraction-time Relations. Never persisted to the registry, "
-            "cumulative_graph.json, or adapter weights."
+            "GraphMerger.merge() onto the merged edge or the node's attribute "
+            "record. Empty for extraction-time Relations. Never persisted to "
+            "the registry, cumulative_graph.json, or adapter weights."
         ),
         exclude=True,
     )
@@ -150,9 +168,9 @@ class Relation(BaseModel):
             "Transient wall-clock timestamp carry-slot (ISO 8601). Populated by "
             "ConsolidationLoop._working_registry_true_relations from "
             "bookkeeping['first_seen'] so the value travels through "
-            "GraphMerger.merge() onto the merged graph edge. Empty for "
-            "extraction-time Relations. Never persisted to the registry, "
-            "cumulative_graph.json, or adapter weights."
+            "GraphMerger.merge() onto the merged edge or the node's attribute "
+            "record. Empty for extraction-time Relations. Never persisted to "
+            "the registry, cumulative_graph.json, or adapter weights."
         ),
         exclude=True,
     )

@@ -1,21 +1,23 @@
 """Tests for paramem.graph.relation_prep.
 
-Covers the three format-neutral relation/entity preparation helpers consumed
-by the indexed-key distillation path
-(``ConsolidationLoop._entries_from_graph``): ``filter_procedural_relations``,
-``partition_relations``, and ``_flatten_entity_attributes``.  No LLM calls —
-all tests are CPU-only.
+Covers the format-neutral relation/entity preparation helpers:
+``filter_procedural_relations``, ``partition_relations``,
+``attribute_value_is_empty``, ``strip_has_prefix``, ``attr_predicate``, and
+``attribute_relations``.  No LLM calls — all tests are CPU-only.
 """
 
 from __future__ import annotations
 
 from paramem.graph.relation_prep import (
     _PROCEDURAL_PREDICATES,
-    _flatten_entity_attributes,
+    attr_predicate,
+    attribute_relations,
+    attribute_value_is_empty,
     filter_procedural_relations,
     partition_relations,
+    strip_has_prefix,
 )
-from paramem.graph.schema import Entity
+from paramem.graph.schema import Entity, Relation, SessionGraph
 from paramem.utils.identity import canonical
 
 
@@ -202,150 +204,172 @@ class TestPartitionRelations:
         assert partition_relations([], procedural_enabled=False) == ([], [])
 
 
-class TestFlattenEntityAttributes:
-    """Unit tests for the private ``_flatten_entity_attributes`` projection.
+class TestAttributeValueIsEmpty:
+    def test_none_is_empty(self):
+        assert attribute_value_is_empty(None) is True
 
-    All tests are CPU-only — no model or tokenizer required.
-    """
+    def test_whitespace_only_is_empty(self):
+        assert attribute_value_is_empty("   ") is True
 
-    def test_empty_entity_list_returns_empty(self):
-        """Empty input produces an empty output list."""
-        result = _flatten_entity_attributes([])
-        assert result == []
+    def test_empty_string_is_empty(self):
+        assert attribute_value_is_empty("") is True
 
-    def test_single_entity_multiple_attributes(self):
-        """Each attribute on a single entity becomes one synthetic relation dict."""
-        entity = Entity(
-            name="Alex",
-            entity_type="person",
-            attributes={"email": "alex@example.com", "phone": "+49123456"},
+    def test_placeholder_values_are_empty(self):
+        for placeholder in ("N/A", "n/a", "None", "null", "unknown", "UNKNOWN"):
+            assert attribute_value_is_empty(placeholder) is True
+
+    def test_real_value_is_not_empty(self):
+        assert attribute_value_is_empty("alex@example.com") is False
+
+    def test_non_string_non_none_is_not_empty(self):
+        assert attribute_value_is_empty(42) is False
+
+
+class TestStripHasPrefix:
+    def test_no_prefix_unchanged(self):
+        assert strip_has_prefix("email") == "email"
+
+    def test_single_underscore_prefix_stripped(self):
+        assert strip_has_prefix("has_email") == "email"
+
+    def test_single_space_prefix_stripped(self):
+        assert strip_has_prefix("has email") == "email"
+
+    def test_doubled_prefix_reaches_fixed_point(self):
+        assert strip_has_prefix("has_has_email") == "email"
+
+    def test_triple_prefix_reaches_fixed_point(self):
+        assert strip_has_prefix("has_has_has_email") == "email"
+
+    def test_mixed_separator_doubled_prefix(self):
+        assert strip_has_prefix("has has_email") == "email"
+
+    def test_empty_string_unchanged(self):
+        assert strip_has_prefix("") == ""
+
+
+class TestAttrPredicate:
+    def test_basic_underscore_key(self):
+        assert attr_predicate("last_name") == "has last name"
+
+    def test_already_prefixed_key_not_doubled(self):
+        assert attr_predicate("has_last_name") == "has last name"
+
+    def test_doubled_prefix_collapses(self):
+        assert attr_predicate("has_has_last_name") == "has last name"
+
+    def test_idempotent_across_spellings(self):
+        variants = ("has_last_name", "last name", "Last Name", "has has last name")
+        results = {attr_predicate(v) for v in variants}
+        assert results == {"has last name"}
+
+    def test_doubled_and_bare_forms_agree(self):
+        assert attr_predicate("has_has_last_name") == attr_predicate("last_name") == "has last name"
+
+
+class TestAttributeRelations:
+    def _graph(self, entities, relations=None):
+        return SessionGraph(
+            session_id="s1",
+            timestamp="2026-01-01T00:00:00",
+            entities=entities,
+            relations=relations or [],
         )
-        result = _flatten_entity_attributes([entity])
-        assert len(result) == 2
-        predicates = {r["predicate"] for r in result}
-        assert predicates == {"has email", "has phone"}
-        for r in result:
-            assert r["subject"] == "Alex"
-            assert r["relation_type"] == "attribute"
 
-    def test_predicate_form_is_has_plus_key(self):
-        """Predicate is exactly 'has <normalised_key>' (space, not underscore)."""
-        entity = Entity(
-            name="Sam",
-            entity_type="person",
-            attributes={"email": "sam@example.com"},
+    def test_projects_one_relation_per_nonempty_attribute(self):
+        graph = self._graph(
+            [
+                Entity(
+                    name="Alex",
+                    entity_type="person",
+                    attributes={"email": "a@b", "title": "N/A", "name": ""},
+                )
+            ]
         )
-        result = _flatten_entity_attributes([entity])
-        assert result[0]["predicate"] == "has email"
-        assert result[0]["object"] == "sam@example.com"
-
-    def test_multiple_entities_preserve_order(self):
-        """Relations for entity A appear before relations for entity B."""
-        entity_a = Entity(name="Alice", entity_type="person", attributes={"email": "a@a.com"})
-        entity_b = Entity(name="Bob", entity_type="person", attributes={"email": "b@b.com"})
-        result = _flatten_entity_attributes([entity_a, entity_b])
-        assert len(result) == 2
-        assert result[0]["subject"] == "Alice"
-        assert result[1]["subject"] == "Bob"
-
-    def test_exclude_pairs_skips_matching_pair(self):
-        """A pair whose (subject, predicate) is in exclude_pairs is omitted."""
-        entity = Entity(
-            name="Alex",
-            entity_type="person",
-            attributes={"email": "alex@example.com", "phone": "+49123456"},
-        )
-        exclude = {("Alex", "has email")}
-        result = _flatten_entity_attributes([entity], exclude_pairs=exclude)
+        result = attribute_relations(graph, speaker_id="speaker0")
         assert len(result) == 1
-        assert result[0]["predicate"] == "has phone"
+        rel = result[0]
+        assert isinstance(rel, Relation)
+        assert rel.subject == "Alex"
+        assert rel.predicate == "has email"
+        assert rel.object == "a@b"
+        assert rel.relation_type == "attribute"
+        assert rel.confidence == 1.0
+        assert rel.speaker_id == "speaker0"
 
-    def test_exclude_pairs_none_value_skips_nothing_extra(self):
-        """When exclude_pairs is None the default is an empty set (nothing excluded)."""
-        entity = Entity(
-            name="Alex",
-            entity_type="person",
-            attributes={"email": "alex@example.com"},
+    def test_no_attributes_yields_nothing(self):
+        graph = self._graph([Entity(name="Alex", entity_type="person")])
+        assert attribute_relations(graph, speaker_id="speaker0") == []
+
+    def test_skips_pair_already_present_in_relations(self):
+        graph = self._graph(
+            [Entity(name="Alex", entity_type="person", attributes={"email": "a@b"})],
+            relations=[
+                Relation(
+                    subject="Alex",
+                    predicate="has email",
+                    object="a@b",
+                    relation_type="attribute",
+                    speaker_id="speaker0",
+                )
+            ],
         )
-        result = _flatten_entity_attributes([entity], exclude_pairs=None)
-        assert len(result) == 1
+        assert attribute_relations(graph, speaker_id="speaker0") == []
 
-    def test_none_attribute_value_is_skipped(self):
-        """Attributes whose value is None are silently omitted.
-
-        Pydantic enforces dict[str, str] at validation time, so None values
-        cannot be constructed via the normal constructor.  model_construct
-        bypasses validation to exercise the defensive guard in
-        flatten_entity_attributes — important because callers that build
-        entities from raw dicts (e.g. deserialization with a lax loader) may
-        inject None before Pydantic can reject it.
-        """
-        entity = Entity.model_construct(
-            name="Alex",
-            entity_type="person",
-            attributes={"email": None, "phone": "+49123456"},
+    def test_skips_pair_already_present_under_canonical_comparison(self):
+        graph = self._graph(
+            [Entity(name="Alex", entity_type="person", attributes={"has_email": "a@b"})],
+            relations=[
+                Relation(
+                    subject="alex",
+                    predicate="has_email",
+                    object="a@b",
+                    relation_type="attribute",
+                    speaker_id="speaker0",
+                )
+            ],
         )
-        result = _flatten_entity_attributes([entity])
-        assert len(result) == 1
-        assert result[0]["predicate"] == "has phone"
+        assert attribute_relations(graph, speaker_id="speaker0") == []
 
-    def test_whitespace_only_attribute_value_is_skipped(self):
-        """Attributes that reduce to an empty string after strip() are omitted."""
-        entity = Entity(
-            name="Alex",
-            entity_type="person",
-            attributes={"email": "   ", "phone": "+49123456"},
+    def test_skips_self_loop(self):
+        graph = self._graph(
+            [Entity(name="Alex", entity_type="person", attributes={"nickname": "Alex"})]
         )
-        result = _flatten_entity_attributes([entity])
-        assert len(result) == 1
-        assert result[0]["predicate"] == "has phone"
+        assert attribute_relations(graph, speaker_id="speaker0") == []
 
-    def test_key_with_spaces_normalised_to_canonical(self):
-        """Attribute keys with spaces canonicalize to the space-form identity
-        surface; ``"has "`` is glued on ahead of it as a literal space, so
-        the whole predicate stays in the one project-wide identity
-        surface."""
-        entity = Entity(
-            name="Alex",
-            entity_type="person",
-            attributes={"phone number": "+49123456"},
+    def test_skips_self_loop_under_canonical_comparison(self):
+        graph = self._graph(
+            [Entity(name="Alex Smith", entity_type="person", attributes={"nickname": "alex_smith"})]
         )
-        result = _flatten_entity_attributes([entity])
-        assert result[0]["predicate"] == "has phone number"
+        assert attribute_relations(graph, speaker_id="speaker0") == []
 
-    def test_key_with_dashes_preserves_dash(self):
-        """Dashes are NOT separators — they survive canonicalization verbatim."""
-        entity = Entity(
-            name="Alex",
-            entity_type="person",
-            attributes={"linked-in": "linkedin.com/in/alex"},
+    def test_does_not_mutate_input_graph(self):
+        entity = Entity(name="Alex", entity_type="person", attributes={"email": "a@b"})
+        graph = self._graph([entity])
+        before = graph.model_copy(deep=True)
+        attribute_relations(graph, speaker_id="speaker0")
+        assert graph == before
+
+    def test_multiple_entities_multiple_attributes(self):
+        graph = self._graph(
+            [
+                Entity(
+                    name="Alex",
+                    entity_type="person",
+                    attributes={"email": "a@b", "phone": "555-1234"},
+                ),
+                Entity(
+                    name="Bea",
+                    entity_type="person",
+                    attributes={"hobby": "chess"},
+                ),
+            ]
         )
-        result = _flatten_entity_attributes([entity])
-        assert result[0]["predicate"] == "has linked-in"
-
-    def test_key_with_uppercase_lowercased(self):
-        """Attribute keys are lowercased before formatting the predicate."""
-        entity = Entity(
-            name="Alex",
-            entity_type="person",
-            attributes={"Email": "alex@example.com"},
-        )
-        result = _flatten_entity_attributes([entity])
-        assert result[0]["predicate"] == "has email"
-
-    def test_entity_with_no_attributes_produces_no_relations(self):
-        """An entity with an empty attributes dict contributes nothing."""
-        entity = Entity(name="Bob", entity_type="person", attributes={})
-        result = _flatten_entity_attributes([entity])
-        assert result == []
-
-    def test_input_entities_not_mutated(self):
-        """The function must not modify the input entity objects."""
-        entity = Entity(
-            name="Alex",
-            entity_type="person",
-            attributes={"email": "alex@example.com"},
-        )
-        original_attrs = dict(entity.attributes)
-        _flatten_entity_attributes([entity])
-        assert entity.attributes == original_attrs
+        result = attribute_relations(graph, speaker_id="speaker1")
+        pairs = {(r.subject, r.predicate, r.object) for r in result}
+        assert pairs == {
+            ("Alex", "has email", "a@b"),
+            ("Alex", "has phone", "555-1234"),
+            ("Bea", "has hobby", "chess"),
+        }
+        assert all(r.speaker_id == "speaker1" for r in result)

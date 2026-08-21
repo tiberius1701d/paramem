@@ -666,10 +666,11 @@ def _migrate_tier_simulate_to_train(
        probe can find them.  The store entry itself is content-only
        (``{key, subject, predicate, object}``) — attribution lives only in
        bookkeeping.  Each registration is paired with a bookkeeping record
-       (``store.set_bookkeeping``), sourced from the live store, then the
-       on-disk ``key_metadata.json``, then the source graph entry's own
-       ``speaker_id``, then an empty-speaker default when none of the three
-       has a value — see the hot-load loop for the priority order.
+       (``store.set_bookkeeping``), sourced from the live store (which
+       already carries the on-disk ``key_metadata.json`` it was hydrated
+       from), then the source graph entry's own ``speaker_id`` — see the
+       hot-load loop for the priority order.  Neither source having a value
+       raises (no-unattributed-keys invariant; see the hot-load loop).
     3. Reset the adapter to LoRA-zero
        (``delete_adapter`` + ``create_adapter`` from the resolved config),
        then ``switch_adapter`` so training writes into this adapter.
@@ -841,15 +842,13 @@ def _migrate_tier_simulate_to_train(
         # above), then the source graph entry's own speaker_id
         # (``iter_entries`` carries it — the same quantity
         # ``build_tier_graph_from_store`` wrote from bookkeeping when the
-        # graph was produced, so it is in-hand attribution, not a guess),
-        # then an empty-speaker / unknown-relation-type default only when
-        # neither has a value for this key (the same minimal shape
-        # MemoryStore.reinforce writes for a never-bookkept key, so it reads
-        # as a legitimate — if unattributed — provenance row rather than a
-        # divergence).  A discarded graph attribution here would mint an
-        # unattributed key that the router never indexes (router.py only
-        # indexes non-empty speaker ids) — trained but unreachable at
-        # inference.
+        # graph was produced, so it is in-hand attribution, not a guess).
+        # Neither source has a value only against a store predating the
+        # bookkeeping speaker invariant — set_bookkeeping now raises
+        # (via paramem.memory.bookkeeping.bookkeeping_row) rather than
+        # minting an unattributed row.  Accepted: a fresh store never
+        # reaches this, and the raise is operator-visible on this base-swap
+        # migration path.
         bk = loop.store.bookkeeping_for_key(key) or {}
         bk_speaker_id = bk.get("speaker_id") or kp.get("speaker_id", "")
         loop.store.set_bookkeeping(
@@ -861,7 +860,6 @@ def _migrate_tier_simulate_to_train(
             last_seen=bk.get("last_seen", ""),
             first_seen=bk.get("first_seen", ""),
             promoted=bk.get("promoted", False),
-            allow_empty_speaker=(bk_speaker_id == ""),
         )
 
     # Step 3: reset adapter to LoRA-zero (delete + recreate) -- the explicit

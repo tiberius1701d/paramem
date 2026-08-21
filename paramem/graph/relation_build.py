@@ -20,8 +20,14 @@ It owns three things:
   no longer routed here by object shape: the model tags them
   ``relation_type="attribute"`` at extraction time, and
   :class:`~paramem.graph.merger.GraphMerger` (the one merge boundary every
-  path crosses) folds them onto the subject node's ``attributes`` dict —
-  see that module's ``relation_type == "attribute"`` branch in ``merge()``.
+  path crosses) folds them onto the subject node's ``attributes`` dict as
+  a provenance-bearing record (``{value, speaker_id, first_seen,
+  last_seen, edge_source?, ik_key?}``) — see that module's
+  ``relation_type == "attribute"`` branch in ``merge()``.  A session's
+  ``Entity.attributes`` reach that same gate through a separate
+  projection (:func:`~paramem.graph.relation_prep.attribute_relations`,
+  run at extraction time, outside this module), not through anything
+  built here.
 * ``recovery_gate`` — the all-dropped safety net's DECISION and its cause
   bookkeeping. The recovery ACTION (re-judging the pre-enrichment facts
   on the local model) stays with its caller: it needs the model and the

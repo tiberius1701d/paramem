@@ -74,7 +74,6 @@ def _make_router_from_entries(
                 key,
                 speaker_id=spk,
                 relation_type=rtype,
-                allow_empty_speaker=(spk == ""),
                 first_seen="",
                 promoted=False,
             )

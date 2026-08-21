@@ -16,6 +16,7 @@ post-enrichment bookkeeping (debug snapshots, reinforcement credit).
 
 import logging
 import math
+from collections import defaultdict
 from typing import TYPE_CHECKING, Callable
 
 import networkx as nx
@@ -294,6 +295,21 @@ def enrich_graph(
     graph.  This mirrors ``ConsolidationLoop._working_registry_true_relations``
     stamping ``last_seen``/``first_seen`` from bookkeeping.
 
+    Speaker attribution is inherited the same way, from the same window
+    walk, rather than read off graph topology. For every source edge in
+    the chunk, its (non-empty) ``speaker_id`` is added to the evidence set
+    of BOTH endpoints; after same_as contraction each endpoint key is
+    folded through :func:`resolve_to_node_key` so a contracted node
+    carries forward the evidence of every surface merged into it. A
+    relation's speaker is the union of its two (resolved) endpoints'
+    evidence sets: exactly one asserter attributes the relation; zero
+    asserters or two-or-more disagreeing asserters leave it unattributable
+    and it is dropped rather than guessed — counted in
+    ``unattributed_dropped`` / ``multi_speaker_dropped`` respectively, with
+    successful attributions counted in ``stamped_relations``. ParaMem is a
+    multi-user system: nothing here assumes one speaker per chunk or per
+    graph.
+
     Early-return conditions (all return ``skipped=True``):
     - No local model available (``model is None``).
     - Graph has fewer than 10 nodes (floor — too little signal).
@@ -390,6 +406,22 @@ def enrich_graph(
               chunk's OTHER slices succeeded and their facts egressed —
               that partial-fail-closed-drop case also logs a per-chunk
               WARNING (``0 < slices_failed < slices``).
+            - ``stamped_relations`` (int): enrichment relations whose two
+              endpoints resolved to exactly one speaker in the chunk's
+              endpoint→speakers evidence (see the speaker-attribution
+              paragraph above) and were therefore attributed and merged.
+            - ``unattributed_dropped`` (int): enrichment relations dropped
+              because neither endpoint's evidence set named any speaker —
+              summed across every chunk.
+            - ``multi_speaker_dropped`` (int): enrichment relations dropped
+              because the union of the two endpoints' evidence named two or
+              more distinct speakers — a fact synthesised across speakers,
+              which one-speaker-per-row bookkeeping cannot express — summed
+              across every chunk. Together with ``stamped_relations`` and
+              ``unattributed_dropped`` this makes the pass's yield
+              (``stamped_relations / (stamped_relations +
+              unattributed_dropped + multi_speaker_dropped)``) readable per
+              run without any threshold.
             - ``skipped`` (bool): ``True`` when enrichment was bypassed.
             - ``skip_reason`` (str | None): reason token when skipped —
               ``"no_model"``, ``"floor"``, or ``"cloud_egress_blocked"``
@@ -428,6 +460,9 @@ def enrich_graph(
         "aborted_reason": None,
         "anonymize_slices": 0,
         "privacy_skipped_slices": 0,
+        "stamped_relations": 0,
+        "unattributed_dropped": 0,
+        "multi_speaker_dropped": 0,
     }
 
     if model is None:
@@ -525,6 +560,12 @@ def enrich_graph(
     privacy_skipped_chunks = 0
     mapping_rekey_dropped = 0
     dropped_relations = 0
+    # Attribution counters — see the speaker-attribution paragraph in the
+    # docstring above and the Returns section. Accumulated across every
+    # chunk's relation-build loop.
+    stamped_relations = 0
+    unattributed_dropped = 0
+    multi_speaker_dropped = 0
     # Slice-level counters (fact-boundary slicing) — see the docstring's
     # Returns section. Accumulated per chunk from payload.slices /
     # payload.slices_failed, whether that chunk's payload ends up "ok" or
@@ -552,11 +593,23 @@ def enrich_graph(
             # window rather than landing untimed.  Computed from the
             # subgraph view BEFORE any same_as contraction below mutates
             # ``graph`` (contraction would change what the view sees).
+            #
+            # The same walk also collects, per node key, the set of
+            # non-empty edge speaker_ids incident to that node — the raw
+            # evidence a relation's attribution is built from below.  One
+            # pass over the chunk's edges for both quantities; no separate
+            # traversal, and no derivation from ``triples`` (a second walk
+            # over the same edges).
             _chunk_last_seen = ""
             _chunk_first_seen = ""
+            _chunk_endpoint_speakers: dict[str, set[str]] = defaultdict(set)
             for _u, _v, _edata in chunk_subgraph.edges(data=True):
                 _chunk_last_seen = max(_chunk_last_seen, _edata.get("last_seen") or "")
                 _chunk_first_seen = min_nonempty(_chunk_first_seen, _edata.get("first_seen") or "")
+                _edge_sid = _edata.get("speaker_id")
+                if _edge_sid:
+                    _chunk_endpoint_speakers[_u].add(_edge_sid)
+                    _chunk_endpoint_speakers[_v].add(_edge_sid)
             triples = serialize_subgraph_triples(chunk_subgraph)
             # The fold graph carries no entity types of its own:
             # registry SPO triples have none, and the merger's fallback
@@ -890,6 +943,16 @@ def enrich_graph(
                     exc,
                 )
 
+        # Fold this chunk's endpoint→speakers evidence through the same
+        # resolver used for relation endpoints below (membership shortcut,
+        # canonical fallback, coref-chain follow), so a node contracted away
+        # by same_as above carries its pre-contraction speakers forward onto
+        # the surviving node — including through a multi-hop coref chain.
+        # Per-chunk, like ``coref_map`` itself.
+        chunk_speakers: dict[str, set[str]] = defaultdict(set)
+        for _raw_key, _sids in _chunk_endpoint_speakers.items():
+            chunk_speakers[resolve_to_node_key(_raw_key, _in_graph, coref_map)] |= _sids
+
         # Build Relation objects from cloud-emitted new_rels for this chunk.
         # Endpoint surface rule: speaker endpoints pass their canonical
         # key (the speaker_id), non-speaker endpoints pass the display surface.
@@ -936,8 +999,25 @@ def enrich_graph(
             if confidence < 0.7:
                 continue
 
-            # Derive speaker_id from the subject node's speaker_id attribute.
-            _subj_sid = graph.nodes.get(subj_canon, {}).get("speaker_id", "")
+            # Attribution is inherited from the chunk's own source facts,
+            # never derived from graph topology: the relation's speaker is
+            # the union of its two (resolved) endpoints' evidence sets,
+            # collected above from this chunk's own edges. Exactly one
+            # asserter attributes the relation; zero or two-or-more leave it
+            # unattributable and it is dropped and counted rather than
+            # guessed — a fact synthesised across two speakers' facts is not
+            # expressible in one-speaker-per-row bookkeeping.
+            endpoint_speakers = chunk_speakers.get(subj_canon, set()) | chunk_speakers.get(
+                obj_canon, set()
+            )
+            if not endpoint_speakers:
+                unattributed_dropped += 1
+                continue
+            if len(endpoint_speakers) > 1:
+                multi_speaker_dropped += 1
+                continue
+            (relation_speaker_id,) = endpoint_speakers
+            stamped_relations += 1
 
             enrichment_relations.append(
                 Relation(
@@ -946,7 +1026,7 @@ def enrich_graph(
                     object=obj_endpoint,
                     relation_type=rtype,  # type: ignore[arg-type]
                     confidence=confidence,
-                    speaker_id=_subj_sid,
+                    speaker_id=relation_speaker_id,
                     symmetric=bool(rel.get("symmetric")),
                     edge_source="graph_enrichment",
                     last_seen=_chunk_last_seen,
@@ -970,7 +1050,8 @@ def enrich_graph(
     logger.info(
         "graph_enrichment: provider=%s chunks=%d new_edges=%d same_as_merges=%d "
         "privacy_skipped_chunks=%d mapping_rekey_dropped=%d dropped_relations=%d "
-        "anonymize_slices=%d privacy_skipped_slices=%d aborted_reason=%s",
+        "anonymize_slices=%d privacy_skipped_slices=%d stamped_relations=%d "
+        "unattributed_dropped=%d multi_speaker_dropped=%d aborted_reason=%s",
         provider,
         calls_made,
         total_new,
@@ -980,6 +1061,9 @@ def enrich_graph(
         dropped_relations,
         anonymize_slices,
         privacy_skipped_slices,
+        stamped_relations,
+        unattributed_dropped,
+        multi_speaker_dropped,
         aborted_reason,
     )
     # Enrichment-collapsed ik_keys are written to the merger's removal ledger
@@ -1005,4 +1089,7 @@ def enrich_graph(
         "aborted_reason": aborted_reason,
         "anonymize_slices": anonymize_slices,
         "privacy_skipped_slices": privacy_skipped_slices,
+        "stamped_relations": stamped_relations,
+        "unattributed_dropped": unattributed_dropped,
+        "multi_speaker_dropped": multi_speaker_dropped,
     }

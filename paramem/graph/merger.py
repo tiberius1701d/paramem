@@ -33,6 +33,7 @@ import networkx as nx
 from rapidfuzz import fuzz
 
 from paramem.graph.prompts import _load_prompt
+from paramem.graph.relation_prep import attr_predicate, attribute_value_is_empty, strip_has_prefix
 from paramem.graph.schema import Entity, Relation, SessionGraph
 from paramem.utils.identity import canonical as canonical_id
 from paramem.utils.identity import is_speaker_id
@@ -73,6 +74,55 @@ def min_nonempty(a: str, b: str) -> str:
     if not b:
         return a
     return min(a, b)
+
+
+def reconcile_provenance(target: dict, relation: "Relation", timestamp: str) -> None:
+    """Apply the one relation -> target provenance rule to *target* in place.
+
+    ``speaker_id``   ``target["speaker_id"] = target.get("speaker_id") or
+                     relation.speaker_id`` — always written, so the key is
+                     present after every call (first-non-empty-wins; an
+                     absent key and an empty value are the same case).
+    ``last_seen``    ``max(target.get("last_seen", ""), relation.last_seen or
+                     timestamp)``.
+    ``first_seen``   ``min_nonempty(target.get("first_seen", ""),
+                     relation.first_seen or timestamp)``.
+    ``edge_source``  written only when ``relation.edge_source`` is non-empty
+                     AND *target* carries none yet (same first-non-empty-wins
+                     rule).
+
+    No ``existing``/net-new flag: on an empty *target* every rule degenerates
+    to the net-new form (``max("", x) == x``, ``min_nonempty("", x) == x``,
+    and first-non-empty-wins on a key that is not yet present is an
+    unconditional stamp) — one rule reproduces both today's re-observation
+    branch and today's net-new branch.
+
+    Three callers, all reconciling a relation onto ONE target: the edge
+    Case-1 update in :meth:`GraphMerger._upsert_relation` (called BEFORE the
+    ``ik_key`` if/elif chain — the keyless-onto-keyed arm copies the
+    already-merged ``target["last_seen"]``/``target["first_seen"]`` into
+    ``adopt_reinforcements`` and needs the merged values, not the pre-merge
+    ones), the edge Case-3 insert (called after ``add_edge``), and the node
+    attribute record built by :meth:`GraphMerger.merge`'s
+    ``relation_type == "attribute"`` gate.  ``confidence`` and the
+    ``sessions`` union stay inline in ``_upsert_relation`` — edge-only, no
+    analog on the attribute record.
+
+    Args:
+        target: The edge or attribute-record dict, mutated in place.
+        relation: The incoming :class:`Relation` supplying the provenance.
+        timestamp: Fallback wall-clock stamp used when *relation* carries
+            no ``last_seen``/``first_seen`` of its own.
+    """
+    from paramem.memory.persistence import _EDGE_SOURCE_ATTR
+
+    target["last_seen"] = max(target.get("last_seen", ""), relation.last_seen or timestamp)
+    target["first_seen"] = min_nonempty(
+        target.get("first_seen", ""), relation.first_seen or timestamp
+    )
+    target["speaker_id"] = target.get("speaker_id") or relation.speaker_id
+    if relation.edge_source and not target.get(_EDGE_SOURCE_ATTR):
+        target[_EDGE_SOURCE_ATTR] = relation.edge_source
 
 
 def check_predicate_coexistence(
@@ -147,35 +197,6 @@ def check_predicate_coexistence(
     return "COEXIST"
 
 
-def _strip_has_prefix(pred: str) -> str:
-    """Strip one leading ``has_``/``has `` token from *pred*, if present.
-
-    Used by the attribute-relation merger gate to derive a node
-    ``attributes`` key from a relation predicate (e.g. ``has_certification``
-    -> ``certification``) before that key is passed through
-    :func:`~paramem.utils.identity.canonical`. Strips AT MOST one
-    occurrence — ``"has_has_email"`` -> ``"has_email"``, never
-    ``"email"`` — so a doubled prefix (a model artefact or a predicate that
-    legitimately starts with a second ``has_``) degrades to a single strip
-    rather than eating both. Recognises both the underscore form
-    (``"has_certification"``) and the space-separated form
-    (``"has certification"``), since this function runs on the RAW
-    relation predicate, before any canonicalization.
-
-    Args:
-        pred: Raw (uncanonicalized) relation predicate.
-
-    Returns:
-        *pred* with a single leading ``has_``/``has `` removed, or *pred*
-        unchanged when it carries neither prefix.
-    """
-    if pred.startswith("has_"):
-        return pred[len("has_") :]
-    if pred.startswith("has "):
-        return pred[len("has ") :]
-    return pred
-
-
 def node_display(node_data: dict, node_key: str) -> str:
     """The display surface for a merged-graph node.
 
@@ -194,6 +215,52 @@ def node_display(node_data: dict, node_key: str) -> str:
         node_key: The node's canonical key, used as the fallback.
     """
     return node_data.get("display_name") or node_key
+
+
+def attribute_fact(node_data: dict, node_key: str, attr_key: str, record: dict) -> dict:
+    """Project one node attribute record into a fact dict.
+
+    Returns ``{subject, predicate, object, speaker_id, first_seen,
+    last_seen, ik_key}`` — ``subject`` is the node's DISPLAY surface via
+    :func:`node_display`, ``predicate`` is :func:`~paramem.graph.relation_prep.attr_predicate`
+    of *attr_key*, ``object`` is ``record["value"]``.  ``ik_key`` is ``""``
+    when *record* carries none (a keyless attribute).
+
+    Placed beside :func:`node_display` — the module that owns node-data
+    reads.  The ONE node-record -> fact projection, shared by the fold's
+    keyed walk and its pending-relation capture
+    (:mod:`paramem.training.consolidation`), so the two callers cannot
+    disagree on the subject surface: the display surface is correct for
+    both — trained content should read the human-readable surface, and a
+    pending-relation ``Relation`` re-merges through :meth:`GraphMerger.merge`,
+    which folds the subject through :func:`~paramem.utils.identity.canonical`
+    for node identity, so display and node-key surfaces resolve to the same
+    node either way.
+
+    Args:
+        node_data: The node's data dict from ``GraphMerger.graph.nodes``
+            (read only to resolve the display surface via
+            :func:`node_display`).
+        node_key: The node's canonical key — :func:`node_display`'s
+            fallback when no ``display_name`` is stored.
+        attr_key: The attribute's canonical key on
+            ``node_data["attributes"]``.
+        record: The attribute record — ``{value, speaker_id, first_seen,
+            last_seen, edge_source?, ik_key?}`` (see the record-shape note
+            on :meth:`GraphMerger.merge`).
+
+    Returns:
+        A fresh dict; *node_data* and *record* are not mutated.
+    """
+    return {
+        "subject": node_display(node_data, node_key),
+        "predicate": attr_predicate(attr_key),
+        "object": record.get("value", ""),
+        "speaker_id": record.get("speaker_id", ""),
+        "first_seen": record.get("first_seen", ""),
+        "last_seen": record.get("last_seen", ""),
+        "ik_key": record.get("ik_key", ""),
+    }
 
 
 def _set_display_name(node: dict, value: str, *, refresh: bool = False) -> None:
@@ -228,15 +295,20 @@ def _synth_speaker_entities(relations: "list[Relation]") -> "list[Entity]":
     by ``speaker_id`` so exactly one entity is produced per unique speaker.
 
     Non-speaker subjects (``speaker_id == ""`` OR ``subject != speaker_id``)
-    are skipped; their nodes retain no ``speaker_id`` attribute, which resolves
-    to ``""`` in the keyed-walk (the correct default for non-person nodes).
+    are skipped; their nodes retain no ``speaker_id`` attribute.
 
     Used by :meth:`GraphMerger.merge_relations` so that
-    :meth:`GraphMerger._upsert_entity` stamps ``speaker_id`` onto the subject
-    node before the edge walk in
-    :meth:`~paramem.training.consolidation.ConsolidationLoop._build_working_keyed_walk`
-    reads it.  Without the entity the node would lack ``speaker_id``, causing
-    minted keys to fall back to ``speaker_id=""``.
+    :meth:`GraphMerger._upsert_entity` stamps the node's own ``speaker_id``
+    attribute onto a speaker subject's node — the identity marker
+    :func:`~paramem.training.graph_enrich.enrich_graph`'s endpoint-surface
+    rule reads to decide whether an enrichment relation's endpoint passes its
+    canonical key (a speaker node) or its display surface (any other node).
+    This node attribute is a separate concern from a relation's or a node
+    attribute record's own ``speaker_id`` provenance field: the fold's keyed
+    walk
+    (:meth:`~paramem.training.consolidation.ConsolidationLoop._build_working_keyed_walk`)
+    reads an edge's or an attribute record's own ``speaker_id`` directly and
+    never falls back to this node attribute.
 
     Args:
         relations: The list of :class:`Relation` objects from which speaker
@@ -387,11 +459,23 @@ class GraphMerger:
         """Merge a session graph into the cumulative graph.
 
         A relation whose ``relation_type == "attribute"`` never becomes an
-        edge: it is diverted onto the SUBJECT node's ``attributes`` dict
-        (see the ``relation.relation_type == "attribute"`` branch below) —
+        edge: it is diverted onto the SUBJECT node's ``attributes`` dict as
+        a provenance-bearing record — ``{value, speaker_id, first_seen,
+        last_seen, edge_source?, ik_key?}``, reconciled by the same
+        :func:`reconcile_provenance` rule the edge path uses (see the
+        ``relation.relation_type == "attribute"`` branch below).  This is
         the merger-gate authority for literal-value facts (phone, email,
         certification, job title, exact date, ...) that would otherwise mint
-        a concept node colliding across subjects sharing the same value.
+        a concept node colliding across subjects sharing the same value. A
+        value carrying no information
+        (:func:`~paramem.graph.relation_prep.attribute_value_is_empty`) is
+        skipped before any record is written. A re-observation carrying the
+        SAME value reconciles onto the existing record (the window widens,
+        provenance is first-non-empty-wins); a DIFFERENT value starts a NEW
+        record lifetime instead of reconciling — the new value's own
+        speaker and window, never blended with the superseded assertion —
+        and, when a key was bound to the superseded value, ledgers the
+        displacement (``attribute_key_superseded``).
 
         Args:
             session_graph: The per-session graph to merge in.
@@ -474,12 +558,26 @@ class GraphMerger:
                 # title, ...): the model has marked this as a scalar datum
                 # ABOUT the subject rather than a claim relating the subject
                 # to a distinct concept. Fold it onto the SUBJECT node's
-                # ``attributes`` dict instead of minting a colliding concept
-                # node keyed on the value (two subjects with the same
-                # certification would otherwise collapse onto one node).
-                # No object node is created, no edge is inserted — this
-                # diversion runs BEFORE the object-node-ensure below so an
-                # attribute relation never reaches ``_upsert_relation``.
+                # ``attributes`` dict as a provenance-bearing record instead
+                # of minting a colliding concept node keyed on the value
+                # (two subjects with the same certification would otherwise
+                # collapse onto one node). No object node is created, no
+                # edge is inserted — this diversion runs BEFORE the
+                # object-node-ensure below so an attribute relation never
+                # reaches ``_upsert_relation``.
+                #
+                # A value carrying no information is skipped before any node
+                # or record is touched — this is in ADDITION to
+                # ``attribute_relations``'s own skip (relation_prep.py): a
+                # model-emitted attribute relation reaches this gate
+                # directly, never through that projection, and a projected
+                # relation reaches ``_entries_from_graph`` WITHOUT crossing
+                # this gate, so a placeholder-valued projection would
+                # otherwise become a keyed entry the gate would have
+                # dropped. Two doors, two guards, one rule.
+                if attribute_value_is_empty(relation.object):
+                    continue
+
                 # Subject-node-ensure mirrors the endpoint-ensure loop below,
                 # restricted to the subject alone.
                 if subject not in self.graph:
@@ -499,51 +597,89 @@ class GraphMerger:
 
                 node = self.graph.nodes[subject]
                 node_attrs = node.get("attributes", {})
-                attr_key = canonical_id(_strip_has_prefix(relation.predicate), mode="full")
-                # Read the incumbent value BEFORE the write below overwrites it —
-                # the supersession guard needs to compare old vs new value, and
-                # once overwritten the old value is gone.
-                incumbent_value = node_attrs.get(attr_key)
+                attr_key = canonical_id(strip_has_prefix(relation.predicate), mode="full")
                 new_value = canonical_id(relation.object, mode="spaces")
-                node_attrs[attr_key] = new_value
-                node["attributes"] = node_attrs
-                if relation.indexed_key:
-                    # Node analog of the edge ``_IK_KEY_ATTR`` — lets the
-                    # fold's node-attribute walk
-                    # (``ConsolidationLoop._build_working_keyed_walk``)
-                    # replay this key's registry-true content instead of
-                    # re-minting it every cycle.
-                    attr_keys = node.setdefault("attribute_keys", {})
-                    incumbent_key = attr_keys.get(attr_key)
-                    if incumbent_key is not None and incumbent_key != relation.indexed_key:
-                        # A prior key already registered for this
-                        # (subject, attribute) pair is about to be overwritten.
-                        # Same value under two keys is a true carry-forward (the
-                        # documented condition for survivor_key): the displaced
-                        # key's reinforcement maturity flows to the survivor via
-                        # _apply_working_reinforcement_credit instead of being silently
-                        # discarded.  A DIFFERENT value winning is the
-                        # contradiction shape — a different fact won, not a
-                        # carry-forward — so it is ledgered as an intentional
-                        # removal WITHOUT a survivor_key: no credit inheritance,
-                        # no promotion.  Either way, _apply_working_fate_decisions
-                        # decides retire-outright vs. withhold-behind-a-marker by
-                        # whether the displaced key's owning tier is rebuilt by
-                        # THIS event, not by survivor_key's presence here.
-                        if incumbent_value == new_value:
+                record = node_attrs.get(attr_key)
+
+                if record is None:
+                    # Net-new attribute: one record, provenance reconciled
+                    # onto an empty target degenerates to an unconditional
+                    # stamp (see reconcile_provenance's docstring).
+                    record = {"value": new_value}
+                    reconcile_provenance(record, relation, timestamp)
+                    if relation.indexed_key:
+                        record["ik_key"] = relation.indexed_key
+                    node_attrs[attr_key] = record
+                elif record["value"] == new_value:
+                    # Same value re-observed: this is a genuine
+                    # reconciliation, not a new lifetime — widen the window
+                    # and adopt provenance, and only touch the key binding
+                    # when the incoming relation itself carries a key.
+                    reconcile_provenance(record, relation, timestamp)
+                    if relation.indexed_key:
+                        incumbent_key = record.get("ik_key")
+                        if incumbent_key is not None and incumbent_key != relation.indexed_key:
+                            # Same value carried forward under a NEW key —
+                            # the documented condition for survivor_key: the
+                            # displaced key's reinforcement maturity flows to
+                            # the survivor via _apply_working_reinforcement_credit
+                            # instead of being silently discarded.
                             self.record_removal(
                                 incumbent_key,
                                 reason="attribute_key_superseded",
                                 survivor_key=relation.indexed_key,
                             )
-                        else:
+                        record["ik_key"] = relation.indexed_key
+                else:
+                    # Different value: a NEW record lifetime, never
+                    # reconciled onto the incumbent — reconciling would
+                    # carry the superseded value's first_seen and its
+                    # original asserter forward onto a fact neither
+                    # describes (a window claiming the new value was
+                    # asserted when the old one was, and, where two
+                    # speakers assert different values, attribution of the
+                    # new value to the speaker who asserted the old one).
+                    incumbent_key = record.get("ik_key")
+                    if relation.indexed_key:
+                        # Keyed case: unchanged two-arm ledger shape — a
+                        # different value winning is the contradiction
+                        # shape (old_object/new_object, no survivor_key,
+                        # unlike the same-value carry-forward arm above).
+                        if incumbent_key is not None and incumbent_key != relation.indexed_key:
                             self.record_removal(
                                 incumbent_key,
                                 reason="attribute_key_superseded",
-                                old_object=incumbent_value,
+                                old_object=record["value"],
                                 new_object=new_value,
                             )
-                    attr_keys[attr_key] = relation.indexed_key
+                        node_attrs[attr_key] = {
+                            "value": new_value,
+                            "speaker_id": relation.speaker_id,
+                            "first_seen": relation.first_seen or timestamp,
+                            "last_seen": relation.last_seen or timestamp,
+                            "ik_key": relation.indexed_key,
+                        }
+                    else:
+                        # Keyless case: a re-observation with a different
+                        # value strands the old key's binding — ledger it
+                        # (no survivor_key: the new value has no key of its
+                        # own yet) and replace the record wholesale.  A
+                        # keyless incumbent (never bound to a key) has
+                        # nothing to ledger.
+                        if incumbent_key is not None:
+                            self.record_removal(
+                                incumbent_key,
+                                reason="attribute_key_superseded",
+                                old_object=record["value"],
+                                new_object=new_value,
+                            )
+                        node_attrs[attr_key] = {
+                            "value": new_value,
+                            "speaker_id": relation.speaker_id,
+                            "first_seen": relation.first_seen or timestamp,
+                            "last_seen": relation.last_seen or timestamp,
+                        }  # no ik_key — the keyed walk's keyless branch mints a fresh one
+                node["attributes"] = node_attrs
                 continue
 
             # Build a display-name map for endpoints not resolved through entities.
@@ -832,11 +968,16 @@ class GraphMerger:
         for speakers — always lowercase ``speaker{N}``).  The human-readable
         display name is stored on the dedicated ``display_name`` node field for
         ALL node types — not just speakers — so downstream consumers never need
-        to use the node key for display.  ``entity.attributes`` (including a
-        model-emitted ``"name"`` key, if present) is folded onto ``attributes``
-        as an ordinary trained fact and never read for display.  First-seen
-        surface wins for non-speakers: ``display_name`` is set on insertion and
-        NOT overwritten on subsequent updates (idempotent).
+        to use the node key for display.  This method never writes ``attributes``:
+        ``entity.attributes`` (including a model-emitted ``"name"`` key, if
+        present) reaches the node's ``attributes`` dict exclusively through
+        the projection into attribute-typed relations
+        (:func:`~paramem.graph.relation_prep.attribute_relations`, run at
+        extraction time) and :meth:`GraphMerger.merge`'s
+        ``relation_type == "attribute"`` gate — never here, and never read
+        for display.  First-seen surface wins for non-speakers:
+        ``display_name`` is set on insertion and NOT overwritten on
+        subsequent updates (idempotent).
 
         Speaker entities (``entity.speaker_id`` set) are keyed by
         ``entity.speaker_id`` verbatim (lowercase ``speaker{N}``,
@@ -858,23 +999,10 @@ class GraphMerger:
             if session_id not in sessions:
                 sessions.append(session_id)
             node["sessions"] = sessions
-            # Merge attributes — only non-empty values are stored. Empty
-            # strings and "N/A"/"None"/"Unknown" placeholders that one
-            # chunk's LLM emitted for missing data are dropped: they neither
-            # overwrite an existing real value nor introduce a noisy
-            # placeholder key into the cumulative graph (a known LLM-
-            # compliance failure mode where the extractor enumerates every
-            # advertised attribute key even when the source has no value).
-            existing_attrs = node.get("attributes", {})
-            for k, v in entity.attributes.items():
-                if _attr_value_is_empty(v):
-                    continue
-                existing_attrs[k] = v
-            node["attributes"] = existing_attrs
             # Display surface, never read from entity.attributes.  Speaker
             # entities refresh on update (entity.name is always the lowercase
             # speaker{N} id); non-speaker entities are first-seen-wins only.
-            if entity.name and not _attr_value_is_empty(entity.name):
+            if entity.name and not attribute_value_is_empty(entity.name):
                 _set_display_name(node, entity.name, refresh=is_speaker)
             # The node key equals entity.speaker_id (lowercase speaker{N}).
             # The ``speaker_id`` node attribute carries the same value.
@@ -883,17 +1011,16 @@ class GraphMerger:
             if is_speaker and node.get("speaker_id") is None:
                 node["speaker_id"] = entity.speaker_id
         else:
-            attributes = {k: v for k, v in entity.attributes.items() if not _attr_value_is_empty(v)}
             node_kwargs: dict = dict(
                 entity_type=entity.entity_type,
-                attributes=attributes,
+                attributes={},
                 reinforcement_count=1,
                 sessions=[session_id],
             )
             # Display surface, never read from entity.attributes.  The node
             # key is now the canonical form so the node ID is no longer the
             # display name.
-            if entity.name and not _attr_value_is_empty(entity.name):
+            if entity.name and not attribute_value_is_empty(entity.name):
                 node_kwargs["display_name"] = entity.name
             if is_speaker:
                 node_kwargs["speaker_id"] = entity.speaker_id
@@ -915,15 +1042,21 @@ class GraphMerger:
         Handles three cases:
 
         1. Identical triple already exists — exact-duplicate reinforcement: bump
-           recurrence.  Case-1-adopt: if the existing edge has no ``ik_key`` and
-           the incoming ``relation.indexed_key`` is set, adopt the key onto the
-           existing edge (fold-only provenance carry-through).  When the
-           existing edge already carries an ``ik_key`` and the incoming
-           relation carries none, this is a keyless re-observation of an
-           already-keyed fact rather than an adopt.  In both cases, when
-           ``credit_adopt_reinforcement`` is ``True``, the surviving key is
-           recorded in ``self.adopt_reinforcements`` for the fold's
-           reinforcement-credit pass.
+           recurrence and reconcile provenance (``speaker_id``, ``edge_source``,
+           ``first_seen``/``last_seen``) via :func:`reconcile_provenance`,
+           called BEFORE the ``ik_key`` if/elif chain below — the
+           keyless-onto-keyed arm reads the already-merged window into
+           ``adopt_reinforcements`` and needs the merged values, not the
+           pre-merge ones.  Case-1-adopt: if the existing edge has no
+           ``ik_key`` and the incoming ``relation.indexed_key`` is set, adopt
+           the key onto the existing edge (fold-only provenance
+           carry-through).  When the existing edge already carries an
+           ``ik_key`` and the incoming relation carries none, this is a
+           keyless re-observation of an already-keyed fact rather than an
+           adopt.  In both cases, when ``credit_adopt_reinforcement`` is
+           ``True``, the surviving key is recorded in
+           ``self.adopt_reinforcements`` for the fold's reinforcement-credit
+           pass.
         2. Same (subject, predicate) but different object — cardinality resolution
            when a model is present and ``resolve_contradictions=True``:
 
@@ -944,11 +1077,13 @@ class GraphMerger:
            no model call, no edge removal.
 
            Cardinality (COEXIST vs REPLACE axis) is cached per predicate.
-        3. New (subject, predicate, object) — net-new edge insertion.  The
+        3. New (subject, predicate, object) — net-new edge insertion, followed
+           by :func:`reconcile_provenance` (degenerates to an unconditional
+           stamp on the fresh edge — see that function's docstring).  The
            ``ik_key`` from ``relation.indexed_key`` is stamped on the edge when
            set (fold provenance; None at normal ingest — no-op).
         """
-        from paramem.memory.persistence import _EDGE_SOURCE_ATTR, _IK_KEY_ATTR
+        from paramem.memory.persistence import _IK_KEY_ATTR
 
         normalized_pred = canonical_id(relation.predicate)
 
@@ -960,8 +1095,8 @@ class GraphMerger:
         # `speaker0 has_sibling nadia`). Uses the structural is_speaker_id token
         # check rather than the node's speaker_id attribute: a speaker endpoint
         # that arrives without a matching Entity is node-created with no
-        # speaker_id attribute (see merge(), ~line 329), so the attribute lookup
-        # has a hole the token check closes.
+        # speaker_id attribute (the endpoint-ensure loop in merge()), so the
+        # attribute lookup has a hole the token check closes.
         any_speaker = is_speaker_id(subject) or is_speaker_id(obj)
         if relation.symmetric and subject > obj and not any_speaker:
             subject, obj = obj, subject
@@ -985,10 +1120,10 @@ class GraphMerger:
         if existing_key is not None:
             edge = self.graph[subject][obj][existing_key]
             edge["reinforcement_count"] = edge.get("reinforcement_count", 0) + 1
-            edge["last_seen"] = max(edge.get("last_seen", ""), relation.last_seen or timestamp)
-            edge["first_seen"] = min_nonempty(
-                edge.get("first_seen", ""), relation.first_seen or timestamp
-            )
+            # Reconcile provenance BEFORE the ik_key if/elif chain below: the
+            # keyless-onto-keyed arm reads edge["last_seen"]/edge["first_seen"]
+            # into adopt_reinforcements and needs the already-merged values.
+            reconcile_provenance(edge, relation, timestamp)
             edge["confidence"] = max(edge.get("confidence", 0), relation.confidence)
             sessions = edge.get("sessions", [])
             if session_id not in sessions:
@@ -1072,13 +1207,6 @@ class GraphMerger:
                     edge.get("last_seen", ""),
                     edge.get("first_seen", ""),
                 )
-            # First-non-empty-wins adopts for speaker_id and edge_source.
-            # Run unconditionally after the ik_key if/elif chain so they never
-            # disturb the elif's adopt-vs-reinforce accounting.
-            if relation.speaker_id and not edge.get("speaker_id"):
-                edge["speaker_id"] = relation.speaker_id
-            if relation.edge_source and not edge.get(_EDGE_SOURCE_ATTR):
-                edge[_EDGE_SOURCE_ATTR] = relation.edge_source
             return None
 
         # --- Case 2: Same-predicate, different-object cardinality resolution ---
@@ -1256,15 +1384,12 @@ class GraphMerger:
             reinforcement_count=1,
             sessions=_initial_sessions,
         )
-        self.graph[subject][obj][new_eid]["last_seen"] = relation.last_seen or timestamp
-        self.graph[subject][obj][new_eid]["first_seen"] = relation.first_seen or timestamp
+        edge = self.graph[subject][obj][new_eid]
+        # On a fresh edge every reconcile_provenance rule degenerates to an
+        # unconditional stamp from *relation* (see that function's docstring).
+        reconcile_provenance(edge, relation, timestamp)
         if relation.indexed_key:
-            self.graph[subject][obj][new_eid][_IK_KEY_ATTR] = relation.indexed_key
-        # Stamp speaker_id unconditionally (a net-new edge has no prior value)
-        # and stamp edge_source conditionally (only when the carry-slot is non-empty).
-        self.graph[subject][obj][new_eid]["speaker_id"] = relation.speaker_id
-        if relation.edge_source:
-            self.graph[subject][obj][new_eid][_EDGE_SOURCE_ATTR] = relation.edge_source
+            edge[_IK_KEY_ATTR] = relation.indexed_key
         return None
 
     def reset_graph(self) -> None:
@@ -1347,23 +1472,3 @@ class GraphMerger:
             self.graph.number_of_edges(),
         )
         return self.graph
-
-
-def _attr_value_is_empty(value) -> bool:
-    """True iff an entity-attribute value carries no information.
-
-    Treats the empty string, the literal placeholder strings ``"N/A"`` /
-    ``"n/a"`` / ``"None"`` / ``"null"`` (case-insensitive), and ``None``
-    as empty.  Used by the attribute-merge step so a non-empty value
-    captured in one chunk is never overwritten by an LLM-emitted
-    placeholder from another chunk that happened to lack the data.
-    """
-    if value is None:
-        return True
-    if isinstance(value, str):
-        stripped = value.strip()
-        if not stripped:
-            return True
-        if stripped.lower() in ("n/a", "none", "null", "unknown"):
-            return True
-    return False

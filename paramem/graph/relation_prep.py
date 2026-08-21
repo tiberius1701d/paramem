@@ -1,16 +1,20 @@
 """Format-neutral relation/entity preparation helpers.
 
-Partitions preference relations to the procedural adapter, and projects
-entity scalar attributes into relation triples.  No LLM.  Used by the
-indexed-key distillation path (``ConsolidationLoop._entries_from_graph``).
+Partitions preference relations to the procedural adapter, and projects a
+session graph's entity scalar attributes into attribute-typed relations. No
+LLM. Also hosts the two small helpers the attribute-projection surfaces
+share: :func:`attribute_value_is_empty` (what counts as no information) and
+:func:`strip_has_prefix` (the raw-predicate -> attribute-key reduction),
+both consumed here and by the merger's node-attribute gate.
 """
 
 from typing import TYPE_CHECKING
 
+from paramem.graph.schema import Relation
 from paramem.utils.identity import canonical
 
 if TYPE_CHECKING:
-    from paramem.graph.schema import Entity
+    from paramem.graph.schema import SessionGraph
 
 # Supplementary predicate set for procedural filtering.
 # Primary gate is relation_type == "preference"; this catches cases where
@@ -75,91 +79,156 @@ def partition_relations(
     return episodic, procedural
 
 
-def attr_predicate(key: str) -> str:
-    """The one predicate surface for a projected attribute fact: ``f"has {canonical(key)}"``.
+def attribute_value_is_empty(value) -> bool:
+    """True iff an entity-attribute value carries no information.
 
-    Shared by every surface that turns an attribute (subject, key, value)
-    pair into a trainable relation-dict predicate: :func:`_flatten_entity_attributes`
-    (the interim path, projecting ``Entity.attributes``) and
+    Treats the empty string, the literal placeholder strings ``"N/A"`` /
+    ``"n/a"`` / ``"None"`` / ``"null"`` / ``"unknown"`` (case-insensitive),
+    and ``None`` as empty. Shared by :func:`attribute_relations` and the
+    merger's node-attribute gate, so a non-empty value captured in one
+    chunk is never overwritten by an LLM-emitted placeholder from another
+    chunk that happened to lack the data.
+
+    Args:
+        value: The raw attribute value (any type; only ``str``/``None`` are
+            treated specially).
+
+    Returns:
+        ``True`` when *value* is ``None``, whitespace-only, or a recognised
+        placeholder string; ``False`` otherwise.
+    """
+    if value is None:
+        return True
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return True
+        if stripped.lower() in ("n/a", "none", "null", "unknown"):
+            return True
+    return False
+
+
+def strip_has_prefix(pred: str) -> str:
+    """Strip leading ``has_``/``has `` tokens from *pred* to a FIXED POINT.
+
+    Used to derive an attribute key from a raw relation predicate (e.g.
+    ``has_certification`` -> ``certification``) before that key is passed
+    through :func:`~paramem.utils.identity.canonical`. Recognises both the
+    underscore form (``"has_certification"``) and the space-separated form
+    (``"has certification"``), since this function runs on the RAW
+    predicate, before any canonicalization.
+
+    Strips repeatedly rather than once: the merger's attribute gate strips
+    one ``has`` to derive the node's attribute key, :func:`attr_predicate`
+    adds one back when that key is later read out as a predicate, and the
+    next fold's gate strips one again — gate, walk, gate. A single-strip
+    rule leaves a key that entered doubled (``"has_has_email"``) doubled
+    forever, because each round trip removes only one of the two prefixes
+    it carries. Stripping to a fixed point instead means every key shape
+    converges to its bare form in one pass, however many ``has`` tokens it
+    accumulated.
+
+    Args:
+        pred: Raw (uncanonicalized) relation predicate.
+
+    Returns:
+        *pred* with every leading ``has_``/``has `` token removed — e.g.
+        ``"has_has_email"`` -> ``"email"`` — or *pred* unchanged when it
+        carries neither prefix.
+    """
+    while True:
+        if pred.startswith("has_"):
+            pred = pred[len("has_") :]
+        elif pred.startswith("has "):
+            pred = pred[len("has ") :]
+        else:
+            return pred
+
+
+def attr_predicate(key: str) -> str:
+    """The one predicate surface for a projected attribute fact.
+
+    ``f"has {canonical(strip_has_prefix(key))}"`` — shared by every surface
+    that turns an attribute (subject, key, value) pair into a trainable
+    relation predicate: :func:`attribute_relations` (projecting
+    ``Entity.attributes`` at extraction time) and
     :meth:`~paramem.training.consolidation.ConsolidationLoop._build_working_keyed_walk`'s
-    node-attribute walk (the derivation path, projecting ``GraphMerger``
-    node ``attributes``). Both surfaces MUST derive the predicate through
-    this one function — a second inline copy of the formula is how the two
-    paths silently diverge (e.g. a node-attribute key copied verbatim from
-    ``Entity.attributes`` by ``GraphMerger._upsert_entity``, still carrying
-    an underscore, must be re-canonicalized here rather than glued as-is).
-    ``canonical()`` is idempotent, so calling this on an already-canonical
-    key (e.g. one the merger's attribute gate wrote) is a no-op.
+    node-attribute walk (projecting ``GraphMerger`` node ``attributes``).
+    Both surfaces MUST derive the predicate through this one function — a
+    second inline copy of the formula is how the two paths silently
+    diverge.
+
+    Idempotent under repeated ``has`` prefixes: ``"has_last_name"``,
+    ``"last name"``, ``"Last Name"`` and ``"has has last name"`` all yield
+    ``"has last name"``, because :func:`strip_has_prefix` reduces to a
+    fixed point before ``canonical()`` and ``"has "`` is prepended exactly
+    once. This closes the gate -> walk -> gate round trip described on
+    :func:`strip_has_prefix`: whatever shape a key arrives in, one pass
+    through this function produces the one canonical predicate surface.
 
     Args:
         key: Raw or already-canonical attribute key.
 
     Returns:
         ``"has "`` followed by the canonical (space-folded, case-folded)
-        form of *key* — the one project-wide identity surface, never a
-        mixed-separator glue.
+        form of *key* with every leading ``has`` token removed first — the
+        one project-wide identity surface, never a mixed-separator glue.
     """
-    return f"has {canonical(key)}"
+    return f"has {canonical(strip_has_prefix(key))}"
 
 
-def _flatten_entity_attributes(
-    entities: "list[Entity]",
-    *,
-    exclude_pairs: "set[tuple[str, str]] | None" = None,
-) -> list[dict]:
-    """Project ``Entity.attributes`` into the canonical relation-dict shape.
+def attribute_relations(graph: "SessionGraph", *, speaker_id: str) -> "list[Relation]":
+    """Project ``graph.entities[*].attributes`` into attribute-typed relations.
 
-    Internal projection used by
-    :meth:`paramem.training.consolidation.ConsolidationLoop._entries_from_graph`.
-    The graph's knowledge lives in two surfaces — relations and entity
-    attributes — and both must reach the indexed-key distillation stage.
-    This helper converts the attribute surface into the relation-dict shape,
-    so the distillation input is the union of "real" relations and
-    "projected" attributes.
+    One :class:`~paramem.graph.schema.Relation` per (entity, attribute key)
+    pair with a non-empty value: ``subject=entity.name``,
+    ``predicate=attr_predicate(key)``, ``object=str(value).strip()``,
+    ``relation_type="attribute"``, ``confidence=1.0``,
+    ``speaker_id=speaker_id``.
 
-    One projected relation is emitted per (entity, attribute_key) pair:
+    Skipped:
 
-        {
-            "subject": entity.name,
-            "predicate": "has <normalised_key>",
-            "object": str(attr_val),
-            "relation_type": "attribute",
-        }
+    - values failing :func:`attribute_value_is_empty`;
+    - pairs whose ``(canonical(subject), canonical(predicate))`` already
+      appears among ``graph.relations`` — an explicit ``has_<key>``
+      relation the extractor emitted directly takes precedence over the
+      projection of the same fact;
+    - pairs where ``canonical(entity.name) == canonical(value)`` — a
+      self-loop, mirroring the extractor's own subject/object self-loop
+      guard.
 
-    Predicate normalisation goes through :func:`attr_predicate` — the ONE
-    formula (``f"has {canonical(key)}"``) shared with
-    :meth:`~paramem.training.consolidation.ConsolidationLoop._build_working_keyed_walk`'s
-    node-attribute walk (the derivation path), so the two surfaces an
-    attribute fact can be trained under never diverge and share one
-    SimHash fingerprint.
+    Args:
+        graph: The session graph whose entities carry the attributes to
+            project. Not mutated.
+        speaker_id: The speaker to attribute every projected relation to —
+            the session's contributing speaker.
 
-    Pairs whose ``(subject, predicate)`` already appears in ``exclude_pairs``
-    are skipped — prevents duplicate keying when an explicit ``has_<key>``
-    relation was already extracted.  Pairs with ``None`` or whitespace-only
-    values are skipped.  Input entities are not mutated.
+    Returns:
+        A fresh list of :class:`~paramem.graph.schema.Relation` objects.
+        May be empty when no entity carries a projectable attribute.
     """
-    _exclude = exclude_pairs if exclude_pairs is not None else set()
-    result: list[dict] = []
-    for entity in entities:
+    existing_pairs = {(canonical(r.subject), canonical(r.predicate)) for r in graph.relations}
+    result: list[Relation] = []
+    for entity in graph.entities:
         if not entity.attributes:
             continue
         for raw_key, attr_val in entity.attributes.items():
-            # Skip empty values
-            if attr_val is None:
+            if attribute_value_is_empty(attr_val):
                 continue
             val_str = str(attr_val).strip()
-            if not val_str:
-                continue
             predicate = attr_predicate(raw_key)
-            pair = (entity.name, predicate)
-            if pair in _exclude:
+            if (canonical(entity.name), canonical(predicate)) in existing_pairs:
+                continue
+            if canonical(entity.name) == canonical(val_str):
                 continue
             result.append(
-                {
-                    "subject": entity.name,
-                    "predicate": predicate,
-                    "object": val_str,
-                    "relation_type": "attribute",
-                }
+                Relation(
+                    subject=entity.name,
+                    predicate=predicate,
+                    object=val_str,
+                    relation_type="attribute",
+                    confidence=1.0,
+                    speaker_id=speaker_id,
+                )
             )
     return result

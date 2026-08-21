@@ -818,6 +818,55 @@ class TestChainProductionParity:
         assert seen["loaded"] == "VARIANT BODY {transcript}"
 
 
+class TestRelationsFromSnapshot:
+    """Direct unit coverage for the shared snapshot-to-relations reader."""
+
+    def test_omits_speaker_id_key_when_edge_carries_none(self, tmp_path):
+        """An edge with no ``speaker_id`` (or an empty one) yields a dict
+        with no ``speaker_id`` key at all — not ``""`` — so a consumer's
+        ``.get("speaker_id", <placeholder>)`` default actually fires."""
+        snap = {
+            "nodes": [{"id": "Alex"}, {"id": "Acme"}, {"id": "Bo"}],
+            "links": [
+                {"source": "Alex", "target": "Acme", "predicate": "works_for"},
+                {
+                    "source": "Alex",
+                    "target": "Bo",
+                    "predicate": "knows",
+                    "speaker_id": "",
+                },
+            ],
+        }
+        snap_path = tmp_path / "graph_merged_snapshot.json"
+        snap_path.write_text(json.dumps(snap), encoding="utf-8")
+
+        relations = calibrate._relations_from_snapshot(str(snap_path))
+
+        assert len(relations) == 2
+        assert "speaker_id" not in relations[0]
+        assert "speaker_id" not in relations[1]
+
+    def test_emits_speaker_id_when_edge_carries_one(self, tmp_path):
+        """An edge that does carry a ``speaker_id`` still emits it verbatim."""
+        snap = {
+            "nodes": [{"id": "Alex"}, {"id": "Acme"}],
+            "links": [
+                {
+                    "source": "Alex",
+                    "target": "Acme",
+                    "predicate": "employed_by",
+                    "speaker_id": "speaker3",
+                },
+            ],
+        }
+        snap_path = tmp_path / "graph_merged_snapshot.json"
+        snap_path.write_text(json.dumps(snap), encoding="utf-8")
+
+        relations = calibrate._relations_from_snapshot(str(snap_path))
+
+        assert relations[0]["speaker_id"] == "speaker3"
+
+
 class TestCalibrateNormalize:
     """Tests for CalibrateNormalizeRequest validation and calibrate_normalize."""
 
@@ -878,6 +927,66 @@ class TestCalibrateNormalize:
         assert result["stage"] == "normalize"
         assert result["parsed"]["input_count"] == 2
         assert isinstance(result["raw_output"], str)
+
+    def test_snapshot_edge_with_no_speaker_gets_structural_placeholder(self, tmp_path):
+        """A snapshot edge carrying no ``speaker_id`` reaches the merger's
+        ``Relation`` construction through the dispatcher's structural
+        ``"speaker0"`` default — not an empty string baked in by the
+        reader. Mutation: reverting ``_relations_from_snapshot`` to always
+        emit ``speaker_id`` (even as ``""``) makes this fail, since ``""``
+        is present and skips the ``.get(..., "speaker0")`` default."""
+        snap = {
+            "nodes": [{"id": "Alex"}, {"id": "Acme"}],
+            "links": [
+                {"source": "Alex", "target": "Acme", "predicate": "works_for"},
+            ],
+        }
+        snap_path = tmp_path / "graph_merged_snapshot.json"
+        snap_path.write_text(json.dumps(snap), encoding="utf-8")
+
+        state = _state_enabled()
+        refiner = _stub_refiner()
+        state["consolidation_loop"].build_tier_refiner.return_value = refiner
+
+        with patch(
+            "paramem.graph.merger.GraphMerger.merge_relations",
+            return_value=None,
+        ) as mocked:
+            _run_normalize(state, CalibrateNormalizeRequest(snapshot_path=str(snap_path)))
+
+        relations_arg = mocked.call_args.args[0]
+        assert len(relations_arg) == 1
+        assert relations_arg[0].speaker_id == "speaker0"
+
+    def test_inline_relation_with_empty_speaker_gets_structural_placeholder(self):
+        """An inline relation carrying an explicit empty ``speaker_id`` must
+        still resolve to the dispatcher's structural ``"speaker0"``
+        default — the same placeholder the snapshot branch gets — since
+        normalization consults attribution nowhere."""
+        state = _state_enabled()
+        refiner = _stub_refiner()
+        state["consolidation_loop"].build_tier_refiner.return_value = refiner
+
+        req = CalibrateNormalizeRequest(
+            relations=[
+                {
+                    "subject": "Alex",
+                    "predicate": "works_for",
+                    "object": "Acme",
+                    "speaker_id": "",
+                }
+            ],
+        )
+
+        with patch(
+            "paramem.graph.merger.GraphMerger.merge_relations",
+            return_value=None,
+        ) as mocked:
+            _run_normalize(state, req)
+
+        relations_arg = mocked.call_args.args[0]
+        assert len(relations_arg) == 1
+        assert relations_arg[0].speaker_id == "speaker0"
 
     def test_runs_the_production_tier_pass(self):
         """The endpoint reaches the production pass through the loop's own

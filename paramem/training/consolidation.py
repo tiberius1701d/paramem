@@ -19,14 +19,11 @@ from paramem.cloud.admission import evaluate_cloud_egress
 from paramem.config.taxonomy import fallback_relation_type, relation_types
 from paramem.graph.extraction_pipeline import ExtractionConfig, ExtractionPipeline
 from paramem.graph.extractor import ExtractionFailed, local_parse_failure
-from paramem.graph.merger import GraphMerger, min_nonempty, node_display
+from paramem.graph.merger import GraphMerger, attribute_fact, min_nonempty, node_display
 from paramem.graph.phase_trace import ExtractionTrace, extraction_trace, phase_trace
-from paramem.graph.relation_prep import (
-    attr_predicate,
-    partition_relations,
-)
+from paramem.graph.relation_prep import partition_relations
 from paramem.graph.schema import Relation, SessionGraph
-from paramem.memory.bookkeeping import credit_reinforcement
+from paramem.memory.bookkeeping import bookkeeping_row, credit_reinforcement
 from paramem.memory.entry import (
     assign_keys,
     content_only_entry,
@@ -1283,14 +1280,15 @@ class ConsolidationLoop:
     ) -> tuple[list[dict], list[dict]]:
         """Build entry relation dicts from a session graph — no model call.
 
-        Projects relations and entity attributes into a unified relation-dict
-        set, then partitions it into episodic/procedural.  Each relation is
-        projected via :func:`_relation_to_entry_dict`, which canonicalizes
-        the predicate so interim-tier entries match the identity form the
-        merger stamps onto the cumulative edge.  The attribute surface
-        (``Entity.attributes``) is projected via
-        ``relation_prep._flatten_entity_attributes`` so scalar-PII keying
-        (email/phone/linkedin) is not silently dropped.
+        Partitions the session graph's relations into episodic/procedural.
+        Each relation is projected via :func:`_relation_to_entry_dict`, which
+        canonicalizes the predicate so interim-tier entries match the identity
+        form the merger stamps onto the cumulative edge.  Entity scalar
+        attributes are already present in ``session_graph.relations`` as
+        attribute-typed relations by the time this method runs —
+        :meth:`~paramem.graph.extraction_pipeline.ExtractionPipeline._run_extractor`
+        projects them via ``relation_prep.attribute_relations`` before the
+        graph is returned — so no separate projection step is needed here.
 
         Returns:
             ``(episodic_relations, procedural_relations)`` — both are lists of
@@ -1305,16 +1303,6 @@ class ConsolidationLoop:
         from paramem.graph import relation_prep
 
         relation_dicts = [_relation_to_entry_dict(r) for r in session_graph.relations]
-        exclude = {(r["subject"], r["predicate"]) for r in relation_dicts}
-        projected = relation_prep._flatten_entity_attributes(
-            session_graph.entities, exclude_pairs=exclude
-        )
-        if projected:
-            logger.info(
-                "Entry distillation: projected %d entity attribute(s) into relation set",
-                len(projected),
-            )
-        relation_dicts.extend(projected)
         return relation_prep.partition_relations(
             relation_dicts, procedural_enabled=procedural_enabled
         )
@@ -1498,7 +1486,21 @@ class ConsolidationLoop:
                         timestamp=event_time,
                     )
                     self._abort_on_local_parse_failure(trace, _mark)
-                    procedural_rels.extend(_relation_to_entry_dict(r) for r in proc_graph.relations)
+                    # Route the procedural extractor's own relations through the
+                    # same partition rule every other tier-set entry point uses
+                    # (_entries_from_graph above, the keyed walk below) — a
+                    # projected entity attribute the procedural extractor's
+                    # graph carries (e.g. an email address) has
+                    # relation_type="attribute" and routes procedural only when
+                    # its predicate matches _PROCEDURAL_PREDICATES; scalar PII
+                    # predicates route episodic, agreeing with the keyed walk's
+                    # decision for the same node record.
+                    _proc_dicts = [_relation_to_entry_dict(r) for r in proc_graph.relations]
+                    _pg_episodic, _pg_procedural = partition_relations(
+                        _proc_dicts, procedural_enabled=True
+                    )
+                    episodic_rels.extend(_pg_episodic)
+                    procedural_rels.extend(_pg_procedural)
                     # Merge proc_graph into the cumulative graph so its relations
                     # reach the unified keying surface (stage_event's working-copy
                     # keyed walk, _build_working_keyed_walk) at the next
@@ -2400,14 +2402,14 @@ class ConsolidationLoop:
 
         An attribute-typed fact (``relation_type == "attribute"``) never
         becomes an edge — :meth:`~paramem.graph.merger.GraphMerger.merge`
-        folds it onto the subject node's ``attributes`` dict instead — so an
-        edge-only walk would silently drop it at the reset this method exists
-        to protect against.  A second pass over ``merger.graph.nodes``
-        recovers it, reusing the same projection
-        :func:`~paramem.graph.relation_prep._flatten_entity_attributes` uses
-        for the interim distillation path
-        (:meth:`_entries_from_graph`), so the predicate/value shape the two
-        surfaces produce never diverges.
+        folds it onto the subject node's ``attributes`` dict instead, as a
+        provenance-bearing record — so an edge-only walk would silently drop
+        it at the reset this method exists to protect against.  A second
+        pass over ``merger.graph.nodes`` recovers it, reading each record
+        through :func:`~paramem.graph.merger.attribute_fact`, the one
+        node-record -> fact projection also used by
+        :meth:`_build_working_keyed_walk`, so the predicate/value/provenance
+        shape the two surfaces produce never diverges.
 
         Returns an empty list when the graph is absent, or has no edges and
         no node attributes; both ``None`` and ``[]`` are valid no-ops for
@@ -2418,12 +2420,23 @@ class ConsolidationLoop:
                 graph.  Each edge contributes exactly one :class:`Relation`
                 with:
 
+                - ``subject``/``object`` the endpoints' DISPLAY surfaces via
+                  :func:`~paramem.graph.merger.node_display` — re-merging this
+                  relation through :meth:`~paramem.graph.merger.GraphMerger.merge`
+                  folds the subject through ``canonical()`` for node identity
+                  (so a node-key subject would resolve to the same node
+                  anyway), but only the display surface is safe to feed back
+                  into the merger's first-seen-wins ``display_name`` write —
+                  the folded node key would otherwise become the node's
+                  display surface for the rest of its life;
                 - ``predicate`` taken from the edge ``"predicate"`` attribute
                   (edges with an empty predicate are skipped);
                 - ``relation_type`` validated against :data:`_VALID_RTYPES`,
                   falling back to :data:`_FALLBACK_RTYPE`;
-                - ``speaker_id`` inherited from the subject node's
-                  ``"speaker_id"`` attribute (empty string when absent);
+                - ``speaker_id`` the edge's own ``"speaker_id"`` attribute —
+                  every edge carries a non-empty one once it has crossed
+                  :meth:`~paramem.graph.merger.GraphMerger.merge`'s
+                  provenance rule, so no node fallback is read;
                 - ``session_ids`` from the edge ``"sessions"`` attribute;
                 - ``last_seen`` from the edge ``"last_seen"`` attribute (empty
                   string when absent).  Propagating the real ingest-time stamp
@@ -2440,23 +2453,25 @@ class ConsolidationLoop:
                   ``min_nonempty`` window-start logic sees the real earliest
                   assertion instead of losing it to a synthetic fold sentinel.
 
-                Each ``(node, attribute_key)`` pair with a non-empty value
-                contributes one further :class:`Relation` with:
+                Each node attribute record contributes one further
+                :class:`Relation`, via :func:`~paramem.graph.merger.attribute_fact`:
 
-                - ``subject`` the node id, ``predicate`` via
+                - ``subject`` the node's DISPLAY surface, ``predicate`` via
                   :func:`~paramem.graph.relation_prep.attr_predicate`,
-                  ``object`` the attribute value, ``relation_type="attribute"``;
-                - ``speaker_id`` from the node's own ``"speaker_id"`` attribute
-                  (empty string when absent) — a node attribute has no edge to
-                  carry a per-fact override;
-                - ``session_ids`` from the node's ``"sessions"`` attribute;
-                - ``last_seen`` / ``first_seen`` empty — no per-attribute
-                  timestamp exists on a graph node.
+                  ``object`` the record's ``value``, ``relation_type="attribute"``;
+                - ``speaker_id``/``first_seen``/``last_seen`` from the record
+                  itself — a node attribute now carries its own provenance,
+                  written by the merger's attribute gate;
+                - ``session_ids`` from the node's ``"sessions"`` attribute.
+
+                A pair already emitted by the edge walk is excluded from the
+                attribute pass under canonical comparison (``canonical(subject)``,
+                ``canonical(predicate)``) — the edge arm supplies display
+                surfaces and the attribute arm now does too, but comparing
+                canonically keeps the exclusion correct regardless of which
+                surface either arm happens to carry.
         """
         import networkx as _nx
-
-        from paramem.graph import relation_prep
-        from paramem.graph.schema import Entity
 
         _g = getattr(self.merger, "graph", None)
         if not isinstance(_g, _nx.MultiDiGraph):
@@ -2468,19 +2483,16 @@ class ConsolidationLoop:
                 continue
             _er_rt_raw = _er_data.get("relation_type", _FALLBACK_RTYPE)
             _er_rt: str = _er_rt_raw if _er_rt_raw in _VALID_RTYPES else _FALLBACK_RTYPE
-            _er_subj_node = _g.nodes.get(_er_subj, {})
-            # Prefer edge-carried speaker_id (the merger stamps it on a net-new
-            # edge and adopts it onto a keyless one), and fall back to the subject
-            # node's speaker_id when the edge carries none.
-            _er_spk = _er_data.get("speaker_id") or _er_subj_node.get("speaker_id", "")
+            _er_subj_display = node_display(_g.nodes.get(_er_subj, {}), _er_subj)
+            _er_obj_display = node_display(_g.nodes.get(_er_obj, {}), _er_obj)
             _result.append(
                 Relation(
-                    subject=_er_subj,
+                    subject=_er_subj_display,
                     predicate=_er_pred,
-                    object=_er_obj,
+                    object=_er_obj_display,
                     relation_type=_er_rt,  # type: ignore[arg-type]
                     confidence=_er_data.get("confidence", 1.0),
-                    speaker_id=_er_spk,
+                    speaker_id=_er_data["speaker_id"],
                     session_ids=list(_er_data.get("sessions", [])),
                     last_seen=_er_data.get("last_seen", ""),
                     first_seen=_er_data.get("first_seen", ""),
@@ -2489,38 +2501,28 @@ class ConsolidationLoop:
 
         # Attribute-typed facts: never edges, so a second pass over node
         # attributes is the only way to recover them before the reset.
-        _exclude_pairs = {(r.subject, r.predicate) for r in _result}
-        _attr_entities: "list[Entity]" = []
+        _exclude_pairs = {(canonical(r.subject), canonical(r.predicate)) for r in _result}
         for _node_id, _node_data in _g.nodes(data=True):
             _node_attrs = _node_data.get("attributes") or {}
             if not _node_attrs:
                 continue
-            _attr_entities.append(
-                Entity(
-                    name=_node_id,
-                    entity_type=_node_data.get("entity_type", "concept"),
-                    attributes=_node_attrs,
+            for _attr_key, _record in _node_attrs.items():
+                _fact = attribute_fact(_node_data, _node_id, _attr_key, _record)
+                if (canonical(_fact["subject"]), canonical(_fact["predicate"])) in _exclude_pairs:
+                    continue
+                _result.append(
+                    Relation(
+                        subject=_fact["subject"],
+                        predicate=_fact["predicate"],
+                        object=_fact["object"],
+                        relation_type="attribute",
+                        confidence=1.0,
+                        speaker_id=_fact["speaker_id"],
+                        session_ids=list(_node_data.get("sessions", [])),
+                        last_seen=_fact["last_seen"],
+                        first_seen=_fact["first_seen"],
+                    )
                 )
-            )
-        _projected = relation_prep._flatten_entity_attributes(
-            _attr_entities, exclude_pairs=_exclude_pairs
-        )
-        for _proj in _projected:
-            _attr_subj = _proj["subject"]
-            _attr_node = _g.nodes.get(_attr_subj, {})
-            _result.append(
-                Relation(
-                    subject=_attr_subj,
-                    predicate=_proj["predicate"],
-                    object=_proj["object"],
-                    relation_type=_proj["relation_type"],  # type: ignore[arg-type]
-                    confidence=1.0,
-                    speaker_id=_attr_node.get("speaker_id", "") or "",
-                    session_ids=list(_attr_node.get("sessions", [])),
-                    last_seen="",
-                    first_seen="",
-                )
-            )
         return _result
 
     def _split_pending_relations(
@@ -2989,44 +2991,6 @@ class ConsolidationLoop:
             "aborted": build_summary["aborted"],
             "tier_bindings": build_summary["tier_bindings"],
         }
-
-    def _unique_speaker_predecessor(self, node: str) -> str:
-        """Return the single non-empty ``speaker_id`` among *node*'s direct
-        (1-hop) graph predecessors, or ``""`` when there is not exactly one.
-
-        Reads ``self.merger.graph``.  Only DIRECT predecessors (in-edge source
-        nodes) are considered; the walk is 1-hop, never transitive — a
-        predecessor that itself carries no ``speaker_id`` contributes nothing
-        and does NOT propagate a chain.  Authoritative-graph-state signal: a
-        predecessor whose own node attribute ``speaker_id`` is non-empty.  No
-        static predicate map is consulted.
-
-        Used ONLY by the keyless-branch terminal fallback in
-        :meth:`_build_working_keyed_walk`, and ONLY when the subject node
-        has no ``speaker_id`` of its own — fills gaps, never overwrites.
-
-        Exactly one distinct non-empty speaker predecessor → return that
-        ``speaker_id``.  Zero predecessors, all predecessors have empty
-        ``speaker_id``, or ≥2 distinct non-empty speaker predecessors →
-        return ``""`` (ambiguous or unattributed — never mis-attribute across
-        speakers).
-
-        Args:
-            node: Canonical node key in ``self.merger.graph``.
-
-        Returns:
-            A non-empty ``speaker_id`` string when exactly one distinct speaker
-            predecessor exists; ``""`` otherwise.
-        """
-        g = self.merger.graph
-        if node not in g:
-            return ""
-        speakers = {
-            sid
-            for pred in g.predecessors(node)
-            if (sid := (g.nodes[pred].get("speaker_id", "") or ""))
-        }
-        return next(iter(speakers)) if len(speakers) == 1 else ""
 
     def build_tier_refiner(self, merger) -> "graph_tier.GraphTierRefiner":
         """Construct a graph-tier refiner over *merger* with this loop's config.
@@ -4023,11 +3987,19 @@ class ConsolidationLoop:
 
         A second pass after the edge walk covers node ``attributes``
         (``Entity.attributes`` — phone/email/date/job-title style facts,
-        invisible to an edge iteration): a keyed attribute is an
+        invisible to an edge iteration).  Each entry under
+        ``node["attributes"]`` is a provenance-bearing record
+        (``{value, speaker_id, first_seen, last_seen, edge_source?,
+        ik_key?}``, written by :meth:`~paramem.graph.merger.GraphMerger.merge`'s
+        attribute gate); this pass reads it through
+        :func:`~paramem.graph.merger.attribute_fact`, the one node-record ->
+        fact projection also used by :meth:`_capture_pending_relations`. A
+        keyed attribute (the record carries an ``ik_key``) is an
         anti-forgetting replay sourced from its owning working tier, handled
         by the same rebuilt/route/drop rule as a keyed edge; a keyless
-        attribute mints a new key on the emitting node's working tier,
-        exactly like a keyless edge.
+        attribute mints a new key — carrying the record's own ``speaker_id``
+        and window, via :func:`~paramem.memory.bookkeeping.bookkeeping_row` —
+        on the emitting node's working tier, exactly like a keyless edge.
 
         Cross-representation dedup: subject and predicate together are an
         attribute's full identity (one value per predicate per node), so
@@ -4073,7 +4045,6 @@ class ConsolidationLoop:
                 a designed-impossible state, not a skip.
         """
         from paramem.memory.interim_adapter import interim_stamp_from_name
-        from paramem.memory.persistence import _EDGE_SOURCE_ATTR
         from paramem.memory.persistence import _IK_KEY_ATTR as _IK_ATTR
 
         rebuilt_tiers = [t for t, wt in working.items() if wt.rebuilt]
@@ -4123,19 +4094,7 @@ class ConsolidationLoop:
                 rt: str = rt_raw if rt_raw in _VALID_RTYPES else _FALLBACK_RTYPE
                 subj_display = node_display(self.merger.graph.nodes[subj_node], subj_node)
                 obj_display = node_display(self.merger.graph.nodes[obj_node], obj_node)
-                edge_sid = data.get("speaker_id", None)
-                if edge_sid:
-                    subj_sid = edge_sid
-                else:
-                    node_attrs = self.merger.graph.nodes.get(subj_node, {}) or {}
-                    subj_sid = node_attrs.get("speaker_id", "") or ""
-                    if not subj_sid and data.get(_EDGE_SOURCE_ATTR) == "graph_enrichment":
-                        # FALLBACK-ONLY (enrichment edges only): subject node
-                        # carries no speaker_id and this edge is a
-                        # cloud-enrichment edge.  Inherit from the subject's
-                        # unique non-empty speaker predecessor (1-hop, direct
-                        # in-edges); ambiguous or absent stays "".
-                        subj_sid = self._unique_speaker_predecessor(subj_node)
+                subj_sid = data["speaker_id"]
 
                 dummy = [
                     {
@@ -4190,15 +4149,15 @@ class ConsolidationLoop:
                 wt.registry.add(minted_key)
                 wt.registry.set_simhash(minted_key, entry_simhash(minted))
                 wt.entries[minted_key] = content_only_entry(minted)
-                wt.rows[minted_key] = {
-                    "speaker_id": subj_sid,
-                    "relation_type": rt,
-                    "reinforcement_count": 1,
-                    "last_reinforced_cycle": self.cycle_count,
-                    "last_seen": data.get("last_seen", ""),
-                    "first_seen": data.get("first_seen", ""),
-                    "promoted": False,
-                }
+                wt.rows[minted_key] = bookkeeping_row(
+                    minted_key,
+                    speaker_id=subj_sid,
+                    relation_type=rt,
+                    first_seen=data.get("first_seen", ""),
+                    promoted=False,
+                    last_reinforced_cycle=self.cycle_count,
+                    last_seen=data.get("last_seen", ""),
+                )
                 wt.dirty = True
                 tier_keyed[tier].append(
                     {
@@ -4252,11 +4211,10 @@ class ConsolidationLoop:
             node_attrs = node_data.get("attributes", {}) or {}
             if not node_attrs:
                 continue
-            node_attr_keys = node_data.get("attribute_keys", {}) or {}
-            node_subj_display = node_display(node_data, node)
-            for attr_key, attr_value in node_attrs.items():
-                attr_pred = attr_predicate(attr_key)
-                attr_key_id = node_attr_keys.get(attr_key)
+            for attr_key, record in node_attrs.items():
+                fact = attribute_fact(node_data, node, attr_key, record)
+                attr_pred = fact["predicate"]
+                attr_key_id = fact["ik_key"]
 
                 survivor_key = emitted_pairs.get((node, attr_pred))
                 if survivor_key is not None:
@@ -4312,12 +4270,12 @@ class ConsolidationLoop:
                     )
                 else:
                     rt = "attribute"
-                    subj_sid = node_data.get("speaker_id", "") or ""
+                    subj_sid = fact["speaker_id"]
                     dummy = [
                         {
-                            "subject": node_subj_display,
+                            "subject": fact["subject"],
                             "predicate": attr_pred,
-                            "object": attr_value,
+                            "object": fact["object"],
                             "relation_type": rt,
                         }
                     ]
@@ -4342,9 +4300,9 @@ class ConsolidationLoop:
                     minted = self._mint_keyed_entries(
                         [
                             {
-                                "subject": node_subj_display,
+                                "subject": fact["subject"],
                                 "predicate": attr_pred,
-                                "object": attr_value,
+                                "object": fact["object"],
                                 "relation_type": rt,
                                 "speaker_id": subj_sid,
                             }
@@ -4366,15 +4324,15 @@ class ConsolidationLoop:
                     wt.registry.add(minted_key)
                     wt.registry.set_simhash(minted_key, entry_simhash(minted))
                     wt.entries[minted_key] = content_only_entry(minted)
-                    wt.rows[minted_key] = {
-                        "speaker_id": subj_sid,
-                        "relation_type": rt,
-                        "reinforcement_count": 1,
-                        "last_reinforced_cycle": self.cycle_count,
-                        "last_seen": "",
-                        "first_seen": "",
-                        "promoted": False,
-                    }
+                    wt.rows[minted_key] = bookkeeping_row(
+                        minted_key,
+                        speaker_id=subj_sid,
+                        relation_type=rt,
+                        first_seen=fact["first_seen"],
+                        promoted=False,
+                        last_reinforced_cycle=self.cycle_count,
+                        last_seen=fact["last_seen"],
+                    )
                     wt.dirty = True
                     tier_keyed[tier].append(
                         {

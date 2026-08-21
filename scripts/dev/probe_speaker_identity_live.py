@@ -432,7 +432,6 @@ def run_gpu_render_resolution(out_dir: Path) -> dict:
             relation_type="factual",
             first_seen=datetime.now(timezone.utc).isoformat(),
             promoted=False,
-            allow_empty_speaker=False,
         )
         probe_a = mem_store.probe_cache({"episodic": [entry_a["key"]]})
         hit_a = probe_a.get(entry_a["key"])
@@ -445,7 +444,6 @@ def run_gpu_render_resolution(out_dir: Path) -> dict:
             relation_type="social",
             first_seen=datetime.now(timezone.utc).isoformat(),
             promoted=False,
-            allow_empty_speaker=False,
         )
         probe_b = mem_store.probe_cache({"episodic": [entry_b["key"]]})
         hit_b = probe_b.get(entry_b["key"])
@@ -499,15 +497,15 @@ def run_gpu_render_resolution(out_dir: Path) -> dict:
         # speaker field and has no resolver kwarg; resolve_speaker_tokens is
         # applied afterward).
         mem_store.put("episodic", entry_anon["key"], entry_anon)
-        # allow_empty_speaker=True: anonymous speakers have a valid token but
-        # no meaningful speaker_id restriction for this probe.
+        # anon_id is a valid speaker_id (SpeakerStore.register_anonymous
+        # returns a real speakerN token) — bookkeeping attributes this key
+        # to the anonymous speaker itself, same as any other key.
         mem_store.set_bookkeeping(
             entry_anon["key"],
-            speaker_id="",
+            speaker_id=anon_id,
             relation_type="factual",
             first_seen=datetime.now(timezone.utc).isoformat(),
             promoted=False,
-            allow_empty_speaker=True,
         )
         probe_anon = mem_store.probe_cache({"episodic": [entry_anon["key"]]})
         hit_anon = probe_anon.get(entry_anon["key"])

@@ -218,6 +218,110 @@ class TestExtractionPathParity:
         assert all(qa["predicate"] != "prefers" for qa in episodic)
         assert {rel["predicate"] for rel in procedural} == {"prefers", "listens to"}
 
+    def test_procedural_extractor_attribute_projection_routes_by_predicate(
+        self, monkeypatch, tmp_path
+    ):
+        """U7.1: an entity attribute the PROCEDURAL extractor's own graph
+        carries is projected into an attribute-typed relation
+        (ExtractionPipeline._run_extractor's attribute_relations call) and
+        THEN routed through the same partition_relations call the
+        procedural extend site applies -- exactly what the fold's keyed
+        walk decides for the same node record. A scalar-PII predicate
+        ('has email') must never reach the procedural set; a
+        procedural-predicate attribute ('has hobby') must never stay
+        episodic.
+
+        Mutation this catches: reverting the procedural extend site to its
+        pre-U7.1 unfiltered ``procedural_rels.extend(...)`` -- both
+        predicates would land in procedural, and the first assertion below
+        would fail.
+        """
+        from paramem.graph.schema import Entity, Relation, SessionGraph
+
+        session_graph = SessionGraph(
+            session_id="s001",
+            timestamp="2026-01-01T00:00:00Z",
+            entities=[Entity(name="Alex", entity_type="person")],
+            relations=[
+                Relation(
+                    subject="Alex",
+                    predicate="lives_in",
+                    object="Millfield",
+                    relation_type="factual",
+                    speaker_id="speaker0",
+                ),
+            ],
+        )
+        procedural_graph = SessionGraph(
+            session_id="s001",
+            timestamp="2026-01-01T00:00:00Z",
+            entities=[
+                Entity(
+                    name="Alex",
+                    entity_type="person",
+                    attributes={"hobby": "chess", "email": "alex@example.com"},
+                )
+            ],
+            relations=[],
+        )
+
+        loop = self._build_loop(
+            monkeypatch,
+            tmp_path,
+            procedural_enabled=True,
+            extract_graph_spy=lambda *a, **kw: session_graph,
+            extract_procedural_spy=lambda *a, **kw: procedural_graph,
+        )
+        episodic, procedural = self._run_extract_session(loop)
+
+        assert any(r["predicate"] == "has email" for r in episodic)
+        assert all(r["predicate"] != "has email" for r in procedural), (
+            "scalar PII must never land in the procedural tier set"
+        )
+        assert any(r["predicate"] == "has hobby" for r in procedural)
+        assert all(r["predicate"] != "has hobby" for r in episodic)
+
+    def test_procedural_projected_attribute_reemission_collapses_under_dedup_episodic(
+        self, monkeypatch, tmp_path
+    ):
+        """The same attribute, surfaced by BOTH the primary session graph's
+        own projection and the procedural extractor's separate projection,
+        collapses to one entry under dedup_episodic rather than training
+        twice."""
+        from paramem.graph.schema import Entity, SessionGraph
+
+        session_graph = SessionGraph(
+            session_id="s001",
+            timestamp="2026-01-01T00:00:00Z",
+            entities=[
+                Entity(name="Alex", entity_type="person", attributes={"email": "alex@example.com"})
+            ],
+            relations=[],
+        )
+        procedural_graph = SessionGraph(
+            session_id="s001",
+            timestamp="2026-01-01T00:00:00Z",
+            entities=[
+                Entity(name="Alex", entity_type="person", attributes={"email": "alex@example.com"})
+            ],
+            relations=[],
+        )
+
+        loop = self._build_loop(
+            monkeypatch,
+            tmp_path,
+            procedural_enabled=True,
+            extract_graph_spy=lambda *a, **kw: session_graph,
+            extract_procedural_spy=lambda *a, **kw: procedural_graph,
+        )
+        episodic, _procedural = self._run_extract_session(loop)
+
+        email_entries = [r for r in episodic if r["predicate"] == "has email"]
+        assert len(email_entries) == 1, (
+            "the same email attribute surfaced by both extractors must collapse "
+            "to one entry under dedup_episodic, not train twice"
+        )
+
     @pytest.mark.parametrize("source_type", ["transcript", "document"])
     @pytest.mark.parametrize(
         "procedural_enabled,loop_overrides",
@@ -732,7 +836,6 @@ class TestTakePendingRelationsGraphLifetime:
         fully reset -- zero edges, an empty removal ledger, and an empty
         adopt-reinforcements map (``reset_graph``'s documented contract)."""
         loop = self._make_bare_loop(tmp_path)
-        loop.merger.graph.add_node("alex", speaker_id="speaker0")
         loop.merger.graph.add_edge(
             "alex",
             "berlin",
@@ -740,6 +843,7 @@ class TestTakePendingRelationsGraphLifetime:
             relation_type="factual",
             confidence=1.0,
             sessions=["s1"],
+            speaker_id="speaker0",
         )
         loop.merger.removal_ledger["stray_key"] = {"reason": "dedup"}
         loop.merger.adopt_reinforcements["stray_key_2"] = 1
@@ -750,43 +854,6 @@ class TestTakePendingRelationsGraphLifetime:
         assert loop.merger.graph.number_of_edges() == 0
         assert loop.merger.removal_ledger == {}
         assert loop.merger.adopt_reinforcements == {}
-
-    def test_captured_product_carries_edge_and_attribute_relations_with_timestamps(
-        self, tmp_path
-    ) -> None:
-        """the captured product carries both edge-derived and
-        node-attribute-derived relations, and preserves last_seen/first_seen
-        off the edge."""
-        loop = self._make_bare_loop(tmp_path)
-        loop.merger.graph.add_node(
-            "alex",
-            speaker_id="speaker0",
-            attributes={"favorite color": "blue"},
-            sessions=["s1"],
-        )
-        loop.merger.graph.add_edge(
-            "alex",
-            "berlin",
-            predicate="lives in",
-            relation_type="factual",
-            confidence=1.0,
-            sessions=["s1"],
-            last_seen="2026-01-02T00:00:00Z",
-            first_seen="2026-01-01T00:00:00Z",
-        )
-
-        pending = loop.take_pending_relations()
-        all_rels = pending.episodic + pending.procedural
-
-        edge_rel = next(r for r in all_rels if r.relation_type == "factual")
-        assert edge_rel.subject == "alex"
-        assert edge_rel.object == "berlin"
-        assert edge_rel.last_seen == "2026-01-02T00:00:00Z"
-        assert edge_rel.first_seen == "2026-01-01T00:00:00Z"
-
-        attr_rel = next(r for r in all_rels if r.relation_type == "attribute")
-        assert attr_rel.subject == "alex"
-        assert attr_rel.object == "blue"
 
     def test_two_consecutive_takes_are_independent(self, tmp_path) -> None:
         """Two consecutive ``take_pending_relations`` calls -- as a
@@ -799,7 +866,12 @@ class TestTakePendingRelationsGraphLifetime:
 
         # Probe batch: one relation about berlin.
         loop.merger.graph.add_edge(
-            "alex", "berlin", predicate="lives in", relation_type="factual", sessions=["probe"]
+            "alex",
+            "berlin",
+            predicate="lives in",
+            relation_type="factual",
+            sessions=["probe"],
+            speaker_id="speaker0",
         )
         probe_take = loop.take_pending_relations()
         assert probe_take.is_empty() is False
@@ -811,7 +883,12 @@ class TestTakePendingRelationsGraphLifetime:
 
         # The fold's own DIFFERENT relation, merged after the probe's take.
         loop.merger.graph.add_edge(
-            "alex", "munich", predicate="visited", relation_type="factual", sessions=["fold"]
+            "alex",
+            "munich",
+            predicate="visited",
+            relation_type="factual",
+            sessions=["fold"],
+            speaker_id="speaker0",
         )
         fold_take = loop.take_pending_relations()
         fold_objects = {r.object for r in fold_take.episodic}
@@ -2055,6 +2132,146 @@ class TestConsolidationLoopRelease:
         loop = self._make_loop_with_mock_merger()
         loop.release()
         loop.release()  # must not raise
+
+
+class TestCapturePendingRelations:
+    """ConsolidationLoop._capture_pending_relations -- snapshots
+    merger.graph edges AND node attributes into a list[Relation] before the
+    extraction boundary resets the graph.  Only ``self.merger`` is touched,
+    so a minimal loop needs no store/config wiring."""
+
+    @staticmethod
+    def _make_loop() -> "ConsolidationLoop":
+        from paramem.graph.merger import GraphMerger
+
+        loop = object.__new__(ConsolidationLoop)
+        loop.merger = GraphMerger()
+        return loop
+
+    def test_attribute_only_graph_captures_record_provenance_and_display_subject(self):
+        """An attribute record's own speaker/window/value round-trip into
+        the captured Relation, with the node's DISPLAY surface as subject
+        and attr_predicate's rendering as predicate -- not the node key,
+        not a synthetic window."""
+        loop = self._make_loop()
+        loop.merger.graph.add_node(
+            "alex morgan",
+            display_name="Alex Morgan",
+            attributes={
+                "email": {
+                    "value": "alex@example.com",
+                    "speaker_id": "speaker2",
+                    "first_seen": "2026-01-01T00:00:00Z",
+                    "last_seen": "2026-02-01T00:00:00Z",
+                }
+            },
+            sessions=["s1", "s2"],
+        )
+
+        result = loop._capture_pending_relations()
+
+        assert len(result) == 1
+        rel = result[0]
+        assert rel.subject == "Alex Morgan"
+        assert rel.predicate == "has email"
+        assert rel.object == "alex@example.com"
+        assert rel.relation_type == "attribute"
+        assert rel.confidence == 1.0
+        assert rel.speaker_id == "speaker2"
+        assert rel.first_seen == "2026-01-01T00:00:00Z"
+        assert rel.last_seen == "2026-02-01T00:00:00Z"
+        assert sorted(rel.session_ids) == ["s1", "s2"]
+
+    def test_no_edges_no_attributes_returns_empty_list(self):
+        loop = self._make_loop()
+        assert loop._capture_pending_relations() == []
+
+    def test_no_merger_graph_returns_empty_list(self):
+        """merger.graph absent (or not a MultiDiGraph) is a no-op, not a
+        crash -- callers treat the result as a valid empty batch."""
+        loop = object.__new__(ConsolidationLoop)
+
+        class _NoGraph:
+            pass
+
+        loop.merger = _NoGraph()
+        assert loop._capture_pending_relations() == []
+
+    def test_fact_present_as_both_edge_and_attribute_excludes_the_attribute(self):
+        """Cross-representation dedup under canonical comparison: a fact
+        the edge walk already emitted for (subject, predicate) is never
+        re-emitted by the attribute pass for the same node."""
+        loop = self._make_loop()
+        g = loop.merger.graph
+        g.add_node(
+            "alex",
+            display_name="Alex",
+            attributes={
+                "email": {
+                    "value": "a@b.com",
+                    "speaker_id": "speaker0",
+                    "first_seen": "",
+                    "last_seen": "",
+                }
+            },
+        )
+        g.add_node("b", display_name="a@b.com")
+        g.add_edge(
+            "alex",
+            "b",
+            predicate="has email",
+            relation_type="attribute",
+            speaker_id="speaker0",
+            confidence=1.0,
+        )
+
+        result = loop._capture_pending_relations()
+
+        assert len(result) == 1, (
+            "the attribute arm must be excluded once the edge arm already "
+            "emitted the same (subject, predicate) pair"
+        )
+        assert result[0].object == "a@b.com"
+        assert result[0].relation_type == "attribute"
+
+    def test_edge_arm_emits_display_surface_on_both_endpoints_and_round_trips_display_name(self):
+        """The edge arm's subject/object are DISPLAY surfaces, never node
+        keys -- feeding the folded node key back into a fresh merge would
+        install it as the node's display_name for the rest of its life."""
+        from paramem.graph.merger import GraphMerger
+
+        loop = self._make_loop()
+        g = loop.merger.graph
+        g.add_node("alex morgan", display_name="Alex Morgan")
+        g.add_node("berlin", display_name="Berlin")
+        g.add_edge(
+            "alex morgan",
+            "berlin",
+            predicate="lives in",
+            relation_type="factual",
+            speaker_id="speaker0",
+            confidence=1.0,
+            first_seen="2026-01-01T00:00:00Z",
+            last_seen="2026-01-01T00:00:00Z",
+            sessions=["s1"],
+        )
+
+        result = loop._capture_pending_relations()
+
+        assert len(result) == 1
+        rel = result[0]
+        assert rel.subject == "Alex Morgan"
+        assert rel.object == "Berlin"
+        assert rel.last_seen == "2026-01-01T00:00:00Z"
+        assert rel.first_seen == "2026-01-01T00:00:00Z"
+        assert rel.session_ids == ["s1"]
+
+        fresh = GraphMerger()
+        fresh.merge_relations(result, session_id="s2", log_label="captured pending")
+        assert fresh.graph.nodes["alex morgan"]["display_name"] == "Alex Morgan", (
+            "a node-key subject would install the folded key as display_name instead"
+        )
+        assert fresh.graph.nodes["berlin"]["display_name"] == "Berlin"
 
 
 class TestSeedKeyMetadata:
