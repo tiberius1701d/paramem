@@ -12,9 +12,9 @@ frozen :class:`~paramem.training.consolidation.FoldScope`.
 
 These tests seed two identical tmp trees (same tier keys, same facts, same
 bookkeeping) and drive ``loop.consolidate(mode=...)`` on each, both with
-``consume_pending=False`` — ``consolidate(mode="simulate")`` raises on
-``consume_pending=True`` (no weight venue to train pending sessions into), so
-venue parity is defined over the shared reconcile-shaped spine only.  Assert
+``pending=None`` — ``consolidate(mode="simulate")`` raises when *pending* is
+not ``None`` (no weight venue to train pending sessions into), so venue
+parity is defined over the shared reconcile-shaped spine only.  Assert
 convergence of everything mode-independent: per-key store cache contents,
 SimHash registry fingerprints, per-tier ``indexed_key_registry`` rows,
 promotion/bookkeeping state, and the venue-labelled outcome classification
@@ -152,8 +152,8 @@ class TestConsolidateVenueParity:
             "paramem.memory.probe.probe_keys_grouped_by_adapter", _fake_weight_probe
         )
 
-        train_result = train_loop.consolidate(mode="train", consume_pending=False)
-        sim_result = sim_loop.consolidate(mode="simulate", consume_pending=False)
+        train_result = train_loop.consolidate(mode="train", pending=None)
+        sim_result = sim_loop.consolidate(mode="simulate", pending=None)
 
         # Both events ran to completion, with nothing aborted, and rebuilt
         # the same tier set.
@@ -230,8 +230,10 @@ class TestConsolidateModeGuard:
     """``consolidate``'s one documented raise — pinned separately from the
     convergence pin above since it never reaches the shared spine at all."""
 
-    def test_simulate_mode_rejects_consume_pending(self, tmp_path):
+    def test_simulate_mode_rejects_pending(self, tmp_path):
+        from paramem.training.consolidation import PendingRelations
+
         loop = _make_loop(tmp_path)
 
-        with pytest.raises(ValueError, match="consume_pending"):
-            loop.consolidate(mode="simulate", consume_pending=True)
+        with pytest.raises(ValueError, match="pending"):
+            loop.consolidate(mode="simulate", pending=PendingRelations(episodic=[], procedural=[]))

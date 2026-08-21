@@ -27,7 +27,6 @@ Consumers: ``tests/adapters/test_slot.py``, ``tests/backup/test_bundle_boot_bind
 ``tests/server/test_erase_doors.py``, ``tests/server/test_gates.py``,
 ``tests/server/test_migration_renderer.py``, ``tests/server/test_startup_validator.py``,
 ``tests/server/test_store_quarantine.py``,
-``tests/server/test_voice_profile_consolidation_paths.py``,
 ``tests/test_boot_binding_integration.py``, ``tests/test_fold_phase1.py``,
 ``tests/test_memory_store.py``, ``tests/test_procedural.py``,
 ``tests/test_publish_bundle_resume.py``, ``tests/test_simulate_train_parity.py``,
@@ -389,7 +388,7 @@ class _SpyEntries(dict):
 def _make_state(loop, *, tmp_path) -> dict:
     """Minimal ``app._state`` for a synchronous, in-process
     ``_run_pending_event_resume()`` call: no event loop (so
-    ``_dispatch_finalize`` runs its closure inline) and no model/tokenizer
+    ``_consolidation_terminal`` runs its closure inline) and no model/tokenizer
     (so ``_revalidate_adapter_manifests`` no-ops rather than reaching for a
     real PEFT model)."""
     config = MagicMock()

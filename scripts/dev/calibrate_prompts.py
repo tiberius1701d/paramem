@@ -50,6 +50,7 @@ import datetime as _dt
 import json
 import re
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -67,7 +68,7 @@ from paramem.graph.document_chunker import (  # noqa: E402
     chunk_text_file,
 )
 from paramem.server.session_buffer import SessionBuffer  # noqa: E402
-from paramem.utils.artifacts import write_artifact  # noqa: E402
+from paramem.utils.artifacts import artifact_run_dir, run_stamp, write_artifact  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Input loading
@@ -156,8 +157,8 @@ def _load_run(index_dir: Path, chunk_idx: int) -> dict | None:
 
     The client keeps an index of which run covered which chunk
     (``runs.json``); the run itself is the artifact the server wrote under
-    ``paths.calibration/artifacts/<run>/``. Nothing is re-recorded on this
-    side, so there is exactly one copy of any run's bytes.
+    ``<artifact_dir>/response.json``. Nothing is re-recorded on this side,
+    so there is exactly one copy of any run's bytes.
 
     Returns ``None`` when the index has no entry for *chunk_idx* or the
     recorded artifact is gone.
@@ -168,10 +169,10 @@ def _load_run(index_dir: Path, chunk_idx: int) -> dict | None:
     artifact_dir = json.loads(index_path.read_text()).get("extract", {}).get(str(chunk_idx))
     if artifact_dir is None:
         return None
-    results = sorted(Path(artifact_dir).glob("calibration_extract_*.json"))
-    if not results:
+    response_path = Path(artifact_dir) / "response.json"
+    if not response_path.exists():
         return None
-    return json.loads(results[-1].read_text())
+    return json.loads(response_path.read_text())
 
 
 def _variants(prompts_dir: Path, prefix: str, stage: str) -> dict[str, str]:
@@ -197,41 +198,143 @@ def _variants(prompts_dir: Path, prefix: str, stage: str) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 
 
+def _wait_for_run_terminal(server: str, headers: dict, *, poll_interval: float = 2.0) -> dict:
+    """Block until ``GET /status`` reports ``consolidating: false``, and
+    return that final status body.
+
+    Any run submitted through the dispatch envelope — a fold or a
+    calibration probe — holds the same mutex, so this is the one wait
+    primitive for either.  Returning the body (rather than discarding it)
+    lets the caller read ``calibration_run`` off the SAME poll that
+    observed the terminal, instead of a second round trip that could race
+    a later run starting.
+    """
+    url = f"{server.rstrip('/')}/status"
+    while True:
+        r = requests.get(url, timeout=30.0, headers=headers)
+        r.raise_for_status()
+        body = r.json()
+        if not body.get("consolidating", False):
+            return body
+        time.sleep(poll_interval)
+
+
 def _post_stage(
     server: str,
     stage: str,
     payload: dict,
     timeout: float = 600.0,
+    *,
+    poll_interval: float = 2.0,
+    backoff_ceiling_s: float = 300.0,
 ) -> dict:
-    """POST *payload* to ``/calibrate/<stage>`` and return the parsed JSON response.
+    """Submit one calibration run and return its recorded response.
 
-    Resolves the bearer token from the environment, secret file, or repo ``.env``
-    (via :func:`paramem.cli.http_client.resolve_token`) and attaches it as an
-    ``Authorization: Bearer <token>`` header.  When no token is present the
-    header is omitted so auth-OFF servers keep working.
+    Submits to ``/calibrate/<stage>`` and reads the dispatch answer:
+
+    * ``started_calibration`` — and only this status — carries ``run_id``
+      and ``artifact_dir``.  Takes both from the 200, polls ``GET /status``
+      until ``consolidating`` is false, then reads
+      ``<artifact_dir>/response.json``.  The run is resolved by the
+      directory THIS call was given, never by whatever ``/status`` reports
+      last — two campaigns against one server must not read each other's
+      results.
+    * ``started_migration`` — the arbitrator pre-empted this request with
+      an armed active-store migration; no calibration run was submitted
+      and no identity is returned.  Treated as a retryable busy answer,
+      like a deferral.
+    * ``deferred_*`` — the server is busy (a fold, a chat turn, the GPU, a
+      TRIAL, a quarantined store).  Retried with bounded exponential
+      backoff up to a wall-clock ceiling, then exits naming the status.  A
+      deferral is not an error.
+    * ``noop_*`` — nothing to run (``/calibrate/extract_pending`` with no
+      pending NAMED session).  Reported and skipped; not an error either.
+    * ``404`` — ``calibrate_endpoint_enabled`` is off; ``503`` — no model
+      loaded, or no memory store; ``401`` — no/invalid bearer token.  Each
+      exits with its own message.
+
+    Resolves the bearer token from the environment, secret file, or repo
+    ``.env`` (via :func:`paramem.cli.http_client.resolve_token`) and
+    attaches it as an ``Authorization: Bearer <token>`` header.  When no
+    token is present the header is omitted so auth-OFF servers keep
+    working.
+
+    Multi-seed / multi-baseline campaigns are now serialized by the
+    server: each call here blocks until its own run's terminal fires
+    before returning, so a loop of several calls runs one gated run at a
+    time rather than issuing overlapping requests.
     """
     url = f"{server.rstrip('/')}/calibrate/{stage}"
     token = resolve_token()
     headers = {"Authorization": f"Bearer {token}"} if token else {}
-    r = requests.post(url, json=payload, timeout=timeout, headers=headers)
-    if r.status_code == 503:
-        raise SystemExit(
-            f"Server returned 503 for /calibrate/{stage}: {r.text}\n"
-            f"Likely a real consolidation cycle is in progress; retry later."
-        )
-    if r.status_code == 404:
-        raise SystemExit(
-            f"Server returned 404 for /calibrate/{stage}: {r.text}\n"
-            f"Set consolidation.calibrate_endpoint_enabled: true in server.yaml."
-        )
-    if r.status_code == 401:
-        raise SystemExit(
-            f"Server returned 401 for /calibrate/{stage}: no/invalid bearer token.\n"
-            f"Set PARAMEM_API_TOKEN (env, ~/.config/paramem/secrets/PARAMEM_API_TOKEN,"
-            f" or repo .env)."
-        )
-    r.raise_for_status()
-    return r.json()
+
+    deadline = time.monotonic() + backoff_ceiling_s
+    delay = poll_interval
+    while True:
+        r = requests.post(url, json=payload, timeout=timeout, headers=headers)
+        if r.status_code == 503:
+            raise SystemExit(
+                f"Server returned 503 for /calibrate/{stage}: {r.text}\n"
+                f"No local model loaded (cloud-only mode or defer-model boot), "
+                f"or no memory store available."
+            )
+        if r.status_code == 404:
+            raise SystemExit(
+                f"Server returned 404 for /calibrate/{stage}: {r.text}\n"
+                f"Set consolidation.calibrate_endpoint_enabled: true in server.yaml."
+            )
+        if r.status_code == 401:
+            raise SystemExit(
+                f"Server returned 401 for /calibrate/{stage}: no/invalid bearer token.\n"
+                f"Set PARAMEM_API_TOKEN (env, ~/.config/paramem/secrets/PARAMEM_API_TOKEN,"
+                f" or repo .env)."
+            )
+        r.raise_for_status()
+        body = r.json()
+        status = body.get("status", "")
+
+        if status == "started_calibration":
+            run_id = body["run_id"]
+            artifact_dir = Path(body["artifact_dir"])
+            final_status = _wait_for_run_terminal(server, headers, poll_interval=poll_interval)
+            response_path = artifact_dir / "response.json"
+            if not response_path.exists():
+                # A crashed run's terminal (_consolidation_run_done) never
+                # writes response.json — it records the crash on
+                # calibration_run instead.  Report that recorded outcome
+                # rather than a bare "never written" — the operator gets
+                # the crash detail without needing to correlate a run_id
+                # against the server log by hand.
+                run_record = final_status.get("calibration_run") or {}
+                if run_record.get("run_id") == run_id and run_record.get("outcome") == "crashed":
+                    raise SystemExit(
+                        f"Calibration run {run_id} ({stage}) crashed on the server "
+                        f"(finished_at={run_record.get('finished_at')!r}) — no "
+                        f"response.json was written. See the server log or "
+                        f"GET /status's calibration_run for detail."
+                    )
+                raise SystemExit(
+                    f"Calibration run {run_id} ({stage}) completed but "
+                    f"{response_path} was never written."
+                )
+            return json.loads(response_path.read_text())
+
+        if status.startswith("noop_"):
+            print(f"/calibrate/{stage}: {status} — nothing to run, skipping.")
+            return {"stage": stage, "status": status, "artifact_dir": ""}
+
+        if status == "started_migration" or status.startswith("deferred_"):
+            if time.monotonic() >= deadline:
+                raise SystemExit(
+                    f"/calibrate/{stage} stayed {status!r} past the "
+                    f"{backoff_ceiling_s:.0f}s retry ceiling."
+                )
+            print(f"/calibrate/{stage}: {status} — retrying in {delay:.0f}s")
+            time.sleep(delay)
+            delay = min(delay * 2, 60.0)
+            continue
+
+        raise SystemExit(f"/calibrate/{stage}: unexpected status {status!r}: {body}")
 
 
 # ---------------------------------------------------------------------------
@@ -686,7 +789,13 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "comma-separated seed list, 'random:N', or 'none' (default). "
             "Seeds only vary output at --temperature>0; at the default "
-            "greedy temperature 0.0 they are a no-op."
+            "greedy temperature 0.0 they are a no-op.  Every run this tool "
+            "submits shares the consolidation dispatch envelope with a "
+            "production fold, so the server serializes them — a multi-seed "
+            "campaign runs one gated call at a time, back to back, rather "
+            "than overlapping requests. That is the correct behaviour on a "
+            "thermally-bounded box, and is slower but safer than the old "
+            "inline-response contract."
         ),
     )
     parser.add_argument("--temperature", type=float, default=None)
@@ -698,7 +807,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--dump-dir",
         default=None,
-        help="default: data/ha/calibration/artifacts/<utc-timestamp>/",
+        help="default: data/ha/calibration/artifacts/campaigns/<utc-timestamp>/",
     )
     parser.add_argument(
         "--seed-from",
@@ -754,10 +863,14 @@ def main(argv: list[str] | None = None) -> int:
 
     # Default dump dir under the calibration workspace (paths.calibration),
     # never under paths.debug: probing artifacts are not debug output and
-    # must not depend on, or pollute, the production debug switch.
+    # must not depend on, or pollute, the production debug switch.  One
+    # stamp everywhere (run_stamp()) and the same artifact_run_dir the
+    # server uses for every /calibrate/* run's own directory — this
+    # client's campaign dump is the one caller that passes "campaigns"
+    # instead of a route path.
     if args.dump_dir is None:
-        ts = _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        dump_dir = _REPO_ROOT / "data" / "ha" / "calibration" / "artifacts" / ts
+        _calibration_root = _REPO_ROOT / "data" / "ha" / "calibration" / "artifacts"
+        dump_dir = artifact_run_dir(_calibration_root, "campaigns", run_stamp())
     else:
         dump_dir = Path(args.dump_dir)
     dump_dir.mkdir(parents=True, exist_ok=True)

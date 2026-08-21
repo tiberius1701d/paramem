@@ -77,12 +77,16 @@ Layout::
             normalization_snapshot.json          # on_normalization
         training/tiers/<adapter_name>/adapter_weights/  # on_main_adapters_saved
         cycle_summary_snapshot.json              # on_cycle_end
-        calibration_<stage>_<ts>.json            # on_calibration_result
+        response.json                            # on_calibration_result
 
 For the debug root the caller resolves ``<root>`` from
 ``ConsolidationLoop.snapshot_dir_for(...)``
 (``paths.debug/episodic/[interim_<stamp>/]cycle_<N>/run_<run_id>/``); for the
-calibration root it is ``paths.calibration/artifacts/<stage>_<ts>/``.
+calibration root it is ``artifact_run_dir(paths.calibration_artifacts,
+route_path, run_stamp())`` — the producing route's path segments, then one
+UTC ``%Y%m%dT%H%M%SZ`` stamp (:func:`run_stamp` / :func:`artifact_run_dir`),
+minted once at the calibrate route's boundary and reused as the run's
+``run_id`` on the wire.
 
 The procedural relations file is omitted when the procedural list is empty.
 """
@@ -91,9 +95,9 @@ from __future__ import annotations
 
 import json
 import logging
-import time
 from contextlib import contextmanager
 from contextvars import ContextVar
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterator
 
@@ -395,24 +399,58 @@ def on_normalization(
         )
 
 
-def on_calibration_result(payload: dict[str, Any]) -> None:
-    """Persist a calibration run's full result.
+def run_stamp() -> str:
+    """One UTC ``%Y%m%dT%H%M%SZ`` stamp per run.
 
-    Writes ``calibration_<stage>_<timestamp>.json`` — the parsed output
-    (including ``diagnostics``, e.g. entity-correction proposals the apply gate
-    rejected, which never reach ``graph.diagnostics["entity_corrections"]``),
-    every phase record, and the raw model output.  The timestamp keeps
-    repeated runs of the same stage from clobbering each other, and the
-    artifact is complete enough to be posted back as the next run's seed.
+    Minted once at the boundary that opens a run (a calibrate route
+    handler, before dispatch) and reused as that run's ``run_id`` on the
+    wire, its artifact directory name (:func:`artifact_run_dir`), and any
+    stamp inside the directory it writes — one identity for everything a
+    run produces.
+    """
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def artifact_run_dir(root: Path, route_path: str, stamp: str) -> Path:
+    """The run directory for one artifact-producing run.
+
+    The producing route's path segments under *root*, then *stamp*:
+    ``artifact_run_dir(root, "/calibrate/extract", s)`` ->
+    ``root/calibrate/extract/<s>``.  The driver script
+    (``scripts/dev/calibrate_prompts.py``) passes ``"campaigns"`` for its
+    own dump directory.
+
+    A path, not a promise the directory exists — it is created on first
+    write, by :func:`write_artifact`.
+    """
+    segments = [seg for seg in route_path.strip("/").split("/") if seg]
+    return root.joinpath(*segments, stamp)
+
+
+def on_calibration_result(payload: dict[str, Any], *, stamp: str) -> None:
+    """Persist a calibration run's full result as ``<base>/response.json``.
+
+    Writes the parsed output (including ``diagnostics``, e.g. entity-correction
+    proposals the apply gate rejected, which never reach
+    ``graph.diagnostics["entity_corrections"]``), every phase record, and the
+    raw model output.  One run, one response — no stamp in the filename,
+    because the run's own directory (named from the same *stamp*) already
+    identifies it, and repeated runs of the same stage land in distinct
+    directories rather than distinct filenames.
+
+    Args:
+        payload: The calibration response dict.
+        stamp: This run's own stamp — passed in rather than minted here, so
+            the run's directory, its ``run_id``, and this artifact all carry
+            one identity.
 
     Lands in the calibration run's directory whenever one is open
     (:func:`calibration_run`) and in the debug tree whenever debug is on.
     """
-    stage = _safe_path_component(payload.get("stage", "run"))
     for base in _active_bases():
-        out_path = base / f"calibration_{stage}_{int(time.time())}.json"
+        out_path = base / "response.json"
         write_artifact(out_path, payload)
-        logger.info("Calibration artifact written: %s", out_path)
+        logger.info("Calibration artifact written: %s (run_id=%s)", out_path, stamp)
 
 
 def on_cycle_end(cycle_summary: dict[str, Any]) -> None:

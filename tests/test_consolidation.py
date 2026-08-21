@@ -401,12 +401,16 @@ class TestExtractionPathParity:
 
 
 class TestLocalParseFailureAbortsFold:
-    """A local-extraction parse failure detected via
-    ``ConsolidationLoop._abort_on_local_parse_failure`` raises
-    ``ExtractionFailed`` before that session's merge, and the merger graph
-    is reset before the exception leaves ``extract_session`` — the
-    fail-loud document-extraction design. A legitimately-empty extraction
-    (no failed phase record) is not mistaken for a failure."""
+    """``extract_session`` aborts on a local-extraction parse failure: raises
+    ``ExtractionFailed`` before that session's merge, and resets the merger
+    graph before the exception leaves the method (the fail-loud
+    document-extraction design, ``paramem/training/consolidation.py``'s own
+    ``except ExtractionFailed: self.merger.reset_graph(); raise``).  A
+    legitimately-empty extraction (no failed phase record) is not mistaken
+    for a failure.  ``VramExhausted`` is a DIFFERENT exception type and must
+    escape uncaught, without triggering the reset (per-chunk isolation keeps
+    an earlier session's merge intact).
+    """
 
     def _build_loop(self, monkeypatch, tmp_path, procedural_enabled: bool = False):
         from peft import PeftModel
@@ -423,8 +427,8 @@ class TestLocalParseFailureAbortsFold:
         procedural_adapter = AdapterConfig() if procedural_enabled else None
 
         # extract_graph / extract_procedural_graph are never reached in
-        # these tests — every call goes through loop.extraction.run /
-        # loop.extraction.run_procedural, patched per-test below — but the
+        # these tests -- every call goes through loop.extraction.run /
+        # loop.extraction.run_procedural, patched per-test below -- but the
         # module bindings must still resolve at ConsolidationLoop
         # construction time.
         monkeypatch.setattr(
@@ -482,9 +486,9 @@ class TestLocalParseFailureAbortsFold:
 
     def _failed_phase_side_effect(self, phase_name: str, session_id: str = "s1"):
         """Build an ``extraction.run``/``run_procedural`` replacement that
-        records a ``"failed"`` phase — matching exactly what
+        records a ``"failed"`` phase -- matching exactly what
         ``_run_local_extraction`` itself does on an unparseable raw
-        output — and returns an empty graph."""
+        output -- and returns an empty graph."""
         from paramem.graph.phase_trace import phase_trace
 
         def _run(*args, **kwargs):
@@ -497,7 +501,7 @@ class TestLocalParseFailureAbortsFold:
     def test_local_extract_failure_raises_and_skips_merge(self, monkeypatch, tmp_path):
         """An episodic-pass parse failure (``local_extract``) raises before
         the LATER procedural pass ever runs, and before either graph
-        reaches ``merger.merge`` — ``procedural_enabled=True`` here is the
+        reaches ``merger.merge`` -- ``procedural_enabled=True`` here is the
         crux: it proves the abort gates the procedural stage, not merely
         the episodic merge that happens to sit next to it."""
         from unittest.mock import patch
@@ -554,7 +558,7 @@ class TestLocalParseFailureAbortsFold:
             with pytest.raises(ExtractionFailed) as exc_info:
                 loop.extract_session("t", "s1", speaker_id="speaker0", speaker_name=None)
         assert exc_info.value.phase == "procedural_extract"
-        # Only the episodic session_graph reached merger.merge — the empty,
+        # Only the episodic session_graph reached merger.merge -- the empty,
         # failed procedural graph never did.
         mock_merge.assert_called_once()
         merged_graph = mock_merge.call_args[0][0]
@@ -599,12 +603,14 @@ class TestLocalParseFailureAbortsFold:
                 loop.extract_session("t2", "s2", speaker_id="speaker0")
 
         assert loop.merger.graph.number_of_nodes() == 0
-        assert loop._capture_pending_relations() == []
+        pending = loop.take_pending_relations()
+        assert pending.episodic == []
+        assert pending.procedural == []
 
     def test_merger_graph_reset_on_cloud_enrich_origin_abort(self, monkeypatch, tmp_path):
-        """The same reset fires for the OTHER ``ExtractionFailed`` origin —
+        """The same reset fires for the OTHER ``ExtractionFailed`` origin --
         a raise from inside ``ExtractionPipeline.run`` itself (the
-        pre-existing ``cloud_enrich`` abort) — one invalidation site
+        pre-existing ``cloud_enrich`` abort) -- one invalidation site
         covering both raise origins."""
         from unittest.mock import patch
 
@@ -626,11 +632,13 @@ class TestLocalParseFailureAbortsFold:
                 loop.extract_session("t2", "s2", speaker_id="speaker0")
 
         assert loop.merger.graph.number_of_nodes() == 0
-        assert loop._capture_pending_relations() == []
+        pending = loop.take_pending_relations()
+        assert pending.episodic == []
+        assert pending.procedural == []
 
     def test_vram_exhausted_escapes_extract_session_uncaught(self, monkeypatch, tmp_path):
         """``VramExhausted`` is deliberately NOT caught by ``extract_session``'s
-        ``except ExtractionFailed`` — per-chunk isolation means it must
+        ``except ExtractionFailed`` -- per-chunk isolation means it must
         propagate straight through, uncaught and unwidened, and must NOT
         trigger the merger-graph reset that ``ExtractionFailed`` does: an
         earlier session already merged this fold survives. Pins the scope
@@ -658,6 +666,174 @@ class TestLocalParseFailureAbortsFold:
         # Per-chunk isolation, unlike the ExtractionFailed abort tests above:
         # the first session's merge is NOT reset.
         assert loop.merger.graph.number_of_nodes() > 0
+
+
+class TestTakePendingRelationsGraphLifetime:
+    """``ConsolidationLoop.take_pending_relations`` -- the one door out of
+    the extraction accumulation.  Uses the lightweight ``object.__new__``
+    loop fixture
+    (:meth:`TestMergeRegistryRelationsTimestamp._make_loop_for_recon_merge`
+    below), copied here so this class does not depend on another class's
+    private helper living further down the file.
+    """
+
+    @staticmethod
+    def _make_bare_loop(tmp_path) -> ConsolidationLoop:
+        from paramem.graph.merger import GraphMerger
+        from paramem.memory.store import MemoryStore
+        from paramem.training.key_registry import KeyRegistry
+        from paramem.utils.config import AdapterConfig, ConsolidationConfig, TrainingConfig
+
+        loop = object.__new__(ConsolidationLoop)
+        loop.model = None
+        loop.tokenizer = None
+        loop.config = ConsolidationConfig()
+        loop.training_config = TrainingConfig(
+            num_epochs=1,
+            gradient_checkpointing=False,
+            batch_size=1,
+            recall_early_stopping=False,
+            recall_probe_batch_size=1,
+        )
+        loop.episodic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
+        loop.semantic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
+        loop.procedural_config = None
+        loop.wandb_config = None
+        loop._thermal_policy = None
+        loop.output_dir = tmp_path
+        loop.save_cycle_snapshots = False
+        loop._debug_base = None
+        loop.snapshot_dir = None
+        loop.shutdown_requested = False
+        loop._bg_trainer = None
+        loop._early_stop_callback = None
+        loop.fingerprint_cache = None
+        loop._keep_prior_slots = 2
+        loop.cycle_count = 0
+        loop._indexed_next_index = 1
+        loop._procedural_next_index = 1
+        loop._procedural_tentative_next_index = 1
+        loop._indexed_ep_interim = {}
+        loop.promoted_keys = set()
+        loop.full_consolidation_period_string = ""
+
+        merger = GraphMerger(model=MagicMock(), tokenizer=MagicMock())
+        merger._predicate_cardinality["lives in"] = False
+        loop.merger = merger
+
+        store = MemoryStore()
+        for tier in ("episodic", "semantic", "procedural"):
+            store.load_registry(tier, KeyRegistry())
+        loop.store = store
+        return loop
+
+    def test_take_pending_relations_resets_ledgers_too(self, tmp_path) -> None:
+        """after the take, the keying surface is
+        fully reset -- zero edges, an empty removal ledger, and an empty
+        adopt-reinforcements map (``reset_graph``'s documented contract)."""
+        loop = self._make_bare_loop(tmp_path)
+        loop.merger.graph.add_node("alex", speaker_id="speaker0")
+        loop.merger.graph.add_edge(
+            "alex",
+            "berlin",
+            predicate="lives in",
+            relation_type="factual",
+            confidence=1.0,
+            sessions=["s1"],
+        )
+        loop.merger.removal_ledger["stray_key"] = {"reason": "dedup"}
+        loop.merger.adopt_reinforcements["stray_key_2"] = 1
+
+        pending = loop.take_pending_relations()
+
+        assert len(pending.episodic) + len(pending.procedural) == 1
+        assert loop.merger.graph.number_of_edges() == 0
+        assert loop.merger.removal_ledger == {}
+        assert loop.merger.adopt_reinforcements == {}
+
+    def test_captured_product_carries_edge_and_attribute_relations_with_timestamps(
+        self, tmp_path
+    ) -> None:
+        """the captured product carries both edge-derived and
+        node-attribute-derived relations, and preserves last_seen/first_seen
+        off the edge."""
+        loop = self._make_bare_loop(tmp_path)
+        loop.merger.graph.add_node(
+            "alex",
+            speaker_id="speaker0",
+            attributes={"favorite color": "blue"},
+            sessions=["s1"],
+        )
+        loop.merger.graph.add_edge(
+            "alex",
+            "berlin",
+            predicate="lives in",
+            relation_type="factual",
+            confidence=1.0,
+            sessions=["s1"],
+            last_seen="2026-01-02T00:00:00Z",
+            first_seen="2026-01-01T00:00:00Z",
+        )
+
+        pending = loop.take_pending_relations()
+        all_rels = pending.episodic + pending.procedural
+
+        edge_rel = next(r for r in all_rels if r.relation_type == "factual")
+        assert edge_rel.subject == "alex"
+        assert edge_rel.object == "berlin"
+        assert edge_rel.last_seen == "2026-01-02T00:00:00Z"
+        assert edge_rel.first_seen == "2026-01-01T00:00:00Z"
+
+        attr_rel = next(r for r in all_rels if r.relation_type == "attribute")
+        assert attr_rel.subject == "alex"
+        assert attr_rel.object == "blue"
+
+    def test_two_consecutive_takes_are_independent(self, tmp_path) -> None:
+        """Two consecutive ``take_pending_relations`` calls -- as a
+        ``/calibrate/extract_pending`` probe immediately followed by a
+        LATER, separate interim fold's own extraction would produce -- yield
+        independent products.  This is the leak-regression guard: the
+        second take must carry only what merged since the first take, none
+        of the probe's earlier content."""
+        loop = self._make_bare_loop(tmp_path)
+
+        # Probe batch: one relation about berlin.
+        loop.merger.graph.add_edge(
+            "alex", "berlin", predicate="lives in", relation_type="factual", sessions=["probe"]
+        )
+        probe_take = loop.take_pending_relations()
+        assert probe_take.is_empty() is False
+        assert any(r.object == "berlin" for r in probe_take.episodic)
+
+        # A later, separate fold's own batch -- nothing added yet: must be empty.
+        empty_take = loop.take_pending_relations()
+        assert empty_take.is_empty() is True
+
+        # The fold's own DIFFERENT relation, merged after the probe's take.
+        loop.merger.graph.add_edge(
+            "alex", "munich", predicate="visited", relation_type="factual", sessions=["fold"]
+        )
+        fold_take = loop.take_pending_relations()
+        fold_objects = {r.object for r in fold_take.episodic}
+        assert fold_objects == {"munich"}, (
+            f"the fold's own take must not carry the probe's earlier content; got {fold_objects}"
+        )
+
+    def test_pending_none_is_a_valid_no_pending_value(self) -> None:
+        """``pending=None`` is the ordinary "this fold
+        stages no pending-session content" value -- distinct from an empty
+        ``PendingRelations``, which stages a (empty) batch.  The second half
+        (``mode='simulate'`` with a non-``None`` ``pending`` raises
+        ``ValueError``) is already pinned by
+        ``tests/test_simulate_train_parity.py::TestConsolidateModeGuard::
+        test_simulate_mode_rejects_pending`` -- not duplicated here."""
+        from paramem.training.consolidation import PendingRelations
+
+        empty = PendingRelations(episodic=[], procedural=[])
+        assert empty.is_empty() is True
+
+        non_empty = PendingRelations(episodic=[MagicMock()], procedural=[])
+        assert non_empty.is_empty() is False
 
 
 class TestInterimRefinementGate:
@@ -1001,6 +1177,11 @@ class TestInterimRefinementGate:
             "extract_session must return non-empty episodic_rels for the test to be valid"
         )
 
+        # extract_session merged the session graph into merger.graph; the one
+        # take ends that batch's extraction lifetime and captures the product
+        # this call threads into run_consolidation_cycle's own pending arg.
+        pending = loop.take_pending_relations()
+
         captured_calls: list[dict] = []
         real_stage_event = loop.stage_event
 
@@ -1019,6 +1200,7 @@ class TestInterimRefinementGate:
                 procedural_rels,
                 speaker_id="spk0",
                 mode="simulate",
+                pending=pending,
                 run_label="s_gate",
                 stamp="20260601T0000",
                 max_interim_count=7,
@@ -1067,6 +1249,11 @@ class TestInterimRefinementGate:
             "extract_session must return non-empty episodic_rels for the test to be valid"
         )
 
+        # extract_session merged the session graph into merger.graph; the one
+        # take ends that batch's extraction lifetime and captures the product
+        # this call threads into run_consolidation_cycle's own pending arg.
+        pending = loop.take_pending_relations()
+
         captured_calls: list[dict] = []
         real_stage_event = loop.stage_event
 
@@ -1080,6 +1267,7 @@ class TestInterimRefinementGate:
                 procedural_rels,
                 speaker_id="spk0",
                 mode="simulate",
+                pending=pending,
                 run_label="s_gate",
                 stamp="20260601T0000",
                 max_interim_count=7,
@@ -2562,121 +2750,6 @@ class TestMergeRegistryRelationsTimestamp:
             "new_object": "munich",
         }, f"Expected key_berlin_legacy retired for munich; got {loop.merger.removal_ledger}"
 
-    def test_capture_pending_propagates_last_seen(self, tmp_path):
-        """_capture_pending_relations carries the edge last_seen onto the captured Relation.
-
-        Pending graph edges are stamped with the real ingest-time last_seen by the
-        merger's Case-3 path (merger.py:821).  Without this propagation the captured
-        Relation would carry last_seen="" (undated) and lose outright to a dated
-        rival — a dated candidate always outranks an undated one — preventing a
-        newer pending fact from superseding an older dated rival.
-        """
-        loop = self._make_loop_for_recon_merge(tmp_path)
-        loop.merger.graph.add_node("alex")
-        loop.merger.graph.add_node("berlin")
-        loop.merger.graph.add_edge(
-            "alex",
-            "berlin",
-            predicate="lives in",
-            relation_type="factual",
-            confidence=1.0,
-            sessions=["s_ingest"],
-            last_seen="2026-01-02T00:00:00Z",
-        )
-
-        pending = loop._capture_pending_relations()
-
-        assert len(pending) == 1, f"Expected 1 pending relation; got {len(pending)}"
-        assert pending[0].last_seen == "2026-01-02T00:00:00Z", (
-            f"last_seen must be propagated from edge; got {pending[0].last_seen!r}"
-        )
-
-    def test_pending_dated_supersedes_older_dated_rival(self, tmp_path):
-        """Pending relation with newer dated last_seen supersedes an older dated rival.
-
-        Scenario (interim/consume-pending path):
-          - Registry-true recon: (alex, lives in → munich), last_seen="2026-01-01" (OLDER)
-          - Pending capture: (alex, lives in → berlin), last_seen="2026-01-02" (NEWER)
-          - resolve_contradictions=True, single-valued predicate
-
-        With _capture_pending_relations now propagating last_seen, the pending relation
-        carries its genuine recency.  The all-dated path fires: incoming_ls="2026-01-02"
-        > rival_ls="2026-01-01" → munich retired, berlin inserted.
-
-        Without the fix (last_seen=""), incoming_ls="" (undated) would lose outright
-        to the dated munich rival — a dated candidate always outranks an undated one
-        — so munich survives and berlin is never inserted (regression: NEW never
-        supersedes OLD).
-        """
-        from paramem.graph.schema import Relation
-        from paramem.memory.persistence import _IK_KEY_ATTR
-
-        loop = self._make_loop_for_recon_merge(tmp_path)
-
-        # Step 1: merge the registry-true recon relation (munich, older dated).
-        recon_relations = [
-            Relation(
-                subject="alex",
-                predicate="lives_in",
-                object="munich",
-                relation_type="factual",
-                confidence=1.0,
-                speaker_id="speaker0",
-                indexed_key="key_munich_old",
-                last_seen="2026-01-01T00:00:00Z",
-            )
-        ]
-        loop.merger.merge_relations(
-            recon_relations,
-            session_id="__full_consolidation_recon__",
-            log_label="recon triples (test)",
-            resolve_contradictions=False,  # recon is old-vs-old for this step
-        )
-
-        # Stamp ik_key onto the munich edge so ledger capture fires on retirement.
-        _alex_successors = list(loop.merger.graph.successors("alex"))
-        for _succ in _alex_successors:
-            for _eid, _edata in loop.merger.graph["alex"][_succ].items():
-                if _edata.get("predicate") == "lives in":
-                    _edata[_IK_KEY_ATTR] = "key_munich_old"
-
-        # Step 2: merge the pending relation (berlin, newer dated) with resolve=True.
-        pending_relations = [
-            Relation(
-                subject="alex",
-                predicate="lives_in",
-                object="berlin",
-                relation_type="factual",
-                confidence=1.0,
-                speaker_id="speaker0",
-                indexed_key="key_berlin_new",
-                last_seen="2026-01-02T00:00:00Z",  # NEWER — as propagated from edge
-            )
-        ]
-        loop.merger.merge_relations(
-            pending_relations,
-            session_id="__interim_pending_sessions__",
-            log_label="pending relations (test)",
-            resolve_contradictions=True,
-        )
-
-        lives_in_objects = [
-            obj
-            for obj in loop.merger.graph.successors("alex")
-            for _, d in loop.merger.graph["alex"][obj].items()
-            if d.get("predicate") == "lives in"
-        ]
-        assert "berlin" in lives_in_objects, (
-            "Newer pending Berlin must be inserted (supersedes older Munich)"
-        )
-        assert "munich" not in lives_in_objects, (
-            "Older registry-true Munich must be retired by newer pending Berlin"
-        )
-        assert "key_munich_old" in loop.merger.removal_ledger, (
-            "Retired Munich key must appear in removal_ledger"
-        )
-        assert loop.merger.removal_ledger["key_munich_old"]["reason"] == "contradiction_same_pred"
-
     def test_pending_dated_vs_legacy_empty_rival_dated_wins(self, tmp_path):
         """Pending dated relation vs legacy "" registry-true rival → dated wins (REPLACE).
 
@@ -3789,41 +3862,41 @@ class TestCalibrationAndDebugRoots:
         from paramem.utils.artifacts import calibration_run
 
         loop = self._loop(tmp_path, save_cycle_snapshots=False)
-        run_dir = tmp_path / "calibration" / "extract_1"
+        run_dir = tmp_path / "calibration" / "calibrate" / "extract" / "20260101T000000Z"
         with loop._artifact_scope(), calibration_run(run_dir):
-            on_calibration_result({"stage": "extract", "parsed": {}})
+            on_calibration_result({"stage": "extract", "parsed": {}}, stamp="20260101T000000Z")
 
         import json as _json
 
-        written = list(run_dir.glob("calibration_extract_*.json"))
-        assert len(written) == 1
-        assert _json.loads(written[0].read_text())["stage"] == "extract"
+        written = run_dir / "response.json"
+        assert written.exists()
+        assert _json.loads(written.read_text())["stage"] == "extract"
 
     def test_both_roots_receive_the_artifact_when_both_are_active(self, tmp_path):
         from paramem.utils.artifacts import calibration_run
 
         loop = self._loop(tmp_path, save_cycle_snapshots=True)
-        run_dir = tmp_path / "calibration" / "extract_1"
+        run_dir = tmp_path / "calibration" / "calibrate" / "extract" / "20260101T000000Z"
         with loop._artifact_scope(), calibration_run(run_dir):
-            on_calibration_result({"stage": "extract", "parsed": {}})
+            on_calibration_result({"stage": "extract", "parsed": {}}, stamp="20260101T000000Z")
 
-        assert len(list(run_dir.glob("calibration_extract_*.json"))) == 1
-        assert len(list((tmp_path / "debug").rglob("calibration_extract_*.json"))) == 1
+        assert (run_dir / "response.json").exists()
+        assert len(list((tmp_path / "debug").rglob("response.json"))) == 1
 
     def test_no_calibration_run_leaves_only_the_debug_root(self, tmp_path):
         loop = self._loop(tmp_path, save_cycle_snapshots=True)
         with loop._artifact_scope():
-            on_calibration_result({"stage": "extract", "parsed": {}})
+            on_calibration_result({"stage": "extract", "parsed": {}}, stamp="20260101T000000Z")
 
-        assert len(list((tmp_path / "debug").rglob("calibration_extract_*.json"))) == 1
+        assert len(list((tmp_path / "debug").rglob("response.json"))) == 1
         assert not (tmp_path / "calibration").exists()
 
     def test_neither_root_active_is_a_no_op(self, tmp_path):
         loop = self._loop(tmp_path, save_cycle_snapshots=False)
         with loop._artifact_scope():
-            on_calibration_result({"stage": "extract", "parsed": {}})
+            on_calibration_result({"stage": "extract", "parsed": {}}, stamp="20260101T000000Z")
 
-        assert not list(tmp_path.rglob("calibration_*.json"))
+        assert not list(tmp_path.rglob("response.json"))
 
     def test_production_hook_artifacts_follow_the_calibration_run(self, tmp_path):
         """Not just the calibration response: an artifact a PRODUCTION hook
@@ -4263,7 +4336,7 @@ class TestFullConsolidationOverdueStatusSurface:
             },
         )
 
-        err, _ = _derive_consolidation_status_fields(state_dir)
+        err, _, _ = _derive_consolidation_status_fields(state_dir)
         assert err is not None, (
             "full_consolidation_overdue incident must surface in last_consolidation_error"
         )

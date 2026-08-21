@@ -47,6 +47,7 @@ from paramem.cloud.providers import get_cloud_agent
 from paramem.graph.extractor import ExtractionFailed
 from paramem.graph.name_extraction import extract_name_via_llm
 from paramem.graph.phase_trace import extraction_trace
+from paramem.graph.prompts import prompt_overrides
 from paramem.models.loader import (
     active_adapter_name,
     base_model_inference,
@@ -64,7 +65,13 @@ from paramem.server.config import (
     default_data_dir,
     load_server_config,
 )
-from paramem.server.consolidation import create_consolidation_loop
+from paramem.server.consolidation import (
+    classify_pending_sessions,
+    create_consolidation_loop,
+    get_or_create_consolidation_loop,
+    retire_unattributable_sessions,
+)
+from paramem.server.consolidation_action import ConsolidationAction, consolidation_content_gate
 from paramem.server.ha_graph import HAEntityGraph
 from paramem.server.incidents import (
     ack_incident,
@@ -102,12 +109,20 @@ from paramem.server.vram_validator import (
 )
 from paramem.training.consolidation import (
     ActiveKeyHydrationFailure,
+    PendingRelations,
     RecallGateRejected,
+    enrichment_signal,
     interim_outcome_label,
 )
 from paramem.training.stage_ledger import data_state_dir
 from paramem.training.thermal_throttle import ThermalPolicy, wait_for_cooldown
 from paramem.utils import systemctl
+from paramem.utils.artifacts import (
+    artifact_run_dir,
+    calibration_run,
+    on_calibration_result,
+    run_stamp,
+)
 from paramem.utils.identity import canonical as _canonical
 from paramem.utils.identity import is_speaker_id as _is_speaker_id
 from paramem.utils.notify import SERVER_CLOUD_ONLY, notify_server
@@ -149,6 +164,12 @@ _state = {
     "ha_client": None,
     "consolidation_loop": None,
     "memory_store": None,
+    # The latest calibration run submitted through /calibrate/* and, once
+    # its terminal fired, its outcome — see StatusResponse.calibration_run.
+    # Written only on status == "started_calibration" (_submit_calibration_run);
+    # completed by _run_calibration_sync's own terminal.  One slot, not a
+    # ring — reset on every process start.
+    "calibration_run": None,
     # True once the store-preload step (_hydrate_memory_store_in_place, via
     # _build_store_contents) has cleanly completed for the CURRENT store
     # object — where completion includes the boot fill exactly when
@@ -496,6 +517,17 @@ class StatusResponse(BaseModel):
     # ``"store_quarantined"`` while this is set; admin endpoints (this one
     # included) keep serving.
     store_quarantined: dict | None = None
+    # The latest calibration run submitted through /calibrate/* and,
+    # once its terminal fired, its outcome — {run_id, action, route,
+    # artifact_dir, started_at, outcome, finished_at}.  Read from the live
+    # `_state["calibration_run"]` slot, falling back to the durable
+    # op_type="calibration" run-status row (see
+    # _derive_consolidation_status_fields) when the live slot has never
+    # been written this process lifetime.  A client never resolves its own
+    # run through this field — it resolves it through the artifact_dir its
+    # own 200 returned; this is for operator visibility only.  None when no
+    # calibration run has ever been submitted.
+    calibration_run: dict | None = None
 
 
 class IntegrityCheckItem(BaseModel):
@@ -517,7 +549,14 @@ class IntegrityResponse(BaseModel):
 
 
 class ConsolidateResponse(BaseModel):
-    """Response schema for every consolidation endpoint.
+    """Response schema for every dispatch endpoint — consolidation and
+    calibration.
+
+    Every route returning this model is declared
+    ``response_model_exclude_none=True``.  The four consolidation routes
+    never set ``run_id``/``artifact_dir``, so their wire shape is exactly
+    ``{"status": ..., "action": ...}`` on every outcome — unchanged by
+    these two additive fields.
 
     Attributes
     ----------
@@ -529,18 +568,35 @@ class ConsolidateResponse(BaseModel):
         collapsed into main memory), ``"interim"`` (recent conversations
         absorbed into a new interim slot), ``"reconcile"`` (main memory rebuilt
         from its own stored knowledge — the same interim-ring absorption as a
-        full fold, with pending sessions left pending), or ``"auto"``
-        when the dispatch was refused before the schedule could resolve it.
-        ``POST /scheduled-tick`` is the only REST door that requests
-        ``AUTO`` (the boot-completion catch-up task also requests it, but
-        in-process rather than through this response schema), so this is
-        how its caller learns which of the two the deadline math resolved
-        to; every other door (``/consolidate``, ``/consolidate/interim``,
-        ``/reconsolidate``) echoes the action it asked for directly.
+        full fold, with pending sessions left pending), ``"auto"``
+        when the dispatch was refused before the schedule could resolve it,
+        ``"calibrate"`` (an operator-supplied calibration artifact), or
+        ``"calibrate_pending"`` (a calibration probe over the pending NAMED
+        session set).  ``POST /scheduled-tick`` is the only REST door that
+        requests ``AUTO`` (the boot-completion catch-up task also requests
+        it, but in-process rather than through this response schema), so
+        this is how its caller learns which of the two the deadline math
+        resolved to; every other consolidation door echoes the action it
+        asked for directly.
+    run_id:
+        The submitted CALIBRATION run's identity — its UTC
+        ``%Y%m%dT%H%M%SZ`` stamp.  Present exactly when *status* is
+        ``"started_calibration"``, and absent otherwise — including on
+        every other ``started_*`` outcome (a fold, which writes no
+        calibration artifacts) and ``"started_migration"`` (the arbitrator
+        pre-empted this request with an armed store migration).  A
+        dispatch that submitted no calibration run has no run to identify.
+    artifact_dir:
+        Where the run writes ``response.json`` and its hook artifacts.
+        Present under the same condition as *run_id*.  A client resolves
+        its own run through this value, never by polling for someone
+        else's.
     """
 
     status: str
     action: str = "none"
+    run_id: str | None = None
+    artifact_dir: str | None = None
 
 
 # --- Document ingest schemas ---
@@ -1603,21 +1659,45 @@ def _revalidate_adapter_manifests(state: dict) -> None:
         manifest_status.pop(stale_name, None)
 
 
-def _dispatch_finalize(finalize: Callable[[], None]) -> None:
-    """Run a consolidation-finalize closure on the asyncio event loop.
+def _consolidation_terminal(body: "Callable[[], None] | None" = None) -> None:
+    """The single exit of every consolidation-envelope run.
 
-    The post-consolidation state mutations (`_state["last_consolidation*"]`,
-    the router reload, and clearing `_state["consolidating"]`) must be visible
-    to /chat handlers atomically with the consolidating-flag clear. They run on
-    the BG-trainer worker thread, so when the event loop is live we hand the
-    closure to it via `call_soon_threadsafe`; otherwise (no loop / tests) we
-    invoke it inline on the current thread.
+    Runs *body* — the run's own bookkeeping (manifest revalidation, incident
+    sweeps, router reload, retirement, the run-status row, the
+    ``_state["calibration_run"]`` outcome) — on the asyncio event loop, then
+    clears ``_state["consolidating"]`` in a ``finally`` so a raising body
+    still releases the arbitrator while its exception still propagates to
+    the loop's handler.  ``None`` is a run whose terminal has no
+    bookkeeping.
+
+    The post-run state mutations (``_state["last_consolidation*"]``, the
+    router reload, and clearing ``_state["consolidating"]``) must be visible
+    to /chat handlers atomically with the consolidating-flag clear. They run
+    on the BG-trainer worker thread or a calibration executor thread, so
+    when the event loop is live we hand the closure to it via
+    ``call_soon_threadsafe``; otherwise (no loop / tests) we invoke it
+    inline on the current thread.
+
+    Scope: runs dispatched through :func:`_dispatch_to_executor`.  The three
+    doors that borrow the same flag as an in-handler mutex — ``POST
+    /interim/discard``, ``POST /speaker/forget``, ``POST /debug/erase-keys``
+    — keep their own request-local ``try/finally``: their no-await-tail
+    invariant requires the clear to land with no yield point, which posting
+    to the loop would break.
     """
+
+    def _run() -> None:
+        try:
+            if body is not None:
+                body()
+        finally:
+            _state["consolidating"] = False
+
     aio_loop = _state.get("event_loop")
     if aio_loop is not None and aio_loop.is_running():
-        aio_loop.call_soon_threadsafe(finalize)
+        aio_loop.call_soon_threadsafe(_run)
     else:
-        finalize()
+        _run()
 
 
 def _sweep_keyless_tier_artifacts(config, state: dict) -> list[str]:
@@ -3086,14 +3166,14 @@ async def lifespan(app: FastAPI):
     # ConsolidationLoop.__init__ -> ensure_adapters -> create_adapter
     # allocates GPU memory BEFORE the post-load VRAM gate below runs, so a
     # failure here (VramExhausted or otherwise) must degrade, not crash the
-    # boot: the lazy _get_or_create_consolidation_loop remains the fallback
+    # boot: the lazy get_or_create_consolidation_loop remains the fallback
     # for every caller that needs the loop, so a swallowed failure here only
     # costs /status reporting adapter_loaded=false until the first
     # consolidation door creates it. Only a sticky, process-fatal CUDA fault
     # gets the crash-loop treatment, mirroring _build_runtime_components's
     # handling just above.
     try:
-        _eager_create_consolidation_loop(config)
+        _eager_create_consolidation_loop()
     except BaseException as _eager_exc:
         if is_fatal_cuda_fault(_eager_exc):
             _fail_fast_cuda(_eager_exc, "eager_consolidation_loop")
@@ -3633,7 +3713,8 @@ async def _run_boot_completion_tasks() -> None:
        arbitrator's own seed-and-noop on the next real tick rather than
        seeded here, so there is exactly one seeding owner. Dispatching
        unconditionally would run the arbitrator's side-effecting pre-stages —
-       retroactive orphan-session claim, ``_triage_pending_sessions``
+       retroactive orphan-session claim,
+       :func:`~paramem.server.consolidation.retire_unattributable_sessions`
        retiring unattributable pending sessions regardless of TTL, and the
        ``pending_rehydration`` migration branch seizing the GPU — on every
        boot with a real cadence configured, whether or not a tick was
@@ -5259,18 +5340,19 @@ def _resolve_speaker(
 
 def _derive_consolidation_status_fields(
     state_dir: Path,
-) -> tuple[dict | None, dict | None]:
-    """Derive ``last_consolidation_error`` and ``last_consolidation_result`` from disk.
+) -> tuple[dict | None, dict | None, dict | None]:
+    """Derive ``last_consolidation_error``, ``last_consolidation_result``, and
+    the durable calibration run row from disk.
 
     Reads the incident store (``incidents.json``) and the run-status registry
-    (``run_status.json``) once and returns the two ``/status`` fields.  Both
+    (``run_status.json``) once and returns the three ``/status`` fields.  All
     sources are read at build time on every ``/status`` poll — no RAM snapshot
     survives.
 
     Returns
     -------
-    tuple[dict | None, dict | None]
-        ``(last_consolidation_error, last_consolidation_result)``
+    tuple[dict | None, dict | None, dict | None]
+        ``(last_consolidation_error, last_consolidation_result, calibration_result)``
 
         ``last_consolidation_error``:
             The ``detail`` dict of the most-recent **active** incident whose
@@ -5282,6 +5364,13 @@ def _derive_consolidation_status_fields(
         ``last_consolidation_result``:
             The ``RunRecord.to_dict()`` for op_type ``"consolidation"`` from
             ``run_status.json``, or ``None`` when no run has been recorded.
+
+        ``calibration_result``:
+            The ``RunRecord.to_dict()`` for op_type ``"calibration"`` from
+            ``run_status.json``, or ``None``.  Durable across a restart —
+            ``StatusResponse.calibration_run``'s fallback for when
+            ``_state["calibration_run"]`` (the live slot, reset on every
+            process start) has never been written this process lifetime.
     """
     # --- last_consolidation_error: derived from active incidents ---
     consolidation_error: dict | None = None
@@ -5312,17 +5401,21 @@ def _derive_consolidation_status_fields(
     except Exception:
         logger.exception("_derive_consolidation_status_fields: could not read incidents")
 
-    # --- last_consolidation_result: derived from run_status.json ---
+    # --- last_consolidation_result / calibration_result: derived from run_status.json ---
     consolidation_result: dict | None = None
+    calibration_result: dict | None = None
     try:
         last_runs = read_last_runs(state_dir)
         rec = last_runs.get("consolidation")
         if rec is not None:
             consolidation_result = rec.to_dict()
+        cal_rec = last_runs.get("calibration")
+        if cal_rec is not None:
+            calibration_result = cal_rec.to_dict()
     except Exception:
         logger.exception("_derive_consolidation_status_fields: could not read run_status")
 
-    return consolidation_error, consolidation_result
+    return consolidation_error, consolidation_result, calibration_result
 
 
 @app.get("/status", response_model=StatusResponse)
@@ -5746,13 +5839,16 @@ async def status():
     except Exception:
         logger.exception("Failed to build backup block — returning empty default")
 
-    # Derive last_consolidation_error and last_consolidation_result from durable
-    # stores (incidents.json + run_status.json) rather than from RAM.  Both fields
-    # are computed once per /status poll; no RAM snapshot survives across restarts.
+    # Derive last_consolidation_error, last_consolidation_result, and the
+    # durable calibration run row from durable stores (incidents.json +
+    # run_status.json) rather than from RAM.  All three are computed once
+    # per /status poll; no RAM snapshot survives across restarts.
     _status_state_dir = data_state_dir(config.paths.data).resolve()
-    _consolidation_error, _consolidation_result = _derive_consolidation_status_fields(
-        _status_state_dir
-    )
+    (
+        _consolidation_error,
+        _consolidation_result,
+        _calibration_result,
+    ) = _derive_consolidation_status_fields(_status_state_dir)
 
     return StatusResponse(
         model=config.model_name,
@@ -5819,6 +5915,7 @@ async def status():
         tier_key_counts=tier_key_counts,
         oldest_interim_stamp=oldest_interim_stamp,
         store_quarantined=_state.get("store_quarantine"),
+        calibration_run=_state.get("calibration_run") or _calibration_result,
     )
 
 
@@ -8086,7 +8183,7 @@ def _live_reload_base_model(
     # release→acquire cycle would otherwise revert to the lazy
     # get-or-create — this call keeps adapter_loaded symmetric
     # across that cycle too, not just across a restart.
-    _eager_create_consolidation_loop(config)
+    _eager_create_consolidation_loop()
     return result
 
 
@@ -9365,11 +9462,10 @@ async def speaker_forget(request: SpeakerForgetRequest):
         error, message = refusal_for(verdict, doing="forgetting a speaker", then="forget")
         raise HTTPException(status_code=409, detail={"error": error, "message": message})
 
-    config = _state["config"]
     # Get-or-create rather than "loop is None -> 503": the guard above
     # already proved mode == "local" (a model is loaded), so the loop can
     # always be created here, mirroring POST /interim/discard.
-    loop = _get_or_create_consolidation_loop(config)
+    loop = get_or_create_consolidation_loop(_state)
 
     # Canonicalize the incoming speaker_id so external cased input
     # (e.g. "Speaker0") matches the internally stored canonical form ("speaker0")
@@ -9409,7 +9505,7 @@ async def speaker_forget(request: SpeakerForgetRequest):
         # (registry writes) must land on the live objects, not a stale
         # pre-lock capture (door staleness race).
         config = _state["config"]
-        loop = _get_or_create_consolidation_loop(config)
+        loop = get_or_create_consolidation_loop(_state)
         return _stale_mark_keys(
             config=config, staled_keys=staled_keys, label="speaker/forget", store=loop.store
         )
@@ -9624,7 +9720,7 @@ async def interim_discard(request: InterimDiscardRequest):
     # always be created here, and gating on a pre-existing loop would make
     # this endpoint unusable on a freshly booted server — exactly the state
     # an operator most plausibly wants to discard from.
-    loop = _get_or_create_consolidation_loop(config)
+    loop = get_or_create_consolidation_loop(_state)
 
     # Step 0c — pure read; a no-op ring must not mutate the store,
     # must not touch incidents, must not log a destructive run.
@@ -9680,7 +9776,7 @@ async def interim_discard(request: InterimDiscardRequest):
         # (registry drop, PEFT unmount) must land on the live objects, not
         # a stale pre-lock capture (door staleness race).
         config = _state["config"]
-        loop = _get_or_create_consolidation_loop(config)
+        loop = get_or_create_consolidation_loop(_state)
 
         # Collect every key the discarded interim tiers know (active + stale)
         # before Step 1 drops them — drop_tier removes the tier's registry,
@@ -10442,109 +10538,351 @@ async def debug_erase_keys(request: DebugEraseKeysRequest):
 # --------------------------------------------------------------------------
 
 
-async def _run_calibrate_off_loop(fn, /, *args) -> Any:
-    """Dispatch one synchronous ``calibrate_module`` handler off the event loop.
+def _mint_run_identity(route_path: str) -> "tuple[str, Path]":
+    """Mint one calibration run's identity — the one place ``run_id`` and
+    ``artifact_dir`` are minted, for every ``/calibrate/*`` route.
 
-    Every ``/calibrate/*`` handler reaches ``gpu_lock_sync()`` (blocking,
-    unbounded timeout) via :func:`paramem.server.calibrate._measured_local_call`.
-    Calling it inline on the event loop — as ``/chat`` does not — would block
-    the loop itself while waiting for the lock; since ``/chat``'s async
-    ``gpu_lock()`` releases its lock in an async-generator ``finally`` that
-    also runs on the loop, a blocked loop can never resume that generator to
-    release the lock it holds. The result is a permanent deadlock, not a
-    slow response. Running the whole handler in the default thread-pool
-    executor keeps the wait off the loop so ``/chat``'s release always gets
-    a turn to run.
+    ``run_id`` is :func:`~paramem.utils.artifacts.run_stamp`, minted once;
+    ``artifact_dir`` is :func:`~paramem.utils.artifacts.artifact_run_dir`
+    resolved against that same stamp — the two must never be minted
+    separately, or a run's directory and its wire ``run_id`` could drift
+    apart.
+    """
+    config = _state["config"]
+    run_id = run_stamp()
+    artifact_dir = artifact_run_dir(config.paths.calibration_artifacts, route_path, run_id)
+    return run_id, artifact_dir
 
-    Runs the ENTIRE handler in one executor thread (not just the GPU-locked
-    section) so any ``ContextVar`` the handler sets — prompt overrides,
-    extraction/phase trace — is set and read within that same thread's
-    single synchronous call, staying coherent; no cross-thread contextvar
-    visibility is needed because nothing outside this call reads them.
+
+def _submit_spec(
+    spec: "calibrate_module.CalibrationRunSpec", *, action: ConsolidationAction
+) -> ConsolidateResponse:
+    """Submit an already-built calibration run spec through the arbitrator —
+    the shared tail behind every ``/calibrate/*`` route, called after the
+    route's own preflight, validate, and spec construction have already
+    run on the event loop.
+
+    ``_state["calibration_run"]`` is published only on
+    ``status == "started_calibration"`` — the exact string, never the
+    ``started_*`` prefix — so neither a deferred/noop dispatch nor a
+    migration pre-empt (``started_migration``) overwrites the record of a
+    run that was actually submitted.  One slot, not a ring: it holds the
+    latest started run and, once its terminal fires
+    (:func:`_run_calibration_sync`), its outcome.
 
     Args:
-        fn: The synchronous ``calibrate_module`` handler to run.
-        *args: Positional arguments forwarded to ``fn``.
+        spec: The run's validated :class:`~paramem.server.calibrate.CalibrationRunSpec`,
+            identity already minted.
+        action: ``CALIBRATE`` (every route whose artifact the operator
+            supplies) or ``CALIBRATE_PENDING`` (``/calibrate/extract_pending``).
 
     Returns:
-        Whatever ``fn`` returns.
-
-    Raises:
-        HTTPException: Re-raised with its original status code — executor
-            futures propagate exceptions from the worker thread to the
-            awaiting coroutine unchanged.
+        :class:`ConsolidateResponse` — ``run_id``/``artifact_dir`` present
+        exactly when ``status == "started_calibration"``.
     """
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, lambda: fn(*args))
+    status, resolved_action = _dispatch_consolidation(action, spec=spec)
+    if status == "started_calibration":
+        _state["calibration_run"] = {
+            "run_id": spec.run_id,
+            "action": resolved_action.value,
+            "route": spec.route_path,
+            "artifact_dir": str(spec.artifact_dir),
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "outcome": None,
+            "finished_at": None,
+        }
+        return ConsolidateResponse(
+            status=status,
+            action=resolved_action.value,
+            run_id=spec.run_id,
+            artifact_dir=str(spec.artifact_dir),
+        )
+    return ConsolidateResponse(status=status, action=resolved_action.value)
 
 
-# Every endpoint below runs the SAME production extraction chain through
-# the SAME handler; the route name selects which calibration use case's
-# declaration (start step, injected artifact, stop step) applies — see
-# paramem.server.calibrate._CHAIN.
-@app.post("/calibrate/extract", dependencies=[Depends(require_admin)])
-async def calibrate_extract_route(req: calibrate_module.CalibrateChainRequest):
-    return await _run_calibrate_off_loop(calibrate_module.calibrate_chain, _state, "extract", req)
+def _submit_calibration_run(
+    stage: str,
+    req: Any,
+    *,
+    action: ConsolidationAction = ConsolidationAction.CALIBRATE,
+) -> ConsolidateResponse:
+    """Mint a declared calibration run's identity, build its spec, and
+    submit it — the boundary tail shared by the nine declared
+    ``/calibrate/*`` stages (the five chain routes via
+    :data:`~paramem.server.calibrate._CHAIN`, the four standalone routes
+    via :data:`~paramem.server.calibrate._STANDALONE`), called after the
+    route's own preflight has already run on the event loop.
+
+    Mints ``run_id``/``artifact_dir`` via :func:`_mint_run_identity`
+    (the one minting site every ``/calibrate/*`` route uses, this one and
+    ``/calibrate/extract_pending``'s route alike), builds the spec
+    via :func:`~paramem.server.calibrate.build_spec` (which runs the
+    stage's own ``validate_*`` as a side effect — zero inference cost, so
+    a 400 costs nothing), and submits through :func:`_submit_spec`.
+    ``/calibrate/extract_pending`` is not one of the nine — its dispatch
+    closure is route-specific (see
+    :func:`~paramem.server.calibrate.validate_extract_pending`'s
+    docstring) — so its route builds a spec directly and calls
+    :func:`_submit_spec` itself.
+
+    Args:
+        stage: A key of :data:`~paramem.server.calibrate._CHAIN` or
+            :data:`~paramem.server.calibrate._STANDALONE`.
+        req: The stage's own request model.
+        action: ``CALIBRATE`` (default) — every declared stage answers
+            this action; ``CALIBRATE_PENDING`` belongs only to
+            ``extract_pending``, which does not call this function.
+
+    Returns:
+        :class:`ConsolidateResponse` — ``run_id``/``artifact_dir`` present
+        exactly when ``status == "started_calibration"``.
+    """
+    route_path = calibrate_module.route_path_for(stage)
+    run_id, artifact_dir = _mint_run_identity(route_path)
+    spec = calibrate_module.build_spec(stage, _state, req, run_id=run_id, artifact_dir=artifact_dir)
+    return _submit_spec(spec, action=action)
 
 
-@app.post("/calibrate/procedural", dependencies=[Depends(require_admin)])
-async def calibrate_procedural_route(req: calibrate_module.CalibrateChainRequest):
-    return await _run_calibrate_off_loop(
-        calibrate_module.calibrate_chain, _state, "procedural", req
-    )
+def _dispatch_calibrate_chain(use_case: str, req: "calibrate_module.CalibrateChainRequest"):
+    """Boundary + submit for the five chain-endpoint routes.
+
+    Runs :func:`~paramem.server.calibrate.preflight` on the event loop,
+    then submits through :func:`_submit_calibration_run` — the one handler
+    behind every chain endpoint.  The route name selects which calibration
+    use case's declaration (start step, injected artifact, stop step)
+    applies (see :data:`~paramem.server.calibrate._CHAIN`); validation
+    itself now runs inside :func:`~paramem.server.calibrate.build_spec`.
+    """
+    calibrate_module.preflight(_state)
+    return _submit_calibration_run(use_case, req)
 
 
-@app.post("/calibrate/anonymize", dependencies=[Depends(require_admin)])
-async def calibrate_anonymize_route(req: calibrate_module.CalibrateChainRequest):
-    return await _run_calibrate_off_loop(calibrate_module.calibrate_chain, _state, "anonymize", req)
+@app.post(
+    "/calibrate/extract",
+    response_model=ConsolidateResponse,
+    response_model_exclude_none=True,
+    dependencies=[Depends(require_admin)],
+)
+async def calibrate_extract_route(
+    req: calibrate_module.CalibrateChainRequest,
+) -> ConsolidateResponse:
+    return _dispatch_calibrate_chain("extract", req)
 
 
-@app.post("/calibrate/plausibility", dependencies=[Depends(require_admin)])
-async def calibrate_plausibility_route(req: calibrate_module.CalibrateChainRequest):
-    return await _run_calibrate_off_loop(
-        calibrate_module.calibrate_chain, _state, "plausibility", req
-    )
+@app.post(
+    "/calibrate/procedural",
+    response_model=ConsolidateResponse,
+    response_model_exclude_none=True,
+    dependencies=[Depends(require_admin)],
+)
+async def calibrate_procedural_route(
+    req: calibrate_module.CalibrateChainRequest,
+) -> ConsolidateResponse:
+    return _dispatch_calibrate_chain("procedural", req)
 
 
-@app.post("/calibrate/enrich", dependencies=[Depends(require_admin)])
-async def calibrate_enrich_route(req: calibrate_module.CalibrateChainRequest):
-    return await _run_calibrate_off_loop(calibrate_module.calibrate_chain, _state, "enrich", req)
+@app.post(
+    "/calibrate/anonymize",
+    response_model=ConsolidateResponse,
+    response_model_exclude_none=True,
+    dependencies=[Depends(require_admin)],
+)
+async def calibrate_anonymize_route(
+    req: calibrate_module.CalibrateChainRequest,
+) -> ConsolidateResponse:
+    return _dispatch_calibrate_chain("anonymize", req)
 
 
-@app.post("/calibrate/normalize", dependencies=[Depends(require_admin)])
-async def calibrate_normalize_route(req: calibrate_module.CalibrateNormalizeRequest):
-    return await _run_calibrate_off_loop(calibrate_module.calibrate_normalize, _state, req)
+@app.post(
+    "/calibrate/plausibility",
+    response_model=ConsolidateResponse,
+    response_model_exclude_none=True,
+    dependencies=[Depends(require_admin)],
+)
+async def calibrate_plausibility_route(
+    req: calibrate_module.CalibrateChainRequest,
+) -> ConsolidateResponse:
+    return _dispatch_calibrate_chain("plausibility", req)
 
 
-@app.post("/calibrate/anonymize_facts", dependencies=[Depends(require_admin)])
-async def calibrate_anonymize_facts_route(req: calibrate_module.CalibrateAnonymizeFactsRequest):
-    return await _run_calibrate_off_loop(calibrate_module.calibrate_anonymize_facts, _state, req)
+@app.post(
+    "/calibrate/enrich",
+    response_model=ConsolidateResponse,
+    response_model_exclude_none=True,
+    dependencies=[Depends(require_admin)],
+)
+async def calibrate_enrich_route(
+    req: calibrate_module.CalibrateChainRequest,
+) -> ConsolidateResponse:
+    return _dispatch_calibrate_chain("enrich", req)
 
 
-@app.post("/calibrate/name", dependencies=[Depends(require_admin)])
-async def calibrate_name_route(req: calibrate_module.CalibrateNameRequest):
-    return await _run_calibrate_off_loop(calibrate_module.calibrate_name, _state, req)
+@app.post(
+    "/calibrate/normalize",
+    response_model=ConsolidateResponse,
+    response_model_exclude_none=True,
+    dependencies=[Depends(require_admin)],
+)
+async def calibrate_normalize_route(
+    req: calibrate_module.CalibrateNormalizeRequest,
+) -> ConsolidateResponse:
+    calibrate_module.preflight(_state)
+    return _submit_calibration_run("normalize", req)
 
 
-@app.post("/calibrate/respond", dependencies=[Depends(require_admin)])
-async def calibrate_respond_route(req: calibrate_module.CalibrateRespondRequest):
+@app.post(
+    "/calibrate/anonymize_facts",
+    response_model=ConsolidateResponse,
+    response_model_exclude_none=True,
+    dependencies=[Depends(require_admin)],
+)
+async def calibrate_anonymize_facts_route(
+    req: calibrate_module.CalibrateAnonymizeFactsRequest,
+) -> ConsolidateResponse:
+    calibrate_module.preflight(_state)
+    return _submit_calibration_run("anonymize_facts", req)
+
+
+@app.post(
+    "/calibrate/name",
+    response_model=ConsolidateResponse,
+    response_model_exclude_none=True,
+    dependencies=[Depends(require_admin)],
+)
+async def calibrate_name_route(req: calibrate_module.CalibrateNameRequest) -> ConsolidateResponse:
+    calibrate_module.preflight(_state)
+    return _submit_calibration_run("name", req)
+
+
+@app.post(
+    "/calibrate/respond",
+    response_model=ConsolidateResponse,
+    response_model_exclude_none=True,
+    dependencies=[Depends(require_admin)],
+)
+async def calibrate_respond_route(
+    req: calibrate_module.CalibrateRespondRequest,
+) -> ConsolidateResponse:
     """Run one production serving turn through ``handle_chat`` for calibration.
 
-    Stamps the idle-debounce marker and runs the training-abort sequence on
-    the event loop, before dispatch — matching every other inference entry
-    point in this module. The ``calibrate_respond`` handler itself then runs
-    in the default thread-pool executor via :func:`_run_calibrate_off_loop`:
-    it blocks on the GPU lock for the length of a real serving turn, and
-    running it inline on the event loop would deadlock ``/chat`` the same
-    way every other ``/calibrate/*`` route would (see
-    ``_run_calibrate_off_loop``'s docstring). The prompt-override and
-    phase-trace ``ContextVar``s the dispatch opens are opened and read
-    inside that same executor call, so running the whole handler in one
-    thread keeps them coherent.
+    Runs the training-abort sequence on the event loop, before dispatch —
+    matching every other inference entry point in this module — but does
+    NOT stamp ``_state["last_chat_monotonic"]``.  That marker exists so a
+    fold does not seize the GPU seconds after a LIVE user turn; this route
+    is a calibration probe of the serving path, not a live turn, and
+    stamping it here would make the arbitrator's own idle debounce defer
+    this call against itself (elapsed time since the stamp is always ~0s).
+    This run still holds the ``consolidating`` mutex for the whole turn,
+    network call included — the run may reach Home Assistant or place a
+    billed cloud call.
     """
-    _state["last_chat_monotonic"] = time.monotonic()
     _abort_background_training_for_inference()
-    return await _run_calibrate_off_loop(calibrate_module.calibrate_respond, _state, req)
+    calibrate_module.preflight(_state)
+    return _submit_calibration_run("respond", req)
+
+
+@app.post(
+    "/calibrate/extract_pending",
+    response_model=ConsolidateResponse,
+    response_model_exclude_none=True,
+    dependencies=[Depends(require_admin)],
+)
+async def calibrate_extract_pending_route(
+    req: calibrate_module.CalibrateExtractPendingRequest,
+) -> ConsolidateResponse:
+    """Run the whole session-tier extraction chain over the pending NAMED
+    session set — exactly what a fold would take right now.
+
+    Non-staging: stages no event, mints no key, retires no session, writes
+    no production incident or attention row.  Noops
+    (``noop_no_pending``/``noop_no_named``) exactly as ``/consolidate/interim``
+    does, since its content is the identical pending NAMED set.
+    """
+    calibrate_module.preflight(_state)
+    resolved = calibrate_module.validate_extract_pending(_state, req)
+
+    def _dispatch() -> "tuple[Any, dict]":
+        loop = get_or_create_consolidation_loop(_state)
+        extraction = _extract_pending_sessions(loop, lock_held=True)
+        parsed = {
+            "sessions": extraction.per_session,
+            "episodic_rels": len(extraction.episodic_rels),
+            "procedural_rels": len(extraction.procedural_rels),
+            "aborted": extraction.aborted is not None,
+        }
+        return "", parsed
+
+    route_path = "/calibrate/extract_pending"
+    run_id, artifact_dir = _mint_run_identity(route_path)
+    spec = calibrate_module.CalibrationRunSpec(
+        stage="extract_pending",
+        route_path=route_path,
+        run_id=run_id,
+        artifact_dir=artifact_dir,
+        dispatch=_dispatch,
+        # Every session this run reaches opens a "local_extract" phase; the
+        # gate names the whole-chain run's own step, not one session's.
+        input_prompt_phase="local_extract",
+        supports_seed=True,
+        params=req.params,
+        overrides=resolved["overrides"],
+    )
+    return _submit_spec(spec, action=ConsolidationAction.CALIBRATE_PENDING)
+
+
+def _run_calibration_sync(spec: "calibrate_module.CalibrationRunSpec") -> None:
+    """Execute one calibration run under the shared envelope.
+
+    Executor entry point.  Opens the run's artifact root INSIDE this frame
+    (``run_in_executor`` does not carry the caller's ContextVars, so the
+    scope must be opened on the worker thread), applies the operator's
+    prompt overrides for the whole run, evicts voice when the run's own
+    artifact is document-shaped, takes the GPU cooldown gate and the GPU
+    lock, pins cuDNN determinism, calls
+    :func:`~paramem.server.calibrate.run_stage`, writes ``response.json``,
+    and exits through :func:`_consolidation_terminal`.  This is the one
+    owner of the ``calibration_run``/``prompt_overrides`` scope for a real
+    dispatch — nothing else opens it.
+
+    Stages no event: no PEFT slot, no ``stage_event``, no stage ledger, no
+    training, no session retirement, no production incident or attention
+    write.
+    """
+    from paramem.server.gpu_lock import gpu_lock_sync
+
+    config = _state["config"]
+    wait_for_cooldown(
+        config.vram.cooldown_gate_threshold_c,
+        config.vram.cooldown_gate_max_wait_fold_s,
+        config.vram.cooldown_gate_poll_s,
+        label="fold",
+    )
+    with calibration_run(spec.artifact_dir), prompt_overrides(spec.overrides):
+        if spec.evicts_voice:
+            _set_voice_pipeline_profile("cpu", lock_held=False)
+        with gpu_lock_sync(), calibrate_module._cudnn_deterministic():
+            payload = calibrate_module.run_stage(spec, _state)
+        _end_voice_eviction(lock_held=False)
+        on_calibration_result(payload, stamp=spec.run_id)
+
+    def _terminal() -> None:
+        outcome = "unreached_step" if payload.get("unreached_step") else "completed"
+        try:
+            record_last_run(
+                data_state_dir(config.paths.data),
+                op_type="calibration",
+                outcome=outcome,
+                summary=f"Calibration {spec.stage}: {outcome}",
+                detail={"route": spec.route_path, "run_id": spec.run_id},
+            )
+        except Exception:
+            logger.exception("Failed to record calibration run status (non-fatal)")
+        _record = _state.get("calibration_run")
+        if _record is not None and _record.get("run_id") == spec.run_id:
+            _record["outcome"] = outcome
+            _record["finished_at"] = datetime.now(timezone.utc).isoformat()
+
+    _consolidation_terminal(_terminal)
 
 
 def _trial_active() -> bool:
@@ -10575,9 +10913,13 @@ async def require_no_trial() -> None:
 
     Applied to the four consolidation routes only.  It is deliberately NOT a
     router-wide dependency: FastAPI resolves dependencies BEFORE request-body
-    validation, so on a body-carrying route (``/ingest-sessions``) it would turn
-    a malformed body's 422 into a 409 — those routes keep their in-handler
-    guard.
+    validation, so on a body-carrying route it would turn a malformed body's
+    422 into a 409.  None of the ten ``/calibrate/*`` routes carry it for
+    exactly that reason — they all carry bodies — so a TRIAL in progress
+    produces 200 ``deferred_trial_active`` from the arbitrator's own guard
+    (:func:`_consolidation_dispatch_guards`) on those routes instead of a
+    409 here.  ``/ingest-sessions`` keeps its own in-handler guard for the
+    same reason.
 
     Raises:
         HTTPException 409 ``trial_active``: A migration TRIAL is in progress.
@@ -10598,6 +10940,7 @@ async def require_no_trial() -> None:
 @app.post(
     "/scheduled-tick",
     response_model=ConsolidateResponse,
+    response_model_exclude_none=True,
     dependencies=[Depends(require_admin), Depends(require_no_trial)],
 )
 async def scheduled_tick():
@@ -10633,6 +10976,7 @@ async def scheduled_tick():
 @app.post(
     "/consolidate",
     response_model=ConsolidateResponse,
+    response_model_exclude_none=True,
     dependencies=[Depends(require_admin), Depends(require_no_trial)],
 )
 async def consolidate():
@@ -10640,7 +10984,8 @@ async def consolidate():
     not time-gated.
 
     Requests ``FULL`` directly: it is gated by the same content check the
-    schedule uses to decide a full cycle is due (:func:`_consolidation_content_gate`'s
+    schedule uses to decide a full cycle is due
+    (:func:`~paramem.server.consolidation_action.consolidation_content_gate`'s
     CONTENT check — payload-bearing interim slots, or at ``max_interim_count: 0``
     pending NAMED sessions), minus the schedule's own deadline math
     (:func:`_is_full_cycle_due`), which is the schedule's business alone and is
@@ -10685,6 +11030,7 @@ async def consolidate():
 @app.post(
     "/consolidate/interim",
     response_model=ConsolidateResponse,
+    response_model_exclude_none=True,
     dependencies=[Depends(require_admin), Depends(require_no_trial)],
 )
 async def consolidate_interim():
@@ -10725,6 +11071,7 @@ async def consolidate_interim():
 @app.post(
     "/reconsolidate",
     response_model=ConsolidateResponse,
+    response_model_exclude_none=True,
     dependencies=[Depends(require_admin), Depends(require_no_trial)],
 )
 async def reconsolidate():
@@ -15582,7 +15929,7 @@ async def backup_restore(req: BackupRestoreRequest):
             # and its old .store (the pre-restore store _lift_quarantined_store
             # replaces) — the next fold's lazily-cached loop would then run
             # against both stale objects. Nulling here means the next fold's
-            # _get_or_create_consolidation_loop rebuilds fresh against the
+            # get_or_create_consolidation_loop rebuilds fresh against the
             # post-restore _state["model"]/_state["memory_store"]. Both
             # releases and the remount+lift are GPU-touching when a model is
             # resident, so all of it runs off the event loop under gpu_lock.
@@ -16069,8 +16416,9 @@ def _is_full_cycle_due(config) -> bool:
     ``count == 0``; there is no interim path to route to.  This function does
     not decide whether there is anything to train on — that "no pending
     sessions → don't dispatch" decision is the arbitrator's content gate
-    (:func:`_consolidation_content_gate`, evaluated on the resolved action
-    after this function returns), which returns ``noop_no_pending`` /
+    (:func:`~paramem.server.consolidation_action.consolidation_content_gate`,
+    evaluated on the resolved action after this function returns), which
+    returns ``noop_no_pending`` /
     ``noop_no_named`` before the fold is ever entered.  At ``N == 0`` this
     function itself returns ``True`` unconditionally.
 
@@ -16370,62 +16718,6 @@ def _record_full_consolidation_overdue(config) -> None:
     )
 
 
-class ConsolidationAction(str, Enum):
-    """What a consolidation dispatch is asked to do — the internal vocabulary.
-
-    ``AUTO`` is requested by ``/scheduled-tick`` (the timer's own door) and by
-    the boot-completion catch-up task (:func:`_run_boot_completion_tasks`,
-    dispatching in-process rather than through a REST call) — nothing else
-    requests it. It becomes ``FULL`` or ``INTERIM`` in
-    :func:`_dispatch_consolidation` according to :func:`_is_full_cycle_due`'s
-    deadline math, and it alone carries the suspend/power-off catch-up gate
-    and the cadence stamp — universal across both ``AUTO`` requesters, so a
-    redundant tick inside the same schedule window no-ops regardless of which
-    one triggers it.  That deadline math is the SCHEDULE's business — a
-    manual door never consults it and never falls back between
-    ``FULL``/``INTERIM``: it requests the one it means.
-
-    ``FULL`` and ``INTERIM`` are each requestable two ways — resolved from
-    ``AUTO`` (the schedule's decision), or requested directly by
-    ``/consolidate`` and ``/consolidate/interim`` respectively (the identical
-    action, manually, right now, with no deadline check) — and the content
-    gate applies to both paths identically: naming the action manually drops
-    only the TIME condition (is a full/interim cycle due), never the CONTENT
-    condition (is there anything for it to consume).  A ``noop_*`` status is
-    not a refusal of the request — it is the answer: there was nothing to do.
-    There is no bypass flag, and the old "explicit ``FULL`` forces past an
-    empty gate" behaviour stays dead.
-
-    - ``FULL`` — collapse the interim slots into the main tiers now.  Content
-      is any payload-bearing interim slot (whatever ``max_interim_count``
-      currently says — a slot minted before an operator lowered it to 0 is
-      still content) OR, only at ``max_interim_count == 0``, pending NAMED
-      sessions (the fold's only content when no interim tier exists at all).
-    - ``INTERIM`` — absorb the pending conversations into a new interim slot.
-      Content is pending NAMED sessions.
-    - ``RECONCILE`` — a full consolidation whose input excludes pending
-      sessions.  One fold topology throughout: the interim ring is
-      recalled, absorbed into the main tiers, and reaped exactly as
-      ``FULL``; only pending sessions differ — they stay pending.  Content
-      is any active key in any registered tier, main or interim; with none
-      the store has nothing to rebuild and the dispatch noops
-      (``noop_no_stored_keys``).  It still passes through the shared safety
-      guards ahead of the content gate — busy/cloud-only/bg-training, a main
-      tier's registry binding being unverified, idle debounce, and
-      pending-rehydration.
-
-    The arbitrator resolves ``AUTO`` and keeps the result: the training layer
-    below receives the fold's mode, its key source, its fold inputs, and the
-    resolved door name itself (``event`` — ``"full"``/``"reconcile"``/
-    ``"interim"``, recorded verbatim in the ledger head) — never who asked.
-    """
-
-    AUTO = "auto"
-    FULL = "full"
-    INTERIM = "interim"
-    RECONCILE = "reconcile"
-
-
 def _store_quarantine_verdict() -> "str | None":
     """``"deferred_store_quarantined"`` while the memory store is quarantined, else ``None``.
 
@@ -16702,30 +16994,47 @@ def _stamp_scheduled_run(config) -> None:
     )
 
 
-def _dispatch_to_executor(fn: Callable[[], None], status: str) -> str:
-    """Submit a consolidation fold to the default executor and return *status*.
+def _dispatch_to_executor(
+    fn: Callable[[], None],
+    status: str,
+    *,
+    action: ConsolidationAction,
+    spec: "calibrate_module.CalibrationRunSpec | None" = None,
+) -> str:
+    """Submit one run — a consolidation fold or a calibration probe — to the
+    default executor and return *status*.
 
-    The single dispatch ritual for every consolidation path.  ``consolidating``
-    is set HERE — on the event-loop thread, before the executor submission —
-    which is what makes the guard in :func:`_consolidation_dispatch_guards`
-    free of a check-then-act race: every route is ``async def`` on that same
-    loop, so no other dispatch can interleave between the guard's read and this
-    write.  Structuring it in one place is the point: a hand-copied dispatch
-    that forgets the flag would let two folds run concurrently, and the second
-    would die in ``_ensure_staging_slot`` (``paramem/training/trainer.py``).
+    The single dispatch ritual for every run this envelope submits.
+    ``consolidating`` is set HERE — on the event-loop thread, before the
+    executor submission — which is what makes the guard in
+    :func:`_consolidation_dispatch_guards` free of a check-then-act race:
+    every route is ``async def`` on that same loop, so no other dispatch can
+    interleave between the guard's read and this write.  Structuring it in
+    one place is the point: a hand-copied dispatch that forgets the flag
+    would let two runs go concurrently, and the second would die in
+    ``_ensure_staging_slot`` (``paramem/training/trainer.py``) or corrupt a
+    calibration run's own artifact scope.
 
     Args:
         fn: The zero-arg sync entry point (``_extract_and_start_training``,
             ``_run_active_store_migration_sync``), or a ``functools.partial``
             that has already bound the entry point's arguments —
             ``_run_full_consolidation_sync`` takes its resolved door name
-            (``event`` — ``"full"`` or ``"reconcile"``) that way, since the
+            (``event`` — ``"full"`` or ``"reconcile"``) that way, and
+            ``_run_calibration_sync`` its ``CalibrationRunSpec``, since the
             executor contract itself carries no arguments.
         status: The status string to return to the caller on submission.
+        action: The action this run resolved to — bound into the executor
+            future's done callback (:func:`_consolidation_run_done`) so a
+            crash records the right incident type.
+        spec: The calibration run's own validated payload, when *action* is
+            ``CALIBRATE``/``CALIBRATE_PENDING`` — bound into the same
+            callback so a crash incident is keyed by the route and the
+            run's own stamp.  ``None`` for every staging action.
 
     Returns:
         *status*, unchanged — so call sites read as ``return
-        _dispatch_to_executor(fn, "started_full")``.
+        _dispatch_to_executor(fn, "started_full", action=action)``.
     """
     _state["consolidating"] = True
     # Use the loop captured once at lifespan startup (line ~2392) rather than
@@ -16739,209 +17048,8 @@ def _dispatch_to_executor(fn: Callable[[], None], status: str) -> str:
     # no fallback.
     event_loop = _state["event_loop"]
     future = event_loop.run_in_executor(None, fn)
-    future.add_done_callback(_scheduled_extract_done_callback)
+    future.add_done_callback(functools.partial(_consolidation_run_done, action, spec))
     return status
-
-
-def _triage_pending_sessions(config, buffer, store) -> "tuple[int, int]":
-    """Classify pending sessions, retire the unusable ones, count the NAMED ones.
-
-    UNIDENTIFIABLE sessions (no speaker id, no voice embedding — nothing can
-    ever attribute them) and HOLDABLE sessions past
-    ``orphan_retirement_seconds`` are marked consolidated here so they cannot
-    accumulate in the buffer forever.  Everything else is left pending.
-
-    An unconditional pre-stage of :func:`_dispatch_consolidation`, run on every
-    dispatch regardless of action.  Retiring what can never be attributed is a
-    side effect, not a gate: it runs before :func:`_consolidation_content_gate`
-    and does not depend on that gate's outcome, so ``RECONCILE`` taking its own
-    branch through the gate does not switch orphan retirement off for that
-    door.  The counts it returns are what :func:`_consolidation_content_gate`
-    decides on for ``FULL``/``INTERIM`` (``RECONCILE``'s own branch reads the
-    store instead).
-
-    Args:
-        config: Live server config.
-        buffer: The ``SessionBuffer``.
-        store: The ``SpeakerStore`` (or ``None`` when no speakers are enrolled).
-
-    Returns:
-        ``(pending_count, named_count)`` — the number of pending sessions seen
-        BEFORE retirement, and the number classified NAMED.  Both are needed:
-        the caller distinguishes "nothing pending at all" (``noop_no_pending``)
-        from "pending, but none attributable" (``noop_no_named``).
-    """
-    from paramem.server.consolidation import (
-        SessionClass,
-        classify_session,
-        discard_session_sink,
-    )
-
-    facts = buffer.pending_facts()
-    if not facts:
-        return 0, 0
-
-    ttl_seconds = config.consolidation.orphan_retirement_seconds
-    drop_ids: list[str] = []
-    named_count = 0
-
-    for fact in facts:
-        sid = fact["speaker_id"]
-        is_anon = store.is_anonymous(sid) if store is not None and sid else False
-        cls = classify_session(
-            speaker_id=sid,
-            is_anonymous=is_anon,
-            has_voice_embedding=fact["has_voice_embedding"],
-        )
-        if cls == SessionClass.NAMED:
-            named_count += 1
-        elif cls == SessionClass.UNIDENTIFIABLE:
-            drop_ids.append(fact["session_id"])
-        else:
-            # HOLDABLE — retire only when TTL set and exceeded
-            if ttl_seconds is not None:
-                age = fact.get("age_seconds")
-                if age is not None and age > ttl_seconds:
-                    drop_ids.append(fact["session_id"])
-
-    if drop_ids:
-        logger.info(
-            "Consolidation dispatch: retiring %d unattributable/expired-holdable session(s)",
-            len(drop_ids),
-        )
-        _retain = config.consolidation.retain_sessions or config.debug
-        buffer.mark_consolidated(
-            drop_ids,
-            retention_dir=discard_session_sink(config) if _retain else None,
-        )
-
-    return len(facts), named_count
-
-
-def _consolidation_content_gate(
-    action: ConsolidationAction,
-    config,
-    *,
-    pending_count: int,
-    named_count: int,
-    memory_store,
-) -> "str | None":
-    """The ONE "is there anything to consolidate?" check for every action.
-
-    Each action has its own input set, and dispatching one with an empty
-    input seizes the GPU to learn nothing:
-
-    - **INTERIM** — its only input is pending sessions.  With none there is
-      nothing to extract and nothing to train.
-    - **FULL** — its input is any payload-bearing interim slot ON DISK,
-      checked regardless of the CURRENT ``max_interim_count``: a slot minted
-      while the count was positive is still content after an operator lowers
-      it to 0 (every full-topology fold absorbs and reaps it either way — a
-      stranded slot is a bug, not a design). Only when NO such
-      slot exists does ``max_interim_count`` matter: at ``> 0`` the standard
-      full cycle does not consume pending sessions directly (that is the
-      interim tier's job) so there is nothing left to check and the gate
-      noops; at ``== 0`` no interim slot is ever minted going forward, so
-      pending NAMED sessions are the fold's own content and the gate falls
-      through to the shared check below.
-    - **RECONCILE** — a full consolidation whose input excludes pending
-      sessions: its content is the keys already active in ANY registered
-      tier, main or interim, via ``memory_store.active_keys_in_tier`` over
-      ``memory_store.tiers_with_registry()`` — the same universe the fold's
-      own pre-fold recall step probes, since a reconcile absorbs and reaps
-      the interim ring exactly like any full fold.  No live store yet is
-      unprovable rather than empty, and the gate lets the dispatch proceed
-      — the same "can't prove it's empty, so don't block it" posture the
-      rest of this function does not need because
-      ``pending_count``/``named_count`` are always countable.  Otherwise, no
-      active key in any tier means there is nothing to rebuild.
-
-    Interim slots are counted through the payload-aware primitive
-    (``iter_interim_dirs(..., payload_only=True)`` — venue-blind, a slot
-    candidate in either venue counts): a slot whose payload write never
-    landed is a directory, not content, and must not
-    satisfy the gate.
-
-    Called for every dispatch that reaches it, whoever asked — ``AUTO``'s
-    resolved outcome (``/scheduled-tick``) or a direct request
-    (``/consolidate``, ``/consolidate/interim``, ``/reconsolidate``).  A
-    manual door drops only the TIME condition (``_is_full_cycle_due``'s
-    deadline math, which this function never touches) — never the CONTENT
-    condition checked here.  A ``noop_*`` status reports "nothing to do" as
-    information, not a refusal.
-
-    The pending-session counts come from :func:`_triage_pending_sessions`,
-    which the arbitrator runs as an unconditional pre-stage.  Passing them in
-    (rather than triaging here) is what keeps orphan retirement independent of
-    whether this gate runs at all, and leaves this function a pure decision:
-    same arguments, same answer, no side effects — ``memory_store`` is a
-    parameter for the same reason, read but never mutated.
-
-    Args:
-        action: ``FULL``, ``INTERIM``, or ``RECONCILE`` — never ``AUTO``
-            (resolved before this is called).
-        config: Live server config — the SAME object the caller resolved
-            ``AUTO`` against, or the config in effect for a direct request.
-        pending_count: Pending sessions seen by the triage pre-stage, counted
-            BEFORE retirement.
-        named_count: How many of those classified NAMED (attributable).
-        memory_store: The live ``MemoryStore`` (``_state["memory_store"]``) —
-            distinct from the ``SpeakerStore`` :func:`_triage_pending_sessions`
-            takes as its own ``store`` argument — or ``None`` when no store
-            has been constructed yet.  Read only for ``RECONCILE``.
-
-    Returns:
-        A terminal ``"noop_*"`` string when there is nothing to consolidate,
-        ``None`` when the dispatch may proceed.
-    """
-    from paramem.memory.interim_adapter import iter_interim_dirs
-
-    if action is ConsolidationAction.RECONCILE:
-        if memory_store is None:
-            return None
-        # active_keys_in_tier is the non-mutating accessor (paramem/memory/
-        # store.py) -- unlike MemoryStore.registry(), which MINTS an empty
-        # registry for a tier that has never seen one.  A noop verdict must
-        # not itself create the registry it just reported as empty.
-        # tiers_with_registry() spans every registered tier, main and
-        # interim alike: a RECONCILE is a full consolidation whose input
-        # excludes pending sessions, so it recalls and absorbs the interim
-        # ring exactly like any full fold, and a ring holding the only
-        # active key must not noop.
-        if any(
-            memory_store.active_keys_in_tier(tier) for tier in memory_store.tiers_with_registry()
-        ):
-            return None
-        logger.info("Consolidation dispatch: no active keys in any tier — noop")
-        return "noop_no_stored_keys"
-
-    if action is ConsolidationAction.FULL:
-        # Content-bearing interim slots are content for the full fold no
-        # matter what max_interim_count says NOW — checked unconditionally so
-        # slots stranded by a later N>0 -> 0 config change still get absorbed
-        # and reaped instead of sitting on disk forever.
-        if any(iter_interim_dirs(config.adapter_dir, payload_only=True)):
-            return None
-        if config.consolidation.max_interim_count > 0:
-            # No interim-slot content, and at this count the full fold does
-            # not consume pending sessions directly -- that's the interim
-            # tier's job, so there is nothing else to check.
-            logger.info("Consolidation dispatch: no content-bearing interim slots — noop")
-            return "noop_no_interim_slots"
-        # max_interim_count == 0: no interim tier ever exists, so pending
-        # NAMED sessions are this fold's own content -- fall through.
-
-    # FULL at max_interim_count == 0 and INTERIM (any count) share the same
-    # input: pending sessions.
-    if named_count > 0:
-        logger.info("Consolidation dispatch: %d NAMED session(s) pending", named_count)
-        return None
-
-    if pending_count == 0:
-        logger.info("Consolidation dispatch: no pending sessions — noop")
-        return "noop_no_pending"
-    logger.info("Consolidation dispatch: no NAMED sessions remain — noop")
-    return "noop_no_named"
 
 
 def _record_consolidation_resume_blocked_incident(exc, event: str) -> None:
@@ -17151,9 +17259,10 @@ def _run_pending_event_resume() -> None:
     None``.  In that case it constructs a throwaway, locally-scoped empty
     :class:`~paramem.memory.store.MemoryStore` and threads it into whichever
     venue's loop-construction seam applies
-    (:func:`_get_or_create_consolidation_loop`'s *store* kwarg for the disk
-    venue, :func:`_run_stage_b_cycle`'s *store* kwarg — same seam — for the
-    weights venue) — ONLY when a fresh loop is being built; an
+    (:func:`~paramem.server.consolidation.get_or_create_consolidation_loop`'s
+    *store* kwarg for the disk venue, :func:`_run_stage_b_cycle`'s *store*
+    kwarg — same seam — for the weights venue) — ONLY when a fresh loop is
+    being built; an
     already-cached process-lifetime loop ignores the override.  The resumed
     event needs nothing FROM the store: :meth:`~paramem.training.consolidation.
     ConsolidationLoop._derive_key_counters` scans an empty store down to the
@@ -17188,19 +17297,19 @@ def _run_pending_event_resume() -> None:
     _store_override = MemoryStore() if _state.get("memory_store") is None else None
 
     if ledger.venue == "disk":
-        loop = _get_or_create_consolidation_loop(config, store=_store_override)
+        loop = get_or_create_consolidation_loop(_state, store=_store_override)
         try:
             result = _finish_resumed_event(loop, staged_event, router=_state.get("router"))
         except ConsolidationResumeBlocked as exc:
             _record_consolidation_resume_blocked_incident(exc, ledger.event)
-            _state["consolidating"] = False
+            _consolidation_terminal(None)
             return
         finalizer = (
             functools.partial(_finalize_interim, loop, result)
             if not _sl.full_topology(ledger.event)
             else functools.partial(_finalize_full, loop, result)
         )
-        _dispatch_finalize(finalizer)
+        _consolidation_terminal(finalizer)
         return
 
     def _body(loop, bt) -> "tuple[str, Callable[[], None] | None]":
@@ -17208,7 +17317,7 @@ def _run_pending_event_resume() -> None:
             result = _finish_resumed_event(loop, staged_event, router=_state.get("router"))
         except ConsolidationResumeBlocked as exc:
             _record_consolidation_resume_blocked_incident(exc, ledger.event)
-            return "resume_blocked", _finalize_stage_b_failure
+            return "resume_blocked", None
         if not _sl.full_topology(ledger.event):
             return "resumed_interim", functools.partial(_finalize_interim, loop, result)
         return "resumed_full", functools.partial(_finalize_full, loop, result)
@@ -17250,17 +17359,24 @@ def _dispatch_resume(config) -> "tuple[str, ConsolidationAction] | None":
         "Consolidation dispatch: resuming pending %s event ahead of any new dispatch",
         action_name,
     )
-    return _dispatch_to_executor(_run_pending_event_resume, "started_resume"), resumed_action
+    return (
+        _dispatch_to_executor(_run_pending_event_resume, "started_resume", action=resumed_action),
+        resumed_action,
+    )
 
 
 def _dispatch_consolidation(
     action: ConsolidationAction,
+    *,
+    spec: "calibrate_module.CalibrationRunSpec | None" = None,
 ) -> "tuple[str, ConsolidationAction]":
-    """Gate + dispatch one consolidation run.  The single arbitrator.
+    """Gate + dispatch one run against the model.  The single arbitrator.
 
-    Every consolidation door — the systemd tick and every operator endpoint —
-    comes through here.  Nothing below this function knows who asked, beyond
-    what *action* says.
+    Every run that touches the model — a consolidation fold, or a
+    calibration probe — comes through here: the systemd tick, every
+    operator consolidation endpoint, and every ``/calibrate/*`` route.
+    Nothing below this function knows who asked, beyond what *action* and
+    *spec* say.
 
     ``AUTO`` is requested by ``/scheduled-tick`` and by the boot-completion
     catch-up task (:func:`_run_boot_completion_tasks`, which dispatches
@@ -17274,10 +17390,12 @@ def _dispatch_consolidation(
     the TIME condition (is a cycle due), never the CONTENT condition (is
     there anything to consume), which the content gate still enforces on the
     resolved-or-direct ``FULL``/``INTERIM``/``RECONCILE`` either way — each on
-    its own input.
+    its own input.  A ``/calibrate/*`` route requests ``CALIBRATE`` or
+    ``CALIBRATE_PENDING`` and passes its own validated *spec* — the only
+    caller that ever passes one; every other door passes ``None``.
 
     Order (unconditional gates first, so an explicit request cannot walk past a
-    safety property):
+    safety property; ★ = gated on ``action.stages_event``):
 
     1. ``_consolidation_dispatch_guards()`` — base-swap active / already-running
        / cloud-only / bg-training / migration TRIAL active.  All actions.
@@ -17288,64 +17406,71 @@ def _dispatch_consolidation(
        explicit request defers on it too.  MUST stay ahead of resume (step 3):
        a weights-venue resume trains on GPU, and a chat-turn abort landing
        mid-resume would livelock the very heal step 3 exists to run.
-    3. **Resume-pending-first** (:func:`_dispatch_resume`) — a pending event's
-       ledger is resumed and finished before any new event starts, the
-       identical contract for every action including ``RECONCILE``; the
-       content gate below is skipped for a resume, since its input is the
-       ledger, not new material.  Runs ahead of BOTH the store-quarantine
-       verdict (step 4) and the tier-unverified gate (step 5): a resume
-       never re-stages — it replays the shadow-byte increments recorded when
-       the event was originally staged — so neither "there is no live store
-       to fold into" nor "a tier's binding is unknowable for a fresh merge"
-       applies to it, and finishing it is precisely what HEALS a store
-       quarantined by a crashed publish on a cold-born tier (the lift at
-       :func:`_finish_resumed_event`'s tail).  A dispatch that resumes never
-       reaches steps 4-6 on this same call — skipping the pre-stages (step 6)
-       on a resuming dispatch is a deliberate, accepted behavior change:
-       retiring orphan sessions is not time-critical, and the next
-       non-resuming dispatch runs it.
+    3. ★ **Resume-pending-first** (:func:`_dispatch_resume`) — a pending
+       event's ledger is resumed and finished before any new STAGING event
+       starts, the identical contract for every staging action including
+       ``RECONCILE``.  A non-staging action (a calibration probe) skips this
+       step and proceeds straight to step 4: a calibration run writes no
+       ledger, no shadow tree and no slot, and retires nothing — the resume
+       replays shadow bytes recorded at staging time, which a probe's own
+       dispatch neither depends on nor would corrupt.  A staging dispatch
+       that resumes never reaches steps 4-7 on this same call — skipping the
+       pre-stages (step 6-7) on a resuming dispatch is a deliberate, accepted
+       behavior change: retiring orphan sessions is not time-critical, and
+       the next non-resuming dispatch runs it.
     4. :func:`_store_quarantine_verdict` — the memory store is quarantined
        (the boot/lift store step could not publish a fresh
        :class:`~paramem.memory.store.MemoryStore`).  All actions, including
-       ``RECONCILE``: with no store there is nothing to fold into or rebuild
-       from.  Only reached when step 3 found nothing pending — the verdict
-       itself is unchanged for that case, quarantined-and-idle still defers
-       here exactly as before.
-    5. **Any MAIN tier's registry binding unverified SINCE the last store
-       step** — every action, including ``RECONCILE``.  Distinct from step 4:
-       this is drift a fold's own post-cycle revalidation
-       (:func:`_revalidate_adapter_manifests`) observed AFTER the last
-       successful boot/lift store step, not (yet) caught by a fresh one. A
-       tier the boot/fold validator could not bind to a registry has an
-       unknowable key set, which the merger's cross-tier identity space
-       cannot tolerate, and both persist branches would overwrite the very
-       manifest/registry pair preserved for recovery.
-    6. Retroactive orphan-session voice claim + :func:`_triage_pending_sessions`
-       — the two side-effect-only pre-stages.  Reached only on a dispatch
-       that did not resume at step 3 (see step 3's note) — retiring what can
-       never be attributed does not depend on which door was used, but it no
-       longer runs ahead of a resume.
-    7. ``pending_rehydration`` — an incoherent active store pre-empts every
-       action until the migration completes.  Runs after resume (step 3) for
-       the same reason it always did: the store migration is
-       content-preserving and needs a coherent, record-free tree, so a
-       pending event always resumes to completion first and the migration
-       only ever reaches a dispatch with no pending record.
-    8. **``AUTO`` only** — the suspend/power-off catch-up gate, and the
+       ``RECONCILE`` and every calibrate action: with no store there is
+       nothing to fold into, rebuild from, or construct the process-lifetime
+       loop against.
+    5. ★ **Any MAIN tier's registry binding unverified SINCE the last store
+       step** — every STAGING action, including ``RECONCILE``.  A
+       non-staging run mints no key and rewrites no registry, so the gate
+       does not apply to it.  Distinct from step 4: this is drift a fold's
+       own post-cycle revalidation (:func:`_revalidate_adapter_manifests`)
+       observed AFTER the last successful boot/lift store step, not (yet)
+       caught by a fresh one.
+    6. **Retroactive orphan-session voice claim** (:func:`_retro_claim_orphan_sessions`)
+       — every action, including both calibrate actions: it attributes, it
+       never retires, so a probe benefits from the same attribution a fold
+       does.
+    7. ★ **Retiring triage** — :func:`classify_pending_sessions` (pure) runs
+       unconditionally, alongside step 6, so the counts it returns are
+       available to the content gate for every action; the retirement side
+       effect (:func:`retire_unattributable_sessions`) runs only for a
+       staging action.  Reached only on a dispatch that did not resume at
+       step 3.
+    8. ``pending_rehydration`` — an incoherent active store pre-empts every
+       action, calibrate included, until the migration completes
+       (``started_migration``).  Runs after resume (step 3) for the same
+       reason it always did: the store migration is content-preserving and
+       needs a coherent, record-free tree, so a pending event always resumes
+       to completion first and the migration only ever reaches a dispatch
+       with no pending record.
+    9. **``AUTO`` only** — the suspend/power-off catch-up gate, and the
        resolution to ``FULL`` or ``INTERIM`` via :func:`_is_full_cycle_due`
-       (its only call site).  Both belong to the schedule; a direct
-       ``FULL``/``INTERIM``/``RECONCILE`` request skips straight past them.
-    9. **Every action reaching this point** — :func:`_consolidation_content_gate`.
-       An empty input set is empty whether the schedule resolved into it or
-       an operator named it directly.  A ``noop_*`` status is not a refusal —
-       it is the answer.  ``FULL``/``INTERIM`` check for new material;
-       ``RECONCILE`` checks whether any tier — main or interim — holds an
-       active key — no live store yet is unprovable and is treated as
-       "proceed", not "empty".
-    10. Dispatch via :func:`_dispatch_to_executor`, advancing the schedule
-        stamp (:func:`_stamp_scheduled_run`) on an ``AUTO`` dispatch only —
-        a direct ``FULL``/``INTERIM``/``RECONCILE`` request does not move
-        the cadence window.
+       (its only call site).  Both belong to the schedule; every other
+       action skips straight past them.
+    10. ``noop_no_interim_tier`` — ``INTERIM`` only.
+    11. **Every action reaching this point** —
+        :func:`~paramem.server.consolidation_action.consolidation_content_gate`.
+        An empty input set is empty whether the schedule resolved into it,
+        an operator named it directly, or a calibration probe asked for the
+        pending set.  A ``noop_*`` status is not a refusal — it is the
+        answer.  ``CALIBRATE`` never noops (the operator already supplied
+        the artifact); ``CALIBRATE_PENDING`` noops exactly as ``INTERIM``
+        does.
+    12. ★ :func:`_stamp_scheduled_run` — ``AUTO`` only (``AUTO`` is a staging
+        action, so both conditions hold; the stamp is written where it is
+        today).
+    13. Dispatch table: ``FULL``/``RECONCILE`` → :func:`_run_full_consolidation_sync`;
+        ``INTERIM`` → :func:`_extract_and_start_training`; ``CALIBRATE``/
+        ``CALIBRATE_PENDING`` → :func:`_run_calibration_sync`, answering
+        ``"started_calibration"`` — the one status that means THIS run was
+        submitted.
+    14. ★ The overdue incident :func:`_record_full_consolidation_overdue`
+        stays inside the ``FULL`` arm.
 
     Args:
         action: ``AUTO`` (the scheduled tick — let ``_is_full_cycle_due``
@@ -17353,16 +17478,22 @@ def _dispatch_consolidation(
             slots into main now — resolved from ``AUTO`` or requested
             directly by ``/consolidate``), ``INTERIM`` (absorb pending
             sessions into a new interim slot — resolved from ``AUTO`` or
-            requested directly by ``/consolidate/interim``), or ``RECONCILE``
+            requested directly by ``/consolidate/interim``), ``RECONCILE``
             (a full consolidation whose input excludes pending sessions:
             pending sessions stay pending; stored interim knowledge is
-            absorbed and reaped like any full fold — ``/reconsolidate``).
+            absorbed and reaped like any full fold — ``/reconsolidate``),
+            ``CALIBRATE`` (an operator-supplied calibration artifact), or
+            ``CALIBRATE_PENDING`` (a calibration probe over the pending
+            NAMED session set — ``POST /calibrate/extract_pending``).
+        spec: The calibration run's own validated payload.  Present only on
+            a ``CALIBRATE``/``CALIBRATE_PENDING`` dispatch; every other
+            caller passes ``None``.
 
     Returns:
         ``(status, action)`` — the terminal status string and the action as
         resolved (the requested action when the dispatch never got as far as
         resolving ``AUTO``).  ``deferred_*`` means "blocked, retry next tick";
-        ``noop_*`` means "nothing to do"; ``started*`` means the fold was
+        ``noop_*`` means "nothing to do"; ``started*`` means the run was
         submitted to the executor.
     """
     config = _state["config"]
@@ -17429,16 +17560,17 @@ def _dispatch_consolidation(
     # skipped deliberately — a resume's input is the ledger, not new
     # material — and so are the pre-stages below (retiring orphan sessions
     # is not time-critical; the next non-resuming dispatch runs them).
-    _resume = _dispatch_resume(config)
-    if _resume is not None:
-        if _scheduled:
-            # The resumed run counts as this window's run: stamping here
-            # means a later record-free tick inside the same window reads
-            # not-due instead of starting a fresh fold. It does not throttle
-            # resume itself, which runs unconditionally while a record is
-            # pending, regardless of the stamp.
-            _stamp_scheduled_run(config)
-        return _resume
+    if action.stages_event:
+        _resume = _dispatch_resume(config)
+        if _resume is not None:
+            if _scheduled:
+                # The resumed run counts as this window's run: stamping here
+                # means a later record-free tick inside the same window reads
+                # not-due instead of starting a fresh fold. It does not throttle
+                # resume itself, which runs unconditionally while a record is
+                # pending, regardless of the stamp.
+                _stamp_scheduled_run(config)
+            return _resume
 
     _quarantine_verdict = _store_quarantine_verdict()
     if _quarantine_verdict is not None:
@@ -17480,37 +17612,44 @@ def _dispatch_consolidation(
     # slot's payload no longer matches its manifest digest, defers every
     # action exactly like a no-matching-slot or key-count-mismatched tier
     # already did.
-    from paramem.memory.interim_adapter import MAIN_TIERS
-    from paramem.server.manifest_status import BINDING_ROW_STATUSES
+    if action.stages_event:
+        from paramem.memory.interim_adapter import MAIN_TIERS
+        from paramem.server.manifest_status import BINDING_ROW_STATUSES
 
-    _manifest_status = _state.get("adapter_manifest_status", {})
-    if any(
-        _manifest_status.get(_tier, {}).get("status") in BINDING_ROW_STATUSES
-        for _tier in MAIN_TIERS
-    ):
-        logger.warning(
-            "Consolidation dispatch (%s): a main tier's registry binding is unverified — deferred",
-            action.value,
-        )
-        return "deferred_tier_unverified", action
+        _manifest_status = _state.get("adapter_manifest_status", {})
+        if any(
+            _manifest_status.get(_tier, {}).get("status") in BINDING_ROW_STATUSES
+            for _tier in MAIN_TIERS
+        ):
+            logger.warning(
+                "Consolidation dispatch (%s): a main tier's registry binding "
+                "is unverified — deferred",
+                action.value,
+            )
+            return "deferred_tier_unverified", action
 
     # Retroactive voice-match claim: scan orphan sessions against every
     # enrolled speaker. Attributes sessions whose embeddings match an
     # existing profile at high confidence. Cheap — centroids are cached.
-    # Not reached on a dispatch that resumed above (see step 3's note).
+    # Every action, including both calibrate actions: it attributes, it
+    # never retires.  Not reached on a staging dispatch that resumed above
+    # (see step 3's note).
     _retro_claim_orphan_sessions()
 
-    # Pending-session triage: retire what can never be attributed (and expired
-    # holdables), and count what remains.  A side-effect pre-stage like the
-    # retro-claim above, NOT a gate — it runs for every non-resuming
-    # dispatch, so no door can switch orphan retirement off by skipping the
-    # content gate.  The counts feed that gate when the scheduled tick
-    # reaches it.
-    _pending_count, _named_count = _triage_pending_sessions(
+    # Pending-session triage: classify_pending_sessions is pure and runs
+    # unconditionally, alongside the retro-claim above, so its counts feed
+    # the content gate for every action including both calibrate actions.
+    # The retirement side effect (retiring what can never be attributed, and
+    # expired holdables) is a staging-only act: a non-staging run mutates no
+    # session state.
+    _triage = classify_pending_sessions(
         config,
         _state["session_buffer"],
         _state.get("speaker_store"),
     )
+    if action.stages_event:
+        retire_unattributable_sessions(config, _state["session_buffer"], _triage.drop_ids)
+    _pending_count, _named_count = _triage.pending_count, _triage.named_count
 
     # Active-store migration gate: when a mode-switch was detected at startup
     # (or an in-progress migration was interrupted), every consolidation
@@ -17532,7 +17671,12 @@ def _dispatch_consolidation(
             )
             return "migration_skipped_degraded", action
         logger.info("Consolidation dispatch: active-store migration pending — running migration")
-        return _dispatch_to_executor(_run_active_store_migration_sync, "started_migration"), action
+        return (
+            _dispatch_to_executor(
+                _run_active_store_migration_sync, "started_migration", action=action
+            ),
+            action,
+        )
 
     # AUTO is requested only by /scheduled-tick and the boot-completion
     # catch-up task, so "action is AUTO" already identifies one of those two
@@ -17588,11 +17732,12 @@ def _dispatch_consolidation(
         return "noop_no_interim_tier", action
 
     # The content gate applies to every action reaching this point (FULL,
-    # INTERIM, or RECONCILE — resolved from AUTO or requested directly): a
-    # manual door drops only the TIME condition (the deadline math above),
-    # never the CONTENT condition here.  Each action reads its own input
-    # through the gate's own branch — see `_consolidation_content_gate`.
-    _gate_status = _consolidation_content_gate(
+    # INTERIM, RECONCILE, CALIBRATE, or CALIBRATE_PENDING — resolved from
+    # AUTO or requested directly): a manual door drops only the TIME
+    # condition (the deadline math above), never the CONTENT condition here.
+    # Each action reads its own input through the gate's own branch — see
+    # `consolidation_content_gate`.
+    _gate_status = consolidation_content_gate(
         action,
         config,
         pending_count=_pending_count,
@@ -17631,13 +17776,34 @@ def _dispatch_consolidation(
         _event = "reconcile" if action is ConsolidationAction.RECONCILE else "full"
         return (
             _dispatch_to_executor(
-                functools.partial(_run_full_consolidation_sync, _event), "started_full"
+                functools.partial(_run_full_consolidation_sync, _event),
+                "started_full",
+                action=action,
+            ),
+            action,
+        )
+
+    if action in (ConsolidationAction.CALIBRATE, ConsolidationAction.CALIBRATE_PENDING):
+        assert spec is not None, (
+            f"{action.value} dispatch reached the executor arm with spec=None — every "
+            f"caller of a calibrate action must pass its own validated spec"
+        )
+        logger.info("Consolidation dispatch: starting calibration run (%s)", action.value)
+        return (
+            _dispatch_to_executor(
+                functools.partial(_run_calibration_sync, spec),
+                "started_calibration",
+                action=action,
+                spec=spec,
             ),
             action,
         )
 
     logger.info("Consolidation dispatch: starting interim extract + train")
-    return _dispatch_to_executor(_extract_and_start_training, "started"), action
+    return (
+        _dispatch_to_executor(_extract_and_start_training, "started", action=action),
+        action,
+    )
 
 
 def _retro_claim_orphan_sessions() -> int:
@@ -17857,6 +18023,37 @@ def _set_voice_pipeline_profile(
     logger.info("Voice pipeline profile: %r", profile)
 
 
+def _end_voice_eviction(*, lock_held: bool) -> None:
+    """Restore the voice pipeline to its target profile at a run's terminal.
+
+    Idempotent, and therefore unconditional at every call site: on a run
+    that never evicted this is a no-op, because ``_set_voice_pipeline_profile``
+    is idempotent — the same property the executor done callback already
+    relies on.
+
+    *lock_held* is a property of the calling FRAME, not of the run:
+    ``True`` on the ``BackgroundTrainer`` worker (which holds
+    ``gpu_lock_sync()`` for the whole Stage-B phase, so a second acquisition
+    would deadlock), ``False`` on the event loop and on an executor thread
+    that has already released it.
+
+    Terminal frames — three:
+
+    - ``_run_stage_b_cycle``'s worker, wrapped around ``body(loop, bt)`` so
+      it covers the success terminal and the crash terminal alike
+      (``lock_held=True``).
+    - The executor body of a run that ends without dispatching to Stage B —
+      ``_extract_and_start_training``'s abort / no-facts / simulate arms,
+      and ``_run_calibration_sync`` (``lock_held=False``).
+    - ``_consolidation_run_done`` (the executor future's done callback)
+      (``lock_held=False``).
+    """
+    try:
+        _set_voice_pipeline_profile(_target_profile(), lock_held=lock_held)
+    except Exception:
+        logger.exception("Voice restore raised; ignoring")
+
+
 def _build_bg_trainer(config) -> "BackgroundTrainer":
     """Construct a fresh BackgroundTrainer bound to the current model/tokenizer.
 
@@ -17941,6 +18138,7 @@ def _await_bg_cycle(
     speaker_id: str,
     mode: "Literal['simulate', 'train']",
     run_label: str,
+    pending: "PendingRelations",
     schedule: str = "",
     max_interim_count: int = 7,
     inference_fallback_adapter: str = "episodic",
@@ -17971,6 +18169,9 @@ def _await_bg_cycle(
         mode: ``"train"`` writes adapter weights; ``"simulate"`` writes a
             ``graph.json`` payload into the same written-slot envelope.
         run_label: Traceability tag passed to ``run_consolidation_cycle``.
+        pending: The batch's merged extraction product — the caller's own
+            :meth:`~paramem.training.consolidation.ConsolidationLoop.take_pending_relations`
+            take, forwarded verbatim to ``run_consolidation_cycle``.
         schedule: Consolidation refresh-cadence string for stamp computation.
         max_interim_count: Cap on concurrent interim adapters.
         inference_fallback_adapter: Adapter name recorded for bookkeeping only
@@ -18019,6 +18220,7 @@ def _await_bg_cycle(
             speaker_id=speaker_id,
             mode=mode,
             run_label=run_label,
+            pending=pending,
             schedule=schedule,
             max_interim_count=max_interim_count,
             session_ids=session_ids,
@@ -18107,6 +18309,7 @@ def _run_extraction_phase(
     all_procedural_rels = []
     session_ids = []
     speaker_ids = []
+    enrichment_signals: list[dict] = []
     total_relations = 0
 
     for session in pending:
@@ -18146,6 +18349,17 @@ def _run_extraction_phase(
             rel["speaker_id"] = session_speaker_id
             rel["session_id"] = session_id
 
+        # This session's own enrichment signal — no incident is written
+        # here; this function is the staging caller for the migration-trial
+        # path (it runs its own extraction loop rather than routing through
+        # the shared _extract_pending_sessions), so it arbitrates the batch
+        # itself below, once extraction finishes — the same obligation
+        # _extract_and_start_training and the full-cycle consume-pending
+        # pre-stage each discharge right after their own extraction call
+        # (see enrichment_signal's and arbitrate_enrichment_incidents's own
+        # docstrings for why the read/write split this way).
+        enrichment_signals.append(enrichment_signal(loop, session_id))
+
         all_episodic_rels.extend(episodic_rels)
         all_procedural_rels.extend(procedural_rels)
         total_relations += len(episodic_rels) + len(procedural_rels)
@@ -18161,6 +18375,18 @@ def _run_extraction_phase(
         if loop.shutdown_requested:
             logger.info("Shutdown requested — stopping extraction after %s", session_id)
             break
+
+    # This function merges via extract_session directly (not through the
+    # server's own _extract_pending_sessions), so this is where its own
+    # extraction lifetime ends — the one take, ahead of either fold call
+    # below.
+    pending_relations = loop.take_pending_relations()
+
+    # Staging-only bookkeeping the extraction stage itself no longer
+    # performs: this batch's enrichment signals are this function's own to
+    # arbitrate, exactly as _extract_and_start_training and the full
+    # pre-stage each do right after their own extraction call.
+    loop.arbitrate_enrichment_incidents(enrichment_signals)
 
     if not all_episodic_rels and not all_procedural_rels:
         logger.info("No relations extracted — skipping training")
@@ -18205,6 +18431,7 @@ def _run_extraction_phase(
                 speaker_id=primary_speaker_sim,
                 mode="simulate",
                 run_label=f"full-{primary_speaker_sim or 'anon'}",
+                pending=pending_relations,
                 schedule=config.consolidation.refresh_cadence,
                 max_interim_count=config.consolidation.max_interim_count,
                 session_ids=session_ids,
@@ -18274,6 +18501,7 @@ def _run_extraction_phase(
                 speaker_id=primary_speaker,
                 mode="train",
                 run_label=f"full-{primary_speaker or 'anon'}",
+                pending=pending_relations,
                 schedule=config.consolidation.refresh_cadence,
                 max_interim_count=config.consolidation.max_interim_count,
                 session_ids=session_ids,
@@ -18336,29 +18564,63 @@ def _run_extraction_phase(
     return summary
 
 
-def _scheduled_extract_done_callback(future):
-    """Clear the consolidating flag only if the extraction phase failed.
+def _consolidation_run_done(
+    action: ConsolidationAction,
+    spec: "calibrate_module.CalibrationRunSpec | None",
+    future,
+) -> None:
+    """Executor future's done callback for every run dispatched through
+    :func:`_dispatch_to_executor`.  Clears the consolidating flag only if
+    the run's OWN executor entry point raised — a normal return means the
+    entry point has already dispatched (or completed) its own terminal.
 
-    On success, _extract_and_start_training has submitted the interim
-    training job to the BG trainer and the flag will be cleared by the
-    job's _finalize_interim closure when the worker thread completes.
+    On success, the entry point (``_extract_and_start_training``,
+    ``_run_full_consolidation_sync``, ``_run_active_store_migration_sync``,
+    ``_run_calibration_sync``) has either submitted the next phase to the BG
+    trainer (whose own terminal will clear the flag) or already called
+    :func:`_consolidation_terminal` itself.
 
-    On VramExhausted, record a durable ``vram_exhausted`` incident so the
-    failure is visible via ``/status`` without scraping logs (derived from
-    the incident store at status build time).  Other exceptions still surface
-    only through the loud ``logger.exception`` line (operators tail the journal).
+    On an uncaught exception this callback is the only terminal reached, so
+    it records a typed incident, ends the voice eviction
+    (:func:`_end_voice_eviction`, ``lock_held=False`` — the callback runs on
+    the event-loop thread after the executor future has already returned;
+    idempotent, safe on a run that never evicted), and calls
+    :func:`_consolidation_terminal` itself:
 
-    Self-healing voice restore: this callback is attached to three executor
-    entry points — ``_extract_and_start_training``, ``_run_full_consolidation_sync``,
-    and ``_run_active_store_migration_sync``.  On any failure path it calls
-    ``_set_voice_pipeline_profile`` unconditionally; idempotency inside that
-    function makes this safe on paths that did not evict voice.  Lock state at
-    this site is ``lock_held=False``: the callback runs on the event-loop thread
-    after the executor future has already returned.
+    - ``VramExhausted`` — a durable ``vram_exhausted`` incident, so the
+      failure is visible via ``/status`` without scraping logs.
+    - Any other exception on a STAGING action — logged only (unchanged);
+      the staging entry points raise into ``_run_stage_b_cycle``'s own
+      crash envelope before ever reaching an uncaught exception here, so
+      this arm is a defensive fallback, not the primary path.
+    - Any other exception on a non-staging (calibration) action — a
+      ``calibration_crash`` incident, keyed by the run's own route
+      (``spec.route_path``), detailed with ``spec.run_id``.  This closes an
+      existing gap: previously an uncaught calibration-executor exception
+      produced no incident at all, only a log line.
+
+    On a non-staging action (``spec is not None``) the terminal it dispatches
+    ALSO sets ``_state["calibration_run"]["outcome"] = "crashed"`` (plus
+    ``finished_at``), keyed by ``spec.run_id`` — independent of which
+    incident branch fired above, so a VRAM-exhausted calibration crash
+    records the outcome exactly like any other.  Without this, the record
+    :func:`_submit_calibration_run` published at dispatch keeps
+    ``outcome: None`` forever after a crash, since the normal-completion
+    terminal (:func:`_run_calibration_sync`'s own) never runs; a client
+    polling for the response then finds no ``response.json`` and no way to
+    tell "still running" from "crashed" apart.  A staging action's terminal
+    stays bookkeeping-free (``None``), as before — staging's own outcome
+    lives in its ledger, not this record.
+
+    Args:
+        action: The action this run resolved to — bound at dispatch time.
+        spec: The calibration run's own validated payload, or ``None`` for
+            a staging action.
+        future: The completed executor future.
     """
     exc = future.exception()
     if exc:
-        logger.error("Scheduled extraction failed: %s", exc, exc_info=exc)
+        logger.error("Consolidation run (%s) failed: %s", action.value, exc, exc_info=exc)
         if isinstance(exc, VramExhausted):
             phase = exc.args[0] if exc.args else "unknown"
             _at = datetime.now(timezone.utc).isoformat()
@@ -18370,73 +18632,51 @@ def _scheduled_extract_done_callback(future):
                 summary=f"Consolidation: VRAM exhausted at phase {phase}",
                 detail={"type": "vram_exhausted", "phase": phase, "at": _at},
             )
-        # Voice was evicted at the cycle's start (doc-only path). On
-        # exception the cycle's normal end-of-cycle restore was not
-        # reached; restore here so STT/TTS aren't stuck unloaded until
-        # the next /chat triggers a wyoming reconnect.
-        try:
-            _set_voice_pipeline_profile(_target_profile(), lock_held=False)
-        except Exception:
-            logger.exception("Voice restore on extraction failure path raised; ignoring")
-        _state["consolidating"] = False
+        elif not action.stages_event and spec is not None:
+            record_incident(
+                data_state_dir(_state["config"].paths.data),
+                type="calibration_crash",
+                key=spec.route_path,
+                severity="failed",
+                summary=f"Calibration run crashed: {spec.route_path}",
+                detail={
+                    "type": "calibration_crash",
+                    "route_path": spec.route_path,
+                    "run_id": spec.run_id,
+                    "error": str(exc),
+                    "at": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+
+        terminal_body = None
+        if not action.stages_event and spec is not None:
+
+            def terminal_body() -> None:
+                _record = _state.get("calibration_run")
+                if _record is not None and _record.get("run_id") == spec.run_id:
+                    _record["outcome"] = "crashed"
+                    _record["finished_at"] = datetime.now(timezone.utc).isoformat()
+
+        _end_voice_eviction(lock_held=False)
+        _consolidation_terminal(terminal_body)
 
 
-def _get_or_create_consolidation_loop(config, *, store=None):
-    """Return the process-lifetime ``ConsolidationLoop``, creating it on first use.
-
-    Shared get-or-create used by :func:`_run_stage_b_cycle` (all three Stage-B
-    entry points — interim-train, full-cycle, active-store migration) and by
-    the interim path's :func:`_extract_pending_sessions` call, which needs the
-    loop before any BG-dispatch decision is made — earlier than
-    ``_run_stage_b_cycle`` is ever called for that path.  Idempotent: a
-    second call finds the loop already in ``_state`` and returns it
-    unchanged — *store* is then a no-op, since only a first-time construction
-    reads it.
-
-    Args:
-        store: Optional store override used ONLY when a fresh loop is being
-            constructed (``_state["consolidation_loop"]`` is ``None``).
-            ``None`` (default, every caller except the pending-event resume)
-            falls through to ``_state["memory_store"]`` — unchanged behavior.
-            The pending-event resume (:func:`_run_pending_event_resume`)
-            passes a locally-constructed empty :class:`MemoryStore` here when
-            ``_state["memory_store"] is None`` (the store is quarantined), so
-            the resumed event's loop has something to fold into without
-            waiting on a lift; :func:`_eager_create_consolidation_loop`
-            never passes this — it still refuses to construct a loop at all
-            while ``_state["memory_store"]`` is ``None``.
-    """
-    loop = _state.get("consolidation_loop")
-    if loop is not None:
-        return loop
-    loop = create_consolidation_loop(
-        _state["model"],
-        _state["tokenizer"],
-        config,
-        store if store is not None else _state["memory_store"],
-        state_provider=lambda: _state,
-    )
-    _state["consolidation_loop"] = loop
-    _state["model"] = loop.model
-    return loop
-
-
-def _eager_create_consolidation_loop(config) -> None:
+def _eager_create_consolidation_loop() -> None:
     """Create the consolidation loop as soon as a local-mode model is resident.
 
     ``/status``'s ``adapter_loaded`` reading (``"episodic" in
     model.peft_config``) only becomes true once a ``ConsolidationLoop``
     exists — its ``__init__`` ensures the adapters are mounted.  Left to the
-    lazy get-or-create (:func:`_get_or_create_consolidation_loop`), a
-    freshly booted server with no trained slots reports
+    lazy get-or-create
+    (:func:`~paramem.server.consolidation.get_or_create_consolidation_loop`),
+    a freshly booted server with no trained slots reports
     ``adapter_loaded=false`` until the first consolidation door runs, so the
     same server flips the reading across a restart.  Calling this at every
     site where a local-mode model lands in ``_state`` (lifespan boot,
     ``_live_reload_base_model``'s tail) keeps the reading symmetric.
 
     No-op in cloud-only mode (model/tokenizer absent) and a no-op when the
-    loop already exists — :func:`_get_or_create_consolidation_loop` is
-    itself idempotent.
+    loop already exists — the shared get-or-create is itself idempotent.
 
     Raises whatever ``ConsolidationLoop.__init__`` raises (e.g.
     ``VramExhausted`` from ``ensure_adapters`` -> ``create_adapter``
@@ -18452,20 +18692,7 @@ def _eager_create_consolidation_loop(config) -> None:
         and _state.get("tokenizer") is not None
         and _state.get("memory_store") is not None
     ):
-        _get_or_create_consolidation_loop(config)
-
-
-def _finalize_stage_b_failure() -> None:
-    """Clear-only finalizer shared by every failed Stage-B cycle.
-
-    No ``router.reload()``: a consolidation event only touches the live
-    store at its own go-live
-    (:meth:`~paramem.training.consolidation.ConsolidationLoop.run_build_and_publish`);
-    a failure before that point leaves the store pre-cycle-identical, and the
-    full/migration failure paths never published anything either — there is
-    nothing new for a failed cycle to reload.
-    """
-    _state["consolidating"] = False
+        get_or_create_consolidation_loop(_state)
 
 
 def _run_stage_b_cycle(
@@ -18481,25 +18708,28 @@ def _run_stage_b_cycle(
     full-cycle, and active-store-migration Stage-B closures.
 
     Creates/reuses the process-lifetime :class:`ConsolidationLoop` (via
-    :func:`_get_or_create_consolidation_loop`), wires the singleton
+    :func:`~paramem.server.consolidation.get_or_create_consolidation_loop`), wires the singleton
     :class:`BackgroundTrainer`, then submits *body* to the trainer under the
     entry GPU-cooldown gate.  *body* receives ``(loop, bt)`` and must return
     a terminal descriptor ``(outcome, finalizer)`` or raise — it must never
-    call ``_dispatch_finalize`` itself; this function is the sole dispatch
+    call ``_consolidation_terminal`` itself; this function is the sole dispatch
     point, reached from exactly one call site for every terminal (success or
     failure — there is no ``if mode`` fork here).
 
     On a normal return, ``_state["model"]`` picks up any PEFT rebind
     performed by *body* (``create_adapter`` / ``create_interim_adapter``) and
-    the terminal's ``finalizer`` — a zero-arg callable, or ``None`` for
-    :func:`_finalize_stage_b_failure` — is dispatched via
-    :func:`_dispatch_finalize`.
+    the terminal's ``finalizer`` — a zero-arg callable, or ``None`` for a
+    clear-only terminal — is dispatched via :func:`_consolidation_terminal`.
+
+    ``body(loop, bt)`` is wrapped in ``_end_voice_eviction(lock_held=True)``
+    so the voice pipeline is restored on the success terminal and the crash
+    terminal alike, from this ONE call site — idempotent, safe on paths
+    that never evicted voice.
 
     On an uncaught exception, records a *kind* incident keyed by
-    *incident_key* (severity ``"failed"``), restores the voice pipeline
-    (``lock_held=True`` — idempotent, safe on paths that never evicted
-    voice), and dispatches :func:`_finalize_stage_b_failure`.  A terminal
-    that the caller wants to treat as a *normal*, non-incident outcome
+    *incident_key* (severity ``"failed"``) and dispatches
+    :func:`_consolidation_terminal` with no bookkeeping.  A terminal that
+    the caller wants to treat as a *normal*, non-incident outcome
     (``aborted``, ``noop``, ``extraction_failed``, ...) must be
     returned by *body*, not raised — raising always produces a *kind*
     incident.
@@ -18518,7 +18748,7 @@ def _run_stage_b_cycle(
         failure_detail: Incident detail payload on an uncaught exception.
         body: The path-specific Stage-B payload, closing over whatever
             pre-stage state (extracted relations, session ids, ...) it needs.
-        store: Forwarded to :func:`_get_or_create_consolidation_loop`
+        store: Forwarded to :func:`~paramem.server.consolidation.get_or_create_consolidation_loop`
             unchanged — ``None`` (default) for the three ordinary Stage-B
             entry points; the pending-event resume's weights-venue call
             passes a locally-constructed empty store when
@@ -18526,7 +18756,7 @@ def _run_stage_b_cycle(
             never blocks the resume that heals it.
     """
     config = _state["config"]
-    loop = _get_or_create_consolidation_loop(config, store=store)
+    loop = get_or_create_consolidation_loop(_state, store=store)
     bt = _active_bg_trainer(config)
     loop._bg_trainer = bt
 
@@ -18538,7 +18768,10 @@ def _run_stage_b_cycle(
             label="fold",
         )
         try:
-            outcome, finalizer = body(loop, bt)
+            try:
+                outcome, finalizer = body(loop, bt)
+            finally:
+                _end_voice_eviction(lock_held=True)
         except Exception as exc:
             logger.exception("%s crashed", kind)
             # BookkeepingInvariantViolation names the divergent tier/keys on
@@ -18586,11 +18819,7 @@ def _run_stage_b_cycle(
                 )
             except Exception:
                 logger.exception("Failed to record %s incident (non-fatal)", kind)
-            try:
-                _set_voice_pipeline_profile(_target_profile(), lock_held=True)
-            except Exception:
-                logger.exception("Voice restore on %s failure path raised; ignoring", kind)
-            _dispatch_finalize(_finalize_stage_b_failure)
+            _consolidation_terminal(None)
             return
         _state["model"] = loop.model
         # Neutral cycle label on the success line — `kind` is an incident
@@ -18600,7 +18829,7 @@ def _run_stage_b_cycle(
         # "full"/"active_store") identifies the Stage-B path without that
         # implication.
         logger.info("%s: cycle complete (outcome=%s)", incident_key, outcome)
-        _dispatch_finalize(finalizer if finalizer is not None else _finalize_stage_b_failure)
+        _consolidation_terminal(finalizer)
 
     bt.submit(_worker, inference_fallback_adapter="episodic")
 
@@ -18698,7 +18927,7 @@ def _finalize_interim(loop, result: dict, *, extraction=None) -> None:
     event whose ledger names the interim door (``ledger.event`` is
     literally ``"interim"``).
 
-    Runs on the asyncio event loop via ``_dispatch_finalize``.  Revalidates
+    Runs on the asyncio event loop via ``_consolidation_terminal``.  Revalidates
     every tier's ``adapter_manifest_status`` row against the freshly-saved
     interim slot (:func:`_revalidate_adapter_manifests` — NOT pure: it also
     performs its documented ``.pending/`` sweep via ``sweep_orphan_pending``,
@@ -18841,7 +19070,6 @@ def _finalize_interim(loop, result: dict, *, extraction=None) -> None:
         resolve_incidents_by_type(_interim_state_dir, "consolidation_resume_blocked")
     except Exception:
         logger.exception("Post-interim run-status/incident bookkeeping failed (non-fatal)")
-    _state["consolidating"] = False
     logger.info(
         "Scheduled-tick complete — adapter=%s, %d total keys",
         result.get("adapter_name"),
@@ -18887,6 +19115,32 @@ class _PendingExtraction:
     evicted_voice:
         ``True`` when the batch contained a document session and the stage
         moved the voice pipeline to CPU.  The CALLER owns the restore.
+    pending:
+        The fold's input — this batch's merged extraction product, captured
+        (and the extraction graph's keying surface reset) exactly once, at
+        this stage's single return, by
+        :meth:`~paramem.training.consolidation.ConsolidationLoop.take_pending_relations`.
+    per_session:
+        One record per session attempted — ``{session_id, speaker_id,
+        source_type, episodic_count, procedural_count, status}`` — for the
+        run's own diagnostics; never read by production retirement/fold
+        logic.
+    chunk_failures:
+        This run's own OOM-skipped-chunk records — the same dicts a staging
+        caller additionally copies into ``_state["chunk_failures"]``.
+    enrichment_signals:
+        One record per session — ``{session_id, anonymize,
+        cloud_enrichment_degraded}`` — read from each session's own
+        ``session_graph.diagnostics`` (via ``loop.last_session_graph``)
+        right after its ``extract_session`` call.  No incident is written
+        here; a staging caller passes this batch to
+        :meth:`~paramem.training.consolidation.ConsolidationLoop.arbitrate_enrichment_incidents`.
+    vram_headroom_warning:
+        This run's own low-headroom attention record (the dict
+        :func:`~paramem.utils.vram_guard.check_vram_headroom` writes into,
+        never ``_state`` directly), or ``None`` when headroom never
+        dropped below the configured floor.  A staging caller copies it
+        into ``_state["vram_low_headroom_warning"]``.
     aborted:
         The ``ExtractionFailed`` that aborted the whole batch, or ``None``
         on a normal return.  When set, no session may be retired.
@@ -18898,6 +19152,11 @@ class _PendingExtraction:
     failed_session_ids: set[str]
     speaker_ids: list[str]
     evicted_voice: bool
+    pending: "PendingRelations"
+    per_session: list[dict]
+    chunk_failures: list[dict]
+    enrichment_signals: list[dict]
+    vram_headroom_warning: "dict | None"
     aborted: "ExtractionFailed | None" = None
 
     def completed_session_ids(self, session_buffer) -> list[str]:
@@ -19001,16 +19260,24 @@ def _extract_pending_sessions(loop, *, lock_held: bool) -> _PendingExtraction:
       exception arrives here, ``loop.extract_session`` has already reset the
       merger graph, so nothing this batch extracted — including any chunk
       that merged successfully earlier in the same batch — survives in
-      ``loop.merger.graph``.  Everything extracted so far is dropped, ALL
-      sessions stay pending, an ``extraction_failed`` incident is recorded
-      keyed by the failing phase, and the abort is RETURNED in
-      :attr:`_PendingExtraction.aborted` — never raised, so the caller can still
-      see :attr:`_PendingExtraction.evicted_voice` and restore voice itself.
+      ``loop.merger.graph``.  ALL sessions stay pending, an
+      ``extraction_failed`` incident is recorded keyed by the failing phase,
+      and the abort is RECORDED in :attr:`_PendingExtraction.aborted` —
+      never raised, so the caller can still see
+      :attr:`_PendingExtraction.evicted_voice` and restore voice itself.
+      The session loop ``break``s rather than returning, so every path
+      reaches the single
+      :meth:`~paramem.training.consolidation.ConsolidationLoop.take_pending_relations`
+      take below exactly once — the extraction graph's lifetime ends here
+      on every exit, not only the clean one.
 
     Args:
         loop: The process-lifetime ``ConsolidationLoop``.  ``extract_session``
-            merges each session graph into its cumulative graph, which is what
-            the consume-pending fold later captures.
+            merges each session graph into its cumulative graph; this
+            function's own single return takes it
+            (:meth:`~paramem.training.consolidation.ConsolidationLoop.take_pending_relations`)
+            into :attr:`_PendingExtraction.pending`, the value every caller
+            threads into its own fold call.
         lock_held: ``True`` when the caller already holds ``gpu_lock_sync()``
             (the consume-pending pre-stage runs on the BackgroundTrainer worker
             thread, which holds it for the whole fold — a second acquisition on
@@ -19041,7 +19308,7 @@ def _extract_pending_sessions(loop, *, lock_held: bool) -> _PendingExtraction:
         )
         == SessionClass.NAMED
     }
-    pending = [s for s in session_buffer.get_pending() if s["session_id"] in named_ids]
+    pending_sessions = [s for s in session_buffer.get_pending() if s["session_id"] in named_ids]
 
     result = _PendingExtraction(
         episodic_rels=[],
@@ -19049,17 +19316,40 @@ def _extract_pending_sessions(loop, *, lock_held: bool) -> _PendingExtraction:
         session_ids=[],
         failed_session_ids=set(),
         speaker_ids=[],
-        evicted_voice=bool(pending) and any(s.get("source_type") == "document" for s in pending),
+        evicted_voice=bool(pending_sessions)
+        and any(s.get("source_type") == "document" for s in pending_sessions),
+        pending=PendingRelations(episodic=[], procedural=[]),
+        per_session=[],
+        chunk_failures=[],
+        enrichment_signals=[],
+        vram_headroom_warning=None,
     )
+    _headroom_sink: dict = {}
 
     with nullcontext() if lock_held else gpu_lock_sync():
         if result.evicted_voice:
             _set_voice_pipeline_profile("cpu", lock_held=True)
 
-        for session in pending:
+        for session in pending_sessions:
             session_id = session["session_id"]
             session_speaker_id = session.get("speaker_id")
+            source_type = session.get("source_type", "transcript")
             result.session_ids.append(session_id)
+
+            def _session_record(
+                status: str, *, episodic_count: int = 0, procedural_count: int = 0
+            ) -> dict:
+                """This iteration's ``per_session`` row — the one place
+                that shape is built, for every outcome (vram_exhausted,
+                extraction_failed, ok) this session can reach."""
+                return {
+                    "session_id": session_id,
+                    "speaker_id": session_speaker_id,
+                    "source_type": source_type,
+                    "episodic_count": episodic_count,
+                    "procedural_count": procedural_count,
+                    "status": status,
+                }
 
             if loop.shutdown_requested:
                 logger.info("Shutdown — stopping extraction early")
@@ -19075,11 +19365,14 @@ def _extract_pending_sessions(loop, *, lock_held: bool) -> _PendingExtraction:
                 # catches an actual OOM mid-generate and re-raises it as
                 # VramExhausted (so /status shows the failure without log
                 # scraping); this is the early operator signal that the booked
-                # headroom is being consumed.
+                # headroom is being consumed.  The sink is this run's own
+                # dict, never _state directly (a non-staging run must not
+                # mutate production attention state) — a staging caller
+                # copies it into _state["vram_low_headroom_warning"] itself.
                 check_vram_headroom(
                     session_id,
                     int(config.vram.vram_cache_headroom_gib * 2**30),
-                    _state,
+                    _headroom_sink,
                 )
                 with vram_scope(session_id):
                     episodic_rels, procedural_rels = loop.extract_session(
@@ -19093,7 +19386,7 @@ def _extract_pending_sessions(loop, *, lock_held: bool) -> _PendingExtraction:
                         or None,
                         plausibility_judge=config.consolidation.extraction_plausibility_judge,
                         plausibility_stage=config.consolidation.extraction_plausibility_stage,
-                        source_type=session.get("source_type", "transcript"),
+                        source_type=source_type,
                         event_time=session["started_at"],
                     )
             except VramExhausted as exc:
@@ -19104,13 +19397,14 @@ def _extract_pending_sessions(loop, *, lock_held: bool) -> _PendingExtraction:
                     phase,
                 )
                 result.failed_session_ids.add(session_id)
-                _state.setdefault("chunk_failures", []).append(
+                result.chunk_failures.append(
                     {
                         "session_id": session_id,
                         "phase": phase,
                         "at": datetime.now(timezone.utc).isoformat(),
                     }
                 )
+                result.per_session.append(_session_record("vram_exhausted"))
                 continue
             except ExtractionFailed as exc:
                 logger.error(
@@ -19121,7 +19415,7 @@ def _extract_pending_sessions(loop, *, lock_held: bool) -> _PendingExtraction:
                     exc.reason,
                     len(result.session_ids),
                 )
-                _state.setdefault("chunk_failures", []).append(
+                result.chunk_failures.append(
                     {
                         "session_id": session_id,
                         "phase": exc.phase,
@@ -19129,6 +19423,8 @@ def _extract_pending_sessions(loop, *, lock_held: bool) -> _PendingExtraction:
                         "at": datetime.now(timezone.utc).isoformat(),
                     }
                 )
+                # extraction_failed is unconditional for every run — a hard
+                # input fault the operator must see regardless of who asked.
                 record_incident(
                     data_state_dir(config.paths.data),
                     type="extraction_failed",
@@ -19143,8 +19439,9 @@ def _extract_pending_sessions(loop, *, lock_held: bool) -> _PendingExtraction:
                         "at": datetime.now(timezone.utc).isoformat(),
                     },
                 )
+                result.per_session.append(_session_record("extraction_failed"))
                 result.aborted = exc
-                return result
+                break
 
             for rel in episodic_rels:
                 rel["speaker_id"] = session_speaker_id
@@ -19159,7 +19456,26 @@ def _extract_pending_sessions(loop, *, lock_held: bool) -> _PendingExtraction:
             result.episodic_rels.extend(episodic_rels)
             result.procedural_rels.extend(procedural_rels)
             result.speaker_ids.append(session_speaker_id)
+            result.per_session.append(
+                _session_record(
+                    "ok",
+                    episodic_count=len(episodic_rels),
+                    procedural_count=len(procedural_rels),
+                )
+            )
 
+            # This session's own enrichment signal — no incident is
+            # written here (see arbitrate_enrichment_incidents's own
+            # docstring for why the write moved to the staging caller).
+            result.enrichment_signals.append(enrichment_signal(loop, session_id))
+
+        # The single door out of the extraction accumulation: captures the
+        # merged product (episodic/procedural, already split) and resets the
+        # keying surface, on every exit path — clean, OOM-skipped, or
+        # ExtractionFailed abort alike.
+        result.pending = loop.take_pending_relations()
+
+    result.vram_headroom_warning = _headroom_sink.get("vram_low_headroom_warning")
     return result
 
 
@@ -19184,14 +19500,12 @@ def _extract_and_start_training():
     slot.  Main adapters are only updated by the full-cycle path that
     calls ``loop.consolidate(...)``.
     """
-    from paramem.server.consolidation import session_retention_dir
-
     config = _state["config"]
     session_buffer = _state["session_buffer"]
 
     # Create or reuse consolidation loop — needed here for the extraction pass,
     # earlier than _run_stage_b_cycle's own get-or-create at training time below.
-    loop = _get_or_create_consolidation_loop(config)
+    loop = get_or_create_consolidation_loop(_state)
 
     # --- Extract all sessions ---
     # ``lock_held=False``: this runs in an executor thread that holds no GPU
@@ -19203,7 +19517,15 @@ def _extract_and_start_training():
     all_procedural_rels = extraction.procedural_rels
     session_ids = extraction.session_ids
     failed_session_ids = extraction.failed_session_ids
-    evict_voice_for_cycle = extraction.evicted_voice
+
+    # Staging-only bookkeeping the extraction stage itself no longer
+    # performs: this is an INTERIM dispatch, so the batch's own OOM-skip
+    # records, enrichment incidents, and low-headroom attention row are
+    # this run's to adopt.
+    _state.setdefault("chunk_failures", []).extend(extraction.chunk_failures)
+    loop.arbitrate_enrichment_incidents(extraction.enrichment_signals)
+    if extraction.vram_headroom_warning is not None:
+        _state["vram_low_headroom_warning"] = extraction.vram_headroom_warning
 
     if extraction.aborted is not None:
         # Whole-batch abort (ExtractionFailed): every session stays pending and
@@ -19211,9 +19533,8 @@ def _extract_and_start_training():
         # recorded the incident; reclaim the voice pipeline it evicted (the
         # cycle drops out without reaching any finalize) and clear the flag so
         # the retry path is not blocked by "deferred_already_running".
-        if evict_voice_for_cycle:
-            _set_voice_pipeline_profile(_target_profile(), lock_held=False)
-        _state["consolidating"] = False
+        _end_voice_eviction(lock_held=False)
+        _consolidation_terminal(None)
         return
 
     # No-facts fast path: a zero-relation batch never reaches
@@ -19229,13 +19550,9 @@ def _extract_and_start_training():
     # one and only site that can retire these sessions.
     if not all_episodic_rels and not all_procedural_rels:
         logger.info("No relations extracted — skipping")
-        session_buffer.mark_consolidated(
-            extraction.completed_session_ids(session_buffer),
-            retention_dir=session_retention_dir(loop, config),
-        )
+        _retire_extracted_sessions(extraction, session_buffer, loop, config)
 
-        if evict_voice_for_cycle:
-            _set_voice_pipeline_profile(_target_profile(), lock_held=False)
+        _end_voice_eviction(lock_held=False)
 
         # State mutations + router reload — post to the event loop so the
         # router cache and inference path see post-cycle state atomically with
@@ -19265,9 +19582,8 @@ def _extract_and_start_training():
                 )
             except Exception:
                 logger.exception("Failed to record no_facts run status (non-fatal)")
-            _state["consolidating"] = False
 
-        _dispatch_finalize(_finalize_no_facts)
+        _consolidation_terminal(_finalize_no_facts)
         return
 
     # --- Simulate mode: peer storage backend ---
@@ -19294,6 +19610,7 @@ def _extract_and_start_training():
             speaker_id=primary_speaker_sim,
             mode="simulate",
             run_label=f"tick-{primary_speaker_sim or 'anon'}",
+            pending=extraction.pending,
             schedule=config.consolidation.refresh_cadence,
             max_interim_count=config.consolidation.max_interim_count,
             session_ids=extraction.completed_session_ids(session_buffer),
@@ -19314,8 +19631,7 @@ def _extract_and_start_training():
         # stage_event/run_build_and_publish spine; cycle_<N>/ snapshots
         # are dropped.
 
-        if evict_voice_for_cycle:
-            _set_voice_pipeline_profile(_target_profile(), lock_held=False)
+        _end_voice_eviction(lock_held=False)
 
         # State mutations + router reload — post to the event loop so the
         # router cache and inference path see the freshly-written state
@@ -19331,7 +19647,7 @@ def _extract_and_start_training():
         # reporting field (the "simulated" outcome string, the run-status
         # summary) is read from sim_result — never a second, hand-rolled
         # finalizer body.
-        _dispatch_finalize(
+        _consolidation_terminal(
             functools.partial(_finalize_interim, loop, sim_result, extraction=extraction)
         )
         return
@@ -19378,6 +19694,7 @@ def _extract_and_start_training():
             speaker_id=primary_speaker,
             mode="train",
             run_label=f"tick-{primary_speaker or 'anon'}",
+            pending=extraction.pending,
             schedule=schedule,
             max_interim_count=max_interim_count,
             interim_overflow_slack=interim_overflow_slack,
@@ -19469,13 +19786,10 @@ def _extract_and_start_training():
         # between this point and the finalizer resumes to complete retirement
         # exactly once instead of retiring twice from two different sources.
 
-        # Restore voice pipeline on the BG worker thread, before returning the
-        # terminal — voice load is multi-second GPU work; running it on the
-        # event loop would block asyncio.  Symmetric with the eviction at
-        # cycle start: paired with the _state["consolidating"] = False signal
-        # inside _finalize_interim.
-        if evict_voice_for_cycle:
-            _set_voice_pipeline_profile(_target_profile(), lock_held=True)
+        # Voice restore is not this closure's job: _run_stage_b_cycle's own
+        # worker wraps this whole body(loop, bt) call in
+        # _end_voice_eviction(lock_held=True), covering the success terminal
+        # and the crash terminal alike from one call site.
 
         finalizer = functools.partial(_finalize_interim, loop, result, extraction=extraction)
         return _cycle_mode, finalizer
@@ -19502,7 +19816,7 @@ def _finalize_full_status_only(
     Each of these two terminals already ran its own outcome-specific
     logging inside the full-cycle body before returning; this finalizer's
     sole job is the durable run-status record and the flag clear, both of
-    which must happen atomically with everything else ``_dispatch_finalize``
+    which must happen atomically with everything else ``_consolidation_terminal``
     guards.
 
     Args:
@@ -19527,7 +19841,6 @@ def _finalize_full_status_only(
         )
     except Exception:
         logger.exception("Failed to record %s run status (non-fatal)", outcome)
-    _state["consolidating"] = False
 
 
 def _finalize_full(
@@ -19655,7 +19968,6 @@ def _finalize_full(
             resolve_incidents_by_type(_full_state_dir, "interim_overflow_pending")
     except Exception:
         logger.exception("Post-full-cycle run-status/incident bookkeeping failed (non-fatal)")
-    _state["consolidating"] = False
     logger.info("Full cycle bookkeeping complete — %d total keys", total_keys)
 
 
@@ -19718,10 +20030,11 @@ def _run_full_consolidation_sync(event: "Literal['full', 'reconcile']") -> None:
         # folds only).
         #
         # At count == 0 no interim slots are ever minted, so pending sessions
-        # must be extracted directly here, before the fold, depositing their
-        # relations into loop.merger.graph.  The full fold's consume_pending
-        # capture stage then snapshots merger.graph into extra_relations and
-        # trains them into the main tiers.  The standard full cycle (count > 0)
+        # must be extracted directly here, before the fold — this pre-stage's
+        # own take_pending_relations() call captures the merged product as
+        # `extraction.pending`, threaded into loop.consolidate(pending=...)
+        # below, and trains them into the main tiers.  The standard full cycle
+        # (count > 0)
         # collapses already-trained interim slots into main and runs no
         # extraction chain at all — hence no pre-stage and no voice eviction.
         # A reconcile event never consumes pending sessions by definition —
@@ -19752,14 +20065,20 @@ def _run_full_consolidation_sync(event: "Literal['full', 'reconcile']") -> None:
         if _consume_pending:
             extraction = _extract_pending_sessions(loop, lock_held=True)
 
-            # Restore voice INSIDE the worker's GPU lock (lock_held=True —
-            # lock_held=False would re-acquire the non-reentrant lock and
-            # deadlock).  Fires on every pre-stage exit: normal, empty batch,
-            # OOM-skipped chunks, and the ExtractionFailed abort below.  An
-            # uncaught exception skips this and is restored by
-            # _run_stage_b_cycle's crash envelope (also lock_held=True).
-            if extraction.evicted_voice:
-                _set_voice_pipeline_profile(_target_profile(), lock_held=True)
+            # Staging-only bookkeeping the extraction stage itself no longer
+            # performs: this is a FULL/consume-pending dispatch, so the
+            # batch's own OOM-skip records, enrichment incidents, and
+            # low-headroom attention row are this run's to adopt.
+            _state.setdefault("chunk_failures", []).extend(extraction.chunk_failures)
+            loop.arbitrate_enrichment_incidents(extraction.enrichment_signals)
+            if extraction.vram_headroom_warning is not None:
+                _state["vram_low_headroom_warning"] = extraction.vram_headroom_warning
+
+            # The voice restore is not this pre-stage's job: _run_stage_b_cycle's
+            # own worker wraps this whole body(loop, bt) call in
+            # _end_voice_eviction(lock_held=True), so the restore fires AFTER
+            # the fold — the heaviest GPU phase on this 8 GiB card runs
+            # without the ~1.5 GiB STT+TTS pair on top of it.
 
             if extraction.aborted is not None:
                 # Whole-batch abort: all sessions stay pending, next tick
@@ -19771,7 +20090,7 @@ def _run_full_consolidation_sync(event: "Literal['full', 'reconcile']") -> None:
             event=event,
             trainer=bt,
             router=_state.get("router"),
-            consume_pending=_consume_pending,
+            pending=(extraction.pending if extraction is not None else None),
             session_ids=(
                 extraction.completed_session_ids(_cp_session_buffer)
                 if extraction is not None
@@ -19877,8 +20196,8 @@ def _run_full_consolidation_sync(event: "Literal['full', 'reconcile']") -> None:
         # content.
         #
         # When max_interim_count == 0 (consume-pending mode): the pre-stage above
-        # extracted pending sessions into merger.graph, and the fold's consume_pending
-        # capture trained them into the main tiers.  MF-A Site B: mark
+        # captured the pending sessions' extraction product as `pending`, and the
+        # fold trained it into the main tiers.  MF-A Site B: mark
         # extraction-succeeded sessions consolidated now that the fold has persisted
         # their knowledge to the main tiers.  Extraction-failed sessions stay pending.
 
@@ -19979,7 +20298,7 @@ def _arm_active_store_migration(config) -> bool:
 def _finalize_migration(loop, updated) -> None:
     """Success/terminal finalizer for the active-store-migration Stage-B cycle.
 
-    Runs on the asyncio event loop via ``_dispatch_finalize``.  Records the
+    Runs on the asyncio event loop via ``_consolidation_terminal``.  Records the
     durable run-status row and, on ``all_tiers_done``, clears
     ``pending_rehydration`` (restoring ``effective_mode`` to the operator's
     configured mode) and auto-resolves migration incidents.  Partial
@@ -20021,13 +20340,6 @@ def _finalize_migration(loop, updated) -> None:
             "Active-store migration complete; effective_mode=%s",
             _state["config"].consolidation.mode,
         )
-    # Partial completion: pending_rehydration stays True so a re-trigger
-    # picks up remaining tiers. effective_mode stays at source_mode.
-    # peft_config alone is not a safe key set: a ``train → simulate``
-    # migration unloads main adapters, so iterating it misses them and
-    # the inference path sees a stale snapshot from boot.  Reading
-    # from disk also drops entries for slots the migration deleted.
-    _state["consolidating"] = False
 
 
 def _run_active_store_migration_sync() -> None:
@@ -20058,8 +20370,8 @@ def _run_active_store_migration_sync() -> None:
         # completed by another caller). Clear pending and return.
         _state["pending_rehydration"] = False
         _state["effective_mode"] = config.consolidation.mode
-        _state["consolidating"] = False
         logger.info("Active-store migration: state file absent — clearing pending flag")
+        _consolidation_terminal(None)
         return
 
     def _run_migration_on_worker(loop, bt) -> "tuple[str, Callable[[], None] | None]":

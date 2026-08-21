@@ -766,13 +766,14 @@ class TestVramConfig:
 
 
 class TestDoneCallbackErrorSurfacing:
-    """`_scheduled_extract_done_callback` populates `_state["last_consolidation_error"]`.
+    """`_consolidation_run_done` records a durable incident on a crashed run.
 
     The callback runs on the asyncio event loop after the consolidation
     executor finishes. When the executor raised :class:`VramExhausted`,
-    the callback must stash a structured error in `_state` so /status
-    can surface it. Other exceptions are logged but do not populate the
-    field.
+    the callback records a `vram_exhausted` incident in the durable
+    incident store (`incidents.json`) so `/status` can surface it. Other
+    exceptions are logged and, on a non-staging (calibration) action,
+    recorded as a `calibration_crash` incident instead.
     """
 
     @staticmethod
@@ -784,14 +785,15 @@ class TestDoneCallbackErrorSurfacing:
         return future
 
     def test_vram_exhausted_populates_state(self, tmp_path):
-        """On VramExhausted, _scheduled_extract_done_callback records a durable
+        """On VramExhausted, _consolidation_run_done records a durable
         incident in the incident store (``incidents.json``) and clears the
         ``consolidating`` flag.  The incident detail matches the historic shape
         ``{"type", "phase", "at"}`` so downstream ``/status`` consumers stay
         HTTP-stable.
         """
-        from paramem.server.app import _scheduled_extract_done_callback, _state
+        from paramem.server.app import _consolidation_run_done, _state
         from paramem.server.config import PathsConfig, ServerConfig
+        from paramem.server.consolidation_action import ConsolidationAction
         from paramem.server.incidents import read_incidents
 
         cfg = ServerConfig()
@@ -804,7 +806,7 @@ class TestDoneCallbackErrorSurfacing:
         try:
             _state["config"] = cfg
             future = self._make_future_with_exception(VramExhausted("session-xyz"))
-            _scheduled_extract_done_callback(future)
+            _consolidation_run_done(ConsolidationAction.INTERIM, None, future)
             # Incident must be recorded in the durable store.
             incidents = read_incidents(tmp_path / "state")
             active = [i for i in incidents if i.type == "vram_exhausted" and i.status == "active"]
@@ -822,8 +824,9 @@ class TestDoneCallbackErrorSurfacing:
         """Non-VramExhausted exceptions do not record an incident and do not
         populate the incident store.
         """
-        from paramem.server.app import _scheduled_extract_done_callback, _state
+        from paramem.server.app import _consolidation_run_done, _state
         from paramem.server.config import PathsConfig, ServerConfig
+        from paramem.server.consolidation_action import ConsolidationAction
         from paramem.server.incidents import read_incidents
 
         cfg = ServerConfig()
@@ -836,7 +839,7 @@ class TestDoneCallbackErrorSurfacing:
         try:
             _state["config"] = cfg
             future = self._make_future_with_exception(RuntimeError("unrelated"))
-            _scheduled_extract_done_callback(future)
+            _consolidation_run_done(ConsolidationAction.INTERIM, None, future)
             # No incident should be written for a generic exception.
             incidents = read_incidents(tmp_path / "state")
             vram_incidents = [i for i in incidents if i.type == "vram_exhausted"]

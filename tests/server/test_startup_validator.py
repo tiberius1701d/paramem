@@ -100,11 +100,14 @@ def _build_write_context(output_dir) -> object:
 class TestEagerConsolidationLoopCreation:
     def test_creates_loop_when_model_tokenizer_and_store_present(self) -> None:
         """Local-mode state (model + tokenizer + memory_store all present)
-        creates the consolidation loop via the shared get-or-create."""
+        creates the consolidation loop via the shared get-or-create.
+
+        ``_eager_create_consolidation_loop`` is zero-arg — it reads
+        ``_state`` directly rather than taking a ``config`` parameter."""
         from paramem.server import app as app_module
 
-        config = MagicMock(name="config")
         state = {
+            "config": MagicMock(name="config"),
             "model": MagicMock(name="model"),
             "tokenizer": MagicMock(name="tokenizer"),
             "memory_store": MagicMock(name="memory_store"),
@@ -113,18 +116,18 @@ class TestEagerConsolidationLoopCreation:
 
         with (
             patch.object(app_module, "_state", state),
-            patch.object(app_module, "_get_or_create_consolidation_loop") as mock_get_or_create,
+            patch.object(app_module, "get_or_create_consolidation_loop") as mock_get_or_create,
         ):
-            app_module._eager_create_consolidation_loop(config)
+            app_module._eager_create_consolidation_loop()
 
-        mock_get_or_create.assert_called_once_with(config)
+        mock_get_or_create.assert_called_once_with(state)
 
     def test_noop_in_cloud_only_mode(self) -> None:
         """No model resident (cloud-only) — the loop is never created."""
         from paramem.server import app as app_module
 
-        config = MagicMock(name="config")
         state = {
+            "config": MagicMock(name="config"),
             "model": None,
             "tokenizer": None,
             "memory_store": None,
@@ -133,19 +136,27 @@ class TestEagerConsolidationLoopCreation:
 
         with (
             patch.object(app_module, "_state", state),
-            patch.object(app_module, "_get_or_create_consolidation_loop") as mock_get_or_create,
+            patch.object(app_module, "get_or_create_consolidation_loop") as mock_get_or_create,
         ):
-            app_module._eager_create_consolidation_loop(config)
+            app_module._eager_create_consolidation_loop()
 
         mock_get_or_create.assert_not_called()
 
     def test_noop_when_loop_already_exists(self) -> None:
         """Idempotent: a second call (loop already resident) does not build
         another one — proven through the real create_consolidation_loop
-        factory, not just a mocked get-or-create."""
+        factory, not just a mocked get-or-create.
+
+        ``create_consolidation_loop`` is patched at its DEFINING module
+        (``paramem.server.consolidation``), not at ``app_module`` — the
+        get-or-create it backs resolves the name via its own
+        ``__globals__`` when it runs, so a patch placed on the importing
+        module (``app_module``) has no effect."""
         from paramem.server import app as app_module
+        from paramem.server import consolidation as consolidation_module
 
         state = {
+            "config": MagicMock(name="config"),
             "model": MagicMock(name="model"),
             "tokenizer": MagicMock(name="tokenizer"),
             "memory_store": MagicMock(name="memory_store"),
@@ -157,11 +168,11 @@ class TestEagerConsolidationLoopCreation:
         with (
             patch.object(app_module, "_state", state),
             patch.object(
-                app_module, "create_consolidation_loop", return_value=fake_loop
+                consolidation_module, "create_consolidation_loop", return_value=fake_loop
             ) as mock_create,
         ):
-            app_module._eager_create_consolidation_loop(MagicMock(name="config"))
-            app_module._eager_create_consolidation_loop(MagicMock(name="config"))
+            app_module._eager_create_consolidation_loop()
+            app_module._eager_create_consolidation_loop()
 
         mock_create.assert_called_once()
 

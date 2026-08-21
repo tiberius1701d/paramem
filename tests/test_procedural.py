@@ -157,6 +157,7 @@ class TestProceduralRoutedToInterim:
         loop.merger.graph.add_edge("bob", "jazz", predicate="likes", relation_type="preference")
         loop.merger.graph.nodes["bob"]["speaker_id"] = "speaker0"
 
+        pending = loop.take_pending_relations()
         loop.run_consolidation_cycle(
             [
                 {
@@ -170,6 +171,7 @@ class TestProceduralRoutedToInterim:
             [],
             speaker_id="speaker0",
             mode="train",
+            pending=pending,
             run_label="test_interim_route",
             stamp=_INTERIM_STAMP,
         )
@@ -199,6 +201,7 @@ class TestProceduralRoutedToInterim:
         loop.merger.graph.add_edge("bob", "jazz", predicate="likes", relation_type="preference")
         loop.merger.graph.nodes["bob"]["speaker_id"] = "speaker0"
 
+        pending = loop.take_pending_relations()
         loop.run_consolidation_cycle(
             [
                 {
@@ -212,6 +215,7 @@ class TestProceduralRoutedToInterim:
             [],
             speaker_id="speaker0",
             mode="train",
+            pending=pending,
             run_label="test_interim_probe_target",
             stamp=_INTERIM_STAMP,
         )
@@ -252,6 +256,7 @@ class TestSimulateModeRegistersProceduralKeys:
         )
         loop.merger.graph.nodes["carol"]["speaker_id"] = "speaker0"
 
+        pending = loop.take_pending_relations()
         result = loop.run_consolidation_cycle(
             [
                 {
@@ -265,6 +270,7 @@ class TestSimulateModeRegistersProceduralKeys:
             [],
             speaker_id="speaker0",
             mode="simulate",
+            pending=pending,
             run_label="test_simulate",
             stamp=_INTERIM_STAMP,
         )
@@ -340,6 +346,7 @@ class TestProceduralRecallGateAllOrNothing:
             patch.object(loop.store, "put", side_effect=_spy_put),
             pytest.raises(RecallGateRejected),
         ):
+            pending = loop.take_pending_relations()
             loop.run_consolidation_cycle(
                 [
                     {
@@ -360,6 +367,7 @@ class TestProceduralRecallGateAllOrNothing:
                 [],
                 speaker_id="speaker0",
                 mode="train",
+                pending=pending,
                 run_label="test_all_or_nothing",
                 stamp=_INTERIM_STAMP,
             )
@@ -409,6 +417,7 @@ class TestProceduralKeyRegisteredInInterimTier:
         loop.merger.graph.add_edge("eve", "running", predicate="enjoys", relation_type="preference")
         loop.merger.graph.nodes["eve"]["speaker_id"] = "speaker0"
 
+        pending = loop.take_pending_relations()
         loop.run_consolidation_cycle(
             [
                 {
@@ -422,6 +431,7 @@ class TestProceduralKeyRegisteredInInterimTier:
             [],
             speaker_id="speaker0",
             mode="train",
+            pending=pending,
             run_label="test_tier_regression",
             stamp=_INTERIM_STAMP,
         )
@@ -448,6 +458,7 @@ class TestProceduralKeyRegisteredInInterimTier:
         loop.merger.graph.add_edge("frank", "chess", predicate="plays", relation_type="preference")
         loop.merger.graph.nodes["frank"]["speaker_id"] = "speaker0"
 
+        pending = loop.take_pending_relations()
         loop.run_consolidation_cycle(
             [
                 {
@@ -461,6 +472,7 @@ class TestProceduralKeyRegisteredInInterimTier:
             [],
             speaker_id="speaker0",
             mode="train",
+            pending=pending,
             run_label="test_bk_preference",
             stamp=_INTERIM_STAMP,
         )
@@ -491,6 +503,7 @@ class TestProceduralKeyRegisteredInInterimTier:
         )
         loop.merger.graph.nodes["gwen"]["speaker_id"] = "speaker0"
 
+        pending = loop.take_pending_relations()
         loop.run_consolidation_cycle(
             [
                 {
@@ -504,6 +517,7 @@ class TestProceduralKeyRegisteredInInterimTier:
             [],
             speaker_id="speaker0",
             mode="train",
+            pending=pending,
             run_label="test_active_keys",
             stamp=_INTERIM_STAMP,
         )

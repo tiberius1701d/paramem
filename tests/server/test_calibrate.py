@@ -19,12 +19,12 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
-from fastapi.testclient import TestClient
 
 from paramem.graph.extraction_pipeline import ExtractionPipeline
 from paramem.graph.phase_trace import (
@@ -34,8 +34,9 @@ from paramem.graph.phase_trace import (
     chain_start,
     phase_trace,
 )
-from paramem.graph.prompts import _load_prompt
+from paramem.graph.prompts import _load_prompt, prompt_overrides
 from paramem.graph.schema import SessionGraph
+from paramem.server import calibrate
 from paramem.server.calibrate import (
     _CHAIN,
     CalibrateAnonymizeFactsRequest,
@@ -45,18 +46,13 @@ from paramem.server.calibrate import (
     CalibrateParams,
     CalibrateRespondRequest,
     _effective_params,
-    _preflight,
     _production_turn_markers,
     _require_turn_marked_transcript,
-    _run_calibration,
-    calibrate_anonymize_facts,
-    calibrate_chain,
-    calibrate_name,
-    calibrate_normalize,
-    calibrate_respond,
+    preflight,
 )
 from paramem.server.config import CloudConfig, PathsConfig, SanitizationConfig
 from paramem.server.inference import ChatResult, handle_chat
+from paramem.utils.artifacts import calibration_run
 
 
 def _empty_graph() -> SessionGraph:
@@ -78,6 +74,7 @@ def _state_disabled() -> dict:
         "consolidating": False,
         "model": MagicMock(),
         "tokenizer": MagicMock(),
+        "memory_store": MagicMock(),
     }
 
 
@@ -101,8 +98,72 @@ def _state_enabled() -> dict:
         "consolidating": False,
         "model": MagicMock(),
         "tokenizer": MagicMock(),
+        "memory_store": MagicMock(),
         "consolidation_loop": MagicMock(),
     }
+
+
+# ---------------------------------------------------------------------------
+# Test-only composition helper — drives the real production pieces
+# (``preflight`` -> ``build_spec`` -> ``run_stage``) in the boundary's own
+# order, so behaviour is asserted against real code, never a synthetic
+# double.  Confined to this test module.  ``build_spec`` is itself
+# production code (``paramem/server/calibrate.py``), shared with the route
+# handlers in ``app.py`` — there is exactly one declaration of each stage's
+# shape (route path, input-prompt phase, seed support, params source:
+# ``calibrate._CHAIN`` / ``calibrate._STANDALONE``).  The ``with
+# calibration_run(...), prompt_overrides(...):`` pair below is a deliberate,
+# small, test-only mirror of the two lines
+# :func:`~paramem.server.app._run_calibration_sync` opens around this same
+# ``run_stage`` call for a real dispatch — that function is the one
+# production owner of the scope; this helper exists only so a test can
+# drive ``run_stage`` without the FastAPI/executor/GPU-lock machinery
+# around it.
+# ---------------------------------------------------------------------------
+
+_DEFAULT_TEST_ARTIFACT_ROOT = Path("/tmp/test-calibrate")
+
+
+def _run_stage(state: dict, stage: str, req, *, artifact_dir: Path | None = None) -> dict:
+    """Run one declared calibration stage exactly as a route would, minus
+    the FastAPI/executor/GPU-lock machinery: ``preflight`` -> ``build_spec``
+    -> ``run_stage``, inside the same ``calibration_run``/``prompt_overrides``
+    scope the real dispatch opens.  ``stage`` is a key of ``calibrate._CHAIN``
+    (the five chain use cases) or ``calibrate._STANDALONE`` (``normalize``,
+    ``anonymize_facts``, ``name``, ``respond``)."""
+    preflight(state)
+    run_dir = artifact_dir if artifact_dir is not None else _DEFAULT_TEST_ARTIFACT_ROOT / stage
+    spec = calibrate.build_spec(stage, state, req, run_id="test-run", artifact_dir=run_dir)
+    with calibration_run(run_dir), prompt_overrides(spec.overrides):
+        return calibrate.run_stage(spec, state)
+
+
+def _run_chain(
+    state: dict, use_case: str, req: CalibrateChainRequest, *, artifact_dir: Path | None = None
+) -> dict:
+    return _run_stage(state, use_case, req, artifact_dir=artifact_dir)
+
+
+def _run_normalize(
+    state: dict, req: CalibrateNormalizeRequest, *, artifact_dir: Path | None = None
+) -> dict:
+    return _run_stage(state, "normalize", req, artifact_dir=artifact_dir)
+
+
+def _run_anonymize_facts(
+    state: dict, req: CalibrateAnonymizeFactsRequest, *, artifact_dir: Path | None = None
+) -> dict:
+    return _run_stage(state, "anonymize_facts", req, artifact_dir=artifact_dir)
+
+
+def _run_name(state: dict, req: CalibrateNameRequest, *, artifact_dir: Path | None = None) -> dict:
+    return _run_stage(state, "name", req, artifact_dir=artifact_dir)
+
+
+def _run_respond(
+    state: dict, req: CalibrateRespondRequest, *, artifact_dir: Path | None = None
+) -> dict:
+    return _run_stage(state, "respond", req, artifact_dir=artifact_dir)
 
 
 def _state_respond() -> dict:
@@ -197,30 +258,47 @@ def _peft_model_mock() -> MagicMock:
 class TestPreflight:
     def test_404_when_flag_disabled(self):
         with pytest.raises(HTTPException) as exc:
-            _preflight(_state_disabled())
+            preflight(_state_disabled())
         assert exc.value.status_code == 404
         assert "disabled" in exc.value.detail.lower()
 
-    def test_503_when_consolidating(self):
-        state = _state_enabled()
-        state["consolidating"] = True
-        with pytest.raises(HTTPException) as exc:
-            _preflight(state)
-        assert exc.value.status_code == 503
-        assert "consolidation" in exc.value.detail.lower()
-        assert exc.value.headers.get("Retry-After") == "60"
-
     def test_503_when_model_missing(self):
+        """No model handle -> 503, independently of ``_state["mode"]``.
+
+        A real consolidation cycle running is no longer a preflight
+        concern: it is now the arbitrator's own guard, answering 200
+        ``deferred_already_running`` — see
+        ``TestConsolidationDispatchGuards`` in test_consolidate_dispatch.py.
+        """
         state = _state_enabled()
         state["model"] = None
         with pytest.raises(HTTPException) as exc:
-            _preflight(state)
+            preflight(state)
         assert exc.value.status_code == 503
         assert "local model" in exc.value.detail.lower()
 
+    def test_503_when_tokenizer_missing(self):
+        state = _state_enabled()
+        state["tokenizer"] = None
+        with pytest.raises(HTTPException) as exc:
+            preflight(state)
+        assert exc.value.status_code == 503
+        assert "local model" in exc.value.detail.lower()
+
+    def test_503_when_memory_store_missing(self):
+        """No memory store handle -> 503 ``store_unavailable`` — the arm
+        that keeps a calibration dispatch from being the first construction
+        of the process-lifetime loop singleton with no store override."""
+        state = _state_enabled()
+        state["memory_store"] = None
+        with pytest.raises(HTTPException) as exc:
+            preflight(state)
+        assert exc.value.status_code == 503
+        assert "memory store" in exc.value.detail.lower()
+
     def test_passes_when_enabled_idle_loaded(self):
         # Should not raise.
-        _preflight(_state_enabled())
+        preflight(_state_enabled())
 
 
 class TestRequireTurnMarkedTranscript:
@@ -324,21 +402,14 @@ class TestChainGuards:
 
     def test_disabled_404(self, use_case):
         with pytest.raises(HTTPException) as exc:
-            calibrate_chain(_state_disabled(), use_case, self._req(use_case))
+            _run_chain(_state_disabled(), use_case, self._req(use_case))
         assert exc.value.status_code == 404
-
-    def test_consolidating_503(self, use_case):
-        state = _state_enabled()
-        state["consolidating"] = True
-        with pytest.raises(HTTPException) as exc:
-            calibrate_chain(state, use_case, self._req(use_case))
-        assert exc.value.status_code == 503
 
     def test_unmarked_transcript_400(self, use_case):
         state = _state_enabled()
         req = self._req(use_case, transcript="Should I follow up with Alex tomorrow?")
         with pytest.raises(HTTPException) as exc:
-            calibrate_chain(state, use_case, req)
+            _run_chain(state, use_case, req)
         assert exc.value.status_code == 400
         assert "turn-marked" in exc.value.detail.lower()
         assert not state["consolidation_loop"].extraction.run.called
@@ -346,7 +417,7 @@ class TestChainGuards:
     def test_empty_speaker_id_400(self, use_case):
         state = _state_enabled()
         with pytest.raises(HTTPException) as exc:
-            calibrate_chain(state, use_case, self._req(use_case, speaker_id=""))
+            _run_chain(state, use_case, self._req(use_case, speaker_id=""))
         assert exc.value.status_code == 400
         assert "speaker_id" in exc.value.detail
 
@@ -358,7 +429,7 @@ class TestChainGuards:
         state["config"].paths = PathsConfig(calibration=tmp_path)
         req = self._req(use_case, prompt_variants={"extraction.txt": "typo_variant.txt"})
         with pytest.raises(HTTPException) as exc:
-            calibrate_chain(state, use_case, req)
+            _run_chain(state, use_case, req)
         assert exc.value.status_code == 400
         assert "variant not found" in exc.value.detail.lower()
         assert not state["consolidation_loop"].extraction.run.called
@@ -374,7 +445,7 @@ class TestChainSeedGuards:
         state = _state_enabled()
         req = CalibrateChainRequest(transcript="[user] hi there", speaker_id="speaker0")
         with pytest.raises(HTTPException) as exc:
-            calibrate_chain(state, use_case, req)
+            _run_chain(state, use_case, req)
         assert exc.value.status_code == 400
         assert _CHAIN[use_case].start in exc.value.detail
         assert not state["consolidation_loop"].extraction.run.called
@@ -388,7 +459,7 @@ class TestChainSeedGuards:
             graph={"not_a": "session graph"},
         )
         with pytest.raises(HTTPException) as exc:
-            calibrate_chain(state, use_case, req)
+            _run_chain(state, use_case, req)
         assert exc.value.status_code == 400
         assert "SessionGraph" in exc.value.detail
 
@@ -403,7 +474,7 @@ class TestChainSeedGuards:
             state["consolidation_loop"].extraction.run_procedural.side_effect = _chain_side_effect(
                 decl.stop or decl.start
             )
-            result = calibrate_chain(
+            result = _run_chain(
                 state,
                 use_case,
                 CalibrateChainRequest(transcript="[user] hi there", speaker_id="speaker0"),
@@ -441,7 +512,7 @@ class TestChainDispatch:
         fields: dict = {"transcript": "[user] hi there", "speaker_id": "speaker0"}
         if _CHAIN[use_case].injects == "graph":
             fields["graph"] = {"session_id": "calib", "timestamp": "2026-01-01T00:00:00Z"}
-        calibrate_chain(state, use_case, CalibrateChainRequest(**fields))
+        _run_chain(state, use_case, CalibrateChainRequest(**fields))
         entry = getattr(state["consolidation_loop"].extraction, _CHAIN[use_case].entry)
         assert entry.called
 
@@ -453,7 +524,7 @@ class TestChainDispatch:
         fields: dict = {"transcript": "[user] hi there", "speaker_id": "speaker0"}
         if decl.injects == "graph":
             fields["graph"] = {"session_id": "calib", "timestamp": "2026-01-01T00:00:00Z"}
-        calibrate_chain(state, use_case, CalibrateChainRequest(**fields))
+        _run_chain(state, use_case, CalibrateChainRequest(**fields))
         assert captured["start"] == decl.start
         assert captured["stop"] == decl.stop
 
@@ -467,14 +538,14 @@ class TestChainDispatch:
             speaker_id="speaker0",
             graph={"session_id": "seeded", "timestamp": "2026-01-01T00:00:00Z"},
         )
-        calibrate_chain(state, "anonymize", req)
+        _run_chain(state, "anonymize", req)
         assert isinstance(captured["seed"], SessionGraph)
         assert captured["seed"].session_id == "seeded"
 
     def test_transcript_use_case_seeds_nothing(self):
         captured: dict = {}
         state = self._capturing_state(captured)
-        calibrate_chain(
+        _run_chain(
             state,
             "extract",
             CalibrateChainRequest(transcript="[user] hi there", speaker_id="speaker0"),
@@ -489,7 +560,7 @@ class TestChainDispatch:
             speaker_id="speaker0",
             stop_phase="second_order_extract",
         )
-        calibrate_chain(state, "extract", req)
+        _run_chain(state, "extract", req)
         assert captured["stop"] == "second_order_extract"
 
     def test_operator_stop_ignored_where_the_endpoint_fixes_one(self):
@@ -501,7 +572,7 @@ class TestChainDispatch:
             graph={"session_id": "calib", "timestamp": "2026-01-01T00:00:00Z"},
             stop_phase="second_order_extract",
         )
-        calibrate_chain(state, "plausibility", req)
+        _run_chain(state, "plausibility", req)
         assert captured["stop"] == "deanon_plausibility"
 
     def test_invalid_stop_phase_400s_before_any_pipeline_call(self):
@@ -516,7 +587,7 @@ class TestChainDispatch:
             stop_phase="not_a_real_phase",
         )
         with pytest.raises(HTTPException) as exc:
-            calibrate_chain(state, "extract", req)
+            _run_chain(state, "extract", req)
         assert exc.value.status_code == 400
         assert "not_a_real_phase" in exc.value.detail
         assert not state["consolidation_loop"].extraction.run.called
@@ -524,9 +595,9 @@ class TestChainDispatch:
     def test_valid_but_non_firing_stop_phase_passes_guard(self):
         """A real member of PHASE_NAMES that this chain run never opens
         clears guard-time validation (it is a valid name, just not
-        applicable) — the eventual 400 comes from the declared-step-
-        unreached path, proven here only by the pipeline having been
-        called at all."""
+        applicable) — the run still completes (post-200 there is no
+        response left to fail), naming the gap in ``unreached_step``,
+        proven here only by the pipeline having been called at all."""
         state = self._capturing_state({})
         state["consolidation_loop"].extraction.run.side_effect = _chain_side_effect("local_extract")
         req = CalibrateChainRequest(
@@ -534,55 +605,13 @@ class TestChainDispatch:
             speaker_id="speaker0",
             stop_phase="name_extract",
         )
-        with pytest.raises(HTTPException):
-            calibrate_chain(state, "extract", req)
+        result = _run_chain(state, "extract", req)
+        assert result["unreached_step"] is not None
         assert state["consolidation_loop"].extraction.run.called
 
-    def test_run_opens_a_calibration_scope_under_the_calibration_root(self, tmp_path):
-        """The run's artifacts are directed at a per-run directory under
-        paths.calibration — so a production hook firing DURING the run (the
-        graph tier's normalization pass writes through the same writer)
-        lands there too, independently of the production debug switch."""
-        from paramem.utils.artifacts import _CALIBRATION_ROOT
-
-        state = _state_enabled()
-        state["config"].paths = PathsConfig(calibration=tmp_path)
-        seen: dict = {}
-
-        def _capture(*_args, **_kwargs):
-            seen["root"] = _CALIBRATION_ROOT.get()
-
-        state["consolidation_loop"].extraction.run.side_effect = _chain_side_effect(
-            "local_extract", _capture
-        )
-        calibrate_chain(
-            state,
-            "extract",
-            CalibrateChainRequest(transcript="[user] hello there", speaker_id="speaker0"),
-        )
-
-        assert seen["root"] is not None
-        assert seen["root"].parent == tmp_path / "artifacts"
-        assert seen["root"].name.startswith("extract_")
-        # Scope closed on the way out — it never leaks past the run.
-        assert _CALIBRATION_ROOT.get() is None
-
-    def test_result_is_emitted_through_the_one_writer(self):
-        """The response goes to the shared artifact hook — the single surface
-        for pipeline artifacts — not to a second writer owned by this module.
-
-        Mutation: reintroduce a private write in calibrate.py -> the hook is
-        never called and this fails.
-        """
-        state = _state_enabled()
-        state["consolidation_loop"].extraction.run.side_effect = _chain_side_effect("local_extract")
-        req = CalibrateChainRequest(transcript="[user] hello there", speaker_id="speaker0")
-
-        with patch("paramem.server.calibrate.on_calibration_result") as hook:
-            result = calibrate_chain(state, "extract", req)
-
-        assert hook.call_count == 1
-        assert hook.call_args.args[0] == result
+    # Artifact-scope opening (``calibration_run``) and the response.json
+    # write (``on_calibration_result``) are the executor envelope's job now
+    # (``app._run_calibration_sync``), not calibrate.py's — covered there.
 
     def test_dispatch_surfaces_focus_step_raw_output(self):
         """The inspected step's ``raw_output`` is surfaced at the response top
@@ -611,7 +640,7 @@ class TestChainDispatch:
             return g
 
         state["consolidation_loop"].extraction.run.side_effect = _record
-        result = calibrate_chain(
+        result = _run_chain(
             state,
             "extract",
             CalibrateChainRequest(transcript="[user] hi there", speaker_id="speaker0"),
@@ -637,20 +666,22 @@ class TestChainSessionSnapshot:
 
     def test_extract_writes_the_session_snapshot(self, tmp_path):
         state = self._paths_state(tmp_path, "local_extract")
-        calibrate_chain(
+        _run_chain(
             state,
             "extract",
             CalibrateChainRequest(transcript="[user] hi there", speaker_id="speaker0"),
+            artifact_dir=tmp_path / "artifacts" / "extract_1",
         )
         snaps = list((tmp_path / "artifacts").glob("extract_*/sessions/calib/graph_snapshot.json"))
         assert len(snaps) == 1
 
     def test_procedural_writes_the_procedural_snapshot(self, tmp_path):
         state = self._paths_state(tmp_path, "procedural_extract")
-        calibrate_chain(
+        _run_chain(
             state,
             "procedural",
             CalibrateChainRequest(transcript="[user] hi there", speaker_id="speaker0"),
+            artifact_dir=tmp_path / "artifacts" / "procedural_1",
         )
         snaps = list(
             (tmp_path / "artifacts").glob(
@@ -666,19 +697,21 @@ class TestChainSessionSnapshot:
             speaker_id="speaker0",
             graph={"session_id": "calib", "timestamp": "2026-01-01T00:00:00Z"},
         )
-        calibrate_chain(state, "anonymize", req)
+        _run_chain(state, "anonymize", req, artifact_dir=tmp_path / "artifacts" / "anonymize_1")
         assert not list((tmp_path / "artifacts").glob("**/*graph_snapshot.json"))
 
 
 class TestDeclaredStepUnreached:
     """A calibration promises ONE step's output. When the configured chain
-    cannot reach that step, the operator must get a refusal naming the gap
-    — never a 200 whose provenance is silently empty.
+    cannot reach that step, the run still completes — post-200 there is no
+    response left to fail — and the gap is reported as DATA:
+    ``response.json``'s ``unreached_step`` field
+    (``{declared_phase, phases_ran, detail}``), never an HTTP error.
 
-    Mutation: drop the check in ``_run_calibration`` -> these fail, and a
-    cloud-disabled server answers /calibrate/enrich with an empty envelope
-    exactly as the pre-unification standalone endpoints never did (they
-    raised 400 from their own guard).
+    Mutation: drop the check in ``run_stage`` -> these fail, and a
+    cloud-disabled server's ``/calibrate/enrich`` run reports
+    ``unreached_step: None`` with silently empty provenance instead of
+    naming the gap.
     """
 
     def _state_with_chain(self, *, phases_that_run: list[str]) -> dict:
@@ -701,21 +734,22 @@ class TestDeclaredStepUnreached:
         )
 
     @pytest.mark.parametrize("use_case", ["enrich", "plausibility"])
-    def test_cloud_gated_step_never_reached_is_a_400(self, use_case):
+    def test_cloud_gated_step_never_reached_is_data_not_an_error(self, use_case):
         """With cloud egress refused the anonymize/enrich stages are skipped,
-        so the declared stop never records. The endpoint says so."""
+        so the declared stop never records. The run still completes, 200,
+        and names the gap in ``unreached_step``."""
         state = self._state_with_chain(phases_that_run=["local_extract"])
-        with pytest.raises(HTTPException) as exc:
-            calibrate_chain(state, use_case, self._graph_req())
-        assert exc.value.status_code == 400
-        assert _CHAIN[use_case].stop in exc.value.detail
+        result = _run_chain(state, use_case, self._graph_req())
+        assert result["unreached_step"] is not None
+        assert result["unreached_step"]["declared_phase"] == _CHAIN[use_case].stop
+        assert _CHAIN[use_case].stop in result["unreached_step"]["detail"]
 
     def test_detail_names_the_steps_that_did_run(self):
         state = self._state_with_chain(phases_that_run=["local_extract", "anonymize"])
-        with pytest.raises(HTTPException) as exc:
-            calibrate_chain(state, "enrich", self._graph_req())
-        assert "local_extract" in exc.value.detail
-        assert "anonymize" in exc.value.detail
+        result = _run_chain(state, "enrich", self._graph_req())
+        assert result["unreached_step"]["phases_ran"] == ["local_extract", "anonymize"]
+        assert "local_extract" in result["unreached_step"]["detail"]
+        assert "anonymize" in result["unreached_step"]["detail"]
 
     def test_detail_reports_the_cloud_verdict_from_the_pipeline_config(self):
         """The verdict is read from the ExtractionConfig the chain itself
@@ -726,15 +760,16 @@ class TestDeclaredStepUnreached:
         state["consolidation_loop"].extraction.config = ExtractionConfig(
             cloud_enabled=False, enrichment_provider="anthropic", scrub=frozenset()
         )
-        with pytest.raises(HTTPException) as exc:
-            calibrate_chain(state, "enrich", self._graph_req())
-        assert "Cloud egress is refused" in exc.value.detail
-        assert "cloud.enabled is off" in exc.value.detail
+        result = _run_chain(state, "enrich", self._graph_req())
+        detail = result["unreached_step"]["detail"]
+        assert "Cloud egress is refused" in detail
+        assert "cloud.enabled is off" in detail
 
     def test_reached_step_returns_normally(self):
         state = self._state_with_chain(phases_that_run=["local_extract", "anonymize"])
-        result = calibrate_chain(state, "anonymize", self._graph_req())
+        result = _run_chain(state, "anonymize", self._graph_req())
         assert result["stage"] == "anonymize"
+        assert result["unreached_step"] is None
 
 
 class TestChainProductionParity:
@@ -753,7 +788,7 @@ class TestChainProductionParity:
         dispatch calling anonymize()/judge_plausibility()/
         request_enrichment() directly is the standalone shape this
         unification removed."""
-        source = inspect.getsource(calibrate_chain)
+        source = inspect.getsource(calibrate.dispatch_chain)
         for primitive in ("anonymize(", "judge_plausibility(", "request_enrichment("):
             assert primitive not in source
 
@@ -779,7 +814,7 @@ class TestChainProductionParity:
             speaker_id="speaker0",
             prompt_variants={"extraction.txt": "my_extraction.txt"},
         )
-        calibrate_chain(state, "extract", req)
+        _run_chain(state, "extract", req)
         assert seen["loaded"] == "VARIANT BODY {transcript}"
 
 
@@ -789,16 +824,8 @@ class TestCalibrateNormalize:
     def test_disabled_404(self):
         req = CalibrateNormalizeRequest(relations=[])
         with pytest.raises(HTTPException) as exc:
-            calibrate_normalize(_state_disabled(), req)
+            _run_normalize(_state_disabled(), req)
         assert exc.value.status_code == 404
-
-    def test_consolidating_503(self):
-        state = _state_enabled()
-        state["consolidating"] = True
-        req = CalibrateNormalizeRequest(relations=[])
-        with pytest.raises(HTTPException) as exc:
-            calibrate_normalize(state, req)
-        assert exc.value.status_code == 503
 
     def test_neither_relations_nor_snapshot_400(self, tmp_path):
         """Providing neither relations nor snapshot_path raises 400."""
@@ -808,7 +835,7 @@ class TestCalibrateNormalize:
             snapshot_path=None,
         )
         with pytest.raises(HTTPException) as exc:
-            calibrate_normalize(state, req)
+            _run_normalize(state, req)
         assert exc.value.status_code == 400
         assert "exactly one" in exc.value.detail.lower()
 
@@ -820,7 +847,7 @@ class TestCalibrateNormalize:
             snapshot_path="/some/path.json",
         )
         with pytest.raises(HTTPException) as exc:
-            calibrate_normalize(state, req)
+            _run_normalize(state, req)
         assert exc.value.status_code == 400
         assert "exactly one" in exc.value.detail.lower()
 
@@ -843,7 +870,7 @@ class TestCalibrateNormalize:
         refiner = _stub_refiner()
         state["consolidation_loop"].build_tier_refiner.return_value = refiner
 
-        result = calibrate_normalize(
+        result = _run_normalize(
             state,
             CalibrateNormalizeRequest(snapshot_path=str(snap_path)),
         )
@@ -864,7 +891,7 @@ class TestCalibrateNormalize:
         refiner = _stub_refiner()
         state["consolidation_loop"].build_tier_refiner.return_value = refiner
 
-        result = calibrate_normalize(
+        result = _run_normalize(
             state,
             CalibrateNormalizeRequest(
                 relations=[
@@ -895,7 +922,7 @@ class TestCalibrateNormalize:
         second copy is exactly the drift this unification removed."""
         import ast
 
-        tree = ast.parse(inspect.getsource(calibrate_normalize).lstrip())
+        tree = ast.parse(inspect.getsource(calibrate.dispatch_normalize).lstrip())
         # Prose describing the production rule is fine; executing it is not,
         # so strip docstrings and comments by reading identifiers only.
         names = {
@@ -958,22 +985,14 @@ class TestCalibrateAnonymizeFacts:
     def test_disabled_404(self):
         req = CalibrateAnonymizeFactsRequest(facts=[])
         with pytest.raises(HTTPException) as exc:
-            calibrate_anonymize_facts(_state_disabled(), req)
+            _run_anonymize_facts(_state_disabled(), req)
         assert exc.value.status_code == 404
-
-    def test_consolidating_503(self):
-        state = _state_with_extraction_config()
-        state["consolidating"] = True
-        req = CalibrateAnonymizeFactsRequest(facts=[])
-        with pytest.raises(HTTPException) as exc:
-            calibrate_anonymize_facts(state, req)
-        assert exc.value.status_code == 503
 
     def test_neither_facts_nor_snapshot_400(self):
         state = _state_with_extraction_config()
         req = CalibrateAnonymizeFactsRequest(facts=None, snapshot_path=None)
         with pytest.raises(HTTPException) as exc:
-            calibrate_anonymize_facts(state, req)
+            _run_anonymize_facts(state, req)
         assert exc.value.status_code == 400
         assert "exactly one" in exc.value.detail.lower()
 
@@ -984,7 +1003,7 @@ class TestCalibrateAnonymizeFacts:
             snapshot_path="/some/path.json",
         )
         with pytest.raises(HTTPException) as exc:
-            calibrate_anonymize_facts(state, req)
+            _run_anonymize_facts(state, req)
         assert exc.value.status_code == 400
         assert "exactly one" in exc.value.detail.lower()
 
@@ -992,7 +1011,7 @@ class TestCalibrateAnonymizeFacts:
         state = _state_with_extraction_config()
         req = CalibrateAnonymizeFactsRequest(facts=[])
         with pytest.raises(HTTPException) as exc:
-            calibrate_anonymize_facts(state, req)
+            _run_anonymize_facts(state, req)
         assert exc.value.status_code == 400
         assert "no facts" in exc.value.detail.lower()
 
@@ -1016,7 +1035,7 @@ class TestCalibrateAnonymizeFacts:
             "paramem.cloud.anonymize.anonymize",
             return_value=_anonymized_contract(),
         ) as mocked:
-            result = calibrate_anonymize_facts(
+            result = _run_anonymize_facts(
                 state, CalibrateAnonymizeFactsRequest(snapshot_path=str(snap_path))
             )
 
@@ -1048,7 +1067,7 @@ class TestCalibrateAnonymizeFacts:
             "paramem.cloud.anonymize.anonymize",
             return_value=_anonymized_contract(),
         ) as mocked:
-            result = calibrate_anonymize_facts(state, CalibrateAnonymizeFactsRequest(facts=facts))
+            result = _run_anonymize_facts(state, CalibrateAnonymizeFactsRequest(facts=facts))
 
         assert mocked.call_count == 1
         call = mocked.call_args
@@ -1067,7 +1086,7 @@ class TestCalibrateAnonymizeFacts:
         prevent."""
         import ast
 
-        tree = ast.parse(inspect.getsource(calibrate_anonymize_facts).lstrip())
+        tree = ast.parse(inspect.getsource(calibrate.dispatch_anonymize_facts).lstrip())
         names = {
             node.id if isinstance(node, ast.Name) else node.attr
             for node in ast.walk(tree)
@@ -1089,7 +1108,7 @@ class TestCalibrateAnonymizeFacts:
             "paramem.cloud.anonymize.anonymize",
             return_value=_anonymized_contract(),
         ):
-            result = calibrate_anonymize_facts(
+            result = _run_anonymize_facts(
                 state,
                 CalibrateAnonymizeFactsRequest(
                     facts=[{"subject": "Alex", "predicate": "works_at", "object": "Acme"}]
@@ -1120,7 +1139,7 @@ class TestCalibrateAnonymizeFacts:
             return _anonymized_contract()
 
         with patch("paramem.cloud.anonymize.anonymize", side_effect=_capture):
-            calibrate_anonymize_facts(
+            _run_anonymize_facts(
                 state,
                 CalibrateAnonymizeFactsRequest(
                     facts=[{"subject": "Alex", "predicate": "works_at", "object": "Acme"}],
@@ -1162,163 +1181,6 @@ class TestEffectiveParamsSeed:
         assert result["seed"] is None
 
 
-class TestRunCalibrationResponseEnvelope:
-    """Verify _run_calibration's inlined response assembly emits the
-        expected uniform envelope.
-
-    These tests exercise the envelope through a trivial ``guard``/
-        ``dispatch`` pair so the assembly logic is pinned independent of any
-        one handler's real behavior. The stand-in ``dispatch`` opens its own
-        phase, exactly as the production paths the real handlers call do.
-    """
-
-    _REQUIRED_KEYS = {
-        "stage",
-        "prompts",
-        "raw_output",
-        "parsed",
-        "n_input_tokens",
-        "n_output_tokens",
-        "wall_clock_seconds",
-        "model",
-        "params_effective",
-        "vram_before",
-        "vram_after",
-        "artifact_dir",
-    }
-
-    def _run(
-        self,
-        *,
-        stage: str = "anonymize",
-        raw_output="some output",
-        parsed: dict | None = None,
-        params: CalibrateParams | None = None,
-        supports_seed: bool = True,
-        state: dict | None = None,
-    ) -> dict:
-        state = state if state is not None else _state_enabled()
-        params = params if params is not None else CalibrateParams()
-        parsed = parsed if parsed is not None else {}
-
-        def guard() -> None:
-            return None
-
-        def dispatch() -> tuple:
-            # A production path opens its own phase onto the trace
-            # _run_calibration holds open; the substrate never synthesises
-            # one. This stand-in does the same.
-            with phase_trace("anonymize"):
-                return raw_output, parsed
-
-        return _run_calibration(
-            stage=stage,
-            guard=guard,
-            dispatch=dispatch,
-            input_prompt_phase="anonymize",
-            state=state,
-            params=params,
-            supports_seed=supports_seed,
-        )
-
-    def test_all_required_keys_present(self):
-        """All 12 uniform keys (plus ``phases``, not required here) appear
-        in the output."""
-        result = self._run(raw_output="some output", parsed={"mapping": {}})
-        assert self._REQUIRED_KEYS.issubset(result.keys())
-
-    def test_stage_field_matches_argument(self):
-        result = self._run(stage="plausibility")
-        assert result["stage"] == "plausibility"
-
-    def test_model_field_matches_config_model_id(self):
-        """``model`` is read from ``state["config"].model_config.model_id``
-        — the model the server actually booted — not any other state key."""
-        state = _state_enabled()
-        result = self._run(state=state)
-        assert result["model"] == state["config"].model_config.model_id
-
-    def test_model_field_ignores_decoy_state_model_id(self):
-        """A stray ``state["model_id"]`` key must not leak into the
-        envelope: this kills any revert to reading it directly instead of
-        ``state["config"].model_config.model_id``."""
-        state = _state_enabled()
-        state["model_id"] = "decoy-model"
-        result = self._run(state=state)
-        assert result["model"] == state["config"].model_config.model_id
-        assert result["model"] != "decoy-model"
-
-    def test_wall_clock_seconds_present_and_nonnegative(self):
-        result = self._run()
-        assert result["wall_clock_seconds"] >= 0
-
-    def test_vram_keys_present(self):
-        result = self._run()
-        assert "vram_before" in result
-        assert "vram_after" in result
-
-    def test_n_output_tokens_minus1_for_empty_raw_output(self):
-        """Empty raw_output → n_output_tokens == -1."""
-        result = self._run(raw_output="")
-        assert result["n_output_tokens"] == -1
-
-    def test_n_tokens_minus1_when_no_tokenizer(self):
-        """No tokenizer in state → both fields stay -1: the ``if tokenizer``
-        / ``if tokenizer and count_str`` sentinel guards short-circuit to
-        -1 rather than calling ``estimate_tokens``.  The real endpoint path
-        503s on a missing tokenizer before reaching this guard
-        (``_preflight`` requires one) — patched to a no-op here to isolate
-        the guard's own behavior rather than re-test ``_preflight``."""
-        state = _state_enabled()
-        state["tokenizer"] = None
-        with patch("paramem.server.calibrate._preflight"):
-            result = self._run(state=state)
-        assert result["n_input_tokens"] == -1
-        assert result["n_output_tokens"] == -1
-
-    def test_n_input_tokens_uses_fallback_estimate_when_tokenizer_raises(self):
-        """A tokenizer that raises on call no longer collapses to -1:
-        ``estimate_tokens`` falls back to a conservative words-based
-        estimate instead."""
-        from paramem.graph.phase_trace import record_prompt
-
-        state = _state_enabled()
-        state["tokenizer"].side_effect = RuntimeError("tokenizer boom")
-
-        def dispatch() -> tuple:
-            with phase_trace("anonymize"):
-                record_prompt(
-                    path="anonymization.txt",
-                    content="one two three four five six seven eight",
-                )
-            return "some raw output text", {"mapping": {}}
-
-        result = _run_calibration(
-            stage="anonymize",
-            guard=lambda: None,
-            dispatch=dispatch,
-            input_prompt_phase="anonymize",
-            state=state,
-            params=CalibrateParams(),
-            supports_seed=True,
-        )
-        assert result["n_input_tokens"] != -1
-        assert result["n_input_tokens"] > 0
-
-    def test_phases_present_from_trace(self):
-        """``phases`` is populated from the phase-trace records the
-        ``entry="standalone"`` scope opens around ``dispatch`` — no
-        caller passes it in directly."""
-        result = self._run()
-        assert "phases" in result
-        assert any(p["name"] == "anonymize" for p in result["phases"])
-
-    def test_supports_seed_false_nulls_seed(self):
-        """supports_seed=False causes seed=null in params_effective."""
-        result = self._run(params=CalibrateParams(seed=99), supports_seed=False)
-        assert result["params_effective"]["seed"] is None
-
-
 class TestExtractionPipelineKwargsSeed:
     """Verify ExtractionPipeline.kwargs passes seed through."""
 
@@ -1354,17 +1216,8 @@ class TestCalibrateName:
             turns=[{"role": "user", "text": "Hi, I'm Alex."}],
         )
         with pytest.raises(HTTPException) as exc:
-            calibrate_name(_state_disabled(), req)
+            _run_name(_state_disabled(), req)
         assert exc.value.status_code == 404
-
-    def test_consolidating_503(self):
-        """calibrate_name returns 503 when a consolidation cycle is in progress."""
-        state = _state_enabled()
-        state["consolidating"] = True
-        req = CalibrateNameRequest(turns=[{"role": "user", "text": "I'm Taylor."}])
-        with pytest.raises(HTTPException) as exc:
-            calibrate_name(state, req)
-        assert exc.value.status_code == 503
 
     def test_model_missing_503(self):
         """calibrate_name returns 503 in cloud-only / defer-model mode."""
@@ -1372,18 +1225,19 @@ class TestCalibrateName:
         state["model"] = None
         req = CalibrateNameRequest(turns=[{"role": "user", "text": "I'm Jordan."}])
         with pytest.raises(HTTPException) as exc:
-            calibrate_name(state, req)
+            _run_name(state, req)
         assert exc.value.status_code == 503
 
     def test_uses_model_bound_after_loop_ensure(self):
         """calibrate_name reads state['model']/state['tokenizer'] AFTER
-        _ensure_calibration_loop has run, not before — a fresh server's
-        first calibration call rebinds state['model'] = loop.model inside
-        that function (calibrate.py defect fix: the pre-rebind read)."""
+        get_or_create_consolidation_loop has run, not before — a fresh
+        server's first calibration call rebinds state['model'] = loop.model
+        inside that function (calibrate.py defect fix: the pre-rebind
+        read)."""
         state = _state_enabled()
         sentinel_model = object()
 
-        def _swap_and_return(passed_state):
+        def _swap_and_return(passed_state, *, store=None):
             passed_state["model"] = sentinel_model
             return passed_state["consolidation_loop"]
 
@@ -1394,8 +1248,13 @@ class TestCalibrateName:
             return "Alex", "raw output"
 
         with (
+            # get_or_create_consolidation_loop is imported fresh inside
+            # dispatch_name from its defining module
+            # (paramem.server.consolidation) on every call, so patching it
+            # on paramem.server.calibrate has no effect — the patch target
+            # must be the definition site.
             patch(
-                "paramem.server.calibrate._ensure_calibration_loop",
+                "paramem.server.consolidation.get_or_create_consolidation_loop",
                 side_effect=_swap_and_return,
             ),
             patch(
@@ -1405,10 +1264,10 @@ class TestCalibrateName:
         ):
             req = CalibrateNameRequest(turns=[{"role": "user", "text": "I'm Alex."}])
             # The stubbed extractor opens no phase record, so
-            # _run_calibration's declared-step-unreached check 400s after
-            # dispatch runs — irrelevant to what this test pins.
-            with pytest.raises(HTTPException):
-                calibrate_name(state, req)
+            # run_stage's declared-step-unreached check reports the gap as
+            # data on the result rather than raising — irrelevant to what
+            # this test pins.
+            _run_name(state, req)
 
         assert captured["model"] is sentinel_model
 
@@ -1423,7 +1282,7 @@ class TestCalibrateName:
             prompt_variants={"name_extraction.txt": "absent_variant.txt"},
         )
         with pytest.raises(HTTPException) as exc:
-            calibrate_name(state, req)
+            _run_name(state, req)
         assert exc.value.status_code == 400
         assert "variant not found" in exc.value.detail.lower()
 
@@ -1450,7 +1309,7 @@ class TestCalibrateName:
             "paramem.evaluation.recall.generate_answer",
             return_value="Alex",
         ):
-            result = calibrate_name(state, req)
+            result = _run_name(state, req)
 
         # Uniform shape keys.
         assert result["stage"] == "name"
@@ -1525,7 +1384,7 @@ class TestCalibrateName:
             "paramem.evaluation.recall.generate_answer",
             return_value="Alex",
         ):
-            result = calibrate_name(state, req)
+            result = _run_name(state, req)
 
         # The provenance block must report the variants as overrides —
         # _load_prompt records "<override:NAME>" for a prompt_overrides hit,
@@ -1577,23 +1436,15 @@ class TestCalibrateRespond:
     def test_disabled_404(self):
         req = CalibrateRespondRequest(text="Hello", speaker_id="speaker0")
         with pytest.raises(HTTPException) as exc:
-            calibrate_respond(_state_disabled(), req)
+            _run_respond(_state_disabled(), req)
         assert exc.value.status_code == 404
-
-    def test_consolidating_503(self):
-        state = _state_respond()
-        state["consolidating"] = True
-        req = CalibrateRespondRequest(text="Hello", speaker_id="speaker0")
-        with pytest.raises(HTTPException) as exc:
-            calibrate_respond(state, req)
-        assert exc.value.status_code == 503
 
     def test_model_missing_503(self):
         state = _state_respond()
         state["model"] = None
         req = CalibrateRespondRequest(text="Hello", speaker_id="speaker0")
         with pytest.raises(HTTPException) as exc:
-            calibrate_respond(state, req)
+            _run_respond(state, req)
         assert exc.value.status_code == 503
 
     def test_unknown_speaker_400_names_the_id(self):
@@ -1605,7 +1456,7 @@ class TestCalibrateRespond:
         state["speaker_store"].get_name.return_value = None
         req = CalibrateRespondRequest(text="Hello", speaker_id="speaker99")
         with pytest.raises(HTTPException) as exc:
-            calibrate_respond(state, req)
+            _run_respond(state, req)
         assert exc.value.status_code == 400
         assert "speaker99" in exc.value.detail
 
@@ -1613,7 +1464,7 @@ class TestCalibrateRespond:
         state = _state_respond()
         req = CalibrateRespondRequest(text="", speaker_id="speaker0")
         with pytest.raises(HTTPException) as exc:
-            calibrate_respond(state, req)
+            _run_respond(state, req)
         assert exc.value.status_code == 400
 
     @pytest.mark.parametrize(
@@ -1624,7 +1475,7 @@ class TestCalibrateRespond:
         state[component] = None
         req = CalibrateRespondRequest(text="Hello", speaker_id="speaker0")
         with pytest.raises(HTTPException) as exc:
-            calibrate_respond(state, req)
+            _run_respond(state, req)
         assert exc.value.status_code == 503
 
     def test_missing_prompt_variant_400_before_dispatch(self, tmp_path):
@@ -1640,7 +1491,7 @@ class TestCalibrateRespond:
             side_effect=AssertionError("dispatch must not run when the guard rejects"),
         ):
             with pytest.raises(HTTPException) as exc:
-                calibrate_respond(state, req)
+                _run_respond(state, req)
         assert exc.value.status_code == 400
         assert "variant not found" in exc.value.detail.lower()
 
@@ -1663,7 +1514,7 @@ class TestCalibrateRespond:
         state = _state_respond()
         req = CalibrateRespondRequest(text="Hello", speaker_id="speaker0")
         with patch("paramem.server.inference.handle_chat", side_effect=_capture):
-            calibrate_respond(state, req)
+            _run_respond(state, req)
 
         assert set(captured) == expected
 
@@ -1677,9 +1528,13 @@ class TestCalibrateRespond:
                 text="a reply", escalated=True, diagnostics=diagnostics
             ),
         ):
-            result = calibrate_respond(state, req)
+            result = _run_respond(state, req)
 
-        required_keys = {
+        # Exact field-set pin, not a subset check: run_stage's own Returns
+        # contract (see its docstring) names every key it emits, including
+        # run_id and unreached_step — a field this envelope silently
+        # started or stopped emitting must fail this test.
+        expected_keys = {
             "stage",
             "prompts",
             "raw_output",
@@ -1693,28 +1548,29 @@ class TestCalibrateRespond:
             "vram_after",
             "phases",
             "artifact_dir",
-            "variants_unexercised",
+            "run_id",
+            "unreached_step",
         }
-        assert required_keys.issubset(result.keys())
+        assert set(result.keys()) == expected_keys
         assert result["stage"] == "respond"
         assert result["raw_output"] == "a reply"
         assert result["parsed"]["escalated"] is True
         # No resolved_text companion: it would write a household member's
         # real display name into an on-disk artifact and duplicate
-        # raw_output — see calibrate_respond's docstring.
+        # raw_output — see dispatch_respond's docstring.
         assert "resolved_text" not in result["parsed"]
         assert result["parsed"]["exit_via"] == "personal_probe"
         assert result["parsed"]["intent"] == "PERSONAL"
         # No prompt_variants were supplied on this request, so there is
         # nothing to have failed to exercise.
-        assert result["variants_unexercised"] == []
+        assert result["parsed"]["variants_unexercised"] == []
 
     def test_no_params_field_and_params_effective_all_null(self):
         """Pins against a later re-introduction of an echo-only ``params``
         field: the request model exposes none, and ``params_effective`` is
-        all-``null`` because ``calibrate_respond`` always calls
-        ``_run_calibration`` with a bare ``CalibrateParams()`` and
-        ``supports_seed=False``."""
+        all-``null`` because the ``respond`` stage's declaration
+        (``calibrate._STANDALONE["respond"]``) always builds the spec with
+        a bare ``CalibrateParams()`` and ``supports_seed=False``."""
         req = CalibrateRespondRequest(
             text="Hello", speaker_id="speaker0", **{"params": {"temperature": 0.9}}
         )
@@ -1725,7 +1581,7 @@ class TestCalibrateRespond:
             "paramem.server.inference.handle_chat",
             side_effect=_respond_dispatch_double(),
         ):
-            result = calibrate_respond(state, req)
+            result = _run_respond(state, req)
 
         assert all(v is None for v in result["params_effective"].values())
 
@@ -1761,14 +1617,14 @@ class TestCalibrateRespond:
             "paramem.server.inference.handle_chat",
             side_effect=_loads_serving_system,
         ):
-            result = calibrate_respond(state, req)
+            result = _run_respond(state, req)
 
         paths_reported = {p["path"] for p in result["prompts"]}
         assert "<override:serving_system.txt>" in paths_reported
         assert result["raw_output"] == variant_content
         # The override's production basename shows up as <override:...> in
         # provenance above, so nothing is unexercised.
-        assert result["variants_unexercised"] == []
+        assert result["parsed"]["variants_unexercised"] == []
 
     def test_variants_unexercised_lists_basename_never_loaded(self, tmp_path):
         """A branch that never touches a given production prompt (e.g. an
@@ -1792,17 +1648,17 @@ class TestCalibrateRespond:
             "paramem.server.inference.handle_chat",
             side_effect=_respond_dispatch_double(),
         ):
-            result = calibrate_respond(state, req)
+            result = _run_respond(state, req)
 
-        assert result["variants_unexercised"] == ["recall_selection.txt"]
+        assert result["parsed"]["variants_unexercised"] == ["recall_selection.txt"]
 
     def test_serve_turn_phase_lands_in_envelope_through_real_handle_chat(self):
         """No dispatch double: exercises the trace no-op nesting the doubles
         in the tests above bypass.  ``handle_chat`` opens its OWN
         ``extraction_trace()``/``phase_trace("serve_turn")`` scope around
         its whole dispatch (see ``paramem.server.inference.handle_chat``);
-        ``_run_calibration`` also opens ``extraction_trace()`` around
-        ``dispatch()``.  Re-entry into an already-active
+        ``run_stage`` also opens ``extraction_trace()`` around
+        ``spec.dispatch()``.  Re-entry into an already-active
         ``extraction_trace()`` is documented as a no-op (the inner scope
         lands on the SAME trace) — this proves that nesting actually works
         end to end, not just in the phase_trace unit tests, by calling the
@@ -1832,7 +1688,7 @@ class TestCalibrateRespond:
             "paramem.server.inference._base_model_answer",
             return_value=ChatResult(text="base reply", escalated=False, diagnostics={}),
         ):
-            result = calibrate_respond(state, req)
+            result = _run_respond(state, req)
 
         serve_records = [p for p in result["phases"] if p.get("name") == "serve_turn"]
         assert len(serve_records) == 1
@@ -1991,93 +1847,3 @@ class TestExtractNameViaLlmUserTurnFilter:
             _load_prompt("no_such_prompt_xyz.txt", prompts_dir=tmp_path)
         assert "no_such_prompt_xyz.txt" in str(exc_info.value)
         assert "Searched" in str(exc_info.value)
-
-
-class TestCalibrateRoutesRunOffEventLoop:
-    """Route-level proof that the nine ``/calibrate/*`` routes dispatch their
-    sync handler off the event loop (``_run_calibrate_off_loop`` in
-    ``paramem/server/app.py``).
-
-    Every calibrate handler reaches ``gpu_lock_sync()`` (blocking, unbounded
-    timeout) through ``_measured_local_call``. Calling it inline on the
-    event loop — as these routes used to — would block the loop while
-    waiting for that lock; ``/chat``'s async ``gpu_lock()`` releases its
-    lock inside an async-generator ``finally`` that itself needs the loop
-    to run, so a blocked loop can never let that release happen and the
-    server deadlocks permanently. These tests exercise the real ASGI app
-    through ``TestClient`` used WITHOUT the ``with`` context-manager form
-    (which would run the app's lifespan and attempt a real model load) to
-    prove the executor round trip preserves both the raised
-    ``HTTPException``'s status code and the calling-side ordering the
-    respond route depends on.
-    """
-
-    def setup_method(self):
-        from paramem.server.app import app as real_app
-        from paramem.server.app import require_admin
-
-        self._real_app = real_app
-        self._require_admin = require_admin
-        real_app.dependency_overrides[require_admin] = lambda: None
-
-    def teardown_method(self):
-        self._real_app.dependency_overrides.pop(self._require_admin, None)
-
-    def test_http_exception_from_executor_surfaces_with_its_status(self):
-        """A calibrate handler's ``HTTPException``, raised inside the
-        thread-pool executor, reaches the client as that same HTTP status —
-        proving ``run_in_executor`` futures propagate exceptions to the
-        awaiting coroutine (and thence into FastAPI's exception handling)
-        unchanged. Uses the real disabled-gate 404 every ``/calibrate/*``
-        route raises when ``calibrate_endpoint_enabled`` is off — no mock
-        of ``calibrate_chain`` itself, so this exercises the actual
-        ``_preflight`` guard running inside the executor thread."""
-        from paramem.server.app import _state
-
-        original_config = _state.get("config")
-        _state["config"] = SimpleNamespace(
-            consolidation=SimpleNamespace(calibrate_endpoint_enabled=False)
-        )
-        try:
-            client = TestClient(self._real_app)
-            resp = client.post(
-                "/calibrate/extract",
-                json={"transcript": "[user] hi there", "speaker_id": "speaker0"},
-            )
-        finally:
-            _state["config"] = original_config
-
-        assert resp.status_code == 404
-        assert "disabled" in str(resp.json()).lower()
-
-    def test_respond_route_stamps_debounce_and_aborts_training_before_dispatch(self):
-        """The idle-debounce stamp and the training-abort call happen on
-        the event-loop side, before the executor dispatch — proven by
-        patching ``calibrate_respond`` itself (no real preflight/model
-        access needed) and asserting the abort mock ran and the debounce
-        marker moved."""
-        from paramem.server.app import _state
-
-        original_last_chat = _state.get("last_chat_monotonic")
-        try:
-            with (
-                patch("paramem.server.app.calibrate_module.calibrate_respond") as mocked_respond,
-                patch(
-                    "paramem.server.app._abort_background_training_for_inference"
-                ) as mocked_abort,
-            ):
-                mocked_respond.return_value = {"stage": "respond", "raw_output": "ok"}
-                client = TestClient(self._real_app)
-                resp = client.post(
-                    "/calibrate/respond",
-                    json={"text": "Hello", "speaker_id": "speaker0"},
-                )
-
-            assert resp.status_code == 200
-            assert resp.json() == {"stage": "respond", "raw_output": "ok"}
-            assert mocked_abort.call_count == 1
-            assert mocked_respond.call_count == 1
-            assert _state.get("last_chat_monotonic") is not None
-            assert _state.get("last_chat_monotonic") != original_last_chat
-        finally:
-            _state["last_chat_monotonic"] = original_last_chat

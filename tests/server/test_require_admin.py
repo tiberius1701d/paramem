@@ -267,6 +267,7 @@ _ADMIN_PATHS = {
     "/calibrate/anonymize_facts",
     "/calibrate/name",
     "/calibrate/respond",
+    "/calibrate/extract_pending",
     "/integrity",
     "/speaker/forget",
     "/interim/discard",

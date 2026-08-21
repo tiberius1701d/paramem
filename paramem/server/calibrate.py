@@ -23,39 +23,49 @@ parameter through the pipeline.
 
 Endpoints running the extraction chain — ``POST /calibrate/{extract,
 procedural,anonymize,enrich,plausibility}`` — share one request shape
-(:class:`CalibrateChainRequest`) and one handler
-(:func:`calibrate_chain`).  They reach the chain through
-:class:`paramem.graph.extraction_pipeline.ExtractionPipeline`, the
+(:class:`CalibrateChainRequest`) and one validate/dispatch pair
+(:func:`validate_chain` / :func:`dispatch_chain`).  They reach the chain
+through :class:`paramem.graph.extraction_pipeline.ExtractionPipeline`, the
 single-topology chokepoint, on the process-wide ``ConsolidationLoop``
-(lazy-built on first /consolidate or /calibrate call), so every flag the
-production cycle applies is applied here too.  Endpoints that enter past
-``local_extract`` inject the graph that stage would have produced;
-endpoints whose own step sits inside a composite stage (``cloud_enrich``,
-``deanon_plausibility``) declare the nearest start that exists and let
-the chain produce the intermediate artifacts by running — which is why
-the enrichment and plausibility use cases place a BILLED cloud call.
+(lazy-built on first dispatch), so every flag the production cycle applies
+is applied here too.  Endpoints that enter past ``local_extract`` inject
+the graph that stage would have produced; endpoints whose own step sits
+inside a composite stage (``cloud_enrich``, ``deanon_plausibility``)
+declare the nearest start that exists and let the chain produce the
+intermediate artifacts by running — which is why the enrichment and
+plausibility use cases place a BILLED cloud call.
 
-The module also hosts four standalone handlers outside the chain —
-:func:`calibrate_normalize` (``POST /calibrate/normalize``),
-:func:`calibrate_anonymize_facts` (``POST /calibrate/anonymize_facts``),
-:func:`calibrate_name` (``POST /calibrate/name``), and
-:func:`calibrate_respond` (``POST /calibrate/respond``) — each with its
-own request shape; see each function's docstring.
+The module also hosts standalone validate/dispatch pairs outside the
+chain — :func:`validate_normalize` / :func:`dispatch_normalize`
+(``POST /calibrate/normalize``), :func:`validate_anonymize_facts` /
+:func:`dispatch_anonymize_facts` (``POST /calibrate/anonymize_facts``),
+:func:`validate_name` / :func:`dispatch_name` (``POST /calibrate/name``),
+:func:`validate_respond` / :func:`dispatch_respond`
+(``POST /calibrate/respond``), and the pending-session probe
+(``POST /calibrate/extract_pending``, dispatched from the server layer
+since its step is :func:`~paramem.server.app._extract_pending_sessions`)
+— each with its own request shape; see each function's docstring.
 
 No call modifies weights or writes production data on disk.  Prompt
 variants are resolved by name from ``paths.calibration/prompts/`` and
 injected via :func:`~paramem.graph.prompts.prompt_overrides`; artifacts
 land under ``paths.calibration/artifacts/``.
 
-Returns a uniform shape:
+**Non-blocking.**  Every ``/calibrate/*`` route is a consolidation
+dispatch: the same guards, the same ``consolidating`` mutex, the same
+executor hop, GPU lock, cooldown gate, and terminal a production fold
+gets.  A route answers HTTP 200 ``{status, action[, run_id, artifact_dir]}``
+at once; the run itself executes on an executor thread and writes its
+full result to ``<artifact_dir>/response.json`` — this module returns no
+result body over HTTP.  A route's own boundary work (:func:`preflight`,
+per-stage ``validate_*``, prompt-variant resolution) runs on the event
+loop, before dispatch; :func:`run_stage` is what the executor calls.
+
+Returns a uniform response-file shape:
 
   stage, prompts, raw_output, parsed, n_input_tokens, n_output_tokens,
   wall_clock_seconds, model, params_effective, vram_before, vram_after,
-  phases, artifact_dir.
-
-Concurrency: every endpoint short-circuits with 503 when
-``_state["consolidating"]`` is True so calibration calls cannot race
-against an active consolidation cycle.
+  phases, artifact_dir, run_id, unreached_step.
 
 Gating: every endpoint short-circuits with 404 when the server config's
 ``calibrate_endpoint_enabled`` flag is False.  Default is False —
@@ -68,8 +78,9 @@ from __future__ import annotations
 import logging
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Callable
 
 from fastapi import HTTPException
 from pydantic import BaseModel, Field
@@ -82,12 +93,11 @@ from paramem.graph.phase_trace import (
     start_at,
     stop_at,
 )
-from paramem.graph.prompts import _load_prompt, prompt_overrides
+from paramem.graph.prompts import _load_prompt
 from paramem.graph.schema import SessionGraph
 from paramem.server import lang_id
-from paramem.server.gpu_lock import gpu_lock_sync
 from paramem.server.session_buffer import SessionBuffer
-from paramem.utils.artifacts import calibration_run, on_calibration_result, on_session_extracted
+from paramem.utils.artifacts import on_session_extracted
 from paramem.utils.tokens import estimate_tokens
 
 logger = logging.getLogger(__name__)
@@ -179,7 +189,7 @@ class CalibrateNormalizeRequest(BaseModel):
 
     ``prompt_variants`` carries the operator's prompt variants, resolved
     the same way every other calibration use case resolves them (see
-    :func:`_resolve_prompt_variants`).
+    :func:`resolve_prompt_variants`).
     """
 
     relations: list[dict] | None = None
@@ -223,7 +233,7 @@ class CalibrateAnonymizeFactsRequest(BaseModel):
 
     ``prompt_variants`` carries the operator's prompt variants, resolved
     the same way every other calibration use case resolves them (see
-    :func:`_resolve_prompt_variants`); the one basename this stage loads
+    :func:`resolve_prompt_variants`); the one basename this stage loads
     is ``anonymization_facts.txt``.
     """
 
@@ -246,7 +256,7 @@ class CalibrateNameRequest(BaseModel):
 
     ``prompt_variants`` carries the operator's prompt variants, resolved
     the same way every other calibration use case resolves them (see
-    :func:`_resolve_prompt_variants`).
+    :func:`resolve_prompt_variants`).
     """
 
     turns: list[dict]
@@ -277,13 +287,36 @@ class CalibrateRespondRequest(BaseModel):
 
     ``prompt_variants`` carries the operator's prompt variants, resolved
     the same way every other calibration use case resolves them (see
-    :func:`_resolve_prompt_variants`).
+    :func:`resolve_prompt_variants`).
     """
 
     text: str
     speaker_id: str
     conversation_id: str = "calib-respond"
     prompt_variants: dict[str, str] = Field(default_factory=dict)
+
+
+class CalibrateExtractPendingRequest(BaseModel):
+    """Body for ``POST /calibrate/extract_pending``.
+
+    The run's artifact is the pending NAMED session set — the same set a
+    fold takes — so this payload carries only what an operator can vary
+    about the run itself.
+
+    Attributes:
+        prompt_variants: ``{production basename: variant basename}``,
+            resolved from ``paths.calibration_prompts`` and injected via
+            :func:`~paramem.graph.prompts.prompt_overrides` — the family's
+            one prompt field, identical in shape and resolution to every
+            other calibration request.  Supplied by the OPERATOR; the
+            driver script expands ``--prompt-prefix`` into it
+            (``scripts/dev/calibrate_prompts.py::_variants``).
+        params: Sampling overrides for this run's local calls, same
+            semantics as every other chain request.
+    """
+
+    prompt_variants: dict[str, str] = Field(default_factory=dict)
+    params: CalibrateParams = Field(default_factory=CalibrateParams)
 
 
 # ---------------------------------------------------------------------------
@@ -332,7 +365,7 @@ def _vram_block() -> dict[str, float] | None:
     return block
 
 
-def _resolve_prompt_variants(state: dict, variants: dict[str, str]) -> dict[str, str]:
+def resolve_prompt_variants(state: dict, variants: dict[str, str]) -> dict[str, str]:
     """Read the operator's prompt variants into a
     :func:`~paramem.graph.prompts.prompt_overrides` mapping.
 
@@ -374,7 +407,7 @@ def _relations_from_snapshot(snapshot_path: str) -> list[dict]:
     ``{subject, predicate, object, relation_type, speaker_id}`` dicts.
 
     THE one snapshot-to-relations reader — shared by
-    :func:`calibrate_normalize` and :func:`calibrate_anonymize_facts` so a
+    :func:`validate_normalize` and :func:`validate_anonymize_facts` so a
     future snapshot-format change updates one place, not two independently
     hand-rolled parses of the same file shape.
 
@@ -453,62 +486,30 @@ def _cudnn_deterministic():
 
 
 # ---------------------------------------------------------------------------
-# Shared measurement primitives
-# ---------------------------------------------------------------------------
-
-
-class _Measurement:
-    """Timing and VRAM snapshot captured around a single calibration call."""
-
-    __slots__ = ("vram_before", "vram_after", "elapsed")
-
-    def __init__(self) -> None:
-        self.vram_before: dict | None = None
-        self.vram_after: dict | None = None
-        self.elapsed: float = 0.0
-
-
-@contextmanager
-def _measured_local_call():
-    """Context manager that wraps the GPU lock and timing for every local stage.
-
-    Captures ``vram_before``, acquires ``gpu_lock_sync()`` and
-    ``_cudnn_deterministic()``, then records ``elapsed`` and ``vram_after``
-    on exit.  All five calibration handler functions (behind nine routes —
-    :func:`calibrate_chain` alone serves five) must use this wrapper so the
-    "every local stage takes the GPU lock" invariant is enforced in a single
-    place.
-
-    Yields a :class:`_Measurement` object whose attributes are populated on
-    context exit.  Usage::
-
-        with _measured_local_call() as m:
-            result = do_gpu_work(...)
-        # m.elapsed, m.vram_before, m.vram_after are now set.
-    """
-    m = _Measurement()
-    m.vram_before = _vram_block()
-    t0 = time.perf_counter()
-    with gpu_lock_sync(), _cudnn_deterministic():
-        yield m
-    m.elapsed = time.perf_counter() - t0
-    m.vram_after = _vram_block()
-
-
-# ---------------------------------------------------------------------------
 # Pre-flight gate (shared by every endpoint)
 # ---------------------------------------------------------------------------
 
 
-def _preflight(state: dict) -> None:
+def preflight(state: dict) -> None:
     """Raise the appropriate HTTP exception when the server is not in a
     state that can serve a calibration call.
 
+    Runs on the event loop, before dispatch — every arm checks a handle
+    directly, never ``state["mode"]`` (which has multiple assignment sites
+    and can lag them).  Whether a real consolidation cycle is currently
+    running is NOT checked here: a calibration call now runs under the
+    same dispatch envelope as a fold, so a busy server answers 200
+    ``deferred_already_running`` from the arbitrator instead of a 503 here.
+
     * 404 when the calibrate flag is off — the endpoint shouldn't exist
       from the client's perspective.
-    * 503 when a real consolidation cycle is running — refusing prevents
-      the calibration call from racing against the model.
-    * 503 when the model isn't loaded (cloud-only mode, defer-model boot).
+    * 503 ``model_not_loaded`` when the local model or tokenizer isn't
+      resident (cloud-only mode, defer-model boot).
+    * 503 ``store_unavailable`` when the memory store hasn't been
+      constructed yet (or is quarantined) — this is also what keeps a
+      calibration dispatch from being the first construction of the
+      process-lifetime loop singleton with no store override, while a
+      pending event's own resume is waiting to pass one.
     """
     config = state.get("config")
     if config is None or not getattr(config.consolidation, "calibrate_endpoint_enabled", False):
@@ -520,19 +521,17 @@ def _preflight(state: dict) -> None:
                 "configs/server.yaml to enable."
             ),
         )
-    if state.get("consolidating"):
-        raise HTTPException(
-            status_code=503,
-            detail="Consolidation cycle in progress; calibration calls "
-            "cannot race against the live model. Retry after the cycle "
-            "completes.",
-            headers={"Retry-After": "60"},
-        )
     if state.get("model") is None or state.get("tokenizer") is None:
         raise HTTPException(
             status_code=503,
             detail="Local model not loaded (cloud-only mode or "
             "defer-model boot). Calibration requires a local model.",
+        )
+    if state.get("memory_store") is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Memory store not available (not yet constructed, or "
+            "quarantined). Calibration requires a live memory store.",
         )
 
 
@@ -624,7 +623,7 @@ def _provenance_from_records(
 
     Args:
         records: Typed phase records from ``ExtractionTrace.records``
-            (one :class:`ExtractionTrace` per :func:`_run_calibration` call).
+            (one :class:`ExtractionTrace` per :func:`run_stage` call).
         phase: The :data:`~paramem.graph.phase_trace.PHASE_NAMES` phase
             whose user-prompt template feeds ``n_input_tokens``.
 
@@ -703,165 +702,140 @@ def _declared_step_unreached(state: dict, stage: str, phase: str, ran: list[str]
     )
 
 
-def _run_calibration(
-    *,
-    stage: str,
-    guard,
-    dispatch,
-    input_prompt_phase: str,
-    state: dict,
-    params: CalibrateParams,
-    supports_seed: bool,
-) -> dict[str, Any]:
-    """Shared execution + response-assembly primitive for every ``/calibrate/*`` handler.
+@dataclass(frozen=True)
+class CalibrationRunSpec:
+    """One validated calibration run, ready to execute.
 
-    Each handler shrinks to building a ``guard`` closure (raises HTTP 400
-    for any invalid input, BEFORE any model call) and a ``dispatch``
-    closure (runs the step, returns ``(raw_output, parsed)``), then calls
-    this function. Prompt provenance is read uniformly from the phase
-    trace — see :func:`_provenance_from_records` — never hand-built.
+    Built on the event loop by the route handler; consumed on the executor
+    thread.  Every field is resolved — no request object and no unvalidated
+    string crosses the thread boundary.
 
-    Execution order:
+    Attributes:
+        stage: The route's own path segment (``"extract"``, ``"normalize"``,
+            ``"extract_pending"``, …) — the response's ``stage`` label.
+        route_path: The producing route (``"/calibrate/extract"``).
+        run_id: This run's stamp, minted at the boundary and already
+            returned to the caller.
+        artifact_dir: This run's directory, already returned to the caller.
+        dispatch: Zero-arg callable running the step and returning
+            ``(raw_output, parsed)`` — the per-stage dispatch closure, with
+            its validated input already bound.
+        input_prompt_phase: Which phase record's non-system prompt feeds
+            ``n_input_tokens`` and the provenance block.
+        supports_seed: Whether ``params_effective["seed"]`` echoes the
+            request's seed.
+        params: The request's :class:`CalibrateParams`.
+        overrides: ``{production basename: variant CONTENT}`` for
+            :func:`~paramem.graph.prompts.prompt_overrides`.
+        evicts_voice: Whether this run's own artifact is document-shaped.
+    """
 
-    1. :func:`_preflight` — the shared 404/503 gates.
-    2. ``guard()`` — MUST run before any model call / before the trace
-       even opens, so a 400 costs zero inference.
-    3. ``with extraction_trace() as trace:`` — opens (or, if already
-       active, no-ops onto) the trace every :func:`~paramem.graph.prompts._load_prompt`
-       call records onto.
-    4. ``with _measured_local_call() as m:`` — GPU lock + timing/VRAM,
-       shared by every local stage.
-    5. ``dispatch()`` is called bare: every calibration use case runs a
-       production path, and every production path opens its own named
-       phases onto this outer trace. Nothing here synthesises a phase — a
-       calibration-only phase record is exactly the divergence this
-       substrate exists to prevent.
-    6. Refuses (400) when no phase record for ``input_prompt_phase`` exists:
-       the endpoint promised that step's output, and a configuration or an
-       input that never reaches it must be reported, not papered over with
-       an envelope carrying empty provenance. See
-       :func:`_declared_step_unreached`.
-    7. Assembles the uniform 12-key response (+ ``phases``) directly from
-       ``records``, ``prompts``, ``input_prompt_text``, ``raw_output``,
-       ``parsed``, and ``m`` — the per-stage parts (``prompts``,
-       ``raw_output``, ``parsed``) come from steps 1-5 above; the shared
-       envelope (token counts, wall clock, VRAM, ``model``,
-       ``params_effective``) is assembled here so every stage reports it
-       identically.  ``n_output_tokens`` is derived from ``raw_output``
-       directly, using ``-1`` when it is falsy or non-string — no
-       calibration stage needs a token count over a different string.
+    stage: str
+    route_path: str
+    run_id: str
+    artifact_dir: Path
+    dispatch: "Callable[[], tuple[Any, Any]]"
+    input_prompt_phase: str
+    supports_seed: bool
+    params: CalibrateParams
+    overrides: dict[str, str] = field(default_factory=dict)
+    evicts_voice: bool = False
+
+
+def run_stage(spec: CalibrationRunSpec, state: dict) -> dict[str, Any]:
+    """Run one calibration step and assemble its response — the shared
+    assembler behind every calibration route, called by
+    :func:`~paramem.server.app._run_calibration_sync` inside the run's
+    artifact scopes (the one owner of that scope for a real dispatch).
+
+    Does exactly what only it can do: open ``extraction_trace()`` around
+    the step, derive the prompt provenance and ``n_input_tokens`` from the
+    phase records the chain itself opened
+    (:func:`_provenance_from_records`) rather than a hand-built literal,
+    count output tokens, read ``model_id`` and ``params_effective``, and
+    record the run's own measurement.  The preflight gates, the input
+    guard, the artifact scope, and the GPU lock are the envelope's own —
+    :func:`~paramem.server.app._run_calibration_sync` owns those, not this
+    function.
+
+    The measurement is retained and is lock-free: ``wall_clock_seconds``
+    (``time.perf_counter`` around ``spec.dispatch()``) and
+    ``vram_before`` / ``vram_after`` are captured here, inside the
+    envelope's lock rather than around it, so the recorded value is the
+    step's own cost — not time spent waiting for the GPU.
 
     Args:
-        stage: Response ``"stage"`` label (``"plausibility"``, ``"normalize"``, …).
-        guard: Zero-arg callable raising :class:`~fastapi.HTTPException`
-            (400) for any invalid input. Called before the trace opens.
-        dispatch: Zero-arg callable that runs the step and returns
-            ``(raw_output, parsed)``.
-        input_prompt_phase: Which phase record's non-system prompt
-            template feeds ``n_input_tokens`` (see
-            :func:`_provenance_from_records`).
-        state: The live server state dict.
-        params: The request's :class:`CalibrateParams`.
-        supports_seed: Whether ``params_effective["seed"]`` echoes
-            ``params.seed`` (``True``) or is forced to ``null`` (``False``).
-            Every extraction-chain and graph-tier stage passes ``True`` — a
-            seeded ``torch.Generator`` scopes the local generate. The one
-            ``False`` caller (:func:`calibrate_respond`) is not a cloud
-            stage: it passes ``False`` because ``CalibrateRespondRequest``
-            carries no sampling-parameter field at all, so no seed exists to
-            thread into the serving path — the flag is about whether a seed
-            was ever supplied, not about which transport the stage uses.
+        spec: The validated run.
+        state: The live server state dict — read for ``tokenizer`` (token
+            counting), ``model_config.model_id``, and (on an unreached
+            declared step) the loop's extraction config for the cloud-egress
+            verdict (:func:`_declared_step_unreached`).
 
     Returns:
-        The uniform calibration response dict.
+        The response dict — the same field set every calibration route has
+        always returned (``stage``, ``prompts``, ``raw_output``, ``parsed``,
+        ``n_input_tokens``, ``n_output_tokens``, ``wall_clock_seconds``,
+        ``model``, ``params_effective``, ``vram_before``, ``vram_after``,
+        ``phases``, ``artifact_dir``) plus ``run_id`` and ``unreached_step``.
+        It is written to disk by the caller rather than returned over HTTP.
     """
-    _preflight(state)
-    guard()
-    _ensure_calibration_loop(state)
-    # Everything this run produces — the response below, and any artifact a
-    # production hook emits while the run executes (the graph tier's
-    # normalization pass writes its raw outputs through the same artifact
-    # hooks) — lands in the run's own directory, whether or not the production
-    # debug switch is on. With debug on, the debug tree receives it too.
-    run_dir = state["config"].paths.calibration_artifacts / f"{stage}_{int(time.time())}"
-    with calibration_run(run_dir):
-        with extraction_trace() as trace:
-            with _measured_local_call() as m:
-                # The production path (extract_graph, the graph-tier pass,
-                # the name extractor) opens its own named phases onto this
-                # same outer trace via the extraction_trace() nesting no-op
-                # — nothing to wrap here.
-                raw_output, parsed = dispatch()
-        records = trace.records
-        if input_prompt_phase not in {r.name for r in records}:
-            raise HTTPException(
-                status_code=400,
-                detail=_declared_step_unreached(
-                    state, stage, input_prompt_phase, [r.name for r in records]
-                ),
-            )
-        prompts, input_prompt_text = _provenance_from_records(records, input_prompt_phase)
+    with extraction_trace() as trace:
+        vram_before = _vram_block()
+        t0 = time.perf_counter()
+        # The production path (extract_graph, the graph-tier pass, the name
+        # extractor, handle_chat) opens its own named phases onto this same
+        # outer trace via the extraction_trace() nesting no-op — nothing to
+        # wrap here.  Nothing here synthesises a phase.
+        raw_output, parsed = spec.dispatch()
+        wall_clock_seconds = time.perf_counter() - t0
+        vram_after = _vram_block()
 
-        tokenizer = state.get("tokenizer")
-        n_in = estimate_tokens(input_prompt_text, tokenizer) if tokenizer else -1
-        count_str = raw_output if isinstance(raw_output, str) else ""
-        n_out = estimate_tokens(count_str, tokenizer) if (tokenizer and count_str) else -1
-        # _preflight refused above when config was absent or no local model is
-        # loaded — this reads the config the server booted its model from.
-        model_id = state["config"].model_config.model_id
-
-        response = {
-            "stage": stage,
-            "prompts": prompts,
-            "raw_output": raw_output,
-            "parsed": parsed,
-            "n_input_tokens": n_in,
-            "n_output_tokens": n_out,
-            "wall_clock_seconds": m.elapsed,
-            "model": model_id,
-            "params_effective": _effective_params(params, supports_seed=supports_seed),
-            "vram_before": m.vram_before,
-            "vram_after": m.vram_after,
-            "phases": [r.to_dict() for r in records],
-            # Where this run's artifacts live. The run — not the caller —
-            # owns its record: the response written below, plus anything a
-            # production hook emitted while it executed. A client reads
-            # them from here instead of keeping its own copy.
-            "artifact_dir": str(run_dir),
+    records = trace.records
+    ran = [r.name for r in records]
+    unreached_step: dict[str, Any] | None = None
+    if spec.input_prompt_phase not in set(ran):
+        # The declared step never ran.  Post-200 there is no response left
+        # to fail with a 400 — the run still completes and writes every
+        # phase that DID run; the gap is reported as data instead.
+        unreached_step = {
+            "declared_phase": spec.input_prompt_phase,
+            "phases_ran": ran,
+            "detail": _declared_step_unreached(state, spec.stage, spec.input_prompt_phase, ran),
         }
-        on_calibration_result(response)
-    return response
+    prompts, input_prompt_text = _provenance_from_records(records, spec.input_prompt_phase)
+
+    tokenizer = state.get("tokenizer")
+    n_in = estimate_tokens(input_prompt_text, tokenizer) if tokenizer else -1
+    count_str = raw_output if isinstance(raw_output, str) else ""
+    n_out = estimate_tokens(count_str, tokenizer) if (tokenizer and count_str) else -1
+    model_id = state["config"].model_config.model_id
+
+    return {
+        "stage": spec.stage,
+        "prompts": prompts,
+        "raw_output": raw_output,
+        "parsed": parsed,
+        "n_input_tokens": n_in,
+        "n_output_tokens": n_out,
+        "wall_clock_seconds": wall_clock_seconds,
+        "model": model_id,
+        "params_effective": _effective_params(spec.params, supports_seed=spec.supports_seed),
+        "vram_before": vram_before,
+        "vram_after": vram_after,
+        "phases": [r.to_dict() for r in records],
+        # Where this run's artifacts live. The run — not the caller — owns
+        # its record: the response written below, plus anything a
+        # production hook emitted while it executed. A client reads them
+        # from here instead of keeping its own copy.
+        "artifact_dir": str(spec.artifact_dir),
+        "run_id": spec.run_id,
+        "unreached_step": unreached_step,
+    }
 
 
 # ---------------------------------------------------------------------------
 # Stage handlers — invoked from the registered FastAPI routes in app.py
 # ---------------------------------------------------------------------------
-
-
-def _ensure_calibration_loop(state: dict):
-    """Lazy-init the loop the same way the production /consolidate handler does.
-
-    This is not a parallel route — it's the same factory and the same single
-    ``ConsolidationLoop`` instance.  The FIRST call (calibrate or consolidate)
-    creates it; subsequent calls reuse.  Calibration touches only
-    ``loop.extraction`` (read-only): no merger, no trainer, no disk writes.
-    Shared by every calibration handler that needs the pipeline — do not
-    inline a second init path.
-    """
-    loop = state.get("consolidation_loop")
-    if loop is None:
-        from paramem.server.consolidation import create_consolidation_loop
-
-        loop = create_consolidation_loop(
-            state["model"],
-            state["tokenizer"],
-            state["config"],
-            state["memory_store"],
-            state_provider=lambda: state,
-        )
-        state["consolidation_loop"] = loop
-        state["model"] = loop.model
-    return loop
 
 
 @dataclass(frozen=True)
@@ -924,28 +898,21 @@ _CHAIN: dict[str, _ChainDeclaration] = {
 }
 
 
-def calibrate_chain(state: dict, use_case: str, req: CalibrateChainRequest) -> dict[str, Any]:
-    """Run the production extraction chain for one calibration use case.
+def validate_chain(state: dict, use_case: str, req: CalibrateChainRequest) -> dict[str, Any]:
+    """Validate one chain-endpoint request — paired with :func:`dispatch_chain`
+    as the use case's validate/dispatch split.
 
-    The one handler behind every chain endpoint.  It reads that use
-    case's declaration (:data:`_CHAIN`), opens the operator's prompt
-    variants, enters the chain where the declaration says, and returns the
-    declared step's output — it never calls a step's primitive itself, so
-    a calibration run cannot diverge from the production call it reports
-    on.
+    Runs on the event loop, before dispatch: rejects unusable input
+    (turn-marking, a missing or unparseable graph seed, a named prompt
+    variant that does not exist) BEFORE any model call, zero inference
+    cost.  Resolves the use case's declaration (:data:`_CHAIN`), the stop
+    step, and the operator's prompt overrides into one dict
+    :func:`dispatch_chain` consumes.
 
-    ``guard`` rejects unusable input (turn-marking, a missing or
-    unparseable graph seed, a named prompt variant that does not exist)
-    before any inference runs; ``dispatch`` routes through
-    :meth:`ExtractionPipeline.run` / :meth:`~ExtractionPipeline.run_procedural`
-    on the process-wide ``ConsolidationLoop``, so calibration shares the
-    exact instance the production /consolidate cycle uses — same model,
-    same config, same flags.
-
-    Prompt provenance and ``n_input_tokens`` come from the phase record
-    the chain itself opened for the inspected step (see
-    :func:`_provenance_from_records`) — never a hand-built ``prompts``
-    literal.
+    Returns:
+        The resolved dict: ``decl``, ``stop``, ``focus`` (the inspected
+        step), ``overrides``, and (only when ``decl.injects == "graph"``)
+        ``seed`` (the validated :class:`~paramem.graph.schema.SessionGraph`).
     """
     decl = _CHAIN[use_case]
     # The operator's stop is honoured only where the declaration leaves one
@@ -956,117 +923,160 @@ def calibrate_chain(state: dict, use_case: str, req: CalibrateChainRequest) -> d
     # declaration leaves it open — falling back to the entry step when the
     # run has no stop at all and walks to the end.
     focus = stop or decl.start
-    resolved: dict[str, Any] = {}
+    resolved: dict[str, Any] = {"decl": decl, "stop": stop, "focus": focus}
 
-    def guard() -> None:
-        # Validated here, at the HTTP boundary — after _preflight's config/
-        # state gates but before the GPU lock _measured_local_call takes —
-        # the SAME source (PHASE_NAMES) stop_at validates again downstream
-        # as a library precondition. Duplicating the membership test is
-        # deliberate: one is a request-input check, the other guards the
-        # pipeline call regardless of caller.
-        if stop is not None and stop not in PHASE_NAMES:
-            raise HTTPException(
-                status_code=400,
-                detail=f"stop_phase {stop!r} is not a valid phase name. Valid: {list(PHASE_NAMES)}",
-            )
-        _require_turn_marked_transcript(req.transcript)
-        if not req.speaker_id:
-            raise HTTPException(
-                status_code=400,
-                detail="speaker_id is required (no empty-string default).",
-            )
-        if decl.injects == "graph":
-            if req.graph is None:
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        f"This calibration enters the chain at {decl.start!r}, which "
-                        f"consumes the graph 'local_extract' would have produced. "
-                        f"Supply it as 'graph' (typically a prior /calibrate/extract "
-                        f"response's parsed graph)."
-                    ),
-                )
-            try:
-                resolved["seed"] = SessionGraph.model_validate(req.graph)
-            except Exception as exc:  # noqa: BLE001
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Invalid SessionGraph payload: {exc}",
-                ) from exc
-        resolved["overrides"] = _resolve_prompt_variants(state, req.prompt_variants)
-
-    def dispatch() -> tuple[Any, dict]:
-        loop = _ensure_calibration_loop(state)
-        kwargs: dict[str, Any] = {
-            "speaker_id": req.speaker_id,
-            "speaker_name": req.speaker_name,
-            "source_type": req.source_type,
-            "seed": req.params.seed,
-        }
-        if decl.entry == "run":
-            # Sampling overrides reach the chain through extract_graph's
-            # signature; run_procedural's does not carry them.
-            if req.params.max_tokens is not None:
-                kwargs["max_tokens"] = req.params.max_tokens
-            if req.params.temperature is not None:
-                kwargs["temperature"] = req.params.temperature
-
-        with (
-            prompt_overrides(resolved["overrides"]),
-            start_at(decl.start, resolved.get("seed")),
-            stop_at(stop),
-        ):
-            graph = getattr(loop.extraction, decl.entry)(
-                req.transcript,
-                req.session_id,
-                **kwargs,
-            )
-        # Symmetric to ConsolidationLoop.extract_session: the caller that turned
-        # a transcript into a session graph persists it as the per-session
-        # snapshot.  The calibration_run scope _run_calibration opened routes it
-        # into this run's own directory (the production debug tree, too, when
-        # debug is on).  Mid-chain endpoints (injects="graph") inject a graph and
-        # run a sub-step — not a session extraction — so they write no snapshot.
-        if decl.injects == "transcript":
-            on_session_extracted(
-                graph,
-                req.session_id,
-                "procedural_graph" if decl.entry == "run_procedural" else "graph",
-            )
-        parsed = graph.model_dump(mode="json") if hasattr(graph, "model_dump") else {}
-
-        # The inspected step's own raw output, surfaced at the top level so
-        # a prompt diff needs no traversal of the phases list.
-        from paramem.graph.phase_trace import get_phases
-
-        record = next(
-            (r for r in get_phases(graph) if r.name == focus),
-            None,
+    # The SAME source (PHASE_NAMES) stop_at validates again downstream as a
+    # library precondition. Duplicating the membership test is deliberate:
+    # one is a request-input check, the other guards the pipeline call
+    # regardless of caller.
+    if stop is not None and stop not in PHASE_NAMES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"stop_phase {stop!r} is not a valid phase name. Valid: {list(PHASE_NAMES)}",
         )
-        return (record.raw_output if record else "") or "", parsed
+    _require_turn_marked_transcript(req.transcript)
+    if not req.speaker_id:
+        raise HTTPException(
+            status_code=400,
+            detail="speaker_id is required (no empty-string default).",
+        )
+    if decl.injects == "graph":
+        if req.graph is None:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"This calibration enters the chain at {decl.start!r}, which "
+                    f"consumes the graph 'local_extract' would have produced. "
+                    f"Supply it as 'graph' (typically a prior /calibrate/extract "
+                    f"response's parsed graph)."
+                ),
+            )
+        try:
+            resolved["seed"] = SessionGraph.model_validate(req.graph)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid SessionGraph payload: {exc}",
+            ) from exc
+    resolved["overrides"] = resolve_prompt_variants(state, req.prompt_variants)
+    # Document-shaped only for the transcript-injecting use cases: a
+    # mid-chain endpoint (injects="graph") never runs the dense-chunk
+    # extraction regime the eviction exists for.
+    resolved["evicts_voice"] = decl.injects == "transcript" and req.source_type == "document"
+    return resolved
 
-    response = _run_calibration(
-        stage=use_case,
-        guard=guard,
-        dispatch=dispatch,
-        input_prompt_phase=focus,
-        state=state,
-        params=req.params,
-        # Every chain run threads the seed into the local steps it walks,
-        # whatever step it is inspecting — the local/cloud split that used
-        # to gate this belonged to the standalone probes.
-        supports_seed=True,
+
+def dispatch_chain(
+    state: dict, use_case: str, req: CalibrateChainRequest, resolved: dict[str, Any]
+) -> tuple[Any, dict]:
+    """Run one calibration use case's chain step — paired with
+    :func:`validate_chain`, which validates the request and resolves the
+    use case's declaration before this runs.
+
+    Routes through :meth:`ExtractionPipeline.run` /
+    :meth:`~ExtractionPipeline.run_procedural` on the process-wide
+    ``ConsolidationLoop``, so calibration shares the exact instance the
+    production consolidation dispatch uses — same model, same config, same
+    flags.  Prompt provenance and ``n_input_tokens`` come from the phase
+    record the chain itself opened for the inspected step (see
+    :func:`_provenance_from_records`) — never a hand-built ``prompts``
+    literal.
+
+    Args:
+        state: The live server state dict.
+        use_case: The route's use case name (``_CHAIN`` key).
+        req: The validated request.
+        resolved: :func:`validate_chain`'s return value.
+    """
+    from paramem.server.consolidation import get_or_create_consolidation_loop
+
+    decl = resolved["decl"]
+    stop = resolved["stop"]
+    focus = resolved["focus"]
+    loop = get_or_create_consolidation_loop(state)
+    kwargs: dict[str, Any] = {
+        "speaker_id": req.speaker_id,
+        "speaker_name": req.speaker_name,
+        "source_type": req.source_type,
+        "seed": req.params.seed,
+    }
+    if decl.entry == "run":
+        # Sampling overrides reach the chain through extract_graph's
+        # signature; run_procedural's does not carry them.
+        if req.params.max_tokens is not None:
+            kwargs["max_tokens"] = req.params.max_tokens
+        if req.params.temperature is not None:
+            kwargs["temperature"] = req.params.temperature
+
+    with (
+        start_at(decl.start, resolved.get("seed")),
+        stop_at(stop),
+    ):
+        graph = getattr(loop.extraction, decl.entry)(
+            req.transcript,
+            req.session_id,
+            **kwargs,
+        )
+    # Symmetric to ConsolidationLoop.extract_session: the caller that turned
+    # a transcript into a session graph persists it as the per-session
+    # snapshot.  The calibration_run scope the envelope opened routes it
+    # into this run's own directory (the production debug tree, too, when
+    # debug is on).  Mid-chain endpoints (injects="graph") inject a graph and
+    # run a sub-step — not a session extraction — so they write no snapshot.
+    if decl.injects == "transcript":
+        on_session_extracted(
+            graph,
+            req.session_id,
+            "procedural_graph" if decl.entry == "run_procedural" else "graph",
+        )
+    parsed = graph.model_dump(mode="json") if hasattr(graph, "model_dump") else {}
+
+    # The inspected step's own raw output, surfaced at the top level so
+    # a prompt diff needs no traversal of the phases list.
+    from paramem.graph.phase_trace import get_phases
+
+    record = next(
+        (r for r in get_phases(graph) if r.name == focus),
+        None,
     )
-    return response
+    return (record.raw_output if record else "") or "", parsed
 
 
-def calibrate_normalize(state: dict, req: CalibrateNormalizeRequest) -> dict[str, Any]:
-    """Run the production predicate-normalization pass on injected relations.
+def validate_normalize(state: dict, req: CalibrateNormalizeRequest) -> dict[str, Any]:
+    """Resolve the injected relations and prompt overrides for
+    :func:`dispatch_normalize` — paired with it as the ``normalize`` stage's
+    validate/dispatch split.
 
-    Normalization is a single-step chain whose artifact is a relation set.
-    ``dispatch`` seeds a throwaway :class:`~paramem.graph.merger.GraphMerger`
-    with that set and hands it to the SAME
+    Resolves the injected relations — supplied inline, or read from a
+    NetworkX node-link snapshot on the server filesystem — and the
+    operator's prompt variants, both before any model call.
+    """
+    has_relations = req.relations is not None
+    has_snapshot = req.snapshot_path is not None
+    if has_relations == has_snapshot:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Exactly one of 'relations' or 'snapshot_path' must be provided, "
+                "not both and not neither."
+            ),
+        )
+    resolved: dict[str, Any] = {"overrides": resolve_prompt_variants(state, req.prompt_variants)}
+    resolved["relations"] = (
+        req.relations if has_relations else _relations_from_snapshot(req.snapshot_path)  # type: ignore[arg-type]
+    )
+    return resolved
+
+
+def dispatch_normalize(
+    state: dict, req: CalibrateNormalizeRequest, resolved: dict[str, Any]
+) -> tuple[Any, dict]:
+    """Run the production predicate-normalization pass on the resolved
+    relations — paired with :func:`validate_normalize`, which resolves
+    *resolved* before this runs.
+
+    Seeds a throwaway :class:`~paramem.graph.merger.GraphMerger` with the
+    resolved relation set and hands it to the SAME
     :class:`~paramem.training.graph_tier.GraphTierRefiner` the consolidation
     cycle builds (``ConsolidationLoop.build_tier_refiner`` is the one
     construction site), so the operator sees the production engine selection
@@ -1077,223 +1087,164 @@ def calibrate_normalize(state: dict, req: CalibrateNormalizeRequest) -> dict[str
     reported are the ones the pass actually applied, to a graph built from
     the injected relations and discarded when the call returns.  The live
     merger is never touched.
-
-    ``guard`` resolves the injected relations — supplied inline, or read
-    from a NetworkX node-link snapshot on the server filesystem — and the
-    operator's prompt variants, both before any model call.
     """
     from paramem.graph.merger import GraphMerger
     from paramem.graph.schema import Relation
+    from paramem.server.consolidation import get_or_create_consolidation_loop
 
-    resolved: dict[str, Any] = {}
-
-    def guard() -> None:
-        has_relations = req.relations is not None
-        has_snapshot = req.snapshot_path is not None
-        if has_relations == has_snapshot:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "Exactly one of 'relations' or 'snapshot_path' must be provided, "
-                    "not both and not neither."
-                ),
+    loop = get_or_create_consolidation_loop(state)
+    merger = GraphMerger(model=state.get("model"), tokenizer=state.get("tokenizer"))
+    # The pass reads subject/predicate/object and the edge bookkeeping
+    # the merger itself stamps; ``relation_type``/``speaker_id`` are
+    # required by the schema but never consulted by it, so an injected
+    # triple that omits them gets a structural placeholder rather than
+    # forcing the operator to supply provenance the calibration does
+    # not use.
+    merger.merge_relations(
+        [
+            Relation(
+                subject=str(rel.get("subject", "")),
+                predicate=str(rel.get("predicate", "")),
+                object=str(rel.get("object", "")),
+                relation_type=rel.get("relation_type", "factual"),
+                speaker_id=rel.get("speaker_id", "speaker0"),
             )
-        resolved["overrides"] = _resolve_prompt_variants(state, req.prompt_variants)
-
-        if has_relations:
-            resolved["relations"] = req.relations
-            return
-
-        resolved["relations"] = _relations_from_snapshot(req.snapshot_path)  # type: ignore[arg-type]
-
-    def dispatch() -> tuple[Any, dict]:
-        loop = _ensure_calibration_loop(state)
-        merger = GraphMerger(model=state.get("model"), tokenizer=state.get("tokenizer"))
-        # The pass reads subject/predicate/object and the edge bookkeeping
-        # the merger itself stamps; ``relation_type``/``speaker_id`` are
-        # required by the schema but never consulted by it, so an injected
-        # triple that omits them gets a structural placeholder rather than
-        # forcing the operator to supply provenance the calibration does
-        # not use.
-        merger.merge_relations(
-            [
-                Relation(
-                    subject=str(rel.get("subject", "")),
-                    predicate=str(rel.get("predicate", "")),
-                    object=str(rel.get("object", "")),
-                    relation_type=rel.get("relation_type", "factual"),
-                    speaker_id=rel.get("speaker_id", "speaker0"),
-                )
-                for rel in resolved["relations"]
-            ],
-            session_id="__calibration_normalize__",
-            log_label="calibration",
-        )
-        before = merger.get_all_triples()
-        # extraction_trace() re-entry is a no-op that yields the scope
-        # _run_calibration already opened, which is where the pass's own
-        # nested scope lands the ``normalize`` phase record.
-        with extraction_trace() as trace, prompt_overrides(resolved["overrides"]):
-            diagnostics = loop.build_tier_refiner(merger).run_normalization()
-        after = merger.get_all_triples()
-        retired = [list(triple) for triple in set(before) - set(after)]
-
-        record = next((r for r in trace.records if r.name == "normalize"), None)
-        parsed: dict[str, Any] = {
-            "surviving_relations": [list(triple) for triple in after],
-            "retired_relations": retired,
-            "input_count": len(resolved["relations"]),
-            "surviving_count": len(after),
-            **diagnostics,
-        }
-        return (record.raw_output if record else "") or "", parsed
-
-    return _run_calibration(
-        stage="normalize",
-        guard=guard,
-        dispatch=dispatch,
-        input_prompt_phase="normalize",
-        state=state,
-        params=req.params,
-        supports_seed=True,
+            for rel in resolved["relations"]
+        ],
+        session_id="__calibration_normalize__",
+        log_label="calibration",
     )
+    before = merger.get_all_triples()
+    # extraction_trace() re-entry is a no-op that yields the scope run_stage
+    # already opened, which is where the pass's own nested scope lands the
+    # ``normalize`` phase record.  The operator's prompt overrides are
+    # already active for the whole run, opened once by the envelope.
+    with extraction_trace() as trace:
+        diagnostics = loop.build_tier_refiner(merger).run_normalization()
+    after = merger.get_all_triples()
+    retired = [list(triple) for triple in set(before) - set(after)]
+
+    record = next((r for r in trace.records if r.name == "normalize"), None)
+    parsed: dict[str, Any] = {
+        "surviving_relations": [list(triple) for triple in after],
+        "retired_relations": retired,
+        "input_count": len(resolved["relations"]),
+        "surviving_count": len(after),
+        **diagnostics,
+    }
+    return (record.raw_output if record else "") or "", parsed
 
 
-def calibrate_anonymize_facts(state: dict, req: CalibrateAnonymizeFactsRequest) -> dict[str, Any]:
-    """Run the graph-tier anonymize step — the SAME local
-    :func:`~paramem.cloud.anonymize.anonymize` call
-    :func:`~paramem.training.graph_enrich.enrich_graph` makes per chunk —
-    on an explicit fact list or graph snapshot.
+def validate_anonymize_facts(state: dict, req: CalibrateAnonymizeFactsRequest) -> dict[str, Any]:
+    """Resolve the fact list and prompt overrides for
+    :func:`dispatch_anonymize_facts` — paired with it as the
+    ``anonymize_facts`` stage's validate/dispatch split.
+    """
+    has_facts = req.facts is not None
+    has_snapshot = req.snapshot_path is not None
+    if has_facts == has_snapshot:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Exactly one of 'facts' or 'snapshot_path' must be provided, "
+                "not both and not neither."
+            ),
+        )
+    resolved: dict[str, Any] = {"overrides": resolve_prompt_variants(state, req.prompt_variants)}
+    facts = req.facts if has_facts else _relations_from_snapshot(req.snapshot_path)  # type: ignore[arg-type]
+    if not facts:
+        raise HTTPException(
+            status_code=400,
+            detail="No facts to anonymize (empty facts list, or snapshot has no edges).",
+        )
+    resolved["facts"] = facts
+    return resolved
 
-    A standalone, non-chunk use case (mirrors :func:`calibrate_normalize`
-    and :func:`calibrate_name`, neither of which is part of
-    :data:`_CHAIN`): the artifact is a fact list, not a transcript, so
-    this never goes through :class:`~paramem.graph.extraction_pipeline.
-    ExtractionPipeline` — it calls the shared cloud-anonymize primitive
-    directly, exactly as production's graph-tier caller does.
 
-    ``scrub`` and ``token_envelope`` are read from ``loop.extraction.config``
-    — the SAME ``ExtractionConfig`` instance
-    :meth:`~paramem.training.consolidation.ConsolidationLoop._current_extraction_config`
-    hands :func:`~paramem.training.graph_enrich.enrich_graph` in
-    production — never a request override, so a calibration run reports
-    on the operator's actual configured envelope, not a synthetic one.
-    ``identity_domain`` is derived from the resolved facts' own
-    subject/object endpoints, mirroring a production chunk's node list
-    (``chunk_nodes`` in ``enrich_graph``) — production has a live merged
-    graph to draw that list from; calibration has only the facts it was
-    handed, which is the faithful analogue.
+def dispatch_anonymize_facts(
+    state: dict, req: CalibrateAnonymizeFactsRequest, resolved: dict[str, Any]
+) -> tuple[Any, dict]:
+    """Run the graph-tier anonymize step on the resolved facts — paired
+    with :func:`validate_anonymize_facts`, which resolves *resolved*
+    before this runs.
 
     ``anonymize()`` itself opens no phase-trace scope — ``paramem.cloud``
-    must not import ``paramem.graph`` (see that module's package
-    docstring) — and production's own call site
+    must not import ``paramem.graph`` — and production's own call site
     (``paramem.training.graph_enrich.enrich_graph``) does not wrap it in
-    one either, so this handler opens ``phase_trace("anonymize")``
-    itself, around the identical primitive call, the same way the
-    session-tier ``anonymize`` stage body
-    (:func:`~paramem.graph.stage_anonymize._stage_anonymize`) already
-    does — ``"anonymize"`` is also the only :data:`~paramem.graph.
-    phase_trace.PHASE_NAMES` member this call shape could carry (the
-    vocabulary is closed); the calibration STAGE label
-    (``"anonymize_facts"``, this use case's own name — distinct from the
-    phase name) is what tells the two apart in the response and at the
-    route level.
+    one either, so this opens ``phase_trace("anonymize")`` itself, around
+    the identical primitive call, the same way the session-tier
+    ``anonymize`` stage body does.
     """
-    resolved: dict[str, Any] = {}
+    from paramem.cloud.anonymize import anonymize
+    from paramem.server.consolidation import get_or_create_consolidation_loop
 
-    def guard() -> None:
-        has_facts = req.facts is not None
-        has_snapshot = req.snapshot_path is not None
-        if has_facts == has_snapshot:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "Exactly one of 'facts' or 'snapshot_path' must be provided, "
-                    "not both and not neither."
-                ),
-            )
-        resolved["overrides"] = _resolve_prompt_variants(state, req.prompt_variants)
-        facts = req.facts if has_facts else _relations_from_snapshot(req.snapshot_path)  # type: ignore[arg-type]
-        if not facts:
-            raise HTTPException(
-                status_code=400,
-                detail="No facts to anonymize (empty facts list, or snapshot has no edges).",
-            )
-        resolved["facts"] = facts
-
-    def dispatch() -> tuple[Any, dict]:
-        from paramem.cloud.anonymize import anonymize
-
-        loop = _ensure_calibration_loop(state)
-        ext_cfg = loop.extraction.config
-        facts = resolved["facts"]
-        # Mirrors enrich_graph's chunk_nodes: every distinct subject/object
-        # surface across the facts this call anonymizes.
-        identity_domain = sorted(
-            {str(f.get("subject", "")) for f in facts if f.get("subject")}
-            | {str(f.get("object", "")) for f in facts if f.get("object")}
-        )
-        with phase_trace("anonymize") as t, prompt_overrides(resolved["overrides"]):
-            anon_prompt = _load_prompt("anonymization_facts.txt")
-            anon_system = _load_prompt("anonymization_system.txt")
-            payload = anonymize(
-                facts,
-                loop.model,
-                loop.tokenizer,
-                transcript="",
-                scrub=ext_cfg.scrub,
-                identity_domain=identity_domain,
-                token_envelope=ext_cfg.anonymize_token_envelope,
-                seed=req.params.seed,
-                user_prompt_template=anon_prompt,
-                system_prompt=anon_system,
-            )
-            t.set_raw(payload.raw)
-            t.set_parsed(
-                {
-                    "mapping": dict(payload.forward),
-                    "mapping_size": len(payload.forward),
-                    "status": payload.status,
-                    "failure": payload.failure,
-                    "slices": payload.slices,
-                    "slices_failed": payload.slices_failed,
-                }
-            )
-        parsed: dict[str, Any] = {
-            "status": payload.status,
-            "failure": payload.failure,
-            "mapping": dict(payload.forward),
-            "slices": payload.slices,
-            "slices_failed": payload.slices_failed,
-            "identity_domain_size": len(identity_domain),
-            "facts_count": len(facts),
-        }
-        return payload.raw, parsed
-
-    return _run_calibration(
-        stage="anonymize_facts",
-        guard=guard,
-        dispatch=dispatch,
-        input_prompt_phase="anonymize",
-        state=state,
-        params=req.params,
-        supports_seed=True,
+    loop = get_or_create_consolidation_loop(state)
+    ext_cfg = loop.extraction.config
+    facts = resolved["facts"]
+    # Mirrors enrich_graph's chunk_nodes: every distinct subject/object
+    # surface across the facts this call anonymizes.
+    identity_domain = sorted(
+        {str(f.get("subject", "")) for f in facts if f.get("subject")}
+        | {str(f.get("object", "")) for f in facts if f.get("object")}
     )
+    with phase_trace("anonymize") as t:
+        anon_prompt = _load_prompt("anonymization_facts.txt")
+        anon_system = _load_prompt("anonymization_system.txt")
+        payload = anonymize(
+            facts,
+            loop.model,
+            loop.tokenizer,
+            transcript="",
+            scrub=ext_cfg.scrub,
+            identity_domain=identity_domain,
+            token_envelope=ext_cfg.anonymize_token_envelope,
+            seed=req.params.seed,
+            user_prompt_template=anon_prompt,
+            system_prompt=anon_system,
+        )
+        t.set_raw(payload.raw)
+        t.set_parsed(
+            {
+                "mapping": dict(payload.forward),
+                "mapping_size": len(payload.forward),
+                "status": payload.status,
+                "failure": payload.failure,
+                "slices": payload.slices,
+                "slices_failed": payload.slices_failed,
+            }
+        )
+    parsed: dict[str, Any] = {
+        "status": payload.status,
+        "failure": payload.failure,
+        "mapping": dict(payload.forward),
+        "slices": payload.slices,
+        "slices_failed": payload.slices_failed,
+        "identity_domain_size": len(identity_domain),
+        "facts_count": len(facts),
+    }
+    return payload.raw, parsed
 
 
-def calibrate_name(state: dict, req: CalibrateNameRequest) -> dict[str, Any]:
-    """Run the production name extractor on an explicit turn list.
+def validate_name(state: dict, req: CalibrateNameRequest) -> dict[str, Any]:
+    """Resolve the prompt overrides for :func:`dispatch_name` — paired
+    with it as the ``name`` stage's validate/dispatch split.
+    """
+    return {"overrides": resolve_prompt_variants(state, req.prompt_variants)}
 
-    Enrollment is a single-step chain: the artifact injected at
-    ``name_extract`` is the turn list, and that step is also the one whose
-    output comes back.  ``dispatch`` calls
-    :func:`~paramem.graph.name_extraction.extract_name_via_llm` — the same
-    function, on the same base weights, that
+
+def dispatch_name(
+    state: dict, req: CalibrateNameRequest, resolved: dict[str, Any]
+) -> tuple[Any, dict]:
+    """Run the production name extractor on the request's turn list —
+    paired with :func:`validate_name`, which resolves *resolved* before
+    this runs.
+
+    Calls :func:`~paramem.graph.name_extraction.extract_name_via_llm` — the
+    same function, on the same base weights, that
     ``_run_enrollment_for_speaker`` calls in production, and which opens
     the ``name_extract`` phase itself.  Nothing here re-implements the
-    post-filter or synthesises a phase record: ``prompts``,
-    ``raw_output`` and ``n_input_tokens`` all come from the phase the
-    primitive opened.
+    post-filter or synthesises a phase record: ``prompts``, ``raw_output``
+    and ``n_input_tokens`` all come from the phase the primitive opened.
 
     ``user_turns_only`` mirrors the production default (``True``) — only
     user turns reach the model; set to ``False`` to include assistant turns
@@ -1302,73 +1253,95 @@ def calibrate_name(state: dict, req: CalibrateNameRequest) -> dict[str, Any]:
     """
     from paramem.graph.name_extraction import extract_name_via_llm
     from paramem.models.loader import base_model_inference
+    from paramem.server.consolidation import get_or_create_consolidation_loop
 
     inference_params = {
         "temperature": req.params.temperature,
         "seed": req.params.seed,
         "max_tokens": req.params.max_tokens,
     }
-    resolved: dict[str, Any] = {}
-
-    def guard() -> None:
-        resolved["overrides"] = _resolve_prompt_variants(state, req.prompt_variants)
-
-    def dispatch() -> tuple[Any, dict]:
-        # Read AFTER _ensure_calibration_loop (called by _run_calibration
-        # before dispatch) so a first-ever calibration call on a fresh
-        # server sees the loop's rebound state["model"]/["tokenizer"]
-        # rather than the pre-rebind values.
-        model = state.get("model")
-        tokenizer = state.get("tokenizer")
-        with prompt_overrides(resolved["overrides"]), base_model_inference(model):
-            extracted, raw_output = extract_name_via_llm(
-                req.turns,
-                model,
-                tokenizer,
-                user_turns_only=req.user_turns_only,
-                params=inference_params,
-            )
-        return raw_output, {"name": extracted}
-
-    return _run_calibration(
-        stage="name",
-        guard=guard,
-        dispatch=dispatch,
-        input_prompt_phase="name_extract",
-        state=state,
-        params=req.params,
-        supports_seed=True,
-    )
+    # get_or_create_consolidation_loop rebinds state["model"]/["tokenizer"]
+    # to the loop's PeftModel wrapper on a fresh server, so it is called
+    # (and its return discarded) BEFORE reading either handle below, even
+    # though this dispatch never touches loop.extraction itself.
+    get_or_create_consolidation_loop(state)
+    model = state.get("model")
+    tokenizer = state.get("tokenizer")
+    with base_model_inference(model):
+        extracted, raw_output = extract_name_via_llm(
+            req.turns,
+            model,
+            tokenizer,
+            user_turns_only=req.user_turns_only,
+            params=inference_params,
+        )
+    return raw_output, {"name": extracted}
 
 
-def calibrate_respond(state: dict, req: CalibrateRespondRequest) -> dict[str, Any]:
-    """Run one production serving turn for an enrolled speaker.
+def validate_respond(state: dict, req: CalibrateRespondRequest) -> dict[str, Any]:
+    """Validate one ``/calibrate/respond`` request — paired with
+    :func:`dispatch_respond` as the ``respond`` stage's validate/dispatch
+    split.
 
-    A standalone use case, like :func:`calibrate_normalize`,
-    :func:`calibrate_anonymize_facts`, and :func:`calibrate_name`: it never
-    goes through :class:`~paramem.graph.extraction_pipeline.ExtractionPipeline`
-    — ``dispatch`` calls :func:`~paramem.server.inference.handle_chat`
-    verbatim, the same function ``POST /chat`` and ``POST /voice`` dispatch
-    to, with the SAME production kwarg set. Everything the call reaches from
-    there (dual-graph routing, the personal probe, HA escalation, cloud
-    escalation, abstention, the base-model fallback) runs exactly as it
-    would on a real turn: **this call may actuate a Home Assistant device
-    and place a billed cloud call**, with no opt-out.
-
-    ``guard`` rejects empty ``text``, empty or unknown ``speaker_id``
+    Rejects empty ``text``, empty or unknown ``speaker_id``
     (``store.get_name(...) is None`` — **400, not 404**: the driver script
-    at ``scripts/dev/calibrate_prompts.py`` turns any 404 into an
+    at ``scripts/dev/calibrate_prompts.py`` turns any 404 into a
     ``calibrate_endpoint_enabled`` operator hint, which would mislead on an
     unenrolled speaker), a missing ``speaker_store``/``session_buffer``/
     ``router``/``memory_store`` (503 — server-not-ready, matching
-    :func:`_preflight`'s vocabulary), and an unresolvable prompt variant —
-    all before any model call. ``dispatch`` resolves the turn's language
+    :func:`preflight`'s vocabulary), and an unresolvable prompt variant —
+    all before any model call.
+    """
+    if not req.text:
+        raise HTTPException(status_code=400, detail="text must not be empty.")
+    if not req.speaker_id:
+        raise HTTPException(
+            status_code=400,
+            detail="speaker_id is required (no empty-string default).",
+        )
+    store = state.get("speaker_store")
+    if store is None:
+        raise HTTPException(status_code=503, detail="Speaker store not ready.")
+    if state.get("session_buffer") is None:
+        raise HTTPException(status_code=503, detail="Session buffer not ready.")
+    if state.get("router") is None:
+        raise HTTPException(status_code=503, detail="Router not ready.")
+    if state.get("memory_store") is None:
+        raise HTTPException(status_code=503, detail="Memory store not ready.")
+    if store.get_name(req.speaker_id) is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown speaker_id: {req.speaker_id!r} is not enrolled.",
+        )
+    return {"overrides": resolve_prompt_variants(state, req.prompt_variants)}
+
+
+def dispatch_respond(
+    state: dict, req: CalibrateRespondRequest, resolved: dict[str, Any]
+) -> tuple[str, dict]:
+    """Run one production serving turn for an enrolled speaker — paired
+    with :func:`validate_respond`, which resolves *resolved* before this
+    runs.
+
+    A standalone use case, like :func:`dispatch_normalize`,
+    :func:`dispatch_anonymize_facts`, and :func:`dispatch_name`: it never
+    goes through :class:`~paramem.graph.extraction_pipeline.ExtractionPipeline`
+    — calls :func:`~paramem.server.inference.handle_chat` verbatim, the same
+    function ``POST /chat`` and ``POST /voice`` dispatch to, with the SAME
+    production kwarg set. Everything the call reaches from there (dual-graph
+    routing, the personal probe, HA escalation, cloud escalation,
+    abstention, the base-model fallback) runs exactly as it would on a real
+    turn: **this call may actuate a Home Assistant device and place a
+    billed cloud call**, with no opt-out.
+
+    Resolves the turn's language
     (:func:`~paramem.server.lang_id.resolve_text_language`), the speaker's
     display name, and the stored conversation history, then calls
-    :func:`~paramem.server.inference.handle_chat` under the operator's
-    prompt overrides; ``model``/``tokenizer`` are read from ``state`` INSIDE
-    ``dispatch`` (after :func:`_ensure_calibration_loop` has had a chance to
-    rebind them on a fresh server, same defect fix as :func:`calibrate_name`).
+    :func:`~paramem.server.inference.handle_chat`; ``model``/``tokenizer``
+    are read from ``state`` AFTER
+    :func:`~paramem.server.consolidation.get_or_create_consolidation_loop`
+    has had a chance to rebind them on a fresh server, same defect fix as
+    :func:`dispatch_name`.
 
     Envelope semantics specific to this use case:
 
@@ -1381,15 +1354,26 @@ def calibrate_respond(state: dict, req: CalibrateRespondRequest) -> dict[str, An
       (:func:`~paramem.server.speaker.resolve_speaker_tokens` is scoped to
       human-display output only), and it would only duplicate
       ``raw_output`` in substance.
-    * ``parsed`` carries ``escalated`` (bool) and every key of
+    * ``parsed`` carries ``escalated`` (bool), every key of
       :attr:`~paramem.server.inference.ChatResult.diagnostics` (routing
-      decision, and — on the personal-probe leg — per-adapter probe
-      counts and the temporal selection outcome) flattened in.
+      decision, and — on the personal-probe leg — per-adapter probe counts
+      and the temporal selection outcome) flattened in, and
+      ``variants_unexercised`` (sorted list, empty when every override
+      loaded): which prompt was resolved is branch-dependent (an
+      HA-answered turn loads none of the serving prompts at all;
+      ``cloud_serving_system.txt`` loads only on cloud escalation;
+      ``recall_selection.txt`` only on the temporal personal leg;
+      ``intent_classifier.txt`` only under ``intent.mode: llm``), so a
+      variant that never got a chance to load is NOT an error — a
+      multi-variant sweep must not fail because one leg didn't fire on
+      this particular utterance, the turn still ran production-faithfully.
+      Computed by diffing ``req.prompt_variants``'s keys against every
+      ``<override:{name}>`` basename this dispatch's own trace captured.
     * ``params_effective`` is all-``null`` by construction: this request
       shape has no sampling-parameter field (see
-      :class:`CalibrateRespondRequest`), so :func:`_run_calibration` is
-      called with a bare :class:`CalibrateParams` and ``supports_seed=False``
-      — no seed threads into the serving path at all.
+      :class:`CalibrateRespondRequest`), so the route passes a bare
+      :class:`CalibrateParams` with ``supports_seed=False`` — no seed
+      threads into the serving path at all.
     * ``n_input_tokens`` measures the template of the FIRST non-``*_system.txt``
       prompt the ``serve_turn`` phase record captured (see
       :func:`_provenance_from_records`) — which basename that actually is
@@ -1403,18 +1387,6 @@ def calibrate_respond(state: dict, req: CalibrateRespondRequest) -> dict[str, An
       ``cloud_enrich``, …) that a turn escalating through
       :func:`~paramem.server.inference.answer_via_cloud` opened on this same
       trace.
-    * ``variants_unexercised`` (sorted list, top-level envelope key, empty
-      when every override loaded): which prompt was resolved is
-      branch-dependent (an HA-answered turn loads none of the serving
-      prompts at all; ``cloud_serving_system.txt`` loads only on cloud
-      escalation; ``recall_selection.txt`` only on the temporal personal
-      leg; ``intent_classifier.txt`` only under ``intent.mode: llm``), so a
-      variant that never got a chance to load is NOT a 400 — a
-      multi-variant sweep must not fail because one leg didn't fire on
-      this particular utterance, the turn still ran production-faithfully.
-      Computed after :func:`_run_calibration` returns, by diffing
-      ``req.prompt_variants``'s keys against every ``<override:{name}>``
-      basename actually found in the response's ``prompts`` list.
 
     This call writes no session-buffer entry, no speaker-store write, and no
     registry write (:func:`~paramem.server.inference.handle_chat` itself
@@ -1423,79 +1395,61 @@ def calibrate_respond(state: dict, req: CalibrateRespondRequest) -> dict[str, An
     :func:`~paramem.utils.artifacts.on_calibration_result` hook, same as
     every other calibration stage.
     """
-    resolved: dict[str, Any] = {}
+    from paramem.server.consolidation import get_or_create_consolidation_loop
+    from paramem.server.inference import handle_chat
 
-    def guard() -> None:
-        if not req.text:
-            raise HTTPException(status_code=400, detail="text must not be empty.")
-        if not req.speaker_id:
-            raise HTTPException(
-                status_code=400,
-                detail="speaker_id is required (no empty-string default).",
-            )
-        store = state.get("speaker_store")
-        if store is None:
-            raise HTTPException(status_code=503, detail="Speaker store not ready.")
-        if state.get("session_buffer") is None:
-            raise HTTPException(status_code=503, detail="Session buffer not ready.")
-        if state.get("router") is None:
-            raise HTTPException(status_code=503, detail="Router not ready.")
-        if state.get("memory_store") is None:
-            raise HTTPException(status_code=503, detail="Memory store not ready.")
-        if store.get_name(req.speaker_id) is None:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Unknown speaker_id: {req.speaker_id!r} is not enrolled.",
-            )
-        resolved["overrides"] = _resolve_prompt_variants(state, req.prompt_variants)
-
-    def dispatch() -> tuple[str, dict]:
-        from paramem.server.inference import handle_chat
-
-        model, tokenizer = state["model"], state["tokenizer"]
-        language, _ = lang_id.resolve_text_language(req.text, state["config"].text_lang_detection)
-        store = state["speaker_store"]
-        speaker_name = store.resolve_speaker_name(req.speaker_id)
-        history = state["session_buffer"].get_conversation_turns(req.conversation_id)
-        with prompt_overrides(resolved["overrides"]):
-            result = handle_chat(
-                text=req.text,
-                conversation_id=req.conversation_id,
-                speaker=speaker_name,
-                speaker_id=req.speaker_id,
-                history=history,
-                model=model,
-                tokenizer=tokenizer,
-                config=state["config"],
-                router=state["router"],
-                cloud_agent=state.get("cloud_agent"),
-                ha_client=state.get("ha_client"),
-                language=language,
-                effective_mode=state.get("effective_mode"),
-                memory_store=state["memory_store"],
-            )
-        parsed = {
-            "escalated": result.escalated,
-            **result.diagnostics,
-        }
-        return result.text, parsed
-
-    response = _run_calibration(
-        stage="respond",
-        guard=guard,
-        dispatch=dispatch,
-        input_prompt_phase="serve_turn",
-        state=state,
-        params=CalibrateParams(),
-        supports_seed=False,
-    )
+    # Rebinds state["model"]/["tokenizer"] on a fresh server, same defect
+    # fix as dispatch_name — this dispatch reads both handles below.
+    get_or_create_consolidation_loop(state)
+    model, tokenizer = state["model"], state["tokenizer"]
+    language, _ = lang_id.resolve_text_language(req.text, state["config"].text_lang_detection)
+    store = state["speaker_store"]
+    speaker_name = store.resolve_speaker_name(req.speaker_id)
+    history = state["session_buffer"].get_conversation_turns(req.conversation_id)
+    with extraction_trace() as trace:
+        result = handle_chat(
+            text=req.text,
+            conversation_id=req.conversation_id,
+            speaker=speaker_name,
+            speaker_id=req.speaker_id,
+            history=history,
+            model=model,
+            tokenizer=tokenizer,
+            config=state["config"],
+            router=state["router"],
+            cloud_agent=state.get("cloud_agent"),
+            ha_client=state.get("ha_client"),
+            language=language,
+            effective_mode=state.get("effective_mode"),
+            memory_store=state["memory_store"],
+        )
+    prompts, _ = _provenance_from_records(trace.records, "serve_turn")
     exercised = {
         path[len("<override:") : -1]
-        for p in response.get("prompts", [])
+        for p in prompts
         if isinstance((path := p.get("path")), str) and path.startswith("<override:")
     }
-    response["variants_unexercised"] = sorted(set(req.prompt_variants) - exercised)
-    return response
+    parsed = {
+        "escalated": result.escalated,
+        **result.diagnostics,
+        "variants_unexercised": sorted(set(req.prompt_variants) - exercised),
+    }
+    return result.text, parsed
+
+
+def validate_extract_pending(state: dict, req: CalibrateExtractPendingRequest) -> dict[str, Any]:
+    """Resolve the prompt overrides for ``POST /calibrate/extract_pending``.
+
+    No session-selection field exists on the request (see
+    :class:`CalibrateExtractPendingRequest`): the run's promise is "exactly
+    what a fold would extract right now", so there is nothing else to
+    validate here.  The dispatch closure itself is built at the route
+    (``paramem.server.app``), since its step —
+    :func:`~paramem.server.app._extract_pending_sessions` — is a
+    server-layer function, not one this module can reach without
+    reaching past the single extraction-graph lifetime owner.
+    """
+    return {"overrides": resolve_prompt_variants(state, req.prompt_variants)}
 
 
 def _effective_params(params: CalibrateParams, *, supports_seed: bool) -> dict:
@@ -1507,9 +1461,8 @@ def _effective_params(params: CalibrateParams, *, supports_seed: bool) -> dict:
     response uses this to inform the operator which fields actually
     landed.
 
-    Every local stage (:func:`calibrate_chain`, :func:`calibrate_normalize`,
-    :func:`calibrate_anonymize_facts`, :func:`calibrate_name`) calls this
-    with ``supports_seed=True``. :func:`calibrate_respond` is the one
+    Every local stage's route passes ``supports_seed=True`` on its
+    :class:`CalibrationRunSpec`. ``/calibrate/respond`` is the one
     ``supports_seed=False`` caller — its request shape carries no sampling
     parameters at all, so ``seed`` is forced to ``null`` rather than echoing
     a value that was never collected.  top_p / top_k are not yet threaded to
@@ -1521,3 +1474,156 @@ def _effective_params(params: CalibrateParams, *, supports_seed: bool) -> dict:
         out[f] = getattr(params, f)
     out["seed"] = params.seed if supports_seed else None
     return out
+
+
+# ---------------------------------------------------------------------------
+# One declaration, one spec builder, one executor — consumed by every
+# /calibrate/* route AND by every test that drives a run without going
+# through app.py's FastAPI handlers.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _StandaloneDeclaration:
+    """One standalone (non-chain) calibration stage's fixed shape — the
+    same declared-once role :data:`_CHAIN` plays for the five chain
+    routes, for the remaining four (``normalize``, ``anonymize_facts``,
+    ``name``, ``respond``).  Read by both the production route dispatcher
+    (:func:`build_spec`, called from ``paramem.server.app``) and every
+    test caller building a run through :func:`build_spec` directly, so a
+    stage's route path, input-prompt phase, seed support, and params
+    source are declared exactly once rather than once per route handler
+    and once per test.
+
+    Attributes:
+        route_path: The producing route (``"/calibrate/normalize"``).
+        input_prompt_phase: Which phase record's non-system prompt feeds
+            ``n_input_tokens`` and the provenance block.
+        supports_seed: Whether ``params_effective["seed"]`` echoes the
+            request's seed.
+        validate: The stage's ``validate_*`` function — ``(state, req) ->
+            resolved dict``.
+        dispatch: The stage's ``dispatch_*`` function — ``(state, req,
+            resolved) -> (raw_output, parsed)``.
+        params: Derives the spec's :class:`CalibrateParams` from the
+            request — ``req.params`` for every stage except ``respond``,
+            whose request shape carries no sampling-parameter field at
+            all.
+    """
+
+    route_path: str
+    input_prompt_phase: str
+    supports_seed: bool
+    validate: "Callable[[dict, Any], dict[str, Any]]"
+    dispatch: "Callable[[dict, Any, dict[str, Any]], tuple[Any, Any]]"
+    params: "Callable[[Any], CalibrateParams]"
+
+
+_STANDALONE: dict[str, _StandaloneDeclaration] = {
+    "normalize": _StandaloneDeclaration(
+        route_path="/calibrate/normalize",
+        input_prompt_phase="normalize",
+        supports_seed=True,
+        validate=validate_normalize,
+        dispatch=dispatch_normalize,
+        params=lambda req: req.params,
+    ),
+    "anonymize_facts": _StandaloneDeclaration(
+        route_path="/calibrate/anonymize_facts",
+        input_prompt_phase="anonymize",
+        supports_seed=True,
+        validate=validate_anonymize_facts,
+        dispatch=dispatch_anonymize_facts,
+        params=lambda req: req.params,
+    ),
+    "name": _StandaloneDeclaration(
+        route_path="/calibrate/name",
+        input_prompt_phase="name_extract",
+        supports_seed=True,
+        validate=validate_name,
+        dispatch=dispatch_name,
+        params=lambda req: req.params,
+    ),
+    "respond": _StandaloneDeclaration(
+        route_path="/calibrate/respond",
+        input_prompt_phase="serve_turn",
+        # CalibrateRespondRequest carries no sampling-parameter field at
+        # all — no seed threads into the serving path.
+        supports_seed=False,
+        validate=validate_respond,
+        dispatch=dispatch_respond,
+        params=lambda _req: CalibrateParams(),
+    ),
+}
+
+
+def route_path_for(stage: str) -> str:
+    """The route path for a declared calibration stage.
+
+    :data:`_CHAIN` and :data:`_STANDALONE` combined cover every
+    ``/calibrate/*`` route except ``extract_pending``, whose spec is built
+    at its own route (see :func:`validate_extract_pending`'s docstring).
+    """
+    if stage in _CHAIN:
+        return f"/calibrate/{stage}"
+    return _STANDALONE[stage].route_path
+
+
+def build_spec(
+    stage: str,
+    state: dict,
+    req: Any,
+    *,
+    run_id: str,
+    artifact_dir: Path,
+) -> CalibrationRunSpec:
+    """Build one calibration run's :class:`CalibrationRunSpec` — the single
+    declaration every route and every test consumes, so a stage's shape
+    (route path, input-prompt phase, seed support, params source) is
+    declared exactly once.
+
+    Runs the stage's ``validate_*`` as a side effect (raises ``HTTPException``
+    on a bad request, exactly as a live dispatch would, before any model
+    call — this is meant to run on the event loop, ahead of dispatch).
+
+    Args:
+        stage: A chain use case (a key of :data:`_CHAIN`) or a standalone
+            stage (a key of :data:`_STANDALONE`) — every ``/calibrate/*``
+            stage except ``extract_pending``, which builds its own spec at
+            the route.
+        state: The live server state dict, passed to ``validate_*`` and
+            closed over by the built ``dispatch`` callable.
+        req: The stage's own validated request model.
+        run_id: This run's stamp, minted by the caller.
+        artifact_dir: This run's directory, minted by the caller.
+
+    Returns:
+        A :class:`CalibrationRunSpec` ready for :func:`run_stage`.
+    """
+    if stage in _CHAIN:
+        resolved = validate_chain(state, stage, req)
+        return CalibrationRunSpec(
+            stage=stage,
+            route_path=f"/calibrate/{stage}",
+            run_id=run_id,
+            artifact_dir=artifact_dir,
+            dispatch=lambda: dispatch_chain(state, stage, req, resolved),
+            input_prompt_phase=resolved["focus"],
+            supports_seed=True,
+            params=req.params,
+            overrides=resolved["overrides"],
+            evicts_voice=resolved["evicts_voice"],
+        )
+    decl = _STANDALONE[stage]
+    resolved = decl.validate(state, req)
+    return CalibrationRunSpec(
+        stage=stage,
+        route_path=decl.route_path,
+        run_id=run_id,
+        artifact_dir=artifact_dir,
+        dispatch=lambda: decl.dispatch(state, req, resolved),
+        input_prompt_phase=decl.input_prompt_phase,
+        supports_seed=decl.supports_seed,
+        params=decl.params(req),
+        overrides=resolved["overrides"],
+    )

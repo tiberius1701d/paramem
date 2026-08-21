@@ -456,6 +456,8 @@ ParaMem owns memory (speaker identification, entity routing, adapter recall, con
 
 Typical operator flow: `POST /consolidate/interim` → poll `GET /status` until `consolidating` is false → `POST /consolidate` when the interim slots should be folded into the mains, or `POST /reconsolidate` when the mains should be rebuilt from what they already hold.
 
+**The `/calibrate/*` family (including `/calibrate/extract_pending`) shares this same arbitration** — the identical `consolidating` mutex, deferral vocabulary, and non-blocking contract — but takes a request body and returns `run_id` + `artifact_dir` on a started run rather than being bodyless; see the calibrate route table above for their own per-route contract.
+
 **A refusal is not an error.** These endpoints are non-blocking: they submit the run and return immediately. When the server is busy (another fold running, someone chatting, the GPU held, cloud-only mode) the response is still **200** with `status: "deferred_*"`; when there is nothing to do it is **200** with `status: "noop_*"`. `curl --fail` therefore does **not** exit non-zero on a deferral — read `status`. The only 4xx from this family is **409 `trial_active`** while a migration TRIAL is in progress. All four endpoints — `POST /reconsolidate` included — also defer with `status: "deferred_tier_unverified"` while a main memory tier's on-disk state cannot be verified against its adapter slots, but only when nothing is pending to resume — a pending consolidation event that was still in flight resumes and finishes first, the same precedence the store-quarantine case above follows; the recovery step for a tier that stays unverified is restoring the affected tier from a snapshot bundle (`POST /backup/restore`) — a same-base restore comes back online on its own, while one that also restores configuration needs a restart to converge. The destructive doors — `POST /speaker/forget`, `POST /debug/erase-keys`, `POST /interim/discard`, `POST /admin/assign-orphans`, and `POST /ingest-sessions/cancel` — stay open while a tier is unverified and no consolidation run is pending resume; while one is pending they answer **409**, naming the run and how it clears (finish it with `POST /consolidate`, or wait for the schedule; a run that keeps failing to resume is superseded by restoring a healthy backup via `POST /backup/restore`).
 
 - **Full-cycle go-live:** at the full-consolidation boundary, all interim adapters are rebuilt into the mains via replay on `all_active_keys ∪ all_interim_keys` (facts are regenerated from the merged graph each cycle, not loaded from a stored file). Each rebuilt tier is recall-sanity-checked before it is promoted, and live artifacts are not touched until every tier in the event has passed its gate — the tiers then go live together and the absorbed interim slots are reaped as part of that same step. A gate failure leaves production exactly as it was, because nothing in the event had gone live yet: there is nothing to roll back.
@@ -484,12 +486,12 @@ The `paramem` management CLI talks to the running server over HTTP (default `htt
 
 - `server.yaml` (config)
 - per adapter tier, its `indexed_key_registry.json` (SimHash fingerprints live inside this file, not a separate one) and `key_metadata.json` (per-key bookkeeping) — **without the registries the weights are useless** (you can't enumerate or verify recalled facts)
-- each enabled adapter's live slot — `meta.json` plus its payload (`adapter_model.safetensors` + `adapter_config.json` for a trained tier, `graph.json` for a tier running under `consolidation.mode: simulate`) — resolved the same way the server mounts it (finalized main slot, or the live interim slot when no full cycle has run yet); every tier has a sealed payload and the bundle captures it the same way regardless of which kind it is
+- each enabled adapter's live slot — `meta.json` plus its payload (`adapter_model.safetensors` + `adapter_config.json` for a trained tier, `graph.json` for a tier running under `consolidation.mode: simulate`) — resolved the same way the server mounts it (finalized main slot, or the live interim slot when no full cycle has run yet); every tier has a written payload and the bundle captures it the same way regardless of which kind it is
 - `speaker_profiles.json` (voice enrollment)
 - a top-level `bundle.meta.json` with the file inventory, per-adapter registry hashes, and the base-model identity
 - `server.yaml.candidate` *(present only in pre-base-swap snapshots)* — the candidate config preserved for a later retry; hash-indexed in the manifest but never restored automatically
 
-Every tier has a sealed payload, whichever venue trained it, and the bundle captures it the same way regardless of kind. A tier running under `consolidation.mode: train` has no separate working-graph artifact to capture: the graph behind that tier's most recent fold lives only in the running consolidation loop and is rebuilt from scratch on every cycle, because the knowledge lives in the adapter weights, not in a stored graph. Either way, regenerable training scaffolding (checkpoints, in-training slots) is never included.
+Every tier has a written payload, whichever venue trained it, and the bundle captures it the same way regardless of kind. A tier running under `consolidation.mode: train` has no separate working-graph artifact to capture: the graph behind that tier's most recent fold lives only in the running consolidation loop and is rebuilt from scratch on every cycle, because the knowledge lives in the adapter weights, not in a stored graph. Either way, regenerable training scaffolding (checkpoints, in-training slots) is never included.
 
 **Encryption is byte-faithful.** A bundle preserves each file's on-disk encryption state: under Security ON the sensitive artifacts (weights, registries, speaker profiles) stay age-encrypted and the operational carve-outs (`server.yaml`, `meta.json`) stay plaintext; under Security OFF everything is plaintext. Restore reproduces that exact posture, so the server boots cleanly in either mode (validated end-to-end: backup → restore → server start → adapters mounted → recall). See [`SECURITY.md`](SECURITY.md) for the encryption model.
 
@@ -915,12 +917,12 @@ Complete REST endpoint reference. Auth scopes: **unauthenticated** — no token 
 | POST | `/gpu/acquire` | admin | Clear any `PARAMEM_EXTRA_ARGS=--defer-model` hold and, if this process is in defer mode, reload the base model in-process.  Called by `pstatus --acquire`.  Idempotent. A failed in-process reload leaves the server cloud-only and reports it in the response; the service restarts itself only if the reload crashed mid-flight. Refuses with **503** while a consolidation cycle is in flight, or **409** while a base-swap migration is actively running. |
 | POST | `/gpu/release` | admin | Release the base model in-process and switch to cloud-only mode, freeing VRAM. Refuses with **503** while a consolidation cycle is in flight, or **409** while a base-swap migration is actively running. |
 | POST | `/incidents/{incident_id}/ack` | admin | Acknowledge an active incident, silencing its attention row in `/status`. |
-| GET | `/integrity` | admin | Run the infrastructure integrity check (registries, simhash, and each tier's sealed payload, verified the same way whether it holds trained weights or a graph) and return a `{ok, checks, failures}` report. Cloud-only-safe — no GPU dependency. |
+| GET | `/integrity` | admin | Run the infrastructure integrity check (registries, simhash, and each tier's written payload, verified the same way whether it holds trained weights or a graph) and return a `{ok, checks, failures}` report. Cloud-only-safe — no GPU dependency. |
 | POST | `/admin/assign-orphans` | admin | Operator-only corrective action: permanently attribute orphan sessions to a single speaker.  Rewrites session jsonls on disk when present; the bound speaker_id flows through the next consolidation cycle into permanent storage regardless of debug mode. |
 | POST | `/speaker/forget` | admin | Remove a speaker's profile, stale-mark their indexed-memory keys, and discard pending sessions. A staled key stops serving immediately (excluded from keyed recall); its identifier is retained, but its content and bookkeeping are retired wholesale at the tier's next consolidation, whether or not that leaves the tier with zero known keys — there is no separate immediate-unmount/delete step. Does not trigger retraining; a staled key is excluded from every future training set, and `POST /reconsolidate` is the door that retrains a tier from its current keys on demand. The registry mutation itself is never refused — the response reports per-tier rebind outcomes (`tiers`, `unbound_tiers`), naming any tier left unbound (`"unbound"` or `"rebind_failed"`, the latter when the re-bind attempt itself hits a storage failure — it never stops the tiers after it from being attempted). Refuses with **409** while busy, training, TRIAL, or cloud-only (these guard the request, not the rebind). See [Forgetting a speaker](#forgetting-a-speaker-data-erasure). |
 | POST | `/interim/discard` | admin | Discard the entire interim ring without folding it into main memory — the only door that removes interim slots without absorbing them first. Synchronous; returns the blast radius without `{"confirm": true}`. Refuses with **409** while busy, training, TRIAL, or cloud-only. See [Discarding the interim ring](#discarding-the-interim-ring). |
 | GET | `/backup/list` | admin | List all backup slots with metadata. See [Backup & Migration](#backup--migration). |
-| POST | `/backup/create` | admin | Take an immediate backup (default `snapshot_bundle` — config, registry, speaker profiles, and each tier's sealed payload: adapter weights for a trained tier, `graph.json` for a tier running under `consolidation.mode: simulate`). See [Backup & Migration](#backup--migration). |
+| POST | `/backup/create` | admin | Take an immediate backup (default `snapshot_bundle` — config, registry, speaker profiles, and each tier's written payload: adapter weights for a trained tier, `graph.json` for a tier running under `consolidation.mode: simulate`). See [Backup & Migration](#backup--migration). |
 | POST | `/backup/restore` | admin | Restore a backup slot onto the live store (`kind=config` or `kind=snapshot_bundle`). See [Backup & Migration](#backup--migration). |
 | POST | `/backup/prune` | admin | Apply the 5-rule retention policy; returns counts of deleted and preserved slots. See [Backup & Migration](#backup--migration). |
 | POST | `/migration/preview` | admin | Stage a candidate `server.yaml` and return a unified diff + tier-classified change list. No files written. See [Backup & Migration](#backup--migration). |
@@ -943,6 +945,7 @@ Complete REST endpoint reference. Auth scopes: **unauthenticated** — no token 
 | POST | `/calibrate/enrich` | admin + `calibrate_endpoint_enabled` + cloud egress | Enter the chain at `anonymize` with a supplied `graph` and return the `cloud_enrich` step's output. Places a cloud call. Does **not** reach the separate graph-level enrichment, which has no calibration route. |
 | POST | `/calibrate/name` | admin + `calibrate_endpoint_enabled` | Run the enrollment name extractor over supplied `turns`. |
 | POST | `/calibrate/respond` | admin + `calibrate_endpoint_enabled` | Run one serving turn through the full production chat dispatch for an enrolled `speaker_id`. Body: `{text, speaker_id, conversation_id?, prompt_variants}` — `text` is a bare utterance, not a turn-marked transcript. Takes no sampling parameters (the serving reply cap is `inference.max_response_tokens`). **May reach Home Assistant and the cloud agent exactly as a real turn does — it can actuate devices and place a billed call.** Writes no conversation state; the reply and the routing diagnostics land in the run's artifact directory — and on a turn that escalates to the cloud, so does the nested local extraction/anonymization output of the utterance the escalation performed along the way. The driver script (`scripts/dev/calibrate_prompts.py`) separately records the `--utterance` text verbatim in its own invocation artifact. Both locations are gitignored data directories; this is disclosure of what was calibrated, not a new risk. |
+| POST | `/calibrate/extract_pending` | admin + `calibrate_endpoint_enabled` | Run exactly what the next fold would extract, right now, against the server's real pending sessions — no transcript in the body. Content-gated the same way `POST /consolidate/interim` is (a `noop_*` status when there is no pending attributable session); never trains, retires a session, or advances the schedule. |
 
 Every route above runs a **real production code path** — none re-invokes a
 step's primitive on its own, so what a probe reports is what production
@@ -953,14 +956,32 @@ effects. Each chain route declares where the chain is entered, which
 artifact it accepts, and which step's output it returns; routes entering
 past `local_extract` require the `graph` that step would have produced
 (typically a prior `/calibrate/extract` response, posted back verbatim).
-When the configured chain cannot reach the step a route reports on — cloud
-egress refused, an injected graph with no relations, a pass
-short-circuiting on its own floor — the call returns HTTP 400 naming the
-steps that did run and the cloud verdict, rather than a response whose
-provenance is silently empty. All routes are gated by
-`consolidation.calibrate_endpoint_enabled=true` (default off); none writes
-weights or production data. `/calibrate/respond` is the one route whose
-downstream effects reach beyond the server process — see its row above.
+
+**All `/calibrate/*` routes share the same dispatch envelope as the four
+consolidation endpoints below** — the same `consolidating` mutex, executor
+hop, GPU lock, cooldown gate, and non-blocking contract. A call returns
+**HTTP 200** immediately with `{status: "started_calibration", action,
+run_id, artifact_dir}`; poll `GET /status` until `consolidating` is false,
+then read the full result from `<artifact_dir>/response.json` — no
+calibration route returns its result inline. An active calibration run
+holds the consolidation mutex exactly like a fold does, so a scheduled tick
+arriving while one is in flight answers `deferred_already_running` and
+retries on its next wall-clock tick. When the configured chain cannot reach
+the step a route reports on — cloud egress refused, an injected graph with
+no relations, a pass short-circuiting on its own floor — the run still
+completes and writes every phase that did run; the gap is reported as an
+`unreached_step` object (declared phase, phases that did run, and the
+cloud-egress verdict) inside `response.json`, never a 4xx — a calibration
+run that reaches a dead end is still a completed, inspectable run. All
+routes are gated by `consolidation.calibrate_endpoint_enabled=true`
+(default off); none writes weights or production data.
+`/calibrate/respond` is the one route whose downstream effects reach beyond
+the server process — see its row above. `response.json`'s
+`wall_clock_seconds` measures the step's own cost, timed inside the
+envelope's GPU lock rather than around it — it excludes any time the run
+spent waiting for the lock. Values recorded before this contract shipped
+included the lock wait and are not comparable; re-run the baseline before
+diffing a prompt change against an older artifact.
 
 **Chat request:**
 
@@ -1113,15 +1134,19 @@ baseline-vs-candidate diff per phase. Workflow:
    --baseline auto --stop-phase <phase>` (use `--stop-phase` to skip
    downstream phases when iterating on early stages — saves compute at
    ~50–70 s per skipped phase).
-3. Read the per-phase diff in stdout (raw output deltas, parsed-summary
-   changes per phase). Every run's full result — the response, plus anything
-   the production code emitted while the run executed — is written by the
-   server under `paths.calibration/artifacts/<run>/`, and each response
-   names its own `artifact_dir`. The client keeps no copy: it writes a
-   `runs.json` index of which run covered which chunk, plus the
-   baseline/variance comparisons it computes across runs. `--seed-from`
-   reads a recorded run back through that index, so a run's output can be
-   posted back as the next run's seed.
+3. The client submits the run, polls `GET /status` until `consolidating`
+   clears, then reads the full result back from disk — no calibration route
+   returns its result inline. Every run's artifact directory is the
+   producing route's path plus one ISO-Z timestamp
+   (`<paths.calibration_artifacts>/calibrate/<stage>/<YYYYMMDDTHHMMSSZ>/`),
+   and the response itself always lands at exactly `response.json` inside
+   it — one run, one file, no timestamp in the filename, since the
+   directory already identifies the run. Read the per-phase diff in stdout
+   (raw output deltas, parsed-summary changes per phase). The client keeps
+   no copy of the response: it writes a `runs.json` index of which run
+   covered which chunk, plus the baseline/variance comparisons it computes
+   across runs. `--seed-from` reads a recorded run back through that index,
+   so a run's output can be posted back as the next run's seed.
 4. Promote the variant to production only when the per-phase diff confirms
    the targeted improvement without regressions on other phases.
 
@@ -1138,10 +1163,11 @@ is branch-dependent, not fixed: an HA-answered turn loads none of them;
 `cloud_serving_system.txt` loads only on cloud escalation; `recall_selection.txt`
 only on the temporal personal leg; `intent_classifier.txt` only under
 `intent.mode: llm`. A variant whose production prompt never got a chance to
-load on that turn is reported back in the response's `variants_unexercised`
-field rather than failing the call — `calibrate_prompts.py` prints a warning
-when it is non-empty. `calib_serving_directives.txt` must be a COMPLETE
-sectioned file — every section `serving_directives.txt` defines (see
+load on that turn is reported back in the response's
+`parsed.variants_unexercised` field rather than failing the call —
+`calibrate_prompts.py` prints a warning when it is non-empty.
+`calib_serving_directives.txt` must be a COMPLETE sectioned file — every
+section `serving_directives.txt` defines (see
 `configs/prompts/serving_directives.txt` for the authoritative list) — a
 partial variant fails the turn rather than falling back per-section to the
 shipped copy.

@@ -436,7 +436,7 @@ def test_plain_reclaim_success_eagerly_creates_consolidation_loop():
     ):
         app_module._live_reload_base_model()
 
-        mock_eager.assert_called_once_with(cfg)
+        mock_eager.assert_called_once_with()
 
 
 def test_reload_failure_paths_do_not_eagerly_create_consolidation_loop():

@@ -1,5 +1,5 @@
 """Structural guard: every Stage-B terminal reaches a flag clear via
-``_dispatch_finalize``.
+``_consolidation_terminal``.
 
 Peer of ``tests/test_extraction_pipeline_guard.py`` — an AST scan rather than
 a live-execution test, because the invariant is about *every* code path in
@@ -8,11 +8,11 @@ the three Stage-B closures (``_run_interim_training``, ``_run_full_cycle``,
 to drive.
 
 The cycle-lifecycle primitive ``_run_stage_b_cycle`` (paramem/server/app.py)
-is the SOLE dispatch point for ``_dispatch_finalize`` on both the success and
+is the SOLE dispatch point for ``_consolidation_terminal`` on both the success and
 the crash-envelope path.  For that single-dispatch-point invariant to hold,
 the three path-specific bodies must:
 
-1. Never call ``_dispatch_finalize`` themselves (the primitive owns it).
+1. Never call ``_consolidation_terminal`` themselves (the primitive owns it).
 2. Return a ``(outcome, finalizer)`` 2-tuple terminal on every code path
    (or raise) — a bare ``return`` / ``return None`` would silently swallow
    the outcome the primitive dispatches.
@@ -48,14 +48,14 @@ def _find_functions_by_name(tree: ast.AST, names: frozenset[str]) -> dict[str, a
     return found
 
 
-def _calls_dispatch_finalize(node: ast.FunctionDef) -> list[int]:
-    """Return line numbers of any ``_dispatch_finalize(...)`` call inside *node*."""
+def _calls_consolidation_terminal(node: ast.FunctionDef) -> list[int]:
+    """Return line numbers of any ``_consolidation_terminal(...)`` call inside *node*."""
     lines = []
     for sub in ast.walk(node):
         if (
             isinstance(sub, ast.Call)
             and isinstance(sub.func, ast.Name)
-            and sub.func.id == "_dispatch_finalize"
+            and sub.func.id == "_consolidation_terminal"
         ):
             lines.append(sub.lineno)
     return lines
@@ -111,8 +111,8 @@ def test_stage_b_bodies_exist_and_are_found():
     assert not missing, f"Stage-B body closure(s) not found in app.py: {sorted(missing)}"
 
 
-def test_stage_b_bodies_never_call_dispatch_finalize():
-    """The three Stage-B bodies must never call _dispatch_finalize themselves.
+def test_stage_b_bodies_never_call_consolidation_terminal():
+    """The three Stage-B bodies must never call _consolidation_terminal themselves.
 
     _run_stage_b_cycle is the sole dispatch point — for both the normal
     return and the crash-envelope path.  A body calling it directly would
@@ -123,10 +123,10 @@ def test_stage_b_bodies_never_call_dispatch_finalize():
     found = _find_functions_by_name(tree, _STAGE_B_BODY_NAMES)
     assert found, "no Stage-B body closures found — see test_stage_b_bodies_exist_and_are_found"
 
-    offenders = {name: _calls_dispatch_finalize(node) for name, node in found.items()}
+    offenders = {name: _calls_consolidation_terminal(node) for name, node in found.items()}
     offenders = {name: lines for name, lines in offenders.items() if lines}
     assert not offenders, (
-        f"Stage-B body closure(s) call _dispatch_finalize directly: {offenders}. "
+        f"Stage-B body closure(s) call _consolidation_terminal directly: {offenders}. "
         "_run_stage_b_cycle must be the sole dispatch point."
     )
 
@@ -152,7 +152,7 @@ def test_stage_b_bodies_return_terminal_tuples_on_every_path():
 
 
 def test_run_stage_b_cycle_dispatches_finalize_on_both_paths():
-    """_run_stage_b_cycle calls _dispatch_finalize from both the success and
+    """_run_stage_b_cycle calls _consolidation_terminal from both the success and
     the crash-envelope path — the single, structurally-guaranteed dispatch
     point for every Stage-B terminal (success or failure).
     """
@@ -161,9 +161,9 @@ def test_run_stage_b_cycle_dispatches_finalize_on_both_paths():
     assert "_run_stage_b_cycle" in found, "_run_stage_b_cycle not found in app.py"
 
     node = found["_run_stage_b_cycle"]
-    call_lines = _calls_dispatch_finalize(node)
+    call_lines = _calls_consolidation_terminal(node)
     assert len(call_lines) == 2, (
-        f"_run_stage_b_cycle must call _dispatch_finalize exactly twice "
+        f"_run_stage_b_cycle must call _consolidation_terminal exactly twice "
         f"(crash envelope + normal return); found at lines {call_lines}"
     )
 
@@ -176,14 +176,14 @@ def test_run_stage_b_cycle_dispatches_finalize_on_both_paths():
                 if (
                     isinstance(inner, ast.Call)
                     and isinstance(inner.func, ast.Name)
-                    and inner.func.id == "_dispatch_finalize"
+                    and inner.func.id == "_consolidation_terminal"
                 ):
                     except_lines.add(inner.lineno)
     assert len(except_lines) == 1, (
-        f"Expected exactly one _dispatch_finalize call inside an except handler "
+        f"Expected exactly one _consolidation_terminal call inside an except handler "
         f"(the crash envelope); found {sorted(except_lines)} of {call_lines}"
     )
     assert len(set(call_lines) - except_lines) == 1, (
-        "Expected exactly one _dispatch_finalize call outside any except handler "
+        "Expected exactly one _consolidation_terminal call outside any except handler "
         "(the normal-return path)"
     )

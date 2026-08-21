@@ -11,6 +11,7 @@ the router can reload from the standard paths without any bridging.
 import enum
 import json
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 
 from paramem.backup.encryption import read_maybe_encrypted
@@ -235,6 +236,159 @@ def create_consolidation_loop(
         if cycle_count is not None:
             loop.seed_key_metadata(cycle_count)
 
+    return loop
+
+
+@dataclass(frozen=True)
+class PendingTriage:
+    """Classification of every pending session, before any retirement.
+
+    The pure output of :func:`classify_pending_sessions` — the arbitrator's
+    own retirement side effect (:func:`retire_unattributable_sessions`)
+    consumes ``drop_ids`` separately, so classifying is same-arguments-
+    same-answer with no side effects.
+
+    Attributes
+    ----------
+    pending_count:
+        Pending sessions seen, before any retirement.
+    named_count:
+        How many of those classified NAMED (attributable).
+    drop_ids:
+        Session ids classified UNIDENTIFIABLE, plus HOLDABLE sessions past
+        ``orphan_retirement_seconds`` — everything :func:`retire_unattributable_sessions`
+        should retire.
+    """
+
+    pending_count: int
+    named_count: int
+    drop_ids: "list[str]"
+
+
+def classify_pending_sessions(config: ServerConfig, buffer, store) -> PendingTriage:
+    """Classify every pending session.  Reads; mutates nothing.
+
+    The arbitrator's unconditional pre-stage runs this on every dispatch
+    (whichever action asked), then feeds ``drop_ids`` to
+    :func:`retire_unattributable_sessions` and ``pending_count``/``named_count``
+    to the content gate — retiring what can never be attributed no longer
+    depends on whether the content gate itself runs.
+
+    Parameters
+    ----------
+    config:
+        Live server config.
+    buffer:
+        The ``SessionBuffer``.
+    store:
+        The ``SpeakerStore`` (or ``None`` when no speakers are enrolled).
+
+    Returns
+    -------
+    PendingTriage
+    """
+    facts = buffer.pending_facts()
+    if not facts:
+        return PendingTriage(pending_count=0, named_count=0, drop_ids=[])
+
+    ttl_seconds = config.consolidation.orphan_retirement_seconds
+    drop_ids: list[str] = []
+    named_count = 0
+
+    for fact in facts:
+        sid = fact["speaker_id"]
+        is_anon = store.is_anonymous(sid) if store is not None and sid else False
+        cls = classify_session(
+            speaker_id=sid,
+            is_anonymous=is_anon,
+            has_voice_embedding=fact["has_voice_embedding"],
+        )
+        if cls == SessionClass.NAMED:
+            named_count += 1
+        elif cls == SessionClass.UNIDENTIFIABLE:
+            drop_ids.append(fact["session_id"])
+        else:
+            # HOLDABLE — retire only when TTL set and exceeded.
+            if ttl_seconds is not None:
+                age = fact.get("age_seconds")
+                if age is not None and age > ttl_seconds:
+                    drop_ids.append(fact["session_id"])
+
+    return PendingTriage(pending_count=len(facts), named_count=named_count, drop_ids=drop_ids)
+
+
+def retire_unattributable_sessions(config: ServerConfig, buffer, drop_ids: "list[str]") -> None:
+    """Retire sessions that can never be attributed, or expired holdables.
+
+    A staging-action-only primitive: called by the arbitrator's retiring
+    triage pre-stage after :func:`classify_pending_sessions`, never by a
+    non-staging (calibration) run.  A no-op on an empty *drop_ids*.
+
+    Parameters
+    ----------
+    config:
+        Live server config.
+    buffer:
+        The ``SessionBuffer``.
+    drop_ids:
+        Session ids to retire — :attr:`PendingTriage.drop_ids`.
+    """
+    if not drop_ids:
+        return
+    logger.info(
+        "Consolidation dispatch: retiring %d unattributable/expired-holdable session(s)",
+        len(drop_ids),
+    )
+    _retain = config.consolidation.retain_sessions or config.debug
+    buffer.mark_consolidated(
+        drop_ids,
+        retention_dir=discard_session_sink(config) if _retain else None,
+    )
+
+
+def get_or_create_consolidation_loop(state: dict, *, store=None) -> ConsolidationLoop:
+    """Return the process-lifetime ``ConsolidationLoop``, creating it on first use.
+
+    THE single get-or-create for the whole tree — every module that needs
+    the loop (``paramem.server.app``, ``paramem.server.calibrate``) calls
+    this one function.  Idempotent: a second call finds the loop already
+    on ``state`` and returns it unchanged — *store* is then a no-op, since
+    only a first-time construction reads it.
+
+    Parameters
+    ----------
+    state:
+        The live server state dict.  ``config`` is always
+        ``state["config"]`` — not a separate parameter, since every caller
+        has exactly one live config to build against.
+    store:
+        Optional store override used ONLY when a fresh loop is being
+        constructed (``state["consolidation_loop"] is None``).  ``None``
+        (default, every caller except the pending-event resume) falls
+        through to ``state["memory_store"]``.  The pending-event resume
+        passes a locally-constructed empty :class:`~paramem.memory.store.MemoryStore`
+        here when ``state["memory_store"] is None`` (the store is
+        quarantined), so the resumed event's loop has something to fold
+        into without waiting on a lift.
+
+    Returns
+    -------
+    ConsolidationLoop
+        The singleton stored on ``state["consolidation_loop"]``.
+    """
+    loop = state.get("consolidation_loop")
+    if loop is not None:
+        return loop
+    config = state["config"]
+    loop = create_consolidation_loop(
+        state["model"],
+        state["tokenizer"],
+        config,
+        store if store is not None else state["memory_store"],
+        state_provider=lambda: state,
+    )
+    state["consolidation_loop"] = loop
+    state["model"] = loop.model
     return loop
 
 

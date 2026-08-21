@@ -143,7 +143,7 @@ def _make_dispatch_state(
 
 # ---------------------------------------------------------------------------
 # TestConsolidationLoopStoreOverride — the store-independent-resume seam:
-# _get_or_create_consolidation_loop(config, store=...) and
+# get_or_create_consolidation_loop(state, store=...) and
 # _run_stage_b_cycle(..., store=...) thread an optional store override
 # through to loop construction, reachable in production ONLY from the
 # pending-event resume (paramem/server/app.py::_run_pending_event_resume).
@@ -152,6 +152,10 @@ def _make_dispatch_state(
 
 
 class TestConsolidationLoopStoreOverride:
+    """``get_or_create_consolidation_loop`` (paramem.server.consolidation) —
+    the ONE get-or-create the whole tree shares, taking ``state`` rather
+    than a bare ``config``."""
+
     def test_store_override_used_only_on_a_fresh_construction(self, monkeypatch) -> None:
         """No cached loop -> a fresh construction reads the override, not
         ``_state["memory_store"]``."""
@@ -167,14 +171,17 @@ class TestConsolidationLoopStoreOverride:
 
         state = {
             "consolidation_loop": None,
+            "config": MagicMock(),
             "model": MagicMock(),
             "tokenizer": MagicMock(),
             "memory_store": default_store,
         }
         monkeypatch.setattr(app_module, "_state", state)
-        monkeypatch.setattr(app_module, "create_consolidation_loop", _fake_create)
+        import paramem.server.consolidation as consolidation_module
 
-        loop = app_module._get_or_create_consolidation_loop(MagicMock(), store=sentinel_store)
+        monkeypatch.setattr(consolidation_module, "create_consolidation_loop", _fake_create)
+
+        loop = app_module.get_or_create_consolidation_loop(state, store=sentinel_store)
 
         assert seen == [sentinel_store]
         assert state["consolidation_loop"] is loop
@@ -194,14 +201,17 @@ class TestConsolidationLoopStoreOverride:
 
         state = {
             "consolidation_loop": None,
+            "config": MagicMock(),
             "model": MagicMock(),
             "tokenizer": MagicMock(),
             "memory_store": default_store,
         }
         monkeypatch.setattr(app_module, "_state", state)
-        monkeypatch.setattr(app_module, "create_consolidation_loop", _fake_create)
+        import paramem.server.consolidation as consolidation_module
 
-        app_module._get_or_create_consolidation_loop(MagicMock())
+        monkeypatch.setattr(consolidation_module, "create_consolidation_loop", _fake_create)
+
+        app_module.get_or_create_consolidation_loop(state)
 
         assert seen == [default_store]
 
@@ -222,14 +232,14 @@ class TestConsolidationLoopStoreOverride:
         monkeypatch.setattr(app_module, "_state", state)
         monkeypatch.setattr(app_module, "create_consolidation_loop", _fake_create)
 
-        loop = app_module._get_or_create_consolidation_loop(MagicMock(), store=object())
+        loop = app_module.get_or_create_consolidation_loop(state, store=object())
 
         assert loop is cached_loop
         assert create_calls == []
 
     def test_run_stage_b_cycle_threads_its_store_kwarg_through(self, monkeypatch) -> None:
         """``_run_stage_b_cycle``'s own ``store=`` kwarg reaches
-        ``_get_or_create_consolidation_loop`` unchanged — the seam the
+        ``get_or_create_consolidation_loop`` unchanged — the seam the
         weights-venue pending-event resume uses
         (``_run_pending_event_resume`` -> ``_run_stage_b_cycle``)."""
         import paramem.server.app as app_module
@@ -237,7 +247,7 @@ class TestConsolidationLoopStoreOverride:
         sentinel_store = object()
         seen_stores: list = []
 
-        def _fake_get_or_create(config, *, store=None):
+        def _fake_get_or_create(state, *, store=None):
             seen_stores.append(store)
             loop = MagicMock()
             loop._bg_trainer = None
@@ -247,7 +257,7 @@ class TestConsolidationLoopStoreOverride:
             "config": MagicMock(),
         }
         monkeypatch.setattr(app_module, "_state", state)
-        monkeypatch.setattr(app_module, "_get_or_create_consolidation_loop", _fake_get_or_create)
+        monkeypatch.setattr(app_module, "get_or_create_consolidation_loop", _fake_get_or_create)
         monkeypatch.setattr(app_module, "_active_bg_trainer", lambda config: MagicMock())
 
         def _body(loop, bt):
@@ -266,13 +276,13 @@ class TestConsolidationLoopStoreOverride:
 
     def test_run_stage_b_cycle_default_store_is_none(self, monkeypatch) -> None:
         """The three ordinary Stage-B entry points never pass ``store=`` —
-        the default ``None`` reaches ``_get_or_create_consolidation_loop``
+        the default ``None`` reaches ``get_or_create_consolidation_loop``
         unchanged, preserving today's behaviour."""
         import paramem.server.app as app_module
 
         seen_stores: list = []
 
-        def _fake_get_or_create(config, *, store=None):
+        def _fake_get_or_create(state, *, store=None):
             seen_stores.append(store)
             loop = MagicMock()
             loop._bg_trainer = None
@@ -282,7 +292,7 @@ class TestConsolidationLoopStoreOverride:
             "config": MagicMock(),
         }
         monkeypatch.setattr(app_module, "_state", state)
-        monkeypatch.setattr(app_module, "_get_or_create_consolidation_loop", _fake_get_or_create)
+        monkeypatch.setattr(app_module, "get_or_create_consolidation_loop", _fake_get_or_create)
         monkeypatch.setattr(app_module, "_active_bg_trainer", lambda config: MagicMock())
 
         def _body(loop, bt):
@@ -922,8 +932,10 @@ class TestConsolidationArbitrator:
         """FULL at max_interim_count==0, no interim slots, one NAMED session → dispatches.
 
         At this count no interim tier exists at all, so the fold's own
-        content is the pending session it will consume directly
-        (``consume_pending=True`` inside ``_run_full_consolidation_sync``).
+        content is the pending session it will consume directly (the
+        consume-pending pre-stage inside ``_run_full_consolidation_sync``
+        extracts it and threads the take as ``pending`` into
+        ``loop.consolidate``).
         """
         from paramem.server.app import ConsolidationAction
 
@@ -1669,7 +1681,7 @@ def _route_client(state, monkeypatch) -> "tuple[object, list[tuple[object, str]]
 
     submitted: list[tuple[object, str]] = []
 
-    def _record(fn, status):
+    def _record(fn, status, **kwargs):
         submitted.append((fn, status))
         return status
 
@@ -1811,6 +1823,76 @@ class TestConsolidationRoutes:
 
         assert resp.status_code == 200
         assert resp.json() == {"status": "noop_no_stored_keys", "action": "reconcile"}
+        assert submitted == []
+
+
+class TestCalibrateRespondRouteDoesNotDeferOnItself:
+    """Regression: ``POST /calibrate/respond`` must not self-defer via the
+    arbitrator's own idle debounce.
+
+    The route used to stamp ``_state["last_chat_monotonic"]`` (the marker
+    that protects a LIVE chat turn from a fold seizing the GPU seconds
+    later) before dispatching itself — so the idle-debounce check always
+    read an elapsed time of ~0s and answered ``deferred_idle`` on every
+    call, regardless of the debounce window.  A calibration probe of the
+    serving path is not a live turn; the fix is to never stamp the marker
+    from this route.  Runs the REAL arbitrator (``_route_client`` stubs
+    only the executor submission) against ``tests/fixtures/server.yaml``'s
+    real ``consolidation.training_idle_debounce_s`` (30s) — a MagicMock
+    config would risk masking the exact arithmetic the bug lived in.
+    """
+
+    def _state(self, tmp_path, monkeypatch):
+        import paramem.server.app as app_module
+        from paramem.server.config import load_server_config
+
+        state = _make_arbitrator_state(tmp_path, max_interim_count=7)
+        cfg = load_server_config("tests/fixtures/server.yaml")
+        cfg.consolidation.calibrate_endpoint_enabled = True
+        state["config"] = cfg
+        state["model"] = MagicMock(name="model")
+        state["tokenizer"] = MagicMock(name="tokenizer")
+        state["memory_store"] = MagicMock(name="memory_store")
+        state["router"] = MagicMock(name="router")
+        state["speaker_store"].get_name.return_value = "Alex"
+        state["calibration_run"] = None
+        monkeypatch.setattr(app_module, "_abort_background_training_for_inference", lambda: None)
+        return state
+
+    def test_started_calibration_when_last_chat_monotonic_is_none(self, tmp_path, monkeypatch):
+        """No prior chat turn at all — the ordinary case, and the one the
+        bug broke: the route's own self-stamp made even a fresh server
+        defer its first /calibrate/respond call."""
+        state = self._state(tmp_path, monkeypatch)
+        assert state["last_chat_monotonic"] is None
+
+        client, submitted = _route_client(state, monkeypatch)
+        resp = client.post("/calibrate/respond", json={"text": "Hello", "speaker_id": "speaker1"})
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["status"] == "started_calibration"
+        assert body["action"] == "calibrate"
+        assert len(submitted) == 1
+        # The bug's own signature: the route must not have stamped the
+        # marker as a side effect of this call.
+        assert state["last_chat_monotonic"] is None
+
+    def test_still_defers_on_a_genuinely_recent_unrelated_chat_turn(self, tmp_path, monkeypatch):
+        """The debounce itself is unchanged and still protects a genuinely
+        recent LIVE ``/chat`` turn from any GPU-seizing dispatch, calibrate
+        included — the fix is narrowly "this route does not stamp the
+        marker ITSELF", not "this route is exempt from the debounce".  A
+        marker set moments ago by something else (a real chat turn) must
+        still defer this call."""
+        state = self._state(tmp_path, monkeypatch)
+        state["last_chat_monotonic"] = time.monotonic()  # a real turn, "just now"
+
+        client, submitted = _route_client(state, monkeypatch)
+        resp = client.post("/calibrate/respond", json={"text": "Hello", "speaker_id": "speaker1"})
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"status": "deferred_idle", "action": "calibrate"}
         assert submitted == []
 
 
@@ -2108,7 +2190,7 @@ class TestFullConsolidationFoldEntry:
         loop.consolidate.assert_called_once()
         _, kwargs = loop.consolidate.call_args
         assert kwargs["mode"] == "simulate"
-        assert kwargs["consume_pending"] is False
+        assert kwargs["pending"] is None
 
     def test_empty_tiers_rebuilt_is_a_noop_terminal(self, monkeypatch, tmp_path) -> None:
         """tiers_rebuilt == [] ends the cycle as a noop for every caller.
@@ -2131,8 +2213,9 @@ class TestFullConsolidationFoldEntry:
         """A reconcile event is a full consolidation whose input excludes
         pending sessions: at ``max_interim_count == 0`` (where an ordinary
         full fold's pre-stage would extract pending sessions directly) a
-        reconcile event still passes ``consume_pending=False`` and never
-        runs the extraction pre-stage -- pending sessions stay pending."""
+        reconcile event still runs no extraction pre-stage and passes
+        ``pending=None`` to ``loop.consolidate`` -- pending sessions stay
+        pending."""
         import paramem.server.app as app_module
 
         state = _make_dispatch_state(
@@ -2148,7 +2231,7 @@ class TestFullConsolidationFoldEntry:
         loop.consolidate.assert_called_once()
         _, kwargs = loop.consolidate.call_args
         assert kwargs["event"] == "reconcile"
-        assert kwargs["consume_pending"] is False
+        assert kwargs["pending"] is None
         extract_spy.assert_not_called()
 
     def test_full_trained_run_status_detail_has_no_extra_fields(
@@ -2885,3 +2968,173 @@ class TestFiveDoorPendingRecordGuard:
 
         assert resp.status_code == 409
         assert resp.json()["detail"]["error"] == "consolidation_pending"
+
+
+# ---------------------------------------------------------------------------
+# TestCalibrateArbitratorStages — the arbitrator's pre-dispatch stages
+# (retro-claim, retiring triage, pending-ledger resume) as they apply to the
+# two calibrate actions specifically: retro-claim runs for every action,
+# including calibrate; retiring triage/mark_consolidated is staging-only;
+# a pending ledger makes a calibrate dispatch PROCEED rather than resume.
+# ---------------------------------------------------------------------------
+
+
+def _dispatch_with_retro_claim_spy(state, action, *, monkeypatch, spec=None):
+    """Like ``_dispatch`` above, but spies on ``_retro_claim_orphan_sessions``
+    instead of stubbing it to a no-op -- the caller needs to observe whether
+    it ran, not merely tolerate it running."""
+    import paramem.server.app as app_module
+
+    calls: list[int] = []
+    _real = app_module._retro_claim_orphan_sessions
+
+    def _spy():
+        calls.append(1)
+        return _real()
+
+    spy = _ExecutorSpy()
+    state["event_loop"] = spy.loop
+    monkeypatch.setattr(app_module, "_state", state)
+    monkeypatch.setattr(app_module, "_retro_claim_orphan_sessions", _spy)
+    status, resolved = app_module._dispatch_consolidation(action, spec=spec)
+    return status, resolved, spy, calls
+
+
+class TestRetroClaimRunsForEveryAction:
+    """the retro-claim runs for every action, including both
+    calibrate actions."""
+
+    def test_retro_claim_runs_for_calibrate_pending_even_on_a_noop(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        from paramem.server.consolidation_action import ConsolidationAction
+
+        state = _make_arbitrator_state(tmp_path, max_interim_count=7)  # nothing pending -> noop
+        status, _resolved, _spy, calls = _dispatch_with_retro_claim_spy(
+            state, ConsolidationAction.CALIBRATE_PENDING, monkeypatch=monkeypatch
+        )
+
+        assert status == "noop_no_pending"
+        assert calls == [1], "retro-claim must run even though this dispatch ends in a noop"
+
+    def test_retro_claim_runs_for_calibrate(self, tmp_path, monkeypatch) -> None:
+        from unittest.mock import MagicMock
+
+        from paramem.server.consolidation_action import ConsolidationAction
+
+        state = _make_arbitrator_state(tmp_path, max_interim_count=7)
+        status, _resolved, spy, calls = _dispatch_with_retro_claim_spy(
+            state, ConsolidationAction.CALIBRATE, monkeypatch=monkeypatch, spec=MagicMock()
+        )
+
+        assert status == "started_calibration"
+        assert calls == [1]
+        assert spy.call_count == 1
+
+    def test_retro_claim_runs_for_a_staging_action_too(self, tmp_path, monkeypatch) -> None:
+        """Control: retro-claim already ran for staging actions before this
+        change; still true."""
+        from paramem.server.consolidation_action import ConsolidationAction
+
+        state = _make_arbitrator_state(tmp_path, max_interim_count=7, named_sessions=1)
+        status, _resolved, _spy, calls = _dispatch_with_retro_claim_spy(
+            state, ConsolidationAction.INTERIM, monkeypatch=monkeypatch
+        )
+
+        assert status == "started"
+        assert calls == [1]
+
+
+class TestRetiringTriageIsStagingOnly:
+    """retiring triage (and therefore ``mark_consolidated``) runs
+    only for staging actions -- a calibrate dispatch classifies pending
+    sessions (the counts feed the content gate) but never retires any of
+    them."""
+
+    def test_calibrate_pending_dispatch_never_calls_mark_consolidated(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        from unittest.mock import patch
+
+        from paramem.server.consolidation_action import ConsolidationAction
+
+        # One UNIDENTIFIABLE session (no speaker_id, no voice embedding) --
+        # a staging dispatch would retire it via retire_unattributable_sessions.
+        state = _make_arbitrator_state(tmp_path, max_interim_count=7, anon_sessions=1)
+        buffer = state["session_buffer"]
+
+        with patch.object(buffer, "mark_consolidated", wraps=buffer.mark_consolidated) as spy:
+            status, _resolved, _spy, _calls = _dispatch_with_retro_claim_spy(
+                state, ConsolidationAction.CALIBRATE_PENDING, monkeypatch=monkeypatch
+            )
+
+        assert status == "noop_no_named"  # the UNIDENTIFIABLE session is not NAMED
+        spy.assert_not_called()
+
+    def test_the_same_unidentifiable_session_is_retired_on_a_staging_dispatch(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """Control: the identical seeded session IS retired when a staging
+        action (here INTERIM) reaches the same triage stage -- proves the
+        prior test's non-call is the calibrate/staging distinction, not an
+        inert fixture."""
+        from unittest.mock import patch
+
+        from paramem.server.consolidation_action import ConsolidationAction
+
+        state = _make_arbitrator_state(tmp_path, max_interim_count=7, anon_sessions=1)
+        buffer = state["session_buffer"]
+
+        with patch.object(buffer, "mark_consolidated", wraps=buffer.mark_consolidated) as spy:
+            status, _resolved, _spy, _calls = _dispatch_with_retro_claim_spy(
+                state, ConsolidationAction.INTERIM, monkeypatch=monkeypatch
+            )
+
+        assert status == "noop_no_named"
+        spy.assert_called_once()
+
+
+class TestPendingLedgerCalibrateProceedsStagingResumes:
+    """a pending stage ledger makes a calibrate dispatch PROCEED
+    past the resume step, while the four staging doors resume the pending
+    event instead."""
+
+    def test_calibrate_proceeds_past_a_pending_full_event_ledger(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        import paramem.server.app as app_module
+        from paramem.server.consolidation_action import ConsolidationAction
+
+        _write_pending_ledger(tmp_path, event="full")
+        state = _make_arbitrator_state(tmp_path, max_interim_count=7)
+
+        status, resolved, spy, _calls = _dispatch_with_retro_claim_spy(
+            state, ConsolidationAction.CALIBRATE, monkeypatch=monkeypatch, spec=MagicMock()
+        )
+
+        # CALIBRATE's content gate never noops, so a resumed dispatch and a
+        # proceeding dispatch are distinguishable by their terminal status
+        # AND by which executor entry point was submitted: a resume submits
+        # _run_pending_event_resume; a proceeding calibrate dispatch submits
+        # _run_calibration_sync.
+        assert status == "started_calibration"
+        assert resolved is ConsolidationAction.CALIBRATE
+        assert len(spy.submitted) == 1
+        submitted_fn = spy.submitted[0]
+        assert submitted_fn is not app_module._run_pending_event_resume
+        assert getattr(submitted_fn, "func", None) is app_module._run_calibration_sync
+
+    def test_a_staging_door_resumes_the_same_pending_ledger(self, tmp_path, monkeypatch) -> None:
+        """Control: the identical pending ledger makes a directly-requested
+        FULL door resume instead of proceeding."""
+        from paramem.server.consolidation_action import ConsolidationAction
+
+        _write_pending_ledger(tmp_path, event="full")
+        state = _make_arbitrator_state(tmp_path, max_interim_count=7)
+
+        status, resolved, spy, _ = _dispatch(
+            state, ConsolidationAction.FULL, monkeypatch=monkeypatch
+        )
+
+        assert status == "started_resume"
+        assert resolved is ConsolidationAction.FULL

@@ -525,6 +525,25 @@ def interim_outcome_label(build_summary: dict, *, venue: str) -> str:
 
 
 @dataclass(frozen=True)
+class PendingRelations:
+    """One batch's merged extraction product, captured at the extraction
+    boundary and consumed by a fold.
+
+    ``episodic`` / ``procedural`` are the split :class:`~paramem.graph.schema.Relation`
+    lists ``stage_event`` receives through its own pending-relations
+    channel.  Empty lists are a valid, meaningful value: an extraction that
+    merged nothing.
+    """
+
+    episodic: "list[Relation]"
+    procedural: "list[Relation]"
+
+    def is_empty(self) -> bool:
+        """``True`` when neither list carries a relation."""
+        return not self.episodic and not self.procedural
+
+
+@dataclass(frozen=True)
 class FoldScope:
     """Immutable descriptor that parameterizes one consolidation event's
     stage-then-build-and-publish pass (:meth:`ConsolidationLoop.stage_event`
@@ -571,15 +590,12 @@ class FoldScope:
             interim scope; the graph-only pass's measured interim output was
             11/15 predicate paraphrases (2026-07-28); cross-session
             inference over the cumulative graph remains the full fold's job.
-        consume_pending: When ``True``, the fold snapshots the pending-session
-            relations sitting in ``merger.graph`` via
-            :meth:`~ConsolidationLoop._capture_pending_relations` and feeds them
-            to :meth:`~ConsolidationLoop.stage_event` through its
-            ``episodic_rels`` argument, so they survive the graph reset.
-            ``True`` for every interim cycle (the pending session IS the
-            cycle's content) and for the full fold in the
-            ``max_interim_count == 0`` consume-pending mode the server selects.
-            ``False`` means no supplemental relations enter the merge.
+
+    Whether an event folds pending-session relations is not a field of
+    this class at all: it is the presence of a :class:`PendingRelations`
+    argument at the call site (:meth:`~ConsolidationLoop.run_consolidation_cycle` /
+    :meth:`~ConsolidationLoop.consolidate`), so a flag and a value can
+    never disagree.
     """
 
     # --- identity / dispatch ---
@@ -590,8 +606,40 @@ class FoldScope:
     normalize: bool = False
     enrich: bool = False
 
-    # --- pending capture ---
-    consume_pending: bool = False  # merge pending-session relations in-fold
+
+def enrichment_signal(loop: "ConsolidationLoop", session_id: str) -> dict:
+    """One session's enrichment-health record, read off ``loop.last_session_graph``
+    right after :meth:`ConsolidationLoop.extract_session` returns for it.
+
+    The single producer of this record's shape (``{session_id, anonymize,
+    cloud_enrichment_degraded}``): every staging caller of ``extract_session``
+    (``_run_extraction_phase``, ``_extract_pending_sessions`` — both in
+    ``paramem.server.app``) calls this once per session instead of each
+    re-reading ``loop.last_session_graph.diagnostics`` inline.  Not folded
+    into ``extract_session``'s own return shape — that 2-tuple
+    (``episodic_rels``, ``procedural_rels``) is destructured by six
+    non-server callers (``experiments/dataset_probe.py``,
+    ``experiments/lme_graph_builder.py``, four
+    ``scripts/dev/probe_*_live.py`` sites) that would all need updating for
+    a shape no calibration or non-staging caller needs — see
+    ``extract_session``'s own docstring for why writing the incident here
+    would be wrong (a non-staging run mutating production incident state);
+    this function only reads, it arbitrates nothing.  A batch's collected
+    records are passed to :meth:`ConsolidationLoop.arbitrate_enrichment_incidents`
+    by the staging caller once extraction finishes.
+    """
+    session_graph = loop.last_session_graph
+    return {
+        "session_id": session_id,
+        "anonymize": (
+            session_graph.diagnostics.get("anonymize") if session_graph is not None else None
+        ),
+        "cloud_enrichment_degraded": (
+            session_graph.diagnostics.get("cloud_enrichment_degraded")
+            if session_graph is not None
+            else None
+        ),
+    }
 
 
 class ConsolidationLoop:
@@ -1490,10 +1538,13 @@ class ConsolidationLoop:
 
         self.last_session_graph = session_graph
 
-        # Surface session-tier enrichment health as an operator-visible
-        # incident.  Factored out so extract_session stays readable and the
-        # arbitration itself is unit-testable without a GPU.
-        self._arbitrate_session_enrichment_incidents(session_graph, session_id)
+        # Session-tier enrichment health is NOT arbitrated into an incident
+        # here: writing one from this method would mean a non-staging run
+        # (a calibration probe running the same extraction chain) mutates
+        # production incident state.  ``self.last_session_graph.diagnostics``
+        # carries the two signals (``"anonymize"`` / ``"cloud_enrichment_degraded"``)
+        # a caller needs to build its own record; a staging caller passes the
+        # batch's records to :meth:`arbitrate_enrichment_incidents`.
 
         # Release reclaimable device memory back to the WSL2 dxg layer at every
         # session boundary.  PyTorch's caching allocator retains freed blocks
@@ -1552,12 +1603,36 @@ class ConsolidationLoop:
             return
         raise ExtractionFailed(record.name, record.reason or f"{record.name} failed to parse")
 
-    def _arbitrate_session_enrichment_incidents(
-        self, session_graph: SessionGraph, session_id: str
-    ) -> None:
+    def arbitrate_enrichment_incidents(self, signals: "list[dict]") -> None:
+        """Reconcile the ``enrichment_degraded`` incident state for a batch
+        of sessions.
+
+        THE public door for the arbitration ``extract_session`` no longer
+        performs itself (writing an incident from inside extraction would
+        let a non-staging run — a calibration probe running the same chain —
+        mutate production incident state).  Called once per batch, after
+        extraction, by a STAGING caller only — the server layer's own
+        extraction pre-stage collects one signal per session from
+        ``session_graph.diagnostics`` right after each ``extract_session``
+        call and passes the whole batch here.
+
+        Args:
+            signals: One record per session —
+                ``{"session_id", "anonymize", "cloud_enrichment_degraded"}``,
+                the same two diagnostic fields ``stage_anonymize`` wrote onto
+                each session's graph.
+
+        A safe no-op when ``self._incidents_state_dir is None``.
+        """
+        if self._incidents_state_dir is None:
+            return
+        for signal in signals:
+            self._arbitrate_one_enrichment_signal(signal)
+
+    def _arbitrate_one_enrichment_signal(self, signal: dict) -> None:
         """Reconcile the ``enrichment_degraded`` incident state for one
-        session against ``session_graph.diagnostics["anonymize"]`` (the same
-        graph object ``stage_anonymize`` wrote it onto).
+        session against its own enrichment signal (see
+        :meth:`arbitrate_enrichment_incidents`).
         ``cloud_enrichment_degraded`` alone can't tell "ran cleanly" apart
         from "never ran" (empty relations, a calibration stop, cloud egress
         refused), so reading it alone would silently resolve a standing
@@ -1576,23 +1651,22 @@ class ConsolidationLoop:
         - any other value: not a real writer output — log a warning and
           touch nothing, rather than conflating it with "absent".
 
-        A safe no-op when ``self._incidents_state_dir is None``.
+        Callers already guard ``self._incidents_state_dir is None`` (see
+        :meth:`arbitrate_enrichment_incidents`).
         """
-        if self._incidents_state_dir is None:
-            return
-
         from paramem.server.incidents import (
             record_incident,
             resolve_incident,
             resolve_incidents_by_type,
         )
 
-        anonymize_outcome = session_graph.diagnostics.get("anonymize")
+        session_id = signal["session_id"]
+        anonymize_outcome = signal.get("anonymize")
 
         if anonymize_outcome in ("ok", "opted_out"):
             resolve_incident(self._incidents_state_dir, "enrichment_degraded", "anonymize")
 
-            degraded = session_graph.diagnostics.get("cloud_enrichment_degraded")
+            degraded = signal.get("cloud_enrichment_degraded")
             if degraded is None:
                 resolve_incident(self._incidents_state_dir, "enrichment_degraded", "cloud_enrich")
             else:
@@ -1689,6 +1763,12 @@ class ConsolidationLoop:
         Note: this method trains AND saves.  Experiment scripts use this
         combined method directly.
         """
+        # This method's own callers merge session content directly via
+        # extract_session (never through the server's own
+        # _extract_pending_sessions), so this is where that batch's
+        # extraction lifetime ends — the one take, ahead of the fold.
+        pending = self.take_pending_relations()
+
         # cycle_count advances inside run_build_and_publish, only once this
         # call's event reaches all_live -- a pre-call snapshot, not a
         # lookahead to a number this call is guaranteed to reach.
@@ -1697,6 +1777,7 @@ class ConsolidationLoop:
             all_procedural_relations,
             speaker_id=speaker_id,
             mode="train",
+            pending=pending,
             run_label=f"train-adapters-cycle{self.cycle_count}",
         )
 
@@ -1723,7 +1804,10 @@ class ConsolidationLoop:
             )
 
             def _consolidate() -> None:
-                self.consolidate(mode="train", trainer=_bt)
+                # The roll-into-main step: the product self.take_pending_relations()
+                # captured above was already consumed by run_consolidation_cycle,
+                # so this event folds no pending-session content of its own.
+                self.consolidate(mode="train", pending=None, trainer=_bt)
 
             try:
                 _bt.submit_and_wait(_consolidate)
@@ -1945,6 +2029,7 @@ class ConsolidationLoop:
         speaker_id: str,
         mode: "Literal['simulate', 'train']",
         run_label: str,
+        pending: "PendingRelations",
         schedule: str = "",
         max_interim_count: int = 7,
         interim_overflow_slack: int = 0,
@@ -1980,9 +2065,10 @@ class ConsolidationLoop:
         5. Mint/refresh the interim PEFT slot (weights venue only) via
            :func:`~paramem.memory.interim_adapter.create_interim_adapter` /
            :func:`~paramem.models.loader.ensure_adapter_matching`, then
-           :meth:`_hydrate_store_for_fold` and :meth:`_capture_pending_relations`
-           (a snapshot of ``merger.graph``'s edges, since the staging pass
-           below resets the graph).
+           :meth:`_hydrate_store_for_fold`.  The batch's own merged
+           relations arrive as the caller-supplied ``pending`` argument
+           (the caller's own :meth:`take_pending_relations` take) —
+           nothing here re-captures ``merger.graph``'s edges.
         6. Stage this event's shadow tree via :meth:`stage_event` — the
            interim scope always pins ``normalize``/``enrich`` ``False`` (see
            :class:`FoldScope`'s own docstring for the rationale); the interim
@@ -2016,6 +2102,11 @@ class ConsolidationLoop:
             run_label: Tag woven into the wandb ``run_name`` for traceability.
                 Pass ``session_id`` for per-session calls, or
                 ``"tick-<stamp>"`` for batch calls from the scheduled tick.
+            pending: The batch's merged extraction product — the caller's own
+                :meth:`take_pending_relations` take, captured at the
+                extraction boundary before this call.  Required: the
+                pending session IS every interim cycle's content, so there
+                is no caller of this method with nothing to pass.
             schedule: Consolidation refresh-cadence string used to compute the
                 sub-interval stamp when *stamp* is not provided.
             max_interim_count: Cap on concurrent interim adapters.  When the
@@ -2149,7 +2240,6 @@ class ConsolidationLoop:
         _interim_scope = FoldScope(
             source=_interim_source,
             persist="interim_slot",
-            consume_pending=True,
             normalize=False,  # normalization is full-fold only
             enrich=False,  # graph enrichment is full-fold only
         )
@@ -2175,11 +2265,6 @@ class ConsolidationLoop:
 
             _recalled_entries = self._hydrate_store_for_fold(_interim_scope)
 
-            # The pending-session content already merged into merger.graph by
-            # the caller's extraction pre-stage — captured before this event's
-            # own staging pass resets the graph.
-            _pending_extra = self._capture_pending_relations()
-
             # Working universe: this tick's own new slot is the sole primary
             # tier; the three main tiers and every sibling interim slot are
             # candidates (dedup-only, never absorbed — the interim topology
@@ -2195,11 +2280,15 @@ class ConsolidationLoop:
             _session_ids = (
                 sorted(session_ids)
                 if session_ids is not None
-                else sorted({sid for rel in _pending_extra for sid in (rel.session_ids or [])})
+                else sorted(
+                    {
+                        sid
+                        for rel in (*pending.episodic, *pending.procedural)
+                        for sid in (rel.session_ids or [])
+                    }
+                )
             )
             _pre_active = set(self.store.active_keys_in_tier(adapter_name))
-
-            _pending_episodic, _pending_procedural = self._split_pending_relations(_pending_extra)
 
             staged_event = self.stage_event(
                 event="interim",
@@ -2208,8 +2297,8 @@ class ConsolidationLoop:
                 primary_tiers={adapter_name: adapter_name},
                 recalled_entries=_recalled_entries,
                 candidate_tiers=_candidate_tiers,
-                episodic_rels=_pending_episodic,
-                procedural_rels=_pending_procedural,
+                episodic_rels=pending.episodic,
+                procedural_rels=pending.procedural,
                 session_ids=_session_ids,
                 promote=False,
                 normalize=False,
@@ -2299,16 +2388,15 @@ class ConsolidationLoop:
     def _capture_pending_relations(self) -> "list[Relation]":
         """Snapshot current merger.graph edges AND node attributes into a list[Relation].
 
-        Called BEFORE :meth:`stage_event` resets the graph, so the
-        pending-session content survives the reset and re-enters the merge
-        through *episodic_rels*, ``stage_event``'s own pending-relations
-        channel.
-
-        Both fold scopes call this on ``scope.consume_pending`` — the one gate.
-        The interim fold always sets it (the pending session IS that cycle's
-        content); the full fold sets it in the ``max_interim_count == 0``
-        consume-pending mode, where app.py has pre-populated ``merger.graph``
-        with the pending-session relations before entering the fold.
+        The one implementation :meth:`take_pending_relations` (its ONE
+        caller) wraps: called by the extraction boundary — the server
+        layer's ``_extract_pending_sessions`` at its single return, or
+        :meth:`train_adapters` for a caller that merged directly — before
+        that boundary resets the graph, so the pending-session content
+        survives the reset and re-enters the merge through *episodic_rels*
+        / *procedural_rels*, ``stage_event``'s own pending-relations
+        channel, via a :class:`PendingRelations` value the caller threads
+        explicitly rather than a flag read off ``merger.graph`` state.
 
         An attribute-typed fact (``relation_type == "attribute"``) never
         becomes an edge — :meth:`~paramem.graph.merger.GraphMerger.merge`
@@ -2472,6 +2560,31 @@ class ConsolidationLoop:
         procedural = [r for i, r in enumerate(pending) if i in procedural_idx]
         return episodic, procedural
 
+    def take_pending_relations(self) -> "PendingRelations":
+        """End the extraction graph's lifetime: capture the merged product
+        and reset the keying surface.
+
+        The ONE door out of the extraction accumulation, called exactly
+        once per batch by the boundary that opened it — the server layer's
+        ``_extract_pending_sessions`` at its single return, for a caller
+        whose sessions merged through the server's own extraction stage;
+        :meth:`train_adapters` for a caller that merged directly via
+        :meth:`extract_session`.  Nothing downstream reads
+        ``self.merger.graph`` for extraction content again after this
+        returns — ``stage_event`` opens its own, separate fold lifetime
+        with its own ``reset_graph()``, which finds this surface already
+        empty and is a no-op there.
+
+        Returns:
+            PendingRelations: The captured product, already split into
+                ``episodic`` / ``procedural`` (see :meth:`_split_pending_relations`).
+                Empty lists on a batch that merged nothing.
+        """
+        captured = self._capture_pending_relations()
+        episodic, procedural = self._split_pending_relations(captured)
+        self.merger.reset_graph()
+        return PendingRelations(episodic=episodic, procedural=procedural)
+
     # ------------------------------------------------------------------
     # Unified persist dispatch — one venue fork for graph-json simulate,
     # interim-slot, and main-tiers full-fold persistence.
@@ -2595,7 +2708,7 @@ class ConsolidationLoop:
         *,
         mode: str,
         event: "Literal['full', 'reconcile']" = "full",
-        consume_pending: bool = False,
+        pending: "PendingRelations | None" = None,
         trainer=None,
         router=None,
         session_ids: "list[str] | None" = None,
@@ -2644,7 +2757,7 @@ class ConsolidationLoop:
         no cold-start arm.  *event* exists only to name the door in the
         ledger and in reporting; it changes no fold behaviour here beyond the
         recorded label — the caller is what keeps sessions pending for a
-        reconcile, via *consume_pending*.
+        reconcile, via *pending*.
 
         Args:
             mode: ``"train"`` or ``"simulate"``.  Required — ``ConsolidationConfig``
@@ -2656,12 +2769,14 @@ class ConsolidationLoop:
                 Both run the identical fold: every interim slot is always a
                 read-only candidate this event absorbs whole (see
                 :meth:`_stage_and_publish_full_event`).
-            consume_pending: When ``True`` (train only), the fold snapshots the
-                pending-session relations already deposited in ``merger.graph`` by the
-                caller's extraction pre-stage and trains them into the main tiers.  The
-                caller derives this from its schedule config
-                (``max_interim_count == 0 and mode != "simulate"``); a reconcile event
-                never sets this — pending sessions stay pending.
+            pending: The caller's own :meth:`take_pending_relations` take
+                (train only), when the pending-session content already
+                extracted by the caller's own extraction pre-stage should
+                train into the main tiers.  The caller derives whether to
+                pass one from its schedule config (``max_interim_count == 0
+                and mode != "simulate"``); a reconcile event never passes
+                one — pending sessions stay pending.  ``None`` (default)
+                means this event folds no pending-session content.
             trainer: :class:`~paramem.server.background_trainer.BackgroundTrainer`
                 holding the GPU lock (train only).  Its ``_set_is_training`` flag is
                 narrowed to ``False`` around the staging pass's CPU-only phase so a
@@ -2672,32 +2787,33 @@ class ConsolidationLoop:
                 ``publish_bundle`` go-live step (both venues).  ``None`` is
                 safe — skipped.
             session_ids: The app layer's own authoritative list of
-                successfully-extracted session ids for this consume-pending
-                batch (``extraction.completed_session_ids(session_buffer)``)
+                successfully-extracted session ids for this *pending* batch
+                (``extraction.completed_session_ids(session_buffer)``)
                 — recorded verbatim in the ledger's extraction stage.
-                Ignored when ``consume_pending`` is ``False`` (nothing this
-                call retires).  Required when ``consume_pending`` is
-                ``True`` — a missing list raises ``TypeError``, never a
-                silent relation-derived guess.
+                Ignored when *pending* is ``None`` (nothing this call
+                retires).  Required when *pending* is not ``None`` — a
+                missing list raises ``TypeError``, never a silent
+                relation-derived guess.
 
         Returns:
             The full-fold result dict (see :meth:`_stage_and_publish_full_event`)
             — one schema for both venues and every terminal return.
 
         Raises:
-            ValueError: When ``consume_pending`` is requested on the simulate venue.
+            ValueError: When *pending* is supplied on the simulate venue.
                 The simulate fold has no weight venue to train pending sessions into,
-                so it would discard the flag; callers derive ``consume_pending`` from
-                ``max_interim_count == 0 and mode != "simulate"``, which cannot produce
-                that pairing today.  The guard exists so a future caller that gets the
-                derivation wrong fails loudly instead of silently ingesting nothing.
+                so it would discard the content; callers derive whether to pass
+                *pending* from ``max_interim_count == 0 and mode != "simulate"``,
+                which cannot produce that pairing today.  The guard exists so a
+                future caller that gets the derivation wrong fails loudly instead
+                of silently ingesting nothing.
             RuntimeError: When ``mode="train"`` is called without the GPU lock held.
         """
-        if mode == "simulate" and consume_pending:
+        if mode == "simulate" and pending is not None:
             raise ValueError(
                 "consolidate(mode='simulate') cannot consume pending sessions: the "
                 "simulate venue writes graph.json and trains nothing. Pass "
-                "consume_pending=False, or run the train venue."
+                "pending=None, or run the train venue."
             )
 
         if mode == "simulate":
@@ -2710,7 +2826,7 @@ class ConsolidationLoop:
                 return self._stage_and_publish_full_event(
                     source="disk",
                     event=event,
-                    consume_pending=False,
+                    pending=None,
                     router=router,
                 )
 
@@ -2730,7 +2846,7 @@ class ConsolidationLoop:
             return self._stage_and_publish_full_event(
                 source="weights",
                 event=event,
-                consume_pending=consume_pending,
+                pending=pending,
                 router=router,
                 trainer=trainer,
                 session_ids=session_ids,
@@ -2741,7 +2857,7 @@ class ConsolidationLoop:
         *,
         source: "Literal['weights', 'disk']",
         event: "Literal['full', 'reconcile']",
-        consume_pending: bool,
+        pending: "PendingRelations | None",
         router,
         trainer=None,
         session_ids: "list[str] | None" = None,
@@ -2754,7 +2870,7 @@ class ConsolidationLoop:
         event absorbs whole and reaps — a reconcile (``/reconsolidate``) runs
         the identical spine, differing from an ordinary full fold only in
         *event*'s recorded label and in the caller leaving sessions pending
-        (``consume_pending=False``).  No main tier's adapter is
+        (``pending=None``).  No main tier's adapter is
         deleted or recreated here except when the operator changed its LoRA
         shape: :func:`~paramem.models.loader.ensure_adapter_matching`
         recreates the resident adapter cold in that one case, before
@@ -2770,14 +2886,14 @@ class ConsolidationLoop:
                 event's venue.
             event: ``"full"`` or ``"reconcile"`` — the door name recorded in
                 the ledger head; changes no fold behaviour here.
-            consume_pending: Whether to fold the pending-session relations
-                already deposited in ``merger.graph`` by the caller's
-                extraction pre-stage into this event.
+            pending: The caller's own :meth:`take_pending_relations` take to
+                fold into this event, or ``None`` when this event folds no
+                pending-session content.
             router: The live ``QueryRouter`` to reload once per bundle;
                 ``None`` skips the reload.
             session_ids: The app layer's own authoritative completed-session
                 list, forwarded verbatim from :meth:`consolidate`.  Required
-                when *consume_pending* is ``True`` — a missing list raises
+                when *pending* is not ``None`` — a missing list raises
                 ``TypeError`` at the sort call, never a silent
                 relation-derived guess.  Unused (may be ``None``) otherwise.
 
@@ -2791,14 +2907,9 @@ class ConsolidationLoop:
             persist="main_tiers",
             normalize=(self.config.refinement_normalization == "on"),
             enrich=(self.config.refinement_enrichment == "on" and self.cloud_enabled),
-            consume_pending=consume_pending,
         )
 
         _recalled_entries = self._hydrate_store_for_fold(scope)
-
-        _pending_extra: "list[Relation] | None" = None
-        if consume_pending:
-            _pending_extra = self._capture_pending_relations()
 
         primary_tiers = {t: t for t in self._tier_config_map()}
 
@@ -2809,7 +2920,7 @@ class ConsolidationLoop:
         candidate_tiers: "dict[str, str] | None" = {t: t for t in _ring}
 
         _staged_session_ids: "list[str] | None" = None
-        if consume_pending:
+        if pending is not None:
             _staged_session_ids = sorted(session_ids)
 
         from paramem.memory.interim_adapter import current_full_consolidation_stamp
@@ -2826,7 +2937,8 @@ class ConsolidationLoop:
         # inside run_build_and_publish, which does touch the GPU.
         if trainer is not None:
             trainer._set_is_training(False)
-        _pending_episodic, _pending_procedural = self._split_pending_relations(_pending_extra or [])
+        _pending_episodic = pending.episodic if pending is not None else []
+        _pending_procedural = pending.procedural if pending is not None else []
         try:
             staged_event = self.stage_event(
                 event=event,
@@ -2960,9 +3072,9 @@ class ConsolidationLoop:
 
         A pass that ran to completion is the success this incident resolves
         on, and this is the only site that observes it — with one sanctioned
-        exception: ``_arbitrate_session_enrichment_incidents``'s
-        cloud-disabled sweep resolves this key too (by type), since a
-        completed pass can never happen while cloud egress is refused.
+        exception: :meth:`_arbitrate_one_enrichment_signal`'s cloud-disabled
+        sweep resolves this key too (by type), since a completed pass can
+        never happen while cloud egress is refused.
         ``result.enrichment is None`` means the pass never ran (enrichment
         off, or an interim scope), which is not evidence of recovery and
         must not clear a standing incident — a no-op in that case.

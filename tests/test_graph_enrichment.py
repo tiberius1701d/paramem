@@ -20,7 +20,7 @@ from peft import PeftModel
 from paramem.cloud.anonymize import anonymize_transcript as _real_anonymize_transcript
 from paramem.graph.schema import SessionGraph
 from paramem.memory.persistence import _EDGE_SOURCE_ATTR
-from paramem.training.consolidation import ConsolidationLoop
+from paramem.training.consolidation import ConsolidationLoop, PendingRelations
 from paramem.training.graph_enrich import serialize_subgraph_triples
 from paramem.training.graph_tier import GraphTierRefiner
 from paramem.utils.config import AdapterConfig, ConsolidationConfig, TrainingConfig
@@ -2426,6 +2426,7 @@ class TestInterimEnrichmentHook:
                 proc,
                 speaker_id="speaker0",
                 mode="train",
+                pending=PendingRelations(episodic=[], procedural=[]),
                 run_label="s1",
                 schedule="12h",
                 max_interim_count=7,
@@ -2483,6 +2484,7 @@ class TestInterimEnrichmentHook:
                 proc,
                 speaker_id="speaker0",
                 mode="train",
+                pending=PendingRelations(episodic=[], procedural=[]),
                 run_label="s1",
                 schedule="12h",
                 max_interim_count=1,
@@ -2701,13 +2703,16 @@ class TestSurvivorRuleEstablishedOutranksEnrichment:
 
 
 class TestArbitrateSessionEnrichmentIncidents:
-    """``ConsolidationLoop._arbitrate_session_enrichment_incidents`` — the
-    session-tier reconciliation extracted from ``extract_session``.
+    """``ConsolidationLoop.arbitrate_enrichment_incidents`` — the session-tier
+    reconciliation extracted from ``extract_session``, now driven by the
+    per-session signal record a staging caller collects rather than the
+    ``SessionGraph`` object itself (``extract_session`` no longer writes
+    this incident directly).
 
     Uses the same ``record_incident``/``resolve_incident`` surface (and the
     same ``incidents_state_dir`` fixture pattern) as
     ``TestRefineConsolidationGraphRecordsVramIncident`` above.  Calls the
-    method directly with a hand-built ``SessionGraph`` rather than driving
+    method directly with a hand-built signal rather than driving
     ``extract_session`` end to end, so no GPU/model call is needed.
     """
 
@@ -2715,6 +2720,17 @@ class TestArbitrateSessionEnrichmentIncidents:
         return SessionGraph(
             session_id="s1", timestamp="2026-08-02T00:00:00+00:00", diagnostics=diagnostics
         )
+
+    @staticmethod
+    def _signal(graph: SessionGraph, session_id: str) -> dict:
+        """Build the ``{session_id, anonymize, cloud_enrichment_degraded}``
+        record a staging caller collects from ``session_graph.diagnostics``
+        right after its own ``extract_session`` call."""
+        return {
+            "session_id": session_id,
+            "anonymize": graph.diagnostics.get("anonymize"),
+            "cloud_enrichment_degraded": graph.diagnostics.get("cloud_enrichment_degraded"),
+        }
 
     def test_ok_and_clean_resolves_both_keys(self, tmp_path):
         """``anonymize == "ok"`` and no ``cloud_enrichment_degraded`` resolves
@@ -2739,7 +2755,7 @@ class TestArbitrateSessionEnrichmentIncidents:
             detail={},
         )
 
-        loop._arbitrate_session_enrichment_incidents(self._graph(anonymize="ok"), "s1")
+        loop.arbitrate_enrichment_incidents([self._signal(self._graph(anonymize="ok"), "s1")])
 
         by_id = {i.id: i.status for i in read_incidents(loop._incidents_state_dir)}
         assert by_id["enrichment_degraded:anonymize"] == "resolved"
@@ -2763,7 +2779,7 @@ class TestArbitrateSessionEnrichmentIncidents:
         )
 
         graph = self._graph(anonymize="ok", cloud_enrichment_degraded={"reason": "unparseable"})
-        loop._arbitrate_session_enrichment_incidents(graph, "s1")
+        loop.arbitrate_enrichment_incidents([self._signal(graph, "s1")])
 
         by_id = {i.id: i for i in read_incidents(loop._incidents_state_dir)}
         assert by_id["enrichment_degraded:anonymize"].status == "resolved"
@@ -2797,7 +2813,9 @@ class TestArbitrateSessionEnrichmentIncidents:
             detail={},
         )
 
-        loop._arbitrate_session_enrichment_incidents(self._graph(anonymize="opted_out"), "s1")
+        loop.arbitrate_enrichment_incidents(
+            [self._signal(self._graph(anonymize="opted_out"), "s1")]
+        )
 
         by_id = {i.id: i.status for i in read_incidents(loop._incidents_state_dir)}
         assert by_id["enrichment_degraded:anonymize"] == "resolved"
@@ -2822,7 +2840,7 @@ class TestArbitrateSessionEnrichmentIncidents:
         )
 
         graph = self._graph(anonymize="failed", fallback_path="anon_failed")
-        loop._arbitrate_session_enrichment_incidents(graph, "s1")
+        loop.arbitrate_enrichment_incidents([self._signal(graph, "s1")])
 
         by_id = {i.id: i for i in read_incidents(loop._incidents_state_dir)}
         assert by_id["enrichment_degraded:anonymize"].status == "active"
@@ -2843,8 +2861,8 @@ class TestArbitrateSessionEnrichmentIncidents:
         from paramem.server.incidents import read_incidents, resolve_incident
 
         graph = self._graph(anonymize="failed")
-        loop._arbitrate_session_enrichment_incidents(graph, "s1")
-        loop._arbitrate_session_enrichment_incidents(graph, "s2")
+        loop.arbitrate_enrichment_incidents([self._signal(graph, "s1")])
+        loop.arbitrate_enrichment_incidents([self._signal(graph, "s2")])
 
         incidents = read_incidents(loop._incidents_state_dir)
         assert len(incidents) == 1
@@ -2852,7 +2870,7 @@ class TestArbitrateSessionEnrichmentIncidents:
         assert incidents[0].status == "active"
 
         resolve_incident(loop._incidents_state_dir, "enrichment_degraded", "anonymize")
-        loop._arbitrate_session_enrichment_incidents(graph, "s3")
+        loop.arbitrate_enrichment_incidents([self._signal(graph, "s3")])
 
         incidents = read_incidents(loop._incidents_state_dir)
         assert incidents[0].status == "active"
@@ -2875,7 +2893,7 @@ class TestArbitrateSessionEnrichmentIncidents:
             detail={},
         )
 
-        loop._arbitrate_session_enrichment_incidents(self._graph(), "s1")
+        loop.arbitrate_enrichment_incidents([self._signal(self._graph(), "s1")])
 
         by_id = {i.id: i for i in read_incidents(loop._incidents_state_dir)}
         assert by_id["enrichment_degraded:cloud_enrich"].status == "active"
@@ -2905,7 +2923,7 @@ class TestArbitrateSessionEnrichmentIncidents:
             detail={},
         )
 
-        loop._arbitrate_session_enrichment_incidents(self._graph(), "s1")
+        loop.arbitrate_enrichment_incidents([self._signal(self._graph(), "s1")])
 
         for inc in read_incidents(loop._incidents_state_dir):
             assert inc.status == "resolved"
@@ -2917,7 +2935,7 @@ class TestArbitrateSessionEnrichmentIncidents:
         ``resolve_incidents_by_type``'s own success-path invariant)."""
         loop = _make_loop(tmp_path, incidents_state_dir=tmp_path / "incidents", cloud_enabled=False)
 
-        loop._arbitrate_session_enrichment_incidents(self._graph(), "s1")
+        loop.arbitrate_enrichment_incidents([self._signal(self._graph(), "s1")])
 
         assert not (loop._incidents_state_dir / "incidents.json").exists()
 
@@ -2944,8 +2962,8 @@ class TestArbitrateSessionEnrichmentIncidents:
             detail={},
         )
 
-        loop._arbitrate_session_enrichment_incidents(
-            self._graph(anonymize="not_a_real_outcome"), "s1"
+        loop.arbitrate_enrichment_incidents(
+            [self._signal(self._graph(anonymize="not_a_real_outcome"), "s1")]
         )
 
         inc = read_incidents(loop._incidents_state_dir)[0]
@@ -2960,7 +2978,9 @@ class TestArbitrateSessionEnrichmentIncidents:
         assert loop._incidents_state_dir is None
 
         with patch("paramem.server.incidents.record_incident") as record_mock:
-            loop._arbitrate_session_enrichment_incidents(self._graph(anonymize="failed"), "s1")
+            loop.arbitrate_enrichment_incidents(
+                [self._signal(self._graph(anonymize="failed"), "s1")]
+            )
 
         record_mock.assert_not_called()
 

@@ -367,11 +367,12 @@ class TestRestartSurvivalStatusDerivation:
         # Fresh call simulates process restart (no in-memory state).
         from paramem.server.app import _derive_consolidation_status_fields
 
-        err, result = _derive_consolidation_status_fields(state_dir)
+        err, result, calibration_result = _derive_consolidation_status_fields(state_dir)
         assert err is not None
         assert err["type"] == "vram_exhausted"
         assert err["phase"] == "phase2"
         assert result is None  # no run_status written
+        assert calibration_result is None  # no calibration run_status written
 
     def test_run_status_survives_simulated_restart(self, tmp_path):
         """Write run_status; _derive_consolidation_status_fields on fresh call reflects it."""
@@ -386,10 +387,11 @@ class TestRestartSurvivalStatusDerivation:
 
         from paramem.server.app import _derive_consolidation_status_fields
 
-        err, result = _derive_consolidation_status_fields(state_dir)
+        err, result, calibration_result = _derive_consolidation_status_fields(state_dir)
         assert err is None
         assert result is not None
         assert result["outcome"] == "noop"
+        assert calibration_result is None  # no calibration run_status written
 
 
 # ---------------------------------------------------------------------------
@@ -448,8 +450,9 @@ class TestAckEndpointNotFound:
 
 class TestWriteSiteVramExhausted:
     def test_vram_exhausted_callback_records_incident(self, state, tmp_path, monkeypatch):
-        """_scheduled_extract_done_callback with VramExhausted → incident recorded."""
-        from paramem.server.app import _scheduled_extract_done_callback
+        """_consolidation_run_done with VramExhausted → incident recorded."""
+        from paramem.server.app import _consolidation_run_done
+        from paramem.server.consolidation_action import ConsolidationAction
         from paramem.utils.vram_guard import VramExhausted
 
         sd = _state_dir(state)
@@ -462,7 +465,7 @@ class TestWriteSiteVramExhausted:
         monkeypatch.setattr(app_module, "_set_voice_pipeline_profile", lambda *a, **kw: None)
         monkeypatch.setattr(app_module, "_target_profile", lambda: "cpu")
 
-        _scheduled_extract_done_callback(_FakeFuture())
+        _consolidation_run_done(ConsolidationAction.INTERIM, None, _FakeFuture())
 
         incidents = read_incidents(sd)
         assert len(incidents) == 1
@@ -474,7 +477,8 @@ class TestWriteSiteVramExhausted:
 
     def test_vram_exhausted_callback_detail_shape(self, state, tmp_path, monkeypatch):
         """detail dict preserves the historic shape {type, phase, at}."""
-        from paramem.server.app import _scheduled_extract_done_callback
+        from paramem.server.app import _consolidation_run_done
+        from paramem.server.consolidation_action import ConsolidationAction
         from paramem.utils.vram_guard import VramExhausted
 
         sd = _state_dir(state)
@@ -486,7 +490,7 @@ class TestWriteSiteVramExhausted:
         monkeypatch.setattr(app_module, "_set_voice_pipeline_profile", lambda *a, **kw: None)
         monkeypatch.setattr(app_module, "_target_profile", lambda: "cpu")
 
-        _scheduled_extract_done_callback(_FakeFuture())
+        _consolidation_run_done(ConsolidationAction.INTERIM, None, _FakeFuture())
 
         inc = read_incidents(sd)[0]
         assert inc.detail["type"] == "vram_exhausted"
@@ -824,7 +828,8 @@ def _drive_stage_b_cycle_crash(state, *, exc):
 
     Mirrors ``TestInterimBookkeepingRegionCrash``'s synchronous-submit
     idiom: ``consolidation_loop`` and ``background_trainer`` are
-    pre-seeded ``MagicMock``s so ``_get_or_create_consolidation_loop`` /
+    pre-seeded ``MagicMock``s so
+    ``paramem.server.consolidation.get_or_create_consolidation_loop`` /
     ``_active_bg_trainer`` short-circuit to them without touching a real
     model, and ``bt.submit`` runs the worker inline rather than on a
     background thread.
@@ -1073,3 +1078,144 @@ class TestStageBCycleInterimRecallGateKeepsSessionsPending:
         assert crashes[0].detail["failed_keys"] == ["graph_bad"]
 
         session_buffer.mark_consolidated.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Calibration crash → calibration_crash incident + calibration_run outcome
+# ---------------------------------------------------------------------------
+
+
+class TestCalibrationCrashOutcome:
+    """A non-staging (calibration) action's crash records BOTH a
+    ``calibration_crash``/``vram_exhausted`` incident (as before) AND sets
+    ``_state["calibration_run"]["outcome"] = "crashed"`` — otherwise the
+    record :func:`_submit_calibration_run` published at dispatch keeps
+    ``outcome: None`` forever, since the run's own normal-completion
+    terminal (:func:`_run_calibration_sync`'s) never runs on a crash."""
+
+    def _spec(self, *, run_id: str, route_path: str = "/calibrate/extract"):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(run_id=run_id, route_path=route_path)
+
+    def test_generic_crash_sets_outcome_crashed(self, state, monkeypatch):
+        from paramem.server.app import _consolidation_run_done
+        from paramem.server.consolidation_action import ConsolidationAction
+
+        spec = self._spec(run_id="run-1")
+        state["calibration_run"] = {
+            "run_id": "run-1",
+            "action": "calibrate",
+            "route": spec.route_path,
+            "artifact_dir": "/tmp/calib/run-1",
+            "started_at": "2026-04-22T08:00:00+00:00",
+            "outcome": None,
+            "finished_at": None,
+        }
+
+        class _FakeFuture:
+            def exception(self):
+                return RuntimeError("boom")
+
+        monkeypatch.setattr(app_module, "_set_voice_pipeline_profile", lambda *a, **kw: None)
+        monkeypatch.setattr(app_module, "_target_profile", lambda: "cpu")
+
+        _consolidation_run_done(ConsolidationAction.CALIBRATE, spec, _FakeFuture())
+
+        incidents = read_incidents(_state_dir(state))
+        crashes = [i for i in incidents if i.type == "calibration_crash"]
+        assert len(crashes) == 1
+        assert crashes[0].detail["route_path"] == spec.route_path
+        assert crashes[0].detail["run_id"] == "run-1"
+
+        record = state["calibration_run"]
+        assert record["outcome"] == "crashed"
+        assert record["finished_at"] is not None
+
+    def test_vram_exhausted_crash_on_calibrate_also_sets_outcome_crashed(self, state, monkeypatch):
+        """A VramExhausted crash records the vram_exhausted incident (not
+        calibration_crash — the two are mutually exclusive by exception
+        type) but still sets the outcome, since that bookkeeping is gated
+        purely on "non-staging action with a spec", independent of which
+        incident branch fired."""
+        from paramem.server.app import _consolidation_run_done
+        from paramem.server.consolidation_action import ConsolidationAction
+        from paramem.utils.vram_guard import VramExhausted
+
+        spec = self._spec(run_id="run-2")
+        state["calibration_run"] = {
+            "run_id": "run-2",
+            "action": "calibrate",
+            "route": spec.route_path,
+            "artifact_dir": "/tmp/calib/run-2",
+            "started_at": "2026-04-22T08:00:00+00:00",
+            "outcome": None,
+            "finished_at": None,
+        }
+
+        class _FakeFuture:
+            def exception(self):
+                return VramExhausted("dispatch")
+
+        monkeypatch.setattr(app_module, "_set_voice_pipeline_profile", lambda *a, **kw: None)
+        monkeypatch.setattr(app_module, "_target_profile", lambda: "cpu")
+
+        _consolidation_run_done(ConsolidationAction.CALIBRATE, spec, _FakeFuture())
+
+        incidents = read_incidents(_state_dir(state))
+        assert [i.type for i in incidents] == ["vram_exhausted"]
+
+        record = state["calibration_run"]
+        assert record["outcome"] == "crashed"
+        assert record["finished_at"] is not None
+
+    def test_stale_run_id_does_not_clobber_a_newer_run(self, state, monkeypatch):
+        """A crash callback for an OLD run must not overwrite the record if
+        a NEWER run has already started and published its own record —
+        matched by run_id, exactly like the normal-completion terminal in
+        _run_calibration_sync."""
+        from paramem.server.app import _consolidation_run_done
+        from paramem.server.consolidation_action import ConsolidationAction
+
+        spec = self._spec(run_id="stale-run")
+        state["calibration_run"] = {
+            "run_id": "newer-run",
+            "action": "calibrate",
+            "route": spec.route_path,
+            "artifact_dir": "/tmp/calib/newer-run",
+            "started_at": "2026-04-22T08:05:00+00:00",
+            "outcome": None,
+            "finished_at": None,
+        }
+
+        class _FakeFuture:
+            def exception(self):
+                return RuntimeError("boom")
+
+        monkeypatch.setattr(app_module, "_set_voice_pipeline_profile", lambda *a, **kw: None)
+        monkeypatch.setattr(app_module, "_target_profile", lambda: "cpu")
+
+        _consolidation_run_done(ConsolidationAction.CALIBRATE, spec, _FakeFuture())
+
+        record = state["calibration_run"]
+        assert record["run_id"] == "newer-run"
+        assert record["outcome"] is None
+
+    def test_staging_action_crash_leaves_calibration_run_untouched(self, state, monkeypatch):
+        """A staging action's crash (spec is None) keeps the pre-existing
+        logged-only behaviour — no calibration_run bookkeeping at all."""
+        from paramem.server.app import _consolidation_run_done
+        from paramem.server.consolidation_action import ConsolidationAction
+
+        state["calibration_run"] = None
+
+        class _FakeFuture:
+            def exception(self):
+                return RuntimeError("boom")
+
+        monkeypatch.setattr(app_module, "_set_voice_pipeline_profile", lambda *a, **kw: None)
+        monkeypatch.setattr(app_module, "_target_profile", lambda: "cpu")
+
+        _consolidation_run_done(ConsolidationAction.INTERIM, None, _FakeFuture())
+
+        assert state["calibration_run"] is None

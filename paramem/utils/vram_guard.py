@@ -302,9 +302,16 @@ def check_vram_headroom(
 
     Action on low headroom:
       - Log a WARNING with the label, current free, and the configured floor.
-      - When ``state`` is provided, populate ``state["vram_low_headroom_warning"]``
-        for :func:`paramem.server.attention._collect_vram_low_headroom_items`
-        to surface in ``/status.attention``.
+      - When ``state`` is provided, populate ``state["vram_low_headroom_warning"]``.
+
+    *state* is the CALLER's own sink, not necessarily the live server
+    ``_state`` — the extraction stage passes its own per-run dict so a
+    non-staging (calibration) run never mutates production attention state;
+    a staging caller copies that dict into ``_state["vram_low_headroom_warning"]``
+    itself, once its own extraction pre-stage returns, for
+    :func:`paramem.server.attention._collect_vram_low_headroom_items` to
+    surface in ``/status.attention``.  Any ``MutableMapping[str, object]``
+    works — this function writes one key and reads nothing else off it.
 
     Phases proceed regardless. Experiments showed that running below the
     KV-cache buffer reliably OOMs, but the cleanup is :func:`vram_scope`'s

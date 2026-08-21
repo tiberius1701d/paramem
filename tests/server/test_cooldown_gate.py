@@ -17,12 +17,44 @@ All tests run CPU-only — no model loading or GPU required.
 
 from __future__ import annotations
 
+import ast
 import inspect
+import textwrap
 from unittest.mock import patch
 
 import pytest
 
 import paramem.server.app as app_module
+
+
+def _first_call_linenos(func, *call_names: str) -> dict[str, int]:
+    """Line number of the first call to each name in ``call_names``, found by
+    walking ``func``'s AST body — never its docstring or any other prose.
+
+    A raw ``source.find(...)`` string search is fooled the moment a
+    docstring happens to quote the same call the assertion is checking for
+    (an ordering assertion pinned by :class:`TestFoldWorkerCooldownOrder`
+    was broken exactly this way once a docstring started narrating
+    ``body(loop, bt)``). Walking the parsed AST, with the docstring
+    statement excluded, is immune to what the prose says.
+    """
+    source = textwrap.dedent(inspect.getsource(func))
+    tree = ast.parse(source)
+    func_def = tree.body[0]
+    assert isinstance(func_def, (ast.FunctionDef, ast.AsyncFunctionDef))
+    body = func_def.body
+    if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
+        body = body[1:]  # drop the docstring statement
+    found: dict[str, int] = {}
+    for node in ast.walk(ast.Module(body=body, type_ignores=[])):
+        if not isinstance(node, ast.Call):
+            continue
+        func_node = node.func
+        name = func_node.id if isinstance(func_node, ast.Name) else None
+        if name in call_names and name not in found:
+            found[name] = node.lineno
+    return found
+
 
 # ---------------------------------------------------------------------------
 # wait_for_cooldown helper
@@ -158,13 +190,16 @@ class TestFoldWorkerCooldownOrder:
     """
 
     def test_stage_b_cycle_has_cooldown_before_body_dispatch(self):
-        """_run_stage_b_cycle: wait_for_cooldown appears before body(loop, bt)."""
-        source = inspect.getsource(app_module._run_stage_b_cycle)
-        cooldown_pos = source.find("wait_for_cooldown")
-        body_pos = source.find("body(loop, bt)")
-        assert cooldown_pos != -1, "wait_for_cooldown not found in _run_stage_b_cycle source"
-        assert body_pos != -1, "body(loop, bt) dispatch not found in _run_stage_b_cycle source"
-        assert cooldown_pos < body_pos, (
+        """_run_stage_b_cycle: wait_for_cooldown appears before body(loop, bt).
+
+        AST-based (see ``_first_call_linenos``): a raw string search over
+        the whole source is fooled by the docstring's own narration of
+        ``body(loop, bt)``, which now precedes the real call textually.
+        """
+        linenos = _first_call_linenos(app_module._run_stage_b_cycle, "wait_for_cooldown", "body")
+        assert "wait_for_cooldown" in linenos, "wait_for_cooldown not called in _run_stage_b_cycle"
+        assert "body" in linenos, "body(loop, bt) dispatch not called in _run_stage_b_cycle"
+        assert linenos["wait_for_cooldown"] < linenos["body"], (
             "wait_for_cooldown must appear before the body(loop, bt) dispatch in "
             "_run_stage_b_cycle; check that the gate is at the top of the worker body"
         )

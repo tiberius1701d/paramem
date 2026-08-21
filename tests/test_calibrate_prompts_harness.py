@@ -206,15 +206,30 @@ class TestLoadChunksTurnMarking:
 class TestPostStageAuth:
     """_post_stage must attach an Authorization header and handle 401 gracefully."""
 
-    def test_bearer_header_attached_when_token_present(self):
-        """_post_stage sends Authorization: Bearer <token> when resolve_token returns a token."""
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-        mock_response.json.return_value = {"ok": True}
+    def test_bearer_header_attached_when_token_present(self, tmp_path: Path):
+        """_post_stage sends Authorization: Bearer <token> when resolve_token
+        returns a token, submits, polls /status, and reads
+        <artifact_dir>/response.json — the non-blocking submit-poll-read
+        contract."""
+        artifact_dir = tmp_path / "run1"
+        artifact_dir.mkdir()
+        (artifact_dir / "response.json").write_text(json.dumps({"ok": True}))
+
+        mock_post_response = MagicMock()
+        mock_post_response.status_code = 200
+        mock_post_response.json.return_value = {
+            "status": "started_calibration",
+            "action": "calibrate",
+            "run_id": "20260101T000000Z",
+            "artifact_dir": str(artifact_dir),
+        }
+        mock_get_response = MagicMock()
+        mock_get_response.json.return_value = {"consolidating": False}
 
         with (
             patch.object(calibrate_prompts, "resolve_token", return_value="test-secret-token"),
-            patch("calibrate_prompts.requests.post", return_value=mock_response) as mock_post,
+            patch("calibrate_prompts.requests.post", return_value=mock_post_response) as mock_post,
+            patch("calibrate_prompts.requests.get", return_value=mock_get_response),
         ):
             result = calibrate_prompts._post_stage(
                 "http://localhost:8420", "normalize", {"snapshot_path": "/tmp/snap.json"}
@@ -248,6 +263,82 @@ class TestPostStageAuth:
         assert "PARAMEM_API_TOKEN" in message, (
             f"Expected 'PARAMEM_API_TOKEN' in SystemExit message, got: {message!r}"
         )
+
+    def test_missing_response_reports_recorded_crash_not_a_bare_never_written(self, tmp_path: Path):
+        """When the run's terminal (_consolidation_run_done) crashed before
+        writing response.json, /status's own calibration_run record (read
+        off the SAME poll that observed consolidating: false) names the
+        crash — the SystemExit message reports it rather than a bare
+        'response.json was never written' with no further detail."""
+        artifact_dir = tmp_path / "run-crashed"
+        artifact_dir.mkdir()
+        # response.json deliberately absent — the run crashed.
+
+        mock_post_response = MagicMock()
+        mock_post_response.status_code = 200
+        mock_post_response.json.return_value = {
+            "status": "started_calibration",
+            "action": "calibrate",
+            "run_id": "run-crashed",
+            "artifact_dir": str(artifact_dir),
+        }
+        mock_get_response = MagicMock()
+        mock_get_response.json.return_value = {
+            "consolidating": False,
+            "calibration_run": {
+                "run_id": "run-crashed",
+                "outcome": "crashed",
+                "finished_at": "2026-04-22T08:10:00+00:00",
+            },
+        }
+
+        with (
+            patch.object(calibrate_prompts, "resolve_token", return_value=None),
+            patch("calibrate_prompts.requests.post", return_value=mock_post_response),
+            patch("calibrate_prompts.requests.get", return_value=mock_get_response),
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                calibrate_prompts._post_stage(
+                    "http://localhost:8420", "normalize", {"snapshot_path": "/tmp/snap.json"}
+                )
+
+        message = str(exc_info.value)
+        assert "crashed" in message.lower(), f"Expected 'crashed' in message, got: {message!r}"
+        assert "run-crashed" in message
+        assert "never written" not in message.lower(), (
+            f"Expected the recorded-crash message, not the bare fallback; got: {message!r}"
+        )
+
+    def test_missing_response_falls_back_to_never_written_when_no_crash_recorded(
+        self, tmp_path: Path
+    ):
+        """Without a matching calibration_run outcome — the pre-existing
+        defensive fallback for an unexplained missing response.json."""
+        artifact_dir = tmp_path / "run-mystery"
+        artifact_dir.mkdir()
+
+        mock_post_response = MagicMock()
+        mock_post_response.status_code = 200
+        mock_post_response.json.return_value = {
+            "status": "started_calibration",
+            "action": "calibrate",
+            "run_id": "run-mystery",
+            "artifact_dir": str(artifact_dir),
+        }
+        mock_get_response = MagicMock()
+        mock_get_response.json.return_value = {"consolidating": False, "calibration_run": None}
+
+        with (
+            patch.object(calibrate_prompts, "resolve_token", return_value=None),
+            patch("calibrate_prompts.requests.post", return_value=mock_post_response),
+            patch("calibrate_prompts.requests.get", return_value=mock_get_response),
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                calibrate_prompts._post_stage(
+                    "http://localhost:8420", "normalize", {"snapshot_path": "/tmp/snap.json"}
+                )
+
+        assert "never written" in str(exc_info.value).lower()
 
 
 class TestAnonymizeStageSpeakerName:
@@ -366,9 +457,7 @@ class TestSeedFromEnrichLoading:
             # run to; the run itself lives there, in one copy.
             artifact_dir = tmp_path / "artifacts" / "extract_1"
             artifact_dir.mkdir(parents=True)
-            (artifact_dir / "calibration_extract_1.json").write_text(
-                json.dumps(self._recorded_run())
-            )
+            (artifact_dir / "response.json").write_text(json.dumps(self._recorded_run()))
             (seed_from / "runs.json").write_text(json.dumps({"extract": {"0": str(artifact_dir)}}))
 
         dump_dir = tmp_path / "dump"
@@ -750,3 +839,246 @@ class TestReplyOverlap:
         assert result["baseline_length"] == len("short")
         assert result["candidate_length"] == len("a somewhat longer reply here")
         assert result["length_delta"] == len("a somewhat longer reply here") - len("short")
+
+
+class TestPostStageBackoffAndTerminalStatuses:
+    """``_post_stage``'s three non-``started_calibration`` branches: a
+    ``deferred_*`` status retries with backoff and eventually raises
+    ``SystemExit`` past the ceiling; a ``noop_*`` status is reported and
+    returned without raising; ``started_migration`` is treated as a
+    retryable busy answer like a deferral.  (The happy path and the two
+    missing-response variants are already covered by ``TestPostStageAuth``
+    above.)"""
+
+    def test_deferred_status_retries_then_completes_on_started_calibration(
+        self, tmp_path: Path
+    ) -> None:
+        artifact_dir = tmp_path / "run1"
+        artifact_dir.mkdir()
+        (artifact_dir / "response.json").write_text(json.dumps({"ok": True}))
+
+        deferred_response = MagicMock()
+        deferred_response.status_code = 200
+        deferred_response.json.return_value = {"status": "deferred_idle", "action": "calibrate"}
+
+        started_response = MagicMock()
+        started_response.status_code = 200
+        started_response.json.return_value = {
+            "status": "started_calibration",
+            "action": "calibrate",
+            "run_id": "run1",
+            "artifact_dir": str(artifact_dir),
+        }
+
+        mock_get_response = MagicMock()
+        mock_get_response.json.return_value = {"consolidating": False}
+
+        with (
+            patch.object(calibrate_prompts, "resolve_token", return_value=None),
+            patch(
+                "calibrate_prompts.requests.post",
+                side_effect=[deferred_response, started_response],
+            ) as mock_post,
+            patch("calibrate_prompts.requests.get", return_value=mock_get_response),
+            patch("calibrate_prompts.time.sleep") as mock_sleep,
+        ):
+            result = calibrate_prompts._post_stage(
+                "http://localhost:8420",
+                "normalize",
+                {"snapshot_path": "/tmp/snap.json"},
+                poll_interval=0.01,
+            )
+
+        assert result == {"ok": True}
+        assert mock_post.call_count == 2, "a deferred answer must be retried, not raised"
+        mock_sleep.assert_called()
+
+    def test_deferred_past_the_backoff_ceiling_raises_systemexit(self, tmp_path: Path) -> None:
+        deferred_response = MagicMock()
+        deferred_response.status_code = 200
+        deferred_response.json.return_value = {
+            "status": "deferred_already_running",
+            "action": "calibrate",
+        }
+
+        with (
+            patch.object(calibrate_prompts, "resolve_token", return_value=None),
+            patch("calibrate_prompts.requests.post", return_value=deferred_response),
+            patch("calibrate_prompts.time.sleep"),
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                calibrate_prompts._post_stage(
+                    "http://localhost:8420",
+                    "normalize",
+                    {"snapshot_path": "/tmp/snap.json"},
+                    poll_interval=0.01,
+                    backoff_ceiling_s=0.0,
+                )
+        assert "deferred_already_running" in str(exc_info.value)
+
+    def test_noop_status_is_reported_and_returned_without_raising(self) -> None:
+        noop_response = MagicMock()
+        noop_response.status_code = 200
+        noop_response.json.return_value = {
+            "status": "noop_no_pending",
+            "action": "calibrate_pending",
+        }
+
+        with (
+            patch.object(calibrate_prompts, "resolve_token", return_value=None),
+            patch("calibrate_prompts.requests.post", return_value=noop_response),
+        ):
+            result = calibrate_prompts._post_stage("http://localhost:8420", "extract_pending", {})
+
+        assert result["status"] == "noop_no_pending"
+        assert result["stage"] == "extract_pending"
+
+    def test_started_migration_is_treated_as_a_retryable_busy_answer(self, tmp_path: Path) -> None:
+        artifact_dir = tmp_path / "run2"
+        artifact_dir.mkdir()
+        (artifact_dir / "response.json").write_text(json.dumps({"ok": True}))
+
+        migration_response = MagicMock()
+        migration_response.status_code = 200
+        migration_response.json.return_value = {
+            "status": "started_migration",
+            "action": "calibrate",
+        }
+        started_response = MagicMock()
+        started_response.status_code = 200
+        started_response.json.return_value = {
+            "status": "started_calibration",
+            "action": "calibrate",
+            "run_id": "run2",
+            "artifact_dir": str(artifact_dir),
+        }
+        mock_get_response = MagicMock()
+        mock_get_response.json.return_value = {"consolidating": False}
+
+        with (
+            patch.object(calibrate_prompts, "resolve_token", return_value=None),
+            patch(
+                "calibrate_prompts.requests.post",
+                side_effect=[migration_response, started_response],
+            ) as mock_post,
+            patch("calibrate_prompts.requests.get", return_value=mock_get_response),
+            patch("calibrate_prompts.time.sleep"),
+        ):
+            result = calibrate_prompts._post_stage(
+                "http://localhost:8420",
+                "normalize",
+                {"snapshot_path": "/tmp/snap.json"},
+                poll_interval=0.01,
+            )
+
+        assert result == {"ok": True}
+        assert mock_post.call_count == 2, (
+            "started_migration must retry (someone else's run was submitted, not this one)"
+        )
+
+
+class TestLoadRunAndSeedFromReadResponseJson:
+    """``_load_run`` reads the run's response back through the CLIENT's own
+    index (``runs.json``) pointing at the SERVER-written ``response.json`` —
+    never a client-recorded copy."""
+
+    def test_load_run_reads_response_json_via_the_index(self, tmp_path: Path) -> None:
+        run_dir = tmp_path / "calibrate" / "extract" / "20260101T000000Z"
+        run_dir.mkdir(parents=True)
+        payload = {"stage": "extract", "parsed": {"relations": []}}
+        (run_dir / "response.json").write_text(json.dumps(payload))
+
+        index_dir = tmp_path / "campaigns" / "20260101T000000Z"
+        index_dir.mkdir(parents=True)
+        (index_dir / "runs.json").write_text(json.dumps({"extract": {"0": str(run_dir)}}))
+
+        result = calibrate_prompts._load_run(index_dir, 0)
+
+        assert result == payload
+
+    def test_load_run_returns_none_when_index_has_no_entry_for_the_chunk(
+        self, tmp_path: Path
+    ) -> None:
+        index_dir = tmp_path / "campaigns" / "20260101T000000Z"
+        index_dir.mkdir(parents=True)
+        (index_dir / "runs.json").write_text(json.dumps({"extract": {}}))
+
+        assert calibrate_prompts._load_run(index_dir, 0) is None
+
+    def test_load_run_returns_none_when_the_recorded_artifact_is_gone(self, tmp_path: Path) -> None:
+        index_dir = tmp_path / "campaigns" / "20260101T000000Z"
+        index_dir.mkdir(parents=True)
+        missing_dir = tmp_path / "calibrate" / "extract" / "does-not-exist"
+        (index_dir / "runs.json").write_text(json.dumps({"extract": {"0": str(missing_dir)}}))
+
+        assert calibrate_prompts._load_run(index_dir, 0) is None
+
+
+class TestCampaignDumpDirectoryLayout:
+    """The campaign dump directory is ``campaigns/<stamp>/`` and the client's
+    own run index records the artifact_dir the SERVER reported, never a
+    client-reconstructed path.
+
+    ``TestNormalizeStageNoNameError.test_normalize_records_the_run_in_the_index``
+    already drives ``main()`` end to end with an explicit ``--dump-dir`` and
+    asserts the index records the server-reported ``artifact_dir`` -- this
+    class covers the one thing that test does not: the DEFAULT dump-dir
+    derivation when ``--dump-dir`` is omitted.
+    """
+
+    def test_default_dump_dir_lands_under_campaigns_slash_stamp_and_records_the_index(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Redirect the module's repo-root constant so the default dump-dir
+        # derivation lands under tmp_path rather than the real project tree.
+        monkeypatch.setattr(calibrate_prompts, "_REPO_ROOT", tmp_path)
+
+        snapshot = tmp_path / "graph_merged_snapshot.json"
+        snapshot.write_text(
+            json.dumps(
+                {
+                    "directed": False,
+                    "multigraph": False,
+                    "graph": {},
+                    "nodes": [
+                        {
+                            "id": "alice",
+                            "attributes": {"name": "Alice"},
+                            "speaker_id": "speaker0",
+                        }
+                    ],
+                    "links": [],
+                }
+            )
+        )
+        real_prompts_dir = Path(__file__).resolve().parents[1] / "configs" / "prompts"
+        canned_response = {
+            **_CANNED_NORMALIZE_RESPONSE,
+            "artifact_dir": "/srv/calibrate/normalize/20260101T000000Z",
+        }
+
+        argv = [
+            "--stages",
+            "normalize",
+            "--snapshot",
+            str(snapshot),
+            "--server",
+            "http://localhost:8420",
+            "--prompts-dir",
+            str(real_prompts_dir),
+            "--baseline",
+            "none",
+        ]
+
+        with patch.object(calibrate_prompts, "_post_stage", return_value=canned_response):
+            rc = calibrate_prompts.main(argv)
+
+        assert rc == 0, f"expected rc=0, got {rc}"
+
+        campaigns_root = tmp_path / "data" / "ha" / "calibration" / "artifacts" / "campaigns"
+        stamp_dirs = list(campaigns_root.iterdir())
+        assert len(stamp_dirs) == 1, f"expected exactly one campaign stamp dir; found {stamp_dirs}"
+        dump_dir = stamp_dirs[0]
+
+        index = json.loads((dump_dir / "runs.json").read_text())
+        assert index["normalize"] == {"None": canned_response["artifact_dir"]}

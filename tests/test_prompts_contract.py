@@ -115,13 +115,15 @@ class TestLoadPromptPhaseTraceRecording:
     own return value into the top-level ``prompts`` field reported by
     several calibrate handlers — so it reported a DIFFERENT prompt than
     production loaded whenever a per-model override existed.  Every
-    calibrate handler has since been hooked into the ``_run_calibration``
-    primitive, which reads prompt provenance from the phase trace
-    ``_load_prompt`` itself populates (see
+    calibrate stage has since been hooked into the shared
+    :func:`~paramem.server.calibrate.run_stage` assembler (called by
+    :func:`~paramem.server.app._run_calibration_sync` for a real dispatch),
+    which reads prompt provenance from the phase trace ``_load_prompt``
+    itself populates (see
     :func:`paramem.server.calibrate._provenance_from_records`), and
     ``_read_prompt`` has been removed.  This test class continues to pin
     that ``_load_prompt``'s OWN chokepoint records truthfully — the
-    property every calibrate handler now depends on directly."""
+    property every calibrate stage now depends on directly."""
 
     def test_silent_fallback_to_shipped_default_is_visible_in_record(self, tmp_path):
         """The file is ABSENT from the operator-supplied ``prompts_dir``, so

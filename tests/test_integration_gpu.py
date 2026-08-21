@@ -369,26 +369,30 @@ class TestTrainingSchedulerBehavior:
         yield
         _state["consolidating"] = saved if saved is not None else False
 
-    def test_scheduled_extract_done_callback_on_exception(self):
-        """_scheduled_extract_done_callback clears the flag if extraction failed."""
-        from paramem.server.app import _scheduled_extract_done_callback, _state
+    # test_scheduled_extract_done_callback_on_exception (generic exception on
+    # a staging action clears _state["consolidating"]) is deleted rather than
+    # retargeted: it is superseded by
+    # tests/test_vram_guard.py::TestDoneCallbackErrorSurfacing::
+    # test_generic_exception_does_not_populate_state, which drives the same
+    # assertion against the current _consolidation_run_done(action, spec,
+    # future) signature.
 
-        future = MagicMock()
-        future.exception.return_value = RuntimeError("extraction failed")
-
-        _state["consolidating"] = True
-        _scheduled_extract_done_callback(future)
-        assert _state["consolidating"] is False
-
-    def test_scheduled_extract_done_callback_on_success(self):
-        """On success, flag stays True — BG trainer will clear it on completion."""
-        from paramem.server.app import _scheduled_extract_done_callback, _state
+    def test_consolidation_run_done_on_success_leaves_flag_alone(self):
+        """On success (future.exception() is None), _consolidation_run_done
+        is a no-op — it does not touch _state["consolidating"] at all.  The
+        flag stays True; the run's own terminal (dispatched by the entry
+        point on a normal return, not by this done callback) is what clears
+        it.  Not covered by tests/test_vram_guard.py or
+        tests/server/test_incident_wiring.py's crash-path tests, which only
+        ever construct a future carrying an exception."""
+        from paramem.server.app import _consolidation_run_done, _state
+        from paramem.server.consolidation_action import ConsolidationAction
 
         future = MagicMock()
         future.exception.return_value = None
 
         _state["consolidating"] = True
-        _scheduled_extract_done_callback(future)
+        _consolidation_run_done(ConsolidationAction.INTERIM, None, future)
         assert _state["consolidating"] is True
 
 
