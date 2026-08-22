@@ -32,8 +32,11 @@ def probe_keys_grouped_by_adapter(
 
     For each ``(adapter_name, keys)`` group:
 
-    - If the adapter is not present in ``model.peft_config``, emits a WARNING
-      and maps every key in the group to ``None``.
+    - If the adapter has no prior trained weights — absent from
+      ``model.peft_config``, OR resident but cold (created, never trained;
+      residency does not imply readiness) — emits a WARNING and maps every
+      key in the group to ``None``. A cold tier is skipped, not probed:
+      probing it would return parse failures instead of the honest ``None``.
     - Otherwise switches to the adapter once via ``switch_adapter`` and calls
       :func:`paramem.training.recall_eval.probe_entries` for the entire key
       list in a single batched pass.
@@ -65,7 +68,7 @@ def probe_keys_grouped_by_adapter(
         success, or ``None`` / a failure dict on failure).
     """
     from paramem.memory.entry import DEFAULT_CONFIDENCE_THRESHOLD, entry_fact_text
-    from paramem.models.loader import switch_adapter
+    from paramem.models.loader import has_prior_trained_weights, switch_adapter
     from paramem.training.recall_eval import probe_entries
 
     if confidence_threshold is None:
@@ -74,9 +77,9 @@ def probe_keys_grouped_by_adapter(
     results: dict[str, dict | None] = {}
 
     for adapter_name, keys in keys_by_adapter.items():
-        if not hasattr(model, "peft_config") or adapter_name not in model.peft_config:
+        if not has_prior_trained_weights(model, adapter_name):
             logger.warning(
-                "Adapter '%s' not loaded — skipping %d key(s): %s",
+                "Adapter '%s' not loaded or carries no trained weights — skipping %d key(s): %s",
                 adapter_name,
                 len(keys),
                 keys,

@@ -488,7 +488,7 @@ class TestAbortTimeout:
 
 
 class TestStaleInTrainingCleanup:
-    """ensure_adapters must remove stale in_training checkpoints on startup."""
+    """_clean_stale_staging_dir must remove stale in_training checkpoints on startup."""
 
     def test_stale_in_training_dir_removed(self, tmp_path):
         from paramem.training.consolidation import ConsolidationLoop
@@ -504,8 +504,9 @@ class TestStaleInTrainingCleanup:
         (stale / "leftover.bin").write_bytes(b"stale garbage")
 
         # Build a loop with pre-wrapped mock model that has peft_config.
-        # __class__ = PeftModel so ensure_adapters' isinstance check
-        # short-circuits without restricting the mock's attribute surface.
+        # __class__ = PeftModel so the isinstance(model, PeftModel) checks
+        # inside ConsolidationLoop.__init__ short-circuit without
+        # restricting the mock's attribute surface.
         model = MagicMock()
         model.__class__ = PeftModel
         model.peft_config = {
@@ -513,14 +514,12 @@ class TestStaleInTrainingCleanup:
             "semantic": MagicMock(),
             "in_training": MagicMock(),
         }
-        # Bypass ensure_adapters model re-wrapping — we just need to trigger cleanup
         loop = ConsolidationLoop(
             model=model,
             tokenizer=MagicMock(),
             consolidation_config=ConsolidationConfig(),
             training_config=TrainingConfig(),
-            episodic_adapter_config=AdapterConfig(),
-            semantic_adapter_config=AdapterConfig(),
+            tier_adapters={"episodic": AdapterConfig(), "semantic": AdapterConfig()},
             memory_store=_MS(),
             output_dir=tmp_path,
             extraction_scrub={"person name"},
@@ -528,7 +527,7 @@ class TestStaleInTrainingCleanup:
             extraction_plausibility_max_tokens=8192,
             extraction_anonymize_token_envelope=8192,
         )
-        # ensure_adapters runs in __init__; the stale dir should be gone
+        # _clean_stale_staging_dir runs in __init__; the stale dir should be gone
         assert not (tmp_path / "in_training").exists(), (
             "Stale in_training directory was not cleaned up"
         )

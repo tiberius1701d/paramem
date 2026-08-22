@@ -32,6 +32,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+from peft import PeftModel
 
 from paramem.graph.prompts import prompt_overrides
 from paramem.memory.store import MemoryStore as _MS
@@ -236,6 +237,22 @@ class TestMaybeEscalateTrimApplication:
         assert result.text == response
 
 
+def _peft_model_mock() -> MagicMock:
+    """``MagicMock(spec=PeftModel)`` -- passes the ``isinstance(model,
+    PeftModel)`` precondition ``base_model_inference`` now enforces
+    wherever a call site here reaches it (``_probe_and_reason``,
+    ``_base_model_answer``, ``_generate_local_reply``).
+    ``gradient_checkpointing_disable``/``_enable`` are dynamic
+    ``__getattr__``-delegated attributes a real (wrapped) PeftModel
+    exposes that ``spec`` cannot see via ``dir(PeftModel)``, so they are
+    pre-set explicitly (mirrors ``tests/server/test_gates.py::
+    _make_mock_model``)."""
+    model = MagicMock(spec=PeftModel)
+    model.gradient_checkpointing_disable = MagicMock()
+    model.gradient_checkpointing_enable = MagicMock()
+    return model
+
+
 class _PlanBuilder:
     """Shared plan/model builders, mirroring
     tests/test_server.py::TestProbeAndReasonDispatch's pattern.
@@ -256,7 +273,7 @@ class _PlanBuilder:
 
     @staticmethod
     def make_model(adapter_names):
-        model = MagicMock()
+        model = _peft_model_mock()
         model.peft_config = {name: MagicMock() for name in adapter_names}
         return model
 
@@ -328,7 +345,7 @@ class TestTokenBudgetPin(_PlanBuilder):
 
         tokenizer = MagicMock()
         tokenizer.apply_chat_template = lambda msgs, **kwargs: "prompt"
-        model = MagicMock()
+        model = _peft_model_mock()
 
         config = ServerConfig()
         config.inference.max_response_tokens = 64
@@ -356,7 +373,7 @@ class TestTokenBudgetPin(_PlanBuilder):
 
         tokenizer = MagicMock()
         tokenizer.apply_chat_template = lambda msgs, **kwargs: "prompt"
-        model = MagicMock()
+        model = _peft_model_mock()
 
         config = ServerConfig()
 
@@ -392,7 +409,7 @@ class TestGenerateLocalReplyTruncationDetection:
             "paramem.server.inference.generate_answer", lambda *a, **kw: "a short answer."
         )
         tokenizer = self._tokenizer_with_ids(10)
-        model = MagicMock()
+        model = _peft_model_mock()
         config = ServerConfig()
         config.inference.max_response_tokens = 64
 
@@ -406,7 +423,7 @@ class TestGenerateLocalReplyTruncationDetection:
             "paramem.server.inference.generate_answer", lambda *a, **kw: "a cut-off reply"
         )
         tokenizer = self._tokenizer_with_ids(64)
-        model = MagicMock()
+        model = _peft_model_mock()
         config = ServerConfig()
         config.inference.max_response_tokens = 64
 
@@ -423,7 +440,7 @@ class TestGenerateLocalReplyTruncationDetection:
             "paramem.server.inference.generate_answer", lambda *a, **kw: "a cut-off reply"
         )
         tokenizer = self._tokenizer_with_ids(64 - _CAP_HIT_TOKEN_TOLERANCE)
-        model = MagicMock()
+        model = _peft_model_mock()
         config = ServerConfig()
         config.inference.max_response_tokens = 64
 
@@ -437,7 +454,7 @@ class TestGenerateLocalReplyTruncationDetection:
             "paramem.server.inference.generate_answer", lambda *a, **kw: "a complete reply."
         )
         tokenizer = self._tokenizer_with_ids(64 - _CAP_HIT_TOKEN_TOLERANCE - 1)
-        model = MagicMock()
+        model = _peft_model_mock()
         config = ServerConfig()
         config.inference.max_response_tokens = 64
 

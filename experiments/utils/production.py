@@ -61,9 +61,10 @@ from paramem.memory.persistence import load_registry, save_registry
 # --- models ---------------------------------------------------------------
 from paramem.models.loader import (
     create_adapter,
-    load_adapter,
+    detach_adapters,
     load_base_model,
     lora_shape_fields,
+    mount_adapter,
     render_chat_prompt,
     save_adapter,
     switch_adapter,
@@ -130,8 +131,9 @@ __all__ = [
     "write_artifact",
     # models
     "create_adapter",
-    "load_adapter",
+    "detach_adapters",
     "load_base_model",
+    "mount_adapter",
     "render_chat_prompt",
     "save_adapter",
     "switch_adapter",

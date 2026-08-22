@@ -5,7 +5,11 @@ Every collaborator here is a CPU-only fake: no GPU, no real PEFT model.
 tokenizer that satisfies the write/publish primitives (``save_pretrained``/
 ``load_adapter``/``named_parameters``/``set_adapter``/``delete_adapter``) for
 real, so ``write_tier_slot``/``publish_tier_registry``/``publish_bundle`` run
-unmocked (I/O only). ``_wire_fakes`` fakes only the two GPU-touching
+unmocked (I/O only). The model itself is ``_make_fake_driver_model``'s
+``MagicMock(spec=PeftModel)`` -- passes every ``isinstance(model, PeftModel)``
+precondition (``create_adapter``/``ensure_adapter_matching``/``tier_backup_scope``)
+while its ``peft_config``/params dicts mutate exactly as a real model's would.
+``_wire_fakes`` fakes only the two GPU-touching
 collaborators every consumer needs faked (training and the recall gate) plus
 ``tier_backup_scope`` (its own backup/restore contract is covered separately
 in ``tests/test_loader.py::TestTierBackupScope``). ``_make_state``/
@@ -14,7 +18,7 @@ blocking helper a synchronous, in-process ``_run_pending_event_resume()``
 call needs. ``_FakeModel``/``_FakeBaseConfig`` are the simpler real-write
 fake used wherever a test needs ``commit_tier_slot``'s real ``save_adapter``
 call to produce a real timestamped slot directory without the full
-mount-loop surface ``_FakeDriverModel`` provides.
+mount-loop surface ``_make_fake_driver_model`` provides.
 ``_recalled_entries_from_store`` builds ``stage_event``'s required
 ``recalled_entries`` argument for a test that drives ``stage_event``
 directly, bypassing production hydration.  ``_SpyEntries`` is a
@@ -40,6 +44,8 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import torch
+import torch.nn as nn
+from peft import PeftModel
 
 from paramem.graph.merger import GraphMerger
 from paramem.graph.schema import Relation
@@ -60,6 +66,13 @@ class _FakeAdapterConfig:
         self.lora_alpha = lora_alpha
         self.lora_dropout = lora_dropout
         self.target_modules = list(target_modules)
+        # create_adapter reads this directly (no getattr default) to decide
+        # whether to patch it from the base model's own config -- every
+        # entry this fixture seeds already carries it, so that patch branch
+        # is simply never taken (mirrors what create_adapter would find on
+        # a real second-and-later peft.LoraConfig entry once base_model_
+        # name_or_path has been set once).
+        self.base_model_name_or_path = "fake/base-model"
 
 
 class _FakeBaseConfig:
@@ -87,36 +100,38 @@ class _FakeTokenizer:
         return 100
 
 
-class _FakeDriverModel:
-    """One fake model exercising every primitive the driver touches across
-    both the write step (``save_pretrained``/``config``) and the publish
-    step's mount loop (``peft_config``/``load_adapter``/``named_parameters``/
-    ``set_adapter``/``delete_adapter``) -- the driver's own ``self.model``
-    is a single object used by both.
-    """
+def _make_fake_driver_model(resident_tiers=()) -> MagicMock:
+    """PEFT-typed double exercising every primitive the driver touches
+    across both the write step (``save_pretrained``/``config``) and the
+    publish step's mount loop (``peft_config``/``load_adapter``/
+    ``named_parameters``/``set_adapter``/``delete_adapter``), plus the
+    loader primitives (``create_adapter``/``ensure_adapter_matching``)
+    that precondition on ``isinstance(model, PeftModel)`` -- the driver's
+    own ``self.model`` is a single object used across all of them.
 
-    _LAYER = "layer0.q_proj"
+    ``MagicMock(spec=PeftModel)`` with every touched method wired to a real
+    ``side_effect`` closure over a shared ``peft_config``/params dict pair,
+    so state mutates exactly as a real model's would -- mirrors
+    ``tests/test_loader.py::_make_fake_backup_model``, the established
+    pattern for a stateful PEFT-typed double in this tree.
+    """
+    layer = "layer0.q_proj"
 
     class _Cfg:
         _name_or_path = "fake/base-model"
         _commit_hash = "deadbeef"
 
-    def __init__(self, resident_tiers=()):
-        self.config = self._Cfg()
-        self.peft_config: dict = {}
-        self._params: dict = {}
-        self.active_adapter = None
-        for tier in resident_tiers:
-            self._seed_adapter(tier)
-        if resident_tiers:
-            self.active_adapter = resident_tiers[0]
+    model = MagicMock(spec=PeftModel)
+    model.config = _Cfg()
+    model.peft_config = {}
+    params: dict = {}
 
-    def _seed_adapter(self, name):
-        self.peft_config[name] = _FakeAdapterConfig()
-        self._params[f"base_model.model.{self._LAYER}.lora_A.{name}.weight"] = _FakeParam()
-        self._params[f"base_model.model.{self._LAYER}.lora_B.{name}.weight"] = _FakeParam()
+    def _seed_adapter(name):
+        model.peft_config[name] = _FakeAdapterConfig()
+        params[f"base_model.model.{layer}.lora_A.{name}.weight"] = _FakeParam()
+        params[f"base_model.model.{layer}.lora_B.{name}.weight"] = _FakeParam()
 
-    def save_pretrained(self, path, selected_adapters=None) -> None:
+    def _save_pretrained(path, selected_adapters=None) -> None:
         """Write adapter-NAME-DEPENDENT stub bytes -- ``save_adapter``'s real
         callers always pass ``selected_adapters=[adapter_name]`` (see
         ``paramem.models.loader.atomic_save_adapter``), so a write test can
@@ -128,28 +143,57 @@ class _FakeDriverModel:
         names = ",".join(selected_adapters or [])
         (p / "adapter_model.safetensors").write_bytes(f"stub-weights:{names}".encode())
 
-    def load_adapter(self, path, adapter_name):
-        self._seed_adapter(adapter_name)
+    def _load_adapter(path, adapter_name):
+        _seed_adapter(adapter_name)
 
-    def named_parameters(self):
-        return list(self._params.items())
+    def _add_adapter(name, lora_config):
+        # create_adapter's cold-birth path (an absent tier, or
+        # ensure_adapter_matching's shape-mismatch recreate) -- seeds
+        # identically to a mounted (load_adapter) tier.
+        _seed_adapter(name)
 
-    def set_adapter(self, name):
-        self.active_adapter = name
+    def _set_adapter(name):
+        model.active_adapter = name
 
-    def delete_adapter(self, name):
-        self.peft_config.pop(name, None)
-        self._params = {k: v for k, v in self._params.items() if f".{name}." not in k}
+    def _delete_adapter(name):
+        model.peft_config.pop(name, None)
+        for key in [k for k in params if f".{name}." in k]:
+            del params[key]
 
-    def eval(self):
-        return self
+    def _named_parameters():
+        return list(params.items())
+
+    def _parameters():
+        return list(params.values())
+
+    model.save_pretrained = MagicMock(side_effect=_save_pretrained)
+    model.load_adapter = MagicMock(side_effect=_load_adapter)
+    model.add_adapter = MagicMock(side_effect=_add_adapter)
+    model.set_adapter = MagicMock(side_effect=_set_adapter)
+    model.delete_adapter = MagicMock(side_effect=_delete_adapter)
+    model.named_parameters = MagicMock(side_effect=_named_parameters)
+    model.parameters = MagicMock(side_effect=_parameters)
+    model.get_base_model = MagicMock(return_value=model)
+    model.eval = MagicMock(return_value=model)
+    # gradient_checkpointing_disable/_enable are dynamic __getattr__-
+    # delegated attributes on a real (wrapped) PeftModel that ``spec``
+    # cannot see via dir(PeftModel) -- pre-set explicitly (mirrors
+    # tests/server/test_gates.py::_make_mock_model).
+    model.gradient_checkpointing_disable = MagicMock()
+    model.gradient_checkpointing_enable = MagicMock()
+
+    for tier in resident_tiers:
+        _seed_adapter(tier)
+    model.active_adapter = resident_tiers[0] if resident_tiers else None
+    model._params = params  # exposed for a caller's own direct assertions
+    return model
 
 
 class _FakeModel:
     """Plain stand-in for a PEFT model whose ``save_pretrained`` performs a
     real (stub-content) filesystem write, so ``commit_tier_slot``'s real
     ``save_adapter`` call produces a real timestamped slot directory. Unlike
-    ``_FakeDriverModel`` it carries no mount-loop surface (``load_adapter``/
+    ``_make_fake_driver_model`` it carries no mount-loop surface (``load_adapter``/
     ``named_parameters``/``set_adapter``/``delete_adapter``) — for consumers
     that never mount a second adapter over this one."""
 
@@ -164,6 +208,41 @@ class _FakeModel:
         (p / "adapter_model.safetensors").write_bytes(b"stub-weights")
 
 
+class _TinyConfig:
+    """Minimal ``.config`` stand-in -- ``PeftModelForCausalLM.forward``
+    unconditionally reads ``self.base_model.config.model_type``, and PEFT's
+    own ``BaseTuner.get_model_config`` dict-ifies it via ``to_dict()``."""
+
+    model_type = "tiny"
+
+    def to_dict(self) -> dict:
+        return {"model_type": self.model_type}
+
+
+class _TinyBase(nn.Module):
+    """Tiny real ``nn.Module`` standing in for the base model -- large
+    enough to carry one target-modules layer (``q_proj``) and a ``.config``
+    with ``model_type``, small enough to run on CPU in milliseconds. Wrapped
+    by the REAL ``peft.get_peft_model``/``create_adapter`` (never mocked),
+    so ``peft_config``/tensor-shape assertions are against real PEFT state.
+    THE one minimal-real-PEFT-wrap fixture in this tree -- a second copy of
+    this class is a duplicate to collapse into this one, not a new local
+    definition."""
+
+    def __init__(self):
+        super().__init__()
+        self.config = _TinyConfig()
+        self.q_proj = nn.Linear(4, 4)
+
+    def forward(self, input_ids=None, **kwargs):
+        return self.q_proj(input_ids)
+
+    def prepare_inputs_for_generation(self, *args, **kwargs):
+        """Never called -- PeftModelForCausalLM.__init__ only reads the
+        bound method off the base model at construction time."""
+        raise NotImplementedError
+
+
 class _FakeProbe:
     """Stand-in for RecallProbe -- verdict content is opaque (_assert_tier_recall
     is faked too and never inspects it), but ``per_key`` must be a real
@@ -176,11 +255,16 @@ class _FakeProbe:
 @contextmanager
 def _fake_tier_backup_scope(model, config, tier):
     """No-op stand-in for tier_backup_scope (patched at its own module):
-    its own backup/restore contract is covered by
-    tests/test_loader.py::TestTierBackupScope; it requires a real
-    peft.PeftModel, which this driver-sequencing suite deliberately does
-    not construct.  ``.vram`` is an empty-but-present mapping -- its
-    real vram_measure population is covered by
+    its own snapshot/restore contract is covered for real by
+    tests/test_loader.py::TestTierBackupScope; this driver-sequencing
+    suite deliberately skips it (a real snapshot-and-restore cycle needs
+    no exercise here beyond that it is entered and exited around
+    training). Carries no ``.model`` attribute, matching the real
+    ``_BackupScope`` shape (``paramem/models/loader.py``) -- the object's
+    identity is fixed at load time, so nothing downstream reads a scope
+    for the model; the caller's own ``model`` reference stays valid
+    throughout. ``.vram`` is an empty-but-present mapping -- its real
+    vram_measure population is covered by
     tests/test_loader.py::TestTierBackupScopeVram; this fake only needs to
     satisfy _train_gate_write's read of the attribute."""
 
@@ -188,7 +272,6 @@ def _fake_tier_backup_scope(model, config, tier):
         pass
 
     scope = _Scope()
-    scope.model = model
     scope.vram = {}
     yield scope
 
@@ -198,7 +281,7 @@ def _make_loop(tmp_path, *, procedural: bool = False, resident_tiers=()) -> Cons
     tokenizer wired for the write/publish primitives this driver calls for
     real."""
     loop = object.__new__(ConsolidationLoop)
-    loop.model = _FakeDriverModel(resident_tiers=resident_tiers)
+    loop.model = _make_fake_driver_model(resident_tiers=resident_tiers)
     loop.tokenizer = _FakeTokenizer()
     loop.config = ConsolidationConfig(promotion_threshold=3, decay_window=10)
     loop.training_config = TrainingConfig(
@@ -212,11 +295,14 @@ def _make_loop(tmp_path, *, procedural: bool = False, resident_tiers=()) -> Cons
     # tests/test_go_live.py) so ensure_adapter_matching's warm no-op path
     # fires instead of a cold get_peft_model() recreate, which needs a
     # real torch.nn.Module the fake model does not provide.
-    loop.episodic_config = AdapterConfig(rank=8, alpha=16, target_modules=["q_proj"])
-    loop.semantic_config = AdapterConfig(rank=8, alpha=16, target_modules=["q_proj"])
-    loop.procedural_config = (
-        AdapterConfig(rank=8, alpha=16, target_modules=["q_proj"]) if procedural else None
-    )
+    loop.tier_adapters = {
+        "episodic": AdapterConfig(rank=8, alpha=16, target_modules=["q_proj"]),
+        "semantic": AdapterConfig(rank=8, alpha=16, target_modules=["q_proj"]),
+    }
+    if procedural:
+        loop.tier_adapters["procedural"] = AdapterConfig(
+            rank=8, alpha=16, target_modules=["q_proj"]
+        )
     loop.wandb_config = None
     loop._thermal_policy = None
     loop.output_dir = tmp_path / "adapters"

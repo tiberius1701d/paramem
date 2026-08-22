@@ -47,8 +47,10 @@ def load_test_env() -> None:
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 
+from collections.abc import Mapping  # noqa: E402
+
 from paramem.models.loader import load_base_model  # noqa: E402
-from paramem.utils.config import ModelConfig  # noqa: E402
+from paramem.utils.config import AdapterConfig, ModelConfig  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -152,15 +154,28 @@ def setup_logging():
     )
 
 
-def load_model_and_config(model_config: ModelConfig):
-    """Load the base model for the given ``ModelConfig``.
+def load_model_and_config(model_config: ModelConfig, adapters: Mapping[str, AdapterConfig]):
+    """Load the base model for the given ``ModelConfig``, wrapped with *adapters*.
 
     Callers pass an explicit ``ModelConfig`` (typically
     ``BENCHMARK_MODELS[args.model]``); the harness does not load any
-    YAML on its own. Returns ``(model, tokenizer)``.
+    YAML on its own. The base model's object identity is fixed at load
+    time (:func:`paramem.models.loader.load_base_model`), so the returned
+    model is always the ``PeftModel`` carrying every tier in *adapters* —
+    no unwrap, no rebind, ever, downstream of this call.
+
+    Args:
+        model_config: Base-model load settings.
+        adapters: ``{tier_name: AdapterConfig}`` for the tier(s) this
+            script will mount or train — there is no empty-map or
+            base-only convention (see
+            :func:`paramem.models.loader.load_base_model`).
+
+    Returns:
+        ``(model, tokenizer)`` — ``model`` is the wrapped ``PeftModel``.
     """
     logger.info("Loading base model: %s", model_config.model_id)
-    model, tokenizer = load_base_model(model_config)
+    model, tokenizer = load_base_model(model_config, adapters)
     return model, tokenizer
 
 
@@ -253,6 +268,6 @@ def evaluate_individual_qa(*args, **kwargs):
 def smoke_test_adapter(*args, **kwargs):
     _retired(
         "smoke_test_adapter",
-        "load the slot via paramem.models.loader.load_adapter then call "
+        "mount the slot via paramem.models.loader.mount_adapter then call "
         "paramem.training.recall_eval.evaluate_indexed_recall",
     )

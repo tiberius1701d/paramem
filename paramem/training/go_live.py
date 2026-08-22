@@ -26,8 +26,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Mapping, Sequence
 
 if TYPE_CHECKING:
-    from peft import PeftModel
-
     from paramem.memory.increment import TierIncrement, TierWriteContext
     from paramem.server.router import QueryRouter
     from paramem.training.stage_ledger import StageLedger
@@ -43,7 +41,7 @@ def publish_bundle(
     written_slots: "Mapping[str, Path | None]",
     router: "QueryRouter | None" = None,
     absorbed_interim_tiers: "Sequence[str]" = (),
-) -> "PeftModel":
+) -> None:
     """Take a written bundle live.  Computes nothing new; every input is already built.
 
     Order: publish each member (destination tier first — the caller orders
@@ -119,12 +117,11 @@ def publish_bundle(
             inlined there) and the disk half (``unload_interim_adapters``,
             unfiltered) both key off this same list.
 
-    Returns:
-        The model, possibly reassigned by the mount loop's
-        ``ensure_adapter_matching`` call (an unwrapped-base cold birth) —
-        ``ctx.model`` otherwise, since ``TierWriteContext`` is frozen and
-        cannot carry the reassignment itself.  Callers that built ``ctx.model``
-        from their own live reference must adopt this return value.
+    ``ctx.model`` is mutated in place throughout (the mount loop's
+    ``ensure_adapter_matching`` call included) — nothing is returned. The
+    base model's object identity is fixed at load time, so a caller that
+    built ``ctx.model`` from its own live reference already holds the same
+    object this function mutated.
     """
     from paramem.adapters.manifest import read_manifest
     from paramem.memory.interim_adapter import adapter_slot_root_for_name
@@ -133,7 +130,7 @@ def publish_bundle(
         prune_old_slots,
         publish_tier_registry,
     )
-    from paramem.models.loader import _adapter_slot_for_load, ensure_adapter_matching
+    from paramem.models.loader import ensure_adapter_matching, mount_adapter
     from paramem.training.stage_ledger import (
         build_artifact_list,
         data_state_dir,
@@ -164,11 +161,6 @@ def publish_bundle(
     # the ledger's event-level venue: the bundle already carries the answer
     # at the member level, so a "simulate" member (no weights to mount) is
     # skipped on its own account, never via an event-wide fork. ---
-    # `ctx` is frozen (TierWriteContext takes no live-state reassignment) and
-    # ensure_adapter_matching may reassign the model (an unwrapped-base cold
-    # birth) — track the current model in a local across the loop rather
-    # than writing back onto ctx.
-    model = ctx.model
     for increment in bundle:
         written_slot = written_slots.get(increment.tier)
         if written_slot is None:
@@ -180,12 +172,11 @@ def publish_bundle(
         # resolves each member's config, via the one rule home
         # (_tier_adapter_config), into ctx before calling here.
         tier_config = ctx.tier_configs[increment.tier]
-        assert_staging_absent(model)
-        with staged_weights(model, fallback_adapter=increment.tier):
-            with _adapter_slot_for_load(written_slot) as load_path:
-                model.load_adapter(str(load_path), adapter_name=STAGING_ADAPTER)
-            model = ensure_adapter_matching(model, tier_config, increment.tier)
-            promote_staging_adapter(model, increment.tier)
+        assert_staging_absent(ctx.model)
+        with staged_weights(ctx.model, fallback_adapter=increment.tier):
+            mount_adapter(ctx.model, written_slot, STAGING_ADAPTER)
+            ensure_adapter_matching(ctx.model, tier_config, increment.tier)
+            promote_staging_adapter(ctx.model, increment.tier)
         logger.info("publish_bundle: mounted written slot for tier %s", increment.tier)
 
     # --- 3. ONE adopt_increments (converge the bundle AND drop the
@@ -202,7 +193,7 @@ def publish_bundle(
     if absorbed_interim_tiers:
         from paramem.memory.interim_adapter import unload_interim_adapters
 
-        unload_interim_adapters(model, ctx.output_dir)
+        unload_interim_adapters(ctx.model, ctx.output_dir)
 
     # --- 6. ONE atomic ledger write for the bundle's tier_live entries --
     # deliberately AFTER publish/mount/adopt/reload/reap: this write records
@@ -242,5 +233,3 @@ def publish_bundle(
             continue
         tier_root = adapter_slot_root_for_name(ctx.output_dir, increment.adapter_name)
         prune_old_slots(tier_root, written_slot, keep=ctx.keep_prior_slots)
-
-    return model

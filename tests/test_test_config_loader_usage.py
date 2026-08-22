@@ -24,7 +24,7 @@ If you hit this lint:
         from paramem.models.loader import load_base_model
 
         cfg = load_server_config("tests/fixtures/server.yaml")
-        model, tokenizer = load_base_model(cfg.model_config)
+        model, tokenizer = load_base_model(cfg.model_config, cfg.tier_config_map())
 
   * If your test verifies the example file itself, add it to the allowlist
     below and document why in a comment.

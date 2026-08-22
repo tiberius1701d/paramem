@@ -1052,7 +1052,7 @@ def run_smoke(*, keep_on_success: bool = False) -> bool:
     try:
         # ── Step 1: Load model ────────────────────────────────────────────────
         logger.info("Loading model: %s", config.model_name)
-        model, tokenizer = load_base_model(config.model_config)
+        model, tokenizer = load_base_model(config.model_config, config.tier_config_map())
         logger.info("Model loaded.")
 
         # ── Step 2: Seed cycle (production consolidation) ────────────────────
@@ -1062,13 +1062,13 @@ def run_smoke(*, keep_on_success: bool = False) -> bool:
         logger.info("Seed cycle status: %s", seed_status)
 
         # The seed cycle's ConsolidationLoop (returned as seed_result["loop"]) is a
-        # BASE-MODEL HOLDER: during the cycle loop.model is rebound to the trained
-        # PeftModel wrapping the base (paramem/training/consolidation.py:264), so it
-        # pins ~4 GiB. In production this loop IS _state["consolidation_loop"], which
-        # _release_base_model_in_process nulls during the apply; the smoke's seed loop
-        # is detached from _state and unreachable by the release. Drop it here, or the
-        # apply's in-process model reload OOMs on the 8 GiB GPU (old base ~4 GiB still
-        # held via the loop + new ~3.7 GiB reload).
+        # BASE-MODEL HOLDER: loop.model holds the trained PeftModel wrapping the
+        # base (its object identity is fixed at load time and never reassigned),
+        # so it pins ~4 GiB. In production this loop IS _state["consolidation_loop"],
+        # which _release_base_model_in_process nulls during the apply; the smoke's
+        # seed loop is detached from _state and unreachable by the release. Drop it
+        # here, or the apply's in-process model reload OOMs on the 8 GiB GPU (old
+        # base ~4 GiB still held via the loop + new ~3.7 GiB reload).
         seed_result = None
         gc.collect()
 

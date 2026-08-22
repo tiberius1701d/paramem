@@ -52,7 +52,7 @@ Recipe fidelity
 ----------------
 Loaded via ``load_server_config("tests/fixtures/server.yaml")`` — never
 ``load_config()`` or ``configs/server.yaml.example`` (project rule). The
-fixture's ``episodic_adapter_config`` supplies rank/alpha/lr/target_modules
+fixture's ``tier_config_map()["episodic"]`` supplies rank/alpha/lr/target_modules
 verbatim; its ``training_config`` supplies batch_size=1,
 max_seq_length=1024, warmup_steps=0, lr_scheduler_type="linear",
 weight_decay=0.1, gradient_checkpointing=True, max_grad_norm=1.0 —
@@ -165,10 +165,11 @@ adapter — corrupting it is real data loss. The directory is
 ``shutil.copytree``'d into the run's scratch dir once per run
 (``<run_dir>/donor_scratch/``, reused across seeds and across
 ``--resume``); the donor is loaded ONLY from that copy via
-``paramem.models.loader._adapter_slot_for_load`` (transparently decrypts
-age-encrypted weights into an anonymous memfd — the same mechanism
-``test16_repair_sweep.py`` / ``test18_probe_batching.py`` already use for
-adapter-slot loading; no plaintext weight bytes touch disk). The original
+``paramem.models.loader.mount_adapter`` (its own decrypt scope
+transparently decrypts age-encrypted weights into an anonymous memfd — the
+same mechanism ``test16_repair_sweep.py`` / ``test18_probe_batching.py``
+already use for adapter-slot loading; no plaintext weight bytes touch
+disk). The original
 *ADAPTER_DIR* is never opened for anything but the ``copytree`` read. The
 donor's LoRA-B Frobenius norm is captured immediately before and
 immediately after each seed's ``train_adapter`` call and asserted
@@ -259,7 +260,7 @@ building a donor checkpoint at the PROCEDURAL topology) dispatched by
 ``main()`` before any of the above arm-configuration logic runs; mutually
 exclusive with every other flag except ``--model``/``--resume``. Builds ONE
 donor checkpoint at the PROCEDURAL topology — rank/alpha/target_modules
-from ``tests/fixtures/server.yaml``'s ``procedural_adapter_config`` via
+from ``tests/fixtures/server.yaml``'s ``tier_config_map()["procedural"]`` via
 ``load_server_config`` (never hardcoded) — reusing
 ``_build_donor_checkpoint`` unchanged and
 ``_build_or_reuse_own_donor_checkpoint`` (the resume-aware build-once
@@ -274,9 +275,8 @@ external ``--donor-checkpoint``). This build trains at
 ``--donor-init`` too). Then cold-seeds a FRESH procedural adapter
 from the built checkpoint via the SAME strict ``copy_adapter_weights`` call
 (raises loud on any parameter-set mismatch) the ``--warm-from``/
-``--donor-init`` arms already use, loaded via the SAME
-``_adapter_slot_for_load`` + ``PeftModel.from_pretrained``
-pattern ``_run_seed``'s Step 1b uses. No recall evaluation runs on the
+``--donor-init`` arms already use, loaded via the SAME ``mount_adapter``
+call ``_run_seed``'s Step 1b uses. No recall evaluation runs on the
 seeded adapter and production ``paramem.training.donor.build_donor`` is
 never exercised (this arm measures GPU feasibility/cost only — wall
 time, mean seconds/optimizer step, ``torch.cuda.mem_get_info`` sampled
@@ -288,7 +288,7 @@ at the build/seed phase boundary: a rerun with the build phase's own
 rerun with the seed phase's own ``donor_build_smoke_seed_done.json`` marker
 already present is a no-op. ``--resume`` into an existing run dir fails
 loudly, before either phase runs, if the CURRENT fixture's
-``procedural_adapter_config`` topology disagrees with the run dir's own
+``tier_config_map()["procedural"]`` topology disagrees with the run dir's own
 recorded ``smoke_config.json`` (mirrors ``main()``'s ``run_config.json``
 mismatch guard). See :func:`_run_donor_build_smoke` /
 :func:`_main_donor_build_smoke` for the full mechanism::
@@ -339,9 +339,10 @@ Reuses ``experiments/utils/test_harness.py`` (``BENCHMARK_MODELS``,
 ``save_results``, ``setup_logging``) and
 ``experiments/utils/gpu_guard.py::acquire_gpu``.
 
-Single base-model load; per seed the model is unwrapped
-(``model = model.base_model.model``) before ``create_adapter`` — never
-``delete_adapter`` then ``create_adapter`` (CLAUDE.md). Each seed gets its
+Single base-model load; per seed every resident adapter is detached
+(``detach_adapters(model, list(model.peft_config))``) before
+``create_adapter`` — never unwrapped (the base model's object identity is
+fixed at load time). Each seed gets its
 own adapter name (``episodic_<arm>_seed<N>``) so residual ``lora.Linear``
 modules from prior seeds never collide. ``torch.manual_seed(seed)`` is set
 immediately before ``create_adapter`` — production LoRA init is unseeded
@@ -494,7 +495,6 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 import torch  # noqa: E402
-from peft import PeftModel  # noqa: E402
 from transformers import TrainerCallback  # noqa: E402
 
 from experiments.utils.production import (  # noqa: E402
@@ -517,12 +517,12 @@ from experiments.utils.test_harness import (  # noqa: E402
 )
 from paramem.memory.entry import build_registry, format_entry_training  # noqa: E402
 from paramem.models.loader import (  # noqa: E402
-    _adapter_slot_for_load,
     atomic_save_adapter,
     copy_adapter_weights,
     create_adapter,
+    detach_adapters,
     lora_b_frobenius_norm,
-    switch_adapter,
+    mount_adapter,
     unload_model,
 )
 from paramem.server.config import load_server_config  # noqa: E402
@@ -1027,8 +1027,10 @@ def _build_donor_checkpoint(
     never for the donor.
 
     Args:
-        model: Base model (unwrapped inside if currently a ``PeftModel`` —
-            discards any resident adapter, matching ``_run_seed``'s Step 1).
+        model: The live PeftModel — its object identity is fixed at load
+            time; every resident adapter is detached inside (discarding any
+            resident adapter, matching ``_run_seed``'s Step 1) and the donor
+            adapter is created on the same object in place, never rebound.
         tokenizer: Tokenizer matching the model.
         adapter_config: The target tier's ``AdapterConfig`` (episodic for
             ``--donor-init``; procedural for ``--donor-build-smoke`` — this
@@ -1052,8 +1054,8 @@ def _build_donor_checkpoint(
     Returns:
         Tuple of ``(model, slot_path, donor_summary)``. ``model`` still
         carries ``DONOR_BUILD_ADAPTER_NAME`` as its active adapter — the
-        caller's next step (``_run_seed``'s Step 1) unwraps and discards it,
-        exactly as it already discards any previous seed's adapters.
+        caller's next step (``_run_seed``'s Step 1) detaches and discards
+        it, exactly as it already discards any previous seed's adapters.
         ``donor_summary`` carries the donor's own final recall
         (``exact_count``/``total``/``rate``/``mean_confidence``/``per_key``
         with verbatim ``raw_output``), the realized weights SHA-256 (read
@@ -1093,11 +1095,9 @@ def _build_donor_checkpoint(
         dropout=DONOR_RECIPE_DROPOUT,
     )
 
-    if isinstance(model, PeftModel):
-        model = model.base_model.model
+    detach_adapters(model, list(model.peft_config))
     torch.manual_seed(DONOR_DEFAULT_SEED)
-    model = create_adapter(model, donor_adapter_config, DONOR_BUILD_ADAPTER_NAME)
-    switch_adapter(model, DONOR_BUILD_ADAPTER_NAME)
+    create_adapter(model, donor_adapter_config, DONOR_BUILD_ADAPTER_NAME)
 
     lora_b_norm_before = lora_b_frobenius_norm(model, DONOR_BUILD_ADAPTER_NAME)
     assert lora_b_norm_before == 0.0, (
@@ -1365,9 +1365,10 @@ def _build_or_reuse_own_donor_checkpoint(
 
     Args:
         run_dir: This run's arm-scoped output directory.
-        model: Base model or ``PeftModel`` (forwarded to
-            ``_build_donor_checkpoint`` when a fresh build is needed;
-            returned unchanged when reusing an existing marker).
+        model: The live PeftModel — its object identity is fixed at
+            load time (forwarded to ``_build_donor_checkpoint`` when a
+            fresh build is needed; returned unchanged when reusing an
+            existing marker).
         tokenizer: Tokenizer matching the model.
         adapter_config: The target tier's ``AdapterConfig`` (episodic for
             ``--donor-init``; procedural for ``--donor-build-smoke`` — this
@@ -1439,9 +1440,9 @@ def _resolve_donor_source(
         donor_checkpoint_arg: ``args.donor_checkpoint`` (``None`` unless the
             operator passed ``--donor-checkpoint``).
         run_dir: This run's arm-scoped output directory.
-        model: Base model or ``PeftModel`` (forwarded to
-            ``_build_donor_checkpoint`` when a fresh build is needed;
-            returned unchanged in cases 1/2).
+        model: The live PeftModel — its object identity is fixed at
+            load time (forwarded to ``_build_donor_checkpoint`` when a
+            fresh build is needed; returned unchanged in cases 1/2).
         tokenizer: Tokenizer matching the model.
         adapter_config: Production episodic ``AdapterConfig``.
         base_training_config: Production episodic ``TrainingConfig``.
@@ -1509,7 +1510,7 @@ DONOR_BUILD_SMOKE_CONFIG_FILENAME: str = "smoke_config.json"
 target_modules) — mirrors ``main()``'s ``run_config.json`` mismatch guard
 (see :func:`_main_donor_build_smoke`) for the much smaller, topology-only
 config surface this mode carries. A ``--resume`` invocation whose CURRENT
-``tests/fixtures/server.yaml`` ``procedural_adapter_config`` disagrees with
+``tests/fixtures/server.yaml`` ``tier_config_map()["procedural"]`` disagrees with
 the recorded value fails loud before either phase runs, rather than
 silently seeding a mismatched-topology adapter."""
 
@@ -1553,7 +1554,7 @@ def _run_donor_build_smoke(
        ``_build_donor_checkpoint`` if no donor checkpoint exists yet under
        *run_dir*, otherwise reuses it and verifies its weights SHA-256 — no
        duplicated resume bookkeeping here. Topology (rank/alpha/
-       target_modules) comes from *cfg*'s ``procedural_adapter_config``;
+       target_modules) comes from *cfg*'s ``tier_config_map()["procedural"]``;
        ``_build_donor_checkpoint`` always trains at
        ``DONOR_RECIPE_LEARNING_RATE``/``DONOR_RECIPE_DROPOUT`` (see that
        function's docstring). ``torch.cuda.reset_peak_memory_stats()`` runs
@@ -1565,15 +1566,15 @@ def _run_donor_build_smoke(
        this is what makes "the build phase completed" resumable at the
        phase boundary, independent of whether the helper itself needed to
        retrain (it does not, once its own marker exists).
-    2. **Seed** — unwrap, load the resolved donor slot fresh via
-       ``_adapter_slot_for_load`` + ``PeftModel.from_pretrained`` (the SAME
-       load pattern ``_run_seed``'s Step 1b already uses for
+    2. **Seed** — detach every resident adapter, mount the resolved donor
+       slot fresh via ``mount_adapter`` (the SAME load pattern
+       ``_run_seed``'s Step 1b already uses for
        ``--warm-from``/``--donor-init`` — reused directly against the
        resolved slot with no separate scratch-copy step, since this is a
        checkpoint this run itself owns rather than a live external adapter
        directory whose corruption would be data loss), ``torch.
        manual_seed(DONOR_DEFAULT_SEED)`` before ``create_adapter`` (fresh
-       LoRA-zero, at the SAME ``procedural_adapter_config`` topology), then
+       LoRA-zero, at the SAME ``tier_config_map()["procedural"]`` topology), then
        the SAME strict ``copy_adapter_weights`` call the ``--warm-from``/
        ``--donor-init`` arms use (raises ``RuntimeError`` on any
        parameter-set mismatch — no special casing here). The destination
@@ -1598,11 +1599,12 @@ def _run_donor_build_smoke(
        invocation.
 
     Args:
-        model: The freshly-loaded base model (never a ``PeftModel`` yet at
-            this call site — no prior adapter has been created this run).
+        model: The freshly-loaded PeftModel — wrapped with the cold
+            ``"procedural"`` tier at load time; no other adapter has been
+            created this run yet.
         tokenizer: Tokenizer matching *model*.
         cfg: The loaded ``ServerConfig`` (``tests/fixtures/server.yaml``) —
-            ``cfg.procedural_adapter_config`` / ``cfg.training_config``
+            ``cfg.tier_config_map()["procedural"]`` / ``cfg.training_config``
             supply the topology/recipe (rank/alpha/target_modules from yaml,
             never hardcoded).
         run_dir: This run's arm-scoped output directory
@@ -1615,7 +1617,7 @@ def _run_donor_build_smoke(
             caller immediately after ``load_model_and_config`` returns —
             recorded verbatim in ``build_results.json``.
     """
-    adapter_config = cfg.procedural_adapter_config
+    adapter_config = cfg.tier_config_map()["procedural"]
     base_training_config = dataclasses.replace(cfg.training_config, recall_early_stopping=False)
 
     build_results_path = run_dir / "build_results.json"
@@ -1702,29 +1704,28 @@ def _run_donor_build_smoke(
         logger.info("Cooldown before the seed phase (a fresh donor build just ran)")
         wait_for_cooldown(52, 600, label="before seed phase")
 
-    if isinstance(model, PeftModel):
-        model = model.base_model.model
+    # Detach every resident adapter (including the build-phase's own
+    # DONOR_BUILD_ADAPTER_NAME, if resident from a fresh build above) — the
+    # base model's object identity is fixed at load time, so this mutates
+    # *model* in place rather than rebinding it.
+    detach_adapters(model, list(model.peft_config))
 
     # Donor-immutability tier-name guard runs BEFORE the try block and
-    # BEFORE create_adapter/switch_adapter, matching _run_seed's placement
-    # (Steps 2-3) — a name collision is a programming bug, not a measured
-    # smoke outcome, and must not be swallowed by the except clause below.
+    # BEFORE create_adapter, matching _run_seed's placement (Steps 2-3) — a
+    # name collision is a programming bug, not a measured smoke outcome,
+    # and must not be swallowed by the except clause below.
     assert DONOR_BUILD_SMOKE_SEED_ADAPTER_NAME not in LIVE_TIER_NAMES, (
         f"Donor-immutability guard FAILED: '{DONOR_BUILD_SMOKE_SEED_ADAPTER_NAME}' "
         f"collides with a live tier name {sorted(LIVE_TIER_NAMES)}."
     )
 
     try:
-        with _adapter_slot_for_load(slot) as load_path:
-            model = PeftModel.from_pretrained(
-                model, str(load_path), adapter_name=DONOR_ADAPTER_NAME
-            )
+        mount_adapter(model, slot, DONOR_ADAPTER_NAME)
 
         donor_norm = lora_b_frobenius_norm(model, DONOR_ADAPTER_NAME)
 
         torch.manual_seed(DONOR_DEFAULT_SEED)
-        model = create_adapter(model, adapter_config, DONOR_BUILD_SMOKE_SEED_ADAPTER_NAME)
-        switch_adapter(model, DONOR_BUILD_SMOKE_SEED_ADAPTER_NAME)
+        create_adapter(model, adapter_config, DONOR_BUILD_SMOKE_SEED_ADAPTER_NAME)
 
         norm_before = lora_b_frobenius_norm(model, DONOR_BUILD_SMOKE_SEED_ADAPTER_NAME)
         assert norm_before == 0.0, (
@@ -1794,7 +1795,7 @@ def _main_donor_build_smoke(args: argparse.Namespace) -> None:
     A GPU feasibility/cost measurement for the per-topology donor build:
     builds ONE donor checkpoint at the PROCEDURAL topology
     (rank/alpha/target_modules from ``tests/fixtures/server.yaml``'s
-    ``procedural_adapter_config`` via ``load_server_config`` — never
+    ``tier_config_map()["procedural"]`` via ``load_server_config`` — never
     hardcoded) and cold-seeds a fresh procedural adapter from it, measuring
     wall time, mean seconds/optimizer step, and VRAM (``torch.cuda.
     mem_get_info`` before load / after load / after build / after seed,
@@ -1815,7 +1816,7 @@ def _main_donor_build_smoke(args: argparse.Namespace) -> None:
     resolved procedural topology is compared against the run dir's own
     recorded ``DONOR_BUILD_SMOKE_CONFIG_FILENAME`` (``"smoke_config.json"``,
     written on first invocation) — a mismatch (e.g. the fixture's
-    ``procedural_adapter_config`` changed between the original run and a
+    ``tier_config_map()["procedural"]`` changed between the original run and a
     ``--resume``) fails loud rather than silently seeding a
     mismatched-topology adapter, mirroring ``main()``'s ``run_config.json``
     guard for the arm loop.
@@ -1846,7 +1847,7 @@ def _main_donor_build_smoke(args: argparse.Namespace) -> None:
     arm_base = OUTPUT_BASE / DONOR_BUILD_SMOKE_ARM
     run_dir = _preflight_run_dir(arm_base, args.model, args.resume)
 
-    adapter_config = cfg.procedural_adapter_config
+    adapter_config = cfg.tier_config_map()["procedural"]
     smoke_config = {
         "model": args.model,
         "topology": "procedural",
@@ -1884,7 +1885,7 @@ def _main_donor_build_smoke(args: argparse.Namespace) -> None:
     model_config = BENCHMARK_MODELS[args.model]
     with acquire_gpu(interactive=True):
         vram_before_load_mib = _cuda_mem_get_info_mib()
-        model, tokenizer = load_model_and_config(model_config)
+        model, tokenizer = load_model_and_config(model_config, {"procedural": adapter_config})
         vram_after_load_mib = _cuda_mem_get_info_mib()
         _run_donor_build_smoke(
             model, tokenizer, cfg, run_dir, vram_before_load_mib, vram_after_load_mib
@@ -1931,23 +1932,24 @@ def _run_seed(
     """Run one seed of *arm*: fresh adapter (cold or warm) -> train -> eval -> save.
 
     Steps:
-      1. Unwrap base model if currently wrapped (CLAUDE.md: never
-         ``delete_adapter`` then ``create_adapter``; unwrap instead). This
-         also discards any donor adapter loaded in a prior seed — the
-         donor is reloaded fresh from *donor_scratch_dir* below so every
-         seed sees byte-identical donor weights regardless of what
-         happened in earlier seeds.
-      1b. (Warm arm only, ``donor_scratch_dir is not None``) Load the donor
+      1. Detach every resident adapter (the base model's object identity is
+         fixed at load time — CLAUDE.md: never unwrap; ``detach_adapters``
+         then ``create_adapter`` in place instead). This also discards any
+         donor adapter loaded in a prior seed — the donor is reloaded fresh
+         from *donor_scratch_dir* below so every seed sees byte-identical
+         donor weights regardless of what happened in earlier seeds.
+      1b. (Warm arm only, ``donor_scratch_dir is not None``) Mount the donor
           adapter from *donor_scratch_dir* — NEVER the caller's original
           path — under the reserved name ``DONOR_ADAPTER_NAME``
-          (``"donor"``), via ``_adapter_slot_for_load`` (transparent
-          decrypt) + ``PeftModel.from_pretrained`` (``is_trainable=False``
-          by default — the donor never receives gradients).
+          (``"donor"``), via ``mount_adapter`` (its own decrypt scope;
+          ``is_trainable=False`` by default — the donor never receives
+          gradients).
       2. ``torch.manual_seed(seed)`` immediately before ``create_adapter`` —
          production LoRA init is unseeded (``paramem/models/loader.py:486``).
-      3. ``create_adapter`` -> fresh LoRA-zero trainable adapter;
-         ``switch_adapter``. Donor-immutability guard: the trainable
-         adapter name is asserted to never collide with a live tier name.
+      3. ``create_adapter`` -> fresh LoRA-zero trainable adapter, activated
+         in place (no separate switch). Donor-immutability guard: the
+         trainable adapter name is asserted to never collide with a live
+         tier name.
       3b. (Warm arm only) ``copy_adapter_weights(model, src="donor",
           dst=adapter_name)`` — copies the donor's LoRA weights into the
           trainable adapter BEFORE training.
@@ -1992,7 +1994,9 @@ def _run_seed(
       12. Save per-key + summary + all hard-assertion values to disk.
 
     Args:
-        model: Base model or PeftModel. Unwrapped inside if wrapped.
+        model: The live PeftModel — its object identity is fixed at load
+            time; Step 1 detaches every resident adapter on it in place
+            rather than unwrapping/rebinding it.
         tokenizer: Tokenizer matching the model.
         seed: Seed for LoRA init (``torch.manual_seed``) and the Trainer's
             data order (``TrainingConfig.seed``).
@@ -2000,7 +2004,7 @@ def _run_seed(
             ``--entries-json``; identical across seeds).
         registry: SimHash registry built from *entries*.
         adapter_config: Production episodic ``AdapterConfig``
-            (``cfg.episodic_adapter_config``).
+            (``cfg.tier_config_map()["episodic"]``).
         base_training_config: Production episodic ``TrainingConfig`` with
             ``num_epochs``/``gradient_accumulation_steps``/``lr_decay_steps``
             (from ``budget_for(n_entries)``, overridden by
@@ -2057,32 +2061,29 @@ def _run_seed(
             assumed away.
 
     Returns:
-        Tuple of ``(model, summary_dict)``. ``model`` is the PeftModel
-        after training (caller should unwrap before the next seed).
+        Tuple of ``(model, summary_dict)``. ``model`` is the same PeftModel
+        object after training — the caller's next seed detaches its
+        adapters (Step 1 above) rather than unwrapping.
     """
     seed_dir = run_dir / f"seed{seed}"
     seed_dir.mkdir(parents=True, exist_ok=True)
     is_warm = donor_scratch_dir is not None
 
-    # Step 1: unwrap if wrapped (discards any prior seed's donor + trainable
-    # adapters — the donor is reloaded fresh below for a byte-identical copy).
-    if isinstance(model, PeftModel):
-        model = model.base_model.model
+    # Step 1: detach every resident adapter (discards any prior seed's donor
+    # + trainable adapters — the donor is reloaded fresh below for a
+    # byte-identical copy). The base model's object identity is fixed at
+    # load time, so this mutates *model* in place rather than rebinding it.
+    detach_adapters(model, list(model.peft_config))
 
-    # Step 1b: (warm arm) load the donor fresh from the immutable scratch
-    # copy. Model is guaranteed unwrapped (raw base) here, so this always
-    # takes the PeftModel.from_pretrained branch (is_trainable=False
-    # default — the donor never receives gradients).
+    # Step 1b: (warm arm) mount the donor fresh from the immutable scratch
+    # copy — DONOR_ADAPTER_NAME is not resident after Step 1's detach, so
+    # PEFT reads its shape from the scratch copy's own on-disk config
+    # (is_trainable=False default — the donor never receives gradients).
     if is_warm:
-        with _adapter_slot_for_load(donor_scratch_dir) as load_path:
-            if isinstance(model, PeftModel):
-                model.load_adapter(str(load_path), adapter_name=DONOR_ADAPTER_NAME)
-            else:
-                model = PeftModel.from_pretrained(
-                    model, str(load_path), adapter_name=DONOR_ADAPTER_NAME
-                )
+        mount_adapter(model, donor_scratch_dir, DONOR_ADAPTER_NAME)
 
-    # Step 2+3: seed LoRA init, create fresh cold trainable adapter, switch to it.
+    # Step 2+3: seed LoRA init, create fresh cold trainable adapter (which
+    # activates it — no separate switch).
     adapter_name = f"episodic_{arm}_seed{seed}"
     assert adapter_name not in LIVE_TIER_NAMES, (
         f"Donor-immutability guard FAILED: trainable adapter name '{adapter_name}' "
@@ -2090,8 +2091,7 @@ def _run_seed(
         "risk overwriting a production adapter slot."
     )
     torch.manual_seed(seed)
-    model = create_adapter(model, adapter_config, adapter_name)
-    switch_adapter(model, adapter_name)
+    create_adapter(model, adapter_config, adapter_name)
 
     # Step 3b: (warm arm) copy donor LoRA weights into the trainable adapter
     # BEFORE training — the staging+promote path inside train_adapter then
@@ -2598,7 +2598,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help=(
             "GPU feasibility/cost measurement for the per-topology donor build: build ONE "
             "donor checkpoint at the PROCEDURAL topology "
-            "(tests/fixtures/server.yaml's procedural_adapter_config — rank/alpha/"
+            '(tests/fixtures/server.yaml\'s tier_config_map()["procedural"] — rank/alpha/'
             "target_modules, never hardcoded) at DONOR_RECIPE_LEARNING_RATE/"
             "DONOR_RECIPE_DROPOUT and budget_for(len(donor_entries))'s derived epoch/accum "
             "budget, then cold-seed a fresh procedural adapter from it via the SAME strict "
@@ -2635,7 +2635,7 @@ def _parse_args() -> argparse.Namespace:
 def main() -> None:
     """Entry point for Test 20.
 
-    Loads ``tests/fixtures/server.yaml`` for ``episodic_adapter_config``
+    Loads ``tests/fixtures/server.yaml`` for ``tier_config_map()["episodic"]``
     (rank/alpha/lr/target_modules) and ``training_config``'s fixture-sourced
     fields (batch_size/max_seq_length/warmup/scheduler/weight_decay/
     gradient_checkpointing/max_grad_norm) — this load has no GPU dependency,
@@ -2762,7 +2762,7 @@ def main() -> None:
     # expected-step derivation below, which now uses the fixture's ACTUAL
     # batch_size rather than a hardcoded constant).
     cfg = load_server_config(str(FIXTURE_CONFIG_PATH))
-    adapter_config = cfg.episodic_adapter_config
+    adapter_config = cfg.tier_config_map()["episodic"]
 
     # epochs/accum/lr_decay_steps are DERIVED per-fold via budget_for
     # (paramem.utils.config) — the SAME function production's per-fold
@@ -2860,7 +2860,7 @@ def main() -> None:
         "donor_checkpoint": args.donor_checkpoint,
         "probe_before_training": args.probe_before_training,
         "recipe_source": (
-            "tests/fixtures/server.yaml (episodic_adapter_config; training_config's "
+            'tests/fixtures/server.yaml (tier_config_map()["episodic"]; training_config\'s '
             "batch_size/max_seq_length/warmup_steps/lr_scheduler_type/weight_decay/"
             "gradient_checkpointing/max_grad_norm); num_epochs/gradient_accumulation_steps/"
             "lr_decay_steps derived per paramem.utils.config.budget_for(n_entries), "
@@ -2915,7 +2915,7 @@ def main() -> None:
     model_config = BENCHMARK_MODELS[args.model]
 
     with acquire_gpu(interactive=True):
-        model, tokenizer = load_model_and_config(model_config)
+        model, tokenizer = load_model_and_config(model_config, {"episodic": adapter_config})
 
         # Donor resolution (--warm-from or --donor-init): copy the donor's
         # weights into this run's immutable scratch dir ONCE, and load the

@@ -96,7 +96,7 @@ def _state_enabled() -> dict:
     return {
         "config": config,
         "consolidating": False,
-        "model": MagicMock(),
+        "model": _peft_model_mock(),
         "tokenizer": MagicMock(),
         "memory_store": MagicMock(),
         "consolidation_loop": MagicMock(),
@@ -1336,49 +1336,6 @@ class TestCalibrateName:
         with pytest.raises(HTTPException) as exc:
             _run_name(state, req)
         assert exc.value.status_code == 503
-
-    def test_uses_model_bound_after_loop_ensure(self):
-        """calibrate_name reads state['model']/state['tokenizer'] AFTER
-        get_or_create_consolidation_loop has run, not before — a fresh
-        server's first calibration call rebinds state['model'] = loop.model
-        inside that function (calibrate.py defect fix: the pre-rebind
-        read)."""
-        state = _state_enabled()
-        sentinel_model = object()
-
-        def _swap_and_return(passed_state, *, store=None):
-            passed_state["model"] = sentinel_model
-            return passed_state["consolidation_loop"]
-
-        captured: dict = {}
-
-        def _fake_extract(turns, model, tokenizer, **kwargs):
-            captured["model"] = model
-            return "Alex", "raw output"
-
-        with (
-            # get_or_create_consolidation_loop is imported fresh inside
-            # dispatch_name from its defining module
-            # (paramem.server.consolidation) on every call, so patching it
-            # on paramem.server.calibrate has no effect — the patch target
-            # must be the definition site.
-            patch(
-                "paramem.server.consolidation.get_or_create_consolidation_loop",
-                side_effect=_swap_and_return,
-            ),
-            patch(
-                "paramem.graph.name_extraction.extract_name_via_llm",
-                side_effect=_fake_extract,
-            ),
-        ):
-            req = CalibrateNameRequest(turns=[{"role": "user", "text": "I'm Alex."}])
-            # The stubbed extractor opens no phase record, so
-            # run_stage's declared-step-unreached check reports the gap as
-            # data on the result rather than raising — irrelevant to what
-            # this test pins.
-            _run_name(state, req)
-
-        assert captured["model"] is sentinel_model
 
     def test_missing_prompt_variant_raises_400(self, tmp_path):
         """A named variant absent from the calibration prompt directory is

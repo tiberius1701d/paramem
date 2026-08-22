@@ -49,7 +49,11 @@ def _is_boundary_layer(py_file: Path) -> bool:
         return False
 
 
-# Existing private imports as of 2026-05-28 (9 imports across 4 files).
+# Existing private imports as of 2026-08-21 (3 imports across 2 files;
+# test16_repair_sweep.py / test18_probe_batching.py / test20_smallN_cold_gate.py's
+# _adapter_slot_for_load imports were removed here — those three now mount
+# adapter slots through the public paramem.models.loader.mount_adapter
+# primitive instead).
 # Format: (relative_path_from_repo_root, module, symbol_name).
 # Each entry is a candidate for either (a) promotion to public,
 # (b) rewriting the call site through a public path, or (c) explicit retire.
@@ -67,16 +71,6 @@ _GRANDFATHERED_IMPORTS: frozenset[tuple[str, str, str]] = frozenset(
             "experiments/test11_adapter_extraction.py",
             "paramem.graph.extractor",
             "_parse_extraction",
-        ),
-        # test16_repair_sweep.py / test18_probe_batching.py / test20_smallN_cold_gate.py
-        # — adapter-slot plumbing internals.  Promote to public or wrap via a
-        # load_adapter variant that returns the slot path.
-        ("experiments/test16_repair_sweep.py", "paramem.models.loader", "_adapter_slot_for_load"),
-        ("experiments/test18_probe_batching.py", "paramem.models.loader", "_adapter_slot_for_load"),
-        (
-            "experiments/test20_smallN_cold_gate.py",
-            "paramem.models.loader",
-            "_adapter_slot_for_load",
         ),
         # experiments/utils/early_stop.py — already a thin re-export of the
         # private early_stop state.  Either inline into the harness or promote
@@ -123,6 +117,11 @@ _GRANDFATHERED_PUBLIC_IMPORTS: frozenset[tuple[str, str, str]] = frozenset(
             "paramem.models.loader",
             "load_base_model",
         ),
+        (
+            "experiments/lme_qa_from_triples_probe.py",
+            "paramem.utils.config",
+            "AdapterConfig",
+        ),
         # probe_adapter.py
         ("experiments/probe_adapter.py", "paramem.models.loader", "unload_model"),
         # quadruple_adapter.py
@@ -143,7 +142,7 @@ _GRANDFATHERED_PUBLIC_IMPORTS: frozenset[tuple[str, str, str]] = frozenset(
             "paramem.memory.entry",
             "format_entry_training",
         ),
-        ("experiments/quadruple_adapter.py", "paramem.models.loader", "create_adapter"),
+        ("experiments/quadruple_adapter.py", "paramem.models.loader", "mount_adapter"),
         ("experiments/quadruple_adapter.py", "paramem.models.loader", "switch_adapter"),
         (
             "experiments/quadruple_adapter.py",
@@ -195,11 +194,16 @@ _GRANDFATHERED_PUBLIC_IMPORTS: frozenset[tuple[str, str, str]] = frozenset(
             "paramem.evaluation.recall",
             "generate_answer",
         ),
-        ("experiments/test10b_diverse_rephrase.py", "paramem.models.loader", "load_adapter"),
+        ("experiments/test10b_diverse_rephrase.py", "paramem.models.loader", "mount_adapter"),
         (
             "experiments/test10b_diverse_rephrase.py",
             "paramem.models.loader",
             "load_base_model",
+        ),
+        (
+            "experiments/test10b_diverse_rephrase.py",
+            "paramem.utils.config",
+            "AdapterConfig",
         ),
         # test11_adapter_extraction.py
         (
@@ -207,11 +211,16 @@ _GRANDFATHERED_PUBLIC_IMPORTS: frozenset[tuple[str, str, str]] = frozenset(
             "paramem.graph.extractor",
             "load_extraction_prompts",
         ),
-        ("experiments/test11_adapter_extraction.py", "paramem.models.loader", "load_adapter"),
+        ("experiments/test11_adapter_extraction.py", "paramem.models.loader", "mount_adapter"),
         (
             "experiments/test11_adapter_extraction.py",
             "paramem.models.loader",
             "load_base_model",
+        ),
+        (
+            "experiments/test11_adapter_extraction.py",
+            "paramem.utils.config",
+            "AdapterConfig",
         ),
         # test16_repair_sweep.py
         ("experiments/test16_repair_sweep.py", "paramem.adapters", "resolve_adapter_slot"),
@@ -230,6 +239,8 @@ _GRANDFATHERED_PUBLIC_IMPORTS: frozenset[tuple[str, str, str]] = frozenset(
         ("experiments/test16_repair_sweep.py", "paramem.memory.persistence", "load_registry"),
         ("experiments/test16_repair_sweep.py", "paramem.memory.persistence", "save_registry"),
         ("experiments/test16_repair_sweep.py", "paramem.models.loader", "create_adapter"),
+        ("experiments/test16_repair_sweep.py", "paramem.models.loader", "detach_adapters"),
+        ("experiments/test16_repair_sweep.py", "paramem.models.loader", "mount_adapter"),
         ("experiments/test16_repair_sweep.py", "paramem.models.loader", "save_adapter"),
         ("experiments/test16_repair_sweep.py", "paramem.models.loader", "switch_adapter"),
         ("experiments/test16_repair_sweep.py", "paramem.models.loader", "unload_model"),
@@ -260,10 +271,9 @@ _GRANDFATHERED_PUBLIC_IMPORTS: frozenset[tuple[str, str, str]] = frozenset(
             "paramem.memory.entry",
             "format_entry_training",
         ),
-        ("experiments/test18_probe_batching.py", "paramem.models.loader", "create_adapter"),
         ("experiments/test18_probe_batching.py", "paramem.models.loader", "load_base_model"),
+        ("experiments/test18_probe_batching.py", "paramem.models.loader", "mount_adapter"),
         ("experiments/test18_probe_batching.py", "paramem.models.loader", "save_adapter"),
-        ("experiments/test18_probe_batching.py", "paramem.models.loader", "switch_adapter"),
         (
             "experiments/test18_probe_batching.py",
             "paramem.training.dataset",
@@ -306,6 +316,8 @@ _GRANDFATHERED_PUBLIC_IMPORTS: frozenset[tuple[str, str, str]] = frozenset(
             "copy_adapter_weights",
         ),
         ("experiments/test20_smallN_cold_gate.py", "paramem.models.loader", "create_adapter"),
+        ("experiments/test20_smallN_cold_gate.py", "paramem.models.loader", "detach_adapters"),
+        ("experiments/test20_smallN_cold_gate.py", "paramem.models.loader", "mount_adapter"),
         # atomic_save_adapter: --donor-init (donor-init validation) persists its
         # own donor checkpoint via the SAME primitive every production tier
         # save uses (added 2026-07-26) -- one implementation, not a copy.
@@ -321,7 +333,6 @@ _GRANDFATHERED_PUBLIC_IMPORTS: frozenset[tuple[str, str, str]] = frozenset(
             "paramem.models.loader",
             "lora_b_frobenius_norm",
         ),
-        ("experiments/test20_smallN_cold_gate.py", "paramem.models.loader", "switch_adapter"),
         ("experiments/test20_smallN_cold_gate.py", "paramem.models.loader", "unload_model"),
         (
             "experiments/test20_smallN_cold_gate.py",

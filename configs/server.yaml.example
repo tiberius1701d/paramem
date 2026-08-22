@@ -85,6 +85,16 @@ paths:
   prompts: configs/prompts      # extraction prompt templates
   telemetry: data/ha/telemetry  # bounded fold VRAM/adapter telemetry ring (always written)
 
+# DISABLING A TIER (any adapters.<tier>.enabled: false edit) is a
+# drain-first operation, refused at boot otherwise:
+#   - A tier is refused while its own registry still holds active keys —
+#     fold/promote or erase its keys first, then disable it.
+#   - episodic specifically is also refused while a populated interim ring
+#     still exists on disk (adapter_dir/episodic/interim_*) — POST
+#     /consolidate to drain the ring into episodic, or POST
+#     /interim/discard to destroy it, first.
+#   - At least one tier must stay enabled unless cloud_only: true — a
+#     local-mode server with no tier has no parametric memory to serve.
 adapters:
   episodic:
     enabled: true
@@ -228,7 +238,13 @@ consolidation:
   mode: train                  # "train" writes LoRA weights into the tier's slot; "simulate" writes graph.json into the tier's slot (no weight training)
                                # Closed vocabulary: any other value is rejected at config load.
                                # "simulate" + max_interim_count: 0 is also rejected (no training venue at all).
-  promotion_threshold: 3       # reinforcement_count threshold for key promotion to semantic
+  promotion_threshold: 3       # reinforcement_count threshold for key promotion to semantic.
+                                # A net-new key starts at reinforcement_count=1, so a value
+                                # below 2 promotes every key on its first staging pass —
+                                # episodic never retains anything. Rejected at config load
+                                # whenever adapters.semantic.enabled is true. Adjust upward
+                                # to require more re-observations before a fact "graduates"
+                                # out of episodic; the minimum meaningful value is 2.
   retain_sessions: true        # archive transcripts after consolidation (false = delete)
   decay_window: 10             # cycles before unreinforced keys decay
   refinement_enrichment: "off"  # graph-stage cloud enrichment pass, full-fold only. off|on. Requires the top-level `cloud.enabled: true` master switch to fire. Same cloud-egress risk described there — this is the flag that actually triggers the graph-content cloud call.

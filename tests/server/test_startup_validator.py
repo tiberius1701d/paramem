@@ -1,5 +1,5 @@
-"""Tests for eager consolidation-loop creation at boot, and the boot binding
-verification suite rebuilt against the venue-uniform target design.
+"""Tests for the boot-time adapter-slot binding decisions and the boot
+binding verification suite rebuilt against the venue-uniform target design.
 
 ``TestValidateAdapterSlotBindingDecisions`` covers ``_validate_adapter_slot``
 directly -- the per-tier mount decision built on a real, already-resolved
@@ -14,14 +14,17 @@ the offending tier(s) and (for the unmigrated-tree case) that no
 consolidation action dispatches while a main tier's binding stays
 unverified.
 
-What remains from the original suite is orthogonal: eager
-``ConsolidationLoop`` creation at boot (``_eager_create_consolidation_loop``)
-and the lifespan wiring that calls it.
+``TestSweepKeylessTierArtifactsKeyedNoCandidateArm`` covers the boot sweep's
+preserve-vs-reap decision for a keyed tier with no candidate payload.
+``TestBootMidWindowServesPreEventContent`` and
+``TestBootMidWindowFirstContentQuarantines`` cover the boot-time cache's
+handling of content published mid-window versus content that is only
+written, not yet published.
 """
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 
 def _build_content_increment(*, tier: str, keys: "list[dict]", pre_sha: str = "") -> object:
@@ -95,102 +98,6 @@ def _build_write_context(output_dir) -> object:
         store=None,
         keep_prior_slots=1,
     )
-
-
-class TestEagerConsolidationLoopCreation:
-    def test_creates_loop_when_model_tokenizer_and_store_present(self) -> None:
-        """Local-mode state (model + tokenizer + memory_store all present)
-        creates the consolidation loop via the shared get-or-create.
-
-        ``_eager_create_consolidation_loop`` is zero-arg — it reads
-        ``_state`` directly rather than taking a ``config`` parameter."""
-        from paramem.server import app as app_module
-
-        state = {
-            "config": MagicMock(name="config"),
-            "model": MagicMock(name="model"),
-            "tokenizer": MagicMock(name="tokenizer"),
-            "memory_store": MagicMock(name="memory_store"),
-            "consolidation_loop": None,
-        }
-
-        with (
-            patch.object(app_module, "_state", state),
-            patch.object(app_module, "get_or_create_consolidation_loop") as mock_get_or_create,
-        ):
-            app_module._eager_create_consolidation_loop()
-
-        mock_get_or_create.assert_called_once_with(state)
-
-    def test_noop_in_cloud_only_mode(self) -> None:
-        """No model resident (cloud-only) — the loop is never created."""
-        from paramem.server import app as app_module
-
-        state = {
-            "config": MagicMock(name="config"),
-            "model": None,
-            "tokenizer": None,
-            "memory_store": None,
-            "consolidation_loop": None,
-        }
-
-        with (
-            patch.object(app_module, "_state", state),
-            patch.object(app_module, "get_or_create_consolidation_loop") as mock_get_or_create,
-        ):
-            app_module._eager_create_consolidation_loop()
-
-        mock_get_or_create.assert_not_called()
-
-    def test_noop_when_loop_already_exists(self) -> None:
-        """Idempotent: a second call (loop already resident) does not build
-        another one — proven through the real create_consolidation_loop
-        factory, not just a mocked get-or-create.
-
-        ``create_consolidation_loop`` is patched at its DEFINING module
-        (``paramem.server.consolidation``), not at ``app_module`` — the
-        get-or-create it backs resolves the name via its own
-        ``__globals__`` when it runs, so a patch placed on the importing
-        module (``app_module``) has no effect."""
-        from paramem.server import app as app_module
-        from paramem.server import consolidation as consolidation_module
-
-        state = {
-            "config": MagicMock(name="config"),
-            "model": MagicMock(name="model"),
-            "tokenizer": MagicMock(name="tokenizer"),
-            "memory_store": MagicMock(name="memory_store"),
-            "consolidation_loop": None,
-        }
-        fake_loop = MagicMock(name="loop")
-        fake_loop.model = state["model"]
-
-        with (
-            patch.object(app_module, "_state", state),
-            patch.object(
-                consolidation_module, "create_consolidation_loop", return_value=fake_loop
-            ) as mock_create,
-        ):
-            app_module._eager_create_consolidation_loop()
-            app_module._eager_create_consolidation_loop()
-
-        mock_create.assert_called_once()
-
-
-class TestLifespanEagerLoopWiring:
-    def test_lifespan_invokes_eager_create_consolidation_loop(self) -> None:
-        """The lifespan boot path must call _eager_create_consolidation_loop
-        after the memory store is built, so a refactor that drops the call
-        fails here rather than silently."""
-        import inspect
-
-        from paramem.server import app as app_module
-
-        source = inspect.getsource(app_module.lifespan)
-        assert "_eager_create_consolidation_loop(" in source, (
-            "lifespan must call _eager_create_consolidation_loop so "
-            "adapter_loaded is symmetric across a restart"
-        )
 
 
 class TestValidateAdapterSlotBindingDecisions:
@@ -357,6 +264,73 @@ class TestValidateAdapterSlotBindingDecisions:
         row = manifest_status["episodic"]
         assert row["status"] == "unrecognized_verdict"
         assert row["severity"] == "red"  # episodic is the primary tier
+
+
+class TestRevalidateAdapterManifestsPostLoopPrune:
+    """``_revalidate_adapter_manifests``' one post-loop prune drops every
+    ``manifest_status`` row keyed by a name that is neither a live tier
+    (``config.tier_config_map()``) nor a live interim directory -- this
+    subsumes both a tier disabled since its row was written and an interim
+    slot folded away or reaped since. No prior test drove this orchestrator
+    directly; every existing reference to
+    ``_validate_adapter_slot`` above exercises the per-tier decision, never
+    the caller's own prune."""
+
+    def _cfg(self, tmp_path):
+        from paramem.server.config import PathsConfig, load_server_config
+
+        cfg = load_server_config("tests/fixtures/server.yaml")
+        cfg.adapters.procedural.enabled = False
+        data_root = tmp_path / "data"
+        cfg.paths = PathsConfig(
+            data=data_root, sessions=data_root / "sessions", debug=data_root / "debug"
+        )
+        return cfg
+
+    def test_prunes_a_disabled_tiers_row_and_a_reaped_interims_row_but_keeps_a_live_one(
+        self, tmp_path
+    ) -> None:
+        from paramem.server import app as app_module
+        from paramem.training.key_registry import KeyRegistry
+
+        cfg = self._cfg(tmp_path)
+
+        # A live tier (episodic) with an active key but no on-disk slot --
+        # resolves KEYS_WITHOUT_SLOT, so its freshly-minted row must SURVIVE
+        # the prune (it is not stale -- episodic is still in tier_config_map()).
+        episodic_root = cfg.adapter_dir / "episodic"
+        episodic_root.mkdir(parents=True)
+        registry = KeyRegistry()
+        registry.add("graph1")
+        registry.set_simhash("graph1", 111)
+        registry.save(episodic_root / "indexed_key_registry.json")
+
+        manifest_status = {
+            # Stale: procedural was disabled (above) since this row was written.
+            "procedural": {"status": "fingerprint_mismatch", "severity": "yellow"},
+            # Stale: this interim slot was reaped/folded away since -- no
+            # such directory exists under episodic/ any more.
+            "episodic_interim_20260101T0000": {"status": "missing", "severity": "yellow"},
+        }
+        state = {
+            "config": cfg,
+            "model": MagicMock(),
+            "tokenizer": MagicMock(),
+            "adapter_manifest_status": manifest_status,
+        }
+
+        app_module._revalidate_adapter_manifests(state)
+
+        assert "procedural" not in manifest_status, (
+            "a row for a tier disabled since it was written must be pruned"
+        )
+        assert "episodic_interim_20260101T0000" not in manifest_status, (
+            "a row for an interim slot reaped since it was written must be pruned"
+        )
+        assert "episodic" in manifest_status, (
+            "a live tier's own freshly-validated row must not be swept by the prune"
+        )
+        assert manifest_status["episodic"]["status"] == "keys_without_slot"
 
 
 class TestSweepKeylessTierArtifactsKeyedNoCandidateArm:

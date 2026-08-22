@@ -1366,7 +1366,10 @@ class TestRunBaseSwapPhaseA:
                     patch("paramem.server.app._finish_base_swap", _fake_finish_base_swap)
                 )
             stack.enter_context(
-                patch("paramem.server.app.create_consolidation_loop", return_value=MagicMock())
+                patch(
+                    "paramem.server.consolidation.create_consolidation_loop",
+                    return_value=MagicMock(),
+                )
             )
             stack.enter_context(
                 patch(
@@ -2206,7 +2209,9 @@ class TestBaseSwapOrchestration:
             patch("paramem.server.app.migrate", side_effect=_fake_migrate),
             patch("paramem.server.migration.promote_config", lambda s, d, **kw: None),
             patch("paramem.server.app._update_trial_gates", _fake_update_gates),
-            patch("paramem.server.app.create_consolidation_loop", return_value=MagicMock()),
+            patch(
+                "paramem.server.consolidation.create_consolidation_loop", return_value=MagicMock()
+            ),
             patch(
                 "paramem.server.app.ThermalPolicy.from_consolidation_config",
                 return_value=MagicMock(),
@@ -2432,7 +2437,9 @@ class TestBaseSwapOrchestration:
             patch("paramem.server.app.migrate", side_effect=_fake_migrate),
             patch("paramem.server.migration.promote_config", lambda s, d, **kw: None),
             patch("paramem.server.app._update_trial_gates", _fake_update_gates_noop),
-            patch("paramem.server.app.create_consolidation_loop", return_value=MagicMock()),
+            patch(
+                "paramem.server.consolidation.create_consolidation_loop", return_value=MagicMock()
+            ),
             patch(
                 "paramem.server.app.ThermalPolicy.from_consolidation_config",
                 return_value=MagicMock(),
@@ -2686,7 +2693,9 @@ class TestBaseSwapOrchestration:
             patch("paramem.server.app.migrate", side_effect=_fake_migrate),
             patch("paramem.server.migration.promote_config", lambda s, d, **kw: None),
             patch("paramem.server.app._update_trial_gates", _fake_update_gates),
-            patch("paramem.server.app.create_consolidation_loop", return_value=MagicMock()),
+            patch(
+                "paramem.server.consolidation.create_consolidation_loop", return_value=MagicMock()
+            ),
             patch(
                 "paramem.server.app.ThermalPolicy.from_consolidation_config",
                 return_value=MagicMock(),
@@ -2954,7 +2963,9 @@ class TestBaseSwapResumePhaseAware:
             patch("paramem.server.app.migrate", side_effect=_fake_migrate),
             patch("paramem.server.migration.promote_config", lambda s, d, **kw: None),
             patch("paramem.server.app._update_trial_gates", _fake_update_gates),
-            patch("paramem.server.app.create_consolidation_loop", return_value=MagicMock()),
+            patch(
+                "paramem.server.consolidation.create_consolidation_loop", return_value=MagicMock()
+            ),
             patch(
                 "paramem.server.app.ThermalPolicy.from_consolidation_config",
                 return_value=MagicMock(),
@@ -3129,7 +3140,9 @@ class TestBaseSwapResumePhaseAware:
             patch("paramem.server.app.migrate", return_value=fake_b),
             patch("paramem.server.migration.promote_config", lambda s, d, **kw: None),
             patch("paramem.server.app._update_trial_gates", _noop_gates),
-            patch("paramem.server.app.create_consolidation_loop", return_value=MagicMock()),
+            patch(
+                "paramem.server.consolidation.create_consolidation_loop", return_value=MagicMock()
+            ),
             patch(
                 "paramem.server.app.ThermalPolicy.from_consolidation_config",
                 return_value=MagicMock(),
@@ -3351,7 +3364,9 @@ class TestBaseSwapStep3ResumeReload:
             patch("paramem.server.app.migrate", return_value=fake_b),
             patch("paramem.server.migration.promote_config", lambda s, d, **kw: None),
             patch("paramem.server.app._update_trial_gates", _fake_update_gates),
-            patch("paramem.server.app.create_consolidation_loop", return_value=MagicMock()),
+            patch(
+                "paramem.server.consolidation.create_consolidation_loop", return_value=MagicMock()
+            ),
             patch(
                 "paramem.server.app.ThermalPolicy.from_consolidation_config",
                 return_value=MagicMock(),
@@ -3908,7 +3923,9 @@ class TestBaseSwapActiveFlag:
             patch("paramem.server.app.migrate", return_value=fake_a),
             patch("paramem.server.migration.promote_config", lambda s, d, **kw: None),
             patch("paramem.server.app._update_trial_gates", _noop_gates),
-            patch("paramem.server.app.create_consolidation_loop", return_value=MagicMock()),
+            patch(
+                "paramem.server.consolidation.create_consolidation_loop", return_value=MagicMock()
+            ),
             patch(
                 "paramem.server.app.ThermalPolicy.from_consolidation_config",
                 return_value=MagicMock(),
@@ -4447,7 +4464,9 @@ class TestPhaseBModelIdentityGuard:
             patch("paramem.server.app.migrate", side_effect=_fake_migrate),
             patch("paramem.server.migration.promote_config", lambda s, d, **kw: None),
             patch("paramem.server.app._update_trial_gates", _fake_update_gates),
-            patch("paramem.server.app.create_consolidation_loop", return_value=MagicMock()),
+            patch(
+                "paramem.server.consolidation.create_consolidation_loop", return_value=MagicMock()
+            ),
             patch(
                 "paramem.server.app.ThermalPolicy.from_consolidation_config",
                 return_value=MagicMock(),
@@ -4690,7 +4709,9 @@ class TestPhaseBModelIdentityGuard:
             patch("paramem.server.app.migrate", side_effect=_fake_migrate),
             patch("paramem.server.migration.promote_config", lambda s, d, **kw: None),
             patch("paramem.server.app._update_trial_gates", _fake_update_gates),
-            patch("paramem.server.app.create_consolidation_loop", return_value=MagicMock()),
+            patch(
+                "paramem.server.consolidation.create_consolidation_loop", return_value=MagicMock()
+            ),
             patch(
                 "paramem.server.app.ThermalPolicy.from_consolidation_config",
                 return_value=MagicMock(),

@@ -1279,12 +1279,7 @@ def _probe_and_reason(
             # disable_adapter() so the active adapter during generation does not
             # matter — only the post-return state (restored here) does.  No-op in
             # simulate mode where probing didn't touch the model.
-            if (
-                _active_mode != "simulate"
-                and model is not None
-                and hasattr(model, "peft_config")
-                and "episodic" in model.peft_config
-            ):
+            if _active_mode != "simulate" and model is not None and "episodic" in model.peft_config:
                 switch_adapter(model, "episodic")
 
         # Reassemble per-step facts so each adapter's results go to its layer.

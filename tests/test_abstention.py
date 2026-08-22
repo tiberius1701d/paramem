@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+from peft import PeftModel
 
 from paramem.memory.store import MemoryStore as _MS
 from paramem.server.config import (
@@ -826,7 +827,12 @@ class TestRelayNoIdentityShortCircuit:
         from paramem.server.app import _relay_route
 
         config = self._config()
-        model = MagicMock()
+        # spec=PeftModel passes the isinstance(model, PeftModel)
+        # precondition base_model_inference now enforces on the relay's
+        # base-model-fallback generate.
+        model = MagicMock(spec=PeftModel)
+        model.gradient_checkpointing_disable = MagicMock()
+        model.gradient_checkpointing_enable = MagicMock()
         tokenizer = MagicMock()
         tokenizer.apply_chat_template.return_value = "prompt text"
 

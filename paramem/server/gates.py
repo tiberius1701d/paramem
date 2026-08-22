@@ -29,6 +29,7 @@ from typing import Any, Literal
 # the indexed_key_registry.json serialization, hence also the single reader
 # for its SimHash map (``KeyRegistry.load_simhashes``).
 from paramem.training.key_registry import KeyRegistry
+from paramem.utils.tiers import MAIN_TIERS
 
 logger = logging.getLogger(__name__)
 
@@ -166,7 +167,7 @@ def _live_key_population(adapter_dir: Path) -> tuple[bytes, list[str]]:
     ``key_metadata.json`` split. Reads via
     :meth:`~paramem.memory.store.MemoryStore.read_registries_from_disk` — the
     same per-tier reader every other adapter-tree walk in the codebase uses
-    — then narrows to :data:`_ADAPTER_KIND_SUBDIRS` (``episodic``,
+    — then narrows to :data:`MAIN_TIERS` (``episodic``,
     ``semantic``, ``procedural``) before returning the concatenated
     canonical registry bytes (for the deterministic sample seed) plus the
     sorted union of active keys across those tiers (the sample population).
@@ -189,7 +190,7 @@ def _live_key_population(adapter_dir: Path) -> tuple[bytes, list[str]]:
         concatenation of each scorable tier's :meth:`KeyRegistry.save_bytes`
         output in tier-walk order (stable regardless of which tier files
         exist on disk); ``population`` is the sorted, deduplicated
-        active-key union over :data:`_ADAPTER_KIND_SUBDIRS` only.
+        active-key union over :data:`MAIN_TIERS` only.
 
     Raises:
         ValueError: Propagated from
@@ -213,7 +214,7 @@ def _live_key_population(adapter_dir: Path) -> tuple[bytes, list[str]]:
     # registries preserves _iter_tier_registry_paths' own walk order (main
     # tiers first, in fixed order, then interim) -- filtering to the main
     # tiers here keeps that same relative order, never re-sorting it.
-    scorable = {tier: reg for tier, reg in registries.items() if tier in _ADAPTER_KIND_SUBDIRS}
+    scorable = {tier: reg for tier, reg in registries.items() if tier in MAIN_TIERS}
     content = b"".join(reg.save_bytes() for reg in scorable.values())
     population = sorted({key for reg in scorable.values() for key in reg.list_active()})
     return content, population
@@ -275,7 +276,7 @@ def _resolve_adapter_mount_path(trial_adapter_dir: Path) -> Path:
     ``trial_adapter`` (or even ``trial_adapter/<kind>``) fails with
     "adapter model file not found".
 
-    Resolution order (per ``_ADAPTER_KIND_SUBDIRS``):
+    Resolution order (per ``MAIN_TIERS``):
 
     1. ``trial_adapter/<kind>/<newest-slot>/`` containing the safetensors —
        per-adapter slot layout.
@@ -283,7 +284,7 @@ def _resolve_adapter_mount_path(trial_adapter_dir: Path) -> Path:
        legacy flat per-kind layout.
     3. ``trial_adapter/`` — legacy/simulated single-adapter top-level layout.
     """
-    for kind in _ADAPTER_KIND_SUBDIRS:
+    for kind in MAIN_TIERS:
         kind_dir = trial_adapter_dir / kind
         if not kind_dir.is_dir():
             continue
@@ -364,8 +365,10 @@ def _ensure_trial_probe_mounted(model: Any, trial_adapter_dir: Path, mount_state
 
     # Diagnostic: surface the model's current adapter state at mount time
     # so we can debug "no adapter loaded" / wrong-wrapper cases on real GPUs.
-    peft_config = getattr(model, "peft_config", None)
-    pc_keys = list(peft_config.keys()) if isinstance(peft_config, dict) else None
+    # The base model's object identity is fixed at load time and always
+    # wrapped with at least one tier resident, so peft_config is
+    # always present here — no getattr default needed.
+    pc_keys = list(model.peft_config)
     logger.info(
         "trial probe mount: model.type=%s peft_config=%s active=%s",
         type(model).__name__,
@@ -404,18 +407,15 @@ def _find_trained_kind_in_memory(model: Any, trial_adapter_dir: Path) -> str | N
     because the probed adapter has never seen the key.
 
     Strategy:
-    1. Iterate ``_ADAPTER_KIND_SUBDIRS`` and find the first kind that has
+    1. Iterate ``MAIN_TIERS`` and find the first kind that has
        ``<trial_adapter_dir>/<kind>/indexed_key_registry.json``.
     2. Verify that kind is in ``model.peft_config``.
-    3. Return that kind. ``None`` if either step fails — caller falls back
-       to loading from disk.
+    3. Return that kind. ``None`` if the registry file / membership check
+       fails for every kind — caller falls back to loading from disk.
     """
-    peft_config = getattr(model, "peft_config", None)
-    if peft_config is None:
-        return None
-    for kind in _ADAPTER_KIND_SUBDIRS:
+    for kind in MAIN_TIERS:
         registry_path = trial_adapter_dir / kind / "indexed_key_registry.json"
-        if registry_path.exists() and kind in peft_config:
+        if registry_path.exists() and kind in model.peft_config:
             return kind
     return None
 
@@ -435,6 +435,8 @@ def _settle_cuda_and_load_adapter(model: Any, mount_path: Path) -> None:
         import torch  # type: ignore[import-not-found]
     except ImportError:
         torch = None  # type: ignore[assignment]
+
+    from paramem.models.loader import mount_adapter
 
     # Initial settle: WSL2 driver needs wall-clock time after a heavy
     # training pass before it can safely service a fresh load_adapter.
@@ -456,8 +458,7 @@ def _settle_cuda_and_load_adapter(model: Any, mount_path: Path) -> None:
         # weights to GPU, so a CUDA failure during load_adapter leaves the
         # name half-registered. Subsequent attempts then fail with
         # "Adapter with name X already exists". Clean up before each try.
-        peft_config = getattr(model, "peft_config", None)
-        if peft_config is not None and _TRIAL_PROBE_ADAPTER_NAME in peft_config:
+        if _TRIAL_PROBE_ADAPTER_NAME in model.peft_config:
             try:
                 model.delete_adapter(_TRIAL_PROBE_ADAPTER_NAME)
             except Exception as cleanup_exc:  # noqa: BLE001
@@ -465,7 +466,7 @@ def _settle_cuda_and_load_adapter(model: Any, mount_path: Path) -> None:
         try:
             if torch is not None and torch.cuda.is_available():
                 torch.cuda.synchronize()
-            model.load_adapter(str(mount_path), adapter_name=_TRIAL_PROBE_ADAPTER_NAME)
+            mount_adapter(model, mount_path, _TRIAL_PROBE_ADAPTER_NAME)
             model.set_adapter(_TRIAL_PROBE_ADAPTER_NAME)
             return
         except Exception as exc:  # noqa: BLE001
@@ -497,11 +498,11 @@ def _settle_cuda_and_load_adapter(model: Any, mount_path: Path) -> None:
 def _unmount_trial_probe(model: Any, mount_state: dict) -> None:
     """Remove the trial probe adapter from the model.
 
-    If ``"trial_probe"`` is the sole adapter loaded (edge case: server
-    started with no live adapters), deleting it would leave PeftModel with
-    no active config and a subsequent ``create_adapter`` would crash with
-    ``KeyError``.  In that case we skip the delete and log a WARN, leaving
-    the sole adapter in place.
+    Every configured tier is resident cold from boot (wrap-once:
+    ``load_base_model`` / ``ensure_resident_tiers``), so ``"trial_probe"``
+    is provably never the model's sole adapter — a delete here is always
+    safe, unlike the historical edge case where a server could boot with
+    zero adapters.
 
     Always restores the previously-active adapter when it is safe to do so.
 
@@ -546,18 +547,6 @@ def _unmount_trial_probe(model: Any, mount_state: dict) -> None:
             return
 
         # Loaded path: delete the adapter we added.
-        peft_config = getattr(model, "peft_config", {})
-        loaded_adapters = list(peft_config.keys())
-
-        if len(loaded_adapters) <= 1:
-            # Sole adapter; skip delete to avoid broken PeftModel (see docstring).
-            logger.warning(
-                "gates: skipping delete_adapter('%s') — it is the sole loaded adapter; "
-                "leaving in place to preserve PeftModel integrity (CLAUDE.md rule).",
-                mounted_name,
-            )
-            return
-
         model.delete_adapter(mounted_name)
 
         pre = mount_state.get("pre_active_adapter", [])
@@ -735,13 +724,10 @@ def _gate_2_training(
     )
 
 
-_ADAPTER_KIND_SUBDIRS = ("episodic", "semantic", "procedural")
-
-
 def _find_tier_registry(trial_adapter_dir: Path) -> tuple[str, Path] | None:
     """Locate the per-tier ``indexed_key_registry.json`` inside *trial_adapter_dir*.
 
-    Checks subdirectories in ``_ADAPTER_KIND_SUBDIRS`` order (episodic first).
+    Checks subdirectories in ``MAIN_TIERS`` order (episodic first).
     Returns the first ``(kind, path)`` pair found, or ``None`` when no registry
     is present.
 
@@ -756,7 +742,7 @@ def _find_tier_registry(trial_adapter_dir: Path) -> tuple[str, Path] | None:
         ``(kind_name, registry_path)`` for the first kind that has a
         ``<kind>/indexed_key_registry.json``, or ``None`` when none exists.
     """
-    for kind in _ADAPTER_KIND_SUBDIRS:
+    for kind in MAIN_TIERS:
         candidate = trial_adapter_dir / kind / "indexed_key_registry.json"
         if candidate.exists():
             return kind, candidate
@@ -857,7 +843,7 @@ def _gate_3_reload_smoke(
             reason=(
                 "no kind-specific adapter trained — indexed_key_registry.json absent "
                 f"in all kind subdirs of {trial_adapter_dir} "
-                f"({', '.join(_ADAPTER_KIND_SUBDIRS)})"
+                f"({', '.join(MAIN_TIERS)})"
             ),
             metrics=None,
         )
@@ -1077,7 +1063,7 @@ def _gate_4_recall_check(
     # since the live sample can draw a key from any of them.
     trial_simhash: dict[str, int] = {}
     try:
-        for kind in _ADAPTER_KIND_SUBDIRS:
+        for kind in MAIN_TIERS:
             trial_simhash.update(
                 KeyRegistry.load_simhashes(trial_adapter_dir / kind / "indexed_key_registry.json")
             )

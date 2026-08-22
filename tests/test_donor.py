@@ -101,9 +101,11 @@ def _make_bare_loop(tmp_path: Path) -> ConsolidationLoop:
     loop.model.get_base_model.return_value.config._name_or_path = _BASE_ID
     loop.tokenizer = MagicMock()
     loop.training_config = TrainingConfig()
-    loop.episodic_config = AdapterConfig(rank=8, alpha=16, target_modules=["q_proj"])
-    loop.semantic_config = AdapterConfig(rank=8, alpha=16, target_modules=["q_proj"])
-    loop.procedural_config = AdapterConfig(rank=8, alpha=16, target_modules=["q_proj", "gate_proj"])
+    loop.tier_adapters = {
+        "episodic": AdapterConfig(rank=8, alpha=16, target_modules=["q_proj"]),
+        "semantic": AdapterConfig(rank=8, alpha=16, target_modules=["q_proj"]),
+        "procedural": AdapterConfig(rank=8, alpha=16, target_modules=["q_proj", "gate_proj"]),
+    }
     loop.wandb_config = None
     loop.output_dir = tmp_path
     loop._thermal_policy = None
@@ -412,9 +414,10 @@ class TestDonorTopologyId:
         from paramem.server.config import load_server_config
 
         cfg = load_server_config("tests/fixtures/server.yaml")
-        episodic_id = donor_topology_id(lora_shape_fields(cfg.episodic_adapter_config))
-        semantic_id = donor_topology_id(lora_shape_fields(cfg.semantic_adapter_config))
-        procedural_id = donor_topology_id(lora_shape_fields(cfg.procedural_adapter_config))
+        tier_adapters = cfg.tier_config_map()
+        episodic_id = donor_topology_id(lora_shape_fields(tier_adapters["episodic"]))
+        semantic_id = donor_topology_id(lora_shape_fields(tier_adapters["semantic"]))
+        procedural_id = donor_topology_id(lora_shape_fields(tier_adapters["procedural"]))
 
         assert episodic_id == semantic_id
         assert procedural_id != episodic_id
@@ -453,7 +456,7 @@ class TestResolveDonorCheckpoint:
         ]
 
         with patch("paramem.training.donor.donor_checkpoint_valid", return_value=True):
-            resolved = loop._resolve_donor_checkpoint("episodic", loop.episodic_config)
+            resolved = loop._resolve_donor_checkpoint("episodic", loop.tier_adapters["episodic"])
 
         expected_dir = donor_store_dir(tmp_path, _BASE_ID, _LORA_SHAPE)
         assert resolved == expected_dir
@@ -470,7 +473,9 @@ class TestResolveDonorCheckpoint:
         ]
 
         with patch("paramem.training.donor.donor_checkpoint_valid", return_value=True):
-            resolved = loop._resolve_donor_checkpoint("procedural", loop.procedural_config)
+            resolved = loop._resolve_donor_checkpoint(
+                "procedural", loop.tier_adapters["procedural"]
+            )
 
         expected_dir = donor_store_dir(tmp_path, _BASE_ID, _PROC_LORA_SHAPE)
         assert resolved == expected_dir
@@ -488,7 +493,7 @@ class TestResolveDonorCheckpoint:
             patch("paramem.training.donor.donor_checkpoint_valid", return_value=False),
             patch("paramem.training.donor.build_donor") as mock_build,
         ):
-            resolved = loop._resolve_donor_checkpoint("episodic", loop.episodic_config)
+            resolved = loop._resolve_donor_checkpoint("episodic", loop.tier_adapters["episodic"])
 
         assert resolved is None
         assert mock_build.called, "a mismatched/missing checkpoint must attempt a rebuild"
@@ -512,7 +517,7 @@ class TestResolveDonorCheckpoint:
                 side_effect=DonorBuildIncomplete("aborted"),
             ) as mock_build,
         ):
-            resolved = loop._resolve_donor_checkpoint("episodic", loop.episodic_config)
+            resolved = loop._resolve_donor_checkpoint("episodic", loop.tier_adapters["episodic"])
 
         assert resolved is None
         assert mock_build.called
@@ -528,7 +533,7 @@ class TestResolveDonorCheckpoint:
         ]
 
         with patch("paramem.training.donor.build_donor") as mock_build:
-            resolved = loop._resolve_donor_checkpoint("episodic", loop.episodic_config)
+            resolved = loop._resolve_donor_checkpoint("episodic", loop.tier_adapters["episodic"])
 
         assert resolved is None
         assert not mock_build.called
@@ -545,7 +550,7 @@ class TestResolveDonorCheckpoint:
         ]
 
         with patch("paramem.training.donor.donor_checkpoint_valid") as mock_valid:
-            resolved = loop._resolve_donor_checkpoint("episodic", loop.episodic_config)
+            resolved = loop._resolve_donor_checkpoint("episodic", loop.tier_adapters["episodic"])
 
         assert resolved is None
         assert not mock_valid.called, "a warm target must never even check the checkpoint"
@@ -574,7 +579,7 @@ class TestResolveDonorCheckpoint:
             loop._train_tier_adapter(
                 [{"key": "graph1", "subject": "s", "predicate": "p", "object": "o"}],
                 adapter_name=DONOR_BUILD_ADAPTER_NAME,
-                adapter_config=loop.episodic_config,
+                adapter_config=loop.tier_adapters["episodic"],
                 training_config=loop.training_config,
                 output_dir=tmp_path / "scratch",
                 run_name="test",
@@ -617,7 +622,7 @@ class TestResolveDonorCheckpoint:
             metrics, _ = loop._train_tier_adapter(
                 [{"key": "graph1", "subject": "s", "predicate": "p", "object": "o"}],
                 adapter_name="episodic",
-                adapter_config=loop.episodic_config,
+                adapter_config=loop.tier_adapters["episodic"],
                 training_config=loop.training_config,
                 output_dir=tmp_path / "scratch",
                 run_name="test",
@@ -625,7 +630,9 @@ class TestResolveDonorCheckpoint:
             )
 
         assert metrics["init"] == "donor"
-        loop._resolve_donor_checkpoint.assert_called_once_with("episodic", loop.episodic_config)
+        loop._resolve_donor_checkpoint.assert_called_once_with(
+            "episodic", loop.tier_adapters["episodic"]
+        )
         assert captured_kwargs["donor_checkpoint_dir"] == resolved_dir
 
 
@@ -669,7 +676,7 @@ class TestBorrowedDonorCache:
         ]
 
         with patch("paramem.training.donor.build_donor") as mock_build:
-            resolved = loop._resolve_donor_checkpoint("episodic", loop.episodic_config)
+            resolved = loop._resolve_donor_checkpoint("episodic", loop.tier_adapters["episodic"])
 
         assert resolved is None
         mock_build.assert_not_called()

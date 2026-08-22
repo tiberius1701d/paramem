@@ -205,7 +205,12 @@ def run_gpu_extraction_check(out_dir: Path) -> dict:
     """
     logger.info("Loading Mistral 7B base model (NF4)...")
     model_config = BENCHMARK_MODELS["mistral"]
-    model, tokenizer = load_base_model(model_config)
+    tier_adapters = {
+        "episodic": _tier_cfg(),
+        "semantic": _tier_cfg(),
+        "procedural": _tier_cfg(),
+    }
+    model, tokenizer = load_base_model(model_config, tier_adapters)
 
     anon_tokens = tokenizer.encode(SUBJECT_ANON, add_special_tokens=False)
     named_tokens = tokenizer.encode(SUBJECT_NAMED, add_special_tokens=False)
@@ -235,9 +240,7 @@ def run_gpu_extraction_check(out_dir: Path) -> dict:
         tokenizer=tokenizer,
         consolidation_config=consolidation_cfg,
         training_config=training_cfg,
-        episodic_adapter_config=_tier_cfg(),
-        semantic_adapter_config=_tier_cfg(),
-        procedural_adapter_config=_tier_cfg(),
+        tier_adapters=tier_adapters,
         # Required kwarg (no default on ConsolidationLoop.__init__).
         memory_store=MemoryStore(),
         wandb_config=None,

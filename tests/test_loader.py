@@ -227,12 +227,35 @@ class TestTierBackupScope:
             with tier_backup_scope(object(), config, "episodic"):
                 pass
 
-    def test_snapshots_and_frees_the_backup_on_clean_exit(self):
+    def test_yielded_scope_carries_no_model_attribute(self):
+        """The base model's object identity never changes across the scope,
+        so the yielded handle has nothing to resync -- it carries only
+        ``vram``, never a ``model`` reference the caller could be tempted
+        to read instead of its own."""
         config = AdapterConfig(rank=8, alpha=16, target_modules=["q_proj"])
         model = _make_fake_backup_model(resident_tiers=["semantic"])
 
         with tier_backup_scope(model, config, "semantic") as scope:
-            model = scope.model
+            assert not hasattr(scope, "model")
+
+    def test_yielded_scope_carries_no_model_attribute_even_on_exception(self):
+        config = AdapterConfig(rank=8, alpha=16, target_modules=["q_proj"])
+        model = _make_fake_backup_model(resident_tiers=["semantic"])
+        captured_scope = None
+
+        with pytest.raises(RuntimeError, match="boom"):
+            with tier_backup_scope(model, config, "semantic") as scope:
+                captured_scope = scope
+                raise RuntimeError("boom")
+
+        assert captured_scope is not None
+        assert not hasattr(captured_scope, "model")
+
+    def test_snapshots_and_frees_the_backup_on_clean_exit(self):
+        config = AdapterConfig(rank=8, alpha=16, target_modules=["q_proj"])
+        model = _make_fake_backup_model(resident_tiers=["semantic"])
+
+        with tier_backup_scope(model, config, "semantic"):
             assert "semantic_backup" in model.peft_config
             # Corrupt the resident tier as if training mutated it in place.
             for name in list(model._params):
@@ -250,8 +273,7 @@ class TestTierBackupScope:
         }
 
         with pytest.raises(RuntimeError, match="boom"):
-            with tier_backup_scope(model, config, "semantic") as scope:
-                model = scope.model
+            with tier_backup_scope(model, config, "semantic"):
                 for name in list(model._params):
                     if ".semantic." in name and "semantic_backup" not in name:
                         model._params[name].data.zero_()
@@ -267,8 +289,8 @@ class TestTierBackupScope:
         config = AdapterConfig(rank=8, alpha=16, target_modules=["q_proj"])
         model = _make_fake_backup_model(resident_tiers=[])
 
-        with tier_backup_scope(model, config, "semantic") as scope:
-            assert "semantic_backup" not in scope.model.peft_config
+        with tier_backup_scope(model, config, "semantic"):
+            assert "semantic_backup" not in model.peft_config
         assert "semantic_backup" not in model.peft_config
 
 
@@ -289,8 +311,7 @@ class TestTierBackupScopeDiscardsStaleBackup:
                 param.data.value = 999
 
         with pytest.raises(RuntimeError, match="boom"):
-            with tier_backup_scope(model, config, "semantic") as scope:
-                model = scope.model
+            with tier_backup_scope(model, config, "semantic"):
                 for name in list(model._params):
                     if ".semantic." in name and "semantic_backup" not in name:
                         model._params[name].data.zero_()
@@ -365,8 +386,7 @@ class TestTierBackupScopeTeardownNeverMasksTheInFlightException:
             real_delete(name)
 
         with pytest.raises(RuntimeError, match="boom"):
-            with tier_backup_scope(model, config, "semantic") as scope:
-                model = scope.model
+            with tier_backup_scope(model, config, "semantic"):
                 model.delete_adapter.side_effect = _delete_boom
                 for name in list(model._params):
                     if ".semantic." in name and "semantic_backup" not in name:

@@ -22,7 +22,7 @@ from paramem.server.config import load_server_config
 from paramem.models.loader import load_base_model
 
 cfg = load_server_config("tests/fixtures/server.yaml")
-model, tokenizer = load_base_model(cfg.model_config)
+model, tokenizer = load_base_model(cfg.model_config, cfg.tier_config_map())
 ```
 
 ### Why not load `configs/server.yaml.example` directly?

@@ -643,7 +643,7 @@ class TestAdapterDropoutConfig:
         )
         cfg = load_server_config(yaml_file)
         assert cfg.adapters.episodic.dropout == 0.0
-        assert cfg.episodic_adapter_config.dropout == 0.0
+        assert cfg.tier_config_map()["episodic"].dropout == 0.0
 
     def test_yaml_dropout_flows_to_adapter_config(self, tmp_path):
         """A non-default yaml dropout reaches the built AdapterConfig."""
@@ -660,7 +660,7 @@ class TestAdapterDropoutConfig:
         )
         cfg = load_server_config(yaml_file)
         assert cfg.adapters.episodic.dropout == 0.1
-        assert cfg.episodic_adapter_config.dropout == 0.1
+        assert cfg.tier_config_map()["episodic"].dropout == 0.1
 
     def test_negative_dropout_rejected(self, tmp_path):
         """dropout < 0 is not a valid probability — reject at config load."""

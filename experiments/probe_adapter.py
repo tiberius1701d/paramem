@@ -19,7 +19,12 @@ from pathlib import Path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from experiments.utils.production import encode_rendered, render_chat_prompt  # noqa: E402
+from experiments.utils.production import (  # noqa: E402
+    AdapterConfig,
+    encode_rendered,
+    mount_adapter,
+    render_chat_prompt,
+)
 from paramem.models.loader import unload_model  # noqa: E402
 
 
@@ -36,13 +41,25 @@ def load_model_and_adapter(adapter_path):
     """Load base model with the saved adapter."""
     from experiments.utils.test_harness import get_benchmark_models, load_model_and_config
 
-    # Infer model from adapter config
+    # Infer model + LoRA shape from the slot's own adapter_config.json — the
+    # live tier map (ensure_resident_tiers) wraps FIRST, before any slot is
+    # mounted, so it is what decides the tier's shape now (see
+    # models/loader.py's wrap-once docstring); a default-shaped map here
+    # would silently diverge from the slot being probed and either mount
+    # cleanly onto the wrong shape or reject a slot that actually matches.
     adapter_config_path = adapter_path / "adapter_config.json"
+    tier_adapter_config = AdapterConfig()
     if adapter_config_path.exists():
         with open(adapter_config_path) as f:
             cfg = json.load(f)
         base_model_id = cfg.get("base_model_name_or_path", "")
         print(f"  Base model: {base_model_id}")
+        tier_adapter_config = AdapterConfig(
+            rank=cfg.get("r", tier_adapter_config.rank),
+            alpha=cfg.get("lora_alpha", tier_adapter_config.alpha),
+            target_modules=cfg.get("target_modules", tier_adapter_config.target_modules),
+            dropout=cfg.get("lora_dropout", tier_adapter_config.dropout),
+        )
 
     # Load base model (Mistral)
     parser = argparse.ArgumentParser()
@@ -53,12 +70,12 @@ def load_model_and_adapter(adapter_path):
     models = list(get_benchmark_models(dummy_args))
     bench_name, bench_config = models[0]
 
-    model, tokenizer = load_model_and_config(bench_config)
+    model, tokenizer = load_model_and_config(bench_config, {"episodic": tier_adapter_config})
 
-    # Load saved adapter
-    from peft import PeftModel
-
-    model = PeftModel.from_pretrained(model, str(adapter_path), adapter_name="episodic")
+    # Mount the saved adapter's weights onto the resident (cold) episodic
+    # tier — the live shape wraps first, so a divergent on-disk rank fails
+    # loudly here rather than being silently adopted.
+    mount_adapter(model, adapter_path, "episodic")
     model.set_adapter("episodic")
     model.gradient_checkpointing_disable()
 

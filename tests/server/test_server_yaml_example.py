@@ -153,8 +153,8 @@ def test_debug_disabled_by_default(example_config):
 
 
 def test_episodic_adapter_config_builds(example_config):
-    """Property accessor must produce a valid AdapterConfig with attention targets."""
-    cfg = example_config.episodic_adapter_config
+    """tier_config_map() must produce a valid AdapterConfig with attention targets."""
+    cfg = example_config.tier_config_map()["episodic"]
     assert cfg.rank == 8
     assert cfg.alpha == 16
     assert cfg.learning_rate == 1e-4
@@ -164,7 +164,7 @@ def test_episodic_adapter_config_builds(example_config):
 
 def test_procedural_adapter_targets_mlp_layers(example_config):
     """Procedural adapter must include MLP layers — behavioural patterns live there."""
-    cfg = example_config.procedural_adapter_config
+    cfg = example_config.tier_config_map()["procedural"]
     assert "gate_proj" in cfg.target_modules, (
         "procedural adapter must target MLP gate_proj for representational imprinting"
     )

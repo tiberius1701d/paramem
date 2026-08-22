@@ -46,10 +46,11 @@
 ### AD-1: Model-Agnostic Adapter Layer
 
 All model-specific logic is isolated behind an abstraction that exposes:
-- `load_base_model(model_id, quantization_config) -> Model`
-- `create_adapter(model, adapter_config) -> PeftModel`
-- `load_adapter(model, path, name) -> PeftModel`
+- `load_base_model(model_config, adapters) -> (PeftModel, tokenizer)`
+- `create_adapter(model, adapter_config, name)` — in place, no return
+- `mount_adapter(model, slot, name)` — in place, no return
 - `switch_adapter(model, name)`
+- `ensure_resident_tiers(model, adapters)` — the wrap primitive
 
 The consolidation loop, graph extractor, and evaluation harness operate against this interface, not against specific model implementations. Swapping models requires changing one config value. The production default is Mistral 7B Instruct v0.3. Validated on three model families (Qwen 2.5 3B, Gemma 2 9B, Mistral 7B); broader validation pending.
 
@@ -65,6 +66,8 @@ Base Model (frozen, 4-bit quantized)
 ```
 
 During inference, adapters can be switched at near-zero cost. During training, each adapter is optimized independently with its own objective.
+
+Which tiers exist is `adapters.<tier>.enabled`, resolved once by `ServerConfig.tier_config_map()`; `promotion_threshold` governs when keys move episodic→semantic, never whether semantic exists.
 
 ### AD-11: Procedural Adapter Targets MLP Layers (live in server deployment)
 
@@ -234,7 +237,7 @@ Every adapter training event — consolidation cycle, interim mint, base-swap Ph
 
 **Pause and resume.** "Pause" is process exit. On the next boot PEFT loads production from disk; `in_training` is absent (never persisted; excluded from backup). The next `train_adapter` call creates a fresh staging slot and `_resolve_resume_checkpoint` finds the saved checkpoint; HF Trainer's `resume_from_checkpoint` loads its weights into staging before continuing from step/epoch N+1.
 
-**Live-reload after base-swap final tier.** After the final `migrate()` returns, the orchestrator calls `_live_reload_base_model` before marking `status=pass`. The reload tears down the PeftModel and rebuilds it from disk, picking up every tier's promoted adapter so the running server serves the new base without a systemctl restart. For the reload to fit on 8 GiB, all base-model holders (`BackgroundTrainer.model`, `ConsolidationLoop.model/.extraction.model`) are released via their encapsulated `release()` methods before the reload.
+**Live-reload after base-swap final tier.** After the final `migrate()` returns, the orchestrator calls `_live_reload_base_model` before marking `status=pass`. The reload releases every holder and reloads the base model, re-creating the configured tiers at load, picking up every tier's promoted adapter so the running server serves the new base without a systemctl restart. For the reload to fit on 8 GiB, all base-model holders (`BackgroundTrainer.model`, `ConsolidationLoop.model/.extraction.model`) are released via their encapsulated `release()` methods before the reload.
 
 ### AD-17: Background Training with Inference Pause
 

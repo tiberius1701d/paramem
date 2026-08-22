@@ -34,6 +34,7 @@ from datetime import date
 from unittest.mock import MagicMock, patch
 
 import pytest
+from peft import PeftModel
 
 from paramem.graph.phase_trace import extraction_trace
 from paramem.memory.store import MemoryStore as _MS
@@ -337,7 +338,17 @@ class _ProbeAndReasonHelpers:
 
     @staticmethod
     def make_model(adapter_names):
-        model = MagicMock()
+        """``MagicMock(spec=PeftModel)`` -- passes the ``isinstance(model,
+        PeftModel)`` precondition ``base_model_inference`` now enforces
+        wherever ``_probe_and_reason``'s reasoning generate reaches it.
+        ``gradient_checkpointing_disable``/``_enable`` are dynamic
+        ``__getattr__``-delegated attributes a real (wrapped) PeftModel
+        exposes that ``spec`` cannot see via ``dir(PeftModel)``, so they
+        are pre-set explicitly (mirrors ``tests/server/test_gates.py::
+        _make_mock_model``)."""
+        model = MagicMock(spec=PeftModel)
+        model.gradient_checkpointing_disable = MagicMock()
+        model.gradient_checkpointing_enable = MagicMock()
         model.peft_config = {name: MagicMock() for name in adapter_names}
         return model
 

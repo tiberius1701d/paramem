@@ -315,7 +315,7 @@ class TopologyAssessment:
 
 
 def assess_topology(
-    adapter_config: AdapterConfig,
+    adapter_config: AdapterConfig | None,
     *,
     main_adapter_configs: Sequence[AdapterConfig],
     max_interim_count: int,
@@ -344,7 +344,12 @@ def assess_topology(
         adapter_config: LoRA config for interim/episodic adapters — interims
             are always episodic-shaped regardless of which main tiers are
             enabled (``paramem/memory/interim_adapter.py`` always passes
-            ``episodic_config``).
+            ``episodic_config``). ``None`` when no interim tier exists (the
+            episodic main tier is disabled): the config's own validation
+            forbids ``max_interim_count > 0`` without episodic, and no
+            interim adapter is ever minted at ``max_interim_count == 0``
+            regardless of ``interim_overflow_slack`` — so the interim
+            contribution to the working set is exactly 0 in that case.
         main_adapter_configs: LoRA configs for the ENABLED main tiers, in tier
             order (episodic, semantic, procedural). The main-adapter total,
             the transient full-fold backup reserve, and the worst-case
@@ -377,8 +382,12 @@ def assess_topology(
 
     headroom_bytes = int(headroom_gib * _GiB)
 
-    adapter_bytes = estimated_adapter_bytes(
-        adapter_config, hidden_size, num_layers, lora_dtype_bytes, peft_overhead_bytes
+    adapter_bytes = (
+        estimated_adapter_bytes(
+            adapter_config, hidden_size, num_layers, lora_dtype_bytes, peft_overhead_bytes
+        )
+        if adapter_config is not None
+        else 0
     )
 
     per_tier_bytes = [
@@ -426,7 +435,7 @@ def assess_topology(
         main_adapter_count=main_adapter_count,
         adapter_bytes=adapter_bytes,
         max_interim_count=max_interim_count,
-        rank=adapter_config.rank,
+        rank=adapter_config.rank if adapter_config is not None else 0,
         headroom_bytes=headroom_bytes,
         total_required_bytes=total_required,
         total_with_margin_bytes=total_with_margin,

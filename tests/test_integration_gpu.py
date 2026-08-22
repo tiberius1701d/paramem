@@ -36,14 +36,23 @@ def _clear_lora_state(model) -> None:
     for the next consumer (this module's later tests AND subsequent test
     files that receive the same session model):
 
-    1. **Disable injected LoRA adapter layers.**  After tests that call
-       :func:`~paramem.models.loader.create_adapter`, the base model's
-       ``nn.Linear`` layers are replaced by PEFT ``LoraLinear`` modules
-       whose ``_active_adapter`` may still point to a trained adapter.
-       Setting ``_active_adapter = []`` on every ``LoraLinear`` (via PEFT's
-       ``BaseTunerLayer.set_adapter``) makes each module's ``forward`` skip
-       the LoRA path and return ``base_layer(x)`` — identical to the
-       original linear behaviour.
+    1. **Reset adapter residency to exactly the configured main tiers.**
+       The base model's object identity is fixed at load time
+       (:func:`~paramem.models.loader.load_base_model` /
+       :func:`~paramem.models.loader.ensure_resident_tiers`): *model* is
+       always a ``PeftModel``, never a raw model with injected
+       ``LoraLinear`` layers to scan for.  Tests in this module mint extra
+       adapters on top of the configured tiers (interim slots,
+       ``in_training``, backups).  The pre-wrap-once reset —
+       ``BaseTunerLayer.set_adapter([])`` on every tuner layer — would
+       leave the tuner layers empty while ``PeftModel.active_adapter``
+       still names a valid adapter: ``forward`` still resolves (it reads
+       the wrapper's own active-adapter name, never the layer state) but
+       with NO adapter actually contributing — a silent layer/wrapper
+       divergence no assertion catches. The correct reset under
+       wrap-once is therefore at the ``PeftModel`` level: detach every
+       resident adapter, then recreate exactly the configured main tiers,
+       cold — the same state as immediately after boot.
 
     2. **Restore generation-clean training state.**  Training paths
        (``train_adapter`` via ``BackgroundTrainer`` / ``ConsolidationLoop``)
@@ -56,29 +65,27 @@ def _clear_lora_state(model) -> None:
        output (truncated/garbage responses).  Disable checkpointing and put
        the model back in ``eval()`` mode so downstream generation is clean.
 
-    No GPU memory is freed here; the lora_A/lora_B parameters remain
-    resident until the session model is deleted at session teardown.
+    No GPU memory is freed here; the lora_A/lora_B parameters of the
+    recreated tiers remain resident until the session model is deleted at
+    session teardown.
 
     Args:
-        model: The ``PreTrainedModel`` (possibly with injected PEFT layers)
-            to clean.  A plain model with no LoRA layers still gets its
-            checkpointing/eval state restored.
+        model: The live ``PeftModel`` to clean.
     """
-    # (2) Always restore generation-clean state, even on a plain model with
-    # no LoRA layers — training may have toggled these on the base model.
+    # (2) Always restore generation-clean state.
     if hasattr(model, "gradient_checkpointing_disable"):
         model.gradient_checkpointing_disable()
     model.eval()
 
-    # (1) Disable any injected LoRA adapters.
-    try:
-        from peft.tuners.tuners_utils import BaseTunerLayer
-    except ImportError:
-        # PEFT not installed — no LoRA layers could have been injected.
-        return
-    for module in model.modules():
-        if isinstance(module, BaseTunerLayer):
-            module.set_adapter([])
+    # (1) Detach every resident adapter, then recreate exactly the
+    # configured main tiers, cold — a delete-then-create pair, with no
+    # model use in between.
+    from paramem.models.loader import detach_adapters, ensure_resident_tiers
+    from paramem.server.config import load_server_config
+
+    cfg = load_server_config("tests/fixtures/server.yaml")
+    detach_adapters(model, list(model.peft_config))
+    ensure_resident_tiers(model, cfg.tier_config_map())
 
 
 def _restore_generation_state(model) -> None:
@@ -421,7 +428,7 @@ class TestBackgroundTrainerTraining:
         model, tokenizer = model_and_tokenizer
 
         if not hasattr(model, "peft_config") or "episodic" not in model.peft_config:
-            model = create_adapter(model, AdapterConfig(), "episodic")
+            create_adapter(model, AdapterConfig(), "episodic")
 
         # Build enough data for training to take at least a few steps.
         keyed = assign_keys([("Alex", f"fact_{i}", f"value_{i}") for i in range(5)])
@@ -494,16 +501,19 @@ def staging_model(model_and_tokenizer):
 
     added: list[str] = []
 
-    # Wrap if not already a PeftModel
+    # The base model's object identity is fixed at load time
+    # (load_base_model / ensure_resident_tiers): model is always a
+    # PeftModel here, already wrapped with every configured tier -- there
+    # is no raw-model case left for create_adapter to handle (it raises
+    # TypeError on a non-PeftModel rather than wrapping one).
     if not isinstance(model, PeftModel):
-        model = create_adapter(model, cfg, "episodic")
-        added.append("episodic")
+        raise TypeError(f"staging_model requires a PeftModel, got {type(model).__name__}")
 
     if "episodic" not in model.peft_config:
-        model = create_adapter(model, cfg, "episodic")
+        create_adapter(model, cfg, "episodic")
         added.append("episodic")
     if "in_training" not in model.peft_config:
-        model = create_adapter(model, cfg, "in_training")
+        create_adapter(model, cfg, "in_training")
         added.append("in_training")
 
     yield model, tokenizer
@@ -843,10 +853,10 @@ class TestUnloadInterimAdaptersSwitchGPU:
 
         created_episodic = not isinstance(model, PeftModel) or "episodic" not in model.peft_config
         if created_episodic:
-            model = create_adapter(model, cfg, "episodic")
+            create_adapter(model, cfg, "episodic")
 
         interim_name = "episodic_interim_20260804T0000"
-        model = create_adapter(model, cfg, interim_name)
+        create_adapter(model, cfg, interim_name)
 
         try:
             # Mirror the production hazard the guard exists for: an interim
@@ -1067,14 +1077,16 @@ class TestVRAMBudget:
     )
 
     def _create_adapters(self, model, adapter_cfg, names):
-        """Attach each adapter in ``names`` to ``model`` and return the (possibly
-        wrapped) PeftModel. Delegates to :func:`create_adapter` so the
-        wrap-vs-add-adapter logic matches production."""
+        """Attach each adapter in ``names`` to ``model`` in place.
+
+        Delegates to :func:`create_adapter`, which mutates *model* and
+        returns ``None`` — the base model's object identity is fixed at
+        load time, so this never wraps; it only ever adds onto the
+        already-wrapped ``model`` passed in."""
         from paramem.models.loader import create_adapter
 
         for name in names:
-            model = create_adapter(model, adapter_cfg, name)
-        return model
+            create_adapter(model, adapter_cfg, name)
 
     def _delete_adapters(self, model, names):
         for name in names:
@@ -1200,7 +1212,7 @@ class TestVRAMBudget:
             staging_name = "in_training_vram_probe"
             all_names = main_names + interim_names + [staging_name]
 
-            model = self._create_adapters(model, adapter_cfg, all_names)
+            self._create_adapters(model, adapter_cfg, all_names)
             created_names.extend(all_names)
 
             # ── (b) reality gate: verify post-load real VRAM usage.

@@ -19,7 +19,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import torch  # noqa: E402
-from peft import LoraConfig, get_peft_model  # noqa: E402
 
 from paramem.models.loader import load_base_model  # noqa: E402
 from paramem.server.config import ServerConfig  # noqa: E402
@@ -48,37 +47,33 @@ def main() -> int:
         f"episodic should stay attention-only, got {sorted(epi_targets)}"
     )
 
-    adapter_cfg = cfg._make_adapter_config(cfg.adapters.procedural)
+    adapter_cfg = cfg.tier_config_map()["procedural"]
     assert set(adapter_cfg.target_modules) == proc_targets
 
-    # 2. Load base model (Mistral 7B NF4 per server default).
+    # 2. Load base model (Mistral 7B NF4 per server default), wrapped with
+    # the procedural tier directly — the base model's object identity is
+    # fixed at load time, and load_base_model / ensure_resident_tiers is
+    # the one get_peft_model call site; a second get_peft_model call on an
+    # already-wrapped PeftModel would alias its peft_config dict rather
+    # than reset it (PEFT tuners_utils.py:281-293).
     logger.info("Loading base model: %s", cfg.model_config.model_id)
     vram_before = torch.cuda.memory_allocated() / 1e9
-    model, tokenizer = load_base_model(cfg.model_config)
+    model, tokenizer = load_base_model(cfg.model_config, {"procedural": adapter_cfg})
+    # load_base_model wraps in one step (base model + the procedural LoRA
+    # adapter both resident on return), so there is no separate
+    # "base-model-only" VRAM checkpoint to compare against — a single
+    # measurement covers both.
     vram_after_load = torch.cuda.memory_allocated() / 1e9
     logger.info(
-        "VRAM after base model load: %.2f GB (Δ %.2f)",
+        "VRAM after base model + procedural adapter load: %.2f GB (Δ %.2f)",
         vram_after_load,
         vram_after_load - vram_before,
     )
 
-    # 3. Attach procedural LoRA adapter with MLP targeting.
-    lora = LoraConfig(
-        r=adapter_cfg.rank,
-        lora_alpha=adapter_cfg.alpha,
-        target_modules=adapter_cfg.target_modules,
-        lora_dropout=adapter_cfg.dropout,
-        bias="none",
-        task_type="CAUSAL_LM",
-    )
-    peft_model = get_peft_model(model, lora)
+    # 3. The procedural LoRA adapter (attention + MLP targeting) is already
+    # attached by load_base_model above.
+    peft_model = model
     peft_model.print_trainable_parameters()
-    vram_after_adapter = torch.cuda.memory_allocated() / 1e9
-    logger.info(
-        "VRAM after adapter attach: %.2f GB (Δ %.2f)",
-        vram_after_adapter,
-        vram_after_adapter - vram_after_load,
-    )
 
     # 4. Verify LoRA modules exist on both attention AND MLP layers.
     attn_lora_hits = 0

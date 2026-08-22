@@ -291,15 +291,9 @@ def main() -> None:
         logger.info("GPU acquired")
         wait_for_cooldown(52, 600, label="preload")
 
-        # Load base model (exactly as dataset_probe.py).
-        from paramem.models.loader import load_base_model
-
-        model_cfg = BENCHMARK_MODELS[args.model]
-        logger.info("Loading base model: %s", model_cfg.model_id)
-        model, tokenizer = load_base_model(model_cfg)
-
-        # Build ConsolidationLoop via canonical server factory
-        # (verbatim from dataset_probe.py).
+        # Build the server config first (verbatim from dataset_probe.py) —
+        # load_base_model needs the resolved tier map (config.tier_config_map())
+        # before the model can be wrapped.
         import dataclasses
 
         from paramem.server.config import load_server_config
@@ -318,6 +312,15 @@ def main() -> None:
         if not args.with_cloud:
             cfg.consolidation.extraction_enrichment_provider = ""
             cfg.consolidation.extraction_plausibility_judge = "off"
+
+        # Load base model (exactly as dataset_probe.py), wrapped with the
+        # tiers this config actually enables (episodic + semantic;
+        # procedural disabled above).
+        from paramem.models.loader import load_base_model
+
+        model_cfg = BENCHMARK_MODELS[args.model]
+        logger.info("Loading base model: %s", model_cfg.model_id)
+        model, tokenizer = load_base_model(model_cfg, cfg.tier_config_map())
 
         loop = create_consolidation_loop(
             model=model,

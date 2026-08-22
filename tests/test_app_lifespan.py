@@ -1146,88 +1146,6 @@ class TestBootCompletionTaskLifespan:
 
 
 # ---------------------------------------------------------------------------
-# Eager consolidation-loop creation must degrade the boot, not crash it —
-# ConsolidationLoop.__init__ allocates GPU memory before the post-load VRAM
-# gate runs, so a failure there (VramExhausted or otherwise) must not
-# propagate out of the lifespan.
-# ---------------------------------------------------------------------------
-
-
-class TestEagerConsolidationLoopBootDegrade:
-    def test_eager_loop_failure_does_not_crash_boot(self, tmp_path):
-        """A boot-time failure inside ``_eager_create_consolidation_loop``
-        (e.g. ``VramExhausted`` from ``ensure_adapters`` -> ``create_adapter``)
-        must degrade, not crash: the lifespan completes normally, no
-        ``consolidation_loop`` is installed, and the lazy get-or-create
-        remains the fallback for every later caller that needs one."""
-        import paramem.server.app as app_module
-        from paramem.server.config import PathsConfig, ServerConfig, STTConfig, TTSConfig
-
-        config = ServerConfig(model_name="mistral")
-        config.cloud_only = True
-        config.stt = STTConfig(enabled=False)
-        config.tts = TTSConfig(enabled=False)
-        root = tmp_path / "data"
-        config.paths = PathsConfig(data=root, sessions=root / "sessions", debug=root / "debug")
-
-        saved_state = {
-            key: app_module._state.get(key)
-            for key in (
-                "config",
-                "cloud_only_startup",
-                "defer_model",
-                "boot_completion_task",
-                "base_swap_task",
-                "consolidation_loop",
-            )
-        }
-        app_module._state["config"] = config
-        app_module._state["cloud_only_startup"] = True
-        app_module._state["defer_model"] = False
-        app_module._state["boot_completion_task"] = None
-        app_module._state["base_swap_task"] = None
-        app_module._state["consolidation_loop"] = None
-
-        async def _run():
-            with (
-                patch.object(app_module, "predict_base_bytes", return_value=None),
-                patch.object(app_module, "_gpu_occupied", return_value=False),
-                patch.object(app_module, "_build_runtime_components"),
-                patch.object(app_module, "_arm_active_store_migration", return_value=False),
-                patch.object(app_module, "_release_base_model_in_process"),
-                patch.object(app_module, "safe_empty_cache"),
-                patch.object(app_module, "_reconcile_scheduling_timers"),
-                patch.object(app_module, "_create_backup"),
-                patch.object(app_module, "_dispatch_consolidation"),
-                patch.object(
-                    app_module,
-                    "_eager_create_consolidation_loop",
-                    side_effect=RuntimeError("boom — simulated eager-loop failure"),
-                ),
-                patch.dict(
-                    app_module._state,
-                    {"session_buffer": MagicMock(), "speaker_store": MagicMock()},
-                    clear=False,
-                ),
-            ):
-                async with app_module.lifespan(app_module.app):
-                    pass
-                for _ in range(5):
-                    await asyncio.sleep(0)
-
-        try:
-            asyncio.run(_run())
-        finally:
-            for key, val in saved_state.items():
-                if val is None:
-                    app_module._state.pop(key, None)
-                else:
-                    app_module._state[key] = val
-
-        assert app_module._state.get("consolidation_loop") is None
-
-
-# ---------------------------------------------------------------------------
 # TestReclaimLoopPermanentDegradeGate — auto-reclaim must never arm after a
 # permanent cloud-only degrade
 # ---------------------------------------------------------------------------
@@ -1262,73 +1180,6 @@ class TestReclaimLoopPermanentDegradeGate:
             "reclaim_task",
             "consolidation_loop",
         )
-
-    def test_permanent_cuda_fault_degrade_leaves_no_reclaim_task(self, tmp_path):
-        """A --defer-model boot starts transiently cloud-only
-        (``cloud_only_reason='training'`` — not in
-        ``_PERMANENT_CLOUD_ONLY_REASONS``), but a fatal, crash-loop-exhausted
-        CUDA fault during eager consolidation-loop creation degrades it to
-        ``'cuda_fault_persistent'`` — a permanent reason minted AFTER the old
-        gate's ``cloud_only_startup``-only check would already have decided
-        to arm.  The gate must re-read the reason at task-creation time and
-        refuse to arm; auto-reclaiming would reload the base model straight
-        back into the same poisoned CUDA context.
-        """
-        import paramem.server.app as app_module
-
-        config = self._make_defer_model_config(tmp_path)
-
-        saved_state = {key: app_module._state.get(key) for key in self._seeded_state_keys()}
-        app_module._state["config"] = config
-        app_module._state["cloud_only_startup"] = False
-        app_module._state["defer_model"] = True
-        app_module._state["cloud_only_reason"] = None
-        app_module._state["mode"] = "local"
-        app_module._state["boot_completion_task"] = None
-        app_module._state["base_swap_task"] = None
-        app_module._state["reclaim_task"] = None
-        app_module._state["consolidation_loop"] = None
-
-        fatal_exc = RuntimeError("CUDA error: an illegal memory access was encountered")
-
-        async def _run():
-            with (
-                patch.object(app_module, "predict_base_bytes", return_value=None),
-                patch.object(app_module, "_gpu_occupied", return_value=False),
-                patch("paramem.server.app.torch.cuda.is_available", return_value=True),
-                patch.object(app_module, "_build_runtime_components"),
-                patch.object(app_module, "_eager_create_consolidation_loop", side_effect=fatal_exc),
-                patch.object(app_module, "_cuda_crashloop_exhausted", return_value=True),
-                patch.object(app_module, "_release_base_model_in_process"),
-                patch.object(app_module, "notify_server"),
-                patch.object(app_module, "safe_empty_cache"),
-                patch.object(app_module, "_arm_active_store_migration", return_value=False),
-                patch.object(app_module, "_reconcile_scheduling_timers"),
-                patch.object(app_module, "_create_backup"),
-                patch.object(app_module, "_dispatch_consolidation"),
-                patch.dict(
-                    app_module._state,
-                    {"session_buffer": MagicMock(), "speaker_store": MagicMock()},
-                    clear=False,
-                ),
-            ):
-                async with app_module.lifespan(app_module.app):
-                    assert app_module._state.get("cloud_only_reason") == "cuda_fault_persistent"
-                    assert app_module._state.get("reclaim_task") is None, (
-                        "reclaim_task must not be armed after a permanent "
-                        "cuda_fault_persistent degrade"
-                    )
-                for _ in range(5):
-                    await asyncio.sleep(0)
-
-        try:
-            asyncio.run(_run())
-        finally:
-            for key, val in saved_state.items():
-                if val is None:
-                    app_module._state.pop(key, None)
-                else:
-                    app_module._state[key] = val
 
     def test_transient_defer_model_boot_still_arms_reclaim_task(self, tmp_path):
         """A --defer-model boot that hits no fault (``cloud_only_reason``
@@ -1387,6 +1238,75 @@ class TestReclaimLoopPermanentDegradeGate:
                     app_module._state[key] = val
 
         assert task_holder["task"].cancelled(), "reclaim_task must be cancelled at shutdown"
+
+    def test_mid_boot_fatal_cuda_fault_blocks_the_reclaim_task(self, tmp_path):
+        """A --defer-model boot starts with a transient reason ('training'),
+        but a fatal CUDA fault surfacing from _build_runtime_components
+        (still reached even when cloud_only=True from the start) degrades
+        cloud_only_reason to the permanent 'cuda_fault_persistent' via
+        _fail_fast_cuda -> _degrade_to_cloud_only. The reclaim-task arm
+        check must read that live value at task-creation time, not a
+        snapshot taken before the fault -- arming it here would reload the
+        base model straight back into the same poisoned CUDA context."""
+        from paramem.utils.vram_guard import is_fatal_cuda_fault
+
+        fault = RuntimeError("CUDA error: an illegal memory access was encountered")
+        assert is_fatal_cuda_fault(fault), (
+            "precondition: the injected fault must actually classify as fatal"
+        )
+
+        import paramem.server.app as app_module
+
+        config = self._make_defer_model_config(tmp_path)
+
+        saved_state = {key: app_module._state.get(key) for key in self._seeded_state_keys()}
+        app_module._state["config"] = config
+        app_module._state["cloud_only_startup"] = False
+        app_module._state["defer_model"] = True
+        app_module._state["cloud_only_reason"] = None
+        app_module._state["mode"] = "local"
+        app_module._state["boot_completion_task"] = None
+        app_module._state["base_swap_task"] = None
+        app_module._state["reclaim_task"] = None
+        app_module._state["consolidation_loop"] = None
+
+        async def _run():
+            with (
+                patch.object(app_module, "predict_base_bytes", return_value=None),
+                patch.object(app_module, "_gpu_occupied", return_value=False),
+                patch("paramem.server.app.torch.cuda.is_available", return_value=True),
+                patch.object(app_module, "_build_runtime_components", side_effect=fault),
+                # _fail_fast_cuda os._exit(1)s on a FRESH crash-loop burst
+                # (systemd-restart recovery) -- only a burst the crash-loop
+                # guard reports exhausted degrades in-process instead, which
+                # is the scenario this test drives.
+                patch.object(app_module, "_cuda_crashloop_exhausted", return_value=True),
+                patch.object(app_module, "_release_base_model_in_process"),
+                patch.object(app_module, "_arm_active_store_migration", return_value=False),
+                patch.object(app_module, "_reconcile_scheduling_timers"),
+                patch.object(app_module, "_create_backup"),
+                patch.object(app_module, "_dispatch_consolidation"),
+                patch.dict(
+                    app_module._state,
+                    {"session_buffer": MagicMock(), "speaker_store": MagicMock()},
+                    clear=False,
+                ),
+            ):
+                async with app_module.lifespan(app_module.app):
+                    assert app_module._state.get("cloud_only_reason") == "cuda_fault_persistent"
+                    assert app_module._state.get("reclaim_task") is None, (
+                        "reclaim_task must NOT be armed once a mid-boot fault has "
+                        "landed cloud_only_reason on a permanent reason"
+                    )
+
+        try:
+            asyncio.run(_run())
+        finally:
+            for key, val in saved_state.items():
+                if val is None:
+                    app_module._state.pop(key, None)
+                else:
+                    app_module._state[key] = val
 
 
 # ---------------------------------------------------------------------------
@@ -1487,6 +1407,141 @@ class TestModeSlotHygiene:
 
         try:
             asyncio.run(_run())
+        finally:
+            for key, val in saved_state.items():
+                if val is None:
+                    app_module._state.pop(key, None)
+                else:
+                    app_module._state[key] = val
+
+
+# ---------------------------------------------------------------------------
+# TestBootDegradeIsNarrowedToVramAndFatalCuda — the boot call to
+# _load_model_into_state degrades to cloud-only ONLY for VramExhausted
+# (cold-tier creation is a VRAM allocation) and the fatal-CUDA path; every
+# other exception -- in particular a config-vs-disk refusal, which is a
+# RuntimeError raised from inside _load_model_into_state -- must propagate
+# and abort the boot loudly rather than being swallowed into a silent
+# cloud-only degrade.
+# ---------------------------------------------------------------------------
+
+
+class TestBootDegradeIsNarrowedToVramAndFatalCuda:
+    def test_vram_exhausted_during_tier_creation_degrades_to_cloud_only(self, tmp_path):
+        """VramExhausted from _load_model_into_state (cold-tier creation
+        overflowing VRAM) must degrade the boot to cloud-only with
+        cloud_only_reason='insufficient_vram' -- never propagate and kill
+        the unit."""
+        import pytest
+
+        from paramem.server import app as app_module
+        from paramem.server.config import PathsConfig, ServerConfig
+        from paramem.utils.vram_guard import VramExhausted
+
+        class _Sentinel(Exception):
+            pass
+
+        config = ServerConfig(model_name="mistral")
+        config.cloud_only = False
+        root = tmp_path / "data"
+        config.paths = PathsConfig(data=root, sessions=root / "sessions", debug=root / "debug")
+
+        saved_state = {
+            key: app_module._state.get(key)
+            for key in ("config", "cloud_only_startup", "defer_model")
+        }
+        app_module._state["config"] = config
+        app_module._state["cloud_only_startup"] = False
+        app_module._state["defer_model"] = False
+
+        try:
+            with (
+                patch.object(app_module, "predict_base_bytes", return_value=None),
+                patch.object(app_module, "_gpu_occupied", return_value=False),
+                patch("paramem.server.app.torch.cuda.is_available", return_value=True),
+                patch.object(
+                    app_module,
+                    "_load_model_into_state",
+                    side_effect=VramExhausted("tier creation"),
+                ),
+                patch.object(app_module, "_release_base_model_in_process"),
+                patch.object(
+                    app_module,
+                    "_build_runtime_components",
+                    side_effect=_Sentinel("short-circuit after degrade"),
+                ),
+            ):
+
+                async def _run():
+                    async with app_module.lifespan(app_module.app):
+                        pass
+
+                with pytest.raises(_Sentinel):
+                    asyncio.run(_run())
+
+            # Assert while the degrade's writes are still live -- the
+            # restore below intentionally resets cloud_only_reason/model so
+            # this test cannot leak boot-degrade state into a later test.
+            assert app_module._state.get("cloud_only_reason") == "insufficient_vram"
+            assert app_module._state.get("model") is None
+        finally:
+            for key, val in saved_state.items():
+                if val is None:
+                    app_module._state.pop(key, None)
+                else:
+                    app_module._state[key] = val
+            app_module._state.pop("cloud_only_reason", None)
+            app_module._state.pop("model", None)
+            app_module._state.pop("topology_assessment", None)
+            app_module._state.pop("usable_ceiling_bytes", None)
+            app_module._state.pop("device_total_memory_bytes", None)
+
+    def test_a_config_vs_disk_refusal_is_not_swallowed_into_cloud_only(self, tmp_path):
+        """A config-vs-disk-refusal-shaped RuntimeError raised from
+        _load_model_into_state is neither VramExhausted nor a fatal-CUDA
+        fault -- it must propagate out of lifespan and abort the boot, never
+        be swallowed into a silent cloud-only degrade."""
+        import pytest
+
+        from paramem.server import app as app_module
+        from paramem.server.config import PathsConfig, ServerConfig
+
+        config = ServerConfig(model_name="mistral")
+        config.cloud_only = False
+        root = tmp_path / "data"
+        config.paths = PathsConfig(data=root, sessions=root / "sessions", debug=root / "debug")
+
+        saved_state = {
+            key: app_module._state.get(key)
+            for key in ("config", "cloud_only_startup", "defer_model", "cloud_only_reason", "mode")
+        }
+        app_module._state["config"] = config
+        app_module._state["cloud_only_startup"] = False
+        app_module._state["defer_model"] = False
+
+        refusal_message = (
+            "adapters.episodic.enabled=false but 1 interim slot(s) still exist "
+            "under adapter_dir/episodic"
+        )
+
+        try:
+            with (
+                patch.object(app_module, "predict_base_bytes", return_value=None),
+                patch.object(app_module, "_gpu_occupied", return_value=False),
+                patch("paramem.server.app.torch.cuda.is_available", return_value=True),
+                patch.object(
+                    app_module,
+                    "_load_model_into_state",
+                    side_effect=RuntimeError(refusal_message),
+                ),
+            ):
+
+                async def _run():
+                    async with app_module.lifespan(app_module.app):
+                        pass
+
+                with pytest.raises(RuntimeError, match="interim slot"):
+                    asyncio.run(_run())
         finally:
             for key, val in saved_state.items():
                 if val is None:

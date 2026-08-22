@@ -511,11 +511,25 @@ _SHAPE_CONSEQUENCE: dict[str, str] = {
 def compute_shape_changes(
     candidate_yaml: dict,
     adapter_dir: Path,
+    candidate_config: ServerConfig,
 ) -> tuple[list[ShapeChange], list[str]]:
     """Return shape-change rows and skip warnings for every enabled adapter.
 
-    For each adapter name whose ``adapters.<name>.enabled`` is ``True`` in
-    *candidate_yaml*:
+    Tier existence is read from *candidate_config* — ``ServerConfig.tier_config_map()``
+    is the sole derivation of ``adapters.<tier>.enabled`` project-wide; this
+    function is not a second one. *candidate_yaml* still carries the answer
+    to a DIFFERENT question this function also asks per field: whether the
+    operator explicitly TOUCHED ``rank``/``alpha``/``target_modules`` in the
+    candidate at all (an omitted field surfaces no change, regardless of
+    whether it differs from the resolved default) — a raw dict read for that
+    one purpose, never for tier existence. The caller already constructs
+    *candidate_config* via :func:`validate_candidate` before calling this
+    (candidate-vs-live-path anchored, and validated against
+    ``load_server_config``'s own tier-existence cross-field guards), so
+    building it a second time here would be the two-implementations mistake
+    ``build_server_config``'s own docstring warns against.
+
+    For each adapter name in ``candidate_config.tier_config_map()``:
 
     1. Resolve that adapter's
        :class:`~paramem.adapters.registry_binding.TierBinding` via
@@ -563,10 +577,15 @@ def compute_shape_changes(
     Parameters
     ----------
     candidate_yaml:
-        Parsed YAML dict from the candidate ``server.yaml``.
+        Parsed YAML dict from the candidate ``server.yaml``. Read here only
+        for the per-field ``rank``/``alpha``/``target_modules`` explicit-edit
+        check — never for tier existence.
     adapter_dir:
         Filesystem path to the adapter directory
         (``config.adapter_dir`` / ``data/ha/adapters/``).
+    candidate_config:
+        The candidate constructed as a ``ServerConfig`` (via
+        :func:`validate_candidate`) — the sole source of which tiers exist.
 
     Returns
     -------
@@ -588,11 +607,12 @@ def compute_shape_changes(
 
     changes: list[ShapeChange] = []
     warnings: list[str] = []
+    enabled_tiers = candidate_config.tier_config_map()
 
     for adapter_name, adapter_vals in sorted(adapters_cfg.items()):
         if not isinstance(adapter_vals, dict):
             continue
-        if not adapter_vals.get("enabled", False):
+        if adapter_name not in enabled_tiers:
             continue
 
         kind_dir = adapter_dir / adapter_name

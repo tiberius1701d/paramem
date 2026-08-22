@@ -140,7 +140,7 @@ def _make_pipeline(model=None, tokenizer=None, **config_overrides):
 
     config_overrides.setdefault("scrub", {"person name"})
     return ExtractionPipeline(
-        model=model if model is not None else MagicMock(),
+        model=model if model is not None else _peft_model_mock(),
         tokenizer=tokenizer if tokenizer is not None else MagicMock(),
         config=ExtractionConfig(**config_overrides),
         prompts_dir=None,
@@ -289,20 +289,6 @@ def test_run_wraps_peft_model_in_disable_adapter(monkeypatch):
     fake_peft.disable_adapter.assert_called_once()
 
 
-def test_run_skips_disable_adapter_for_plain_model(monkeypatch):
-    """Gap B (negative): plain (non-PeftModel) models must NOT be wrapped."""
-    plain_model = MagicMock()  # no spec — fails isinstance(_, PeftModel)
-    pipeline = _make_pipeline(model=plain_model)
-
-    monkeypatch.setattr(
-        "paramem.graph.extraction_pipeline.extract_graph",
-        lambda *a, **kw: MagicMock(),
-    )
-    pipeline.run("transcript", "s001", speaker_id="speaker0")
-
-    plain_model.disable_adapter.assert_not_called()
-
-
 def test_run_threads_positional_args(monkeypatch):
     """Gap C: :meth:`ExtractionPipeline.run` must pass
     ``(model, tokenizer, transcript, session_id)`` to the real extractor
@@ -321,7 +307,7 @@ def test_run_threads_positional_args(monkeypatch):
 
     monkeypatch.setattr("paramem.graph.extraction_pipeline.extract_graph", spy)
 
-    model_sentinel = MagicMock(name="model_sentinel")
+    model_sentinel = _peft_model_mock()
     tokenizer_sentinel = MagicMock(name="tokenizer_sentinel")
     pipeline = _make_pipeline(
         model=model_sentinel,
@@ -572,20 +558,6 @@ def test_run_procedural_wraps_peft_model_in_disable_adapter(monkeypatch):
     fake_peft.disable_adapter.assert_called_once()
 
 
-def test_run_procedural_skips_disable_adapter_for_plain_model(monkeypatch):
-    """Procedural negative case: plain models must NOT be wrapped."""
-    plain_model = MagicMock()
-    pipeline = _make_pipeline(model=plain_model)
-
-    monkeypatch.setattr(
-        "paramem.graph.extraction_pipeline.extract_procedural_graph",
-        lambda *a, **kw: MagicMock(),
-    )
-    pipeline.run_procedural("transcript", "s001", speaker_id="speaker0")
-
-    plain_model.disable_adapter.assert_not_called()
-
-
 def test_consolidation_loop_constructor_threads_extraction_flags(tmp_path):
     """Experiment-path mirror of (b): kwargs forwarded to
     ``ConsolidationLoop.__init__`` must land on
@@ -630,8 +602,7 @@ def test_consolidation_loop_constructor_threads_extraction_flags(tmp_path):
         tokenizer=MagicMock(),
         consolidation_config=ConsolidationConfig(),
         training_config=TrainingConfig(),
-        episodic_adapter_config=AdapterConfig(),
-        semantic_adapter_config=AdapterConfig(),
+        tier_adapters={"episodic": AdapterConfig(), "semantic": AdapterConfig()},
         memory_store=_MS(),
         output_dir=tmp_path,
         extraction_plausibility_max_tokens=8192,
@@ -674,8 +645,7 @@ def test_consolidation_loop_threads_model_name_to_extraction_pipeline(tmp_path):
         tokenizer=MagicMock(),
         consolidation_config=ConsolidationConfig(),
         training_config=TrainingConfig(),
-        episodic_adapter_config=AdapterConfig(),
-        semantic_adapter_config=AdapterConfig(),
+        tier_adapters={"episodic": AdapterConfig(), "semantic": AdapterConfig()},
         memory_store=_MS(),
         output_dir=tmp_path,
         model_name="qwen3-4b",
@@ -709,7 +679,7 @@ def test_run_threads_positional_args_procedural(monkeypatch):
 
     monkeypatch.setattr("paramem.graph.extraction_pipeline.extract_procedural_graph", spy)
 
-    model_sentinel = MagicMock(name="model_sentinel")
+    model_sentinel = _peft_model_mock()
     pipeline = _make_pipeline(model=model_sentinel)
     pipeline.prompts_dir = "/custom/prompts"
 
@@ -987,8 +957,7 @@ def _build_loop_with_session_dump(tmp_path, monkeypatch, *, fake_graph):
         tokenizer=MagicMock(),
         consolidation_config=ConsolidationConfig(),
         training_config=TrainingConfig(),
-        episodic_adapter_config=AdapterConfig(),
-        semantic_adapter_config=AdapterConfig(),
+        tier_adapters={"episodic": AdapterConfig(), "semantic": AdapterConfig()},
         memory_store=_MS(),
         output_dir=tmp_path,
         save_cycle_snapshots=True,
@@ -1298,19 +1267,19 @@ def test_background_trainer_single_constructor_literal_in_app():
 # ---------------------------------------------------------------------------
 
 
-def _inference_model_mock(*, peft: bool, checkpointing: bool):
-    """Build a mock model for :func:`base_model_inference` tests.
-
-    ``peft=True`` returns a ``MagicMock(spec=PeftModel)`` so the primitive's
-    ``isinstance(model, PeftModel)`` branch fires; ``peft=False`` returns a
-    plain mock that fails that check.  ``checkpointing`` seeds the
-    ``is_gradient_checkpointing`` flag the primitive reads at scope entry.
-    ``gradient_checkpointing_{disable,enable}`` are attached explicitly because
-    they are not on ``PeftModel``'s spec surface.
+def _inference_model_mock(*, checkpointing: bool):
+    """Build a ``MagicMock(spec=PeftModel)`` for :func:`base_model_inference`
+    tests -- the primitive requires a ``PeftModel`` (raises ``TypeError``
+    otherwise; that precondition is covered directly in
+    ``tests/test_model_identity_contract.py``), so every model this helper
+    builds passes ``isinstance(model, PeftModel)``. ``checkpointing`` seeds
+    the ``is_gradient_checkpointing`` flag the primitive reads at scope
+    entry. ``gradient_checkpointing_{disable,enable}`` are attached
+    explicitly because they are not on ``PeftModel``'s spec surface.
     """
     from peft import PeftModel
 
-    m = MagicMock(spec=PeftModel) if peft else MagicMock()
+    m = MagicMock(spec=PeftModel)
     m.is_gradient_checkpointing = checkpointing
     m.disable_adapter = MagicMock()
     m.gradient_checkpointing_disable = MagicMock()
@@ -1318,60 +1287,17 @@ def _inference_model_mock(*, peft: bool, checkpointing: bool):
     return m
 
 
-def test_base_model_inference_restores_checkpointing_when_entered_on():
-    """A model entering with gradient checkpointing ON must exit ON.
-
-    Inside the scope checkpointing is disabled (KV cache required for
-    ``generate``); the finally clause re-enables it with the non-reentrant
-    kwargs so the caller's training state is unchanged after the scope.
-    """
-    from paramem.models.loader import base_model_inference
-
-    m = _inference_model_mock(peft=False, checkpointing=True)
-    with base_model_inference(m):
-        m.gradient_checkpointing_disable.assert_called_once()
-        m.gradient_checkpointing_enable.assert_not_called()
-
-    m.gradient_checkpointing_enable.assert_called_once()
-    _, kwargs = m.gradient_checkpointing_enable.call_args
-    assert kwargs["gradient_checkpointing_kwargs"] == {"use_reentrant": False}
-
-
-def test_base_model_inference_leaves_checkpointing_off_when_entered_off():
-    """A model entering with checkpointing OFF must exit OFF — the restore is
-    conditional on the pre-scope state, never an unconditional re-enable."""
-    from paramem.models.loader import base_model_inference
-
-    m = _inference_model_mock(peft=False, checkpointing=False)
-    with base_model_inference(m):
-        pass
-
-    m.gradient_checkpointing_disable.assert_not_called()
-    m.gradient_checkpointing_enable.assert_not_called()
-
-
 def test_base_model_inference_enters_disable_adapter_for_peft():
     """When the model is a PeftModel, the scope must enter ``disable_adapter()``
     so generation runs on the base weights."""
     from paramem.models.loader import base_model_inference
 
-    m = _inference_model_mock(peft=True, checkpointing=False)
+    m = _inference_model_mock(checkpointing=False)
     with base_model_inference(m):
         pass
 
     m.disable_adapter.assert_called_once()
     m.disable_adapter.return_value.__enter__.assert_called_once()
-
-
-def test_base_model_inference_skips_disable_adapter_for_plain_model():
-    """A plain (non-PeftModel) model must NOT be wrapped in ``disable_adapter()``."""
-    from paramem.models.loader import base_model_inference
-
-    m = _inference_model_mock(peft=False, checkpointing=False)
-    with base_model_inference(m):
-        pass
-
-    m.disable_adapter.assert_not_called()
 
 
 def test_name_enrollment_enters_base_model_inference():

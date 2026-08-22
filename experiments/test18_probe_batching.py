@@ -71,6 +71,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from experiments.utils.gpu_guard import acquire_gpu  # noqa: E402
+from experiments.utils.production import switch_adapter  # noqa: E402
 from experiments.utils.test_harness import (  # noqa: E402
     BENCHMARK_MODELS,
     add_model_args,
@@ -85,10 +86,9 @@ from paramem.memory.entry import (  # noqa: E402
     format_entry_training,
 )
 from paramem.models.loader import (  # noqa: E402
-    create_adapter,
     load_base_model,
+    mount_adapter,
     save_adapter,
-    switch_adapter,
 )
 from paramem.training.dataset import build_inference_prompts, trained_recall_template  # noqa: E402
 from paramem.training.recall_eval import (  # noqa: E402
@@ -106,6 +106,22 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_N_KEYS = 137
 ADAPTER_NAME = "probe_bench_episodic"
+
+
+def bench_adapter_config() -> AdapterConfig:
+    """The one LoRA shape for ``ADAPTER_NAME`` — production episodic
+    topology (rank 8, alpha 16).  Shared by :func:`main` (which wraps the
+    freshly loaded model with this shape) and :func:`train_bench_adapter`
+    (which passes it to ``train_adapter``), so the tier this script mounts
+    or trains is always the same shape as the one it wraps with.
+    """
+    return AdapterConfig(
+        rank=8,
+        alpha=16,
+        dropout=0.0,
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+        learning_rate=1e-4,
+    )
 
 
 def _default_batch_sizes(n_keys: int) -> list[int]:
@@ -440,12 +456,10 @@ def load_baseline(baseline_dir: Path, model, tokenizer):
     production assignment and the baseline is unusable.
 
     The adapter file may be age-encrypted (production encryption at rest).
-    ``_adapter_slot_for_load`` decrypts into an anonymous memfd / shm
-    region before handing the path to PEFT, so no plaintext weight bytes
-    touch the disk during loading.
+    :func:`~paramem.models.loader.mount_adapter`'s own decrypt scope
+    decrypts into an anonymous memfd / shm region before handing the path
+    to PEFT, so no plaintext weight bytes touch the disk during loading.
     """
-    from paramem.models.loader import _adapter_slot_for_load
-
     rels_path = baseline_dir / "episodic_rels.json"
     if not rels_path.exists():
         raise FileNotFoundError(
@@ -470,33 +484,24 @@ def load_baseline(baseline_dir: Path, model, tokenizer):
             f"Baseline missing adapter weights at {slot}/adapter_model.safetensors."
         )
 
-    from peft import PeftModel
-
-    with _adapter_slot_for_load(slot) as load_path:
-        # The context manager yields a directory containing the decrypted
-        # adapter_model.safetensors + adapter_config.json.  PEFT's
-        # load_adapter / from_pretrained accept that path directly.
-        if isinstance(model, PeftModel):
-            model.load_adapter(str(load_path), adapter_name=ADAPTER_NAME)
-        else:
-            model = PeftModel.from_pretrained(model, str(load_path), adapter_name=ADAPTER_NAME)
+    mount_adapter(model, slot, ADAPTER_NAME)
+    # mount_adapter loads weights only — it does not activate the adapter.
+    # Make the activation explicit rather than relying on map/creation
+    # order to have left it active.
     switch_adapter(model, ADAPTER_NAME)
     return model, entries
 
 
 def train_bench_adapter(model, tokenizer, entries: list[dict], num_epochs: int):
     """Train ``ADAPTER_NAME`` on ``entries`` so probes have a target to
-    recall.  Returns the (possibly re-wrapped) model.
+    recall.
+
+    ``ADAPTER_NAME`` is already resident (cold) on *model* — the caller
+    wraps with it at load time via :func:`bench_adapter_config`. This
+    function trains it in place and returns the same model object; its
+    identity never changes.
     """
-    adapter_cfg = AdapterConfig(
-        rank=8,
-        alpha=16,
-        dropout=0.0,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
-        learning_rate=1e-4,
-    )
-    model = create_adapter(model, adapter_cfg, ADAPTER_NAME)
-    switch_adapter(model, ADAPTER_NAME)
+    adapter_cfg = bench_adapter_config()
     examples = format_entry_training(entries, tokenizer, max_length=512)
 
     class _Dataset:
@@ -768,7 +773,7 @@ def main() -> None:
 
         with acquire_gpu(interactive=True):
             logger.info("Loading model %s into %s", model_name, run_dir)
-            model, tokenizer = load_base_model(model_cfg)
+            model, tokenizer = load_base_model(model_cfg, {ADAPTER_NAME: bench_adapter_config()})
 
             if args.baseline:
                 baseline_dir = Path(args.baseline)

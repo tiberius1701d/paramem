@@ -72,7 +72,6 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 import numpy as np  # noqa: E402
-from peft import PeftModel  # noqa: E402
 
 from experiments.quadruple_adapter import load_unique_triples  # noqa: E402
 from experiments.utils.early_stop import (  # noqa: E402
@@ -102,8 +101,9 @@ from paramem.memory.persistence import (  # noqa: E402
     save_registry,
 )
 from paramem.models.loader import (  # noqa: E402
-    _adapter_slot_for_load,
     create_adapter,
+    detach_adapters,
+    mount_adapter,
     save_adapter,
     switch_adapter,
     unload_model,
@@ -1352,7 +1352,9 @@ def run_cell(
     (seed, D).  Already-done cells (``*_done.json`` present) are skipped.
 
     Args:
-        model: Loaded base model (must NOT be a PeftModel at entry).
+        model: The live PeftModel — its object identity is fixed at load
+            time; this function's own base-D step detaches and
+            recreates/mounts "episodic" on it in place, never rebinding it.
         tokenizer: Tokenizer.
         seed: RNG seed for this run.
         D: Pretrain epoch depth.
@@ -1437,18 +1439,18 @@ def run_cell(
         a_keyed = json.loads((base_dir / "quads.json").read_text())
         a_registry = load_registry(base_dir / "simhash_registry.json")
         encoding_floor_epoch = base_done.get("encoding_floor_epoch")
-        # Reload adapter.
-        if isinstance(model, PeftModel):
-            model = model.base_model.model
+        # Reload adapter: detach every resident adapter, recreate "episodic"
+        # cold (fixes its shape), then mount the saved weights onto it in
+        # place — the base model's object identity never changes.
+        detach_adapters(model, list(model.peft_config))
+        create_adapter(model, _adapter_config(), "episodic")
         a_slot = resolve_adapter_slot(base_dir / "episodic_adapter", "episodic", "")
         if a_slot is None:
             raise FileNotFoundError(
                 f"Seed {seed} D={D}: episodic adapter not found under "
                 f"{base_dir / 'episodic_adapter'}"
             )
-        with _adapter_slot_for_load(a_slot) as _load_path:
-            model = PeftModel.from_pretrained(model, str(_load_path), adapter_name="episodic")
-        switch_adapter(model, "episodic")
+        mount_adapter(model, a_slot, "episodic")
     else:
         _check_pause(f"before base_{D} seed {seed}", run_dir)
 
@@ -1462,10 +1464,8 @@ def run_cell(
             D,
             REFERENCE_EPOCHS,
         )
-        if isinstance(model, PeftModel):
-            model = model.base_model.model
-        model = create_adapter(model, _adapter_config(), "episodic")
-        switch_adapter(model, "episodic")
+        detach_adapters(model, list(model.peft_config))
+        create_adapter(model, _adapter_config(), "episodic")
 
         a_keyed = build_phase_A_keyed(triple_pool, total_keys=n_keys)
         a_registry = build_registry(a_keyed)
@@ -1572,18 +1572,17 @@ def run_cell(
         overwrite_swap_registry = load_registry(corrupted_dir / "overwrite_swap_registry.json")
         overwritten_keyed = json.loads((corrupted_dir / "overwritten_keyed.json").read_text())
         overwritten_registry = load_registry(corrupted_dir / "overwritten_registry.json")
-        # Reload corrupted adapter for repair cells.
-        if isinstance(model, PeftModel):
-            model = model.base_model.model
+        # Reload corrupted adapter for repair cells: detach every resident
+        # adapter, recreate "episodic" cold, then mount the saved weights.
+        detach_adapters(model, list(model.peft_config))
+        create_adapter(model, _adapter_config(), "episodic")
         c_slot = resolve_adapter_slot(corrupted_dir / "episodic_adapter", "episodic", "")
         if c_slot is None:
             raise FileNotFoundError(
                 f"Seed {seed} D={D}: corrupted episodic adapter not found under "
                 f"{corrupted_dir / 'episodic_adapter'}"
             )
-        with _adapter_slot_for_load(c_slot) as _load_path:
-            model = PeftModel.from_pretrained(model, str(_load_path), adapter_name="episodic")
-        switch_adapter(model, "episodic")
+        mount_adapter(model, c_slot, "episodic")
     else:
         # Stopping conditions before cooldown (CLAUDE.md: all stops checked before cooldown).
         _check_pause(f"before corrupted_{D} seed {seed}", run_dir)
@@ -1766,17 +1765,17 @@ def run_cell(
             wd,
         )
 
-        # Reload corrupted_D adapter fresh for each cell.
-        if isinstance(model, PeftModel):
-            model = model.base_model.model
+        # Reload corrupted_D adapter fresh for each cell: detach every
+        # resident adapter, recreate "episodic" cold, then mount the saved
+        # weights — the base model's object identity never changes.
+        detach_adapters(model, list(model.peft_config))
+        create_adapter(model, _adapter_config(), "episodic")
         c_slot = resolve_adapter_slot(corrupted_dir / "episodic_adapter", "episodic", "")
         if c_slot is None:
             raise FileNotFoundError(
                 f"Seed {seed} D={D}: corrupted adapter not found for cell {cell_name}"
             )
-        with _adapter_slot_for_load(c_slot) as _load_path:
-            model = PeftModel.from_pretrained(model, str(_load_path), adapter_name="episodic")
-        switch_adapter(model, "episodic")
+        mount_adapter(model, c_slot, "episodic")
 
         cell_dir.mkdir(parents=True, exist_ok=True)
 
@@ -2485,7 +2484,7 @@ def main() -> None:
     model_config = BENCHMARK_MODELS[cfg["model"]]
 
     with acquire_gpu(interactive=True):
-        model, tokenizer = load_model_and_config(model_config)
+        model, tokenizer = load_model_and_config(model_config, {"episodic": _adapter_config()})
 
         for seed in cfg.get("seeds", args.seeds):
             _check_pause(f"before seed {seed}", run_dir)
@@ -2499,10 +2498,9 @@ def main() -> None:
 
                 logger.info("Starting seed %d D=%d", seed, D)
 
-                # Ensure model is unwrapped before each (seed, D).
-                if isinstance(model, PeftModel):
-                    model = model.base_model.model
-
+                # run_cell's own base-D step (re)builds "episodic" for this
+                # (seed, D) — either a fresh cold create or a detach+mount
+                # reload from disk — so there is no separate reset here.
                 run_cell(model, tokenizer, seed, D, run_dir, cfg)
 
                 # Verify integrity + recompute aggregate after each (seed, D).

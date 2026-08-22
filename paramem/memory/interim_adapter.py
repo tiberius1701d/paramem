@@ -19,9 +19,10 @@ backup runner can share it without ``interim_adapter`` (a ``memory``-layer
 module) importing from ``backup``.
 
 This module also owns the on-disk tier-topology helpers for the adapter
-store: the main-tier name/order tuple (:data:`MAIN_TIERS`), the whole-store
-tier walk (:func:`iter_tier_roots`), and the interim-slot enumeration
-(:func:`iter_interim_dirs`, :func:`interim_tiers_newest_first`).
+store: the whole-store tier walk (:func:`iter_tier_roots`), which reads
+the main-tier name/order tuple from :data:`paramem.utils.tiers.MAIN_TIERS`,
+and the interim-slot enumeration (:func:`iter_interim_dirs`,
+:func:`interim_tiers_newest_first`).
 
 Callers (wiring schedule):
   Scheduled consolidation path — calls create_interim_adapter when run_consolidation_cycle
@@ -52,7 +53,6 @@ import logging
 from collections.abc import Iterator
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Final
 
 from peft import PeftModel
 
@@ -60,6 +60,7 @@ from paramem.memory.persistence import reap_tier_artifacts
 from paramem.models.loader import create_adapter, detach_adapters
 from paramem.server.schedule_grammar import compute_schedule_period_seconds
 from paramem.utils.config import AdapterConfig
+from paramem.utils.tiers import MAIN_TIERS
 
 logger = logging.getLogger(__name__)
 
@@ -93,13 +94,6 @@ INTERIM_DIR_PREFIX = "interim_"
 # (``app._full_cycle_deadline_dt``) composes from this one constant — the
 # shape is never re-declared as a pattern or a literal length.
 INTERIM_STAMP_FORMAT = "%Y%m%dT%H%M"
-
-# The three main tiers, in canonical order.  The main-tier tuple shared by
-# this store's tier walks (:func:`iter_tier_roots` and its consumers). Other
-# modules (``paramem.server.gates``, ``paramem.server.active_store_migration``,
-# ``paramem.models.loader``) still declare the literal triple independently —
-# this is not a project-wide canonical source.
-MAIN_TIERS: Final[tuple[str, str, str]] = ("episodic", "semantic", "procedural")
 
 
 def interim_stamp_from_name(name: str) -> str | None:
@@ -413,37 +407,34 @@ def create_interim_adapter(
     model: PeftModel,
     adapter_config: AdapterConfig,
     stamp: str,
-) -> PeftModel:
-    """Create an episodic interim adapter on the live model.
+) -> None:
+    """Create an episodic interim adapter on the live model, in place.
 
     Idempotent: if the adapter for *stamp* already exists in model.peft_config
-    the model is returned unchanged.  The caller is responsible for switching
-    the active adapter back to "episodic" (main) after any training on the new
-    interim adapter is complete.
+    this is a no-op.  The caller is responsible for switching the active
+    adapter back to "episodic" (main) after any training on the new interim
+    adapter is complete.
 
     Args:
         model: Live PeftModel that already has the main adapters loaded.
+            Mutated in place; nothing is returned.
         adapter_config: LoRA config to use for the new adapter (should match
-            the episodic_adapter_config from server config so all interim
+            the episodic tier's ``AdapterConfig`` from
+            ``config.tier_config_map()["episodic"]`` so all interim
             adapters are topology-compatible with the main episodic adapter).
         stamp: ISO 8601 basic timestamp string (``YYYYMMDDTHHMM``) used as the
             adapter-name suffix, e.g. ``"20260418T1430"`` →
             ``"episodic_interim_20260418T1430"``.
-
-    Returns:
-        Updated PeftModel (same object when the adapter already exists;
-        may be re-assigned by create_adapter when adding a new adapter).
     """
     name = f"{INTERIM_NAME_PREFIX}{stamp}"
     if name in model.peft_config:
         logger.debug("Interim adapter already exists for %s — no-op", stamp)
-        return model
-    model = create_adapter(model, adapter_config, adapter_name=name)
+        return
+    create_adapter(model, adapter_config, adapter_name=name)
     logger.info("Created interim adapter: %s", name)
-    return model
 
 
-def unload_interim_adapters(model, adapter_dir: Path) -> list[str]:
+def unload_interim_adapters(model: PeftModel | None, adapter_dir: Path) -> list[str]:
     """Reap every interim slot: the PEFT adapters (when any) and the on-disk dirs.
 
     Called from ``paramem.training.go_live.publish_bundle`` after
@@ -452,13 +443,12 @@ def unload_interim_adapters(model, adapter_dir: Path) -> list[str]:
     the ``POST /interim/discard`` door to reap the ring without folding it
     into the main tiers first.
 
-    **Both fold venues call this.**  The weights venue has PEFT interim adapters
-    mounted and an on-disk slot dir per adapter; the disk venue has only the
-    on-disk slot dirs (``self.model`` there is a bare base model, not a
-    :class:`~peft.PeftModel`, and holds no ``peft_config``).  The PEFT half is
-    therefore skipped when *model* is not a ``PeftModel`` — the on-disk reap is
-    unconditional and is the same reap in both venues.  Do not write a second
-    reaper for the disk venue.
+    Every production caller holds a resident (wrap-once) ``PeftModel`` — the
+    base model's object identity is fixed at load time, so there is no
+    "disk venue holds a bare base model" case to special-case. ``model`` may
+    still be ``None`` (e.g. quarantined/cloud-only state); that skips the
+    PEFT half via an explicit branch, never an ``isinstance`` fork. The
+    on-disk reap is unconditional either way.
 
     The three main adapters (episodic, semantic, procedural) remain loaded
     throughout — the sole-adapter trap does not apply.
@@ -473,23 +463,22 @@ def unload_interim_adapters(model, adapter_dir: Path) -> list[str]:
     interim slot directory yielded by :func:`iter_interim_dirs`.
 
     Args:
-        model: Live model.  A :class:`~peft.PeftModel` has its interim adapters
-            deleted and must contain at least one main adapter so
-            ``delete_adapter`` never removes the last adapter.  Anything else
-            (bare base model, ``None``) skips the PEFT half.
+        model: Live ``PeftModel``, or ``None`` to skip the PEFT half
+            entirely (only the on-disk reap runs). A non-``None`` model
+            must contain at least one main adapter so ``delete_adapter``
+            never removes the last adapter.
         adapter_dir: Parent directory (config.adapter_dir) whose
             episodic_interim_* subdirectories are removed.
 
     Returns:
-        Sorted list of adapter names that were unloaded from PEFT (empty in the
-        disk venue, where there are none).
+        Sorted list of adapter names that were unloaded from PEFT (empty
+        when *model* is ``None``).
     """
-    interim_names = (
-        sorted(n for n in model.peft_config if n.startswith(INTERIM_NAME_PREFIX))
-        if isinstance(model, PeftModel)
-        else []
-    )
-    detach_adapters(model, interim_names)
+    if model is None:
+        interim_names: list[str] = []
+    else:
+        interim_names = sorted(n for n in model.peft_config if n.startswith(INTERIM_NAME_PREFIX))
+        detach_adapters(model, interim_names)
 
     # UNFILTERED ON PURPOSE — never pass ``mode`` here.  The reap must see EVERY
     # interim directory, payload-bearing or not.  A payload-filtered reap would

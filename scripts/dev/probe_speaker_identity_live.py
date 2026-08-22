@@ -280,7 +280,12 @@ def run_gpu_render_resolution(out_dir: Path) -> dict:
     """
     logger.info("Loading Mistral 7B (NF4)...")
     model_config = BENCHMARK_MODELS["mistral"]
-    model, tokenizer = load_base_model(model_config)
+    tier_adapters = {
+        "episodic": _tier_cfg(),
+        "semantic": _tier_cfg(),
+        "procedural": _tier_cfg(),
+    }
+    model, tokenizer = load_base_model(model_config, tier_adapters)
 
     training_cfg = TrainingConfig(
         batch_size=1,
@@ -297,9 +302,7 @@ def run_gpu_render_resolution(out_dir: Path) -> dict:
         tokenizer=tokenizer,
         consolidation_config=consolidation_cfg,
         training_config=training_cfg,
-        episodic_adapter_config=_tier_cfg(),
-        semantic_adapter_config=_tier_cfg(),
-        procedural_adapter_config=_tier_cfg(),
+        tier_adapters=tier_adapters,
         memory_store=MemoryStore(),
         wandb_config=None,
         output_dir=out_dir,

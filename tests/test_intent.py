@@ -12,6 +12,7 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
+from peft import PeftModel
 
 from paramem.server import intent as intent_module
 from paramem.server.config import IntentConfig
@@ -456,9 +457,14 @@ def _stub_classifier_model(response_text: str) -> _ClassifierModelHandle:
     tokenizer.eos_token_id = 0
     tokenizer.decode.return_value = response_text
 
-    model = MagicMock()
+    # spec=PeftModel passes the isinstance(model, PeftModel) precondition
+    # base_model_inference (entered inside generate_adapter_off) now
+    # enforces.
+    model = MagicMock(spec=PeftModel)
     model.device = "cpu"
     model.is_gradient_checkpointing = False
+    model.gradient_checkpointing_disable = MagicMock()
+    model.gradient_checkpointing_enable = MagicMock()
     # generate() returns the prompt + 4 fresh tokens.  The slice
     # output_ids[0][inputs["input_ids"].shape[-1]:] inside _classify_via_llm
     # extracts the generated tail.

@@ -290,7 +290,7 @@ def main(argv: list[str] | None = None) -> int:
     server_cfg = load_server_config("tests/fixtures/server.yaml")
     model_cfg = server_cfg.model_config
     print(f"  model: {model_cfg.model_id}")
-    model, tokenizer = load_base_model(model_cfg)
+    model, tokenizer = load_base_model(model_cfg, server_cfg.tier_config_map())
     print("  ready")
 
     # Resolve the scrub scope.  CLI override wins; otherwise inherit from

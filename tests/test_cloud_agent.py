@@ -4,6 +4,7 @@ import logging
 from unittest.mock import MagicMock, patch
 
 import pytest
+from peft import PeftModel
 
 from paramem.cloud.admission import PROVIDER_KEY_ENV
 from paramem.cloud.providers.base import CloudAgent, CloudAgentConfig, CloudResponse, ToolCall
@@ -25,6 +26,19 @@ def _full_probe_selection():
     from paramem.server.temporal_selection import DateSelection
 
     return DateSelection(all=True, ranges=(), include_undated=True)
+
+
+def _peft_model_mock() -> MagicMock:
+    """``MagicMock(spec=PeftModel)`` -- passes the ``isinstance(model,
+    PeftModel)`` precondition ``base_model_inference`` now enforces
+    wherever ``handle_chat``'s reasoning generate reaches it.
+    ``gradient_checkpointing_disable`` is a dynamic ``__getattr__``-
+    delegated attribute a real (wrapped) PeftModel exposes that ``spec``
+    cannot see via ``dir(PeftModel)``, so it is pre-set explicitly
+    (mirrors ``tests/server/test_gates.py::_make_mock_model``)."""
+    model = MagicMock(spec=PeftModel)
+    model.gradient_checkpointing_disable = MagicMock()
+    return model
 
 
 class TestCloudResponse:
@@ -500,8 +514,7 @@ class TestPrivacyRouting:
 
         # Mock model and tokenizer — the recalled fact comes from the seeded
         # store below, so only the reasoning generate needs stubbing.
-        model = MagicMock()
-        model.gradient_checkpointing_disable = MagicMock()
+        model = _peft_model_mock()
         tokenizer = MagicMock()
 
         config = MagicMock()
@@ -566,8 +579,7 @@ class TestPrivacyRouting:
         cloud_agent = self._make_mock_cloud_agent()
         router = self._make_mock_router(known_entities=["Jordan"])
 
-        model = MagicMock()
-        model.gradient_checkpointing_disable = MagicMock()
+        model = _peft_model_mock()
         tokenizer = MagicMock()
 
         config = MagicMock()
@@ -617,8 +629,7 @@ class TestPrivacyRouting:
         cloud_agent = self._make_mock_cloud_agent()
         router = self._make_mock_router(known_entities=["Jordan"])
 
-        model = MagicMock()
-        model.gradient_checkpointing_disable = MagicMock()
+        model = _peft_model_mock()
         tokenizer = MagicMock()
 
         config = MagicMock()
@@ -708,8 +719,7 @@ class TestPrivacyRouting:
         cloud_agent = self._make_mock_cloud_agent()
         router = self._make_unknown_router()
 
-        model = MagicMock()
-        model.gradient_checkpointing_disable = MagicMock()
+        model = _peft_model_mock()
         tokenizer = MagicMock()
 
         config = MagicMock()
@@ -748,8 +758,7 @@ class TestPrivacyRouting:
 
         router = self._make_mock_router(known_entities=["Jordan"])
 
-        model = MagicMock()
-        model.gradient_checkpointing_disable = MagicMock()
+        model = _peft_model_mock()
         tokenizer = MagicMock()
 
         config = MagicMock()
@@ -797,8 +806,7 @@ class TestPrivacyRouting:
         cloud_agent = self._make_mock_cloud_agent()
         router = self._make_ha_only_router()
 
-        model = MagicMock()
-        model.gradient_checkpointing_disable = MagicMock()
+        model = _peft_model_mock()
         tokenizer = MagicMock()
 
         config = MagicMock()
@@ -833,8 +841,7 @@ class TestPrivacyRouting:
         cloud_agent = self._make_mock_cloud_agent()
         router = self._make_ha_only_router()
 
-        model = MagicMock()
-        model.gradient_checkpointing_disable = MagicMock()
+        model = _peft_model_mock()
         tokenizer = MagicMock()
 
         config = MagicMock()
@@ -875,8 +882,7 @@ class TestPrivacyRouting:
         cloud_agent = self._make_mock_cloud_agent()
         router = self._make_both_match_router()
 
-        model = MagicMock()
-        model.gradient_checkpointing_disable = MagicMock()
+        model = _peft_model_mock()
         tokenizer = MagicMock()
 
         config = MagicMock()
@@ -938,8 +944,7 @@ class TestPrivacyRouting:
         cloud_agent = self._make_mock_cloud_agent()
         router = self._make_mock_router(known_entities=["Jordan"])
 
-        model = MagicMock()
-        model.gradient_checkpointing_disable = MagicMock()
+        model = _peft_model_mock()
         tokenizer = MagicMock()
 
         config = MagicMock()
@@ -1118,8 +1123,7 @@ class TestCloudModePolicy:
             ha_client = MagicMock()
             ha_client.conversation_process.return_value = None
 
-        model = MagicMock()
-        model.gradient_checkpointing_disable = MagicMock()
+        model = _peft_model_mock()
         tokenizer = MagicMock()
 
         with patch(

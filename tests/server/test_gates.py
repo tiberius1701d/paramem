@@ -22,13 +22,14 @@ from __future__ import annotations
 
 import json
 import logging
+from collections import defaultdict
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+from peft import PeftModel
 
 from paramem.server.gates import (
-    _ADAPTER_KIND_SUBDIRS,
     _TRIAL_PROBE_ADAPTER_NAME,
     GATE_4_SAMPLE_SIZE,
     GateResult,
@@ -42,6 +43,7 @@ from paramem.server.gates import (
     _unmount_trial_probe,
 )
 from paramem.training.key_registry import KeyRegistry
+from paramem.utils.tiers import MAIN_TIERS
 
 
 @pytest.fixture(autouse=True)
@@ -90,13 +92,30 @@ def _make_trial_adapter(tmp_path: Path, with_registry: bool = True) -> Path:
 
 
 def _make_mock_model(adapter_names: list[str] | None = None) -> MagicMock:
-    """Build a MagicMock that mimics a PeftModel with named adapters."""
-    model = MagicMock()
+    """Build a MagicMock(spec=PeftModel) that mimics a PeftModel with named adapters.
+
+    ``spec=PeftModel`` makes ``isinstance(model, PeftModel)`` True (required by
+    ``mount_adapter``'s precondition) while still allowing every attribute the
+    tests in this module configure directly (``peft_config``, ``active_adapter``,
+    ``load_adapter``, ``delete_adapter``, ``set_adapter`` are all real PeftModel
+    attributes/methods, so ``spec`` does not block them).
+    """
+    model = MagicMock(spec=PeftModel)
     if adapter_names is None:
         adapter_names = ["episodic"]
-    # peft_config is a dict keyed by adapter name.
-    model.peft_config = {name: MagicMock() for name in adapter_names}
+    # peft_config is a dict keyed by adapter name, auto-vivifying on lookup
+    # of a name not yet present -- mirrors real PEFT's load_adapter, which
+    # inserts the entry as a side effect before mount_adapter's own
+    # base_model_name_or_path check reads it back.
+    model.peft_config = defaultdict(MagicMock, {name: MagicMock() for name in adapter_names})
     model.active_adapter = adapter_names[0] if adapter_names else None
+    # Attributes torch.nn.Module / transformers.PreTrainedModel expose on a
+    # real (wrapped) PeftModel via dynamic __getattr__ delegation rather than
+    # as class-level attributes -- MagicMock(spec=PeftModel) cannot see these
+    # through dir(PeftModel), so gates.py's calls to them need an explicit
+    # mock in place before first access.
+    model.gradient_checkpointing_disable = MagicMock()
+    model.gradient_checkpointing_enable = MagicMock()
     return model
 
 
@@ -382,18 +401,6 @@ class TestUnmountTrialProbe:
         mount_state = {"mounted": True, "pre_active_adapter": ["episodic"]}
         _unmount_trial_probe(model, mount_state)
         model.delete_adapter.assert_called_once_with("trial_probe")
-
-    def test_delete_not_called_when_sole_adapter(self, caplog):
-        """delete_adapter must NOT be called when trial_probe is sole adapter."""
-        import paramem.server.gates as gates_mod
-
-        gates_mod.logger.propagate = True
-        model = _make_mock_model(["trial_probe"])
-        mount_state = {"mounted": True, "pre_active_adapter": []}
-        with caplog.at_level(logging.WARNING):
-            _unmount_trial_probe(model, mount_state)
-        model.delete_adapter.assert_not_called()
-        assert any("sole loaded adapter" in r.message for r in caplog.records)
 
     def test_unmount_survives_delete_raising(self):
         """delete_adapter raising must not propagate out of _unmount_trial_probe."""
@@ -915,7 +922,7 @@ class TestGate3KindSubdirLayout:
         trial_dir = tmp_path / "trial_adapter"
         trial_dir.mkdir()
         # Create kind subdirs without indexed_key_registry.json.
-        for kind in _ADAPTER_KIND_SUBDIRS:
+        for kind in MAIN_TIERS:
             (trial_dir / kind).mkdir()
 
         model = _make_mock_model()
@@ -1647,7 +1654,7 @@ class TestGate4RunsAgainstPerTierRegistries:
     def test_population_excludes_interim_tier_keys(self, tmp_path):
         """An interim slot's active keys carry no fingerprint in the trial's
         per-tier SimHash map -- full-replay training only ever writes that
-        map for the three main tiers (``_ADAPTER_KIND_SUBDIRS``), never for
+        map for the three main tiers (``MAIN_TIERS``), never for
         an interim slot.  ``_live_key_population`` must never draw an
         interim key into the sample population, or the probe would score an
         unverifiable key as a spurious miss."""

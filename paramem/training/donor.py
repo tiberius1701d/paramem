@@ -1089,8 +1089,7 @@ def build_donor(
 
     Args:
         loop: The live :class:`~paramem.training.consolidation.ConsolidationLoop`
-            (its ``model``/``tokenizer``/``training_config``/
-            ``episodic_config``/``semantic_config``/``procedural_config``
+            (its ``model``/``tokenizer``/``training_config``/``tier_adapters``
             supply everything this needs — no separate model load).
         adapter_config: The TARGET tier's ``AdapterConfig`` — the same
             object ``_train_tier_adapter`` was called with at the call
@@ -1137,7 +1136,7 @@ def build_donor(
     )
 
     try:
-        loop.model = create_adapter(loop.model, recipe_config, build_name)
+        create_adapter(loop.model, recipe_config, build_name)
         switch_adapter(loop.model, build_name)
         metrics, _recall_state = loop._train_tier_adapter(
             entries,
@@ -1218,15 +1217,16 @@ def build_donor(
 def load_donor_into_transient_slot(model, store_dir: Path, transient_name: str) -> None:
     """Load the donor checkpoint under *store_dir* onto *model* as *transient_name*.
 
-    Handles three PEFT/on-disk pitfalls when mounting a donor checkpoint:
-    loads via ``model.load_adapter`` rather than ``PeftModel.from_pretrained``
-    (which nests tensor names on a multi-adapter model and breaks reload),
-    patches ``base_model_name_or_path`` on the mounted adapter's PEFT config
-    when PEFT leaves it ``None`` (its behaviour for second-and-later
-    adapters), and transparently decrypts the age-encrypted safetensors
-    :func:`build_donor` writes via
-    :func:`~paramem.models.loader._adapter_slot_for_load`'s memfd-backed
-    context manager.
+    Thin wrapper around :func:`~paramem.models.loader.mount_adapter`, which
+    owns the mount mechanics: loading via ``model.load_adapter`` rather than
+    ``PeftModel.from_pretrained`` (which nests tensor names on a
+    multi-adapter model and breaks reload), patching
+    ``base_model_name_or_path`` on the mounted adapter's PEFT config when
+    PEFT leaves it ``None`` (its behaviour for second-and-later adapters),
+    and transparently decrypting the age-encrypted safetensors
+    :func:`build_donor` writes via ``_adapter_slot_for_load``'s memfd-backed
+    context manager. This function's own job is resolving the donor
+    checkpoint's live slot from *store_dir*.
 
     Args:
         model: The live ``PeftModel``.
@@ -1238,14 +1238,9 @@ def load_donor_into_transient_slot(model, store_dir: Path, transient_name: str) 
         FileNotFoundError: No donor slot exists under *store_dir*.
     """
     from paramem.adapters.manifest import find_live_slot
-    from paramem.models.loader import _adapter_slot_for_load
+    from paramem.models.loader import mount_adapter
 
     slot = find_live_slot(Path(store_dir), "")
     if slot is None:
         raise FileNotFoundError(f"No donor checkpoint found under {store_dir}")
-    with _adapter_slot_for_load(slot) as load_path:
-        model.load_adapter(str(load_path), adapter_name=transient_name)
-    if model.peft_config[transient_name].base_model_name_or_path is None:
-        base_name = getattr(model.get_base_model().config, "_name_or_path", None)
-        if base_name:
-            model.peft_config[transient_name].base_model_name_or_path = base_name
+    mount_adapter(model, slot, transient_name)

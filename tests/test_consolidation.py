@@ -13,6 +13,7 @@ import time
 from unittest.mock import MagicMock
 
 import pytest
+from peft import PeftModel
 
 from paramem.training.consolidation import ConsolidationLoop
 from paramem.training.graph_tier import GraphTierRefiner
@@ -21,6 +22,21 @@ from paramem.utils.artifacts import (
     on_calibration_result,
     on_normalization,
 )
+
+
+def _peft_model_mock() -> MagicMock:
+    """``MagicMock(spec=PeftModel)`` standing in for ``loop.model`` wherever
+    a test's code path reaches :func:`~paramem.models.loader.base_model_inference`
+    (its ``isinstance(model, PeftModel)`` precondition rejects a bare
+    ``MagicMock()``).  ``gradient_checkpointing_disable``/``_enable`` are
+    dynamic ``__getattr__``-delegated attributes on a real (wrapped)
+    ``PeftModel`` that ``spec`` cannot see via ``dir(PeftModel)``, so they
+    are pre-set explicitly (mirrors ``tests/server/test_gates.py::
+    _make_mock_model``)."""
+    model = MagicMock(spec=PeftModel)
+    model.gradient_checkpointing_disable = MagicMock()
+    model.gradient_checkpointing_enable = MagicMock()
+    return model
 
 
 def _refiner_for(loop: ConsolidationLoop) -> GraphTierRefiner:
@@ -147,15 +163,16 @@ class TestExtractionPathParity:
         loop_kwargs.setdefault("extraction_max_tokens", 8192)
         loop_kwargs.setdefault("extraction_plausibility_max_tokens", 8192)
         loop_kwargs.setdefault("extraction_anonymize_token_envelope", 8192)
+        tier_adapters = {"episodic": AdapterConfig(), "semantic": AdapterConfig()}
+        if procedural_adapter is not None:
+            tier_adapters["procedural"] = procedural_adapter
         loop = ConsolidationLoop(
             model=model,
             tokenizer=MagicMock(),
             consolidation_config=ConsolidationConfig(),
             training_config=TrainingConfig(),
-            episodic_adapter_config=AdapterConfig(),
-            semantic_adapter_config=AdapterConfig(),
+            tier_adapters=tier_adapters,
             memory_store=_MS(),
-            procedural_adapter_config=procedural_adapter,
             output_dir=tmp_path,
             **loop_kwargs,
         )
@@ -544,15 +561,16 @@ class TestLocalParseFailureAbortsFold:
             lambda *a, **kw: SessionGraph(session_id="unused", timestamp="2026-01-01T00:00:00Z"),
         )
 
+        tier_adapters = {"episodic": AdapterConfig(), "semantic": AdapterConfig()}
+        if procedural_adapter is not None:
+            tier_adapters["procedural"] = procedural_adapter
         loop = ConsolidationLoop(
             model=model,
             tokenizer=MagicMock(),
             consolidation_config=ConsolidationConfig(),
             training_config=TrainingConfig(),
-            episodic_adapter_config=AdapterConfig(),
-            semantic_adapter_config=AdapterConfig(),
+            tier_adapters=tier_adapters,
             memory_store=_MS(),
-            procedural_adapter_config=procedural_adapter,
             output_dir=tmp_path,
             extraction_scrub={"person name"},
             extraction_max_tokens=8192,
@@ -799,9 +817,10 @@ class TestTakePendingRelationsGraphLifetime:
             recall_early_stopping=False,
             recall_probe_batch_size=1,
         )
-        loop.episodic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
-        loop.semantic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
-        loop.procedural_config = None
+        loop.tier_adapters = {
+            "episodic": AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"]),
+            "semantic": AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"]),
+        }
         loop.wandb_config = None
         loop._thermal_policy = None
         loop.output_dir = tmp_path
@@ -980,10 +999,8 @@ class TestInterimRefinementGate:
                 refinement_contradiction=refinement_contradiction,
             ),
             training_config=TrainingConfig(),
-            episodic_adapter_config=AdapterConfig(),
-            semantic_adapter_config=AdapterConfig(),
+            tier_adapters={"episodic": AdapterConfig(), "semantic": AdapterConfig()},
             memory_store=_MS(),
-            procedural_adapter_config=None,
             output_dir=tmp_path,
             extraction_scrub={"person name"},
             cloud_enabled=cloud_enabled,
@@ -2603,10 +2620,8 @@ class TestSameAsSpeakerPairGuard:
             tokenizer=MagicMock(),
             consolidation_config=ConsolidationConfig(),
             training_config=TrainingConfig(),
-            episodic_adapter_config=AdapterConfig(),
-            semantic_adapter_config=AdapterConfig(),
+            tier_adapters={"episodic": AdapterConfig(), "semantic": AdapterConfig()},
             memory_store=MemoryStore(),
-            procedural_adapter_config=None,
             output_dir=tmp_path,
             extraction_enrichment_provider="anthropic",
             extraction_enrichment_provider_model="claude-sonnet-4-6",
@@ -2861,9 +2876,10 @@ class TestMergeRegistryRelationsTimestamp:
             recall_early_stopping=False,
             recall_probe_batch_size=1,
         )
-        loop.episodic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
-        loop.semantic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
-        loop.procedural_config = None
+        loop.tier_adapters = {
+            "episodic": AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"]),
+            "semantic": AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"]),
+        }
         loop.wandb_config = None
         loop._thermal_policy = None
         loop.output_dir = tmp_path
@@ -3163,7 +3179,7 @@ class TestRunGraphNormalizationApply:
         from paramem.utils.config import AdapterConfig, ConsolidationConfig, TrainingConfig
 
         loop = object.__new__(ConsolidationLoop)
-        loop.model = model if model is not None else MagicMock()
+        loop.model = model if model is not None else _peft_model_mock()
         loop.tokenizer = MagicMock()
         loop.tokenizer.apply_chat_template.return_value = "formatted_prompt"
         loop.config = ConsolidationConfig(
@@ -3176,9 +3192,10 @@ class TestRunGraphNormalizationApply:
             recall_early_stopping=False,
             recall_probe_batch_size=1,
         )
-        loop.episodic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
-        loop.semantic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
-        loop.procedural_config = None
+        loop.tier_adapters = {
+            "episodic": AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"]),
+            "semantic": AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"]),
+        }
         loop.wandb_config = None
         loop._thermal_policy = None
         loop.output_dir = tmp_path
@@ -3744,7 +3761,7 @@ class TestRunGraphNormalizationCloudEngine:
         from paramem.utils.config import AdapterConfig, ConsolidationConfig, TrainingConfig
 
         loop = object.__new__(ConsolidationLoop)
-        loop.model = MagicMock()
+        loop.model = _peft_model_mock()
         loop.tokenizer = MagicMock()
         loop.tokenizer.apply_chat_template.return_value = "formatted_prompt"
         loop.config = ConsolidationConfig(
@@ -3758,9 +3775,10 @@ class TestRunGraphNormalizationCloudEngine:
             recall_early_stopping=False,
             recall_probe_batch_size=1,
         )
-        loop.episodic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
-        loop.semantic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
-        loop.procedural_config = None
+        loop.tier_adapters = {
+            "episodic": AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"]),
+            "semantic": AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"]),
+        }
         loop.wandb_config = None
         loop._thermal_policy = None
         loop.output_dir = tmp_path

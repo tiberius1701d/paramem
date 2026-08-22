@@ -164,10 +164,13 @@ def gpu_base_model():
     (the default when ``--gpu`` is absent).
 
     Yields:
-        tuple[PreTrainedModel, PreTrainedTokenizer]: The base model and its
-        tokenizer. The model is a plain ``PreTrainedModel`` on GPU; adapter
-        state accumulated during a test module is cleaned up by that module's
-        own teardown fixtures (see ``test_integration_gpu.py``).
+        tuple[PeftModel, PreTrainedTokenizer]: The base model and its
+        tokenizer. The base model's object identity is fixed at load time:
+        ``model`` is always a ``PeftModel`` already wrapped with every
+        configured main tier (cold at first boot), never a plain
+        ``PreTrainedModel`` to wrap later. Adapter state accumulated during
+        a test module is cleaned up by that module's own teardown fixtures
+        (see ``test_integration_gpu.py``).
     """
     os.environ.setdefault("HF_DEACTIVATE_ASYNC_LOAD", "1")
 
@@ -176,7 +179,7 @@ def gpu_base_model():
     from paramem.utils.vram_guard import safe_empty_cache
 
     cfg = load_server_config("tests/fixtures/server.yaml")
-    model, tokenizer = load_base_model(cfg.model_config)
+    model, tokenizer = load_base_model(cfg.model_config, cfg.tier_config_map())
     yield model, tokenizer
 
     # Teardown: release GPU memory using safe_empty_cache so cuBLAS

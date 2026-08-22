@@ -8,6 +8,7 @@ episodic and semantic adapters.
 import hashlib
 import logging
 import secrets
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -673,11 +674,9 @@ class ConsolidationLoop:
         tokenizer,
         consolidation_config: ConsolidationConfig,
         training_config: TrainingConfig,
-        episodic_adapter_config: AdapterConfig,
-        semantic_adapter_config: AdapterConfig,
         *,
         memory_store,
-        procedural_adapter_config: Optional[AdapterConfig] = None,
+        tier_adapters: Mapping[str, AdapterConfig],
         wandb_config: Optional[WandbConfig] = None,
         output_dir: str | Path = "outputs/phase3",
         extraction_temperature: float = 0.0,
@@ -750,9 +749,12 @@ class ConsolidationLoop:
         # reachable from this module — the loop accepts the precomputed
         # ThermalPolicy instead of re-deriving it.
         self._thermal_policy = thermal_policy
-        self.episodic_config = episodic_adapter_config
-        self.semantic_config = semantic_adapter_config
-        self.procedural_config = procedural_adapter_config
+        # THE tier-existence fact for this loop: {tier_name: AdapterConfig},
+        # in MAIN_TIERS order for the tiers this deployment has — a tier
+        # exists iff adapters.<tier>.enabled. PRODUCTION SOURCE:
+        # config.tier_config_map(), threaded by
+        # paramem.server.consolidation.create_consolidation_loop.
+        self.tier_adapters: dict[str, AdapterConfig] = dict(tier_adapters)
         self.wandb_config = wandb_config
         self.save_cycle_snapshots = save_cycle_snapshots
         # Run ID identifies a single ConsolidationLoop construction so successive
@@ -836,8 +838,12 @@ class ConsolidationLoop:
         # fresh; any prior graph state would be discarded at fold entry and
         # loading it here would only populate ingest-time data that nobody reads.
 
-        # Ensure both adapters exist on the model
-        self.model = self.ensure_adapters()
+        # Every tier this loop trains is already resident on ``self.model`` —
+        # created cold by load_base_model / ensure_resident_tiers at boot,
+        # before this loop is ever constructed. This is what lets
+        # ConsolidationLoop(model=None) (cloud-only) construct without
+        # crashing rather than needing a model to create adapters on.
+        self._clean_stale_staging_dir()
 
         # Attach the live model to the merger so model-only contradiction
         # resolution is always-on during merge calls.
@@ -1466,7 +1472,7 @@ class ConsolidationLoop:
                 # directly from session_graph with no model.generate calls.
                 episodic_rels, procedural_rels = self._entries_from_graph(
                     session_graph,
-                    procedural_enabled=self.procedural_config is not None,
+                    procedural_enabled="procedural" in self.tier_adapters,
                 )
 
                 # --- PROCEDURAL: separate extraction pass ---
@@ -1475,7 +1481,7 @@ class ConsolidationLoop:
                 # the shared _run_local_extraction primitive, so no wrapper is
                 # needed here.
                 proc_graph: SessionGraph | None = None
-                if self.procedural_config is not None:
+                if "procedural" in self.tier_adapters:
                     _mark = len(trace.records)
                     proc_graph = self.extraction.run_procedural(
                         session_transcript,
@@ -2005,6 +2011,7 @@ class ConsolidationLoop:
                 or the interim-adapter naming convention.
         """
         from paramem.memory.interim_adapter import INTERIM_NAME_PREFIX, interim_stamp_from_name
+        from paramem.utils.tiers import MAIN_TIERS
 
         # Episodic interim slot: scratch nested one level under the interim
         # tier root (sibling of <slot_date>/, indexed_key_registry.json and
@@ -2017,7 +2024,7 @@ class ConsolidationLoop:
         if adapter_name.startswith(INTERIM_NAME_PREFIX):
             raise ValueError(f"Malformed interim adapter name: {adapter_name!r}")
 
-        if adapter_name not in ("episodic", "semantic", "procedural"):
+        if adapter_name not in MAIN_TIERS:
             raise ValueError(f"Unknown adapter name for training output dir: {adapter_name!r}")
 
         # Tier-level scratch under <tier>/, scoped to the current full cycle.
@@ -2258,11 +2265,11 @@ class ConsolidationLoop:
                 from paramem.models.loader import ensure_adapter_matching
 
                 if adapter_name not in self.model.peft_config:
-                    self.model = create_interim_adapter(self.model, self.episodic_config, stamp)
+                    create_interim_adapter(self.model, self.tier_adapters["episodic"], stamp)
                     logger.info("run_consolidation_cycle: created interim adapter %s", adapter_name)
                 else:
-                    self.model = ensure_adapter_matching(
-                        self.model, self.episodic_config, adapter_name
+                    ensure_adapter_matching(
+                        self.model, self.tier_adapters["episodic"], adapter_name
                     )
 
             _recalled_entries = self._hydrate_store_for_fold(_interim_scope)
@@ -2277,7 +2284,7 @@ class ConsolidationLoop:
             _sibling_interim_tiers = [
                 t for t in interim_tiers_newest_first(self.store) if t != adapter_name
             ]
-            _candidate_tiers = {t: t for t in [*self._tier_config_map(), *_sibling_interim_tiers]}
+            _candidate_tiers = {t: t for t in [*self.tier_adapters, *_sibling_interim_tiers]}
 
             _session_ids = (
                 sorted(session_ids)
@@ -2549,7 +2556,7 @@ class ConsolidationLoop:
             ``(episodic, procedural)`` — the same :class:`Relation` objects
             from *pending*, partitioned with relative order preserved.
         """
-        if self.procedural_config is None or not pending:
+        if "procedural" not in self.tier_adapters or not pending:
             return list(pending), []
         from paramem.graph.relation_prep import filter_procedural_relations
 
@@ -2913,7 +2920,7 @@ class ConsolidationLoop:
 
         _recalled_entries = self._hydrate_store_for_fold(scope)
 
-        primary_tiers = {t: t for t in self._tier_config_map()}
+        primary_tiers = {t: t for t in self.tier_adapters}
 
         # Every full-topology event absorbs the interim ring whole.
         from paramem.memory.interim_adapter import interim_tiers_newest_first
@@ -3073,44 +3080,23 @@ class ConsolidationLoop:
     #: how a fact is spelled, it does not observe the fact again.
     _REOBSERVED_REASONS = frozenset({"dedup"})
 
-    def ensure_adapters(self):
-        """Create production adapters that don't exist yet.
+    def _clean_stale_staging_dir(self) -> None:
+        """Remove stale on-disk staging checkpoints left by a prior crash.
 
-        Production adapters (episodic, semantic, procedural) are created based
-        on configuration.  The staging slot (``in_training``) is NOT created
-        here: per the staging+promote contract, the slot is transient and is
-        created/destroyed per training event by
-        ``trainer._ensure_staging_slot`` and the post-save cleanup at each
-        save site.  Pre-creating it at startup would violate the
-        "transient — exists only while a training event is in flight"
-        invariant.
+        ``output_dir/in_training`` is HF-Trainer scratch, unrelated to the
+        PEFT slot lifecycle — filesystem-level debris from a crash-resume
+        attempt that never completed. Called once at construction (formerly
+        the tail of the deleted ``ensure_adapters``, which also created the
+        production tiers; tier creation now happens once, before this loop
+        is ever constructed, via ``load_base_model`` /
+        ``paramem.models.loader.ensure_resident_tiers``).
         """
         import shutil
 
-        from peft import PeftModel
-
-        from paramem.models.loader import create_adapter
-
-        has_peft = isinstance(self.model, PeftModel)
-        if not has_peft or "episodic" not in self.model.peft_config:
-            logger.info("Creating episodic adapter")
-            self.model = create_adapter(self.model, self.episodic_config, "episodic")
-        if self.config.promotion_threshold > 0 and "semantic" not in self.model.peft_config:
-            logger.info("Creating semantic adapter")
-            self.model = create_adapter(self.model, self.semantic_config, "semantic")
-        if self.procedural_config is not None and "procedural" not in self.model.peft_config:
-            logger.info("Creating procedural adapter")
-            self.model = create_adapter(self.model, self.procedural_config, "procedural")
-
-        # Clean stale on-disk staging checkpoints (HF Trainer output_dir/in_training).
-        # These are filesystem-level debris from a prior crash-resume attempt,
-        # unrelated to the PEFT slot lifecycle.
         stale_dir = Path(self.output_dir) / "in_training"
         if stale_dir.exists():
             logger.info("Cleaning stale in_training checkpoints at %s", stale_dir)
             shutil.rmtree(stale_dir)
-
-        return self.model
 
     def _disable_gradient_checkpointing(self) -> None:
         """Disable gradient checkpointing for generation."""
@@ -3937,7 +3923,7 @@ class ConsolidationLoop:
             }
         ]
         _ep_rels, _proc_rels = partition_relations(
-            dummy, procedural_enabled=self.procedural_config is not None
+            dummy, procedural_enabled="procedural" in self.tier_adapters
         )
         dest_tier = "procedural" if _proc_rels else "episodic"
         dest = working[dest_tier]
@@ -4105,7 +4091,7 @@ class ConsolidationLoop:
                     }
                 ]
                 _ep_rels, _proc_rels = partition_relations(
-                    dummy, procedural_enabled=self.procedural_config is not None
+                    dummy, procedural_enabled="procedural" in self.tier_adapters
                 )
                 kind = "procedural" if _proc_rels else "episodic"
                 tier = mint_destination.get(kind)
@@ -4280,7 +4266,7 @@ class ConsolidationLoop:
                         }
                     ]
                     _ep_rels, _proc_rels = partition_relations(
-                        dummy, procedural_enabled=self.procedural_config is not None
+                        dummy, procedural_enabled="procedural" in self.tier_adapters
                     )
                     kind = "procedural" if _proc_rels else "episodic"
                     tier = mint_destination.get(kind)
@@ -4804,16 +4790,16 @@ class ConsolidationLoop:
         """Assemble this event's :class:`~paramem.memory.increment.TierWriteContext`
         from the loop's own state.
 
-        Rebuilt fresh at every call site that needs one rather than threaded
-        as a stale value: ``TierWriteContext`` is frozen, and
-        :func:`~paramem.training.go_live.publish_bundle`'s mount step (and
-        :meth:`_train_gate_write`'s own training call) may reassign
-        ``self.model`` (an unwrapped-base cold birth) — rebuilding from
-        ``self.model`` each time is what keeps every write/publish call
-        working from the current handle.
+        Rebuilt fresh at every call site that needs one rather than cached,
+        since ``TierWriteContext`` is frozen and a caller building one
+        earlier in the event may not reflect a config change mid-process —
+        the loop's own state (``self.tier_adapters``, ``self.model``) is the
+        single source, re-read each time. ``self.model``'s object identity
+        never changes (fixed at load time), so this is about staying
+        current with ``self.tier_adapters``, not with a reassigned model.
 
         Args:
-            extra_tiers: Tier names beyond the three main tiers that the
+            extra_tiers: Tier names beyond this loop's main tiers that the
                 caller's bundle may name (an interim slot such as
                 ``"episodic_interim_<stamp>"``). Each is resolved through
                 :meth:`_tier_adapter_config` — the one rule home for the
@@ -4824,7 +4810,7 @@ class ConsolidationLoop:
         """
         from paramem.memory.increment import TierWriteContext
 
-        tier_configs = dict(self._tier_config_map())
+        tier_configs = dict(self.tier_adapters)
         for tier in extra_tiers:
             tier_configs.setdefault(tier, self._tier_adapter_config(tier))
 
@@ -4838,33 +4824,29 @@ class ConsolidationLoop:
             keep_prior_slots=self._keep_prior_slots,
         )
 
-    def _tier_config_map(self) -> "dict[str, AdapterConfig]":
-        """This loop's ``{tier_name: AdapterConfig}`` map for every tier its
-        write context may need to mount.
-
-        The three main tiers map to their own resolved config; any other
-        tier name (an interim slot, e.g. ``"episodic_interim_<stamp>"``) is
-        always episodic-shaped in this codebase, so it maps to
-        ``episodic_config`` — the same assumption
-        :meth:`_training_output_dir` and every existing interim-mint call
-        site make.
-        """
-        configs: dict[str, AdapterConfig] = {
-            "episodic": self.episodic_config,
-            "semantic": self.semantic_config,
-        }
-        if self.procedural_config is not None:
-            configs["procedural"] = self.procedural_config
-        return configs
-
     def _tier_adapter_config(self, tier: str) -> "AdapterConfig":
-        """One tier's ``AdapterConfig`` — the main-tier map plus the interim
-        fallback :meth:`_tier_config_map` documents.
+        """One tier's ``AdapterConfig`` — ``self.tier_adapters`` plus the
+        interim-is-episodic-shaped fallback.
+
+        Any tier name not itself a key of ``self.tier_adapters`` (an interim
+        slot, e.g. ``"episodic_interim_<stamp>"``) is always episodic-shaped
+        in this codebase, so it maps to ``self.tier_adapters["episodic"]`` —
+        the same assumption :meth:`_training_output_dir` and every existing
+        interim-mint call site make.
+
+        Raises:
+            KeyError: *tier* is neither a key of ``self.tier_adapters`` nor
+                an interim adapter name (e.g. a main tier the operator has
+                disabled).
         """
-        configs = self._tier_config_map()
-        if tier in configs:
-            return configs[tier]
-        return self.episodic_config
+        if tier in self.tier_adapters:
+            return self.tier_adapters[tier]
+
+        from paramem.memory.interim_adapter import INTERIM_NAME_PREFIX
+
+        if tier.startswith(INTERIM_NAME_PREFIX):
+            return self.tier_adapters["episodic"]
+        raise KeyError(tier)
 
     @staticmethod
     def _latest_stage(ledger: "StageLedger", tier: str, stage: str) -> "dict | None":
@@ -5053,10 +5035,9 @@ class ConsolidationLoop:
         # that directory exists for.
         output_dir = Path(ledger.tiers[tier]["scratch"])
 
-        self.model = ensure_adapter_matching(self.model, adapter_config, tier)
+        ensure_adapter_matching(self.model, adapter_config, tier)
 
         with tier_backup_scope(self.model, adapter_config, tier) as scope:
-            self.model = scope.model
             self._record_fold_telemetry(
                 ledger=ledger,
                 kind="backup_creation",
@@ -5515,7 +5496,7 @@ class ConsolidationLoop:
         if to_publish:
             bundle = self._ordered_publish_bundle(to_publish)
             ctx = self._build_write_context(extra_tiers=[inc.tier for inc in bundle])
-            model = publish_bundle(
+            publish_bundle(
                 bundle,
                 ctx=ctx,
                 ledger=ledger,
@@ -5523,7 +5504,6 @@ class ConsolidationLoop:
                 router=router,
                 absorbed_interim_tiers=ledger.absorbed_interim_tiers,
             )
-            self.model = model
             published_tiers.extend(inc.tier for inc in bundle)
             ledger = _sl.read_ledger(state_dir)
 

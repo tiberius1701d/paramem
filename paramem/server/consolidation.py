@@ -147,12 +147,8 @@ def create_consolidation_loop(
         tokenizer=tokenizer,
         consolidation_config=config.consolidation_config,
         training_config=config.training_config,
-        episodic_adapter_config=config.episodic_adapter_config,
-        semantic_adapter_config=config.semantic_adapter_config,
         memory_store=memory_store,
-        procedural_adapter_config=(
-            config.procedural_adapter_config if config.adapters.procedural.enabled else None
-        ),
+        tier_adapters=config.tier_config_map(),
         output_dir=_output_dir,
         extraction_temperature=0.0,
         extraction_max_tokens=config.consolidation.extraction_max_tokens,
@@ -388,7 +384,6 @@ def get_or_create_consolidation_loop(state: dict, *, store=None) -> Consolidatio
         state_provider=lambda: state,
     )
     state["consolidation_loop"] = loop
-    state["model"] = loop.model
     return loop
 
 

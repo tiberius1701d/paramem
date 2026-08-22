@@ -48,9 +48,10 @@ from experiments.utils.test_harness import (  # noqa: E402
 )
 from paramem.evaluation.recall import generate_answer  # noqa: E402
 from paramem.models.loader import (  # noqa: E402
-    load_adapter,
     load_base_model,
+    mount_adapter,
 )
+from paramem.utils.config import AdapterConfig  # noqa: E402
 
 setup_logging()
 logger = logging.getLogger(__name__)
@@ -522,10 +523,12 @@ def run_test10b(
         output_dir / "run_config.json",
     )
 
-    # Load model
+    # Load model, wrapped with the episodic tier every checkpoint below
+    # mounts its weights onto in place — the base model's object identity
+    # is fixed at load time, so there is no unwrap between checkpoints.
     model_config = BENCHMARK_MODELS[model_name]
     logger.info("Loading model: %s", model_name)
-    model, tokenizer = load_base_model(model_config)
+    model, tokenizer = load_base_model(model_config, {"episodic": AdapterConfig()})
     model.gradient_checkpointing_disable()
 
     # Generate diverse questions (cached in output dir)
@@ -564,11 +567,11 @@ def run_test10b(
 
         logger.info("Checkpoint %d/%d: %s", i + 1, len(checkpoints), epoch_name)
 
-        # Load adapter from Test 10's checkpoint
-        if isinstance(model, PeftModel):
-            model = model.base_model.model
+        # Mount this checkpoint's weights onto the resident episodic tier
+        # in place — each iteration overwrites the same adapter name, so
+        # there is no accumulation and nothing to unwrap.
         adapter_path = cp_dir / "adapter"
-        model = load_adapter(model, str(adapter_path), "episodic")
+        mount_adapter(model, adapter_path / "episodic", "episodic")
         model.gradient_checkpointing_disable()
 
         # Probe
@@ -592,13 +595,7 @@ def run_test10b(
 
         # Cooldown between checkpoints
         if i < len(checkpoints) - 1:
-            if isinstance(model, PeftModel):
-                model = model.base_model.model
             wait_for_cooldown(52, 600, label="between checkpoints")
-
-    # Unwrap final adapter
-    if isinstance(model, PeftModel):
-        model = model.base_model.model
 
     # Build summary from output dir
     output_checkpoints = sorted(

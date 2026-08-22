@@ -28,12 +28,29 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
+from peft import PeftModel
 
 import paramem.server.app as app_module
 from paramem.cloud.providers.base import CloudResponse
 from paramem.graph.schema import Relation, SessionGraph
 from paramem.server.inference import ChatResult
 from paramem.server.session_buffer import SessionBuffer
+
+
+def _peft_model_mock() -> MagicMock:
+    """``MagicMock(spec=PeftModel)`` -- passes the ``isinstance(model,
+    PeftModel)`` precondition ``base_model_inference`` now enforces
+    wherever a local-mode state's reasoning generate reaches it.
+    ``is_gradient_checkpointing`` defaults False and
+    ``gradient_checkpointing_disable``/``_enable`` are pre-set -- dynamic
+    ``__getattr__``-delegated attributes a real (wrapped) PeftModel
+    exposes that ``spec`` cannot see via ``dir(PeftModel)`` (mirrors
+    ``tests/server/test_gates.py::_make_mock_model``)."""
+    model = MagicMock(spec=PeftModel)
+    model.is_gradient_checkpointing = False
+    model.gradient_checkpointing_disable = MagicMock()
+    model.gradient_checkpointing_enable = MagicMock()
+    return model
 
 
 def _make_config() -> MagicMock:
@@ -64,7 +81,7 @@ def _make_state(tmp_path, *, mode: str = "local", cloud_only_reason=None) -> dic
             "ha_client": None,
             "cloud_agent": MagicMock(),
             "cloud_providers": {},
-            "model": MagicMock() if mode == "local" else None,
+            "model": _peft_model_mock() if mode == "local" else None,
             "tokenizer": MagicMock() if mode == "local" else None,
             "background_trainer": None,
             "relay_notice_conversations": set(),
@@ -301,7 +318,6 @@ class TestForcedCloudRouting:
         ``Route 'cloud' unavailable.`` -> this test fails.
         """
         state = _make_state(tmp_path, mode="local")
-        state["model"].is_gradient_checkpointing = False
         agent = state["cloud_agent"]
         agent.call.return_value = CloudResponse(text="Paris.")
         monkeypatch.setattr(app_module, "_state", state)
@@ -670,7 +686,6 @@ class TestRelayLegEgressSurfaces:
         anon = "My name is Person_1 and I take heart medication every morning."
 
         state = _make_state(tmp_path, mode="local")
-        state["model"].is_gradient_checkpointing = False
         ha_client = MagicMock()
         # HA declines this turn, so the chain continues to the cloud leg and
         # BOTH payload surfaces are observable in one pass.
@@ -724,7 +739,6 @@ class TestRelayLegEgressSurfaces:
         extraction sentinel is not a speaker id and must never be
         forwarded as one."""
         state = _make_state(tmp_path, mode="local")
-        state["model"].is_gradient_checkpointing = False
         state["ha_client"] = None
         state["cloud_agent"].call.return_value = CloudResponse(text="ok")
         monkeypatch.setattr(app_module, "_state", state)

@@ -188,10 +188,11 @@ class TestMigrateTierSimulateToTrainEntryFilter:
         _wire_fakes(loop, monkeypatch, train_side_effect=lambda entries, **kwargs: (None, None))
 
         def _fake_create_adapter(model, adapter_config, adapter_name="default"):
-            # Mirrors _FakeDriverModel's own _seed_adapter contract instead
-            # of taking the real cold get_peft_model() path, which needs a
-            # real torch.nn.Module.
-            model._seed_adapter(adapter_name)
+            # Mirrors real create_adapter's own add_adapter call, on the fake
+            # driver model's (tests/_fold_fixtures.py::_make_fake_driver_model)
+            # public seeding contract -- instead of taking the real cold
+            # get_peft_model() path, which needs a real torch.nn.Module.
+            model.add_adapter(adapter_name, adapter_config)
             model.set_adapter(adapter_name)
             return model
 

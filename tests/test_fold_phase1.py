@@ -45,11 +45,12 @@ def _make_loop(tmp_path, *, procedural: bool = False) -> ConsolidationLoop:
         recall_early_stopping=False,
         recall_probe_batch_size=1,
     )
-    loop.episodic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
-    loop.semantic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
-    loop.procedural_config = (
-        AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"]) if procedural else None
-    )
+    loop.tier_adapters = {
+        "episodic": AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"]),
+        "semantic": AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"]),
+    }
+    if procedural:
+        loop.tier_adapters["procedural"] = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
     loop.wandb_config = None
     loop._thermal_policy = None
     loop.output_dir = tmp_path / "adapters"
@@ -753,6 +754,57 @@ class TestPromotion:
         assert working["episodic"].rows["graph1"]["promoted"] is False
         assert loop._pending_promoted_keys == set()
         assert loop.promoted_keys == set()
+
+    def test_net_new_key_promotes_only_after_one_re_observation_at_threshold_2(self, tmp_path):
+        """A net-new key is minted at reinforcement_count=1 (the same
+        default every fresh key row carries). At promotion_threshold=2 --
+        the smallest threshold config validation accepts, because 1 is
+        every key's own first-staging value and 2 is what a re-observation
+        produces -- the key must NOT promote on its first pass, and MUST
+        promote once one re-observation has bumped its count to 2."""
+        loop = _make_loop(tmp_path)
+        loop.config.promotion_threshold = 2
+        loop.store.registry("episodic").add("graph1")
+        loop.store.set_bookkeeping(
+            "graph1",
+            speaker_id="speaker0",
+            relation_type="factual",
+            reinforcement_count=1,
+            last_reinforced_cycle=0,
+            last_seen="2026-01-01T00:00:00Z",
+            first_seen="2026-01-01T00:00:00Z",
+            promoted=False,
+        )
+        loop.store.put(
+            "episodic",
+            "graph1",
+            {"key": "graph1", "subject": "alex", "predicate": "lives in", "object": "berlin"},
+            register=False,
+        )
+
+        working = loop._recall_working_tiers(
+            {"episodic": "episodic", "semantic": "semantic"},
+            {},
+            _recalled_entries_from_store(loop),
+        )
+        first_pass = loop._promote_working_keys(working)
+
+        assert first_pass == []
+        assert "graph1" in working["episodic"].registry.list_active()
+        assert "graph1" not in working["semantic"].registry.list_active()
+
+        # One re-observation: bump reinforcement_count to 2 on the SAME
+        # working row (mirrors the shared credit_reinforcement primitive's
+        # effect, without pulling in the full reinforcement-credit path).
+        working["episodic"].rows["graph1"]["reinforcement_count"] = 2
+
+        second_pass = loop._promote_working_keys(working)
+
+        assert second_pass == ["graph1"]
+        assert "graph1" not in working["episodic"].registry.list_active()
+        assert "graph1" in working["semantic"].registry.list_active()
+        assert working["semantic"].rows["graph1"]["promoted"] is True
+        assert working["semantic"].rows["graph1"]["reinforcement_count"] == 2
 
 
 class TestApplyWorkingReinforcementCreditDirect:

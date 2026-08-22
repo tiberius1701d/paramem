@@ -22,18 +22,32 @@ import json
 from unittest.mock import MagicMock, patch
 
 import pytest
+from peft import PeftModel
 
 from paramem.graph.extractor import normalize_predicates
 from paramem.graph.phase_trace import extraction_trace
 from paramem.graph.prompts import _load_prompt
 
 
+def _peft_model_mock() -> MagicMock:
+    """``MagicMock(spec=PeftModel)`` -- passes the ``isinstance(model,
+    PeftModel)`` precondition ``base_model_inference`` now enforces on
+    ``normalize_predicates``'s local-mode call.
+    ``gradient_checkpointing_disable``/``_enable`` are dynamic
+    ``__getattr__``-delegated attributes a real (wrapped) PeftModel
+    exposes that ``spec`` cannot see via ``dir(PeftModel)``, so they are
+    pre-set explicitly (mirrors ``tests/server/test_gates.py::
+    _make_mock_model``)."""
+    model = MagicMock(spec=PeftModel)
+    model.gradient_checkpointing_disable = MagicMock()
+    model.gradient_checkpointing_enable = MagicMock()
+    return model
+
+
 def _make_model_tokenizer(raw_outputs: list[str]):
     """Return a (model, tokenizer) MagicMock pair that produces the given
     raw strings from sequential generate_answer calls (one per candidate group)."""
-    model = MagicMock()
-    model.gradient_checkpointing_disable = MagicMock()
-    model.gradient_checkpointing_enable = MagicMock()
+    model = _peft_model_mock()
     tokenizer = MagicMock()
     tokenizer.apply_chat_template = MagicMock(return_value="<formatted>")
     return model, tokenizer
@@ -58,7 +72,7 @@ def _run(
 
 class TestEmptyInput:
     def test_empty_returns_empty_clusters(self):
-        model = MagicMock()
+        model = _peft_model_mock()
         tokenizer = MagicMock()
         clusters_by_so, diag = normalize_predicates(
             [],
@@ -79,9 +93,7 @@ class TestSinglePredicateGroupPassthrough:
             {"subject": "Alex", "predicate": "likes", "object": "hiking"},
             {"subject": "Sam", "predicate": "works_at", "object": "Acme"},
         ]
-        model = MagicMock()
-        model.gradient_checkpointing_disable = MagicMock()
-        model.gradient_checkpointing_enable = MagicMock()
+        model = _peft_model_mock()
         tokenizer = MagicMock()
         # If generate_answer were called, the side_effect would raise.
         with patch(
@@ -127,9 +139,7 @@ class TestSynonymClusters:
             {"subject": "Alex", "predicate": "lives_in", "object": "Berlin"},
             {"subject": "Alex", "predicate": "lives_in", "object": "Munich"},
         ]
-        model = MagicMock()
-        model.gradient_checkpointing_disable = MagicMock()
-        model.gradient_checkpointing_enable = MagicMock()
+        model = _peft_model_mock()
         tokenizer = MagicMock()
         with patch(
             "paramem.graph.extractor.generate_answer",
@@ -215,9 +225,11 @@ class TestGroundingGuard:
             {"subject": "A", "predicate": "p1", "object": "B"},
             {"subject": "A", "predicate": "p2", "object": "B"},
         ]
-        model = MagicMock()
-        model.gradient_checkpointing_disable = MagicMock()
-        model.gradient_checkpointing_enable = MagicMock()
+        model = _peft_model_mock()
+        # Entering checkpointing ON is what makes the finally-block
+        # re-enable meaningful to assert on -- grad_checkpointing_disabled
+        # only re-enables when it was already on at scope entry.
+        model.is_gradient_checkpointing = True
         tokenizer = MagicMock()
         tokenizer.apply_chat_template = MagicMock(return_value="<fmt>")
         with patch(
@@ -348,9 +360,7 @@ class TestPromptProvenance:
             {"subject": "Alex", "predicate": "employed_by", "object": "Acme"},
         ]
         raw = json.dumps({"clusters": [["works_for", "employed_by"]]})
-        model = MagicMock()
-        model.gradient_checkpointing_disable = MagicMock()
-        model.gradient_checkpointing_enable = MagicMock()
+        model = _peft_model_mock()
         tokenizer = MagicMock()
         tokenizer.apply_chat_template = MagicMock(return_value="<formatted>")
 

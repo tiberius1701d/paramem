@@ -375,8 +375,22 @@ and semantic adapters over its lifetime. Neither ever deletes anything.
 
 | Parameter | Default | Effect | When to adjust |
 |---|---|---|---|
-| `promotion_threshold` | `3` | How much standing a fact needs before it moves from the episodic adapter to the semantic one. Standing comes from being said again in a *later* conversation — repetition inside one conversation does not count — and a fact also keeps the standing of any duplicate merged into it, so consolidating two records of the same fact never costs it its place. | Raise to keep the semantic tier smaller and more selective, so only facts confirmed across several conversations settle there. Lower to promote sooner, at the cost of promoting things that turned out to be passing remarks. |
+| `promotion_threshold` | `3` | How much standing a fact needs before it moves from the episodic adapter to the semantic one. Standing comes from being said again in a *later* conversation — repetition inside one conversation does not count — and a fact also keeps the standing of any duplicate merged into it, so consolidating two records of the same fact never costs it its place. A newly learned fact starts with one observation, so the smallest value that still means "confirmed again" is `2`; a value below that is rejected at boot (see [Boot-time tier validation](#boot-time-tier-validation) below) when the semantic tier is enabled. | Raise to keep the semantic tier smaller and more selective, so only facts confirmed across several conversations settle there. Lower to promote sooner, at the cost of promoting things that turned out to be passing remarks — never below `2`. |
 | `decay_window` | `10` | How many consolidation cycles a fact may go unmentioned before it is logged as a decay candidate. Advisory only — nothing is deleted, and the fact stays recallable; unimportant facts fade on their own as the adapter is retrained around them. | Lower to see fading candidates sooner in the logs; raise to quieten them. Purely diagnostic — changing it does not change what the server keeps. |
+
+#### Boot-time tier validation
+
+The server refuses to start on a contradictory `adapters:`/`consolidation:` configuration rather than silently reinterpreting it. Five checks run at boot — some as soon as the config file is read, some once the model is about to load and on-disk state is visible:
+
+| Rejected when | Why it's contradictory | Remediation |
+|---|---|---|
+| The semantic tier is enabled with `promotion_threshold` below `2` | A net-new fact starts with one observation; below `2` every fact promotes to semantic on sight, so the episodic tier never retains anything | Set `promotion_threshold: 2` or higher, or disable the semantic tier to run episodic-only |
+| Every tier is disabled while `cloud_only: false` | A local-mode server with no tier has no parametric memory to serve | Enable at least one tier, or set `cloud_only: true` |
+| The episodic tier is disabled while interim consolidation is still configured (`consolidation.max_interim_count` above `0`) | The interim ring is episodic-shaped and has nowhere to land without an episodic tier | Set `max_interim_count: 0` and run one full consolidation to drain the ring, then disable episodic |
+| The episodic tier is disabled while interim data still exists on disk | Turning off the knob doesn't remove data already staged in the ring | Run `POST /consolidate` to fold the ring into episodic (or `POST /interim/discard` to drop it), then disable episodic |
+| A tier is disabled while it still holds active memory keys | Disabling a tier that still owns keys would make those facts permanently unreachable — nothing else rebuilds them | Fold or promote the tier's keys elsewhere, or erase them, then disable the tier |
+
+**Disabling any tier is a drain-first operation.** The server never silently drops facts by turning off the tier that holds them — fold or erase a tier's keys (and drain the interim ring before disabling episodic) before the config change is accepted.
 
 #### Graph refinement
 

@@ -51,6 +51,7 @@ from paramem.graph.prompts import prompt_overrides
 from paramem.models.loader import (
     active_adapter_name,
     base_model_inference,
+    has_prior_trained_weights,
     load_base_model,
     switch_adapter,
     unload_model,
@@ -67,7 +68,6 @@ from paramem.server.config import (
 )
 from paramem.server.consolidation import (
     classify_pending_sessions,
-    create_consolidation_loop,
     get_or_create_consolidation_loop,
     retire_unattributable_sessions,
 )
@@ -1589,21 +1589,23 @@ def _revalidate_adapter_manifests(state: dict) -> None:
     real, unconditional delete. Healthy adapters have their row removed;
     unhealthy ones get a fresh row stamped with the current ``checked_at``.
 
-    Main tiers first (episodic/semantic/procedural, gated on
-    ``adapter_cfg.enabled``), then every interim dir :func:`iter_interim_dirs`
-    currently yields (no ``enabled`` gate — interims stay episodic-shaped
-    and validated regardless of the main episodic tier's enabled state;
-    ``kind_dir`` is the exact path ``iter_interim_dirs`` yielded, never
-    re-derived — see :func:`_validate_adapter_slot`'s docstring for why).
-    Finally, any ``manifest_status`` row keyed by an interim adapter name
-    (:data:`~paramem.memory.interim_adapter.INTERIM_NAME_PREFIX`) whose
-    on-disk directory no longer exists (folded away or discarded since the
-    row was written) is popped — a full cycle can retire an interim slot
-    without that interim ever being revalidated again, so without this
-    prune a stale row would linger and permanently suppress the
-    ``local_recall_inactive`` attention item (any row with a problematic
-    status defers to the more specific fingerprint item instead — see the
-    guard in
+    Main tiers first — every tier in ``config.tier_config_map()`` — then
+    every interim dir :func:`iter_interim_dirs` currently yields (interims
+    stay episodic-shaped and validated regardless of the main episodic
+    tier's enabled state, subject to the boot-time refusal of a populated
+    ring left behind by a disabled episodic tier — see
+    :func:`_load_model_into_state`; ``kind_dir`` is the
+    exact path ``iter_interim_dirs`` yielded, never re-derived — see
+    :func:`_validate_adapter_slot`'s docstring for why). Finally, ONE
+    post-loop prune drops every ``manifest_status`` row keyed by a name that
+    is neither in ``config.tier_config_map()`` nor a live interim directory
+    name — this subsumes both a tier disabled since its row was written and
+    an interim slot folded away or discarded since (a full cycle can retire
+    an interim slot without that interim ever being revalidated again, so
+    without this prune a stale row would linger and permanently suppress
+    the ``local_recall_inactive`` attention item — any row with a
+    problematic status defers to the more specific fingerprint item instead,
+    see the guard in
     :func:`~paramem.server.attention._collect_local_recall_inactive_items`).
     """
     config = state.get("config")
@@ -1614,21 +1616,14 @@ def _revalidate_adapter_manifests(state: dict) -> None:
 
     from paramem.adapters.registry_binding import verify_tier_binding
     from paramem.memory.interim_adapter import (
-        INTERIM_NAME_PREFIX,
         adapter_slot_root_for_name,
         iter_interim_dirs,
     )
 
     manifest_status = state.setdefault("adapter_manifest_status", {})
 
-    for name, adapter_cfg in (
-        ("episodic", config.adapters.episodic),
-        ("semantic", config.adapters.semantic),
-        ("procedural", config.adapters.procedural),
-    ):
-        if not adapter_cfg.enabled:
-            manifest_status.pop(name, None)
-            continue
+    _tier_configs = config.tier_config_map()
+    for name, adapter_cfg in _tier_configs.items():
         _kind_dir = adapter_slot_root_for_name(config.adapter_dir, name)
         _validate_adapter_slot(
             name,
@@ -1639,23 +1634,21 @@ def _revalidate_adapter_manifests(state: dict) -> None:
             manifest_status,
         )
 
-    live_interims = list(iter_interim_dirs(config.adapter_dir))
-    for _interim_name, _interim_path in live_interims:
-        _validate_adapter_slot(
-            _interim_name,
-            config.adapters.episodic,
-            model,
-            _interim_path,
-            verify_tier_binding(_interim_name, _interim_path),
-            manifest_status,
-        )
+    live_interims: list = []
+    if "episodic" in _tier_configs:
+        live_interims = list(iter_interim_dirs(config.adapter_dir))
+        for _interim_name, _interim_path in live_interims:
+            _validate_adapter_slot(
+                _interim_name,
+                _tier_configs["episodic"],
+                model,
+                _interim_path,
+                verify_tier_binding(_interim_name, _interim_path),
+                manifest_status,
+            )
 
-    live_interim_names = {n for n, _ in live_interims}
-    for stale_name in [
-        n
-        for n in manifest_status
-        if n.startswith(INTERIM_NAME_PREFIX) and n not in live_interim_names
-    ]:
+    live_names = set(_tier_configs) | {n for n, _ in live_interims}
+    for stale_name in [n for n in manifest_status if n not in live_names]:
         manifest_status.pop(stale_name, None)
 
 
@@ -2019,8 +2012,39 @@ def _sweep_keyless_tier_artifacts(config, state: dict) -> list[str]:
     return sorted(reaped)
 
 
-def _mount_adapters_from_slots(model, tokenizer, config, state: dict):
-    """Load enabled adapters from slot-dir layout with manifest verification.
+def _record_tier_weight_state(state: dict, model, config) -> None:
+    """Snapshot per-main-tier trained-weight status onto ``state``, once.
+
+    ``has_prior_trained_weights`` walks ``model.named_parameters()`` — cheap
+    once per adapter mutation, expensive if called on every ``/status`` poll
+    (the fold cadence is roughly once per second). Weight state only
+    actually changes where an adapter is mounted or promoted, so this is
+    called exactly at those boundaries — the end of
+    :func:`_mount_adapters_from_slots` (covers both the boot path via
+    :func:`_load_model_into_state` and the restore path via
+    :func:`_remount_adapters_from_disk`, which both call it) and the
+    full-cycle finalizer (:func:`_finalize_full`, the go-live promote path,
+    shared by every full/reconcile-shaped fold regardless of which driver
+    dispatched it) — never recomputed by a reader. ``/status`` reads the
+    recorded map instead of calling ``has_prior_trained_weights`` itself.
+
+    Args:
+        state: The global ``_state`` dict (mutated in place).
+        model: The live model, or ``None`` (cloud-only) — an empty map is
+            recorded in that case.
+        config: The live ``ServerConfig`` — ``tier_config_map()`` names the
+            tiers to snapshot.
+    """
+    if model is None:
+        state["tier_weight_state"] = {}
+        return
+    state["tier_weight_state"] = {
+        name: has_prior_trained_weights(model, name) for name in config.tier_config_map()
+    }
+
+
+def _mount_adapters_from_slots(model, tokenizer, config, state: dict) -> None:
+    """Load enabled adapters from slot-dir layout with manifest verification, in place.
 
     Pre-mount housekeeping runs first, before any slot is resolved for any
     tier (:func:`_sweep_keyless_tier_artifacts`, which itself runs
@@ -2034,12 +2058,14 @@ def _mount_adapters_from_slots(model, tokenizer, config, state: dict):
     (``_build_store_contents``, called from ``_preload_memory_store`` further
     down the same boot/reload event), and the integrity report all then see
     the identical, already-cleaned tree instead of three independently timed
-    snapshots that could disagree). Then every adapter kind — the three
-    enabled main tiers (episodic/semantic/procedural) AND every interim tier
-    on disk (``episodic_interim_*``, no ``enabled`` gate — interims stay
-    episodic-shaped even when the episodic main tier is disabled) — is
-    validated through the single :func:`_validate_adapter_slot` decision
-    tree:
+    snapshots that could disagree). Then every adapter kind — every tier in
+    ``config.tier_config_map()`` AND every interim tier on disk
+    (``episodic_interim_*``, gated on ``"episodic" in config.tier_config_map()``
+    — the boot-time refusal already blocks boot when episodic is disabled
+    with a populated ring, so this is a second, defensive gate rather than
+    the primary one)
+    — is validated through the single :func:`_validate_adapter_slot`
+    decision tree:
 
     1. Sweep orphan ``.pending`` dirs (inside the validator, scoped to that
        tier's own slot root).
@@ -2049,28 +2075,33 @@ def _mount_adapters_from_slots(model, tokenizer, config, state: dict):
        :func:`~paramem.adapters.registry_binding.verify_tier_binding`.
     3. The binding carries the matched slot, when one was found.
     4. Read the manifest; compare base model / tokenizer / LoRA fingerprints
-       (interim tiers compare against ``config.adapters.episodic`` — interim
-       slots are episodic-shaped).
+       (interim tiers compare against ``config.tier_config_map()["episodic"]``
+       — interim slots are episodic-shaped).
     5. Mount matching slots; record mismatch / missing / unverified rows in
        ``state["adapter_manifest_status"]``.
 
+    Finally, :func:`_record_tier_weight_state` snapshots each main tier's
+    trained-weight status onto ``state["tier_weight_state"]`` — the one
+    write ``/status`` reads instead of measuring on every poll.
+
     Args:
-        model: Base model (or existing PeftModel) to load adapters onto.
+        model: The live ``PeftModel`` to mount adapters onto. Every tier is
+            already resident (created cold by :func:`load_base_model` /
+            :func:`~paramem.models.loader.ensure_resident_tiers`) — this
+            function only ever mounts trained weights onto an existing
+            adapter name, never creates one. Mutated in place; nothing is
+            returned.
         tokenizer: Loaded tokenizer (for fingerprint comparison).
         config: Loaded ``ServerConfig``.
         state: The global ``_state`` dict (mutated in-place for manifest
-            status and, when :func:`_sweep_keyless_tier_artifacts`'s
+            status, ``state["tier_weight_state"]`` and, when
+            :func:`_sweep_keyless_tier_artifacts`'s
             ``cleanup_partial_slots`` pass removes anything,
             ``state["integrity_cleanup"]``).
-
-    Returns:
-        The updated model (PeftModel when any adapter was loaded, otherwise
-        the original base model).
     """
-    from peft import PeftModel
-
     from paramem.adapters.registry_binding import verify_tier_binding
     from paramem.memory.interim_adapter import adapter_slot_root_for_name
+    from paramem.models.loader import mount_adapter
 
     manifest_status: dict = state.setdefault("adapter_manifest_status", {})
     # Per-tier paths live at <adapter_dir>/<tier>/indexed_key_registry.json; each
@@ -2087,22 +2118,13 @@ def _mount_adapters_from_slots(model, tokenizer, config, state: dict):
         logger.info("Boot sweep: reaped keyless tier(s): %s", ", ".join(_swept_tiers))
 
     def _load_one(name: str, slot: Path):
-        """Mount a single adapter from *slot* onto *model* (mutates nonlocal model).
+        """Mount a single adapter from *slot* onto *model*, in place.
 
         Does not overwrite an existing manifest status row — the validator may
         have already recorded a manifest_missing or migrated_unverified row.
-        Transparently decrypts age-encrypted ``adapter_model.safetensors`` via
-        :func:`~paramem.models.loader._adapter_slot_for_load`.
         """
-        from paramem.models.loader import _adapter_slot_for_load
-
-        nonlocal model
         try:
-            with _adapter_slot_for_load(slot) as load_path:
-                if isinstance(model, PeftModel):
-                    model.load_adapter(str(load_path), adapter_name=name)
-                else:
-                    model = PeftModel.from_pretrained(model, str(load_path), adapter_name=name)
+            mount_adapter(model, slot, name)
             logger.info("Mounted adapter %s from slot %s", name, slot.name)
         except Exception as exc:
             logger.error("Failed to load adapter %s from %s: %s", name, slot, exc)
@@ -2119,13 +2141,8 @@ def _mount_adapters_from_slots(model, tokenizer, config, state: dict):
     # ---- Main adapter kinds ----
     # Per-tier validation is delegated to _validate_adapter_slot so the
     # boot path and post-full-cycle revalidation share one decision tree.
-    for name, adapter_cfg in (
-        ("episodic", config.adapters.episodic),
-        ("semantic", config.adapters.semantic),
-        ("procedural", config.adapters.procedural),
-    ):
-        if not adapter_cfg.enabled:
-            continue
+    _tier_configs = config.tier_config_map()
+    for name, adapter_cfg in _tier_configs.items():
         _kind_dir = adapter_slot_root_for_name(config.adapter_dir, name)
         slot, _manifest, should_mount = _validate_adapter_slot(
             name,
@@ -2140,36 +2157,34 @@ def _mount_adapters_from_slots(model, tokenizer, config, state: dict):
 
     # ---- Interim adapters ----
     # Same _validate_adapter_slot decision tree as the main tiers, using
-    # config.adapters.episodic as the fingerprint reference (interim slots
-    # are episodic-shaped) and each interim's own per-tier registry hash
-    # (never the main-episodic hash — comparing to the main hash always
-    # misses when a full cycle hasn't run yet). No .enabled gate here:
-    # interims stay episodic-shaped and mountable even when the episodic
-    # main tier is disabled. ``_interim_path`` (the exact path
-    # iter_interim_dirs yielded) is passed as kind_dir directly — never
-    # re-derived from ``_interim_name`` via adapter_slot_root_for_name,
-    # which raises on a stray dir whose stamp is malformed (see
-    # _validate_adapter_slot's docstring).
-    from paramem.memory.interim_adapter import iter_interim_dirs
+    # tier_config_map()["episodic"] as the fingerprint reference (interim
+    # slots are episodic-shaped) and each interim's own per-tier registry
+    # hash (never the main-episodic hash — comparing to the main hash always
+    # misses when a full cycle hasn't run yet). Gated on episodic existing —
+    # a populated ring under a disabled episodic tier is refused at boot
+    # before this function is ever reached; this is belt-and-suspenders
+    # for any other caller of this function (e.g. a reload).
+    # ``_interim_path`` (the exact path iter_interim_dirs yielded) is passed
+    # as kind_dir directly — never re-derived from ``_interim_name`` via
+    # adapter_slot_root_for_name, which raises on a stray dir whose stamp is
+    # malformed (see _validate_adapter_slot's docstring).
+    if "episodic" in _tier_configs:
+        from paramem.memory.interim_adapter import iter_interim_dirs
 
-    for _interim_name, _interim_path in iter_interim_dirs(config.adapter_dir):
-        slot, _manifest, should_mount = _validate_adapter_slot(
-            _interim_name,
-            config.adapters.episodic,
-            model,
-            _interim_path,
-            verify_tier_binding(_interim_name, _interim_path),
-            manifest_status,
-        )
-        if should_mount and slot is not None:
-            _load_one(_interim_name, slot)
+        for _interim_name, _interim_path in iter_interim_dirs(config.adapter_dir):
+            slot, _manifest, should_mount = _validate_adapter_slot(
+                _interim_name,
+                _tier_configs["episodic"],
+                model,
+                _interim_path,
+                verify_tier_binding(_interim_name, _interim_path),
+                manifest_status,
+            )
+            if should_mount and slot is not None:
+                _load_one(_interim_name, slot)
 
-    if hasattr(model, "peft_config") and model.peft_config:
-        logger.info("Adapters loaded: %s", list(model.peft_config.keys()))
-    else:
-        logger.info("No adapters found — starting fresh")
-
-    return model
+    logger.info("Adapters loaded: %s", list(model.peft_config.keys()))
+    _record_tier_weight_state(state, model, config)
 
 
 def _check_manifest_fingerprints(manifest, model, adapter_cfg) -> "str | None":
@@ -2459,19 +2474,17 @@ def _compute_topology_assessment(config, base_pred: int | None):
     ).element_size()
     peft_overhead_bytes = config.vram.peft_overhead_per_adapter_mib * 1024 * 1024
     piper_ort_context_bytes = config.vram.tts_piper_ort_context_mib * 1024 * 1024
-    main_adapter_configs = [
-        tier_cfg
-        for tier_cfg, server_cfg in (
-            (config.episodic_adapter_config, config.adapters.episodic),
-            (config.semantic_adapter_config, config.adapters.semantic),
-            (config.procedural_adapter_config, config.adapters.procedural),
-        )
-        if server_cfg.enabled
-    ]
+    _tier_configs = config.tier_config_map()
+    main_adapter_configs = list(_tier_configs.values())
+    # Interims are always episodic-shaped, regardless of whether episodic is
+    # itself an enabled main tier. ``None`` when episodic is absent — config
+    # load already forbids max_interim_count > 0 without episodic, so there
+    # is no interim shape to derive and assess_topology treats the interim
+    # contribution as 0 in that case (never a fallback shape borrowed from
+    # another tier).
+    _interim_config = _tier_configs.get("episodic")
     assessment = assess_topology(
-        # Interims are always episodic-shaped, regardless of whether episodic
-        # is itself an enabled main tier.
-        config.episodic_adapter_config,
+        _interim_config,
         main_adapter_configs=main_adapter_configs,
         max_interim_count=config.consolidation.max_interim_count,
         interim_overflow_slack=config.consolidation.interim_overflow_slack,
@@ -3140,7 +3153,32 @@ async def lifespan(app: FastAPI):
             # See that function's docstring for why this is load-bearing.  The
             # per-process VRAM cap is applied as that function's first step
             # (before any tensor allocation) — no separate cap call here.
-            _load_model_into_state(config)
+            #
+            # Cold-tier creation (paramem.models.loader.ensure_resident_tiers)
+            # is a VRAM allocation like any other boot-time load, so it must
+            # sit behind the same degrade-not-crash posture as the drain wait
+            # above and check_post_load_budget below: a VRAM shortfall here
+            # produces a running cloud-only server, never a dead unit. Catch
+            # ONLY VramExhausted and the fatal-CUDA path — the config-vs-disk
+            # refusals inside _load_model_into_state (a populated interim
+            # ring left behind by a disabled episodic tier, a disabled tier
+            # whose registry still holds active keys, and the legacy adapter
+            # layout check) must abort the boot loudly, not be swallowed
+            # into a silent cloud-only degrade.
+            try:
+                _load_model_into_state(config)
+            except VramExhausted:
+                logger.warning(
+                    "Boot model load: VRAM exhausted during tier creation — degrading to cloud-only"
+                )
+                _degrade_to_cloud_only("insufficient_vram")
+                cloud_only = True
+            except BaseException as _load_exc:
+                if is_fatal_cuda_fault(_load_exc):
+                    _fail_fast_cuda(_load_exc, "load_model_into_state")
+                    cloud_only = True  # on the exhausted-burst path: _degrade ran, stays up
+                else:
+                    raise
 
     # Config-derived component construction — single shared routine called by
     # BOTH the lifespan (here) and the live-apply path.  At boot the session
@@ -3155,36 +3193,6 @@ async def lifespan(app: FastAPI):
             cloud_only = True  # on the exhausted-burst path: _degrade ran, stays up
         else:
             raise
-
-    # Eager consolidation-loop creation — mounts the adapters as soon as a
-    # local-mode model is resident (_build_runtime_components's memory-store
-    # preload just populated _state["memory_store"]) so /status's
-    # adapter_loaded reading does not depend on the first consolidation door
-    # having run. No-op in cloud-only mode; a later post-load VRAM-overflow
-    # degrade below releases it along with every other base-model holder.
-    #
-    # ConsolidationLoop.__init__ -> ensure_adapters -> create_adapter
-    # allocates GPU memory BEFORE the post-load VRAM gate below runs, so a
-    # failure here (VramExhausted or otherwise) must degrade, not crash the
-    # boot: the lazy get_or_create_consolidation_loop remains the fallback
-    # for every caller that needs the loop, so a swallowed failure here only
-    # costs /status reporting adapter_loaded=false until the first
-    # consolidation door creates it. Only a sticky, process-fatal CUDA fault
-    # gets the crash-loop treatment, mirroring _build_runtime_components's
-    # handling just above.
-    try:
-        _eager_create_consolidation_loop()
-    except BaseException as _eager_exc:
-        if is_fatal_cuda_fault(_eager_exc):
-            _fail_fast_cuda(_eager_exc, "eager_consolidation_loop")
-            cloud_only = True  # on the exhausted-burst path: _degrade ran, stays up
-        else:
-            logger.exception(
-                "Eager consolidation-loop creation failed at boot — continuing "
-                "without it; the lazy get-or-create remains the fallback and "
-                "/status will report adapter_loaded=false until the first "
-                "consolidation door runs"
-            )
 
     # Post-load authoritative gate. Runs AFTER _build_runtime_components so
     # the measured allocation includes the STT/TTS GPU footprint. On failure,
@@ -5424,21 +5432,21 @@ async def status():
     config = _state["config"]
     model = _state["model"]
 
-    adapter_loaded = (
-        hasattr(model, "peft_config") and "episodic" in model.peft_config if model else False
-    )
+    # The episodic tier carries trained weights — not merely that an
+    # adapter object exists (residency does not imply readiness). A
+    # resident-but-cold episodic tier (created but never trained) reads
+    # False here. Read from the recorded snapshot
+    # (_record_tier_weight_state, written at every adapter-mutation
+    # boundary — mount and go-live promote) rather than measured here:
+    # has_prior_trained_weights walks named_parameters(), and /status is
+    # polled roughly once per second during a fold.
+    adapter_loaded = _state.get("tier_weight_state", {}).get("episodic", False)
 
     # Adapter inventory: enumerate configured kinds + interim capacity. Main
-    # adapters contribute 1 each when enabled in yaml; interim contributes
+    # adapters contribute 1 each when their tier exists; interim contributes
     # max_interim_count (the capacity ceiling enforced by the VRAM validator).
-    adapter_config_counts: dict[str, int] = {}
-    for kind, cfg in (
-        ("episodic", config.adapters.episodic),
-        ("semantic", config.adapters.semantic),
-        ("procedural", config.adapters.procedural),
-    ):
-        if cfg.enabled:
-            adapter_config_counts[kind] = 1
+    _status_tier_configs = config.tier_config_map()
+    adapter_config_counts: dict[str, int] = {kind: 1 for kind in _status_tier_configs}
     if config.consolidation.max_interim_count > 0:
         adapter_config_counts["interim"] = config.consolidation.max_interim_count
 
@@ -5649,12 +5657,15 @@ async def status():
         model_id = None
 
     # Episodic adapter rank surfaces the primary knob for indexed-key recall.
-    episodic_rank = config.adapters.episodic.rank if config.adapters.episodic.enabled else None
+    episodic_rank = (
+        _status_tier_configs["episodic"].rank if "episodic" in _status_tier_configs else None
+    )
 
-    # Per-kind adapter spec. Only include enabled kinds so pstatus doesn't
-    # display disabled rows. target_kind compresses target_modules into a
-    # category label — "attn+mlp" means MLP layers are in the set, else
-    # "attn". A caller interested in the exact list can hit the yaml.
+    # Per-kind adapter spec — one row per tier in tier_config_map() (disabled
+    # tiers are absent from the map, so pstatus never displays a row for
+    # one). target_kind compresses target_modules into a category label —
+    # "attn+mlp" means MLP layers are in the set, else "attn". A caller
+    # interested in the exact list can hit the yaml.
     def _target_kind(target_modules: list[str]) -> str:
         for t in target_modules or []:
             tl = t.lower()
@@ -5662,20 +5673,15 @@ async def status():
                 return "attn+mlp"
         return "attn"
 
-    adapter_specs: dict[str, dict] = {}
-    for _kind, _cfg in (
-        ("episodic", config.adapters.episodic),
-        ("semantic", config.adapters.semantic),
-        ("procedural", config.adapters.procedural),
-    ):
-        if not _cfg.enabled:
-            continue
-        adapter_specs[_kind] = {
+    adapter_specs: dict[str, dict] = {
+        _kind: {
             "rank": _cfg.rank,
             "alpha": _cfg.alpha,
             "learning_rate": _cfg.learning_rate,
             "target_kind": _target_kind(_cfg.target_modules),
         }
+        for _kind, _cfg in _status_tier_configs.items()
+    }
 
     # Speaker-embedding backend. Only populate when the pyannote model is
     # actually loaded — disabled / failed-load paths leave the fields None
@@ -7673,15 +7679,12 @@ def _remount_adapters_from_disk(config) -> None:
     mounted tier adapter, so this may (and, for a full bundle, does) empty
     ``model.peft_config`` entirely — :func:`detach_adapters` documents this
     exact "the caller is emptying peft_config deliberately and owns the
-    restore" branch. Emptying leaves ``model.active_adapter`` stale (the PEFT
-    sole-adapter trap: an emptied-but-still-PeftModel-wrapped model must
-    never receive ``add_adapter``/``load_adapter`` next — see this module's
-    PEFT rules), so the model is unwrapped to the bare base
-    (``model.base_model.model``) BEFORE calling
-    :func:`_mount_adapters_from_slots` again — its first re-mount then takes
-    the clean ``PeftModel.from_pretrained`` wrap path, identical to the very
-    first adapter mounted at boot, rather than ``PeftModel.load_adapter`` on
-    a model whose active-adapter reference no longer resolves.
+    restore" branch. Emptying leaves ``model.active_adapter`` stale, but the
+    model's object identity never changes: :func:`~paramem.models.loader.ensure_resident_tiers`
+    restores every configured tier onto the SAME ``PeftModel`` object
+    (a detach immediately followed by the create that repairs it, with no
+    model use in between) rather than the model being unwrapped and
+    re-wrapped.
 
     Caller responsibility: serialize this against every other GPU user —
     call under ``gpu_lock`` (mirrors every other PEFT-mutating primitive in
@@ -7690,9 +7693,7 @@ def _remount_adapters_from_disk(config) -> None:
     Args:
         config: Live server config object.
     """
-    from peft import PeftModel
-
-    from paramem.models.loader import detach_adapters
+    from paramem.models.loader import detach_adapters, ensure_resident_tiers
 
     model = _state.get("model")
     if model is None:
@@ -7700,20 +7701,18 @@ def _remount_adapters_from_disk(config) -> None:
         return
 
     tokenizer = _state.get("tokenizer")
-    if isinstance(model, PeftModel):
-        mounted = sorted(model.peft_config.keys())
-        detach_adapters(model, mounted)
-        model = model.base_model.model  # unwrap — the clean re-wrap path below needs it
+    mounted = sorted(model.peft_config.keys())
+    detach_adapters(model, mounted)
+    ensure_resident_tiers(model, config.tier_config_map())
 
     # Manifest status describes the PRE-restore tree; every row is stale the
     # instant the tree is rewritten underneath it — same reset
     # _load_model_into_state performs on every fresh load.
     _state["adapter_manifest_status"] = {}
-    model = _mount_adapters_from_slots(model, tokenizer, config, _state)
-    if hasattr(model, "peft_config") and "episodic" in model.peft_config:
+    _mount_adapters_from_slots(model, tokenizer, config, _state)
+    if "episodic" in model.peft_config:
         switch_adapter(model, "episodic")
-    _state["model"] = model
-    logger.info("Adapter re-mount complete — model handle refreshed in _state")
+    logger.info("Adapter re-mount complete")
 
 
 def _load_model_into_state(config) -> None:
@@ -7744,22 +7743,13 @@ def _load_model_into_state(config) -> None:
     """
     apply_process_cap(fraction=config.vram.process_cap_fraction)
     logger.info("Loading model: %s (%s)", config.model_name, config.model_config.model_id)
-    with vram_measure("base") as _base_vm:
-        model, tokenizer = load_base_model(config.model_config)
-    # Store the measured delta in the per-component VRAM ledger (bytes).
-    # vram_measure stores an INT — no BASE-MODEL HOLDER created here.
-    _state["vram_components"]["base"] = _base_vm["delta"]
-
-    # Manifest caches are model-specific; re-init on every load.
-    _state["adapter_manifest_status"] = {}
-    _state["base_model_hash_cache"] = {}
 
     # Refuse to start on a legacy adapter layout (pre-2026-05-14 hierarchy
     # refactor). Operator must run scripts/migrate/restructure_adapter_dir.py
     # before restart. The new code paths use iter_interim_dirs() which scans
     # adapter_dir/episodic/interim_*, so legacy adapter_dir/episodic_interim_*
     # dirs would be invisible and produce a silently degraded server.
-    from paramem.memory.interim_adapter import detect_legacy_adapter_layout
+    from paramem.memory.interim_adapter import detect_legacy_adapter_layout, iter_interim_dirs
 
     _legacy = detect_legacy_adapter_layout(config.adapter_dir)
     if _legacy:
@@ -7770,11 +7760,73 @@ def _load_model_into_state(config) -> None:
             "adapters under adapter_dir/episodic/, then restart."
         )
 
-    # Mount adapters from slots — wraps the model in PeftModel.
-    model = _mount_adapters_from_slots(model, tokenizer, config, _state)
+    # Config-vs-disk companion to the config-document guards in
+    # paramem.server.config: episodic disabled with a populated interim
+    # ring on disk has no destination to absorb into. Disabling
+    # max_interim_count alone (setting it to 0) is not enough — it only
+    # stops MINTING new interim slots; an already-populated ring still sits
+    # on disk with no tier to drain into.
+    _tier_configs = config.tier_config_map()
+    if "episodic" not in _tier_configs:
+        _stray_interims = list(iter_interim_dirs(config.adapter_dir))
+        if _stray_interims:
+            raise RuntimeError(
+                f"adapters.episodic.enabled=false but "
+                f"{len(_stray_interims)} interim slot(s) still exist under "
+                f"{config.adapter_dir / 'episodic'}.\n"
+                f"\n"
+                f"The interim ring has no destination tier to absorb into.\n"
+                f"\n"
+                f"Remediation:\n"
+                f"  - POST /consolidate to drain the ring into episodic, or\n"
+                f"  - POST /interim/discard to destroy it,\n"
+                f"    then disable episodic."
+            )
+
+    # A tier disabled while its own registry still holds active keys
+    # makes those keys unreachable: no adapter is created, no slot is
+    # mounted, and nothing rebuilds them at the next fold. Uses the same
+    # registry↔slot binding primitive the mount loop and migration path
+    # already resolve a tier's active key count through.
+    from paramem.adapters.registry_binding import verify_tier_binding
+    from paramem.memory.interim_adapter import adapter_slot_root_for_name
+    from paramem.utils.tiers import MAIN_TIERS
+
+    for _tier in MAIN_TIERS:
+        if _tier in _tier_configs:
+            continue
+        _tier_root = adapter_slot_root_for_name(config.adapter_dir, _tier)
+        _binding = verify_tier_binding(_tier, _tier_root)
+        if _binding.registry is not None and _binding.registry.list_active():
+            raise RuntimeError(
+                f"adapters.{_tier}.enabled=false but its registry at {_tier_root} "
+                f"holds {len(_binding.registry.list_active())} active key(s).\n"
+                f"\n"
+                f"Disabling a tier that still owns keys makes them unreachable — no "
+                f"adapter is created, no slot is mounted, and nothing rebuilds them "
+                f"at the next fold.\n"
+                f"\n"
+                f"Remediation:\n"
+                f"  - Drain the tier (fold/promote its keys elsewhere), or\n"
+                f"  - Erase its keys,\n"
+                f"    then disable it."
+            )
+
+    with vram_measure("base") as _base_vm:
+        model, tokenizer = load_base_model(config.model_config, _tier_configs)
+    # Store the measured delta in the per-component VRAM ledger (bytes).
+    # vram_measure stores an INT — no BASE-MODEL HOLDER created here.
+    _state["vram_components"]["base"] = _base_vm["delta"]
+
+    # Manifest caches are model-specific; re-init on every load.
+    _state["adapter_manifest_status"] = {}
+    _state["base_model_hash_cache"] = {}
+
+    # Mount adapters from slots onto the already-resident (cold) tiers.
+    _mount_adapters_from_slots(model, tokenizer, config, _state)
 
     # Restore the main episodic adapter as the active adapter.
-    if hasattr(model, "peft_config") and "episodic" in model.peft_config:
+    if "episodic" in model.peft_config:
         switch_adapter(model, "episodic")
 
     _state["model"] = model
@@ -8172,18 +8224,6 @@ def _live_reload_base_model(
             )
             result = "reload_failed"
 
-    # Eager consolidation-loop creation — both success branches above land
-    # mode="local" here with the model resident; the fall-through failure
-    # branch (plain-reclaim component rebuild failure) called
-    # _release_base_model_in_process(), which nulls _state["model"]/
-    # ["tokenizer"] — the gate inside _eager_create_consolidation_loop reads
-    # those (not mode) and skips because the model is absent, not because
-    # mode reads "cloud-only".  _release_base_model_in_process also nulls
-    # _state["consolidation_loop"] on every release path, so a
-    # release→acquire cycle would otherwise revert to the lazy
-    # get-or-create — this call keeps adapter_loaded symmetric
-    # across that cycle too, not just across a restart.
-    _eager_create_consolidation_loop()
     return result
 
 
@@ -9574,7 +9614,7 @@ def _interim_discard_inventory(loop, config) -> dict:
       — the exact set :func:`~paramem.memory.interim_adapter.unload_interim_adapters`
       will remove from disk (payload-bearing or not).
     - ``peft_names``: interim-prefixed keys in ``loop.model.peft_config`` when
-      ``loop.model`` is a :class:`~peft.PeftModel`, else empty.
+      ``loop.model`` is resident (not ``None`` — cloud-only), else empty.
     - ``active_keys`` / ``stale_keys``: per-tier counts from the store, for
       every name in ``store_tiers``.
 
@@ -9593,8 +9633,6 @@ def _interim_discard_inventory(loop, config) -> dict:
         (dict[str, int]), and ``"empty"`` (bool — True when ``store_tiers``,
         ``disk_dirs`` and ``peft_names`` are all empty).
     """
-    from peft import PeftModel
-
     from paramem.memory.interim_adapter import (
         INTERIM_NAME_PREFIX,
         interim_tiers_newest_first,
@@ -9607,7 +9645,7 @@ def _interim_discard_inventory(loop, config) -> dict:
     disk_dir_names = {name: path.name for name, path in disk_pairs}
     peft_names = (
         sorted(n for n in loop.model.peft_config if n.startswith(INTERIM_NAME_PREFIX))
-        if isinstance(loop.model, PeftModel)
+        if loop.model is not None
         else []
     )
     return {
@@ -10080,9 +10118,7 @@ async def debug_recall(request: DebugRecallRequest):
     if model is None or tokenizer is None:
         return JSONResponse({"status": "not_ready"}, status_code=503)
 
-    from peft import PeftModel
-
-    available = sorted(model.peft_config.keys()) if isinstance(model, PeftModel) else []
+    available = sorted(model.peft_config.keys())
     if request.adapter != "none" and request.adapter not in available:
         return JSONResponse(
             {
@@ -10098,6 +10134,7 @@ async def debug_recall(request: DebugRecallRequest):
     from paramem.evaluation.recall import generate_answer
     from paramem.memory.entry import parse_recalled_entry
     from paramem.models.loader import (
+        base_model_inference,
         grad_checkpointing_disabled,
         render_chat_prompt,
         switch_adapter,
@@ -10128,29 +10165,23 @@ async def debug_recall(request: DebugRecallRequest):
         elif isinstance(raw_active, str):
             prior = [raw_active]
 
-        with grad_checkpointing_disabled(model):
-            t0 = time.monotonic()
-            try:
-                if request.adapter == "none":
-                    if isinstance(model, PeftModel):
-                        with model.disable_adapter():
-                            raw = generate_answer(
-                                model,
-                                tokenizer,
-                                prompt,
-                                max_new_tokens=request.max_new_tokens,
-                                temperature=request.temperature,
-                            )
-                    else:
-                        raw = generate_answer(
-                            model,
-                            tokenizer,
-                            prompt,
-                            max_new_tokens=request.max_new_tokens,
-                            temperature=request.temperature,
-                        )
-                    adapter_active_label = "disabled"
-                else:
+        # One CM per branch — base_model_inference already disables gradient
+        # checkpointing internally (and the active adapter), so wrapping it
+        # in grad_checkpointing_disabled too would open the same CM twice.
+        t0 = time.monotonic()
+        try:
+            if request.adapter == "none":
+                with base_model_inference(model):
+                    raw = generate_answer(
+                        model,
+                        tokenizer,
+                        prompt,
+                        max_new_tokens=request.max_new_tokens,
+                        temperature=request.temperature,
+                    )
+                adapter_active_label = "disabled"
+            else:
+                with grad_checkpointing_disabled(model):
                     switch_adapter(model, request.adapter)
                     raw = generate_answer(
                         model,
@@ -10159,14 +10190,14 @@ async def debug_recall(request: DebugRecallRequest):
                         max_new_tokens=request.max_new_tokens,
                         temperature=request.temperature,
                     )
-                    adapter_active_label = request.adapter
-            finally:
-                # Restore prior adapter so the next /chat starts predictable.
-                if prior and isinstance(model, PeftModel):
-                    switch_adapter(model, prior[0] if len(prior) == 1 else prior)
+                adapter_active_label = request.adapter
+        finally:
+            # Restore prior adapter so the next /chat starts predictable.
+            if prior:
+                switch_adapter(model, prior[0] if len(prior) == 1 else prior)
 
-            latency_ms = int((time.monotonic() - t0) * 1000)
-            return raw, adapter_active_label, latency_ms
+        latency_ms = int((time.monotonic() - t0) * 1000)
+        return raw, adapter_active_label, latency_ms
 
     async with gpu_lock():
         loop = asyncio.get_running_loop()
@@ -11474,8 +11505,13 @@ async def migration_preview(request: PreviewRequest):
     # --- Construct the candidate as if it already sat at the live config path ---
     # Parseable YAML is not a bootable config.  Reject here, at LIVE, so an
     # unbootable candidate is never staged: state stays LIVE, nothing is stashed.
+    # The returned ServerConfig is discarded by every OTHER caller of
+    # validate_candidate (it carries interpolated secrets), but this one is
+    # kept — compute_shape_changes below reads tier existence from its
+    # tier_config_map() rather than re-deriving adapters.<tier>.enabled from
+    # the raw candidate dict a second time.
     try:
-        validate_candidate(candidate_bytes, live_config_path)
+        candidate_config = validate_candidate(candidate_bytes, live_config_path)
     except CandidateConfigInvalid as exc:
         raise HTTPException(
             status_code=400,
@@ -11496,7 +11532,9 @@ async def migration_preview(request: PreviewRequest):
 
     # --- Shape-change detection ---
     adapter_dir = config.adapter_dir if config is not None else default_data_dir() / "adapters"
-    shape_changes, shape_change_warnings = compute_shape_changes(parsed_candidate, adapter_dir)
+    shape_changes, shape_change_warnings = compute_shape_changes(
+        parsed_candidate, adapter_dir, candidate_config
+    )
 
     # --- Detect simulate-mode ---
     simulate_mode_override = detect_simulate_mode(parsed_candidate)
@@ -12466,20 +12504,11 @@ async def _run_trial_consolidation() -> None:
                 else data_state_dir(default_data_dir()) / "trial" / "adapters"
             )
 
-            # Use loop.model (the PeftModel wrapper) instead of the raw
-            # _state["model"] (base MistralForCausalLM). The trial loop's
-            # create_adapter calls rebind self.model = PeftModel(...) — that
-            # wrapper holds the trial adapters in a form that PEFT's
-            # set_adapter / probe_key can use. The raw base model's
-            # peft_config is populated in-place but `_hf_peft_config_loaded`
-            # is False, which causes set_adapter to raise "No adapter loaded".
-            gate_model = (
-                loop.model
-                if not session_buffer_empty and "loop" in locals() and loop is not None
-                else model
-            )
+            # model IS loop.model — the base model's object identity is fixed
+            # at load time, so every holder (including the trial loop)
+            # holds the identical PeftModel; no pick is needed.
             results = evaluate_gates(
-                model=gate_model,
+                model=model,
                 tokenizer=tokenizer,
                 trial_adapter_dir=trial_adapter_dir,
                 live_adapter_dir=live_adapter_dir,
@@ -12762,12 +12791,10 @@ async def _run_base_swap_orchestration(
             pre_trial_hash = _resume_marker.pre_trial_config_sha256
         else:
             # Fresh start — build per-tier adapter_dirs dict from the live config.
-            adapter_dirs: dict[str, Path] = {}
-            adapters_cfg = getattr(config, "adapters", None)
-            for _tier_name in ("episodic", "semantic", "procedural"):
-                _tier_cfg = getattr(adapters_cfg, _tier_name, None) if adapters_cfg else None
-                if _tier_cfg is not None and getattr(_tier_cfg, "enabled", False):
-                    adapter_dirs[_tier_name] = Path(config.adapter_dir) / _tier_name
+            adapter_dirs: dict[str, Path] = {
+                _tier_name: Path(config.adapter_dir) / _tier_name
+                for _tier_name in config.tier_config_map()
+            }
 
             data_dir = Path(config.paths.data)
             speaker_profiles_path = data_dir / "speaker_profiles.json"
@@ -12865,17 +12892,7 @@ async def _run_base_swap_orchestration(
             )
             save_state(Path(config.adapter_dir), migration_state)
 
-            loop = _state.get("consolidation_loop")
-            if loop is None:
-                loop = create_consolidation_loop(
-                    _state["model"],
-                    _state["tokenizer"],
-                    config,
-                    _state["memory_store"],
-                    state_provider=lambda: _state,
-                )
-                _state["consolidation_loop"] = loop
-                _state["model"] = loop.model
+            loop = get_or_create_consolidation_loop(_state)
 
             bt = _build_bg_trainer(config)
             _state["background_trainer"] = bt
@@ -12918,7 +12935,13 @@ async def _run_base_swap_orchestration(
                         phase_a_error.append(RuntimeError("Phase A: migration state file vanished"))
                         return
                     updated = migrate(loop, config, _fresh_state)
-                    _state["model"] = loop.model
+                    # migrate() re-creates and retrains each tier it touches
+                    # directly on loop.model (create_adapter + train), not
+                    # through the fold's go-live promote path — re-snapshot
+                    # here even on a partial run, since a tier already
+                    # migrated before a later tier's failure keeps its new
+                    # weight state regardless of the overall outcome.
+                    _record_tier_weight_state(_state, loop.model, config)
                     if not updated.all_tiers_done(loop.store.tiers_with_registry()):
                         first_fail = next(iter(updated.failed_tiers.values()), "unknown")
                         phase_a_error.append(RuntimeError(f"Phase A incomplete: {first_fail}"))
@@ -13219,17 +13242,7 @@ async def _run_base_swap_orchestration(
         )
         save_state(Path(config_b.adapter_dir), migration_state_b)
 
-        loop_b = _state.get("consolidation_loop")
-        if loop_b is None:
-            loop_b = create_consolidation_loop(
-                _state["model"],
-                _state["tokenizer"],
-                config_b,
-                _state["memory_store"],
-                state_provider=lambda: _state,
-            )
-            _state["consolidation_loop"] = loop_b
-            _state["model"] = loop_b.model
+        loop_b = get_or_create_consolidation_loop(_state)
 
         bt_b = _build_bg_trainer(config_b)
         _state["background_trainer"] = bt_b
@@ -13305,7 +13318,12 @@ async def _run_base_swap_orchestration(
                 if _phase_b_cycle_count is not None:
                     loop_b.seed_key_metadata(_phase_b_cycle_count)
                 updated_b = migrate(loop_b, config_b, _fresh_state_b)
-                _state["model"] = loop_b.model
+                # loop_b.model IS _state["model"] here (loop_b was built by
+                # get_or_create_consolidation_loop off the live _state,
+                # post-Step-3 base reload) — re-snapshot even on a partial
+                # run; a later Step 6 reload re-derives it again once the
+                # swap fully lands.
+                _record_tier_weight_state(_state, loop_b.model, config_b)
                 if not updated_b.all_tiers_done(loop_b.store.tiers_with_registry()):
                     first_fail = next(iter(updated_b.failed_tiers.values()), "unknown")
                     phase_b_error.append(RuntimeError(f"Phase B incomplete: {first_fail}"))
@@ -15923,16 +15941,19 @@ async def backup_restore(req: BackupRestoreRequest):
             # as _release_base_model_in_process's holders 2 and 3, minus
             # releasing the base model itself), re-mount adapters from the
             # restored slots onto the resident model (no-op in cloud-only
-            # mode), then lift the store. Without this release,
-            # _state["consolidation_loop"] keeps its old .model (a detached
-            # PEFT wrapper _remount_adapters_from_disk unwraps and discards)
-            # and its old .store (the pre-restore store _lift_quarantined_store
-            # replaces) — the next fold's lazily-cached loop would then run
-            # against both stale objects. Nulling here means the next fold's
-            # get_or_create_consolidation_loop rebuilds fresh against the
-            # post-restore _state["model"]/_state["memory_store"]. Both
-            # releases and the remount+lift are GPU-touching when a model is
-            # resident, so all of it runs off the event loop under gpu_lock.
+            # mode), then lift the store. The base model's object identity
+            # never changes (_remount_adapters_from_disk mutates the SAME
+            # PeftModel in place — detach then ensure_resident_tiers, never
+            # an unwrap), so this release is about the loop/store wrappers,
+            # not the model handle. Without it, _state["consolidation_loop"]
+            # keeps its old .store (the pre-restore store
+            # _lift_quarantined_store replaces) — the next fold's
+            # lazily-cached loop would then run against a stale store.
+            # Nulling here means the next fold's get_or_create_consolidation_loop
+            # rebuilds fresh against the post-restore _state["memory_store"].
+            # Both releases and the remount+lift are GPU-touching when a
+            # model is resident, so all of it runs off the event loop under
+            # gpu_lock.
             def _restore_converge_sync() -> bool:
                 # Re-resolve rather than close over the handler's pre-lock
                 # capture — same door-staleness argument as
@@ -17613,8 +17634,8 @@ def _dispatch_consolidation(
     # action exactly like a no-matching-slot or key-count-mismatched tier
     # already did.
     if action.stages_event:
-        from paramem.memory.interim_adapter import MAIN_TIERS
         from paramem.server.manifest_status import BINDING_ROW_STATUSES
+        from paramem.utils.tiers import MAIN_TIERS
 
         _manifest_status = _state.get("adapter_manifest_status", {})
         if any(
@@ -18225,8 +18246,6 @@ def _await_bg_cycle(
             max_interim_count=max_interim_count,
             session_ids=session_ids,
         )
-        # Propagate any PeftModel handle rebinding from create_interim_adapter.
-        _state["model"] = loop.model
 
     bt.submit_and_wait(_run, inference_fallback_adapter=inference_fallback_adapter)
     return _result_holder["result"]
@@ -18272,7 +18291,7 @@ def _run_extraction_phase(
     config = _state["config"]
     session_buffer = _state["session_buffer"]
 
-    if not config.adapters.episodic.enabled:
+    if "episodic" not in config.tier_config_map():
         logger.info("Episodic adapter is disabled in config, skipping consolidation")
         return {"status": "disabled", "sessions": 0, "loop": loop}
 
@@ -18661,40 +18680,6 @@ def _consolidation_run_done(
         _consolidation_terminal(terminal_body)
 
 
-def _eager_create_consolidation_loop() -> None:
-    """Create the consolidation loop as soon as a local-mode model is resident.
-
-    ``/status``'s ``adapter_loaded`` reading (``"episodic" in
-    model.peft_config``) only becomes true once a ``ConsolidationLoop``
-    exists — its ``__init__`` ensures the adapters are mounted.  Left to the
-    lazy get-or-create
-    (:func:`~paramem.server.consolidation.get_or_create_consolidation_loop`),
-    a freshly booted server with no trained slots reports
-    ``adapter_loaded=false`` until the first consolidation door runs, so the
-    same server flips the reading across a restart.  Calling this at every
-    site where a local-mode model lands in ``_state`` (lifespan boot,
-    ``_live_reload_base_model``'s tail) keeps the reading symmetric.
-
-    No-op in cloud-only mode (model/tokenizer absent) and a no-op when the
-    loop already exists — the shared get-or-create is itself idempotent.
-
-    Raises whatever ``ConsolidationLoop.__init__`` raises (e.g.
-    ``VramExhausted`` from ``ensure_adapters`` -> ``create_adapter``
-    allocating GPU memory) — this function does not catch. The lifespan
-    boot call site wraps this in a log-and-continue handler (mirroring
-    ``_build_runtime_components``'s) so a failure here degrades rather
-    than crashing the boot; the ``_live_reload_base_model`` tail call is
-    unwrapped because that function's own callers already wrap the whole
-    reload.
-    """
-    if (
-        _state.get("model") is not None
-        and _state.get("tokenizer") is not None
-        and _state.get("memory_store") is not None
-    ):
-        get_or_create_consolidation_loop(_state)
-
-
 def _run_stage_b_cycle(
     *,
     kind: str,
@@ -18716,10 +18701,12 @@ def _run_stage_b_cycle(
     point, reached from exactly one call site for every terminal (success or
     failure — there is no ``if mode`` fork here).
 
-    On a normal return, ``_state["model"]`` picks up any PEFT rebind
-    performed by *body* (``create_adapter`` / ``create_interim_adapter``) and
-    the terminal's ``finalizer`` — a zero-arg callable, or ``None`` for a
-    clear-only terminal — is dispatched via :func:`_consolidation_terminal`.
+    On a normal return, the terminal's ``finalizer`` — a zero-arg callable,
+    or ``None`` for a clear-only terminal — is dispatched via
+    :func:`_consolidation_terminal`. ``_state["model"]`` needs no re-sync:
+    the base model's object identity is fixed at load time, so *body*'s
+    ``create_adapter`` / ``create_interim_adapter`` calls (via ``loop``)
+    mutate the identical object already held there.
 
     ``body(loop, bt)`` is wrapped in ``_end_voice_eviction(lock_held=True)``
     so the voice pipeline is restored on the success terminal and the crash
@@ -18821,7 +18808,6 @@ def _run_stage_b_cycle(
                 logger.exception("Failed to record %s incident (non-fatal)", kind)
             _consolidation_terminal(None)
             return
-        _state["model"] = loop.model
         # Neutral cycle label on the success line — `kind` is an incident
         # TYPE ("training_crash"/"consolidation_crash"/"migration_error")
         # and is reserved for the crash path; logging it here would misread
@@ -19875,7 +19861,10 @@ def _finalize_full(
        earlier in the process) and dispose the event's record — not gated
        on the consume-pending pre-stage having run, since the ledger is
        the source of truth for what to retire either way.
-    d. ``_state`` flags / result bookkeeping — ``last_consolidation`` etc.
+    d. ``_state`` flags / result bookkeeping — ``last_consolidation``,
+       ``tier_weight_state`` (:func:`_record_tier_weight_state`, the go-live
+       promote path's write site — a tier may just have gone from cold to
+       trained-warm) etc.
        ``full_consolidation_overdue`` resolves only when every tier the
        event's ledger names went live (``result["completed"]``): a
        partially completed event (one whose bundle has not all gone live)
@@ -19933,6 +19922,13 @@ def _finalize_full(
         _full_outcome = "full_trained"
     if _full_completed:
         _state["last_consolidation"] = datetime.now(timezone.utc).isoformat()
+        # Every main tier this event's ledger names may just have gone
+        # live (the go-live promote path, paramem.training.go_live.publish_bundle,
+        # mounted its written slot and promoted it onto ctx.model — the SAME
+        # object as loop.model / _state["model"], fixed at load time) —
+        # re-snapshot the weight-state record here rather than leaving
+        # /status to measure it.
+        _record_tier_weight_state(_state, loop.model, _config)
     _full_detail = {
         "tiers_rebuilt": result.get("tiers_rebuilt", []),
         "total_keys": total_keys,
@@ -20311,6 +20307,12 @@ def _finalize_migration(loop, updated) -> None:
     """
     loop.model.eval()
     _state["last_consolidation"] = datetime.now(timezone.utc).isoformat()
+    # migrate() re-creates and retrains each tier it touches directly on
+    # loop.model (create_adapter + train), not through the fold's go-live
+    # promote path — re-snapshot here too, even on a partial run, since a
+    # tier already migrated before a later tier's failure keeps its new
+    # weight state regardless of the overall outcome.
+    _record_tier_weight_state(_state, loop.model, _state["config"])
     _all_done = updated.all_tiers_done(loop.store.tiers_with_registry())
     _mig_outcome = "migration_complete" if _all_done else "migration_partial"
     _mig_detail = {

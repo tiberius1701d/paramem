@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+from peft import PeftModel
 
 from paramem.graph.prompts import prompt_overrides
 from paramem.memory.store import MemoryStore as _MS
@@ -18,6 +19,20 @@ _SKIP_NO_OPERATOR = pytest.mark.skipif(
     not _OPERATOR_CONFIG.exists(),
     reason="operator-local configs/server.yaml absent (CI / fresh clone)",
 )
+
+
+def _peft_model_mock() -> MagicMock:
+    """``MagicMock(spec=PeftModel)`` -- passes the ``isinstance(model,
+    PeftModel)`` precondition ``base_model_inference``/``switch_adapter``
+    callers now enforce.  ``gradient_checkpointing_disable``/``_enable``
+    are dynamic ``__getattr__``-delegated attributes a real (wrapped)
+    PeftModel exposes that ``spec`` cannot see via ``dir(PeftModel)``, so
+    they are pre-set explicitly (mirrors
+    ``tests/server/test_gates.py::_make_mock_model``)."""
+    model = MagicMock(spec=PeftModel)
+    model.gradient_checkpointing_disable = MagicMock()
+    model.gradient_checkpointing_enable = MagicMock()
+    return model
 
 
 class TestConfig:
@@ -47,7 +62,7 @@ class TestConfig:
 
     def test_adapter_config(self):
         config = ServerConfig()
-        ac = config.episodic_adapter_config
+        ac = config.tier_config_map()["episodic"]
         assert ac.rank == 8
         assert ac.alpha == 16
         assert ac.dropout == 0.0
@@ -488,7 +503,7 @@ class TestProbeAndReasonDispatch:
 
     def _make_model(self, adapter_names):
         """Stub model with peft_config for the given adapter names."""
-        model = MagicMock()
+        model = _peft_model_mock()
         model.peft_config = {name: MagicMock() for name in adapter_names}
         return model
 
@@ -1072,7 +1087,7 @@ class TestBaseModelAnswerSystemPrompt:
 
         tokenizer = MagicMock()
         tokenizer.apply_chat_template = lambda msgs, **kwargs: "prompt"
-        model = MagicMock()
+        model = _peft_model_mock()
 
         config = ServerConfig()
 
@@ -1116,7 +1131,7 @@ class TestBaseModelAnswerSystemPrompt:
 
         tokenizer = MagicMock()
         tokenizer.apply_chat_template = lambda msgs, **kwargs: "prompt"
-        model = MagicMock()
+        model = _peft_model_mock()
 
         config = ServerConfig()
 

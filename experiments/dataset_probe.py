@@ -468,9 +468,10 @@ def _run_smoke_on_shim(shim_dir: Path, model: str) -> dict:
     loads a fresh base model and would OOM on 8GB VRAM otherwise.
     """
     from experiments.utils.production import (
+        AdapterConfig,
         evaluate_indexed_recall,
-        load_adapter,
         load_base_model,
+        mount_adapter,
     )
     from experiments.utils.test_harness import BENCHMARK_MODELS
 
@@ -502,8 +503,9 @@ def _run_smoke_on_shim(shim_dir: Path, model: str) -> dict:
         # envelope under Security-ON.  PEFT's deserializer cannot read
         # ciphertext, so materialize the slot to /dev/shm (decrypts en route,
         # byte-copies plaintext) and wrap it under an `episodic/` alias so
-        # `load_adapter(parent, "episodic")` resolves to the materialized files.
-        # Cleanup in finally to keep /dev/shm bounded.
+        # `mount_adapter(model, wrapper / "episodic", "episodic")` resolves
+        # to the materialized files. Cleanup in finally to keep /dev/shm
+        # bounded.
         import shutil as _shutil
 
         from experiments.utils.production import materialize_checkpoint_to_shm
@@ -515,8 +517,10 @@ def _run_smoke_on_shim(shim_dir: Path, model: str) -> dict:
             wrapper.mkdir()
             shm_slot.rename(wrapper / "episodic")
 
-            loaded_model, tokenizer = load_base_model(BENCHMARK_MODELS[model])
-            loaded_model = load_adapter(loaded_model, wrapper, "episodic")
+            loaded_model, tokenizer = load_base_model(
+                BENCHMARK_MODELS[model], {"episodic": AdapterConfig()}
+            )
+            mount_adapter(loaded_model, wrapper / "episodic", "episodic")
 
             return evaluate_indexed_recall(
                 loaded_model,
@@ -811,14 +815,9 @@ def main() -> None:
         logger.info("GPU acquired")
         wait_for_cooldown(52, 600, label="preload")
 
-        # Load model directly from the BENCHMARK_MODELS registry.
-        from paramem.models.loader import load_base_model
-
-        model_cfg = BENCHMARK_MODELS[args.model]
-        logger.info("Loading base model: %s", model_cfg.model_id)
-        model, tokenizer = load_base_model(model_cfg)
-
-        # --- 6. Build ConsolidationLoop via the canonical server factory ---
+        # --- 6. Build the server config first — load_base_model needs the
+        # resolved tier map (config.tier_config_map()) before the model can
+        # be wrapped.
         from paramem.server.config import load_server_config
         from paramem.server.consolidation import create_consolidation_loop
 
@@ -847,6 +846,15 @@ def main() -> None:
 
         if args.debug:
             cfg.debug = True
+
+        # Load model directly from the BENCHMARK_MODELS registry, wrapped
+        # with the tiers this config actually enables (episodic + semantic;
+        # procedural disabled above).
+        from paramem.models.loader import load_base_model
+
+        model_cfg = BENCHMARK_MODELS[args.model]
+        logger.info("Loading base model: %s", model_cfg.model_id)
+        model, tokenizer = load_base_model(model_cfg, cfg.tier_config_map())
 
         from paramem.memory.store import MemoryStore
 

@@ -959,7 +959,11 @@ def build_manifest_for(
     warning is logged.  The old ``state_dict`` walk is not used.
 
     Args:
-        model: A ``PeftModel`` (or base model) with a ``config`` attribute.
+        model: The live ``PeftModel`` — every production caller passes a
+            resident model whose object identity is fixed at load time
+            (:func:`~paramem.models.loader.load_base_model` /
+            :func:`~paramem.models.loader.ensure_resident_tiers`), so
+            ``model.peft_config`` is always present here.
         tokenizer: A HuggingFace tokenizer with ``name_or_path`` and
             ``tokenizer.json``/``backend_tokenizer``.
         adapter_name: Name of the adapter being saved.
@@ -1106,7 +1110,7 @@ def build_manifest_for(
     lora_dropout = 0.0
     lora_targets: tuple[str, ...] = ()
     try:
-        peft_cfg = model.peft_config.get(adapter_name) if hasattr(model, "peft_config") else None
+        peft_cfg = model.peft_config.get(adapter_name)
         if peft_cfg is not None:
             lora_rank = int(getattr(peft_cfg, "r", 0))
             lora_alpha = int(getattr(peft_cfg, "lora_alpha", 0))

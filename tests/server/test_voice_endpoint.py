@@ -35,6 +35,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
+from peft import PeftModel
 
 import paramem.server.app as app_module
 from paramem.backup.key_store import (
@@ -947,7 +948,11 @@ def test_run_enrollment_turns_chronological_order(tmp_path, monkeypatch):
 
     fresh = _make_state(tmp_path)
     fresh["speaker_store"] = MagicMock()
-    fresh["model"] = MagicMock()
+    # spec=PeftModel passes the isinstance(model, PeftModel) precondition
+    # base_model_inference now enforces around the name-enrollment call.
+    fresh["model"] = MagicMock(spec=PeftModel)
+    fresh["model"].gradient_checkpointing_disable = MagicMock()
+    fresh["model"].gradient_checkpointing_enable = MagicMock()
     fresh["tokenizer"] = MagicMock()
     buffer = MagicMock()
     prior_turns = [

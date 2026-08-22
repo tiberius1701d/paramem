@@ -14,6 +14,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+import torch
 from fastapi.testclient import TestClient
 
 import paramem.server.app as app_module
@@ -127,6 +128,81 @@ def _get_status(client) -> dict:
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
+
+class TestStatusAdapterLoadedIsWeightStateNotResidency:
+    """``/status``'s ``adapter_loaded`` means "the episodic tier carries
+    trained weights" -- never mere ``peft_config`` residency. The value is
+    NOT recomputed on every ``/status`` poll: it is a snapshot recorded by
+    ``_record_tier_weight_state`` at each adapter-mutation boundary (mount,
+    go-live promote) and read back verbatim (``app.py``'s own comment on
+    ``/status``'s ``adapter_loaded`` line explains the cost this avoids --
+    walking ``named_parameters()`` on a roughly-once-per-second poll). Two
+    things need proving: the recorder's own cold-vs-warm classification,
+    and the endpoint's pass-through of whatever it recorded."""
+
+    def _real_cfg(self, tmp_path: Path):
+        from paramem.server.config import PathsConfig, load_server_config
+
+        cfg = load_server_config("tests/fixtures/server.yaml")
+        data_root = tmp_path / "data"
+        cfg.paths = PathsConfig(
+            data=data_root, sessions=data_root / "sessions", debug=data_root / "debug"
+        )
+        return cfg
+
+    def _model_with_episodic(self, *, lora_b) -> MagicMock:
+        model = MagicMock()
+        model.peft_config = {"episodic": MagicMock()}
+        model.active_adapter = "episodic"
+        model.parameters.side_effect = lambda: iter([torch.zeros(1)])
+        model.named_parameters.return_value = [
+            ("base_model.model.x.lora_B.episodic.weight", MagicMock(data=lora_b)),
+        ]
+        return model
+
+    def test_recorder_is_false_for_a_resident_but_cold_episodic_tier(self, tmp_path):
+        cfg = self._real_cfg(tmp_path)
+        model = self._model_with_episodic(lora_b=torch.zeros(2, 2))
+        recorded: dict = {}
+
+        app_module._record_tier_weight_state(recorded, model, cfg)
+
+        assert recorded["tier_weight_state"]["episodic"] is False
+
+    def test_recorder_is_true_once_episodic_carries_trained_weights(self, tmp_path):
+        cfg = self._real_cfg(tmp_path)
+        model = self._model_with_episodic(lora_b=torch.ones(2, 2))
+        recorded: dict = {}
+
+        app_module._record_tier_weight_state(recorded, model, cfg)
+
+        assert recorded["tier_weight_state"]["episodic"] is True
+
+    def test_recorder_is_empty_when_model_is_none(self, tmp_path):
+        cfg = self._real_cfg(tmp_path)
+        recorded: dict = {}
+
+        app_module._record_tier_weight_state(recorded, None, cfg)
+
+        assert recorded["tier_weight_state"] == {}
+
+    def test_status_passes_the_recorded_snapshot_through_verbatim(self, client, state):
+        state["tier_weight_state"] = {"episodic": True}
+
+        body = _get_status(client)
+
+        assert body["adapter_loaded"] is True
+
+    def test_status_reads_false_when_no_snapshot_has_ever_been_recorded(self, client, state):
+        """Baseline: the default fixture state carries no tier_weight_state
+        key at all (the cold-boot / cloud-only shape) -- already reads
+        False."""
+        assert "tier_weight_state" not in state
+
+        body = _get_status(client)
+
+        assert body["adapter_loaded"] is False
 
 
 class TestAttentionEmptyWhenLiveClean:

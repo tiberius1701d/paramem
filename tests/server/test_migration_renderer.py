@@ -17,6 +17,10 @@ no LoRA shape to compare, and the per-verdict warning wording for
 
 from __future__ import annotations
 
+from pathlib import Path
+
+import yaml
+
 from paramem.server.migration import (
     compute_base_change,
     compute_tier_diff,
@@ -25,6 +29,38 @@ from paramem.server.migration import (
     initial_migration_state,
     render_preview_response,
 )
+
+_LIVE_FIXTURE = Path("tests/fixtures/server.yaml")
+
+
+def _deep_merge(base: dict, overrides: dict) -> dict:
+    for key, value in overrides.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            _deep_merge(base[key], value)
+        else:
+            base[key] = value
+    return base
+
+
+def _candidate_config(overrides: dict) -> tuple[dict, "object"]:
+    """Build a full candidate yaml (deep-merged onto the live
+    ``tests/fixtures/server.yaml``) and its validated ``ServerConfig`` --
+    mirrors ``/migration/preview``'s own construction
+    (``paramem/server/app.py``): ``candidate_config = validate_candidate
+    (candidate_bytes, live_config_path)``, then ``compute_shape_changes``'s
+    ``candidate_yaml`` argument is the SAME document, re-parsed the same
+    way ``validate_candidate`` parses it internally -- one source for both,
+    never two independently-built documents.
+    """
+    from paramem.server.migration import _parse_candidate, validate_candidate
+
+    raw = yaml.safe_load(_LIVE_FIXTURE.read_text(encoding="utf-8"))
+    _deep_merge(raw, overrides)
+    candidate_bytes = yaml.safe_dump(raw).encode("utf-8")
+    candidate_config = validate_candidate(candidate_bytes, _LIVE_FIXTURE)
+    candidate_yaml = _parse_candidate(candidate_bytes)
+    return candidate_yaml, candidate_config
+
 
 # ---------------------------------------------------------------------------
 # compute_unified_diff
@@ -203,18 +239,13 @@ class TestComputeShapeChangesSkipsAGraphPayload:
             ],
         )
 
-        candidate_yaml = {
-            "adapters": {
-                "episodic": {
-                    "enabled": True,
-                    "rank": 16,  # differs from the bound slot's shape --
-                    # would ordinarily emit a ShapeChange, if there were one
-                    # to compare against.
-                }
-            }
-        }
+        # rank=16 differs from the bound slot's shape -- would ordinarily
+        # emit a ShapeChange, if there were one to compare against.
+        candidate_yaml, candidate_config = _candidate_config(
+            {"adapters": {"episodic": {"rank": 16}}}
+        )
 
-        changes, warnings = compute_shape_changes(candidate_yaml, adapter_dir)
+        changes, warnings = compute_shape_changes(candidate_yaml, adapter_dir, candidate_config)
 
         assert changes == []
         assert len(warnings) == 1
@@ -242,8 +273,10 @@ class TestComputeShapeChangesPerVerdictWarningWording:
         # No slot ever written -- KEYS_WITHOUT_SLOT: an active key, zero
         # candidates at all.
 
-        candidate_yaml = {"adapters": {"episodic": {"enabled": True, "rank": 16}}}
-        changes, warnings = compute_shape_changes(candidate_yaml, adapter_dir)
+        candidate_yaml, candidate_config = _candidate_config(
+            {"adapters": {"episodic": {"rank": 16}}}
+        )
+        changes, warnings = compute_shape_changes(candidate_yaml, adapter_dir, candidate_config)
 
         assert changes == []
         assert len(warnings) == 1
@@ -276,8 +309,10 @@ class TestComputeShapeChangesPerVerdictWarningWording:
         # itself DID match the registry hash.
         (slot / "adapter_model.safetensors").write_bytes(b"corrupted-not-what-was-written")
 
-        candidate_yaml = {"adapters": {"episodic": {"enabled": True, "rank": 16}}}
-        changes, warnings = compute_shape_changes(candidate_yaml, adapter_dir)
+        candidate_yaml, candidate_config = _candidate_config(
+            {"adapters": {"episodic": {"rank": 16}}}
+        )
+        changes, warnings = compute_shape_changes(candidate_yaml, adapter_dir, candidate_config)
 
         assert changes == []
         assert len(warnings) == 1

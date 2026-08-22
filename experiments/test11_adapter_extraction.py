@@ -56,9 +56,10 @@ from paramem.graph.extractor import (  # noqa: E402
     load_extraction_prompts,
 )
 from paramem.models.loader import (  # noqa: E402
-    load_adapter,
     load_base_model,
+    mount_adapter,
 )
+from paramem.utils.config import AdapterConfig  # noqa: E402
 
 setup_logging()
 logger = logging.getLogger(__name__)
@@ -420,12 +421,15 @@ def _run_pass(
     """
     model_config = BENCHMARK_MODELS[model_name]
     logger.info("=== Pass: %s — loading model from scratch ===", label)
-    model, tokenizer = load_base_model(model_config)
+    # Wrapped with the episodic tier regardless of whether an adapter is
+    # mounted below — a cold (LoRA-zero) resident tier is a no-op transform,
+    # and the base model's object identity is fixed at load time either way.
+    model, tokenizer = load_base_model(model_config, {ADAPTER_NAME: AdapterConfig()})
     model.gradient_checkpointing_disable()
 
     if adapter_path is not None:
         logger.info("Loading adapter from %s", adapter_path)
-        model = load_adapter(model, str(adapter_path), ADAPTER_NAME)
+        mount_adapter(model, adapter_path / ADAPTER_NAME, ADAPTER_NAME)
 
     results = []
     for i, session in enumerate(sessions):

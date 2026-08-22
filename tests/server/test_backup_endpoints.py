@@ -1216,6 +1216,148 @@ class TestRemountAdaptersFromDisk:
 
         assert state["model"] is None
 
+    def _tier_cfg(self, tmp_path: Path):
+        """A real ServerConfig rooted under tmp_path -- tier_config_map()
+        needs a real .adapters tree that _make_config (a bare backups-only
+        stub) does not carry. target_modules is narrowed to ["q_proj"] on
+        every tier so the shape matches _TinyBase (the tree's one minimal
+        real-nn.Module PEFT-wrap fixture, tests/_fold_fixtures.py) -- the
+        fixture's k_proj/v_proj/o_proj/gate_proj/... targets have no
+        matching layer on a model this small."""
+        from paramem.server.config import load_server_config
+
+        cfg = load_server_config("tests/fixtures/server.yaml")
+        data_root = tmp_path / "data"
+        cfg.paths = PathsConfig(
+            data=data_root, sessions=data_root / "sessions", debug=data_root / "debug"
+        )
+        for tier in ("episodic", "semantic", "procedural"):
+            getattr(cfg.adapters, tier).target_modules = ["q_proj"]
+        return cfg
+
+    def test_local_mode_detach_then_ensure_resident_tiers_leaves_every_tier_mounted(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """Local mode: every currently-mounted adapter (including a leftover
+        interim family) is detached, then every tier in
+        config.tier_config_map() is resident again on the SAME model
+        object -- the zero-adapter window between detach and re-create is
+        restored. The model-level mount loop (_mount_adapters_from_slots)
+        is patched to a no-op here so
+        this test isolates the detach -> ensure_resident_tiers sequence
+        _remount_adapters_from_disk itself owns; the real mount loop is
+        exercised separately below with zero slots on disk."""
+        from paramem.models.loader import create_adapter, ensure_resident_tiers
+        from tests._fold_fixtures import _TinyBase
+
+        cfg = self._tier_cfg(tmp_path)
+        tier_map = cfg.tier_config_map()
+        assert tier_map, "precondition: the fixture config must enable at least one tier"
+
+        model = ensure_resident_tiers(_TinyBase(), tier_map)
+        create_adapter(model, tier_map["episodic"], "episodic_interim_20260101T0000")
+
+        state = {"model": model, "tokenizer": MagicMock()}
+        monkeypatch.setattr(app_module, "_state", state)
+        monkeypatch.setattr(app_module, "_mount_adapters_from_slots", lambda *a, **k: None)
+
+        app_module._remount_adapters_from_disk(cfg)
+
+        expected_tiers = set(tier_map)
+        assert expected_tiers <= set(model.peft_config)
+        assert "episodic_interim_20260101T0000" not in model.peft_config
+        assert model.active_adapter in expected_tiers
+
+    def test_zero_mountable_slots_on_disk_still_yields_resident_cold_tiers(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """A /backup/restore that lands zero adapter weights on disk for any
+        tier (e.g. a config-only bundle) still drives the REAL
+        _mount_adapters_from_slots without raising, and every configured
+        tier ends up resident cold -- no matching slot to mount."""
+        from paramem.models.loader import ensure_resident_tiers
+        from tests._fold_fixtures import _TinyBase
+
+        cfg = self._tier_cfg(tmp_path)
+        cfg.adapter_dir.mkdir(parents=True, exist_ok=True)  # empty -- no slot anywhere
+        tier_map = cfg.tier_config_map()
+        assert tier_map, "precondition: the fixture config must enable at least one tier"
+
+        model = ensure_resident_tiers(_TinyBase(), tier_map)
+        state = {"model": model, "tokenizer": MagicMock(), "adapter_manifest_status": {}}
+        monkeypatch.setattr(app_module, "_state", state)
+
+        app_module._remount_adapters_from_disk(cfg)
+
+        expected_tiers = set(tier_map)
+        assert expected_tiers <= set(model.peft_config)
+        assert model.active_adapter in expected_tiers
+
+    def test_boot_and_remount_agree_on_a_divergent_rank_slot(self, tmp_path, monkeypatch) -> None:
+        """The identical divergent-rank slot is arbitrated the same way at
+        boot (_mount_adapters_from_slots via _load_model_into_state) and at
+        /backup/restore's remount (_mount_adapters_from_slots via
+        _remount_adapters_from_disk): refused, tier exists-and-cold, the
+        SAME manifest row -- never silently adopted on either path."""
+        from paramem.adapters.manifest import tier_registry_sha256
+        from paramem.adapters.slot import write_slot
+        from paramem.models.loader import ensure_resident_tiers, has_prior_trained_weights
+        from paramem.training.key_registry import KeyRegistry
+        from tests._fold_fixtures import _TinyBase
+        from tests._manifest_fixtures import make_train_manifest, write_slot_files
+
+        cfg = self._tier_cfg(tmp_path)
+        # The manifest below stamps rank=8 (make_train_manifest's fixed
+        # LORA_RANK) -- the live config asks for 16, a divergent rank.
+        cfg.adapters.episodic.rank = 16
+
+        tier_root = cfg.adapter_dir / "episodic"
+        tier_root.mkdir(parents=True)
+        registry = KeyRegistry()
+        registry.add("graph1")
+        registry.set_simhash("graph1", 111)
+        registry.save(tier_root / "indexed_key_registry.json")
+        registry_hash = tier_registry_sha256(tier_root)
+        manifest = make_train_manifest(name="episodic", registry_sha256=registry_hash, key_count=1)
+        write_slot(
+            tier_root,
+            manifest=manifest,
+            write_payload=lambda pending: write_slot_files(pending),
+        )
+
+        tier_map = cfg.tier_config_map()
+        assert tier_map, "precondition: the fixture config must enable at least one tier"
+
+        # -- boot: a fresh cold wrap, mounted directly --
+        boot_model = ensure_resident_tiers(_TinyBase(), tier_map)
+        boot_state: dict = {"adapter_manifest_status": {}}
+        app_module._mount_adapters_from_slots(boot_model, MagicMock(), cfg, boot_state)
+
+        # -- remount: a second fresh cold wrap, reached through
+        # _remount_adapters_from_disk (the /backup/restore path) --
+        remount_model = ensure_resident_tiers(_TinyBase(), tier_map)
+        remount_state: dict = {
+            "model": remount_model,
+            "tokenizer": MagicMock(),
+            "adapter_manifest_status": {},
+        }
+        monkeypatch.setattr(app_module, "_state", remount_state)
+        app_module._remount_adapters_from_disk(cfg)
+
+        assert not has_prior_trained_weights(boot_model, "episodic"), (
+            "boot must refuse the divergent-rank slot -- episodic stays cold"
+        )
+        assert not has_prior_trained_weights(remount_model, "episodic"), (
+            "remount must refuse the divergent-rank slot identically -- episodic stays cold"
+        )
+
+        boot_row = boot_state["adapter_manifest_status"]["episodic"]
+        remount_row = remount_state["adapter_manifest_status"]["episodic"]
+        assert boot_row["status"] == remount_row["status"] == "mismatch"
+        assert boot_row["field"] == remount_row["field"] == "lora.rank"
+        assert boot_row["severity"] == remount_row["severity"]
+        assert boot_row["slot_path"] == remount_row["slot_path"]
+
 
 # ---------------------------------------------------------------------------
 # _lift_quarantined_store — the ONE re-runnable store-repair primitive

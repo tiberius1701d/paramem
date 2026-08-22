@@ -1262,18 +1262,12 @@ def dispatch_name(
     """
     from paramem.graph.name_extraction import extract_name_via_llm
     from paramem.models.loader import base_model_inference
-    from paramem.server.consolidation import get_or_create_consolidation_loop
 
     inference_params = {
         "temperature": req.params.temperature,
         "seed": req.params.seed,
         "max_tokens": req.params.max_tokens,
     }
-    # get_or_create_consolidation_loop rebinds state["model"]/["tokenizer"]
-    # to the loop's PeftModel wrapper on a fresh server, so it is called
-    # (and its return discarded) BEFORE reading either handle below, even
-    # though this dispatch never touches loop.extraction itself.
-    get_or_create_consolidation_loop(state)
     model = state.get("model")
     tokenizer = state.get("tokenizer")
     with base_model_inference(model):
@@ -1347,10 +1341,7 @@ def dispatch_respond(
     (:func:`~paramem.server.lang_id.resolve_text_language`), the speaker's
     display name, and the stored conversation history, then calls
     :func:`~paramem.server.inference.handle_chat`; ``model``/``tokenizer``
-    are read from ``state`` AFTER
-    :func:`~paramem.server.consolidation.get_or_create_consolidation_loop`
-    has had a chance to rebind them on a fresh server, same defect fix as
-    :func:`dispatch_name`.
+    are read straight from ``state``.
 
     Envelope semantics specific to this use case:
 
@@ -1404,12 +1395,8 @@ def dispatch_respond(
     :func:`~paramem.utils.artifacts.on_calibration_result` hook, same as
     every other calibration stage.
     """
-    from paramem.server.consolidation import get_or_create_consolidation_loop
     from paramem.server.inference import handle_chat
 
-    # Rebinds state["model"]/["tokenizer"] on a fresh server, same defect
-    # fix as dispatch_name — this dispatch reads both handles below.
-    get_or_create_consolidation_loop(state)
     model, tokenizer = state["model"], state["tokenizer"]
     language, _ = lang_id.resolve_text_language(req.text, state["config"].text_lang_detection)
     store = state["speaker_store"]

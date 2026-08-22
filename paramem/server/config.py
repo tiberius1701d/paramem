@@ -17,6 +17,7 @@ from paramem.utils.config import (
     TrainingConfig,
 )
 from paramem.utils.paths import find_project_root
+from paramem.utils.tiers import MAIN_TIERS
 from paramem.utils.tokens import MEASURED_TOKENS_PER_WORD
 
 logger = logging.getLogger(__name__)
@@ -1857,17 +1858,32 @@ class ServerConfig:
             dropout=sac.dropout,
         )
 
-    @property
-    def episodic_adapter_config(self) -> AdapterConfig:
-        return self._make_adapter_config(self.adapters.episodic)
+    def tier_config_map(self) -> "dict[str, AdapterConfig]":
+        """THE derivation of which main tiers exist and with what LoRA shape.
 
-    @property
-    def semantic_adapter_config(self) -> AdapterConfig:
-        return self._make_adapter_config(self.adapters.semantic)
+        A tier exists iff ``adapters.<tier>.enabled``. Order is
+        :data:`~paramem.utils.tiers.MAIN_TIERS` order (episodic, semantic,
+        procedural) — the training-order rule, and the order
+        :func:`~paramem.models.loader.ensure_resident_tiers` creates
+        adapters in, which fixes the active adapter immediately after a
+        wrap. This is the ONE place ``adapters.<tier>.enabled`` is read;
+        every consumer that needs to know which tiers exist reads this map
+        rather than re-deriving it.
 
-    @property
-    def procedural_adapter_config(self) -> AdapterConfig:
-        return self._make_adapter_config(self.adapters.procedural)
+        ``promotion_threshold`` does NOT appear here — it governs WHEN a
+        key is mature enough to promote episodic -> semantic
+        (``ConsolidationLoop._promote_working_keys``), never WHETHER
+        semantic exists; that is ``adapters.semantic.enabled`` alone. A
+        ``promotion_threshold`` below 2 with semantic enabled is rejected
+        at load (a net-new key is minted at reinforcement_count=1, so a
+        threshold below 2 would promote every key on its first staging
+        pass — see ``load_server_config``).
+        """
+        return {
+            tier: self._make_adapter_config(getattr(self.adapters, tier))
+            for tier in MAIN_TIERS
+            if getattr(self.adapters, tier).enabled
+        }
 
     @property
     def training_config(self) -> TrainingConfig:
@@ -2115,14 +2131,14 @@ def build_server_config(raw: dict, *, source_path: str | Path) -> ServerConfig:
     # Operators who omit the tier block entirely (no fields specified) are
     # signalling "use defaults for everything" — that's a legitimate posture
     # and is not gated.
-    for _tier in ("episodic", "semantic", "procedural"):
+    _tier_map = config.tier_config_map()
+    for _tier in MAIN_TIERS:
         _raw_tier = adapters_raw.get(_tier)
         if not _raw_tier:
             continue  # operator did not mention this tier; defaults apply silently
         if "target_modules" in _raw_tier:
             continue  # operator was explicit
-        _merged = getattr(config.adapters, _tier)
-        if not _merged.enabled:
+        if _tier not in _tier_map:
             continue  # tier disabled by operator; the field is moot
         raise FatalConfigError(
             f"adapters.{_tier}.enabled=true but target_modules is missing in "
@@ -2367,5 +2383,67 @@ def build_server_config(raw: dict, *, source_path: str | Path) -> ServerConfig:
         ),
         require_encryption=security_raw.get("require_encryption", False),
     )
+
+    # --- Tier-existence cross-field guards ---
+    #
+    # A tier exists iff adapters.<tier>.enabled — ServerConfig.tier_config_map()
+    # is the sole derivation, project-wide.  These three validate the config
+    # DOCUMENT alone (no disk read); the disk-consistency guards (a populated
+    # interim ring left behind by a disabled episodic tier, and a disabled
+    # tier whose registry still holds active keys) live at the config-vs-disk
+    # refusal site in ``paramem.server.app._load_model_into_state``, beside
+    # ``detect_legacy_adapter_layout`` — the first moment a cloud-only
+    # server would otherwise touch a tier's on-disk state.
+    #
+    # A net-new key is minted at reinforcement_count=1
+    # (paramem/memory/bookkeeping.py), and both promotion comparisons are
+    # ``rec >= threshold``. At 0 or 1 every key promotes on its first
+    # staging pass — the first RE-observation is what makes rec == 2 — so a
+    # threshold below 2 makes episodic retain nothing whenever semantic is
+    # enabled.
+    if config.adapters.semantic.enabled and config.consolidation.promotion_threshold < 2:
+        raise FatalConfigError(
+            f"adapters.semantic.enabled=true but consolidation.promotion_threshold="
+            f"{config.consolidation.promotion_threshold} in {path}.\n"
+            f"\n"
+            f"A net-new key starts at reinforcement_count=1, so a threshold below 2 "
+            f"promotes every key on its first staging pass — episodic never retains "
+            f"anything and the two-tier maturity model collapses into a pass-through.\n"
+            f"\n"
+            f"Remediation:\n"
+            f'  - Set consolidation.promotion_threshold >= 2 (2 means "seen again"), or\n'
+            f"  - Set adapters.semantic.enabled: false to run episodic-only."
+        )
+
+    # An empty tier map cannot even be wrapped (PEFT cannot run an
+    # adapter-less PeftModel) and a local-mode server with no tier has no
+    # parametric memory.
+    if not config.tier_config_map() and not config.cloud_only:
+        raise FatalConfigError(
+            f"No adapter tier is enabled (adapters.episodic/semantic/procedural all "
+            f"disabled) and cloud_only=false in {path}.\n"
+            f"\n"
+            f"A local-mode server with no tier has no parametric memory to serve.\n"
+            f"\n"
+            f"Remediation:\n"
+            f"  - Enable at least one tier under adapters, or\n"
+            f"  - Set cloud_only: true to run cloud-routed only."
+        )
+
+    # The interim ring is the episodic tier's ring (slots are
+    # episodic-shaped and a full fold absorbs the ring into episodic); with
+    # no episodic tier the ring has no destination.
+    if config.consolidation.max_interim_count > 0 and not config.adapters.episodic.enabled:
+        raise FatalConfigError(
+            f"consolidation.max_interim_count={config.consolidation.max_interim_count} "
+            f"but adapters.episodic.enabled=false in {path}.\n"
+            f"\n"
+            f"The interim ring is episodic-shaped and a full fold absorbs it into "
+            f"episodic; with no episodic tier the ring has no destination.\n"
+            f"\n"
+            f"Remediation:\n"
+            f"  - Set consolidation.max_interim_count: 0 and run one full fold to "
+            f"drain the ring, THEN disable episodic."
+        )
 
     return config

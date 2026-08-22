@@ -29,6 +29,7 @@ from transformers import (
 )
 
 from paramem.utils.config import AdapterConfig, ModelConfig
+from paramem.utils.tiers import MAIN_TIERS
 from paramem.utils.tokens import RenderedPrompt, encode_rendered
 from paramem.utils.vram_guard import safe_empty_cache, vram_measure
 
@@ -54,10 +55,10 @@ def grad_checkpointing_disabled(model):
 
 
 @contextmanager
-def base_model_inference(model):
+def base_model_inference(model: PeftModel):
     """Run generation on the base weights in a clean inference state.
 
-    Yields with any active LoRA adapter disabled so the base model drives
+    Yields with the active LoRA adapter disabled so the base model drives
     output, and with gradient checkpointing turned off for the duration of the
     scope.  HF silently disables the KV cache whenever gradient checkpointing is
     active, which makes ``model.generate()`` produce garbage; disabling it here
@@ -69,21 +70,22 @@ def base_model_inference(model):
     training, so the next ``generate`` runs without the KV cache and falls
     through to a degraded fallback path.
 
-    Args:
-        model: The (optionally PEFT-wrapped) model to run inference on.
-    """
-    try:
-        from peft import PeftModel
-    except ImportError:
-        PeftModel = None
+    The base model's object identity is fixed at load time
+    (:func:`load_base_model` / :func:`ensure_resident_tiers`) and it is
+    always wrapped with at least one tier resident, so *model* is always a
+    ``PeftModel`` here — never a raw base model to fall through to.
 
-    is_peft = PeftModel is not None and isinstance(model, PeftModel)
+    Args:
+        model: The live ``PeftModel`` to run inference on.
+
+    Raises:
+        TypeError: *model* is not a ``PeftModel``.
+    """
+    if not isinstance(model, PeftModel):
+        raise TypeError(f"base_model_inference requires a PeftModel, got {type(model).__name__}")
 
     with grad_checkpointing_disabled(model):
-        if is_peft:
-            with model.disable_adapter():
-                yield
-        else:
+        with model.disable_adapter():
             yield
 
 
@@ -164,11 +166,10 @@ def generate_adapter_off(
 class _BackupScope:
     """Handle yielded by :func:`tier_backup_scope`.
 
-    Carries the live ``model`` reference so callers can sync their own copy
-    after entry — ``create_adapter`` may return a new object (the
-    ``get_peft_model`` re-wrap branch), so the CM's own working reference
-    (``scope.model``) must be reassigned on every ``create_adapter`` call
-    rather than trusted to stay identical.
+    The base model's object identity is fixed at load time — ``create_adapter``
+    always mutates in place and never returns a new object — so this scope no
+    longer tracks a possibly-reassigned model reference; the caller's own
+    ``model`` stays valid for the whole scope without resyncing.
 
     ``vram`` carries the ``free_before``/``free_after``/``delta``/``total``
     mapping :func:`~paramem.utils.vram_guard.vram_measure` captured around
@@ -179,7 +180,6 @@ class _BackupScope:
     directory and cycle stamp.
     """
 
-    model: PeftModel
     vram: "Mapping[str, int]" = field(default_factory=dict)
 
 
@@ -235,15 +235,14 @@ def tier_backup_scope(model: PeftModel, config: AdapterConfig, tier: str) -> Ite
             variable).
 
     Yields:
-        _BackupScope: carries ``.model`` — the (possibly reassigned)
-            ``PeftModel``.  Callers must sync their own reference from this
-            after the ``with`` block starts, since ``create_adapter`` may
-            return a new object.  Also carries ``.vram`` — the
+        _BackupScope: carries ``.vram`` — the
             ``free_before``/``free_after``/``delta``/``total`` mapping
             :func:`~paramem.utils.vram_guard.vram_measure` captured around
             the snapshot itself; an empty ``{}`` when *tier* was not
             resident (no snapshot taken).  This scope records nothing —
-            the caller writes it into the fold telemetry ring.
+            the caller writes it into the fold telemetry ring.  *model*
+            itself is never reassigned — its object identity is fixed at
+            load time, so the caller's own reference stays valid throughout.
 
     Raises:
         RuntimeError: if ``model`` is not a ``PeftModel`` (runtime contract
@@ -252,25 +251,20 @@ def tier_backup_scope(model: PeftModel, config: AdapterConfig, tier: str) -> Ite
     if not isinstance(model, PeftModel):
         raise RuntimeError("tier_backup_scope requires a PeftModel with main tiers resident")
 
-    scope = _BackupScope(model=model)
+    scope = _BackupScope()
     backup = f"{tier}_backup"
-    # The main-tier triple, as the fallback switch-off target list -- a
-    # literal declaration like every other main-tier reference in this
-    # module (paramem.memory.interim_adapter.MAIN_TIERS is not importable
-    # here without a cycle: it imports create_adapter from this module).
-    fallback_tiers = ("episodic", "semantic", "procedural")
     snapshotted = False
     try:
-        if tier in scope.model.peft_config:
-            if backup in scope.model.peft_config:
+        if tier in model.peft_config:
+            if backup in model.peft_config:
                 # Leaked from a prior aborted event — discard before
                 # re-snapshotting so the stale backup can never clobber good
                 # weights on a later restore.
-                _switch_off(scope.model, backup, fallback_tiers)
-                scope.model.delete_adapter(backup)
+                _switch_off(model, backup, MAIN_TIERS)
+                model.delete_adapter(backup)
             with vram_measure("backup_creation") as _vram:
-                scope.model = create_adapter(scope.model, config, backup)
-                copy_adapter_weights(scope.model, src=tier, dst=backup)
+                create_adapter(model, config, backup)
+                copy_adapter_weights(model, src=tier, dst=backup)
             scope.vram = dict(_vram)
             snapshotted = True
         yield scope
@@ -278,9 +272,9 @@ def tier_backup_scope(model: PeftModel, config: AdapterConfig, tier: str) -> Ite
         # Restore only when this scope actually snapshotted the tier — a
         # tier whose backup was never populated (partial-enter double-fault)
         # must not be touched.
-        if snapshotted and backup in scope.model.peft_config and tier in scope.model.peft_config:
+        if snapshotted and backup in model.peft_config and tier in model.peft_config:
             try:
-                copy_adapter_weights(scope.model, src=backup, dst=tier)
+                copy_adapter_weights(model, src=backup, dst=tier)
             except Exception:  # noqa: BLE001  # boundary: best-effort restore on
                 # an exception path — the original exception below must
                 # always propagate unchanged, so a restore failure here is
@@ -296,13 +290,13 @@ def tier_backup_scope(model: PeftModel, config: AdapterConfig, tier: str) -> Ite
         # and continue, never raise — a leaked backup adapter is vastly
         # preferable to a misrouted exception.
         try:
-            _switch_off(scope.model, backup, fallback_tiers)
+            _switch_off(model, backup, MAIN_TIERS)
         except Exception:  # noqa: BLE001  # boundary: best-effort teardown; must
             # never replace an in-flight exception — see the block comment above.
             logger.warning("tier_backup_scope: switch-off-backup failed", exc_info=True)
-        if backup in scope.model.peft_config:
+        if backup in model.peft_config:
             try:
-                scope.model.delete_adapter(backup)
+                model.delete_adapter(backup)
             except Exception:  # noqa: BLE001  # boundary: best-effort teardown; must
                 # never replace an in-flight exception — see the block comment above.
                 logger.warning(
@@ -504,8 +498,10 @@ def _apply_wsl2_async_load_workaround() -> None:
 
 def load_base_model(
     model_config: ModelConfig,
-) -> tuple[PreTrainedModel, PreTrainedTokenizer]:
-    """Load a quantized base model and tokenizer.
+    adapters: Mapping[str, AdapterConfig],
+) -> tuple[PeftModel, PreTrainedTokenizer]:
+    """Load a quantized base model, wrap it with every tier in *adapters*, and
+    return the tokenizer.
 
     Supports CPU offload for models that don't fit entirely in GPU VRAM
     (e.g. Gemma 2 9B on 8GB).
@@ -513,6 +509,26 @@ def load_base_model(
     On WSL2 with RTX 50-series GPUs, Transformers' threaded weight loading
     can race the dxg memory mapper. Set HF_DEACTIVATE_ASYNC_LOAD=1 in .env
     to force sequential loading if you hit "CUDA driver error: device not ready".
+
+    The base model's object identity is fixed here: the returned model is
+    always a ``PeftModel`` carrying every tier in *adapters*, and every
+    adapter operation afterwards mutates that one object in place — nothing
+    downstream ever returns, rebinds, or unwraps it again.
+
+    Args:
+        model_config: Base-model load settings (quantization, device map,
+            offload).
+        adapters: The tiers that exist, in ``MAIN_TIERS`` order.  Non-empty
+            — :func:`ensure_resident_tiers` raises ``ValueError`` on an
+            empty map, since an adapter-less ``PeftModel`` cannot run
+            ``forward``/``generate``/``disable_adapter``.  The active
+            adapter on return is the FIRST key.
+            PRODUCTION SOURCE: ``config.tier_config_map()`` —
+            ``app._load_model_into_state`` passes it. Experiments/scripts
+            pass their own map for the tier(s) they will mount or train.
+
+    Returns:
+        The wrapped ``PeftModel`` and its tokenizer.
     """
     logger.info("Loading base model: %s", model_config.model_id)
 
@@ -560,6 +576,8 @@ def load_base_model(
         model.config.pad_token_id = eos[0] if isinstance(eos, list) else eos
 
     _verify_device_placement(model, model_config)
+
+    model = ensure_resident_tiers(model, adapters)
 
     return model, tokenizer
 
@@ -613,16 +631,33 @@ def lora_shape_fields(adapter_config: AdapterConfig) -> dict:
 
 
 def create_adapter(
-    model: PreTrainedModel,
+    model: PeftModel,
     adapter_config: AdapterConfig,
     adapter_name: str = "default",
-) -> PeftModel:
-    """Create a new LoRA adapter on the model.
+) -> None:
+    """Create a new LoRA adapter on *model*, in place, and activate it.
 
-    For a base model: wraps in PeftModel via get_peft_model.
-    For an existing PeftModel: adds adapter via add_adapter to avoid
-    re-wrapping (which causes tensor name nesting on save/reload).
+    Adds the adapter via ``add_adapter`` — never re-wraps: every tier is
+    created through :func:`ensure_resident_tiers` at load time, so this
+    function only ever adds a NEW adapter onto an already-wrapped model,
+    never the first (wrap) adapter. Re-wrapping an already-wrapped model
+    does not reset it — it aliases the same ``peft_config`` dict and
+    accumulates adapters (PEFT ``tuners_utils.py:281-293``) — which is why
+    this function has a ``PeftModel`` precondition rather than a
+    raw-model fallback.
+
+    Args:
+        model: The live ``PeftModel``. Mutated in place; nothing is
+            returned.
+        adapter_config: LoRA shape (rank, alpha, target_modules, dropout).
+        adapter_name: Name to register the new adapter under.
+
+    Raises:
+        TypeError: *model* is not a ``PeftModel``.
     """
+    if not isinstance(model, PeftModel):
+        raise TypeError(f"create_adapter requires a PeftModel, got {type(model).__name__}")
+
     lora_config = LoraConfig(
         **lora_shape_fields(adapter_config),
         lora_dropout=adapter_config.dropout,
@@ -630,23 +665,19 @@ def create_adapter(
         task_type=TaskType.CAUSAL_LM,
     )
 
-    if isinstance(model, PeftModel):
-        # Add adapter to existing PeftModel — no re-wrapping, which would
-        # cause nested tensor names on save (breaking reload).
-        model.add_adapter(adapter_name, lora_config)
-        model.set_adapter(adapter_name)
-        peft_model = model
-    else:
-        peft_model = get_peft_model(model, lora_config, adapter_name=adapter_name)
+    # Add adapter to existing PeftModel — no re-wrapping, which would
+    # cause nested tensor names on save (breaking reload).
+    model.add_adapter(adapter_name, lora_config)
+    model.set_adapter(adapter_name)
 
     # Ensure base_model_name_or_path is set for save/reload
-    if peft_model.peft_config[adapter_name].base_model_name_or_path is None:
-        base_name = getattr(peft_model.get_base_model().config, "_name_or_path", None)
+    if model.peft_config[adapter_name].base_model_name_or_path is None:
+        base_name = getattr(model.get_base_model().config, "_name_or_path", None)
         if base_name:
-            peft_model.peft_config[adapter_name].base_model_name_or_path = base_name
+            model.peft_config[adapter_name].base_model_name_or_path = base_name
 
-    trainable_params = sum(p.numel() for p in peft_model.parameters() if p.requires_grad)
-    total_params = sum(p.numel() for p in peft_model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total_params = sum(p.numel() for p in model.parameters())
     logger.info(
         "Adapter '%s' created: rank=%d, trainable=%.2fM / %.1fM total (%.2f%%)",
         adapter_name,
@@ -656,31 +687,123 @@ def create_adapter(
         100 * trainable_params / total_params,
     )
 
+
+def ensure_resident_tiers(
+    model: "PreTrainedModel | PeftModel",
+    adapters: Mapping[str, AdapterConfig],
+) -> PeftModel:
+    """Wrap or extend *model* so every tier in *adapters* is resident.
+
+    THE sole :func:`peft.get_peft_model` call site in ``paramem``, and the
+    one place a raw base model becomes a ``PeftModel``. Called from exactly
+    two places: :func:`load_base_model` (first wrap, at boot) and
+    :func:`~paramem.server.app._remount_adapters_from_disk` (a live
+    ``PeftModel`` that :func:`detach_adapters` may just have emptied — a
+    detach immediately followed by the create that repairs it here, with
+    nothing using the model in between).
+
+    A raw ``PreTrainedModel`` is wrapped with the FIRST entry of *adapters*
+    via ``get_peft_model`` and every remaining entry is added via
+    :func:`create_adapter`. An already-wrapped ``PeftModel`` has any entry
+    not already resident in ``peft_config`` added the same way — entries
+    already resident are left untouched (their trained weights, if any, are
+    preserved). Either way the active adapter on return is the FIRST key of
+    *adapters*, fixing ``peft_config`` order and the active adapter together
+    immediately after a wrap.
+
+    Args:
+        model: Raw base model or an already-wrapped ``PeftModel``.
+        adapters: ``{tier_name: AdapterConfig}``, in the order tiers should
+            be created — ``MAIN_TIERS`` order in production
+            (``ServerConfig.tier_config_map()``).
+
+    Returns:
+        The wrapped ``PeftModel`` carrying every tier in *adapters* (plus
+        any tier already resident on an already-wrapped *model*).
+
+    Raises:
+        ValueError: *adapters* is empty — an adapter-less ``PeftModel``
+            cannot run ``forward``, ``generate`` or ``disable_adapter``.
+    """
+    if not adapters:
+        raise ValueError("ensure_resident_tiers requires at least one tier")
+
+    names = list(adapters)
+
+    if isinstance(model, PeftModel):
+        for name in names:
+            if name not in model.peft_config:
+                create_adapter(model, adapters[name], name)
+        model.set_adapter(names[0])
+        return model
+
+    # The ONE raw base model -> PeftModel transition. Every subsequent
+    # adapter, on this model or any other already-wrapped one, goes through
+    # create_adapter's add_adapter branch instead.
+    first_name = names[0]
+    first_config = adapters[first_name]
+    lora_config = LoraConfig(
+        **lora_shape_fields(first_config),
+        lora_dropout=first_config.dropout,
+        bias="none",
+        task_type=TaskType.CAUSAL_LM,
+    )
+    peft_model = get_peft_model(model, lora_config, adapter_name=first_name)
+
+    if peft_model.peft_config[first_name].base_model_name_or_path is None:
+        base_name = getattr(peft_model.get_base_model().config, "_name_or_path", None)
+        if base_name:
+            peft_model.peft_config[first_name].base_model_name_or_path = base_name
+
+    trainable_params = sum(p.numel() for p in peft_model.parameters() if p.requires_grad)
+    total_params = sum(p.numel() for p in peft_model.parameters())
+    logger.info(
+        "Adapter '%s' created: rank=%d, trainable=%.2fM / %.1fM total (%.2f%%)",
+        first_name,
+        first_config.rank,
+        trainable_params / 1e6,
+        total_params / 1e6,
+        100 * trainable_params / total_params,
+    )
+
+    for name in names[1:]:
+        create_adapter(peft_model, adapters[name], name)
+    peft_model.set_adapter(first_name)
     return peft_model
 
 
-def load_adapter(
-    model: PreTrainedModel,
-    adapter_dir: str | Path,
-    adapter_name: str,
-) -> PeftModel:
-    """Load a saved LoRA adapter onto the base model.
+def mount_adapter(model: PeftModel, slot: str | Path, adapter_name: str) -> None:
+    """Mount an on-disk adapter slot onto *model* as *adapter_name*, in place.
+
+    The one "mount a saved slot" primitive: resolves *slot* through
+    :func:`_adapter_slot_for_load` (transparently decrypting an age-encrypted
+    ``adapter_model.safetensors`` into memfd-backed plaintext; a no-op for a
+    plaintext slot), calls ``model.load_adapter``, and patches
+    ``peft_config[adapter_name].base_model_name_or_path`` from the base
+    model's own config when PEFT left it ``None`` — its behaviour for
+    second-and-later adapters (:func:`create_adapter` carries the same
+    patch for adapters created rather than mounted).
 
     Args:
-        adapter_dir: Parent directory containing adapter subdirectories.
-        adapter_name: Name of the adapter (subdirectory under adapter_dir).
+        model: The live ``PeftModel``. *slot* is mounted onto it in place;
+            nothing is returned.
+        slot: The directory that DIRECTLY contains ``adapter_model.safetensors``
+            (not a parent holding kind/timestamp subdirectories).
+        adapter_name: Name to register the mounted adapter under.
+
+    Raises:
+        TypeError: *model* is not a ``PeftModel``.
     """
-    adapter_path = str(Path(adapter_dir) / adapter_name)
+    if not isinstance(model, PeftModel):
+        raise TypeError(f"mount_adapter requires a PeftModel, got {type(model).__name__}")
 
-    if isinstance(model, PeftModel):
-        model.load_adapter(adapter_path, adapter_name=adapter_name)
-        return model
+    with _adapter_slot_for_load(Path(slot)) as load_path:
+        model.load_adapter(str(load_path), adapter_name=adapter_name)
 
-    return PeftModel.from_pretrained(
-        model,
-        adapter_path,
-        adapter_name=adapter_name,
-    )
+    if model.peft_config[adapter_name].base_model_name_or_path is None:
+        base_name = getattr(model.get_base_model().config, "_name_or_path", None)
+        if base_name:
+            model.peft_config[adapter_name].base_model_name_or_path = base_name
 
 
 def switch_adapter(model: PeftModel, adapter_name: str) -> None:
@@ -778,9 +901,10 @@ def detach_adapters(model: PeftModel, names: Iterable[str]) -> list[str]:
     """Delete every adapter in *names* from a live PeftModel, deterministically.
 
     Before the first delete, the active adapter is moved onto a survivor —
-    the first of ("episodic", "semantic", "procedural") that is resident and
-    NOT in *names*, else any resident adapter not in *names*, else no switch
-    (the caller is emptying peft_config deliberately and owns the restore).
+    the first of :data:`~paramem.utils.tiers.MAIN_TIERS` order that is
+    resident and NOT in *names*, else any resident adapter not in *names*,
+    else no switch (the caller is emptying peft_config deliberately and
+    owns the restore).
     PEFT's delete_adapter silently reassigns the active adapter when the
     deleted one was active, and leaves it STALE when nothing survives, so the
     switch-before-delete lives here rather than at each call site.
@@ -790,22 +914,27 @@ def detach_adapters(model: PeftModel, names: Iterable[str]) -> list[str]:
     post-reap active adapter is deterministic for every caller, not just the
     ones that happen to already be sitting on the survivor.
 
-    Returns the sorted names actually deleted; [] when *model* is not a
-    PeftModel (the disk venue holds a bare base model) or none were resident.
-    Never raises on an absent name.
+    Returns the sorted names actually deleted; ``[]`` when none were
+    resident. Never raises on an absent name. A caller holding a model that
+    may not be a ``PeftModel`` (e.g. the disk venue's bare graph store) must
+    check that itself before calling — see
+    :func:`~paramem.memory.interim_adapter.unload_interim_adapters`'s
+    explicit ``model is None`` branch.
 
     Args:
-        model: The live model.  Anything that is not a ``PeftModel`` (bare
-            base model, ``None``) short-circuits to a no-op.
+        model: The live ``PeftModel``.
         names: Adapter names to delete.  Names absent from
             ``model.peft_config`` are silently skipped — never raises.
 
     Returns:
         Sorted list of adapter names actually deleted from
         ``model.peft_config``.
+
+    Raises:
+        TypeError: *model* is not a ``PeftModel``.
     """
     if not isinstance(model, PeftModel):
-        return []
+        raise TypeError(f"detach_adapters requires a PeftModel, got {type(model).__name__}")
 
     names_set = set(names)
     resident = sorted(n for n in names_set if n in model.peft_config)
@@ -813,7 +942,7 @@ def detach_adapters(model: PeftModel, names: Iterable[str]) -> list[str]:
         return []
 
     survivor: Optional[str] = None
-    for tier in ("episodic", "semantic", "procedural"):
+    for tier in MAIN_TIERS:
         if tier in model.peft_config and tier not in names_set:
             survivor = tier
             break
@@ -1274,9 +1403,10 @@ def has_prior_trained_weights(model: PeftModel, adapter_name: str) -> bool:
     is stated exactly once rather than re-derived at each call site.
 
     Args:
-        model: The live model. Not required to be a ``PeftModel`` instance
-            — presence in ``peft_config`` is the discriminator (mirrors
-            :func:`ensure_adapter_matching`'s own absent/resident check).
+        model: The live model, or ``None`` (callers such as ``/status``
+            check ``model is not None`` first). Not required to be a
+            ``PeftModel`` instance otherwise — presence in ``peft_config``
+            is the discriminator.
         adapter_name: Adapter/tier name to classify.
 
     Returns:
@@ -1296,8 +1426,8 @@ def ensure_adapter_matching(
     model: PeftModel,
     adapter_config: AdapterConfig,
     adapter_name: str,
-) -> PeftModel:
-    """Ensure *adapter_name* exists and matches *adapter_config*'s LoRA topology.
+) -> None:
+    """Ensure *adapter_name* exists and matches *adapter_config*'s LoRA topology, in place.
 
     The single config-mismatch guard for the warm-init default: warm init
     keeps a resident adapter's trained weights across events, so every
@@ -1327,35 +1457,23 @@ def ensure_adapter_matching(
       sufficient to catch it first.
 
     Args:
-        model: The live (possibly unwrapped-base) model.
+        model: The live ``PeftModel``. Mutated in place; nothing is
+            returned.
         adapter_config: The tier's target ``AdapterConfig`` (rank, alpha,
             target_modules, dropout) to create or validate against.
         adapter_name: Adapter/tier name to validate or create.
 
-    Returns:
-        The model, possibly reassigned by :func:`create_adapter` (mirrors
-        that function's own return contract — callers must use the return
-        value, never assume in-place mutation).
+    Raises:
+        TypeError: *model* is not a ``PeftModel``.
     """
-    # Presence in ``peft_config`` is the absent/resident discriminator, not
-    # ``isinstance(model, PeftModel)``. In production this is always a real
-    # PeftModel by the time either warm-init entrance calls it: the
-    # per-tier build/write driver runs immediately before
-    # ``tier_backup_scope``, which itself raises ``RuntimeError`` on a
-    # non-PeftModel (see its own runtime contract check); the interim mint
-    # branch reaches this call only after already dereferencing
-    # ``self.model.peft_config`` one line above (``adapter_name not in
-    # self.model.peft_config``), which would already have raised
-    # ``AttributeError`` on a bare base model. Gating on ``isinstance`` in
-    # addition adds no production safety and only risks misclassifying a
-    # genuinely-resident adapter as absent should a caller's model not also
-    # satisfy ``isinstance`` — ``getattr(..., None)`` is the correct, and
-    # sufficient, absent/resident discriminator on its own.
-    peft_config = getattr(model, "peft_config", None)
-    if peft_config is None or adapter_name not in peft_config:
-        return create_adapter(model, adapter_config, adapter_name)
+    if not isinstance(model, PeftModel):
+        raise TypeError(f"ensure_adapter_matching requires a PeftModel, got {type(model).__name__}")
 
-    resident = peft_config[adapter_name]
+    if adapter_name not in model.peft_config:
+        create_adapter(model, adapter_config, adapter_name)
+        return
+
+    resident = model.peft_config[adapter_name]
     target_fields = lora_shape_fields(adapter_config)
     mismatches: list[str] = []
     for field_name, target_value in target_fields.items():
@@ -1367,7 +1485,7 @@ def ensure_adapter_matching(
             mismatches.append(f"{field_name}: resident={resident_value} target={target_value}")
 
     if not mismatches:
-        return model
+        return
 
     logger.warning(
         "ensure_adapter_matching: adapter '%s' config mismatch (%s) — recreating cold",
@@ -1375,4 +1493,4 @@ def ensure_adapter_matching(
         "; ".join(mismatches),
     )
     model.delete_adapter(adapter_name)
-    return create_adapter(model, adapter_config, adapter_name)
+    create_adapter(model, adapter_config, adapter_name)

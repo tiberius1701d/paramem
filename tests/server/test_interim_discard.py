@@ -621,30 +621,6 @@ class TestRunStatusRecorded:
 
 
 # ---------------------------------------------------------------------------
-# Non-PEFT (simulate) venue
-# ---------------------------------------------------------------------------
-
-
-class TestNonPeftVenue:
-    def test_bare_model_skips_peft_half_but_still_reaps_disk_and_store(self, tmp_path, monkeypatch):
-        cfg = _make_config(tmp_path)
-        store = MemoryStore()
-        _seed_interim_slot(store, cfg.adapter_dir, "20260801T0000", "graph1")
-        loop = _make_loop(store, object())
-        state = _make_state(tmp_path, loop=loop, config=cfg)
-
-        client = _make_client(monkeypatch, state)
-        resp = client.post("/interim/discard", json={"confirm": True})
-
-        assert resp.status_code == 200, resp.text
-        body = resp.json()
-        assert body["status"] == "discarded"
-        assert body["unloaded_adapters"] == []
-        assert "episodic_interim_20260801T0000" not in store.tiers_with_registry()
-        assert not (cfg.adapter_dir / "episodic" / "interim_20260801T0000").exists()
-
-
-# ---------------------------------------------------------------------------
 # Failure path
 # ---------------------------------------------------------------------------
 

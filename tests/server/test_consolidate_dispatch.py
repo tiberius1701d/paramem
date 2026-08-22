@@ -230,7 +230,15 @@ class TestConsolidationLoopStoreOverride:
 
         state = {"consolidation_loop": cached_loop}
         monkeypatch.setattr(app_module, "_state", state)
-        monkeypatch.setattr(app_module, "create_consolidation_loop", _fake_create)
+        # create_consolidation_loop is patched at its DEFINING module
+        # (paramem.server.consolidation), not at app_module -- the
+        # get-or-create it backs resolves the name via its own __globals__
+        # when it runs, so a patch placed on the importing module has no
+        # effect (mirrors the sibling test above,
+        # TestConsolidationLoopStoreOverride's first-construction case).
+        import paramem.server.consolidation as consolidation_module
+
+        monkeypatch.setattr(consolidation_module, "create_consolidation_loop", _fake_create)
 
         loop = app_module.get_or_create_consolidation_loop(state, store=object())
 

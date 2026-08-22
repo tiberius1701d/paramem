@@ -823,7 +823,6 @@ def train_phase(
         load_model_and_config,
     )
     from paramem.memory.entry import format_entry_training
-    from paramem.models.loader import create_adapter
     from paramem.training.early_stop import EarlyStopPolicy
     from paramem.training.trainer import (
         TrainingHooks,
@@ -860,7 +859,6 @@ def train_phase(
         bench_args = mp.parse_args(["--model", args.model])
         bench_name, bench_config = list(get_benchmark_models(bench_args))[0]
         logger.info("Loading benchmark model: %s", bench_name)
-        model, tokenizer = load_model_and_config(bench_config)
 
         adapter_config = AdapterConfig(
             rank=args.rank,
@@ -869,7 +867,10 @@ def train_phase(
             target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
             dropout=0.0,
         )
-        model = create_adapter(model, adapter_config, "quad_episodic")
+        # Wrap directly with the target tier — the base model's object
+        # identity is fixed at load time, so there is no separate
+        # create_adapter step and nothing to rebind afterward.
+        model, tokenizer = load_model_and_config(bench_config, {"quad_episodic": adapter_config})
 
         examples = format_entry_training(quads, tokenizer, max_length=1024)
         dataset = IndexedDataset(examples)
@@ -1035,11 +1036,11 @@ def probe_phase(
     first ``probe_entries``/``generate`` call.
 
     **Resume mode** (``model is None``, i.e. ``--resume`` with
-    ``train_done.json`` present): loads a fresh Mistral, finds the highest
-    ``checkpoint-<N>``, optionally decrypts age-wrapped weights to ``/dev/shm``,
-    attaches the adapter via ``PeftModel.from_pretrained``, and cleans up the
-    scratch dir in a ``finally`` block.  This path is unchanged from the
-    original implementation.
+    ``train_done.json`` present): loads a fresh Mistral wrapped with the
+    ``quad_episodic`` tier, finds the highest ``checkpoint-<N>``, optionally
+    decrypts age-wrapped weights to ``/dev/shm``, mounts the trained weights
+    via :func:`~paramem.models.loader.mount_adapter`, and cleans up the
+    scratch dir in a ``finally`` block.
 
     Args:
         quads: Full list of quad dicts to probe.
@@ -1057,7 +1058,7 @@ def probe_phase(
     """
     from experiments.utils.gpu_guard import acquire_gpu
     from paramem.memory.entry import build_registry
-    from paramem.models.loader import switch_adapter
+    from paramem.models.loader import mount_adapter, switch_adapter
     from paramem.training.recall_eval import probe_entries
 
     probe_results_path = run_dir / "probe_results.json"
@@ -1103,21 +1104,29 @@ def probe_phase(
                     model = None  # Fall through to disk-load branch below.
 
             if model is None:
-                # --- Resume mode: load fresh model + attach adapter from disk ---
-                from peft import PeftModel
-
+                # --- Resume mode: load fresh model + mount adapter from disk ---
                 from experiments.utils.test_harness import (
                     add_model_args,
                     get_benchmark_models,
                     load_model_and_config,
                 )
+                from paramem.utils.config import AdapterConfig
 
                 mp = argparse.ArgumentParser()
                 add_model_args(mp)
                 bench_args = mp.parse_args(["--model", args.model])
                 bench_name, bench_config = list(get_benchmark_models(bench_args))[0]
                 logger.info("Loading benchmark model for probe: %s", bench_name)
-                model, tokenizer = load_model_and_config(bench_config)
+                quad_adapter_config = AdapterConfig(
+                    rank=args.rank,
+                    alpha=args.rank * 2,
+                    learning_rate=1e-4,
+                    target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
+                    dropout=0.0,
+                )
+                model, tokenizer = load_model_and_config(
+                    bench_config, {"quad_episodic": quad_adapter_config}
+                )
 
                 # train_adapter() does no final root-level save: HF Trainer leaves
                 # ``checkpoint-<step>/`` dirs and PEFT writes the adapter one level
@@ -1140,9 +1149,12 @@ def probe_phase(
 
                 # When Security is ON, EncryptCheckpointCallback age-wraps every
                 # checkpoint file (adapter_config.json / adapter_model.safetensors
-                # included). PeftModel.from_pretrained reads them directly and chokes
-                # on the age magic — mirror BackgroundTrainer's resume path: decrypt
-                # into a tmpfs tempdir and load the plaintext copy from there.
+                # included) — including adapter_config.json, which mount_adapter's
+                # own decrypt scope does NOT cover (it only decrypts a promoted
+                # slot's adapter_model.safetensors). PEFT reads adapter_config.json
+                # directly and chokes on the age magic — mirror BackgroundTrainer's
+                # resume path: decrypt the whole checkpoint dir into a tmpfs
+                # tempdir and mount the plaintext copy from there.
                 from paramem.backup.age_envelope import is_age_envelope
 
                 if is_age_envelope(adapter_dir_probe / "adapter_config.json"):
@@ -1157,9 +1169,10 @@ def probe_phase(
                     adapter_dir_probe = scratch_dir
 
                 logger.info("Loading adapter from %s", adapter_dir_probe)
-                model = PeftModel.from_pretrained(
-                    model, str(adapter_dir_probe), adapter_name="quad_episodic"
-                )
+                mount_adapter(model, adapter_dir_probe, "quad_episodic")
+                # mount_adapter loads weights only — it does not activate the
+                # adapter. Make the activation explicit rather than relying
+                # on map/creation order to have left it active.
                 switch_adapter(model, "quad_episodic")
 
             # Common setup before any generate() call (CLAUDE.md rule).

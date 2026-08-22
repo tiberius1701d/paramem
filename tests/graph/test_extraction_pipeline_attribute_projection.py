@@ -14,14 +14,31 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+from peft import PeftModel
+
 from paramem.graph.extraction_pipeline import ExtractionConfig, ExtractionPipeline
 from paramem.graph.schema import Entity, Relation, SessionGraph
+
+
+def _peft_model_mock() -> MagicMock:
+    """``MagicMock(spec=PeftModel)`` -- passes the ``isinstance(model,
+    PeftModel)`` precondition ``base_model_inference`` (entered by
+    ``ExtractionPipeline.run``/``run_procedural``) now enforces.
+    ``gradient_checkpointing_disable``/``_enable`` are dynamic
+    ``__getattr__``-delegated attributes a real (wrapped) PeftModel
+    exposes that ``spec`` cannot see via ``dir(PeftModel)``, so they are
+    pre-set explicitly (mirrors ``tests/server/test_gates.py::
+    _make_mock_model``)."""
+    model = MagicMock(spec=PeftModel)
+    model.gradient_checkpointing_disable = MagicMock()
+    model.gradient_checkpointing_enable = MagicMock()
+    return model
 
 
 def _pipeline(**config_overrides) -> ExtractionPipeline:
     config_overrides.setdefault("scrub", {"person name"})
     return ExtractionPipeline(
-        model=MagicMock(),
+        model=_peft_model_mock(),
         tokenizer=MagicMock(),
         config=ExtractionConfig(**config_overrides),
         prompts_dir=None,

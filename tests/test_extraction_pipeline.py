@@ -4,10 +4,23 @@ import json
 from unittest.mock import MagicMock, patch
 
 import pytest
+from peft import PeftModel
 
 from paramem.graph.extractor import PlausibilityVerdict, _extract_json_block
 from paramem.graph.phase_trace import extraction_trace
 from paramem.graph.schema import Entity, Relation, SessionGraph
+
+
+def _peft_model_mock() -> MagicMock:
+    """``MagicMock(spec=PeftModel)`` -- passes the ``isinstance(model,
+    PeftModel)`` precondition ``base_model_inference`` now enforces
+    wherever a call site here reaches it (``anonymize_turn`` et al.).
+    ``is_gradient_checkpointing`` defaults False (mirrors every prior
+    caller's explicit ``model.is_gradient_checkpointing = False``) so
+    ``grad_checkpointing_disabled`` takes its no-op branch."""
+    model = MagicMock(spec=PeftModel)
+    model.is_gradient_checkpointing = False
+    return model
 
 
 def _kept_verdict(facts: list[dict]) -> PlausibilityVerdict:
@@ -1030,8 +1043,7 @@ class TestPipelineMaxTokensThreading:
                 raw="",
             )
 
-        model = MagicMock()
-        model.is_gradient_checkpointing = False
+        model = _peft_model_mock()
         tokenizer = MagicMock()
 
         with (
@@ -1085,8 +1097,7 @@ class TestAnonymizeTurnSpeakerAnchorGate:
                 raw="",
             )
 
-        model = MagicMock()
-        model.is_gradient_checkpointing = False
+        model = _peft_model_mock()
         tokenizer = MagicMock()
 
         with (
@@ -1180,8 +1191,7 @@ class TestAnonymizeTurnRelationFreeTurn:
                 raw="",
             )
 
-        model = MagicMock()
-        model.is_gradient_checkpointing = False
+        model = _peft_model_mock()
         tokenizer = MagicMock()
 
         with (
@@ -2326,8 +2336,7 @@ class TestValidityRuleSessionFlowEndToEnd:
         from paramem.graph.flows import anonymize_turn
 
         graph = _make_graph([("Alex", "lives_in", "Millfield")])
-        model = MagicMock()
-        model.is_gradient_checkpointing = False
+        model = _peft_model_mock()
         tokenizer = MagicMock()
 
         with (

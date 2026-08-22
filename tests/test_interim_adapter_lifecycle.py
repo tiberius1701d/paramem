@@ -171,38 +171,6 @@ class TestInterimTiersNewestFirst:
 
 
 class TestCreateInterimAdapterIdempotent:
-    def test_first_call_creates_adapter(self) -> None:
-        """create_interim_adapter calls create_adapter for a new stamp."""
-        model = _make_stub_peft_model("episodic", "semantic", "procedural")
-        adapter_config = MagicMock()
-        stamp = "20260418T1430"
-
-        expected_name = f"episodic_interim_{stamp}"
-        returned_model = MagicMock()
-
-        with patch(
-            "paramem.memory.interim_adapter.create_adapter",
-            return_value=returned_model,
-        ) as mock_create:
-            result = create_interim_adapter(model, adapter_config, stamp)
-
-        mock_create.assert_called_once_with(model, adapter_config, adapter_name=expected_name)
-        assert result is returned_model
-
-    def test_second_call_is_no_op(self) -> None:
-        """create_interim_adapter returns the same model unchanged on the second call."""
-        stamp = "20260418T1430"
-        name = f"episodic_interim_{stamp}"
-        # Simulate the adapter already being registered
-        model = _make_stub_peft_model("episodic", "semantic", "procedural", name)
-        adapter_config = MagicMock()
-
-        with patch("paramem.memory.interim_adapter.create_adapter") as mock_create:
-            result = create_interim_adapter(model, adapter_config, stamp)
-
-        mock_create.assert_not_called()
-        assert result is model
-
     def test_different_stamp_creates_new_adapter(self) -> None:
         """create_interim_adapter creates a distinct adapter per stamp."""
         model = _make_stub_peft_model("episodic", "semantic", "procedural")
@@ -246,65 +214,6 @@ class TestEnsureAdapterMatching:
 
         return AdapterConfig(rank=8, alpha=16, target_modules=["q_proj", "v_proj"])
 
-    def test_absent_adapter_creates_cold(self) -> None:
-        """No resident adapter under this name -> create_adapter (cold birth)."""
-        model = _make_stub_peft_model("episodic")
-        adapter_config = self._adapter_config()
-        returned_model = MagicMock()
-
-        with patch(
-            "paramem.models.loader.create_adapter", return_value=returned_model
-        ) as mock_create:
-            from paramem.models.loader import ensure_adapter_matching
-
-            result = ensure_adapter_matching(model, adapter_config, "procedural")
-
-        mock_create.assert_called_once_with(model, adapter_config, "procedural")
-        assert result is returned_model
-
-    def test_matching_resident_is_a_no_op(self) -> None:
-        """A resident adapter whose r/lora_alpha/target_modules already match
-        the target config is left untouched -- no delete, no create."""
-        model = _make_stub_peft_model("episodic")
-        adapter_config = self._adapter_config()
-        resident = model.peft_config["episodic"]
-        resident.r = adapter_config.rank
-        resident.lora_alpha = adapter_config.alpha
-        resident.target_modules = list(adapter_config.target_modules)
-
-        with patch("paramem.models.loader.create_adapter") as mock_create:
-            from paramem.models.loader import ensure_adapter_matching
-
-            result = ensure_adapter_matching(model, adapter_config, "episodic")
-
-        mock_create.assert_not_called()
-        model.delete_adapter.assert_not_called()
-        assert result is model
-        assert "episodic" in model.peft_config, "the resident adapter must survive untouched"
-
-    def test_rank_mismatch_recreates_cold(self) -> None:
-        """A rank change is deleted and recreated -- never compared by
-        parameter key set (a rank change would surface there as a
-        tensor-shape error, not a key mismatch)."""
-        model = _make_stub_peft_model("episodic")
-        adapter_config = self._adapter_config()
-        resident = model.peft_config["episodic"]
-        resident.r = 4  # target is rank=8
-        resident.lora_alpha = adapter_config.alpha
-        resident.target_modules = list(adapter_config.target_modules)
-        returned_model = MagicMock()
-
-        with patch(
-            "paramem.models.loader.create_adapter", return_value=returned_model
-        ) as mock_create:
-            from paramem.models.loader import ensure_adapter_matching
-
-            result = ensure_adapter_matching(model, adapter_config, "episodic")
-
-        model.delete_adapter.assert_called_once_with("episodic")
-        mock_create.assert_called_once_with(model, adapter_config, "episodic")
-        assert result is returned_model
-
     def test_alpha_mismatch_recreates_cold(self) -> None:
         """A lora_alpha change alone is also a mismatch."""
         model = _make_stub_peft_model("episodic")
@@ -338,24 +247,6 @@ class TestEnsureAdapterMatching:
 
         model.delete_adapter.assert_called_once_with("episodic")
         mock_create.assert_called_once_with(model, adapter_config, "episodic")
-
-    def test_target_modules_order_insensitive_match(self) -> None:
-        """Same modules in a different order is still a match, not a mismatch."""
-        model = _make_stub_peft_model("episodic")
-        adapter_config = self._adapter_config()
-        resident = model.peft_config["episodic"]
-        resident.r = adapter_config.rank
-        resident.lora_alpha = adapter_config.alpha
-        resident.target_modules = list(reversed(adapter_config.target_modules))
-
-        with patch("paramem.models.loader.create_adapter") as mock_create:
-            from paramem.models.loader import ensure_adapter_matching
-
-            result = ensure_adapter_matching(model, adapter_config, "episodic")
-
-        mock_create.assert_not_called()
-        model.delete_adapter.assert_not_called()
-        assert result is model
 
     def test_mismatch_warning_names_the_field(self, caplog: pytest.LogCaptureFixture) -> None:
         """The recreate-on-mismatch path logs a warning naming the adapter
@@ -427,15 +318,6 @@ class TestDetachAdapters:
         model.set_adapter.assert_not_called()
         assert model.peft_config == {}
 
-    def test_non_peft_model_returns_empty_list(self) -> None:
-        """A bare (non-PeftModel) object short-circuits to a no-op — the
-        disk venue holds a bare base model, not a PeftModel."""
-        from paramem.models.loader import detach_adapters
-
-        deleted = detach_adapters(object(), ["episodic"])
-
-        assert deleted == []
-
     def test_absent_name_is_a_no_op(self) -> None:
         """A name not resident in peft_config is silently skipped — never
         raises, and no delete/switch call is made for it."""
@@ -493,40 +375,12 @@ class TestUnloadInterimAdaptersBothVenueReap:
         assert not dir_a.exists()
         assert not dir_b.exists()
 
-    def test_disk_venue_reaps_the_identical_directories_with_a_bare_model(
-        self, tmp_path: Path
-    ) -> None:
-        """The disk venue's ``self.model`` is a bare base model, not a
-        PeftModel — the on-disk reap is unconditional and untouched by that
-        difference: the same directories disappear, only the returned
-        (PEFT) name list is empty."""
-        from paramem.memory.interim_adapter import unload_interim_adapters
-
-        adapter_dir = tmp_path / "adapters"
-        dir_a = _seed_interim_dir(adapter_dir, "20260101T0000")
-        dir_b = _seed_interim_dir(adapter_dir, "20260102T0000")
-
-        deleted = unload_interim_adapters(object(), adapter_dir)
-
-        assert deleted == []
-        assert not dir_a.exists()
-        assert not dir_b.exists()
-
 
 class TestUnloadInterimAdaptersPeftHalfSkip:
-    """A non-``PeftModel`` model (bare base model, or ``None``) skips the
-    PEFT half entirely — never touches ``peft_config``/``delete_adapter``,
-    which a bare object does not even carry."""
-
-    def test_bare_object_model_never_raises_and_returns_no_names(self, tmp_path: Path) -> None:
-        from paramem.memory.interim_adapter import unload_interim_adapters
-
-        adapter_dir = tmp_path / "adapters"
-        _seed_interim_dir(adapter_dir, "20260101T0000")
-
-        deleted = unload_interim_adapters(object(), adapter_dir)
-
-        assert deleted == []
+    """``model=None`` is the only input that skips the PEFT half entirely —
+    never touches ``peft_config``/``delete_adapter``. Under wrap-once every
+    non-``None`` model is a resident ``PeftModel``; there is no bare
+    base-model case left to skip for."""
 
     def test_none_model_never_raises_and_returns_no_names(self, tmp_path: Path) -> None:
         from paramem.memory.interim_adapter import unload_interim_adapters

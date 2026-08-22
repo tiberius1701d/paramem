@@ -500,7 +500,7 @@ def cleanup_partial_slots(adapter_dir: Path) -> list[dict]:
     """Delete partial-trained/partial-written adapter slot directories under each main tier.
 
     Walks ``<adapter_dir>/<tier>/`` for every tier in
-    :data:`~paramem.memory.interim_adapter.MAIN_TIERS` and removes any
+    :data:`~paramem.utils.tiers.MAIN_TIERS` and removes any
     subdirectory that is NOT a complete slot.  A "complete slot" carries
     every file :func:`~paramem.adapters.slot.required_slot_files` names for
     the slot's OWN payload kind — read from its ``meta.json`` — so a train
@@ -576,7 +576,8 @@ def cleanup_partial_slots(adapter_dir: Path) -> list[dict]:
         read_manifest,
     )
     from paramem.adapters.slot import required_slot_files
-    from paramem.memory.interim_adapter import INTERIM_DIR_PREFIX, MAIN_TIERS
+    from paramem.memory.interim_adapter import INTERIM_DIR_PREFIX
+    from paramem.utils.tiers import MAIN_TIERS
 
     removed: list[dict] = []
     for tier_name in MAIN_TIERS:

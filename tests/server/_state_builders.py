@@ -71,15 +71,12 @@ def _make_forget_loop_with_store(store: MemoryStore) -> MagicMock:
     bookkeeping, simhash) but drive everything else on the loop through a
     mock.
 
-    Wires ``loop.model`` (a bare, non-PEFT ``MagicMock``) and
-    ``loop.ensure_adapters`` (returns whatever ``loop.model`` currently is,
-    read dynamically at call time) so any code path that reads them has
-    something to call without crashing.
+    Wires ``loop.model`` (a bare, non-PEFT ``MagicMock``) so any code path
+    that reads it has something to call without crashing.
     """
     loop = MagicMock()
     loop.store = store
     loop.model = MagicMock()
-    loop.ensure_adapters = MagicMock(side_effect=lambda: loop.model)
     return loop
 
 
@@ -101,7 +98,6 @@ def _make_forget_loop(speaker_id: str, keys: list[str]) -> MagicMock:
     """
     loop = MagicMock()
     loop.model = MagicMock()
-    loop.ensure_adapters = MagicMock(side_effect=lambda: loop.model)
 
     # iter_bookkeeping returns bookkeeping records keyed by speaker_id.
     # The handler iterates all records and filters by record.get("speaker_id").

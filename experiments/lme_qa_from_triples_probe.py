@@ -1003,11 +1003,16 @@ def main() -> None:
     from experiments.utils.gpu_guard import acquire_gpu
     from experiments.utils.test_harness import BENCHMARK_MODELS
     from paramem.models.loader import load_base_model
+    from paramem.utils.config import AdapterConfig
 
     with acquire_gpu():
         bench_config = BENCHMARK_MODELS[args.model]
         logger.info("Loading base model (no adapter): %s", bench_config.model_id)
-        model, tokenizer = load_base_model(bench_config)
+        # Wrapped with a cold (LoRA-zero, no-op) episodic tier — the base
+        # model's object identity is fixed at load time and a PeftModel is
+        # never adapter-less; the adapter is never trained or activated
+        # here, so generation is identical to a bare base model.
+        model, tokenizer = load_base_model(bench_config, {"episodic": AdapterConfig()})
 
         # CLAUDE.md: disable gradient_checkpointing before any generate() call.
         model.gradient_checkpointing_disable()

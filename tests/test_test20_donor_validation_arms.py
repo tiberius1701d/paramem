@@ -367,10 +367,11 @@ class TestRunDonorBuildSmokeTwoMarkerResume:
         # invoked once the seed marker short-circuits the function; kept
         # here so a regression that moves the marker check surfaces as a
         # clean assertion failure rather than a real adapter-load attempt.
-        load_adapter_mock = MagicMock()
-        monkeypatch.setattr(
-            "experiments.test20_smallN_cold_gate.PeftModel.from_pretrained", load_adapter_mock
-        )
+        # The seed phase mounts the resolved donor slot via mount_adapter
+        # (paramem.models.loader) -- PeftModel.from_pretrained is no longer
+        # on this script's load path.
+        mount_adapter_mock = MagicMock()
+        monkeypatch.setattr("experiments.test20_smallN_cold_gate.mount_adapter", mount_adapter_mock)
         create_adapter_mock = MagicMock()
         monkeypatch.setattr(
             "experiments.test20_smallN_cold_gate.create_adapter", create_adapter_mock
@@ -393,7 +394,7 @@ class TestRunDonorBuildSmokeTwoMarkerResume:
         assert result is None
         build_mock.assert_called_once()
         create_adapter_mock.assert_not_called()
-        load_adapter_mock.assert_not_called()
+        mount_adapter_mock.assert_not_called()
         copy_weights_mock.assert_not_called()
         # The build-phase results ARE recorded (build_results.json did not
         # pre-exist), proving only the SEED phase was skipped.

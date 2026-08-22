@@ -158,12 +158,11 @@ def test_factory_threads_every_config_knob(
     )
 
     # --- Adapter configs ---
-    assert captured["episodic_adapter_config"] == cfg.episodic_adapter_config
-    assert captured["semantic_adapter_config"] == cfg.semantic_adapter_config
+    assert captured["tier_adapters"] == cfg.tier_config_map()
     if cfg.adapters.procedural.enabled:
-        assert captured["procedural_adapter_config"] == cfg.procedural_adapter_config
+        assert "procedural" in captured["tier_adapters"]
     else:
-        assert captured["procedural_adapter_config"] is None
+        assert "procedural" not in captured["tier_adapters"]
 
     # --- Training and consolidation configs ---
     assert captured["training_config"] == cfg.training_config

@@ -72,6 +72,7 @@ from typing import TYPE_CHECKING, Optional
 from paramem.backup.encryption import read_maybe_encrypted, write_infra_bytes
 from paramem.training.consolidation import RecallGateRejected
 from paramem.training.trainer import STAGING_ADAPTER, promote_staging_adapter, staged_weights
+from paramem.utils.tiers import MAIN_TIERS
 
 if TYPE_CHECKING:
     from paramem.server.config import ServerConfig
@@ -81,7 +82,6 @@ logger = logging.getLogger(__name__)
 
 
 _STATE_FILENAME = ".active_store_migration.json"
-TIERS: tuple[str, ...] = ("episodic", "semantic", "procedural")
 
 
 # ---------------------------------------------------------------------------
@@ -230,7 +230,7 @@ def detect_mode_switch(config: "ServerConfig") -> Optional[MigrationState]:
 
     adapter_dir = Path(config.adapter_dir)
     payload_kinds: list["str | None"] = []
-    for t in TIERS:
+    for t in MAIN_TIERS:
         tier_root = adapter_dir / t
         bound = find_live_slot(tier_root, tier_registry_sha256(tier_root))
         kind: "str | None" = None
@@ -319,7 +319,7 @@ def migrate(
         # venue's payload also carries a registry file (both commit
         # primitives write the registry last, as the commit signal), so
         # _has_adapter_registry already corroborates disk content on its own.
-        disk_has_content = any(_has_adapter_registry(adapter_dir, t) for t in TIERS) or any(
+        disk_has_content = any(_has_adapter_registry(adapter_dir, t) for t in MAIN_TIERS) or any(
             True for _ in iter_interim_dirs(adapter_dir)
         )
         if disk_has_content:
@@ -606,30 +606,6 @@ def _migrate_tier_train_to_simulate(
     )
 
 
-def _tier_adapter_config(loop: "ConsolidationLoop", name: str):
-    """Resolve the ``AdapterConfig`` for a store name from the loop.
-
-    Interim adapter names (``"episodic_interim_<stamp>"``) are mapped to the
-    episodic config because interim adapters are always topology-compatible
-    with the main episodic adapter (same rank, alpha, and target modules).
-
-    Raises ``_TierSkipped`` when the resolved tier is configured-out
-    (e.g. ``procedural_config is None`` after the operator disabled procedural).
-    """
-    from paramem.memory.interim_adapter import INTERIM_NAME_PREFIX
-
-    lookup = "episodic" if name.startswith(INTERIM_NAME_PREFIX) else name
-    cfg_map = {
-        "episodic": loop.episodic_config,
-        "semantic": loop.semantic_config,
-        "procedural": loop.procedural_config,
-    }
-    tier_config = cfg_map.get(lookup)
-    if tier_config is None:
-        raise _TierSkipped(f"store {name} (lookup={lookup!r}) not enabled (config is None)")
-    return tier_config
-
-
 def _migrate_tier_simulate_to_train(
     loop: "ConsolidationLoop", config: "ServerConfig", name: str
 ) -> None:
@@ -804,7 +780,15 @@ def _migrate_tier_simulate_to_train(
             len(entries),
         )
 
-    tier_config = _tier_adapter_config(loop, name)
+    # loop._tier_adapter_config is the one rule home for the
+    # interim-is-episodic-shaped fallback; its KeyError (name is neither a
+    # resident main tier nor an interim adapter name — e.g. a main tier the
+    # operator has disabled) converts to this module's own skip-and-continue
+    # convention.
+    try:
+        tier_config = loop._tier_adapter_config(name)
+    except KeyError:
+        raise _TierSkipped(f"store {name}: not in loop.tier_adapters") from None
 
     # Bookkeeping source for the hot-load loop below, resolved once (not
     # per key).  ``iter_entries`` only carries {key, subject, predicate,
@@ -876,7 +860,7 @@ def _migrate_tier_simulate_to_train(
     # donor seeding being unconditional, not a special case here.
     if name in loop.model.peft_config:
         loop.model.delete_adapter(name)
-    loop.model = create_adapter(loop.model, tier_config, name)
+    create_adapter(loop.model, tier_config, name)
     switch_adapter(loop.model, name)
 
     # Steps 4-5: format + dataset + budget derivation + recall callback +
