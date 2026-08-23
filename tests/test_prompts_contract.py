@@ -1100,66 +1100,44 @@ class TestPlausibilityPromptContract:
             "order encodes default disposition."
         )
 
-    def test_output_contract_is_drop_index_set(self):
-        """The plausibility judge's output protocol is a small JSON object
-        ``{"drop": [<index>, ...]}`` listing which input facts to drop —
-        NOT an echo of every kept fact.
+    def test_output_examples_render_to_rule_keyed_drop_maps(self):
+        """The Output section's worked examples parse to the rule-keyed
+        drop-set contract: a firing example whose every rule key is one of
+        :data:`PLAUSIBILITY_RULES` mapping to a list of ints, and a
+        clean-input example that is the empty map — not the retired empty
+        list."""
+        from paramem.graph.extractor import PLAUSIBILITY_RULES
 
-        Why this is structural, not stylistic: the previous "echo every
-        kept fact" contract had Mistral 7B emit EOS mid-array on long
-        inputs (the closing ``]`` never arrived, so the response parser
-        couldn't recover the envelope; the gate fail-opened with 0 facts
-        filtered).  The drop-set output is bounded by the count of
-        actual rule matches — typically 0–5 indices for clean inputs —
-        so truncation cannot kill the gate.
-
-        Regressing to "echo every fact" silently re-introduces the
-        truncation failure mode, so this assertion locks the contract.
-        """
-        tmpl = _load_prompt("cloud_plausibility.txt")
-        # Must specify the drop-index-set object shape.
-        assert '"drop"' in tmpl, (
-            'Plausibility prompt must specify the drop-set output shape ({"drop": [<index>, ...]}).'
-        )
-        # Must describe the index-based reference convention.
-        assert "zero-based" in tmpl.lower() and "index" in tmpl.lower(), (
-            "Plausibility prompt must teach zero-based index references — the "
-            "judge needs to know how facts are numbered to refer to them."
-        )
-        # Must forbid echoing kept facts (the regression vector).
-        forbids_echo = re.search(
-            r"do not (echo|include the facts|return surviving|emit the surviving)",
-            tmpl,
-            re.IGNORECASE,
-        )
-        assert forbids_echo, (
-            "Plausibility prompt must explicitly forbid echoing the kept facts — "
-            "without this the model defaults to verbose echo and triggers the "
-            "Mistral-7B EOS-mid-array truncation."
-        )
-
-    def test_output_contract_instructs_the_annotated_drop_form(self):
-        """The Output section instructs the annotated ``{"index", "rule"}``
-        drop-entry form — both
-        ``"index"`` and ``"rule"`` appear in the output contract, and the
-        worked example renders as parseable JSON after ``.format()``. The
-        pin that stops a future prompt edit from silently reverting rule
-        capture (the parser still tolerates the bare-integer form, but the
-        judge is never asked to emit it)."""
         tmpl = _load_prompt("cloud_plausibility.txt")
         output_section = tmpl[tmpl.index("## Output") :]
-        assert '"index"' in output_section
-        assert '"rule"' in output_section
+        rendered = output_section.format(transcript="x", facts_json="[]")
+        examples = [json.loads(m) for m in re.findall(r"Example[^\n:]*:\s*(\{.*\})", rendered)]
+        assert len(examples) >= 2, "Expected at least a firing example and a clean example."
+        for example in examples:
+            assert set(example) == {"drop"}
+            assert isinstance(example["drop"], dict)
+        assert {"drop": {}} in examples, (
+            "Output section must include a clean-input example with the empty "
+            "rule-keyed map, not the retired empty list."
+        )
+        firing_examples = [e for e in examples if e["drop"]]
+        assert firing_examples, "Expected a worked example with at least one rule firing."
+        for example in firing_examples:
+            for rule_key, indices in example["drop"].items():
+                assert rule_key in PLAUSIBILITY_RULES
+                assert isinstance(indices, list)
+                assert all(isinstance(i, int) for i in indices)
 
-        rendered = tmpl.format(transcript="Person_1 said hi.", facts_json="[]")
-        example_match = re.search(r"Example with two drops:\s*(\{.*\})", rendered)
-        assert example_match, "Could not locate the two-drop worked example in the rendered prompt."
-        parsed = json.loads(example_match.group(1))
-        assert parsed["drop"], "Worked example must be non-empty."
-        for entry in parsed["drop"]:
-            assert set(entry) == {"index", "rule"}
-            assert isinstance(entry["index"], int)
-            assert isinstance(entry["rule"], str)
+    def test_transcript_label_is_source_neutral(self):
+        """The label preceding ``{transcript}`` no longer names a
+        conversation-specific source — the same judge also runs on
+        document-sized chunks, not just conversation turns."""
+        tmpl = _load_prompt("cloud_plausibility.txt")
+        lines = tmpl.splitlines()
+        placeholder_idx = next(i for i, line in enumerate(lines) if line.strip() == "{transcript}")
+        label_line = lines[placeholder_idx - 1].strip()
+        assert label_line.endswith(":")
+        assert "conversation" not in label_line.lower()
 
     def test_r4_carve_out_for_speaker_tokens_is_explicit(self):
         """R4 ("conversation-role reference") lexically targets the
@@ -1189,6 +1167,23 @@ class TestPlausibilityPromptContract:
         # literal escaped correctly.
         rendered = tmpl.format(transcript="x", facts_json="[]")
         assert "speaker{N}" in rendered
+
+    def test_drop_rules_section_matches_rule_vocabulary(self):
+        """The ``## Drop rules`` section's numbered rule ids must be
+        exactly the closed vocabulary the parser recognizes
+        (:data:`PLAUSIBILITY_RULES`). A structural scan, not a substring
+        check: a rule added to the prompt text alone (with no matching
+        entry in the code constant) — or vice versa — must fail here,
+        since the parser silently counts an unrecognized rule id as
+        unattributed rather than raising."""
+        from paramem.graph.extractor import PLAUSIBILITY_RULES
+
+        tmpl = _load_prompt("cloud_plausibility.txt")
+        section_start = tmpl.index("## Drop rules")
+        section_end = tmpl.index("## Input")
+        section = tmpl[section_start:section_end]
+        rule_ids = {m.group(1) for m in re.finditer(r"^(R\d+)\.", section, flags=re.MULTILINE)}
+        assert rule_ids == set(PLAUSIBILITY_RULES)
 
 
 class TestProceduralPrompt:

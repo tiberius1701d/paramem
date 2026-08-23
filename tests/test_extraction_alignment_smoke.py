@@ -25,7 +25,7 @@ def _verdict_dropping(facts: list[dict], predicates: set[str]) -> PlausibilityVe
     tests need in place of a real drop-set round trip."""
     kept = [f for f in facts if f.get("predicate") not in predicates]
     dropped = [
-        {"index": i, "rule": None, "fact": f}
+        {"index": i, "rule": "R1", "fact": f}
         for i, f in enumerate(facts)
         if f.get("predicate") in predicates
     ]

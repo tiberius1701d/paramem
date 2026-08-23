@@ -40,7 +40,7 @@ def _verdict_dropping(facts: list[dict], predicates: set[str]) -> PlausibilityVe
     of the same name."""
     kept = [f for f in facts if f.get("predicate") not in predicates]
     dropped = [
-        {"index": i, "rule": None, "fact": f}
+        {"index": i, "rule": "R1", "fact": f}
         for i, f in enumerate(facts)
         if f.get("predicate") in predicates
     ]
@@ -98,15 +98,6 @@ class TestExtractJsonBlock:
         text = '["a", "b"] {"entities": []}'
         result = json.loads(_extract_json_block(text))
         assert result == {"entities": []}
-
-    def test_bare_int_list_is_envelope(self):
-        # Plausibility-shape: drop-set bare integer array (`[0, 2, 5]`).
-        # Accepted as a valid envelope so the shared finder serves the
-        # drop-set parser without bespoke unwrap.  Distinct from extraction
-        # / enrichment outputs (those have dict-shaped first elements).
-        text = "[0, 2, 5]"
-        result = json.loads(_extract_json_block(text))
-        assert result == [0, 2, 5]
 
     def test_markdown_code_block(self):
         text = '```json\n{"facts": []}\n```'
@@ -219,244 +210,6 @@ class TestParseExtractionShapes:
         assert len(g.entities) == 0
 
 
-class TestPlausibilityDropSet:
-    """The plausibility judge emits ``{"drop": [<index>, ...]}`` — a small
-    JSON object listing which input facts to drop by zero-based index,
-    each entry optionally annotated with the rule that matched.
-    ``_apply_drop_set`` parses that output and returns a
-    ``PlausibilityVerdict`` (``kept``/``dropped``/``out_of_range``).
-
-    This class covers the parser tolerance and the drop application:
-    happy path, alternative output shapes the model might produce, edge
-    cases (out-of-range, duplicates, malformed), the rule-attribution
-    payload, and the fail-open contract on parse failure.
-    """
-
-    def _facts(self, n: int) -> list[dict]:
-        return [{"subject": f"S{i}", "predicate": "p", "object": f"O{i}"} for i in range(n)]
-
-    def test_empty_drop_set_keeps_all_facts(self):
-        """``{"drop": []}`` is the prompt-defined "clean input" output — the
-        judge found no DROP-rule matches; every fact survives."""
-        from paramem.graph.extractor import _apply_drop_set
-
-        facts = self._facts(5)
-        out = _apply_drop_set(facts, '{"drop": []}')
-        assert out.kept == facts
-        assert out.dropped == []
-        assert out.out_of_range == []
-
-    def test_single_index_dropped(self):
-        from paramem.graph.extractor import _apply_drop_set
-
-        facts = self._facts(5)
-        out = _apply_drop_set(facts, '{"drop": [2]}')
-        assert out is not None
-        assert [f["subject"] for f in out.kept] == ["S0", "S1", "S3", "S4"]
-
-    def test_multiple_indices_dropped_unordered(self):
-        from paramem.graph.extractor import _apply_drop_set
-
-        facts = self._facts(6)
-        out = _apply_drop_set(facts, '{"drop": [4, 0, 2]}')
-        assert out is not None
-        assert [f["subject"] for f in out.kept] == ["S1", "S3", "S5"]
-
-    def test_duplicate_indices_dedupped(self):
-        from paramem.graph.extractor import _apply_drop_set
-
-        facts = self._facts(5)
-        out = _apply_drop_set(facts, '{"drop": [1, 1, 1]}')
-        assert out is not None
-        assert [f["subject"] for f in out.kept] == ["S0", "S2", "S3", "S4"]
-
-    def test_out_of_range_indices_skipped(self):
-        """A bad index shouldn't void an otherwise-valid drop set —
-        it lands in ``out_of_range`` (never applied) rather than
-        fail-opening the entire gate."""
-        from paramem.graph.extractor import _apply_drop_set
-
-        facts = self._facts(3)
-        out = _apply_drop_set(facts, '{"drop": [0, 99, -1, 2]}')
-        assert out is not None
-        assert [f["subject"] for f in out.kept] == ["S1"]
-        assert {r["index"] for r in out.out_of_range} == {99, -1}
-        assert all(r["input_count"] == 3 for r in out.out_of_range)
-
-    def test_bare_array_shape_accepted(self):
-        """Some models drop the ``{"drop": ...}`` wrapper and emit a bare
-        integer array.  Accepted because the intent is unambiguous."""
-        from paramem.graph.extractor import _apply_drop_set
-
-        facts = self._facts(4)
-        out = _apply_drop_set(facts, "[1, 3]")
-        assert out is not None
-        assert [f["subject"] for f in out.kept] == ["S0", "S2"]
-
-    def test_object_index_with_rule_annotation(self):
-        """Some models annotate each drop with the rule that fired:
-        ``{"drop": [{"index": 2, "rule": "R1"}, ...]}``.  Index and rule
-        are both extracted and land on the dropped-record."""
-        from paramem.graph.extractor import _apply_drop_set
-
-        facts = self._facts(5)
-        raw = '{"drop": [{"index": 1, "rule": "R3"}, {"index": 4, "rule": "R5"}]}'
-        out = _apply_drop_set(facts, raw)
-        assert out is not None
-        assert [f["subject"] for f in out.kept] == ["S0", "S2", "S3"]
-        assert out.dropped == [
-            {"index": 1, "rule": "R3", "fact": facts[1]},
-            {"index": 4, "rule": "R5", "fact": facts[4]},
-        ]
-
-    def test_bare_integer_drops_carry_no_rule(self):
-        from paramem.graph.extractor import _apply_drop_set
-
-        facts = self._facts(3)
-        out = _apply_drop_set(facts, '{"drop": [1]}')
-        assert out.dropped == [{"index": 1, "rule": None, "fact": facts[1]}]
-
-    def test_reason_key_accepted_as_rule_alias(self):
-        from paramem.graph.extractor import _apply_drop_set
-
-        facts = self._facts(3)
-        out = _apply_drop_set(facts, '{"drop": [{"index": 0, "reason": "R2"}]}')
-        assert out.dropped == [{"index": 0, "rule": "R2", "fact": facts[0]}]
-
-    def test_non_string_rule_reads_as_none(self):
-        from paramem.graph.extractor import _apply_drop_set
-
-        facts = self._facts(3)
-        out = _apply_drop_set(facts, '{"drop": [{"index": 0, "rule": 5}]}')
-        assert out.dropped == [{"index": 0, "rule": None, "fact": facts[0]}]
-
-    def test_rule_longer_than_32_chars_truncated(self):
-        import json
-
-        from paramem.graph.extractor import _MAX_RULE_CHARS, _apply_drop_set
-
-        facts = self._facts(3)
-        long_rule = "x" * (_MAX_RULE_CHARS + 18)
-        raw = json.dumps({"drop": [{"index": 0, "rule": long_rule}]})
-        out = _apply_drop_set(facts, raw)
-        assert out.dropped[0]["rule"] == long_rule[:_MAX_RULE_CHARS]
-        assert len(out.dropped[0]["rule"]) == _MAX_RULE_CHARS
-
-    def test_alternate_key_drop_indices(self):
-        """``"drop_indices"`` is a common synonym a model might pick.
-        Accept it transparently."""
-        from paramem.graph.extractor import _apply_drop_set
-
-        facts = self._facts(3)
-        out = _apply_drop_set(facts, '{"drop_indices": [0]}')
-        assert out is not None
-        assert [f["subject"] for f in out.kept] == ["S1", "S2"]
-
-    def test_code_fenced_output_is_unwrapped(self):
-        """Models often wrap structured output in ```json``` fences.
-        The shared envelope-finder strips them."""
-        from paramem.graph.extractor import _apply_drop_set
-
-        facts = self._facts(4)
-        raw = '```json\n{"drop": [2]}\n```'
-        out = _apply_drop_set(facts, raw)
-        assert out is not None
-        assert [f["subject"] for f in out.kept] == ["S0", "S1", "S3"]
-
-    def test_single_backtick_inline_code_is_unwrapped(self):
-        """Live-probe regression: when the prompt itself uses inline-code
-        formatting around the output spec example, the model copies the
-        single-backtick wrapper into its answer (``​`{"drop": [2]}`​``).
-        Parser must strip the inline-code wrapper too — not just the
-        triple-backtick code-fence form.
-        """
-        from paramem.graph.extractor import _apply_drop_set
-
-        facts = self._facts(4)
-        raw = '`{"drop": [2]}`'
-        out = _apply_drop_set(facts, raw)
-        assert out is not None
-        assert [f["subject"] for f in out.kept] == ["S0", "S1", "S3"]
-
-    def test_malformed_output_returns_none(self):
-        """Parse failure must return ``None`` — caller fail-opens by
-        keeping all input facts.  This matches the prior contract:
-        a ``None`` return → the caller (e.g. the ``enrich`` stage)
-        logs a warning and continues with the unfiltered input."""
-        from paramem.graph.extractor import _apply_drop_set
-
-        facts = self._facts(3)
-        assert _apply_drop_set(facts, "I cannot process this request.") is None
-        assert _apply_drop_set(facts, "{not_valid_json") is None
-
-    def test_none_input_returns_none(self):
-        from paramem.graph.extractor import _apply_drop_set
-
-        assert _apply_drop_set([], None) is None
-        assert _apply_drop_set([{"subject": "S"}], None) is None
-
-    def test_empty_input_with_empty_drop(self):
-        """``_apply_drop_set([], '{"drop": []}')`` is the most common
-        plausibility outcome on an extraction that produced no facts —
-        must succeed and return an empty verdict."""
-        from paramem.graph.extractor import _apply_drop_set
-
-        out = _apply_drop_set([], '{"drop": []}')
-        assert out.kept == []
-        assert out.dropped == []
-        assert out.out_of_range == []
-
-    def test_drop_set_with_non_int_entries_skipped(self):
-        """Stray strings / null / booleans inside the array don't void the
-        whole set — they're skipped while integer entries are honoured."""
-        from paramem.graph.extractor import _apply_drop_set
-
-        facts = self._facts(4)
-        out = _apply_drop_set(facts, '{"drop": [1, "junk", null, 3, true]}')
-        assert out is not None
-        assert [f["subject"] for f in out.kept] == ["S0", "S2"]
-
-    def test_envelope_wrapped_in_one_element_list_is_unwrapped(self):
-        """A judge that wraps the whole ``{"drop": [...]}`` envelope in a
-        one-element list is recovered correctly — the shared primitive
-        (``_extract_json_block``) unwraps that shape to the inner
-        envelope dict, so this caller's own dict-shaped ``"drop"`` branch
-        runs rather than silently treating the wrapped dict as one
-        non-integer drop candidate."""
-        from paramem.graph.extractor import _apply_drop_set
-
-        facts = self._facts(5)
-        raw = '[{"drop": [1, 3]}]'
-        out = _apply_drop_set(facts, raw)
-        assert out is not None
-        assert [f["subject"] for f in out.kept] == ["S0", "S2", "S4"]
-
-    def test_out_of_range_annotated_form_carries_rule(self):
-        from paramem.graph.extractor import _apply_drop_set
-
-        facts = self._facts(1)
-        out = _apply_drop_set(facts, '{"drop": [{"index": 1, "rule": "R2"}]}')
-        assert out.kept == facts
-        assert out.dropped == []
-        assert out.out_of_range == [{"index": 1, "input_count": 1, "rule": "R2"}]
-
-    def test_out_of_range_negative_index_recorded(self):
-        from paramem.graph.extractor import _apply_drop_set
-
-        facts = self._facts(1)
-        out = _apply_drop_set(facts, '{"drop": [-1]}')
-        assert out.out_of_range == [{"index": -1, "input_count": 1, "rule": None}]
-
-    def test_mixed_valid_and_invalid_indices_records_both_sides(self):
-        from paramem.graph.extractor import _apply_drop_set
-
-        facts = self._facts(2)
-        out = _apply_drop_set(facts, '{"drop": [0, 7]}')
-        assert [f["subject"] for f in out.kept] == ["S1"]
-        assert out.dropped == [{"index": 0, "rule": None, "fact": facts[0]}]
-        assert out.out_of_range == [{"index": 7, "input_count": 2, "rule": None}]
-
-
 class TestRenderIndexedFacts:
     """``_render_indexed_facts`` produces ``[N] <json>`` lines that the
     plausibility prompt teaches the judge to reference.  Without a stable
@@ -512,6 +265,263 @@ class TestRenderIndexedFacts:
         )
         assert "Müller" in rendered
         assert "Köln" in rendered
+
+
+class TestPlausibilityDropSetRuleKeyed:
+    """The plausibility judge emits ``{"drop": {"R1": [<index>, ...], ...}}``
+    — a map from rule id to the indices that rule drops, or ``{"drop": {}}``
+    when nothing matched. ``_apply_drop_set`` parses that output and returns
+    a ``PlausibilityVerdict`` (``kept``/``dropped``/``out_of_range``/
+    ``unattributed``).
+
+    An index that does not sit in a list under one of the rule keys
+    ``R1``-``R6`` is not a drop — it is counted in ``unattributed`` and the
+    fact stays kept. This is the robustness contract for the retired shapes
+    (a bare index array, the old ``{"index", "rule"}`` annotated form): a
+    parseable old-shape verdict is *counted*, not turned into a fail-open
+    trigger.
+    """
+
+    def _facts(self, n: int) -> list[dict]:
+        return [{"subject": f"S{i}", "predicate": "p", "object": f"O{i}"} for i in range(n)]
+
+    def test_rule_keyed_happy_path(self):
+        from paramem.graph.extractor import _apply_drop_set
+
+        facts = self._facts(5)
+        out = _apply_drop_set(facts, '{"drop": {"R1": [3], "R4": [0]}}')
+        assert out is not None
+        assert [f["subject"] for f in out.kept] == ["S1", "S2", "S4"]
+        assert {(d["index"], d["rule"]) for d in out.dropped} == {(0, "R4"), (3, "R1")}
+        assert out.out_of_range == []
+        assert out.unattributed == 0
+
+    def test_empty_rule_map_keeps_all_facts(self):
+        """``{"drop": {}}`` is the prompt-defined "clean input" output —
+        the judge found no rule matches; every fact survives."""
+        from paramem.graph.extractor import _apply_drop_set
+
+        facts = self._facts(4)
+        out = _apply_drop_set(facts, '{"drop": {}}')
+        assert out.kept == facts
+        assert out.dropped == []
+        assert out.out_of_range == []
+        assert out.unattributed == 0
+
+    def test_duplicate_index_across_two_rules_lowest_wins(self):
+        from paramem.graph.extractor import _apply_drop_set
+
+        facts = self._facts(3)
+        out = _apply_drop_set(facts, '{"drop": {"R4": [1], "R1": [1]}}')
+        assert out is not None
+        assert [f["subject"] for f in out.kept] == ["S0", "S2"]
+        assert out.dropped == [{"index": 1, "rule": "R1", "fact": facts[1]}]
+
+    def test_unknown_rule_key_is_unattributed_fact_kept(self):
+        from paramem.graph.extractor import _apply_drop_set
+
+        facts = self._facts(3)
+        out = _apply_drop_set(facts, '{"drop": {"R9": [1]}}')
+        assert out is not None
+        assert out.kept == facts  # nothing dropped — unattributed, not applied
+        assert out.dropped == []
+        assert out.unattributed == 1
+
+    def test_retired_annotated_list_shape_counts_unattributed_and_keeps_facts(self):
+        """The retired ``[{"index": N, "rule": "Rk"}]`` per-entry annotated
+        form is a successful parse with zero drops — not a new fail-open
+        trigger. Every element of the list is one claim the judge made
+        without a rule, so two entries count two unattributed claims and
+        every fact stays kept."""
+        from paramem.graph.extractor import _apply_drop_set
+
+        facts = self._facts(3)
+        out = _apply_drop_set(facts, '{"drop": [{"index": 1, "rule": "R1"}, {"index": 2}]}')
+        assert out is not None
+        assert out.kept == facts
+        assert out.dropped == []
+        assert out.unattributed == 2
+
+    def test_retired_bare_array_shape_counts_unattributed_and_keeps_facts(self):
+        """The retired bare-index-array ``{"drop": [1]}`` shape: the one
+        parseable int inside is one unattributed claim, zero drops applied."""
+        from paramem.graph.extractor import _apply_drop_set
+
+        facts = self._facts(3)
+        out = _apply_drop_set(facts, '{"drop": [1]}')
+        assert out is not None
+        assert out.kept == facts
+        assert out.dropped == []
+        assert out.unattributed == 1
+
+    def test_out_of_range_under_a_rule_recorded_with_rule(self):
+        """A bad index shouldn't void an otherwise-valid drop set — it
+        lands in ``out_of_range`` (never applied), still carrying the
+        rule that cited it."""
+        from paramem.graph.extractor import _apply_drop_set
+
+        facts = self._facts(2)
+        out = _apply_drop_set(facts, '{"drop": {"R2": [7]}}')
+        assert out is not None
+        assert out.kept == facts
+        assert out.dropped == []
+        assert out.out_of_range == [{"index": 7, "input_count": 2, "rule": "R2"}]
+        assert out.unattributed == 0
+
+    def test_non_int_elements_are_unattributed(self):
+        """Stray non-int entries under a valid rule key don't void the
+        rule's other in-range int drops — each is counted separately as
+        unattributed (booleans excluded from the int check)."""
+        from paramem.graph.extractor import _apply_drop_set
+
+        facts = self._facts(3)
+        out = _apply_drop_set(facts, '{"drop": {"R1": [1, "junk", null, true]}}')
+        assert out is not None
+        assert [f["subject"] for f in out.kept] == ["S0", "S2"]
+        assert out.unattributed == 3  # "junk", null, true
+
+    def test_dropped_rule_is_always_a_string(self):
+        """The rule-keyed contract cannot produce the retired ``rule:
+        None`` shape — every drop record's rule is the non-empty rule-key
+        string it was found under."""
+        from paramem.graph.extractor import _apply_drop_set
+
+        facts = self._facts(2)
+        out = _apply_drop_set(facts, '{"drop": {"R6": [0]}}')
+        assert out is not None
+        assert len(out.dropped) == 1
+        assert isinstance(out.dropped[0]["rule"], str)
+        assert out.dropped[0]["rule"] == "R6"
+
+    def test_non_dict_drop_scalar_counts_one_unattributed(self):
+        """A bare scalar (or a string) under ``"drop"`` is not itself
+        enumerable — it counts as exactly one unattributed claim, zero
+        drops applied, the fact kept."""
+        from paramem.graph.extractor import _apply_drop_set
+
+        facts = self._facts(2)
+        for raw in ('{"drop": 5}', '{"drop": "R1"}'):
+            out = _apply_drop_set(facts, raw)
+            assert out is not None, raw
+            assert out.kept == facts
+            assert out.dropped == []
+            assert out.unattributed == 1
+
+    def test_known_rule_key_with_non_list_value_is_unattributed(self):
+        """A known rule key whose value is not a list (e.g. a bare int)
+        never reaches the per-element int loop — the whole value is one
+        unattributed claim, zero drops applied."""
+        from paramem.graph.extractor import _apply_drop_set
+
+        facts = self._facts(2)
+        out = _apply_drop_set(facts, '{"drop": {"R1": 3}}')
+        assert out is not None
+        assert out.kept == facts
+        assert out.dropped == []
+        assert out.unattributed == 1
+
+    def test_missing_drop_key_returns_none(self):
+        """A structurally valid envelope under a different key (no
+        ``"drop"``) is not this judge's output at all — the caller
+        fail-opens."""
+        from paramem.graph.extractor import _apply_drop_set
+
+        facts = self._facts(2)
+        assert _apply_drop_set(facts, '{"facts": []}') is None
+
+    def test_top_level_list_returns_none(self):
+        """A bare top-level JSON array (the retired whole-response shape)
+        is not a dict, so it can never carry a ``"drop"`` key — parse
+        failure, caller fail-opens."""
+        from paramem.graph.extractor import _apply_drop_set
+
+        facts = self._facts(6)
+        assert _apply_drop_set(facts, "[0, 2, 5]") is None
+
+    def test_negative_index_under_a_rule_is_out_of_range(self):
+        """A negative index is outside ``[0, n_facts)`` like any other
+        out-of-range value — recorded, never applied, still carrying the
+        rule that cited it."""
+        from paramem.graph.extractor import _apply_drop_set
+
+        facts = self._facts(3)
+        out = _apply_drop_set(facts, '{"drop": {"R3": [-1]}}')
+        assert out is not None
+        assert out.kept == facts
+        assert out.dropped == []
+        assert out.out_of_range == [{"index": -1, "input_count": 3, "rule": "R3"}]
+
+    def test_duplicate_index_within_one_rule_counted_once(self):
+        """The same index repeated under one rule is one drop, not two —
+        ``rules`` is keyed by index."""
+        from paramem.graph.extractor import _apply_drop_set
+
+        facts = self._facts(3)
+        out = _apply_drop_set(facts, '{"drop": {"R1": [1, 1]}}')
+        assert out is not None
+        assert [f["subject"] for f in out.kept] == ["S0", "S2"]
+        assert out.dropped == [{"index": 1, "rule": "R1", "fact": facts[1]}]
+
+    def test_empty_list_under_a_rule_counts_zero_unattributed(self):
+        """An enumerable-but-empty value (``{"R9": []}``) has nothing to
+        attribute — zero unattributed claims, zero drops, regardless of
+        whether the key itself is a recognized rule."""
+        from paramem.graph.extractor import _apply_drop_set
+
+        facts = self._facts(2)
+        out = _apply_drop_set(facts, '{"drop": {"R9": []}}')
+        assert out is not None
+        assert out.kept == facts
+        assert out.dropped == []
+        assert out.unattributed == 0
+
+    def test_unattributed_claims_emit_a_counts_only_warning(self, caplog):
+        """A non-zero unattributed count is surfaced as a warning
+        mirroring the sibling out-of-range warning — counts only, never
+        fact content."""
+        import logging
+
+        from paramem.graph.extractor import _apply_drop_set
+
+        facts = self._facts(3)
+        with caplog.at_level(logging.WARNING, logger="paramem.graph.extractor"):
+            out = _apply_drop_set(facts, '{"drop": {"R9": [1]}}')
+        assert out is not None
+        assert out.unattributed == 1
+        warnings = [r for r in caplog.records if "unattributed" in r.getMessage().lower()]
+        assert len(warnings) == 1
+        message = warnings[0].getMessage()
+        assert "1" in message
+        assert str(len(facts)) in message
+        for fact in facts:
+            assert fact["subject"] not in message
+            assert fact["object"] not in message
+
+    def test_fenced_output_is_unwrapped(self):
+        """Models often wrap structured output in ```json``` fences.
+        The shared envelope-finder strips them."""
+        from paramem.graph.extractor import _apply_drop_set
+
+        facts = self._facts(4)
+        raw = '```json\n{"drop": {"R1": [2]}}\n```'
+        out = _apply_drop_set(facts, raw)
+        assert out is not None
+        assert [f["subject"] for f in out.kept] == ["S0", "S1", "S3"]
+
+    def test_malformed_output_returns_none(self):
+        """Parse failure must return ``None`` — caller fail-opens by
+        keeping all input facts."""
+        from paramem.graph.extractor import _apply_drop_set
+
+        facts = self._facts(3)
+        assert _apply_drop_set(facts, "I cannot process this request.") is None
+        assert _apply_drop_set(facts, "{not_valid_json") is None
+
+    def test_none_input_returns_none(self):
+        from paramem.graph.extractor import _apply_drop_set
+
+        assert _apply_drop_set([], None) is None
+        assert _apply_drop_set([{"subject": "S"}], None) is None
 
 
 class TestEnrichmentDelta:
@@ -1991,42 +2001,6 @@ class TestCloudEnrichmentProvider:
         for r in result.relations:
             assert "Person_1" not in r.subject
             assert "City_1" not in r.object
-
-    def test_judge_plausibility_round_trip(self):
-        """Local plausibility filter applies the drop-set to the input facts.
-
-        Output contract is ``{"drop": [<index>, ...]}``; the helper indexes
-        by position and returns the surviving facts unchanged.  This used
-        to be an echo-protocol where the model returned the kept facts
-        verbatim — that protocol triggered Mistral 7B truncation on long
-        inputs (see ``TestPlausibilityDropSet`` for the structural tests
-        and the new prompt contract).
-        """
-        from paramem.graph.extractor import judge_plausibility
-
-        facts = [
-            {"subject": "Alex", "predicate": "lives_in", "object": "Millfield"},
-            {"subject": "Alex", "predicate": "has_name", "object": "Alex"},  # self-loop
-        ]
-        # Drop the self-loop at index 1; keep index 0.
-        drop_response = '{"drop": [1]}'
-        tokenizer = MagicMock()
-        tokenizer.apply_chat_template = MagicMock(return_value="formatted")
-        with (
-            # See companion comment above (test_anonymize_graceful_on_bad_output):
-            # ``generate_answer`` is bound at module top in extractor.py, so
-            # its patch targets the bound name there; ``adapt_messages`` is
-            # only ever called from inside render_chat_prompt
-            # (paramem.models.loader), so its patch targets THAT module.
-            patch("paramem.graph.extractor.generate_answer", return_value=drop_response),
-            patch("paramem.models.loader.adapt_messages", return_value=[]),
-        ):
-            result, raw = judge_plausibility(facts, "transcript", MagicMock(), tokenizer)
-        assert result is not None
-        assert len(result.kept) == 1
-        assert result.kept[0] == facts[0]  # input fact returned unchanged
-        assert result.dropped == [{"index": 1, "rule": None, "fact": facts[1]}]
-        assert raw == drop_response
 
     def test_normalize_anonymization_mapping_inverts_placeholder_keys(self):
         """Mapping with placeholder keys is inverted to {real: placeholder} canonical."""
@@ -3545,13 +3519,14 @@ class TestPlausibilityTupleReturn:
     def test_plausibility_with_cloud_returns_facts_and_raw(self):
         """request_plausibility returns (facts, raw_response).
 
-        Plausibility is now a drop-set protocol — the judge emits a small
-        ``{"drop": [<index>, ...]}`` object instead of echoing kept facts.
-        Empty drop set keeps every input fact unchanged.
+        Plausibility is a rule-keyed drop-set protocol — the judge emits a
+        small ``{"drop": {"R1": [<index>, ...], ...}}`` map from rule id to
+        the indices that rule drops, instead of echoing kept facts. An
+        empty rule map (``{"drop": {}}``) keeps every input fact unchanged.
         """
         from paramem.graph.extractor import request_plausibility
 
-        fake_raw = '{"drop": []}'
+        fake_raw = '{"drop": {}}'
         input_fact = {"subject": "A", "predicate": "knows", "object": "B"}
         with patch("paramem.graph.extractor._cloud_call", return_value=fake_raw):
             verdict, raw = request_plausibility(
@@ -3700,7 +3675,7 @@ class TestPlausibilityFilterWithCloudPromptsDir:
 
         def fake_cloud_call(prompt, *args, **kwargs):
             captured_prompts.append(prompt)
-            return '{"drop": []}'
+            return '{"drop": {}}'
 
         with patch("paramem.graph.extractor._cloud_call", side_effect=fake_cloud_call):
             request_plausibility(
@@ -3726,7 +3701,7 @@ class TestPlausibilityFilterWithCloudPromptsDir:
 
         def fake_cloud_call(prompt, *args, **kwargs):
             captured_prompts.append(prompt)
-            return '{"drop": []}'
+            return '{"drop": {}}'
 
         with patch("paramem.graph.extractor._cloud_call", side_effect=fake_cloud_call):
             request_plausibility(
@@ -3799,7 +3774,7 @@ class TestCloudSystemPromptCallTimeOverride:
 
         def fake_cloud_call(prompt, *args, **kwargs):
             captured.append(kwargs.get("system_prompt"))
-            return '{"drop": []}'
+            return '{"drop": {}}'
 
         with patch("paramem.graph.extractor._cloud_call", side_effect=fake_cloud_call):
             with extraction_trace() as trace:
@@ -3835,7 +3810,7 @@ class TestCloudSystemPromptCallTimeOverride:
         tokenizer = MagicMock()
         tokenizer.apply_chat_template = MagicMock(return_value="formatted")
         with (
-            patch("paramem.graph.extractor.generate_answer", return_value='{"drop": []}'),
+            patch("paramem.graph.extractor.generate_answer", return_value='{"drop": {}}'),
             # Identity passthrough so the real messages list (carrying the
             # override) reaches apply_chat_template unchanged — see the
             # companion note on TestFilterWithCloudPromptsDir-style tests.
@@ -6536,6 +6511,37 @@ class TestPlausibilityJudgeStateIntegration:
         assert deanon_plaus.parsed["dropped_facts"][0]["rule"] == "R1"
         assert deanon_plaus.parsed["out_of_range"] == [{"index": 3, "input_count": 1, "rule": None}]
 
+    def test_deanon_ran_unattributed_reaches_diagnostics_and_parsed(self):
+        """A drop claim the judge could not pin to a rule is counted in
+        ``plausibility_unattributed_deanon`` and the phase-trace
+        ``parsed`` payload — never applied, so the input fact survives
+        alongside the one real, rule-attributed drop."""
+        graph, mapping, anon_facts = self._graph_and_mapping()
+
+        def fake_local_plaus(facts, transcript, model, tokenizer, **kwargs):
+            verdict = PlausibilityVerdict(
+                kept=[],
+                dropped=[{"index": 0, "rule": "R1", "fact": facts[0]}],
+                out_of_range=[],
+                unattributed=2,
+            )
+            return verdict, "raw"
+
+        with extraction_trace() as trace:
+            with patch("paramem.graph.flows.judge_plausibility", side_effect=fake_local_plaus):
+                result = self._run(
+                    graph,
+                    mapping,
+                    anon_facts,
+                    plausibility_judge="auto",
+                    plausibility_stage="deanon",
+                )
+
+        assert result.diagnostics["plausibility_unattributed_deanon"] == 2
+        assert isinstance(result.diagnostics["plausibility_dropped_deanon_facts"][0]["rule"], str)
+        deanon_plaus = next(p for p in trace.records if p.name == "deanon_plausibility")
+        assert deanon_plaus.parsed["unattributed"] == 2
+
     def test_deanon_judge_returning_none_fails_open(self):
         graph, mapping, anon_facts = self._graph_and_mapping()
 
@@ -6746,6 +6752,35 @@ class TestPlausibilityJudgeStateIntegration:
         anon_plaus = next(p for p in trace.records if p.name == "anon_plausibility")
         assert anon_plaus.parsed["dropped_facts"][0]["rule"] == "R1"
         assert anon_plaus.parsed["out_of_range"] == [{"index": 3, "input_count": 1, "rule": None}]
+
+    def test_anon_ran_unattributed_reaches_diagnostics_and_parsed(self):
+        """Mirrors ``test_deanon_ran_unattributed_reaches_diagnostics_and_parsed``
+        at the anon site."""
+        graph, mapping, anon_facts = self._graph_and_mapping()
+
+        def fake_plaus(facts, api_key, **kwargs):
+            verdict = PlausibilityVerdict(
+                kept=[],
+                dropped=[{"index": 0, "rule": "R1", "fact": facts[0]}],
+                out_of_range=[],
+                unattributed=2,
+            )
+            return verdict, "raw"
+
+        with extraction_trace() as trace:
+            with patch("paramem.graph.stage_enrich.request_plausibility", side_effect=fake_plaus):
+                result = self._run(
+                    graph,
+                    mapping,
+                    anon_facts,
+                    plausibility_judge="anthropic",
+                    plausibility_stage="anon",
+                )
+
+        assert result.diagnostics["plausibility_unattributed_anon"] == 2
+        assert isinstance(result.diagnostics["plausibility_dropped_anon_facts"][0]["rule"], str)
+        anon_plaus = next(p for p in trace.records if p.name == "anon_plausibility")
+        assert anon_plaus.parsed["unattributed"] == 2
 
     def test_anon_ran_arm_stop_at_returns_before_deanonymize(self):
         """``stop_at("anon_plausibility")`` must return right after the

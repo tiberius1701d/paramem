@@ -1,6 +1,7 @@
 """Tests for knowledge graph extraction."""
 
 import json
+import logging
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -154,9 +155,10 @@ class TestExtractJsonBlock:
         assert "truncated at max_tokens" in message
 
     def test_accepts_plausibility_empty_list(self):
-        """Plausibility legitimately returns ``[]`` when all facts were
-        filtered.  The parser must accept lists (even empty) as valid
-        envelopes."""
+        """Extraction legitimately returns a bare ``[]`` when a raw fact
+        list is empty (plausibility's own output is now the rule-keyed
+        ``{"drop": {...}}`` map, never a bare list).  The parser must
+        accept lists (even empty) as valid envelopes."""
         result = _extract_json_block("[]")
         assert json.loads(result) == []
 
@@ -1762,11 +1764,17 @@ class TestRecordPlausibilityVerdict:
     """``record_plausibility_verdict`` — the ran-path telemetry writer
     shared by all three plausibility sites."""
 
-    def _verdict(self, dropped: list[dict], out_of_range: list[dict] | None = None):
+    def _verdict(
+        self,
+        dropped: list[dict],
+        out_of_range: list[dict] | None = None,
+        unattributed: int = 0,
+    ):
         return PlausibilityVerdict(
             kept=[{"subject": "Alex", "predicate": "lives_in", "object": "Millfield"}],
             dropped=dropped,
             out_of_range=out_of_range or [],
+            unattributed=unattributed,
         )
 
     def test_writes_all_documented_keys(self):
@@ -1791,6 +1799,18 @@ class TestRecordPlausibilityVerdict:
         assert graph.diagnostics["plausibility_dropped_anon"] == 0
         assert "plausibility_dropped_anon_facts" not in graph.diagnostics
         assert graph.diagnostics["plausibility_out_of_range_anon"] == []
+
+    def test_writes_unattributed_count(self):
+        graph = _make_graph([])
+        verdict = self._verdict([], unattributed=3)
+        record_plausibility_verdict(graph, "anon", verdict, judge="anthropic")
+        assert graph.diagnostics["plausibility_unattributed_anon"] == 3
+
+    def test_unattributed_defaults_to_zero_when_clean(self):
+        graph = _make_graph([])
+        verdict = self._verdict([])
+        record_plausibility_verdict(graph, "deanon", verdict, judge="local")
+        assert graph.diagnostics["plausibility_unattributed_deanon"] == 0
 
     def test_unknown_site_raises(self):
         graph = _make_graph([])
@@ -1892,6 +1912,56 @@ class TestFallbackPlausibilityStates:
         assert out.diagnostics["plausibility_state_fallback"] == {"state": "ran", "reason": None}
         assert out.diagnostics["plausibility_dropped_fallback"] == 0
         assert out.diagnostics["plausibility_judge_actual"] == "local_fallback"
+
+    def test_ran_with_drop_captures_raw_and_logs_counts(self, caplog):
+        """This recovery path opens no ``phase_trace``, so the judge's raw
+        response is captured directly to ``plausibility_raw_fallback`` —
+        otherwise an unattributed drop on this path would be unrecoverable.
+        Unlike the anon site's ``cloud_plausibility_raw_response``, this
+        judge runs over real-named facts, so the captured string is real
+        content, not indices only. The judged-facts / fallback-dropped
+        counts also reach an INFO log line — counts only, never fact
+        content (subject/object never appear in the log)."""
+        graph = self._graph()
+        raw_facts = [
+            {
+                "subject": r.subject,
+                "predicate": r.predicate,
+                "object": r.object,
+                "relation_type": r.relation_type,
+                "confidence": r.confidence,
+                "symmetric": r.symmetric,
+            }
+            for r in graph.relations
+        ]
+        verdict = PlausibilityVerdict(
+            kept=[],
+            dropped=[{"index": 0, "rule": "R1", "fact": raw_facts[0]}],
+            out_of_range=[],
+            unattributed=1,
+        )
+        raw_response = '{"drop": {"R1": [0], "R9": [2]}}'
+        with (
+            caplog.at_level(logging.INFO, logger="paramem.graph.extractor"),
+            patch(
+                "paramem.graph.extractor.judge_plausibility",
+                return_value=(verdict, raw_response),
+            ),
+        ):
+            out = _fallback_plausibility_on_raw(
+                graph,
+                "[user] I live in Millfield.",
+                MagicMock(),
+                MagicMock(),
+                "all_dropped",
+                speaker_id="speaker0",
+            )
+        assert out.diagnostics["plausibility_raw_fallback"] == raw_response
+        assert "judged_facts=1" in caplog.text
+        assert "fallback_dropped=1" in caplog.text
+        # Counts only — no fact content leaks into the log line.
+        assert "Millfield" not in caplog.text
+        assert "Alex" not in caplog.text
 
     def test_skipped_no_model(self):
         graph = self._graph()

@@ -57,11 +57,12 @@ _JSON_ENVELOPE_KEYS = frozenset(
         "summary",
         # Anonymizer envelope — `{"mapping": {...}}`
         "mapping",
-        # Plausibility drop-set envelope — `{"drop": [<idx>...]}` plus
-        # tolerated aliases the parser accepts.
+        # Plausibility drop-set envelope — `{"drop": {"R1": [<idx>...],
+        # ...}}`, a map from rule id to the indices that rule drops.
+        # Shared with the enrichment delta's own `drop` key below (a bare
+        # index array — a distinct contract; both key off the same top-
+        # level name).
         "drop",
-        "drop_indices",
-        "indices",
         # cloud enrichment delta envelope — `{"add": [...], "modify": [...],
         # "drop": [...], "bindings": {...}}`. ``drop`` is shared with
         # plausibility above. ``bindings`` overlaps `new_entity_bindings`
@@ -97,23 +98,23 @@ def _classify_candidate(value: object) -> _CandidateVerdict:
       length-1 list keeps the same precedence it had when this was an
       inline ``list_wrapped_envelope`` flag.
     * ``"defer"`` — structurally valid but content-FREE: ``{}``, ``[]``,
-      or a bare integer array (``[0, 2, 5]``).  Each is a legitimate
-      whole-response shape (the plausibility drop-set's "all dropped" /
-      tolerated bare-array forms, an empty no-op delta) AND is textually
-      indistinguishable from prose noise — the cloud enrichment model
-      narrates its plan by bracketed fact index (``[9]``, ``[0] and
-      [5]``), the very notation ``configs/prompts/cloud_enrichment.txt``
-      teaches it.  Carrying no envelope evidence, such a candidate must
-      never outrank a real envelope appearing LATER in the same response,
-      so the caller remembers the first one and keeps scanning.
+      or a bare integer array (``[0, 2, 5]``).  ``{}``/``[]`` are a
+      legitimate whole-response shape (an empty no-op delta) AND, along
+      with the bare integer array, textually indistinguishable from
+      prose noise — the cloud enrichment model narrates its plan by
+      bracketed fact index (``[9]``, ``[0] and [5]``), the very notation
+      ``configs/prompts/cloud_enrichment.txt`` teaches it.  Carrying no
+      envelope evidence, such a candidate must never outrank a real
+      envelope appearing LATER in the same response, so the caller
+      remembers the first one and keeps scanning.
     * ``"skip"`` — parsed, but not an envelope in any shape: a dict with
       no envelope key or a list of non-fact dicts (both are what survives
       a truncated outer envelope), a string/scalar list, a bare scalar.
       Never returned, in any circumstance.
     """
     if isinstance(value, dict):
-        # Empty dict is unambiguously "no items" (drop-set-style no-op
-        # delta) — content-free, hence deferred, not accepted outright.
+        # Empty dict is unambiguously "no items" — content-free, hence
+        # deferred, not accepted outright.
         if not value:
             return "defer"
         # Rejects naked entity / relation dicts that survive a truncated
@@ -174,12 +175,11 @@ def _extract_json_block(text: str) -> str:
        symmetric duplicates" — using exactly the bracketed-index notation
        ``configs/prompts/cloud_enrichment.txt`` teaches it.  ``[9]`` is a
        structurally valid JSON array sitting at a candidate position
-       EARLIER than the envelope, and is indistinguishable from the
-       plausibility drop-set's tolerated bare-integer form (``[0, 2,
-       5]``).  It is content-free, so it is DEFERRED, not returned (see
-       :func:`_classify_candidate`): the scan continues to the real
-       envelope, and a deferred candidate is returned only once the scan
-       proves no envelope follows it.
+       EARLIER than the envelope, and is indistinguishable in shape from
+       any other bare integer array.  It is content-free, so it is
+       DEFERRED, not returned (see :func:`_classify_candidate`): the scan
+       continues to the real envelope, and a deferred candidate is
+       returned only once the scan proves no envelope follows it.
 
     Algorithm: walk every ``{`` / ``[`` position in the text, try
     ``raw_decode`` from each, and classify what decodes
@@ -262,9 +262,9 @@ def _extract_json_block(text: str) -> str:
 
     if deferred is not None:
         # No evidence-carrying envelope anywhere in the response, so the
-        # content-free candidate IS the response: plausibility's `[]` /
-        # `[0, 2, 5]` drop sets and the empty `{}` no-op delta all arrive
-        # in exactly this shape.
+        # content-free candidate IS the response: an empty `{}` no-op
+        # delta, an empty `[]`, or a bare integer array all arrive in
+        # exactly this shape.
         return deferred
     if saw_decode_success_no_envelope:
         # Some JSON parsed cleanly but none had envelope keys.  Two

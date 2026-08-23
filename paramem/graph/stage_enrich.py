@@ -433,6 +433,7 @@ def _stage_enrich(ctx: StageContext, state: StageState) -> StageState:
                             "dropped_count": dropped_plaus,
                             "dropped_facts": verdict.dropped,
                             "out_of_range": verdict.out_of_range,
+                            "unattributed": verdict.unattributed,
                         }
                     )
                     logger.info(

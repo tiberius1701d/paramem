@@ -105,17 +105,17 @@ class ExtractionFailed(RuntimeError):
 # figure and must be updated together.
 #
 # Plausibility output couples to chunk density. The filter's contract
-# (configs/prompts/cloud_plausibility.txt) is a small ``{"drop": [...]}``
-# object listing the indices (each optionally annotated with the rule
-# that matched) — so its output volume scales with the number of rule
-# matches, not with the surviving-fact count, but the number of rule
-# matches itself scales with chunk density on a dense input. Lowering the
-# cap independently for plausibility was attempted and reverted: a 2048
-# cap truncated the JSON array on dense chunks, the parse failed, and the
-# caller fell back to passing the unfiltered set forward. KV-cache
-# pressure must be mitigated upstream (STT/TTS eviction, gc.collect
-# before empty_cache, per-phase vram_scope wraps), not by truncating
-# correctness-bearing output.
+# (configs/prompts/cloud_plausibility.txt) is a small ``{"drop": {"R1":
+# [...], ...}}`` map, one entry per rule that matched — so its output
+# volume scales with the number of rule matches, not with the
+# surviving-fact count, but the number of rule matches itself scales
+# with chunk density on a dense input. Lowering the cap independently
+# for plausibility was attempted and reverted: a 2048 cap truncated the
+# JSON array on dense chunks, the parse failed, and the caller fell back
+# to passing the unfiltered set forward. KV-cache pressure must be
+# mitigated upstream (STT/TTS eviction, gc.collect before empty_cache,
+# per-phase vram_scope wraps), not by truncating correctness-bearing
+# output.
 _DEFAULT_FILTER_MAX_TOKENS = 8192
 # Deterministic by default; threaded to every provider call so Anthropic
 # and OpenAI-compatible filters match exactly.
@@ -1312,6 +1312,8 @@ def _fallback_plausibility_on_raw(
         }
         for r in graph.relations
     ]
+    judged_facts = len(raw_facts)
+    fallback_dropped_count = 0
 
     # Local plausibility filter (uses real names). No ``ctx.plausibility_judge``
     # gate on this recovery path — unlike the deanon/anon sites, this
@@ -1322,7 +1324,7 @@ def _fallback_plausibility_on_raw(
     elif model is None or tokenizer is None:
         record_plausibility_state(graph, "fallback", PLAUSIBILITY_SKIPPED, reason="no_model")
     else:
-        verdict, _raw = judge_plausibility(
+        verdict, raw_response = judge_plausibility(
             raw_facts,
             transcript,
             model,
@@ -1331,7 +1333,18 @@ def _fallback_plausibility_on_raw(
             temperature=_DEFAULT_FILTER_TEMPERATURE,
             seed=seed,
         )
+        # This recovery path opens no ``phase_trace`` (unlike the
+        # deanon/anon sites), so the judge's raw response would otherwise
+        # be unrecoverable if it carried an unattributed drop. Unlike the
+        # anon site (which judges anonymized facts and stores
+        # ``cloud_plausibility_raw_response``, ``paramem.graph.stage_enrich``),
+        # this judge runs over the raw, real-named facts — the captured
+        # string here is whatever the model emitted, over real names, not
+        # indices only.
+        if raw_response:
+            graph.diagnostics["plausibility_raw_fallback"] = raw_response
         if verdict is not None:
+            fallback_dropped_count = len(verdict.dropped)
             raw_facts = verdict.kept
             record_plausibility_verdict(graph, "fallback", verdict, judge="local_fallback")
         else:
@@ -1349,6 +1362,11 @@ def _fallback_plausibility_on_raw(
         "_fallback_plausibility_on_raw: reason=%r, %d relation(s) surviving",
         reason,
         len(kept_relations),
+    )
+    logger.info(
+        "_fallback_plausibility_on_raw: judged_facts=%d, fallback_dropped=%d",
+        judged_facts,
+        fallback_dropped_count,
     )
     return graph
 
@@ -2025,12 +2043,13 @@ def request_graph_enrichment(
 def _render_indexed_facts(facts: list[dict]) -> str:
     """Format facts for the plausibility prompt as ``[N] <json>`` lines.
 
-    The plausibility judge's output contract is a small ``{"drop": [...]}``
-    object listing zero-based indices of facts that match a DROP rule.
-    Rendering each input with its index in square brackets is what makes
-    that contract referenceable — the judge can quote ``[3]`` rather than
-    echoing the entire fact verbatim, which is what used to truncate
-    Mistral 7B mid-array on long KEEP-by-default outputs.
+    The plausibility judge's output contract is a small ``{"drop": {"R1":
+    [...], ...}}`` map, keyed by the rule that matched, listing the
+    zero-based indices of facts that rule drops. Rendering each input
+    with its index in square brackets is what makes that contract
+    referenceable — the judge can quote ``[3]`` rather than echoing the
+    entire fact verbatim, which is what used to truncate Mistral 7B
+    mid-array on long KEEP-by-default outputs.
     """
     return "\n".join(f"[{i}] {json.dumps(f, ensure_ascii=False)}" for i, f in enumerate(facts))
 
@@ -2049,11 +2068,6 @@ def _cloud_facing_payload(facts: list[dict], anon_transcript: str | None) -> tup
     """
     return _render_indexed_facts(facts), anon_transcript or "(not available)"
 
-
-# Rule-string cap in a parsed drop record — a diagnostic sample, not a
-# redaction: rules are short judge-cited identifiers (``"R1"``), never
-# fact content.
-_MAX_RULE_CHARS: int = 32
 
 # Judge-state vocabulary: ``ran`` (judge called, drop set parsed and
 # applied — 0 drops included), ``failed`` (judge called, output
@@ -2075,20 +2089,47 @@ _PLAUSIBILITY_STATES: frozenset[str] = frozenset(
 # existing ``plausibility_dropped_<site>`` counters already use.
 PLAUSIBILITY_SITES: tuple[str, ...] = ("anon", "deanon", "fallback")
 
+# The closed rule vocabulary the judge's drop-set map keys against — see
+# the ``## Drop rules`` section of ``configs/prompts/cloud_plausibility.txt``.
+# A drop claim under any other key is unattributed (:func:`_parse_drop_set`),
+# never applied. Telemetry identifiers — never renamed or renumbered.
+PLAUSIBILITY_RULES: tuple[str, ...] = ("R1", "R2", "R3", "R4", "R5", "R6")
+
 
 @dataclass(frozen=True)
 class DropSet:
     """A plausibility judge's parsed drop-set output.
 
-    ``rules`` maps an in-range dropped index to the judge-cited rule
-    (``None`` when the judge emitted a bare index, no annotation).
-    ``out_of_range`` carries every index the judge cited that fell
-    outside ``[0, n_facts)`` — recorded, never applied, since there is no
-    fact at that position to drop.
+    ``rules`` maps an in-range dropped index to the rule that claimed it
+    (one of :data:`PLAUSIBILITY_RULES`) — when two rules claim the same
+    index, the lowest rule id wins. ``out_of_range`` carries every index a
+    rule cited that fell outside ``[0, n_facts)`` — recorded, never
+    applied, since there is no fact at that position to drop.
+    ``unattributed`` counts every drop claim the judge made that could
+    not be pinned to a rule (an unknown rule key, a non-list rule value,
+    a non-int element, or an index reached through a retired non-dict
+    ``"drop"`` shape) — never applied; the fact stays kept.
     """
 
-    rules: dict[int, str | None]
+    rules: dict[int, str]
     out_of_range: list[dict]
+    unattributed: int
+
+
+def _count_unattributed_claims(value: object) -> int:
+    """Unattributed-claim count for a drop-set value shape
+    :func:`_parse_drop_set`'s rule-keyed contract does not recognize — a
+    retired non-dict ``"drop"`` value, an unknown rule key, or a
+    non-list rule value. A list is enumerable: every element is one claim
+    the judge made without a rule — a bare index, an ``{"index": N}``
+    object, anything else — so an empty list counts zero. A value that is
+    not enumerable at all (a scalar, ``None``, a string) counts as exactly
+    one claim, the floor that keeps a malformed non-list value from being
+    silently worth zero.
+    """
+    if isinstance(value, list):
+        return len(value)
+    return 1
 
 
 @dataclass(frozen=True)
@@ -2096,49 +2137,51 @@ class PlausibilityVerdict:
     """The result of applying a :class:`DropSet` to the judge's input facts.
 
     ``kept`` preserves input order. ``dropped`` is one record per dropped
-    fact — ``{"index": int, "rule": str | None, "fact": dict}`` — in
-    ascending index order, nested rather than merged into the fact dict so
-    no fact field can ever collide with the attribution fields.
-    ``out_of_range`` is :attr:`DropSet.out_of_range` carried through
-    unchanged.
+    fact — ``{"index": int, "rule": str, "fact": dict}`` — in ascending
+    index order, nested rather than merged into the fact dict so no fact
+    field can ever collide with the attribution fields; ``rule`` is
+    always a non-empty string. ``out_of_range`` is
+    :attr:`DropSet.out_of_range` carried through unchanged. ``unattributed``
+    is :attr:`DropSet.unattributed` carried through unchanged (default 0
+    so callers that construct a verdict without judging unattributed
+    claims keep working).
     """
 
     kept: list[dict]
     dropped: list[dict]
     out_of_range: list[dict]
-
-
-def _drop_rule(entry: dict) -> str | None:
-    """The rule a drop-set entry cited, or ``None`` when it named none.
-
-    The first non-empty string among ``"rule"`` then ``"reason"`` (the
-    accepted alias), stripped and truncated to :data:`_MAX_RULE_CHARS`. A
-    non-string value under either key reads as ``None``.
-    """
-    for key in ("rule", "reason"):
-        value = entry.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()[:_MAX_RULE_CHARS]
-    return None
+    unattributed: int = 0
 
 
 def _parse_drop_set(raw: str | None, n_facts: int) -> DropSet | None:
-    """Parse the plausibility judge's drop-set output.
+    """Parse the plausibility judge's rule-keyed drop-set output.
 
-    Accepts these shapes (most permissive — all are observed in practice):
+    The judge's contract (``configs/prompts/cloud_plausibility.txt``) is
+    ``{"drop": {"R1": [3], "R4": [0, 17]}}`` — a map from rule id to the
+    indices that rule drops, or ``{"drop": {}}`` when nothing matched. An
+    index is a drop only when it sits in a list under one of the rule
+    keys in :data:`PLAUSIBILITY_RULES`; everything else the judge cites —
+    an unknown key's indices, non-int elements, or an index reached
+    through a retired non-dict ``"drop"`` shape — is counted in
+    :attr:`DropSet.unattributed` instead, and the fact is kept.
 
-    * ``{"drop": [0, 2, 5]}`` — bare integer array.
-    * ``[0, 2, 5]`` — the wrapper dropped; some models emit this.
-    * ``{"drop": [{"index": 0, "rule": "R1"}, ...]}`` — the model
-      annotated each drop with its rule reason (the prompt's preferred
-      shape — see ``configs/prompts/cloud_plausibility.txt``).
+    Returns ``None`` on ``raw`` being ``None``/blank, JSON parse failure,
+    a non-dict top level, or a missing ``"drop"`` key — the caller
+    fail-opens (keeps all facts), matching the prior contract. A
+    ``"drop"`` value that parses but is not itself a dict (the retired
+    list/scalar forms) is NOT a parse failure: every parseable int inside
+    it is counted as unattributed (zero if it is an empty or all-non-int
+    list — there is nothing to attribute), or exactly one if the value
+    is not itself enumerable (a scalar, ``None``, a string), and zero
+    drops are applied — an old-shape verdict is counted, not turned into
+    a new fail-open trigger.
 
-    Returns the parsed :class:`DropSet` on success; ``None`` on parse
-    failure (caller fail-opens — keep all facts). An index outside
-    ``[0, n_facts)`` lands in :attr:`DropSet.out_of_range` instead of
-    being counted and discarded — there is no fact at that position to
-    drop, so it is never applied, but a single bad index doesn't void an
-    otherwise-valid drop set.
+    An index outside ``[0, n_facts)`` under a valid rule key lands in
+    :attr:`DropSet.out_of_range` instead of :attr:`DropSet.rules` — there
+    is no fact at that position to drop, so it is never applied, but a
+    single bad index doesn't void an otherwise-valid drop set. The same
+    index claimed by two rules resolves to the lowest rule id
+    (deterministic).
     """
     if raw is None or not raw.strip():
         return None
@@ -2146,49 +2189,43 @@ def _parse_drop_set(raw: str | None, n_facts: int) -> DropSet | None:
     # That helper handles markdown fences, prose preamble before the
     # JSON, and the inline-backtick `{...}` wrapper implicitly (raw_decode
     # stops at the JSON's natural close; a trailing backtick is ignored).
-    # Drop / drop_indices / indices are in `_JSON_ENVELOPE_KEYS`, and
-    # bare integer arrays are accepted as envelopes for the same reason.
     try:
         json_str = _extract_json_block(raw)
         parsed = json.loads(json_str)
     except (json.JSONDecodeError, ValueError) as e:
         logger.warning("plaus drop-set parse failed: %s", e)
         return None
-    candidates: list[object]
-    if isinstance(parsed, dict):
-        for key in ("drop", "drop_indices", "indices"):
-            value = parsed.get(key)
-            if isinstance(value, list):
-                candidates = value
-                break
-        else:
-            logger.warning(
-                "plaus drop-set object missing 'drop' key (got keys: %s)",
-                list(parsed.keys())[:5],
-            )
-            return None
-    elif isinstance(parsed, list):
-        candidates = parsed
-    else:
+    if not isinstance(parsed, dict):
         logger.warning("plaus drop-set unexpected shape: %s", type(parsed).__name__)
         return None
-    rules: dict[int, str | None] = {}
+    if "drop" not in parsed:
+        logger.warning(
+            "plaus drop-set object missing 'drop' key (got keys: %s)",
+            list(parsed.keys())[:5],
+        )
+        return None
+    drop = parsed["drop"]
+    rules: dict[int, str] = {}
     out_of_range: list[dict] = []
-    for c in candidates:
-        rule: str | None = None
-        if isinstance(c, dict):
-            idx = c.get("index")
-            if isinstance(idx, bool) or not isinstance(idx, int):
+    unattributed = 0
+    if isinstance(drop, dict):
+        for rule_key, value in drop.items():
+            if rule_key not in PLAUSIBILITY_RULES or not isinstance(value, list):
+                unattributed += _count_unattributed_claims(value)
                 continue
-            rule = _drop_rule(c)
-        elif isinstance(c, bool) or not isinstance(c, int):
-            continue
-        else:
-            idx = c
-        if 0 <= idx < n_facts:
-            rules[idx] = rule
-        else:
-            out_of_range.append({"index": idx, "input_count": n_facts, "rule": rule})
+            for c in value:
+                if isinstance(c, bool) or not isinstance(c, int):
+                    unattributed += 1
+                    continue
+                if 0 <= c < n_facts:
+                    if c not in rules or PLAUSIBILITY_RULES.index(
+                        rule_key
+                    ) < PLAUSIBILITY_RULES.index(rules[c]):
+                        rules[c] = rule_key
+                else:
+                    out_of_range.append({"index": c, "input_count": n_facts, "rule": rule_key})
+    else:
+        unattributed = _count_unattributed_claims(drop)
     if out_of_range:
         logger.warning(
             "plaus drop-set: %d index(es) out of range [0, %d) — indices=%s",
@@ -2196,7 +2233,13 @@ def _parse_drop_set(raw: str | None, n_facts: int) -> DropSet | None:
             n_facts,
             [r["index"] for r in out_of_range],
         )
-    return DropSet(rules=rules, out_of_range=out_of_range)
+    if unattributed:
+        logger.warning(
+            "plaus drop-set: %d unattributed claim(s) out of %d fact(s)",
+            unattributed,
+            n_facts,
+        )
+    return DropSet(rules=rules, out_of_range=out_of_range, unattributed=unattributed)
 
 
 def _apply_drop_set(facts: list[dict], raw: str | None) -> PlausibilityVerdict | None:
@@ -2214,7 +2257,12 @@ def _apply_drop_set(facts: list[dict], raw: str | None) -> PlausibilityVerdict |
     dropped = [
         {"index": i, "rule": drop_set.rules[i], "fact": facts[i]} for i in sorted(drop_set.rules)
     ]
-    return PlausibilityVerdict(kept=kept, dropped=dropped, out_of_range=drop_set.out_of_range)
+    return PlausibilityVerdict(
+        kept=kept,
+        dropped=dropped,
+        out_of_range=drop_set.out_of_range,
+        unattributed=drop_set.unattributed,
+    )
 
 
 def record_plausibility_verdict(
@@ -2225,6 +2273,7 @@ def record_plausibility_verdict(
     Writes ``plausibility_dropped_<site>`` (int, always),
     ``plausibility_dropped_<site>_facts`` (only when non-empty — bulky),
     ``plausibility_out_of_range_<site>`` (list, always),
+    ``plausibility_unattributed_<site>`` (int, always — 0 when clean),
     ``plausibility_state_<site> = {"state": "ran", "reason": None}``, and
     ``plausibility_judge_actual = judge``.
 
@@ -2245,6 +2294,7 @@ def record_plausibility_verdict(
     if verdict.dropped:
         graph.diagnostics[f"plausibility_dropped_{site}_facts"] = verdict.dropped
     graph.diagnostics[f"plausibility_out_of_range_{site}"] = verdict.out_of_range
+    graph.diagnostics[f"plausibility_unattributed_{site}"] = verdict.unattributed
     graph.diagnostics[f"plausibility_state_{site}"] = {"state": PLAUSIBILITY_RAN, "reason": None}
     graph.diagnostics["plausibility_judge_actual"] = judge
 
@@ -2343,7 +2393,9 @@ def _parse_enrichment_delta(raw: str | None, n_facts: int) -> EnrichmentDelta | 
     * ``bindings`` — dict mapping new ``"Prefix_N"`` placeholders to the
       exact anonymized-transcript spans they stand for.
 
-    Tolerated shapes (mirroring ``_parse_drop_set``'s permissiveness):
+    Tolerated shapes (this envelope's own contract — a bare index array,
+    distinct from the rule-keyed map :func:`_parse_drop_set` reads for
+    the plausibility judge):
 
     * ``{"add": [...], "modify": [...], "drop": [...], "bindings": {...}}``
       — preferred shape; all four keys optional (missing == no-op).
@@ -2441,8 +2493,11 @@ def _parse_enrichment_delta(raw: str | None, n_facts: int) -> EnrichmentDelta | 
             sorted(_FACT_FIELDS),
         )
 
-    # drop[] — tolerates the same per-entry shapes as `_parse_drop_set`
-    # (bare ints, `{"index": N, "rule": "Rk"}` annotated form).
+    # drop[] — this envelope's own contract: a bare index array, honored
+    # unconditionally (no rule attribution — that is the plausibility
+    # judge's separate, rule-keyed `drop` map read by `_parse_drop_set`).
+    # Tolerates both a bare int and the legacy `{"index": N, "rule": "Rk"}`
+    # per-entry annotated form.
     drop: set[int] = set()
     out_of_range_drop = 0
     raw_drop = parsed.get("drop")
@@ -2696,12 +2751,12 @@ def request_plausibility(
     No additions, no modifications. See cloud_plausibility.txt for the
     drop criteria (self-loops, tautologies, role leaks, etc.).
 
-    The judge emits a small ``{"drop": [<index>, ...]}`` object (each
-    entry optionally annotated with the rule that matched); this helper
-    applies the drop-set to the input facts and returns the
-    :class:`PlausibilityVerdict`. Output is bounded and tiny by
-    construction, so the truncation failure mode that hit the previous
-    "echo every fact" protocol cannot recur on long inputs.
+    The judge emits a small ``{"drop": {"R1": [<index>, ...], ...}}`` map,
+    keyed by the rule that matched; this helper applies the drop-set to
+    the input facts and returns the :class:`PlausibilityVerdict`. Output
+    is bounded and tiny by construction, so the truncation failure mode
+    that hit the previous "echo every fact" protocol cannot recur on long
+    inputs.
 
     Returns `(verdict, raw_response)`. Raw response is preserved so
     callers can inspect the judge's verdict when questioning drop

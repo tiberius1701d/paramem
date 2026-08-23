@@ -487,6 +487,7 @@ def _stage_deanonymize(ctx: StageContext, state: StageState) -> StageState:
                         "dropped_count": dropped_deanon,
                         "dropped_facts": verdict.dropped,
                         "out_of_range": verdict.out_of_range,
+                        "unattributed": verdict.unattributed,
                     }
                 )
                 logger.info(
