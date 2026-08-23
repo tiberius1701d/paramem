@@ -888,6 +888,7 @@ def anonymize_turn(
     speaker_name: str | None = None,
     prompts_dir: str | Path | None = None,
     scrub: set[str] | frozenset[str],
+    token_envelope: int,
 ) -> AnonymizedContract:
     """Local extract + local anonymize for cloud egress.
 
@@ -950,6 +951,19 @@ def anonymize_turn(
     the helper returns ``status="opted_out"`` with ``anon_transcript``
     sourced from the passed-in ``transcript`` verbatim, never a model
     artifact.
+
+    ``token_envelope`` is the total (prompt + output) token budget the
+    ``anonymize`` call below may occupy — forwarded verbatim as its own
+    ``token_envelope`` argument. Required keyword-only, no module
+    default: this is a VRAM-safety-critical parameter by the same
+    standard as ``scrub`` above, and an unbudgeted anonymize call is a
+    defect to trace, not a value to fall back on silently. Production's
+    only caller, :func:`~paramem.server.inference.answer_via_cloud`,
+    sources it from ``config.consolidation.extraction_anonymize_token_envelope``
+    — the one operator envelope value that also sizes session-tier
+    extraction and graph-tier enrichment (:data:`_DEFAULT_ANONYMIZER_TOKEN_ENVELOPE`
+    remains the module default for those other paths' own signatures; it
+    is not read here).
 
     ``speaker_id`` is the resolved speaker store ID, threaded to
     :func:`extract_graph` (which requires it) and stamped on the
@@ -1115,7 +1129,7 @@ def anonymize_turn(
                 speaker_name=speaker_name,
                 speaker_id=anchor_speaker_id,
                 speaker_anchor_template=anon_anchor_prompt,
-                token_envelope=_DEFAULT_ANONYMIZER_TOKEN_ENVELOPE,
+                token_envelope=token_envelope,
                 user_prompt_template=anon_prompt,
                 system_prompt=anon_system,
             )

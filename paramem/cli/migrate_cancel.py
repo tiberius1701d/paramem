@@ -70,11 +70,7 @@ def run(args: argparse.Namespace) -> int:
                 )
                 return 0
         # All other 409 codes and non-409 HTTP errors.
-        print(
-            f"paramem migrate-cancel: server returned HTTP {exc.status_code} from {exc.url}.\n"
-            f"{exc.body.strip() or '(empty response body)'}",
-            file=sys.stderr,
-        )
+        print(f"paramem migrate-cancel: server returned {exc}", file=sys.stderr)
         return 1
 
     if getattr(args, "json", False):

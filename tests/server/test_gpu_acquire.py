@@ -71,6 +71,7 @@ def test_acquire_in_defer_mode_reloads_and_switches_voice():
         result = _call_gpu_acquire()
 
     assert result["reloaded_live"] is True
+    assert result["cloud_only_reason"] is None
     mock_reload.assert_called_once()
     # Voice restore is owned by the primitive; /gpu/acquire must NOT call it on success.
     gpu_calls = [c for c in mock_profile.call_args_list if c.args and c.args[0] == "gpu"]
@@ -154,6 +155,7 @@ def test_acquire_after_release_reloads_and_switches_voice():
         f"calls={mock_profile.call_args_list}"
     )
     assert result["reloaded_live"] is True
+    assert result["cloud_only_reason"] is None
 
 
 def test_acquire_respects_explicit_cloud_only_config():
@@ -231,6 +233,7 @@ def test_acquire_defers_on_insufficient_vram_without_restart():
     assert result["deferred_insufficient_vram"] is True
     assert result["will_restart"] is False
     assert result["reload_failed"] is False
+    assert result["cloud_only_reason"] == "insufficient_vram"
 
 
 def test_acquire_falls_back_to_restart_on_reload_failure():
@@ -311,6 +314,50 @@ def test_acquire_handled_reload_failure_stays_cloud_only_no_restart():
     assert result["reloaded_live"] is False
     assert result["will_restart"] is False
     assert result["deferred_insufficient_vram"] is False
+    assert result["cloud_only_reason"] == "reload_failed"
+
+
+def test_config_refused_returns_200_with_the_reason_and_no_restart():
+    """When _live_reload_base_model returns "config_refused" (the store
+    changed between an earlier validation and this reload), the process is
+    known-clean — released, mode already cloud-only — so acquire reports the
+    reason via cloud_only_reason and does NOT restart. A refused reload is
+    not a FAILED one: reload_failed must stay False.
+    """
+    from paramem.server import app as app_module
+
+    state_patch = {
+        "defer_model": True,
+        "mode": "cloud-only",
+        "cloud_only_reason": "training",
+    }
+
+    def fake_reload_config_refused(**_kw):
+        app_module._state["mode"] = "cloud-only"
+        app_module._state["cloud_only_reason"] = "config_refused"
+        return "config_refused"
+
+    with (
+        patch.dict(app_module._state, state_patch, clear=False),
+        patch.object(app_module, "_clear_hold_env", return_value=True),
+        patch.object(
+            app_module,
+            "_get_hold_state",
+            return_value={"hold_active": True, "owner_pid": 1234, "owner_alive": True},
+        ),
+        patch.object(app_module, "_live_reload_base_model", side_effect=fake_reload_config_refused),
+        patch.object(app_module, "_set_voice_pipeline_profile") as mock_profile,
+        patch.object(app_module, "_restart_service") as mock_restart,
+    ):
+        result = _call_gpu_acquire()
+
+    mock_restart.assert_not_called()
+    mock_profile.assert_not_called()
+    assert result["reloaded_live"] is False
+    assert result["reload_failed"] is False
+    assert result["deferred_insufficient_vram"] is False
+    assert result["will_restart"] is False
+    assert result["cloud_only_reason"] == "config_refused"
 
 
 # ---------------------------------------------------------------------------

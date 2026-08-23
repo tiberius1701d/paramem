@@ -317,21 +317,6 @@ def adapter_slot_root_for_name(adapter_dir: Path, name: str) -> Path:
     return adapter_dir / name
 
 
-def detect_legacy_adapter_layout(adapter_dir: Path) -> list[Path]:
-    """Return any legacy top-level ``episodic_interim_<stamp>`` dirs.
-
-    Used by the boot lifespan to refuse start until the migration script
-    has been run.  Empty list = clean layout.
-    """
-    if not adapter_dir.is_dir():
-        return []
-    legacy: list[Path] = []
-    for path in adapter_dir.glob(f"{INTERIM_NAME_PREFIX}*"):
-        if path.is_dir():
-            legacy.append(path)
-    return sorted(legacy)
-
-
 def current_interim_stamp(
     refresh_cadence: str,
     *,

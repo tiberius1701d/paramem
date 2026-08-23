@@ -79,12 +79,7 @@ def run(args: argparse.Namespace) -> int:
             if detail.get("error") in ("not_trial", "not_found"):
                 print("paramem migrate-rollback: no trial active; nothing to rollback.")
                 return 0
-        print(
-            f"paramem migrate-rollback: server returned HTTP {exc.status_code}"
-            f" from {exc.url}.\n"
-            f"{exc.body.strip() or '(empty response body)'}",
-            file=sys.stderr,
-        )
+        print(f"paramem migrate-rollback: server returned {exc}", file=sys.stderr)
         return 1
 
     archive_warning = result.get("archive_warning")

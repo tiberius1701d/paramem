@@ -104,9 +104,12 @@ def reconcile_provenance(target: dict, relation: "Relation", timestamp: str) -> 
     ``adopt_reinforcements`` and needs the merged values, not the pre-merge
     ones), the edge Case-3 insert (called after ``add_edge``), and the node
     attribute record built by :meth:`GraphMerger.merge`'s
-    ``relation_type == "attribute"`` gate.  ``confidence`` and the
-    ``sessions`` union stay inline in ``_upsert_relation`` — edge-only, no
-    analog on the attribute record.
+    ``relation_type == "attribute"`` gate — called BEFORE that gate's own
+    ``ik_key`` if/elif chain, for the identical reason: its keyless-onto-keyed
+    arm also copies the already-merged ``record["last_seen"]``/
+    ``record["first_seen"]`` into ``adopt_reinforcements``.  ``confidence``
+    and the ``sessions`` union stay inline in ``_upsert_relation`` —
+    edge-only, no analog on the attribute record.
 
     Args:
         target: The edge or attribute-record dict, mutated in place.
@@ -475,7 +478,12 @@ class GraphMerger:
         record lifetime instead of reconciling — the new value's own
         speaker and window, never blended with the superseded assertion —
         and, when a key was bound to the superseded value, ledgers the
-        displacement (``attribute_key_superseded``).
+        displacement (``attribute_key_superseded``). A keyless same-value
+        re-observation landing on an already-keyed record earns
+        reinforcement credit under ``credit_adopt_reinforcement``, the
+        attribute mirror of the edge path's keyless-onto-keyed arm — an
+        attribute-typed key matures and promotes through the same credit
+        surface as any other key.
 
         Args:
             session_graph: The per-session graph to merge in.
@@ -492,13 +500,16 @@ class GraphMerger:
                 ) coexist rather than fabricating a NOW recency value.
                 When ``False``, Case-2 is short-circuited: no model call, no
                 edge removal.
-            credit_adopt_reinforcement: When ``True``, two Case-1 arms record
-                the adopted key in ``self.adopt_reinforcements`` for the
-                fold's reinforcement-credit pass: the adopt branch (an
-                incoming keyed relation adopts its ``indexed_key`` onto a
-                pre-existing keyless edge) and the keyless-onto-keyed arm (an
-                incoming keyless relation re-observes an already-keyed edge).
-                Default ``False``.
+            credit_adopt_reinforcement: When ``True``, three arms record the
+                adopted key in ``self.adopt_reinforcements`` for the fold's
+                reinforcement-credit pass: two Case-1 edge arms — the adopt
+                branch (an incoming keyed relation adopts its
+                ``indexed_key`` onto a pre-existing keyless edge) and the
+                keyless-onto-keyed arm (an incoming keyless relation
+                re-observes an already-keyed edge) — and the attribute
+                gate's same-value keyless-onto-keyed arm (an incoming
+                keyless attribute relation re-observes an already-keyed
+                attribute record). Default ``False``.
 
         Returns the updated cumulative graph.
 
@@ -630,6 +641,22 @@ class GraphMerger:
                                 survivor_key=relation.indexed_key,
                             )
                         record["ik_key"] = relation.indexed_key
+                    elif record.get("ik_key") and credit_adopt_reinforcement:
+                        # Keyless-onto-keyed re-sighting, attribute mirror of
+                        # the edge arm below (_upsert_relation): the incoming
+                        # relation carries no ik_key but the record was
+                        # already keyed by an earlier merge in this fold —
+                        # credit the reinforcement so an attribute-typed key
+                        # matures through the same surface an edge-typed key
+                        # does.  Gated on credit_adopt_reinforcement so an
+                        # enrichment-time merge (which restates a fact, not
+                        # re-observes it) never earns credit here.  Reads the
+                        # window reconcile_provenance just merged above, not
+                        # the pre-merge relation values.
+                        self.adopt_reinforcements[record["ik_key"]] = (
+                            record["last_seen"],
+                            record["first_seen"],
+                        )
                 else:
                     # Different value: a NEW record lifetime, never
                     # reconciled onto the incumbent — reconciling would
@@ -1201,7 +1228,10 @@ class GraphMerger:
             # re-observation is silently dropped and the key's reinforcement
             # count never grows.  Gated on credit_adopt_reinforcement so an
             # enrichment-time merge (which restates a fact, not re-observes
-            # it) never earns credit here.
+            # it) never earns credit here.  ``GraphMerger.merge``'s attribute
+            # gate carries the identical arm for attribute-typed records
+            # (its same-value branch) — this is not the only such arm, edges
+            # and attributes share the mechanism.
             elif not relation.indexed_key and edge.get(_IK_KEY_ATTR) and credit_adopt_reinforcement:
                 self.adopt_reinforcements[edge[_IK_KEY_ATTR]] = (
                     edge.get("last_seen", ""),

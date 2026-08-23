@@ -229,6 +229,38 @@ class TestCollectIncidentItems:
         items = _collect_incident_items({}, cfg)
         assert items == []
 
+    def test_config_refused_incident_surfaces_as_an_attention_row_naming_the_refusal(
+        self, tmp_path
+    ):
+        """A ``config_refused`` incident (the shape ``_live_reload_base_model``
+        records when a ``ConfigStoreMismatch`` is caught) surfaces as one
+        ``incident_config_refused`` attention row naming the refusal text —
+        pinning that the generic incident collector is the surfacing
+        mechanism, so a dedicated populator is never added."""
+        state_dir = tmp_path / "state"
+        refusal_message = (
+            "adapters.episodic.enabled=false but 1 interim slot(s) still exist "
+            "under adapter_dir/episodic"
+        )
+        record_incident(
+            state_dir,
+            type="config_refused",
+            key="interim_ring_without_episodic",
+            severity="failed",
+            summary=f"Config refused on reload: {refusal_message.splitlines()[0][:160]}",
+            detail={"message": refusal_message, "adapter_dir": "adapter_dir"},
+        )
+
+        cfg = MagicMock()
+        cfg.paths.data = tmp_path
+
+        items = _collect_incident_items({}, cfg)
+        assert len(items) == 1
+        item = items[0]
+        assert item.kind == "incident_config_refused"
+        assert item.level == "failed"
+        assert "interim slot" in item.summary
+
 
 # ---------------------------------------------------------------------------
 # Populator registration

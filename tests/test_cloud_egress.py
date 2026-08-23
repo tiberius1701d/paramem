@@ -21,7 +21,7 @@ from paramem.cloud.anonymize import (
 from paramem.cloud.deanonymize import CloudScope, deanonymize_facts, deanonymize_text
 from paramem.cloud.placeholders import insert_placeholders
 from paramem.graph.schema import Relation, SessionGraph, facts_from_relations
-from paramem.utils.vram_guard import MIB_PER_TOKEN_TRANSIENT
+from paramem.utils.vram_guard import MIB_PER_PROMPT_TOKEN_PREFILL
 
 
 def _stub_tokenizer() -> MagicMock:
@@ -1240,7 +1240,7 @@ class TestDynamicVramClamp:
             )
 
         assert captured["configured_envelope"] == 8192
-        assert captured["token_envelope"] == int(1191 / MIB_PER_TOKEN_TRANSIENT)
+        assert captured["token_envelope"] == int(1191 / MIB_PER_PROMPT_TOKEN_PREFILL)
         assert captured["token_envelope"] < 8192
 
     def test_cpu_passthrough_no_cuda(self):
@@ -1298,10 +1298,10 @@ class TestDynamicVramClamp:
             patch("paramem.utils.vram_guard.safe_empty_cache"),
             patch(
                 "paramem.utils.vram_guard.torch.cuda.mem_get_info",
-                # ~200 supportable tokens at MIB_PER_TOKEN_TRANSIENT — far
+                # ~200 supportable tokens at MIB_PER_PROMPT_TOKEN_PREFILL — far
                 # below what 30 facts need, so VRAM (not the configured
                 # ceiling) is the binding constraint.
-                return_value=(int(200 * MIB_PER_TOKEN_TRANSIENT * 2**20), 8192 * 2**20),
+                return_value=(int(200 * MIB_PER_PROMPT_TOKEN_PREFILL * 2**20), 8192 * 2**20),
             ),
         ):
             payload = anonymize(

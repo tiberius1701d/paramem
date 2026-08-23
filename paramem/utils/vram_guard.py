@@ -19,7 +19,7 @@ Three integration points, one component:
 3. :func:`effective_token_envelope` — clamps an operator-configured
    token envelope (e.g. ``consolidation.extraction_anonymize_token_envelope``)
    down to what LIVE free VRAM can actually support, using the measured
-   :data:`MIB_PER_TOKEN_TRANSIENT` constant. The configured value stays
+   :data:`MIB_PER_PROMPT_TOKEN_PREFILL` constant. The configured value stays
    the ceiling; live free VRAM only sizes a call down, never up. Consumed
    by :func:`paramem.cloud.anonymize.anonymize`.
 
@@ -42,29 +42,31 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_PROCESS_FRACTION = 0.85
 
-# Measured VRAM cost per token of a transient local generate() call's
-# KV-cache + activation growth (prefill + decode combined) — the constant
-# behind the dynamic anonymize-envelope clamp
-# (paramem.cloud.anonymize.anonymize; clamping the configured envelope to
-# live free VRAM was owner-approved 2026-07-28).
+# Measured VRAM cost per PROMPT token of the adapter-OFF local generate()
+# call's prefill transient (KV-cache + activation growth building the
+# prompt's initial pass) — the constant behind the dynamic
+# anonymize-envelope clamp (paramem.cloud.anonymize.anonymize; clamping
+# the configured envelope to live free VRAM was owner-approved
+# 2026-07-28).
 #
-# Derivation (live-fold fault, journal 2026-07-28 06:48): an 8,192-token
-# call (prompt 7,257 + max_new 935 — the packer sized it exactly to the
-# configured envelope) faulted "device not ready" with only 1,191 MiB free
-# at entry; reserved climbed 4,698 -> 6,278 MiB (a 1,580 MiB jump) before
-# free hit 0. That gives a FLOOR of 1,191 / 8,192 ~= 0.145 MiB/token — an
-# UNDERESTIMATE, since the call never finished allocating (true demand was
-# higher than what 1,191 MiB could satisfy). A 4,249-token call completed
-# successfully with only 1,407 MiB free, giving a loose CEILING of
-# 1,407 / 4,249 ~= 0.331 MiB/token (loose: that call may not have needed
-# the full 1,407 MiB available, so the true per-token cost could be lower).
+# Derivation (direct measurement, 2026-08-22): three adapter-OFF
+# anonymize chunks of 7032 / 6760 / 6034 prompt tokens drew
+# 1687 / 1622 / 1449 MiB of transient, i.e. 0.2399 / 0.2399 / 0.2401 MiB
+# per prompt token — corroborated across eleven runs Aug 1-21 2026. The
+# 0.338 MiB/token figure separately observed on zero-slot boots was the
+# loader-identity defect closed in bd31429 (a stale raw-model holder
+# running the generate adapter-ON), not a second modelled state — this
+# constant models exactly one thing: the adapter-OFF prefill transient
+# per prompt token.
 #
-# Chosen conservatively toward FEWER supportable tokens (per owner
-# direction): 1.5x the measured floor (0.145 * 1.5 ~= 0.218, rounded to
-# 0.22) — inside the owner-specified 0.20-0.22 MiB/token band, comfortably
-# above the floor (never under-clamps the failing case) and well below the
-# loose ceiling (leaves margin against the successful case's variance).
-MIB_PER_TOKEN_TRANSIENT: float = 0.22
+# Unit mismatch, by construction: effective_token_envelope() below
+# divides free MiB by this PROMPT-token constant and compares the result
+# against a TOTAL (prompt + output) envelope, so every envelope token is
+# treated as a prompt token. That is conservative in the safe direction
+# (a real call's prompt length is <= its total envelope, and the prefill
+# transient this constant models is the dominant cost), not a bug to fix
+# silently.
+MIB_PER_PROMPT_TOKEN_PREFILL: float = 0.24
 
 
 class VramExhausted(RuntimeError):
@@ -417,11 +419,18 @@ def effective_token_envelope(configured_envelope: int) -> tuple[int, float | Non
     ``(effective_envelope, free_mib)``:
 
     * ``effective_envelope = min(configured_envelope, free_mib /
-      MIB_PER_TOKEN_TRANSIENT)``, floored to an int.
+      MIB_PER_PROMPT_TOKEN_PREFILL)``, floored to an int.
     * ``free_mib`` is the measured free VRAM in MiB, or ``None`` when CUDA
       is unavailable or the driver query failed — a caller distinguishes
       "not measured" from a real (possibly tiny) reading, and logs the
       former without pretending it is a numeric zero.
+
+    Unit mismatch by construction: ``MIB_PER_PROMPT_TOKEN_PREFILL`` models
+    MiB per PROMPT token, but ``configured_envelope`` (and the value this
+    function returns) is a TOTAL (prompt + output) budget — every envelope
+    token is therefore treated as if it were a prompt token. That is
+    conservative in the safe direction (a call's prompt length never
+    exceeds its total envelope), not a bug to silently fix.
 
     No CUDA available -> ``(configured_envelope, None)``: a strict
     passthrough so CPU-only test suites and environments never need a GPU
@@ -459,7 +468,7 @@ def effective_token_envelope(configured_envelope: int) -> tuple[int, float | Non
         logger.debug("effective_token_envelope: mem_get_info failed: %s", exc)
         return configured_envelope, None
     free_mib = free_bytes / (1024 * 1024)
-    supportable_tokens = int(free_mib / MIB_PER_TOKEN_TRANSIENT)
+    supportable_tokens = int(free_mib / MIB_PER_PROMPT_TOKEN_PREFILL)
     effective = min(configured_envelope, max(supportable_tokens, 0))
     return effective, free_mib
 

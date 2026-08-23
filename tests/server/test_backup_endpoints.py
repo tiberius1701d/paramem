@@ -741,6 +741,54 @@ class TestRestoreUnbootableConfigReturns400:
         assert resp.status_code == 200, resp.text
         assert Path(state["config_path"]).read_bytes() == backup_content
 
+    def test_a_config_backup_contradicting_the_store_is_rejected_as_unbootable(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """The same ``validate_candidate`` gate this door already runs also
+        runs the config-vs-store check: a backup that constructs cleanly but
+        re-points ``paths.data`` at a root holding a populated interim ring
+        under a disabled episodic tier is refused as unbootable, and the
+        live config is left untouched."""
+        config = _make_config(tmp_path)
+        backups_root = config.paths.data / "backups"
+        backups_root.mkdir(parents=True, exist_ok=True)
+
+        candidate_data_root = tmp_path / "restored-data"
+        interim_dir = candidate_data_root / "adapters" / "episodic" / "interim_20260101T0000"
+        interim_dir.mkdir(parents=True)
+
+        store_contradicting_content = (
+            "model: mistral\n"
+            "debug: false\n"
+            "paths:\n"
+            f"  data: {candidate_data_root}\n"
+            "consolidation:\n"
+            "  max_interim_count: 0\n"
+            "adapters:\n"
+            "  episodic:\n"
+            "    enabled: false\n"
+        ).encode()
+        slot_dir = backup_write(
+            ArtifactKind.CONFIG,
+            store_contradicting_content,
+            meta_fields={"tier": "daily"},
+            backups_root=backups_root,
+            backups_cfg=ServerBackupsConfig(),
+        )
+        backup_id = slot_dir.name
+
+        state = _make_state(tmp_path, config)
+        client = _make_client(monkeypatch, state)
+        live_path = Path(state["config_path"])
+        live_bytes_before = live_path.read_bytes()
+
+        resp = client.post("/backup/restore", json={"backup_id": backup_id})
+
+        assert resp.status_code == 400, resp.text
+        assert resp.json()["detail"]["error"] == "backup_unbootable"
+        assert "interim slot(s)" in resp.json()["detail"]["message"]
+        assert live_path.read_bytes() == live_bytes_before, "live config was mutated on rejection"
+
 
 # ---------------------------------------------------------------------------
 # Test 36 — /backup/restore not found → 404

@@ -89,11 +89,7 @@ def run(args: argparse.Namespace) -> int:
                     file=sys.stderr,
                 )
                 return 1
-        print(
-            f"paramem migrate-accept: server returned HTTP {exc.status_code} from {exc.url}.\n"
-            f"{exc.body.strip() or '(empty response body)'}",
-            file=sys.stderr,
-        )
+        print(f"paramem migrate-accept: server returned {exc}", file=sys.stderr)
         return 1
 
     if getattr(args, "json", False):

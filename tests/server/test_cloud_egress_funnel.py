@@ -426,7 +426,7 @@ def _turn(
 
 @pytest.mark.parametrize(
     "reason",
-    ["gpu_conflict", "insufficient_vram", "reload_failed", "apply_failed"],
+    ["gpu_conflict", "insufficient_vram", "reload_failed", "apply_failed", "config_refused"],
 )
 def test_involuntary_reasons_close_the_cloud_leg(tmp_path, monkeypatch, reason):
     """The local model is gone against the operator's wishes → cloud gated."""
@@ -772,3 +772,67 @@ class TestRelayLegEgressSurfaces:
             )
 
         assert mock_anonymizer.call_args.kwargs["speaker_id"] is None
+
+
+# ---------------------------------------------------------------------------
+# Anonymize token envelope — production source
+# ---------------------------------------------------------------------------
+
+
+def test_answer_via_cloud_sources_the_envelope_from_config():
+    """``answer_via_cloud`` must forward
+    ``config.consolidation.extraction_anonymize_token_envelope`` — and
+    only that value — as ``anonymize_turn``'s ``token_envelope`` kwarg.
+
+    The sentinel is deliberately not the shipped default (8192): a caller
+    that silently reverts to a literal/default value instead of reading
+    the config passes ``test_chat_egress_forwards_the_callers_envelope``
+    (which only pins that ``anonymize_turn`` forwards whatever it is
+    given) but fails THIS test, which pins where that value comes from in
+    production.
+    """
+    from paramem.server.inference import answer_via_cloud
+
+    sentinel_envelope = 5150
+    cfg = MagicMock()
+    cfg.sanitization.cloud_mode = "anonymize"
+    cfg.sanitization.scrub = {"person name"}
+    cfg.consolidation.extraction_anonymize_token_envelope = sentinel_envelope
+
+    cloud_agent = MagicMock()
+    captured = {}
+
+    def fake_anonymize_turn(*args, **kwargs):
+        captured.update(kwargs)
+        from paramem.cloud.anonymize import AnonymizedContract
+
+        # status="failed" short-circuits answer_via_cloud immediately
+        # after the call, so the cloud agent and deanonymize path never
+        # need to be exercised for this test's purpose.
+        return AnonymizedContract(
+            status="failed",
+            forward={},
+            reverse={},
+            anon_transcript="",
+            declared=frozenset(),
+            norm_stats={"inverted": 0, "dropped": 0},
+            rekey_dropped=0,
+            raw="",
+            failure=None,
+        )
+
+    with patch("paramem.graph.flows.anonymize_turn", side_effect=fake_anonymize_turn):
+        result = answer_via_cloud(
+            "What's the population of Berlin?",
+            cloud_agent,
+            cfg,
+            is_personal=False,
+            model=MagicMock(),
+            tokenizer=MagicMock(),
+            speaker=None,
+            speaker_id=None,
+        )
+
+    assert result is None
+    assert captured.get("token_envelope") == sentinel_envelope
+    cloud_agent.call.assert_not_called()

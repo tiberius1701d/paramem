@@ -66,11 +66,7 @@ def run(args: argparse.Namespace) -> int:
         )
         return 2
     except http_client.ServerHTTPError as exc:
-        print(
-            f"paramem backup-create: server returned HTTP {exc.status_code} from {exc.url}.\n"
-            f"{exc.body.strip() or '(empty response body)'}",
-            file=sys.stderr,
-        )
+        print(f"paramem backup-create: server returned {exc}", file=sys.stderr)
         return 1
 
     if getattr(args, "json", False):

@@ -480,6 +480,45 @@ class TestRollbackRejectsUnbootableBackup:
         assert resp.status_code in (200, 207), resp.text
         assert live_yaml.read_bytes() == _A_YAML
 
+    def test_a_backup_contradicting_the_store_is_rejected_as_unbootable(
+        self, tmp_path, monkeypatch
+    ):
+        """Config A can construct cleanly and still be rejected: the same
+        ``validate_candidate`` gate also runs the config-vs-store check, so
+        a backup that re-points ``paths.data`` at a root holding a populated
+        interim ring under a disabled episodic tier is refused as
+        unbootable — the live config is untouched."""
+        candidate_data_root = tmp_path / "restored-data"
+        interim_dir = candidate_data_root / "adapters" / "episodic" / "interim_20260101T0000"
+        interim_dir.mkdir(parents=True)
+
+        store_contradicting_a = (
+            "model: mistral\n"
+            "debug: false\n"
+            "paths:\n"
+            f"  data: {candidate_data_root}\n"
+            "consolidation:\n"
+            "  max_interim_count: 0\n"
+            "adapters:\n"
+            "  episodic:\n"
+            "    enabled: false\n"
+        ).encode()
+
+        fresh = _make_state(tmp_path, a_yaml_bytes=store_contradicting_a)
+        monkeypatch.setattr(app_module, "_state", fresh)
+        monkeypatch.setattr(app_module, "_apply_config_live", _default_apply_stub_rollback())
+        live_yaml = Path(fresh["config_path"])
+        live_bytes_before = live_yaml.read_bytes()
+
+        client = TestClient(app_module.app, raise_server_exceptions=False)
+        resp = client.post("/migration/rollback")
+
+        assert resp.status_code == 400, resp.text
+        assert resp.json()["detail"]["error"] == "backup_unbootable"
+        assert "interim slot(s)" in resp.json()["detail"]["message"]
+        assert live_yaml.read_bytes() == live_bytes_before, "live config was mutated on rejection"
+        assert fresh["migration"]["state"] == "TRIAL"
+
 
 # ---------------------------------------------------------------------------
 # Step 2 failure: pre-mortem backup failed → 500, state=TRIAL

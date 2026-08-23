@@ -1071,9 +1071,10 @@ class ConsolidationScheduleConfig(ConsolidationConfig):
     # ConsolidationLoop._current_extraction_config (graph tier).
     # This value is the operator CEILING, not a guarantee: each call
     # additionally clamps to live free VRAM (paramem.utils.vram_guard.
-    # effective_token_envelope, MIB_PER_TOKEN_TRANSIENT) — live evidence
-    # (2026-07-28) showed a packer-correct call sized exactly to this
-    # ceiling still faulting on a tighter-than-expected free-VRAM moment.
+    # effective_token_envelope, MIB_PER_PROMPT_TOKEN_PREFILL) — live
+    # evidence (2026-07-28) showed a packer-correct call sized exactly to
+    # this ceiling still faulting on a tighter-than-expected free-VRAM
+    # moment.
     extraction_anonymize_token_envelope: int = 8192
     # Fallback words->tokens ratio for paramem.utils.tokens.estimate_tokens
     # when no live tokenizer is available (the CLI document chunker; an
@@ -2390,10 +2391,13 @@ def build_server_config(raw: dict, *, source_path: str | Path) -> ServerConfig:
     # is the sole derivation, project-wide.  These three validate the config
     # DOCUMENT alone (no disk read); the disk-consistency guards (a populated
     # interim ring left behind by a disabled episodic tier, and a disabled
-    # tier whose registry still holds active keys) live at the config-vs-disk
-    # refusal site in ``paramem.server.app._load_model_into_state``, beside
-    # ``detect_legacy_adapter_layout`` — the first moment a cloud-only
-    # server would otherwise touch a tier's on-disk state.
+    # tier whose registry still holds active keys) live in
+    # ``paramem.server.config_store_validator.check_config_against_store``.
+    # The earliest reader is not boot: every config-promotion door reaches it
+    # through ``paramem.server.migration.validate_candidate``, starting with
+    # ``POST /migration/preview`` — a candidate is checked against the store
+    # before anything is promoted and with no model loaded. Boot itself calls
+    # the same function from ``paramem.server.app._load_model_into_state``.
     #
     # A net-new key is minted at reinforcement_count=1
     # (paramem/memory/bookkeeping.py), and both promotion comparisons are

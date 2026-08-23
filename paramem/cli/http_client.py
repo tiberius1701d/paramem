@@ -137,6 +137,13 @@ class ServerHTTPError(Exception):
     Typically a 5xx from the server or a 4xx other than 404 (e.g. 400
     validation failure).  The caller should surface the status code and body
     to the operator and exit 1.
+
+    ``str(exc)`` includes the response body (when non-empty) alongside the
+    status code and URL, so any handler that renders the exception directly
+    (rather than reading ``.body``/``parse_error_detail`` itself) still
+    surfaces the server's actual message — e.g. the refusal text carried in
+    a ``candidate_invalid_config`` / ``backup_unbootable`` detail — instead
+    of just the bare status line.
     """
 
     def __init__(self, status_code: int, url: str, body: str) -> None:
@@ -144,6 +151,12 @@ class ServerHTTPError(Exception):
         self.url = url
         self.body = body
         super().__init__(f"HTTP {status_code} from {url}")
+
+    def __str__(self) -> str:
+        stripped = self.body.strip()
+        if stripped:
+            return f"HTTP {self.status_code} from {self.url}: {stripped}"
+        return f"HTTP {self.status_code} from {self.url}"
 
 
 def parse_error_detail(body: str) -> dict:

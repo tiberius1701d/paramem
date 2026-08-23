@@ -312,6 +312,7 @@ def test_cloud_anonymizer_contract(loaded_model):
             speaker_id=entry["speaker_id"],
             speaker_name=entry["speaker_name"],
             scrub=_DEFAULT_SCRUB,
+            token_envelope=8192,
         )
 
         # A genuinely blocked call is ``status == "failed"`` (extraction
@@ -425,6 +426,7 @@ def test_cloud_anonymizer_contract_strict_scope_anonymizes_places(loaded_model):
         speaker_id=entry["speaker_id"],
         speaker_name=entry["speaker_name"],
         scrub={"person name", "city"},
+        token_envelope=8192,
     )
     anon_text = payload.anon_transcript
 

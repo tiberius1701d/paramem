@@ -509,3 +509,114 @@ class TestAttributeGateValueChangeStartsNewLifetime:
             "old_object": "alex@example.com",
             "new_object": "alex-new@example.com",
         }
+
+
+class TestAttributeGateReinforcementCredit:
+    """The attribute gate's same-value branch mirrors
+    `_upsert_relation`'s keyless-onto-keyed reinforcement arm (the
+    `elif not relation.indexed_key and edge.get(_IK_KEY_ATTR)` branch): a
+    keyless same-value re-observation landing on an already-keyed record
+    earns `adopt_reinforcements` credit under `credit_adopt_reinforcement`,
+    so an attribute-typed key matures through the same surface an edge-typed
+    key does."""
+
+    def test_keyless_re_observation_of_a_keyed_record_earns_credit(self):
+        merger = GraphMerger()
+        merger.merge(
+            _session(
+                _attr_relation(
+                    indexed_key="graph5",
+                    speaker_id="speaker0",
+                    first_seen="2026-01-01T00:00:00Z",
+                    last_seen="2026-01-01T00:00:00Z",
+                ),
+                session_id="s0",
+            )
+        )
+        merger.merge(
+            _session(
+                _attr_relation(
+                    speaker_id="speaker0",
+                    first_seen="2026-03-01T00:00:00Z",
+                    last_seen="2026-03-01T00:00:00Z",
+                ),
+                session_id="s1",
+            ),
+            credit_adopt_reinforcement=True,
+        )
+        record = merger.graph.nodes["speaker0"]["attributes"]["email"]
+        assert record["ik_key"] == "graph5", "the key binding is untouched by the credit arm"
+        assert merger.adopt_reinforcements == {
+            "graph5": (record["last_seen"], record["first_seen"])
+        }
+        # The credited window is the MERGED one, not the incoming relation's.
+        assert record["last_seen"] == "2026-03-01T00:00:00Z"
+        assert record["first_seen"] == "2026-01-01T00:00:00Z"
+
+    def test_credit_is_withheld_without_the_flag(self):
+        """Pins that an enrichment-time merge (restatement, not
+        re-observation) never earns credit — the merge above without
+        `credit_adopt_reinforcement=True`."""
+        merger = GraphMerger()
+        merger.merge(
+            _session(_attr_relation(indexed_key="graph5"), session_id="s0"),
+        )
+        merger.merge(
+            _session(_attr_relation(), session_id="s1"),
+        )
+        assert merger.adopt_reinforcements == {}
+        record = merger.graph.nodes["speaker0"]["attributes"]["email"]
+        assert record["ik_key"] == "graph5"
+
+    def test_keyless_re_observation_of_a_keyless_record_earns_nothing(self):
+        """No `ik_key` on the incumbent — nothing to credit even with the
+        flag set."""
+        merger = GraphMerger()
+        merger.merge(_session(_attr_relation(), session_id="s0"))
+        merger.merge(
+            _session(_attr_relation(), session_id="s1"),
+            credit_adopt_reinforcement=True,
+        )
+        assert merger.adopt_reinforcements == {}
+        record = merger.graph.nodes["speaker0"]["attributes"]["email"]
+        assert "ik_key" not in record
+
+    def test_incoming_keyed_relation_takes_the_key_binding_arm_not_the_credit_arm(self):
+        """When the incoming relation itself carries a key, the existing
+        carry-forward (key-binding) behaviour fires — the credit arm is an
+        `elif`, mutually exclusive with it."""
+        merger = GraphMerger()
+        merger.merge(_session(_attr_relation(indexed_key="graph5"), session_id="s0"))
+        merger.merge(
+            _session(_attr_relation(indexed_key="graph5"), session_id="s1"),
+            credit_adopt_reinforcement=True,
+        )
+        assert merger.adopt_reinforcements == {}
+        record = merger.graph.nodes["speaker0"]["attributes"]["email"]
+        assert record["ik_key"] == "graph5"
+
+    def test_a_different_speaker_re_asserting_the_same_value_credits_and_keeps_the_first_asserter(
+        self,
+    ):
+        """A different speaker re-asserting the same value credits exactly
+        as it does for edges: reconcile_provenance's speaker_id rule is
+        first-non-empty-wins, so the credited key's owner is unaffected."""
+        merger = GraphMerger()
+        merger.merge(
+            _session(
+                _attr_relation(indexed_key="graph5", speaker_id="speaker0"),
+                session_id="s0",
+            )
+        )
+        merger.merge(
+            _session(
+                _attr_relation(speaker_id="speaker9"),
+                session_id="s1",
+            ),
+            credit_adopt_reinforcement=True,
+        )
+        record = merger.graph.nodes["speaker0"]["attributes"]["email"]
+        assert record["speaker_id"] == "speaker0", "first-non-empty-wins: original speaker kept"
+        assert merger.adopt_reinforcements == {
+            "graph5": (record["last_seen"], record["first_seen"])
+        }

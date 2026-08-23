@@ -33,6 +33,10 @@ through ``promote_config`` (there is no candidate file at a path and no staged h
 to check). Instead they call ``migration.validate_candidate`` on the decrypted
 backup bytes before their own rename, so the "unbootable config goes live" property
 still holds for them without reusing the candidate-promotion primitive.
+``validate_candidate`` now also checks the candidate against the tier store on
+disk (``paramem.server.config_store_validator.check_config_against_store``), so
+this same gate proves "does not contradict the store it would run against" as
+well as "constructs".
 """
 
 from __future__ import annotations

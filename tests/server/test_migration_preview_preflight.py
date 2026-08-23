@@ -513,3 +513,55 @@ class TestPreviewConfigNoneIsCheckError:
         assert body["state"] == "LIVE"
         assert body.get("pre_flight_disk_used_gb") is None
         assert state["migration"]["state"] == "LIVE"
+
+
+# ---------------------------------------------------------------------------
+# Test — a candidate that contradicts its OWN store is rejected before
+# staging (config-vs-store validation, shared by every config-promotion door
+# through paramem.server.migration.validate_candidate)
+# ---------------------------------------------------------------------------
+
+
+class TestPreviewRejectsCandidateContradictingItsOwnStore:
+    def test_a_candidate_contradicting_the_store_is_rejected_before_staging(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """A candidate that disables episodic while a populated interim ring
+        still sits under its OWN paths.data is rejected at preview: 400
+        candidate_invalid_config naming the refusal text, migration state
+        stays LIVE, nothing staged."""
+        config = _make_config(tmp_path, max_total_disk_gb=20.0)
+        backups_root = config.paths.data / "backups"
+        backups_root.mkdir(parents=True, exist_ok=True)
+
+        state = _make_state(tmp_path, config=config)
+        monkeypatch.setattr(app_module, "_state", state)
+
+        # The candidate re-points paths.data at its own root — the check
+        # must read the CANDIDATE's adapter_dir, not the live one.
+        candidate_data_root = tmp_path / "candidate-data"
+        interim_dir = candidate_data_root / "adapters" / "episodic" / "interim_20260101T0000"
+        interim_dir.mkdir(parents=True)
+
+        candidate_yaml = (
+            "model: mistral\n"
+            "debug: true\n"
+            "paths:\n"
+            f"  data: {candidate_data_root}\n"
+            "consolidation:\n"
+            "  max_interim_count: 0\n"
+            "adapters:\n"
+            "  episodic:\n"
+            "    enabled: false\n"
+        ).encode()
+
+        client = TestClient(app_module.app, raise_server_exceptions=False)
+        cand = _write_candidate(tmp_path, content=candidate_yaml)
+        resp = client.post("/migration/preview", json={"candidate_path": str(cand)})
+
+        assert resp.status_code == 400, resp.text
+        body = resp.json()
+        assert body["detail"]["error"] == "candidate_invalid_config"
+        assert "interim slot(s)" in body["detail"]["message"]
+        assert "POST /consolidate to drain the ring into episodic" in body["detail"]["message"]
+        assert state["migration"]["state"] == "LIVE"

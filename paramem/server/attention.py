@@ -1313,6 +1313,11 @@ def _collect_voice_degradation_items(state: dict, config) -> list[AttentionItem]
     cause = {
         "insufficient_vram": "insufficient GPU VRAM (external process holds the device)",
         "reload_failed": "base-model GPU reload failed",
+        "apply_failed": "config-apply component rebuild failed after reload",
+        "config_refused": "config contradicts the store on disk",
+        "cuda_fault_persistent": (
+            "CUDA crash-loop guard exhausted — degraded to persistent cloud-only"
+        ),
         "training": "GPU deferred for background training",
         "gpu_conflict": "GPU occupied by another process at startup",
         "released": "GPU released to another consumer",

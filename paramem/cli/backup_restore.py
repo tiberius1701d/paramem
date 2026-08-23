@@ -111,22 +111,14 @@ def run(args: argparse.Namespace) -> int:
                     file=sys.stderr,
                 )
             else:
-                print(
-                    f"paramem backup-restore: server returned HTTP 409 from {exc.url}.\n"
-                    f"{exc.body.strip() or '(empty response body)'}",
-                    file=sys.stderr,
-                )
+                print(f"paramem backup-restore: server returned {exc}", file=sys.stderr)
             return 1
         if exc.status_code == 400:
             detail = http_client.parse_error_detail(exc.body)
             message = detail.get("message", exc.body.strip()) if detail else exc.body.strip()
             print(f"paramem backup-restore: {message}", file=sys.stderr)
             return 1
-        print(
-            f"paramem backup-restore: server returned HTTP {exc.status_code} from {exc.url}.\n"
-            f"{exc.body.strip() or '(empty response body)'}",
-            file=sys.stderr,
-        )
+        print(f"paramem backup-restore: server returned {exc}", file=sys.stderr)
         return 1
 
     if getattr(args, "json", False):

@@ -715,6 +715,7 @@ def answer_via_cloud(
             speaker_id=speaker_id,
             speaker_name=speaker,
             scrub=set(config.sanitization.scrub),
+            token_envelope=config.consolidation.extraction_anonymize_token_envelope,
         )
         if payload.status == "failed":
             # Per-query block: extraction error, anonymizer parse failure or

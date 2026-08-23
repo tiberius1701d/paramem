@@ -723,6 +723,60 @@ class TestConfirmRejectsUnbootableCandidate:
         assert _config_backup_slots(state) == []
 
 
+class TestConfirmRejectsCandidateContradictingItsOwnStore:
+    """The config-vs-store check runs INSIDE the same ``validate_candidate``
+    gate as construction — a candidate need not be unbootable to be
+    rejected; it can construct cleanly and still contradict the store it
+    would run against (its OWN ``paths.data``, when the candidate re-points
+    it)."""
+
+    def test_a_candidate_contradicting_the_store_is_rejected_before_promotion(
+        self, client, state, tmp_path
+    ):
+        candidate_data_root = tmp_path / "candidate-data"
+        interim_dir = candidate_data_root / "adapters" / "episodic" / "interim_20260101T0000"
+        interim_dir.mkdir(parents=True)
+
+        candidate = (
+            "model: mistral\n"
+            "debug: true\n"
+            "paths:\n"
+            f"  data: {candidate_data_root}\n"
+            "consolidation:\n"
+            "  max_interim_count: 0\n"
+            "adapters:\n"
+            "  episodic:\n"
+            "    enabled: false\n"
+        ).encode()
+
+        # A single "debug" diff entry is neither the pure mode-switch shape
+        # (dotted_path == "consolidation.mode") nor a base swap (no "model"
+        # entry) — the general trial branch runs, and validate_candidate is
+        # its first step, same as every other branch.
+        state["migration"]["tier_diff"] = [
+            {
+                "dotted_path": "debug",
+                "old_value": False,
+                "new_value": True,
+                "tier": "pipeline_altering",
+            },
+        ]
+        cand_path = _restage(state, tmp_path, candidate)
+        live_path = Path(state["config_path"])
+
+        resp = client.post("/migration/confirm", json={})
+
+        assert resp.status_code == 409, resp.text
+        assert resp.json()["detail"]["error"] == "candidate_invalid_config"
+        assert "interim slot(s)" in resp.json()["detail"]["message"]
+        # Nothing moved: live config intact, candidate still staged, STAGING held.
+        assert live_path.read_bytes() == _LIVE_YAML
+        assert cand_path.read_bytes() == candidate
+        assert state["migration"]["state"] == "STAGING"
+        assert read_trial_marker(state["config"].paths.data / "state") is None
+        assert _config_backup_slots(state) == []
+
+
 class TestConfirmBaseSwapRejectsUnbootableCandidate:
     """Base swap validates before TRIAL and before the orchestration task is created.
 

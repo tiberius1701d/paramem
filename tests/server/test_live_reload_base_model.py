@@ -444,18 +444,15 @@ def test_load_failure_releases_and_stays_cloud_only():
         assert app_module._state["cloud_only_reason"] == "reload_failed"
 
 
-@pytest.mark.parametrize("scenario", ["insufficient_vram", "reload_failed", "apply_failed"])
-def test_handled_failure_return_value_matches_state_reason(scenario):
-    """The invariant the whole return-value contract rests on: whenever
-    ``_live_reload_base_model`` returns a handled-failure reason, that is
-    the exact same string it just wrote to ``_state["cloud_only_reason"]``
-    — the return value (the control-flow channel) and the state write (the
-    ``/status``-facing display value) never diverge, across all three
-    terminals in the closed vocabulary.
+def test_vram_exhausted_on_load_maps_to_insufficient_vram():
+    """When ``_load_model_into_state`` itself raises ``VramExhausted`` (as
+    opposed to the pre-flight gate declining), the reload maps it to
+    ``insufficient_vram`` — the same terminal the boot path already uses for
+    a ``VramExhausted`` from tier creation. Today this would fall into the
+    bare ``except Exception`` and be misreported as ``reload_failed``.
     """
-    import contextlib
-
     from paramem.server import app as app_module
+    from paramem.utils.vram_guard import VramExhausted
 
     fake_assessment = MagicMock(name="assessment")
     fake_assessment.required_bytes = int(6 * 2**30)
@@ -464,6 +461,113 @@ def test_handled_failure_return_value_matches_state_reason(scenario):
         "mode": "cloud-only",
         "cloud_only_reason": "released",
         "config": _server_config(),
+        "topology_assessment": fake_assessment,
+    }
+
+    with (
+        patch.dict(app_module._state, state_patch, clear=False),
+        patch.object(app_module, "_release_base_model_in_process") as mock_release,
+        patch("paramem.server.app.torch.cuda.is_available", return_value=True),
+        patch.object(app_module, "_wait_for_gpu_drain", return_value=True),
+        patch.object(
+            app_module,
+            "_load_model_into_state",
+            side_effect=VramExhausted("tier creation"),
+        ),
+        patch.object(app_module, "_build_runtime_components") as mock_build,
+    ):
+        result = app_module._live_reload_base_model()
+
+        assert mock_release.call_count == 2
+        mock_build.assert_not_called()
+        assert result == "insufficient_vram"
+        assert app_module._state["mode"] == "cloud-only"
+        assert app_module._state["cloud_only_reason"] == "insufficient_vram"
+
+
+def test_config_store_mismatch_sets_config_refused_and_records_an_incident(tmp_path):
+    """When ``_load_model_into_state`` raises ``ConfigStoreMismatch`` (the
+    residual race: the store changed between an earlier door's validation
+    and this reload), the reload releases, sets
+    ``cloud_only_reason="config_refused"``, does NOT call
+    ``_build_runtime_components``, and records an active incident whose
+    summary carries the refusal text.
+    """
+    from paramem.server import app as app_module
+    from paramem.server.config_store_validator import ConfigStoreMismatch
+    from paramem.server.incidents import read_incidents
+    from paramem.training.stage_ledger import data_state_dir
+
+    fake_assessment = MagicMock(name="assessment")
+    fake_assessment.required_bytes = int(6 * 2**30)
+
+    cfg = _server_config()
+    cfg.paths.data = tmp_path
+
+    refusal_message = (
+        "adapters.episodic.enabled=false but 1 interim slot(s) still exist "
+        "under adapter_dir/episodic"
+    )
+
+    state_patch = {
+        "mode": "cloud-only",
+        "cloud_only_reason": "released",
+        "config": cfg,
+        "topology_assessment": fake_assessment,
+    }
+
+    with (
+        patch.dict(app_module._state, state_patch, clear=False),
+        patch.object(app_module, "_release_base_model_in_process") as mock_release,
+        patch("paramem.server.app.torch.cuda.is_available", return_value=True),
+        patch.object(app_module, "_wait_for_gpu_drain", return_value=True),
+        patch.object(
+            app_module,
+            "_load_model_into_state",
+            side_effect=ConfigStoreMismatch(refusal_message, check="interim_ring_without_episodic"),
+        ),
+        patch.object(app_module, "_build_runtime_components") as mock_build,
+    ):
+        result = app_module._live_reload_base_model()
+
+        assert mock_release.call_count == 2
+        mock_build.assert_not_called()
+        assert result == "config_refused"
+        assert app_module._state["mode"] == "cloud-only"
+        assert app_module._state["cloud_only_reason"] == "config_refused"
+
+    incidents = read_incidents(data_state_dir(cfg.paths.data))
+    active = [i for i in incidents if i.type == "config_refused" and i.status == "active"]
+    assert len(active) == 1, f"expected exactly one active config_refused incident; got {incidents}"
+    assert "interim slot" in active[0].summary
+
+
+@pytest.mark.parametrize(
+    "scenario", ["insufficient_vram", "reload_failed", "apply_failed", "config_refused"]
+)
+def test_handled_failure_return_value_matches_state_reason(scenario, tmp_path):
+    """The invariant the whole return-value contract rests on: whenever
+    ``_live_reload_base_model`` returns a handled-failure reason, that is
+    the exact same string it just wrote to ``_state["cloud_only_reason"]``
+    — the return value (the control-flow channel) and the state write (the
+    ``/status``-facing display value) never diverge, across all four
+    terminals in the closed vocabulary.
+    """
+    import contextlib
+
+    from paramem.server import app as app_module
+    from paramem.server.config_store_validator import ConfigStoreMismatch
+
+    fake_assessment = MagicMock(name="assessment")
+    fake_assessment.required_bytes = int(6 * 2**30)
+
+    cfg = _server_config()
+    cfg.paths.data = tmp_path
+
+    state_patch = {
+        "mode": "cloud-only",
+        "cloud_only_reason": "released",
+        "config": cfg,
         "topology_assessment": fake_assessment,
     }
 
@@ -485,14 +589,23 @@ def test_handled_failure_return_value_matches_state_reason(scenario):
                 side_effect=RuntimeError("CUDA out of memory"),
             )
         )
+    elif scenario == "config_refused":
+        patches.append(patch.object(app_module, "_wait_for_gpu_drain", return_value=True))
+        patches.append(
+            patch.object(
+                app_module,
+                "_load_model_into_state",
+                side_effect=ConfigStoreMismatch(
+                    "store contradicts config", check="interim_ring_without_episodic"
+                ),
+            )
+        )
     else:  # apply_failed — the full config-apply rebuild path
         state_patch["config_path"] = "configs/server.yaml"
         refresh_config_from_disk = True
         patches.append(patch.object(app_module, "_wait_for_gpu_drain", return_value=True))
         patches.append(patch.object(app_module, "_load_model_into_state"))
-        patches.append(
-            patch.object(app_module, "load_server_config", return_value=_server_config())
-        )
+        patches.append(patch.object(app_module, "load_server_config", return_value=cfg))
         patches.append(
             patch.object(
                 app_module,

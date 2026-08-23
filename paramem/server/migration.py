@@ -15,9 +15,13 @@ Design notes
   the live config path** (:func:`validate_candidate`), and only then renames.  A
   candidate that cannot boot therefore never becomes the live config.
 - ``validate_candidate`` calls ``build_server_config`` — the construction stage
-  boot itself runs — so validation cannot drift from boot.  It discards the
-  resulting ``ServerConfig`` object at every call site: the config that goes live
-  is the one boot (or ``_refresh_config_from_disk_into_state``) loads from disk.
+  boot itself runs — so validation cannot drift from boot, then checks the
+  result against the tier store on disk
+  (``paramem.server.config_store_validator.check_config_against_store``), the
+  same check boot itself runs inside ``_load_model_into_state``.  It discards
+  the resulting ``ServerConfig`` object at every call site: the config that
+  goes live is the one boot (or ``_refresh_config_from_disk_into_state``)
+  loads from disk.
 - ``MigrationStashState`` mirrors ``ConfigDriftState`` in ``drift.py`` as a
   TypedDict so the slot on ``_state["migration"]`` is self-describing.
 - ``validate_candidate_path`` enforces that the candidate lives on the same
@@ -59,6 +63,7 @@ from paramem.backup.backup import write as backup_write
 from paramem.backup.types import ArtifactKind
 from paramem.config.classification import Tier, classify, walk_dict_leaves
 from paramem.server.config import ServerBackupsConfig, ServerConfig, build_server_config
+from paramem.server.config_store_validator import check_config_against_store
 
 logger = logging.getLogger(__name__)
 
@@ -932,11 +937,15 @@ def _sha256_bytes(data: bytes) -> str:
 
 
 class CandidateConfigInvalid(ValueError):
-    """The candidate ``server.yaml`` parses but cannot be constructed into a config.
+    """The candidate ``server.yaml`` parses but cannot be constructed into a
+    config, OR it constructs cleanly but contradicts the tier store it would
+    run against.
 
     Raised by :func:`validate_candidate`.  The HTTP layer maps it to
     ``400 candidate_invalid_config`` (preview) / ``409 candidate_invalid_config``
-    (confirm).  The message is the original construction error verbatim.
+    (confirm).  The message is the original construction error, or the
+    :class:`~paramem.server.config_store_validator.ConfigStoreMismatch`
+    refusal text, verbatim.
     """
 
 
@@ -950,13 +959,20 @@ class CandidateChanged(ValueError):
 
 
 def validate_candidate(candidate_bytes: bytes, live_config_path: Path) -> ServerConfig:
-    """Construct the candidate config as if it already sat at the live config path.
+    """Construct the candidate config as if it already sat at the live config
+    path, then check it against the tier store it would run against.
 
     Runs the same construction stage boot runs (``build_server_config``), so a
     candidate that passes here is a candidate the server can boot from.  The
     ``live_config_path`` anchor is load-bearing: ``paths.*`` resolve against the
     project root of the YAML's directory, so validating with the staging path
-    would build a *different* config than the one that goes live.
+    would build a *different* config than the one that goes live.  Construction
+    is then followed by
+    :func:`~paramem.server.config_store_validator.check_config_against_store`,
+    so a candidate that passes here is one the server can both boot from AND
+    that does not contradict the tiers already on disk — including a candidate
+    that re-points ``paths.data``, which is checked against its OWN new
+    ``adapter_dir``, not the live one.
 
     Every caller **discards** the returned ``ServerConfig``.  It is never stashed,
     serialised, or written: it carries interpolated secrets, whereas the stash and
@@ -965,7 +981,8 @@ def validate_candidate(candidate_bytes: bytes, live_config_path: Path) -> Server
     Boundary error handling: operator-supplied YAML can fail construction with
     ``ValueError`` (validation guards), ``FatalConfigError`` (adapter guard), or
     ``TypeError`` (unknown key reaching ``**kwargs``; an uninterpolated ``${VAR}``
-    left in a typed non-str field).  All are re-raised as
+    left in a typed non-str field); a candidate that constructs cleanly can still
+    fail the store check with ``ConfigStoreMismatch``.  All are re-raised as
     :class:`CandidateConfigInvalid` so the HTTP layer answers 4xx, not 500.
 
     Parameters
@@ -984,11 +1001,14 @@ def validate_candidate(candidate_bytes: bytes, live_config_path: Path) -> Server
     Raises
     ------
     CandidateConfigInvalid
-        The candidate is unparseable or cannot be constructed/validated.
+        The candidate is unparseable, cannot be constructed, or contradicts
+        the tier store it would run against.
     """
     try:
         parsed = _parse_candidate(candidate_bytes)
-        return build_server_config(parsed, source_path=live_config_path)
+        config = build_server_config(parsed, source_path=live_config_path)
+        check_config_against_store(config)
+        return config
     except Exception as exc:  # noqa: BLE001 — boundary: operator-supplied file
         raise CandidateConfigInvalid(str(exc)) from exc
 

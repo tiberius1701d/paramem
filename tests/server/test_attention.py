@@ -771,6 +771,40 @@ def test_voice_degraded_components_reflect_only_enabled_gpu_component():
     assert "STT/TTS" not in items[0].summary
 
 
+#: Every cause-map entry ("explicit" is excluded — it no-emits entirely, by
+#: design, before the map is ever consulted). Each value is the distinctive
+#: substring the map's own text carries for that reason, so a reason that
+#: silently fell through to the raw ``str(reason)`` fallback fails loudly
+#: rather than passing on a coincidental substring match (e.g. "training" is
+#: both a valid reason AND a word inside its own cause sentence).
+_VOICE_DEGRADATION_CAUSES = {
+    "insufficient_vram": "insufficient GPU VRAM",
+    "reload_failed": "base-model GPU reload failed",
+    "apply_failed": "config-apply component rebuild failed after reload",
+    "config_refused": "config contradicts the store on disk",
+    "cuda_fault_persistent": "CUDA crash-loop guard exhausted",
+    "training": "GPU deferred for background training",
+    "gpu_conflict": "GPU occupied by another process at startup",
+    "released": "GPU released to another consumer",
+    "live_reload": "base-model reload in progress",
+}
+
+
+@pytest.mark.parametrize("reason,expected_cause", list(_VOICE_DEGRADATION_CAUSES.items()))
+def test_voice_degraded_cause_map_names_every_involuntary_and_transient_reason(
+    reason, expected_cause
+):
+    """Every ``cloud_only_reason`` the cause map names produces its own
+    human-readable clause in the summary — pins the map's content so a
+    reason silently falling through to the raw ``str(reason)`` fallback
+    (e.g. after a reason is added elsewhere but forgotten here) fails this
+    test instead of shipping a degraded-but-unexplained attention row."""
+    state = {"voice_profile": "cpu", "cloud_only_reason": reason}
+    items = _collect_voice_degradation_items(state, _voice_cfg())
+    assert len(items) == 1
+    assert expected_cause in items[0].summary
+
+
 # ---------------------------------------------------------------------------
 # _collect_local_recall_inactive_items
 # ---------------------------------------------------------------------------

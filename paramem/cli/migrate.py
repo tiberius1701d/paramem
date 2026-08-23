@@ -509,7 +509,9 @@ def _render_apply_result(result: dict, server_url: str) -> None:
     - Failure (``applied_live=False``, other reason) → restart-hint fallback,
       naming ``restart_required_reason`` (e.g. ``lock_timeout``,
       ``consolidating``) when the apply was never attempted, or
-      ``cloud_only_reason`` when a reload was attempted and failed.
+      ``cloud_only_reason`` when a reload was attempted and failed or was
+      refused (e.g. ``config_refused`` — the store changed since an earlier
+      validation).
 
     The server does NOT self-fire a restart for R-PORT.  The CLI is the sole
     restart trigger — always gated on operator consent.
@@ -613,8 +615,9 @@ def _render_apply_result(result: dict, server_url: str) -> None:
     # Apply failed or other unexpected reason — restart-hint fallback.
     # restart_required_reason (e.g. "lock_timeout", "consolidating") names
     # why the apply was never attempted; cloud_only_reason is only set when
-    # a reload was actually attempted and failed — prefer the former when
-    # both could apply, since it is the more specific, always-true cause.
+    # a reload was actually attempted and either failed or was refused
+    # (e.g. "config_refused") — prefer the former when both could apply,
+    # since it is the more specific, always-true cause.
     if reason:
         print(
             f"  Apply not attempted ({reason}); config is on disk — restart to apply.",
@@ -1090,11 +1093,7 @@ def run(args: argparse.Namespace) -> int:
         )
         return 2
     except http_client.ServerHTTPError as exc:
-        print(
-            f"paramem migrate: server returned HTTP {exc.status_code} from {exc.url}.\n"
-            f"{exc.body.strip() or '(empty response body)'}",
-            file=sys.stderr,
-        )
+        print(f"paramem migrate: server returned {exc}", file=sys.stderr)
         return 1
 
     if getattr(args, "json", False):

@@ -688,6 +688,47 @@ class TestConfigVsDiskGuardsV3bV4:
         with pytest.raises(_ReachedLoadBaseModel):
             app_module._load_model_into_state(cfg)
 
+    def test_a_passing_check_resolves_an_active_config_refused_incident(
+        self, tmp_path, monkeypatch
+    ):
+        """The single resolve site lives inside ``_load_model_into_state``,
+        immediately after ``check_config_against_store`` returns -- reached
+        by BOTH boot and every reload, since both paths funnel through this
+        one function. A ``config_refused`` incident from an earlier refusal
+        against this same store clears the moment the check passes again --
+        no separate resolve call is needed on either path."""
+        from paramem.server import app as app_module
+        from paramem.server.incidents import read_incidents, record_incident
+        from paramem.training.stage_ledger import data_state_dir
+
+        cfg = _cfg_rooted_at(tmp_path)
+        # Clean store: every tier enabled by default (no adapters.* override
+        # here), no interim ring, no disabled-tier keys --
+        # check_config_against_store passes.
+
+        state_dir = data_state_dir(cfg.paths.data)
+        record_incident(
+            state_dir,
+            type="config_refused",
+            key="interim_ring_without_episodic",
+            severity="failed",
+            summary="Config refused on reload: adapters.episodic.enabled=false but ...",
+            detail={"message": "stale refusal", "adapter_dir": str(cfg.adapter_dir)},
+        )
+        assert read_incidents(state_dir)[0].status == "active"
+
+        monkeypatch.setattr(app_module, "apply_process_cap", lambda **kwargs: None)
+        monkeypatch.setattr(
+            app_module, "load_base_model", MagicMock(side_effect=_ReachedLoadBaseModel)
+        )
+
+        with pytest.raises(_ReachedLoadBaseModel):
+            app_module._load_model_into_state(cfg)
+
+        incidents = read_incidents(state_dir)
+        assert len(incidents) == 1
+        assert incidents[0].status == "resolved"
+
     def test_v4_refusal_is_not_reachable_through_the_classification_preview(self):
         """Confirms the disabled-tier-with-active-keys refusal is the only
         one: adapters.<tier>.enabled classifies as Tier.DESTRUCTIVE via the

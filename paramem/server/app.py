@@ -66,6 +66,7 @@ from paramem.server.config import (
     default_data_dir,
     load_server_config,
 )
+from paramem.server.config_store_validator import ConfigStoreMismatch, check_config_against_store
 from paramem.server.consolidation import (
     classify_pending_sessions,
     get_or_create_consolidation_loop,
@@ -212,7 +213,9 @@ _state = {
     # shutdown and cleared so a repeated lifespan (TestClient) starts clean.
     "boot_completion_task": None,
     "mode": "local",  # "local" or "cloud-only"
-    # "explicit", "training", "gpu_conflict", "cuda_fault_persistent", or None
+    # "explicit", "training", "gpu_conflict", "cuda_fault_persistent",
+    # "insufficient_vram", "reload_failed", "apply_failed", "config_refused",
+    # "released", "live_reload", or None
     "cloud_only_reason": None,
     "cloud_only_startup": False,  # set by --cloud-only CLI flag before app start
     # (conversation_id, notice_kind) pairs already announced over the relay
@@ -340,7 +343,9 @@ class StatusResponse(BaseModel):
     model_id: str | None = None
     model_device: str | None = None  # cuda / cpu / None (cloud-only)
     mode: str  # "local" or "cloud-only"
-    # "explicit", "training", "gpu_conflict", "cuda_fault_persistent", or None
+    # "explicit", "training", "gpu_conflict", "cuda_fault_persistent",
+    # "insufficient_vram", "reload_failed", "apply_failed", "config_refused",
+    # "released", "live_reload", or None
     cloud_only_reason: str | None
     adapter_loaded: bool  # legacy: True when episodic main adapter is loaded
     # Rank of the episodic LoRA adapter (load-bearing for indexed-key recall).
@@ -1186,10 +1191,11 @@ class AcceptResponse(BaseModel):
         display-only text, never the command actually executed.
     cloud_only_reason:
         The reload primitive's own reason when a reload was attempted and
-        failed (one of ``_live_reload_base_model``'s closed vocabulary:
-        ``"insufficient_vram"``, ``"reload_failed"``, ``"apply_failed"``).
-        ``None`` when the apply was never attempted (see
-        ``restart_required_reason``) or when it succeeded.
+        failed or was refused (one of ``_live_reload_base_model``'s closed
+        vocabulary: ``"insufficient_vram"``, ``"reload_failed"``,
+        ``"apply_failed"``, ``"config_refused"``).  ``None`` when the apply
+        was never attempted (see ``restart_required_reason``) or when it
+        succeeded.
     """
 
     state: str
@@ -1232,10 +1238,11 @@ class RollbackResponse(BaseModel):
         ``False`` for R-PATHS and for failures.
     cloud_only_reason:
         The reload primitive's own reason when a reload was attempted and
-        failed (one of ``_live_reload_base_model``'s closed vocabulary:
-        ``"insufficient_vram"``, ``"reload_failed"``, ``"apply_failed"``).
-        ``None`` when the apply was never attempted (see
-        ``restart_required_reason``) or when it succeeded.
+        failed or was refused (one of ``_live_reload_base_model``'s closed
+        vocabulary: ``"insufficient_vram"``, ``"reload_failed"``,
+        ``"apply_failed"``, ``"config_refused"``).  ``None`` when the apply
+        was never attempted (see ``restart_required_reason``) or when it
+        succeeded.
     """
 
     state: str
@@ -3159,12 +3166,13 @@ async def lifespan(app: FastAPI):
             # sit behind the same degrade-not-crash posture as the drain wait
             # above and check_post_load_budget below: a VRAM shortfall here
             # produces a running cloud-only server, never a dead unit. Catch
-            # ONLY VramExhausted and the fatal-CUDA path — the config-vs-disk
-            # refusals inside _load_model_into_state (a populated interim
-            # ring left behind by a disabled episodic tier, a disabled tier
-            # whose registry still holds active keys, and the legacy adapter
-            # layout check) must abort the boot loudly, not be swallowed
-            # into a silent cloud-only degrade.
+            # ONLY VramExhausted and the fatal-CUDA path — a ConfigStoreMismatch
+            # raised inside _load_model_into_state (see
+            # paramem.server.config_store_validator.check_config_against_store:
+            # a populated interim ring left behind by a disabled episodic tier,
+            # or a disabled tier whose registry still holds active keys) must
+            # abort the boot loudly, not be swallowed into a silent cloud-only
+            # degrade.
             try:
                 _load_model_into_state(config)
             except VramExhausted:
@@ -4437,6 +4445,7 @@ _INVOLUNTARY_CLOUD_ONLY_REASONS: frozenset[str] = frozenset(
         "insufficient_vram",
         "reload_failed",
         "apply_failed",
+        "config_refused",
         "cuda_fault_persistent",
     }
 )
@@ -5980,13 +5989,17 @@ async def gpu_acquire():
     Recovery matches state certainty. When the reload primitive HANDLES the
     failure internally (returns a reason instead of raising) the process is
     known-clean — released to ~0 GiB VRAM, mode already cloud-only — so the
-    server just stays cloud-only and reports the reason in the response
-    (``reload_failed: true``); no restart is triggered. Insufficient free
-    VRAM (an external GPU consumer holds the device) is one such handled
-    reason and gets its own flag, ``deferred_insufficient_vram: true`` — a
+    server just stays cloud-only and reports the reason in both
+    ``cloud_only_reason`` and a reason-specific flag; no restart is
+    triggered. Insufficient free VRAM (an external GPU consumer holds the
+    device) gets its own flag, ``deferred_insufficient_vram: true`` — a
     restart there would only crash-loop on the lifespan VRAM budget gate.
-    Only an escaped exception (unknown process state) falls back to
-    ``_restart_service`` (``will_restart: true``).
+    A config that contradicts the store on disk (the residual race between
+    an earlier validation and this reload) reports
+    ``cloud_only_reason: "config_refused"`` with ``reload_failed: false`` —
+    a refused reload is not a failed one. Any other handled failure reports
+    ``reload_failed: true``. Only an escaped exception (unknown process
+    state) falls back to ``_restart_service`` (``will_restart: true``).
 
     Refuses (without touching hold state) while a consolidation cycle is
     in flight (503 ``consolidating`` — same idiom as ``/gpu/release``) or
@@ -6033,6 +6046,7 @@ async def gpu_acquire():
     deferred_insufficient_vram = False
     reload_failed = False
     will_restart = False
+    cloud_only_reason: str | None = None
     if needs_reload:
         try:
             from paramem.server.gpu_lock import gpu_lock
@@ -6136,9 +6150,23 @@ async def gpu_acquire():
                 # (unconditional, before its own VRAM gate) already leaves
                 # voice on CPU on every path that can produce this reason.
                 deferred_insufficient_vram = True
+                cloud_only_reason = reason
                 logger.warning(
                     "/gpu/acquire: insufficient free VRAM to reload the model — "
                     "staying cloud-only. Free the GPU and retry `pstatus --acquire`."
+                )
+            elif reason == "config_refused":
+                # The store changed between an earlier config-promotion door's
+                # validation and this reload — the reload's own refusal is the
+                # race safety net. A refused reload is not a FAILED one: the
+                # primitive already released and recorded an incident, so
+                # reload_failed stays False here — reload_failed means the
+                # load itself broke, not that it was correctly declined.
+                cloud_only_reason = reason
+                logger.error(
+                    "/gpu/acquire: reload refused — config contradicts the store "
+                    "on disk. Fix the config or the store, then retry "
+                    "`pstatus --acquire`."
                 )
             else:
                 # Handled failure ("reload_failed" / "apply_failed"): the
@@ -6146,6 +6174,7 @@ async def gpu_acquire():
                 # the server cloud-only in a known-clean state. No restart —
                 # recovery matches state certainty.
                 reload_failed = True
+                cloud_only_reason = reason
                 logger.error(
                     "/gpu/acquire: in-process reload failed (%s) — staying "
                     "cloud-only. Retry `pstatus --acquire` once the underlying "
@@ -6162,6 +6191,7 @@ async def gpu_acquire():
         "reloaded_live": reloaded_live,
         "deferred_insufficient_vram": deferred_insufficient_vram,
         "reload_failed": reload_failed,
+        "cloud_only_reason": cloud_only_reason,
     }
 
 
@@ -7740,78 +7770,23 @@ def _load_model_into_state(config) -> None:
     — where the lifespan's own ``apply_process_cap`` branch was
     skipped — still gets the safety bulkhead before any tensor
     allocation. ``apply_process_cap`` is idempotent.
+
+    Refuses (``ConfigStoreMismatch``) on a config that contradicts the
+    tier store already on disk — see
+    :func:`~paramem.server.config_store_validator.check_config_against_store`.
     """
     apply_process_cap(fraction=config.vram.process_cap_fraction)
     logger.info("Loading model: %s (%s)", config.model_name, config.model_config.model_id)
 
-    # Refuse to start on a legacy adapter layout (pre-2026-05-14 hierarchy
-    # refactor). Operator must run scripts/migrate/restructure_adapter_dir.py
-    # before restart. The new code paths use iter_interim_dirs() which scans
-    # adapter_dir/episodic/interim_*, so legacy adapter_dir/episodic_interim_*
-    # dirs would be invisible and produce a silently degraded server.
-    from paramem.memory.interim_adapter import detect_legacy_adapter_layout, iter_interim_dirs
+    check_config_against_store(config)
+    # The check just passed -- any config_refused incident from a prior
+    # crashed reload (or a now-fixed store) is stale. One record site
+    # (the reload's ConfigStoreMismatch handler) and one resolve site
+    # (here) cover boot and every reload alike, since both paths reach
+    # this line only through this one function.
+    resolve_incidents_by_type(data_state_dir(config.paths.data), "config_refused")
 
-    _legacy = detect_legacy_adapter_layout(config.adapter_dir)
-    if _legacy:
-        names = ", ".join(p.name for p in _legacy)
-        raise RuntimeError(
-            f"Legacy adapter layout detected at {config.adapter_dir} ({names}). "
-            "Run scripts/migrate/restructure_adapter_dir.py to relocate interim "
-            "adapters under adapter_dir/episodic/, then restart."
-        )
-
-    # Config-vs-disk companion to the config-document guards in
-    # paramem.server.config: episodic disabled with a populated interim
-    # ring on disk has no destination to absorb into. Disabling
-    # max_interim_count alone (setting it to 0) is not enough — it only
-    # stops MINTING new interim slots; an already-populated ring still sits
-    # on disk with no tier to drain into.
     _tier_configs = config.tier_config_map()
-    if "episodic" not in _tier_configs:
-        _stray_interims = list(iter_interim_dirs(config.adapter_dir))
-        if _stray_interims:
-            raise RuntimeError(
-                f"adapters.episodic.enabled=false but "
-                f"{len(_stray_interims)} interim slot(s) still exist under "
-                f"{config.adapter_dir / 'episodic'}.\n"
-                f"\n"
-                f"The interim ring has no destination tier to absorb into.\n"
-                f"\n"
-                f"Remediation:\n"
-                f"  - POST /consolidate to drain the ring into episodic, or\n"
-                f"  - POST /interim/discard to destroy it,\n"
-                f"    then disable episodic."
-            )
-
-    # A tier disabled while its own registry still holds active keys
-    # makes those keys unreachable: no adapter is created, no slot is
-    # mounted, and nothing rebuilds them at the next fold. Uses the same
-    # registry↔slot binding primitive the mount loop and migration path
-    # already resolve a tier's active key count through.
-    from paramem.adapters.registry_binding import verify_tier_binding
-    from paramem.memory.interim_adapter import adapter_slot_root_for_name
-    from paramem.utils.tiers import MAIN_TIERS
-
-    for _tier in MAIN_TIERS:
-        if _tier in _tier_configs:
-            continue
-        _tier_root = adapter_slot_root_for_name(config.adapter_dir, _tier)
-        _binding = verify_tier_binding(_tier, _tier_root)
-        if _binding.registry is not None and _binding.registry.list_active():
-            raise RuntimeError(
-                f"adapters.{_tier}.enabled=false but its registry at {_tier_root} "
-                f"holds {len(_binding.registry.list_active())} active key(s).\n"
-                f"\n"
-                f"Disabling a tier that still owns keys makes them unreachable — no "
-                f"adapter is created, no slot is mounted, and nothing rebuilds them "
-                f"at the next fold.\n"
-                f"\n"
-                f"Remediation:\n"
-                f"  - Drain the tier (fold/promote its keys elsewhere), or\n"
-                f"  - Erase its keys,\n"
-                f"    then disable it."
-            )
-
     with vram_measure("base") as _base_vm:
         model, tokenizer = load_base_model(config.model_config, _tier_configs)
     # Store the measured delta in the per-component VRAM ledger (bytes).
@@ -7881,7 +7856,7 @@ def _live_reload_base_model(
     refresh_config_from_disk: bool = False,
     rebuild_session_buffer: bool = False,
     lock_held: bool = False,
-) -> Literal["insufficient_vram", "reload_failed", "apply_failed"] | None:
+) -> Literal["insufficient_vram", "reload_failed", "apply_failed", "config_refused"] | None:
     """Release+reload the base model in-process to recover device memory.
 
     Used as the recovery path when STT cannot reload post-cycle because
@@ -7980,21 +7955,27 @@ def _live_reload_base_model(
 
     Returns
     -------
-    Literal["insufficient_vram", "reload_failed", "apply_failed"] or None
+    Literal["insufficient_vram", "reload_failed", "apply_failed", "config_refused"] or None
         ``None`` on success (mode is now ``"local"``).  On a handled
         failure, the same reason string just written to
         ``_state["cloud_only_reason"]`` — one of the closed vocabulary
-        ``"insufficient_vram"`` (VRAM preflight gate refused the load),
-        ``"reload_failed"`` (the model load itself raised, or the
+        ``"insufficient_vram"`` (the VRAM preflight gate refused the load,
+        OR the load itself raised ``VramExhausted``),
+        ``"reload_failed"`` (the model load raised anything else, or the
         plain-reclaim component rebuild raised after a successful load),
-        or ``"apply_failed"`` (the full config-apply component rebuild
-        raised after a successful load).  An exception that escapes this
-        function (not caught by any of the above) signals an UNHANDLED
-        failure — the caller cannot assume the process is in a known
-        clean state and should treat it differently from a returned
-        reason string.  This return value is the control-flow channel;
-        ``_state["cloud_only_reason"]`` keeps being written on every path
-        exactly as before because ``/status`` reads it directly.
+        ``"apply_failed"`` (the full config-apply component rebuild
+        raised after a successful load), or ``"config_refused"`` (the
+        store changed between an earlier validation and this load, so the
+        load itself raised ``ConfigStoreMismatch`` — a race safety net,
+        recorded as an incident; see
+        :func:`~paramem.server.config_store_validator.check_config_against_store`).
+        An exception that escapes this function (not caught by any of the
+        above) signals an UNHANDLED failure — the caller cannot assume the
+        process is in a known clean state and should treat it differently
+        from a returned reason string.  This return value is the
+        control-flow channel; ``_state["cloud_only_reason"]`` keeps being
+        written on every path exactly as before because ``/status`` reads
+        it directly.
 
     Note on the synchronous maintenance guard:
     When ``refresh_config_from_disk=True`` the CALLER (``_apply_config_live``)
@@ -8086,18 +8067,41 @@ def _live_reload_base_model(
         )
         return "insufficient_vram"
 
-    load_failed = False
+    failure_reason: Literal["insufficient_vram", "reload_failed", "config_refused"] | None = None
+    refusal_message: str | None = None
+    refusal_check: str | None = None
     try:
         _load_model_into_state(config)
-    except Exception:
+    except VramExhausted:
         # Log here (the traceback is still live), but do NOT free here:
         # the partially-loaded model is pinned by this active traceback,
         # so ``safe_empty_cache`` would not return its bytes. The cleanup
-        # runs below, after the except block drops the traceback.
+        # runs below, after the except block drops the traceback. Same
+        # terminal the boot path already maps VramExhausted to
+        # (app.py's lifespan VramExhausted handler).
+        logger.exception("Live model reload failed during base-model load — VRAM exhausted")
+        failure_reason = "insufficient_vram"
+    except ConfigStoreMismatch as exc:
+        # The residual race this primitive's own refusal is the safety net
+        # for: a door validated a candidate against the store, and the
+        # store changed (a fold, POST /interim/discard, POST
+        # /speaker/forget) before this reload re-checked it inside
+        # _load_model_into_state. Log here (traceback still live; see the
+        # note above) — the incident record and the release both run below,
+        # after the traceback drops.  Capture the exception's STRING content
+        # (message, check) rather than the exception object itself: holding
+        # the object would pin its traceback across the release below,
+        # falsifying this comment and defeating the release's own device-
+        # memory reclaim (see the note on the ``except Exception`` branch).
+        logger.exception("Live model reload refused — config contradicts the store")
+        refusal_message = str(exc)
+        refusal_check = exc.check
+        failure_reason = "config_refused"
+    except Exception:
         logger.exception("Live model reload failed during base-model load")
-        load_failed = True
+        failure_reason = "reload_failed"
 
-    if load_failed:
+    if failure_reason is not None:
         # (b) Fail clean. The traceback is gone now, so the partial model
         # is unreferenced — ``_release_base_model_in_process`` ->
         # ``safe_empty_cache`` (gc.collect + clearCublasWorkspaces +
@@ -8106,12 +8110,30 @@ def _live_reload_base_model(
         # caller's job: it must run outside the ``gpu_lock`` this function
         # may be holding (the auto-reclaim path calls us under that lock).
         _release_base_model_in_process()
-        _state["cloud_only_reason"] = "reload_failed"
-        logger.error(
-            "Live model reload failed — released partial allocation, "
-            "server stays cloud-only until the GPU frees or a restart."
-        )
-        return "reload_failed"
+        _state["cloud_only_reason"] = failure_reason
+        if failure_reason == "config_refused":
+            record_incident(
+                data_state_dir(config.paths.data),
+                type="config_refused",
+                key=refusal_check,
+                severity="failed",
+                summary=f"Config refused on reload: {refusal_message.splitlines()[0][:160]}",
+                detail={
+                    "message": refusal_message,
+                    "adapter_dir": str(config.adapter_dir),
+                },
+            )
+            logger.error(
+                "Live model reload refused — config contradicts the store on disk; "
+                "server stays cloud-only, no restart. Fix the config or the store, "
+                "then retry `pstatus --acquire`."
+            )
+        else:
+            logger.error(
+                "Live model reload failed — released partial allocation, "
+                "server stays cloud-only until the GPU frees or a restart."
+            )
+        return failure_reason
 
     if refresh_config_from_disk:
         # Config-apply path: full component rebuild via the shared routine.
@@ -11691,10 +11713,12 @@ async def migration_confirm(request: ConfirmRequest):
     Implements the 5-step atomic ordering:
 
     1. Acquire migration lock + verify STAGING + verify not consolidating +
-       **construct the candidate config** (``validate_candidate``).  All three
-       confirm branches (pure mode-switch, base swap, general trial) share this
-       gate, so an unbootable candidate is rejected before the first mutation —
-       before any backup, marker, ``state="TRIAL"``, or background task.
+       **construct the candidate config and check it against the tier store**
+       (``validate_candidate``).  All three confirm branches (pure
+       mode-switch, base swap, general trial) share this gate, so a
+       candidate that cannot boot, or that contradicts the tiers already on
+       disk, is rejected before the first mutation — before any backup,
+       marker, ``state="TRIAL"``, or background task.
     2. Write the pre-migration config backup slot (``backup_live_config``).
     3. Write ``state/trial.json`` marker.
     4. ``promote_config(candidate → configs/server.yaml)`` — re-read, re-hash-check,
@@ -14370,10 +14394,12 @@ async def migration_rollback():
     1. Re-verify inside lock (state=TRIAL).
     2. Snapshot B into rollback_pre_mortem backup.
     3. Resolve A config artifact from marker; decrypt it and **construct it as if
-       it already sat at the live config path** (``validate_candidate``) — a
-       backup is a config that was validated against a schema that may since have
-       grown new load-time guards, so restoring it is a second door onto the same
-       "unbootable config goes live" defect a candidate promotion closes.
+       it already sat at the live config path, and check it against the tier
+       store** (``validate_candidate``) — a backup is a config that was
+       validated against a schema (and a store) that may since have grown new
+       guards, so restoring it is a second door onto the same "unbootable /
+       store-contradicting config goes live" defect a candidate promotion
+       closes.
     4. Atomic rename A artifact → live config path.
     5. **Clear trial marker** (BEFORE rotation).
     6. Rotate trial adapter + graph (non-fatal; triggers 207 on failure).

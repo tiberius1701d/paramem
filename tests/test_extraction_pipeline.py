@@ -1013,20 +1013,22 @@ class TestPipelineMaxTokensThreading:
         sig = inspect.signature(_fallback_plausibility_on_raw)
         assert "max_tokens" in sig.parameters
 
-    def test_extract_and_anonymize_pins_anonymizer_default(self):
+    def test_chat_egress_forwards_the_callers_envelope(self):
         """``anonymize_turn`` (chat egress) must call ``anonymize`` with
-        the module's own default token envelope
-        (``_DEFAULT_ANONYMIZER_TOKEN_ENVELOPE``) — deliberately not
-        operator-tuned, matching ``extract_graph``'s own call to the
-        module default ``_DEFAULT_FILTER_MAX_TOKENS`` at this same call
-        site. One envelope, no second cap: there is no flat 2048
-        chat-egress ceiling distinct from the envelope.
+        the exact ``token_envelope`` its own caller passed in — never a
+        module default. The value asserted here is an arbitrary sentinel
+        (not 8192, the module default and also the shipped
+        ``extraction_anonymize_token_envelope`` default) so a silent
+        fallback to the module default would fail this test. Production's
+        caller, ``answer_via_cloud``, sources this value from
+        ``config.consolidation.extraction_anonymize_token_envelope`` — the
+        one operator envelope value project-wide.
         """
-        from paramem.cloud.anonymize import _DEFAULT_ANONYMIZER_TOKEN_ENVELOPE
         from paramem.graph.flows import anonymize_turn
 
         graph = _make_graph([("Alex", "lives_in", "Millfield")])
         captured = {}
+        sentinel_envelope = 4321
 
         def fake_anonymize(*args, **kwargs):
             captured.update(kwargs)
@@ -1058,9 +1060,28 @@ class TestPipelineMaxTokensThreading:
                 model,
                 tokenizer,
                 scrub={"person name"},
+                token_envelope=sentinel_envelope,
             )
 
-        assert captured.get("token_envelope") == _DEFAULT_ANONYMIZER_TOKEN_ENVELOPE
+        assert captured.get("token_envelope") == sentinel_envelope
+
+    def test_token_envelope_is_required(self):
+        """``anonymize_turn`` has no ``token_envelope`` default — calling
+        it without one raises ``TypeError``, pinning that no hidden
+        fallback can be reintroduced on this VRAM-safety-critical, same
+        standard as ``scrub``."""
+        from paramem.graph.flows import anonymize_turn
+
+        model = _peft_model_mock()
+        tokenizer = MagicMock()
+
+        with pytest.raises(TypeError):
+            anonymize_turn(
+                "Alex lives in Millfield.",
+                model,
+                tokenizer,
+                scrub={"person name"},
+            )
 
 
 class TestAnonymizeTurnSpeakerAnchorGate:
@@ -1111,6 +1132,7 @@ class TestAnonymizeTurnSpeakerAnchorGate:
                 speaker_id=speaker_id,
                 speaker_name=speaker_name,
                 scrub={"person name"},
+                token_envelope=8192,
             )
         return captured
 
@@ -1198,7 +1220,9 @@ class TestAnonymizeTurnRelationFreeTurn:
             patch("paramem.graph.flows.extract_graph", return_value=_make_graph([])),
             patch("paramem.graph.flows.anonymize", side_effect=fake_anonymize) as mock_anonymize,
         ):
-            payload = anonymize_turn(text, model, tokenizer, scrub={"person name"})
+            payload = anonymize_turn(
+                text, model, tokenizer, scrub={"person name"}, token_envelope=8192
+            )
         return payload, captured, mock_anonymize
 
     def test_zero_relations_reaches_the_anonymize_chain_with_empty_facts(self):
@@ -2351,6 +2375,7 @@ class TestValidityRuleSessionFlowEndToEnd:
                 model,
                 tokenizer,
                 scrub={"person name"},
+                token_envelope=8192,
             )
 
         assert payload.status != "failed"

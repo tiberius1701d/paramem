@@ -18,7 +18,7 @@ import torch
 
 from paramem.utils.vram_guard import (
     DEFAULT_PROCESS_FRACTION,
-    MIB_PER_TOKEN_TRANSIENT,
+    MIB_PER_PROMPT_TOKEN_PREFILL,
     VramExhausted,
     _mem_snapshot_mib,
     apply_process_cap,
@@ -274,12 +274,57 @@ class TestVramScopeTelemetry:
         assert "free=128 MiB" in fail_lines[0]
 
 
+class TestMibPerPromptTokenPrefillConstant:
+    """Pins the measured constant's value and states what it measures.
+
+    ``MIB_PER_PROMPT_TOKEN_PREFILL`` models the adapter-OFF prefill
+    transient in MiB per PROMPT token (2026-08-22 direct measurement:
+    three chunks of 7032/6760/6034 prompt tokens drew 1687/1622/1449 MiB,
+    ~0.24 MiB/prompt-token, corroborated across eleven runs Aug 1-21
+    2026) — not decode, not adapter-ON, not a total-envelope token.
+    """
+
+    def test_value_is_the_measured_2026_08_22_figure(self):
+        """The constant carries the direct-measurement value (0.24), not
+        the superseded 2026-07-28 fault-inference value (0.22)."""
+        assert MIB_PER_PROMPT_TOKEN_PREFILL == pytest.approx(0.24)
+
+    def test_name_states_prefill_per_prompt_token(self):
+        """The symbol name itself states what is measured: MiB per PROMPT
+        token of the PREFILL phase — never 'transient' alone, which said
+        nothing about which phase or token class."""
+        import paramem.utils.vram_guard as vram_guard_module
+
+        assert hasattr(vram_guard_module, "MIB_PER_PROMPT_TOKEN_PREFILL")
+        assert not hasattr(vram_guard_module, "MIB_PER_TOKEN_TRANSIENT")
+
+    def test_measured_chunk_fits_at_its_measured_free_vram(self):
+        """The measurement itself must be self-consistent through the
+        clamp: at 1687 MiB free (the 2026-08-22 measured transient for
+        the 7032-token chunk), the constant must admit approximately that
+        many supportable prompt tokens — pins the constant's MEANING
+        rather than re-asserting the literal against itself. The
+        constant (0.24) is a conservative rounding of the exact measured
+        ratio (0.2399), so the clamp admits very slightly fewer than the
+        measured chunk's own token count — within 1%, not exactly it."""
+        with (
+            patch("paramem.utils.vram_guard.torch.cuda.is_available", return_value=True),
+            patch("paramem.utils.vram_guard.safe_empty_cache"),
+            patch(
+                "paramem.utils.vram_guard.torch.cuda.mem_get_info",
+                return_value=(1687 * 2**20, 8192 * 2**20),
+            ),
+        ):
+            effective, _free_mib = effective_token_envelope(8192)
+        assert effective == pytest.approx(7032, rel=0.01)
+
+
 class TestEffectiveTokenEnvelope:
     """``effective_token_envelope`` — the dynamic VRAM clamp for the
     anonymize token envelope (owner-approved 2026-07-28).
 
     ``effective = min(configured_envelope, free_mib /
-    MIB_PER_TOKEN_TRANSIENT)`` — the configured value is a CEILING,
+    MIB_PER_PROMPT_TOKEN_PREFILL)`` — the configured value is a CEILING,
     live free VRAM only sizes a call DOWN, never up.
     """
 
@@ -325,7 +370,7 @@ class TestEffectiveTokenEnvelope:
             ),
         ):
             effective, free_mib = effective_token_envelope(8192)
-        expected = int(1191 / MIB_PER_TOKEN_TRANSIENT)
+        expected = int(1191 / MIB_PER_PROMPT_TOKEN_PREFILL)
         assert effective == expected
         assert effective < 8192
         assert free_mib == pytest.approx(1191.0)
@@ -335,7 +380,7 @@ class TestEffectiveTokenEnvelope:
         resolves to the configured value at the boundary (either
         formulation is correct at equality)."""
         configured = 1000
-        free_mib_val = configured * MIB_PER_TOKEN_TRANSIENT
+        free_mib_val = configured * MIB_PER_PROMPT_TOKEN_PREFILL
         with (
             patch("paramem.utils.vram_guard.torch.cuda.is_available", return_value=True),
             patch("paramem.utils.vram_guard.safe_empty_cache"),

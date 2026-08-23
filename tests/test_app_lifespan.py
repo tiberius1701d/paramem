@@ -1497,14 +1497,16 @@ class TestBootDegradeIsNarrowedToVramAndFatalCuda:
             app_module._state.pop("device_total_memory_bytes", None)
 
     def test_a_config_vs_disk_refusal_is_not_swallowed_into_cloud_only(self, tmp_path):
-        """A config-vs-disk-refusal-shaped RuntimeError raised from
-        _load_model_into_state is neither VramExhausted nor a fatal-CUDA
-        fault -- it must propagate out of lifespan and abort the boot, never
-        be swallowed into a silent cloud-only degrade."""
+        """A ``ConfigStoreMismatch`` raised from _load_model_into_state is
+        neither VramExhausted nor a fatal-CUDA fault -- it must propagate out
+        of lifespan and abort the boot, never be swallowed into a silent
+        cloud-only degrade. ``ConfigStoreMismatch`` is a ``RuntimeError``
+        subclass, so ``pytest.raises(RuntimeError, ...)`` still holds."""
         import pytest
 
         from paramem.server import app as app_module
         from paramem.server.config import PathsConfig, ServerConfig
+        from paramem.server.config_store_validator import ConfigStoreMismatch
 
         config = ServerConfig(model_name="mistral")
         config.cloud_only = False
@@ -1532,7 +1534,9 @@ class TestBootDegradeIsNarrowedToVramAndFatalCuda:
                 patch.object(
                     app_module,
                     "_load_model_into_state",
-                    side_effect=RuntimeError(refusal_message),
+                    side_effect=ConfigStoreMismatch(
+                        refusal_message, check="interim_ring_without_episodic"
+                    ),
                 ),
             ):
 

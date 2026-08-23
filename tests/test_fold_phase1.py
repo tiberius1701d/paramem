@@ -806,6 +806,136 @@ class TestPromotion:
         assert working["semantic"].rows["graph1"]["promoted"] is True
         assert working["semantic"].rows["graph1"]["reinforcement_count"] == 2
 
+    def test_attribute_key_promotes_after_one_re_observation_at_threshold_2(self, tmp_path):
+        """An attribute-typed key reaches ``promotion_threshold`` through the
+        same one credit surface an edge-typed key does
+        (``_apply_working_reinforcement_credit`` -> ``_promote_working_keys``).
+        Mirrors ``test_net_new_key_promotes_only_after_one_re_observation_at_threshold_2``
+        above, except the re-observation is credited through
+        ``adopt_reinforcements`` (the attribute gate's keyless-onto-keyed
+        arm's own effect) rather than a hand-set row mutation, and the
+        seeded row carries ``relation_type='attribute'``."""
+        loop = _make_loop(tmp_path)
+        loop.config.promotion_threshold = 2
+        loop.store.registry("episodic").add("graph1")
+        loop.store.set_bookkeeping(
+            "graph1",
+            speaker_id="speaker0",
+            relation_type="attribute",
+            reinforcement_count=1,
+            last_reinforced_cycle=0,
+            last_seen="2026-01-01T00:00:00Z",
+            first_seen="2026-01-01T00:00:00Z",
+            promoted=False,
+        )
+        loop.store.put(
+            "episodic",
+            "graph1",
+            {"key": "graph1", "subject": "alex", "predicate": "has email", "object": "a@b.com"},
+            register=False,
+        )
+
+        working = loop._recall_working_tiers(
+            {"episodic": "episodic", "semantic": "semantic"},
+            {},
+            _recalled_entries_from_store(loop),
+        )
+        first_pass = loop._promote_working_keys(working)
+
+        assert first_pass == []
+        assert "graph1" in working["episodic"].registry.list_active()
+        assert "graph1" not in working["semantic"].registry.list_active()
+
+        # The attribute gate's keyless-onto-keyed re-observation arm writes
+        # exactly this shape into adopt_reinforcements — a strictly-newer
+        # window than the row's current last_seen so the credit is earned.
+        loop._apply_working_reinforcement_credit(
+            working, {"graph1": ("2026-02-01T00:00:00Z", "2026-01-01T00:00:00Z")}
+        )
+        assert working["episodic"].rows["graph1"]["reinforcement_count"] == 2
+
+        second_pass = loop._promote_working_keys(working)
+
+        assert second_pass == ["graph1"]
+        assert "graph1" not in working["episodic"].registry.list_active()
+        assert "graph1" in working["semantic"].registry.list_active()
+        assert working["semantic"].rows["graph1"]["promoted"] is True
+        assert working["semantic"].rows["graph1"]["reinforcement_count"] == 2
+        assert working["semantic"].rows["graph1"]["relation_type"] == "attribute"
+
+    def test_attribute_key_promotes_via_stage_event_reinforcement_credit_arc(self, tmp_path):
+        """The real production arc, not a hand-fed credit dict: the
+        attribute gate's keyless-onto-keyed arm (``merger.py``) writes into
+        ``self.merger.adopt_reinforcements`` during the pending-relations
+        merge (``credit_adopt_reinforcement=True``,
+        ``consolidation.py`` ~4649), :meth:`GraphTierRefiner.refine`
+        (``graph_tier.py`` ~604-611) copies that dict onto
+        ``result.adopt_reinforcements``, :meth:`stage_event` feeds it into
+        :meth:`_apply_working_reinforcement_credit` (~4680), and
+        ``promote=True`` runs :meth:`_promote_working_keys` in the same
+        pass -- proving the arm reaches promotion through the real fold
+        path (merger -> refiner -> credit -> promote), not through a
+        hand-set row or a hand-fed ``adopt_reinforcements`` dict."""
+        loop = _make_loop(tmp_path)
+        loop.config.promotion_threshold = 2
+        loop.store.registry("episodic").add("graph1")
+        loop.store.set_bookkeeping(
+            "graph1",
+            speaker_id="speaker0",
+            relation_type="attribute",
+            reinforcement_count=1,
+            last_reinforced_cycle=0,
+            last_seen="2026-01-01T00:00:00Z",
+            first_seen="2026-01-01T00:00:00Z",
+            promoted=False,
+        )
+        loop.store.put(
+            "episodic",
+            "graph1",
+            {"key": "graph1", "subject": "alex", "predicate": "has email", "object": "a@b.com"},
+            register=False,
+        )
+
+        result = loop.stage_event(
+            recalled_entries=_recalled_entries_from_store(loop),
+            event="full",
+            venue="weights",
+            stamp="stampF",
+            primary_tiers={"episodic": "episodic", "semantic": "semantic"},
+            episodic_rels=[
+                _rel(
+                    "alex",
+                    "has_email",
+                    "a@b.com",
+                    relation_type="attribute",
+                    speaker_id="speaker0",
+                    last_seen="2026-02-01T00:00:00Z",
+                )
+            ],
+            promote=True,
+        )
+        assert result is not None
+
+        episodic_keyed = json.loads(
+            (_shadow_dir(loop, "full", "episodic") / "keyed.json").read_text()
+        )
+        assert episodic_keyed == [], "the promoted key must leave the episodic shadow tier"
+
+        semantic_keyed = json.loads(
+            (_shadow_dir(loop, "full", "semantic") / "keyed.json").read_text()
+        )
+        assert [row["key"] for row in semantic_keyed] == ["graph1"]
+        assert semantic_keyed[0]["object"] == "a@b.com"
+
+        semantic_rows = json.loads(
+            (_shadow_dir(loop, "full", "semantic") / "key_metadata.json").read_text()
+        )["keys"]
+        assert semantic_rows["graph1"]["reinforcement_count"] == 2, (
+            "the keyless re-observation must have earned credit through the "
+            "real merge -> refine -> credit -> promote arc, not a hand-fed dict"
+        )
+        assert semantic_rows["graph1"]["promoted"] is True
+
 
 class TestApplyWorkingReinforcementCreditDirect:
     """Direct unit tests of
