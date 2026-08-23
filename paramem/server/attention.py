@@ -1281,7 +1281,8 @@ def _collect_voice_degradation_items(state: dict, config) -> list[AttentionItem]
     synthesis latency; without a signal the operator sees only a slower
     response and cannot tell why. This item names the IMPACT (latency) and
     the SOURCE (mapped from ``cloud_only_reason``; ``None`` in local mode
-    means the STT/TTS GPU load itself failed).
+    means either a run in progress — ``state["consolidating"]`` true — or,
+    absent that, the STT/TTS GPU load itself failed).
 
     No-emit when:
     - ``config`` is None (unit-test shim);
@@ -1290,6 +1291,13 @@ def _collect_voice_degradation_items(state: dict, config) -> list[AttentionItem]
       "explicit"``) — CPU voice is then intended, not degraded;
     - neither STT nor TTS is enabled-and-configured-for-GPU (CPU is then the
       configured default, not a degradation).
+
+    A consolidation or calibration run in progress (``state["consolidating"]``
+    true, ``cloud_only_reason`` still ``None``) still emits — voice really is
+    on CPU — but with its own cause and action hint: the eviction is a
+    deliberate, self-resolving property of the run's own envelope
+    (:func:`~paramem.server.app._dispatch_to_executor`), not a fault, so
+    there is nothing for the operator to act on.
     """
     if config is None:
         return []
@@ -1310,19 +1318,24 @@ def _collect_voice_degradation_items(state: dict, config) -> list[AttentionItem]
     if not (stt_gpu or tts_gpu):
         return []
 
-    cause = {
-        "insufficient_vram": "insufficient GPU VRAM (external process holds the device)",
-        "reload_failed": "base-model GPU reload failed",
-        "apply_failed": "config-apply component rebuild failed after reload",
-        "config_refused": "config contradicts the store on disk",
-        "cuda_fault_persistent": (
-            "CUDA crash-loop guard exhausted — degraded to persistent cloud-only"
-        ),
-        "training": "GPU deferred for background training",
-        "gpu_conflict": "GPU occupied by another process at startup",
-        "released": "GPU released to another consumer",
-        "live_reload": "base-model reload in progress",
-    }.get(reason, "STT/TTS GPU load failed" if reason is None else str(reason))
+    if reason is None and state.get("consolidating"):
+        cause = "consolidation or calibration run in progress — GPU voice returns at its terminal"
+        action_hint = "wait for the run to finish; no operator action"
+    else:
+        cause = {
+            "insufficient_vram": "insufficient GPU VRAM (external process holds the device)",
+            "reload_failed": "base-model GPU reload failed",
+            "apply_failed": "config-apply component rebuild failed after reload",
+            "config_refused": "config contradicts the store on disk",
+            "cuda_fault_persistent": (
+                "CUDA crash-loop guard exhausted — degraded to persistent cloud-only"
+            ),
+            "training": "GPU deferred for background training",
+            "gpu_conflict": "GPU occupied by another process at startup",
+            "released": "GPU released to another consumer",
+            "live_reload": "base-model reload in progress",
+        }.get(reason, "STT/TTS GPU load failed" if reason is None else str(reason))
+        action_hint = "free the GPU; ParaMem restores GPU voice on the next reclaim"
 
     components = "/".join(c for c, on in (("STT", stt_gpu), ("TTS", tts_gpu)) if on)
     summary = f"Voice DEGRADED — {components} on CPU, higher speech latency (cause: {cause})"
@@ -1331,7 +1344,7 @@ def _collect_voice_degradation_items(state: dict, config) -> list[AttentionItem]
             kind="voice_degraded",
             level="info",
             summary=summary,
-            action_hint="free the GPU; ParaMem restores GPU voice on the next reclaim",
+            action_hint=action_hint,
             age_seconds=None,
         )
     ]

@@ -761,6 +761,43 @@ def test_voice_degraded_local_mode_load_failure_source():
     assert "GPU load failed" in items[0].summary
 
 
+def test_voice_degraded_consolidating_names_the_run_not_a_fault():
+    """reason is None AND a consolidation/calibration run is in progress →
+    the cause names the run's own envelope, not a GPU-load failure, and the
+    action hint tells the operator there is nothing to do."""
+    state = {"voice_profile": "cpu", "cloud_only_reason": None, "consolidating": True}
+    items = _collect_voice_degradation_items(state, _voice_cfg())
+    assert len(items) == 1
+    assert "consolidation or calibration run in progress" in items[0].summary
+    assert "GPU load failed" not in items[0].summary
+    assert items[0].action_hint == "wait for the run to finish; no operator action"
+
+
+def test_voice_degraded_consolidating_false_keeps_the_load_failure_cause():
+    """consolidating explicitly False behaves exactly like the reason=None
+    default case above -- the branch keys on truthiness, not presence."""
+    state = {"voice_profile": "cpu", "cloud_only_reason": None, "consolidating": False}
+    items = _collect_voice_degradation_items(state, _voice_cfg())
+    assert len(items) == 1
+    assert "GPU load failed" in items[0].summary
+    assert items[0].action_hint == "free the GPU; ParaMem restores GPU voice on the next reclaim"
+
+
+def test_voice_degraded_consolidating_ignored_when_reason_is_set():
+    """A real cloud_only_reason outranks `consolidating` -- the run-in-
+    progress cause only applies to the reason=None (STT/TTS GPU load
+    failure) branch."""
+    state = {
+        "voice_profile": "cpu",
+        "cloud_only_reason": "insufficient_vram",
+        "consolidating": True,
+    }
+    items = _collect_voice_degradation_items(state, _voice_cfg())
+    assert len(items) == 1
+    assert "insufficient GPU VRAM" in items[0].summary
+    assert "consolidation or calibration run in progress" not in items[0].summary
+
+
 def test_voice_degraded_components_reflect_only_enabled_gpu_component():
     """Only TTS configured for GPU (STT disabled) → summary names TTS only."""
     state = {"voice_profile": "cpu", "cloud_only_reason": "insufficient_vram"}

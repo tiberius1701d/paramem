@@ -17,6 +17,8 @@ from __future__ import annotations
 from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from paramem.training.consolidation import PendingRelations
 
 
@@ -60,7 +62,7 @@ def _make_config(mode: str = "train", tmp_path=None) -> MagicMock:
     return cfg
 
 
-def _make_state_patch(pending: list[dict], config, *, target_profile: str = "gpu") -> tuple:
+def _make_state_patch(pending: list[dict], config) -> tuple:
     mock_buffer = MagicMock()
     mock_buffer.get_pending.return_value = pending
     mock_buffer.pending_count = len(pending)
@@ -88,8 +90,8 @@ def _make_state_patch(pending: list[dict], config, *, target_profile: str = "gpu
         "ha_client": None,
         "speaker_store": None,
         "consolidating": True,
-        "mode": "local" if target_profile == "gpu" else "cloud-only",
-        "voice_profile": target_profile,
+        "mode": "local",
+        "voice_profile": "gpu",
         "chunk_failures": [],
         "router": MagicMock(),
         "event_loop": None,
@@ -98,11 +100,11 @@ def _make_state_patch(pending: list[dict], config, *, target_profile: str = "gpu
 
 
 @contextmanager
-def _patch_extract_training(pending, config, loop, *, target_profile: str = "gpu"):
+def _patch_extract_training(pending, config, loop):
     """Patch ``_state`` for ``_extract_and_start_training`` calls."""
     import paramem.server.app as app_module
 
-    state_patch, mock_buffer = _make_state_patch(pending, config, target_profile=target_profile)
+    state_patch, mock_buffer = _make_state_patch(pending, config)
 
     with (
         patch.dict(app_module._state, state_patch, clear=False),
@@ -285,6 +287,98 @@ class TestConsolidationRunDoneNoOpOnCleanReturn:
 
 
 # ---------------------------------------------------------------------------
+# Every submission through _dispatch_to_executor evicts the GPU voice pair
+# before the run's own entry point runs -- one envelope, so a staging action
+# and a calibrate action see the identical VRAM regime.
+# ---------------------------------------------------------------------------
+
+
+class TestDispatchToExecutorEvictsVoiceBeforeEntryPoint:
+    def _dispatch_and_run_submission(self, *, action, spec=None):
+        """Call ``_dispatch_to_executor`` against a fake event loop that
+        records the submitted callable instead of running it, then invoke
+        that callable directly (as the executor thread would) and return the
+        call order recorded by the ``_set_voice_pipeline_profile`` /
+        entry-point spies.
+        """
+        import paramem.server.app as app_module
+
+        calls: list[tuple] = []
+        loop = MagicMock()
+        submitted: list = []
+
+        def _submit(executor, fn):
+            submitted.append(fn)
+            future = MagicMock()
+            future.add_done_callback.return_value = None
+            return future
+
+        loop.run_in_executor.side_effect = _submit
+        state = {"consolidating": False, "event_loop": loop}
+
+        def _fake_evict(profile, *, lock_held=False) -> None:
+            calls.append(("evict", profile, lock_held))
+
+        def _entry() -> None:
+            calls.append(("entry",))
+
+        with (
+            patch.object(app_module, "_state", state),
+            patch.object(app_module, "_set_voice_pipeline_profile", _fake_evict),
+        ):
+            status = app_module._dispatch_to_executor(_entry, "started", action=action, spec=spec)
+            assert len(submitted) == 1, "exactly one callable submitted to the executor"
+            submitted[0]()  # run it, as the executor thread would -- still inside the
+            # patched scope, since the real _set_voice_pipeline_profile must never run
+            # against a fake _state.
+        return status, calls
+
+    def test_staging_action_runs_voice_eviction_before_the_entry_point(self) -> None:
+        from paramem.server.consolidation_action import ConsolidationAction
+
+        status, calls = self._dispatch_and_run_submission(action=ConsolidationAction.INTERIM)
+
+        assert status == "started"
+        assert calls == [("evict", "cpu", False), ("entry",)], (
+            "voice must be evicted before the staging entry point runs"
+        )
+
+    def test_calibrate_action_runs_voice_eviction_before_the_entry_point(self) -> None:
+        from paramem.server.consolidation_action import ConsolidationAction
+
+        status, calls = self._dispatch_and_run_submission(
+            action=ConsolidationAction.CALIBRATE, spec=MagicMock()
+        )
+
+        assert status == "started"
+        assert calls == [("evict", "cpu", False), ("entry",)], (
+            "voice must be evicted before the calibrate entry point runs"
+        )
+
+    def test_eviction_failure_propagates_and_never_reaches_the_entry_point(self) -> None:
+        """``_run_evicted`` adds no exception handling of its own (its own
+        documented contract): an eviction failure must propagate to the
+        caller UNCHANGED, and the entry point it wraps must never run --
+        the executor future then carries the eviction's own exception,
+        exactly as if this wrapper did not exist."""
+        import paramem.server.app as app_module
+
+        entry_calls: list[str] = []
+
+        def _entry() -> None:
+            entry_calls.append("entry")
+
+        def _raising_evict(profile, *, lock_held=False) -> None:
+            raise RuntimeError("voice eviction boom")
+
+        with patch.object(app_module, "_set_voice_pipeline_profile", _raising_evict):
+            with pytest.raises(RuntimeError, match="voice eviction boom"):
+                app_module._run_evicted(_entry)
+
+        assert entry_calls == [], "the entry point must never run when eviction raises"
+
+
+# ---------------------------------------------------------------------------
 # 44 — enrichment_degraded / vram-headroom-attention authority.
 # Structural: the extract_pending route's own dispatch closure never
 # arbitrates enrichment incidents or copies a vram-headroom warning into
@@ -435,84 +529,3 @@ class TestCalibrateNeverRetiresASession:
         # The session is still on disk, pending -- a calibrate run wrote no
         # retention side effect at all.
         assert [s["session_id"] for s in buffer.get_pending()] == [expected_session_id]
-
-
-# ---------------------------------------------------------------------------
-# Voice eviction fires for a document-shaped batch, exactly
-# once, and the interim path's restore happens after training (i.e. NOT
-# inside the extraction stage itself -- _extract_pending_sessions never
-# restores; only its callers do, at their own terminal).
-# ---------------------------------------------------------------------------
-
-
-class TestDocumentBatchEvictsVoiceExactlyOnce:
-    def test_document_session_evicts_voice_inside_the_lock(self, tmp_path) -> None:
-        import paramem.server.app as app_module
-
-        pending = _make_pending(source_type="document", n=1)
-        config = _make_config(tmp_path=tmp_path)
-        loop = _make_loop_no_qa()
-
-        state_patch, _mock_buffer = _make_state_patch(pending, config, target_profile="gpu")
-        with (
-            patch.dict(app_module._state, state_patch, clear=False),
-            patch("paramem.server.app._set_voice_pipeline_profile") as mock_profile,
-            patch("paramem.server.app.check_vram_headroom"),
-            patch("paramem.server.app.vram_scope") as mock_vram_scope,
-        ):
-            mock_vram_scope.return_value.__enter__ = MagicMock(return_value=None)
-            mock_vram_scope.return_value.__exit__ = MagicMock(return_value=False)
-            result = app_module._extract_pending_sessions(loop, lock_held=True)
-
-        assert result.evicted_voice is True
-        # Exactly one eviction call (to "cpu"), and _extract_pending_sessions
-        # itself never restores -- that is its caller's job at its own
-        # terminal (see _end_voice_eviction's three declared call sites).
-        calls = mock_profile.call_args_list
-        assert len(calls) == 1
-        args, kwargs = calls[0]
-        assert args[0] == "cpu"
-        assert kwargs.get("lock_held") is True
-
-    def test_transcript_only_batch_never_evicts(self, tmp_path) -> None:
-        import paramem.server.app as app_module
-
-        pending = _make_pending(source_type="transcript", n=1)
-        config = _make_config(tmp_path=tmp_path)
-        loop = _make_loop_no_qa()
-
-        state_patch, _mock_buffer = _make_state_patch(pending, config, target_profile="gpu")
-        with (
-            patch.dict(app_module._state, state_patch, clear=False),
-            patch("paramem.server.app._set_voice_pipeline_profile") as mock_profile,
-            patch("paramem.server.app.check_vram_headroom"),
-            patch("paramem.server.app.vram_scope") as mock_vram_scope,
-        ):
-            mock_vram_scope.return_value.__enter__ = MagicMock(return_value=None)
-            mock_vram_scope.return_value.__exit__ = MagicMock(return_value=False)
-            result = app_module._extract_pending_sessions(loop, lock_held=True)
-
-        assert result.evicted_voice is False
-        mock_profile.assert_not_called()
-
-    def test_interim_no_facts_terminal_restores_exactly_once_after_extraction(
-        self, tmp_path
-    ) -> None:
-        """The whole-cycle path (_extract_and_start_training's no-facts arm)
-        evicts once (inside the lock) and restores once (outside the lock,
-        after the extraction stage has returned) -- two calls total, never a
-        second eviction and never a restore before extraction completes."""
-        import paramem.server.app as app_module
-
-        pending = _make_pending(source_type="document", n=1)
-        config = _make_config(tmp_path=tmp_path)
-        loop = _make_loop_no_qa()
-
-        with _patch_extract_training(pending, config, loop) as (mock_profile, _mock_buffer):
-            app_module._extract_and_start_training()
-
-        calls = mock_profile.call_args_list
-        profiles_in_order = [c.args[0] for c in calls]
-        assert profiles_in_order == ["cpu", "gpu"], (
-            f"expected exactly one evict then one restore, in that order; got {calls}"
-        )

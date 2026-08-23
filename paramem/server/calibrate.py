@@ -735,7 +735,6 @@ class CalibrationRunSpec:
         params: The request's :class:`CalibrateParams`.
         overrides: ``{production basename: variant CONTENT}`` for
             :func:`~paramem.graph.prompts.prompt_overrides`.
-        evicts_voice: Whether this run's own artifact is document-shaped.
     """
 
     stage: str
@@ -747,7 +746,6 @@ class CalibrationRunSpec:
     supports_seed: bool
     params: CalibrateParams
     overrides: dict[str, str] = field(default_factory=dict)
-    evicts_voice: bool = False
 
 
 def run_stage(spec: CalibrationRunSpec, state: dict) -> dict[str, Any]:
@@ -967,10 +965,6 @@ def validate_chain(state: dict, use_case: str, req: CalibrateChainRequest) -> di
                 detail=f"Invalid SessionGraph payload: {exc}",
             ) from exc
     resolved["overrides"] = resolve_prompt_variants(state, req.prompt_variants)
-    # Document-shaped only for the transcript-injecting use cases: a
-    # mid-chain endpoint (injects="graph") never runs the dense-chunk
-    # extraction regime the eviction exists for.
-    resolved["evicts_voice"] = decl.injects == "transcript" and req.source_type == "document"
     return resolved
 
 
@@ -1608,7 +1602,6 @@ def build_spec(
             supports_seed=True,
             params=req.params,
             overrides=resolved["overrides"],
-            evicts_voice=resolved["evicts_voice"],
         )
     decl = _STANDALONE[stage]
     resolved = decl.validate(state, req)

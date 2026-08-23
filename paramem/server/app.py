@@ -10889,13 +10889,15 @@ def _run_calibration_sync(spec: "calibrate_module.CalibrationRunSpec") -> None:
     Executor entry point.  Opens the run's artifact root INSIDE this frame
     (``run_in_executor`` does not carry the caller's ContextVars, so the
     scope must be opened on the worker thread), applies the operator's
-    prompt overrides for the whole run, evicts voice when the run's own
-    artifact is document-shaped, takes the GPU cooldown gate and the GPU
-    lock, pins cuDNN determinism, calls
+    prompt overrides for the whole run, takes the GPU cooldown gate and the
+    GPU lock, pins cuDNN determinism, calls
     :func:`~paramem.server.calibrate.run_stage`, writes ``response.json``,
     and exits through :func:`_consolidation_terminal`.  This is the one
     owner of the ``calibration_run``/``prompt_overrides`` scope for a real
-    dispatch — nothing else opens it.
+    dispatch — nothing else opens it.  Voice eviction is not this function's
+    business — :func:`_dispatch_to_executor` already evicted it before this
+    frame ever started running; this function only restores it, at its own
+    terminal below.
 
     Stages no event: no PEFT slot, no ``stage_event``, no stage ledger, no
     training, no session retirement, no production incident or attention
@@ -10911,8 +10913,6 @@ def _run_calibration_sync(spec: "calibrate_module.CalibrationRunSpec") -> None:
         label="fold",
     )
     with calibration_run(spec.artifact_dir), prompt_overrides(spec.overrides):
-        if spec.evicts_voice:
-            _set_voice_pipeline_profile("cpu", lock_held=False)
         with gpu_lock_sync(), calibrate_module._cudnn_deterministic():
             payload = calibrate_module.run_stage(spec, _state)
         _end_voice_eviction(lock_held=False)
@@ -17041,6 +17041,22 @@ def _stamp_scheduled_run(config) -> None:
     )
 
 
+def _run_evicted(fn: Callable[[], None]) -> None:
+    """Evict the GPU voice pair, then run *fn* — the executor-thread wrapper
+    every dispatched run passes through.
+
+    Runs on the executor thread, ahead of the run's own entry point.
+    ``_set_voice_pipeline_profile("cpu", lock_held=False)`` acquires the GPU
+    lock itself and is idempotent (early return when the profile is already
+    ``cpu``), so a cloud-only server pays nothing.  No exception handling of
+    its own: an eviction failure or an *fn* failure propagates unchanged to
+    the executor future, so :func:`_consolidation_run_done` sees exactly
+    what it would have seen without this wrapper.
+    """
+    _set_voice_pipeline_profile("cpu", lock_held=False)
+    fn()
+
+
 def _dispatch_to_executor(
     fn: Callable[[], None],
     status: str,
@@ -17061,6 +17077,18 @@ def _dispatch_to_executor(
     would let two runs go concurrently, and the second would die in
     ``_ensure_staging_slot`` (``paramem/training/trainer.py``) or corrupt a
     calibration run's own artifact scope.
+
+    A run's lifetime — for VRAM purposes — is dispatch to terminal, not
+    whatever *fn* itself decides to do: eviction is a property of THIS
+    envelope, not of any one action or artifact shape.  Every submission
+    wraps *fn* in :func:`_run_evicted`, which evicts the GPU voice pair
+    before calling it, so AUTO/FULL/INTERIM/RECONCILE folds, a pending-event
+    resume, an active-store migration, and every ``/calibrate/*`` route see
+    the identical VRAM regime regardless of action or input shape.  Voice
+    keeps serving from the always-resident CPU pair meanwhile.  Restore is
+    symmetric at the run's terminal — :func:`_end_voice_eviction`, fired
+    unconditionally by every terminal frame (see its own docstring) — never
+    threaded through this function.
 
     Args:
         fn: The zero-arg sync entry point (``_extract_and_start_training``,
@@ -17094,7 +17122,7 @@ def _dispatch_to_executor(
     # ``_state["event_loop"]`` is a real startup bug, so there is deliberately
     # no fallback.
     event_loop = _state["event_loop"]
-    future = event_loop.run_in_executor(None, fn)
+    future = event_loop.run_in_executor(None, functools.partial(_run_evicted, fn))
     future.add_done_callback(functools.partial(_consolidation_run_done, action, spec))
     return status
 
@@ -17349,6 +17377,7 @@ def _run_pending_event_resume() -> None:
             result = _finish_resumed_event(loop, staged_event, router=_state.get("router"))
         except ConsolidationResumeBlocked as exc:
             _record_consolidation_resume_blocked_incident(exc, ledger.event)
+            _end_voice_eviction(lock_held=False)
             _consolidation_terminal(None)
             return
         finalizer = (
@@ -17356,6 +17385,7 @@ def _run_pending_event_resume() -> None:
             if not _sl.full_topology(ledger.event)
             else functools.partial(_finalize_full, loop, result)
         )
+        _end_voice_eviction(lock_held=False)
         _consolidation_terminal(finalizer)
         return
 
@@ -18084,14 +18114,23 @@ def _end_voice_eviction(*, lock_held: bool) -> None:
     would deadlock), ``False`` on the event loop and on an executor thread
     that has already released it.
 
-    Terminal frames — three:
+    Terminal frames:
 
     - ``_run_stage_b_cycle``'s worker, wrapped around ``body(loop, bt)`` so
       it covers the success terminal and the crash terminal alike
       (``lock_held=True``).
-    - The executor body of a run that ends without dispatching to Stage B —
-      ``_extract_and_start_training``'s abort / no-facts / simulate arms,
-      and ``_run_calibration_sync`` (``lock_held=False``).
+    - ``_extract_and_start_training``'s abort / no-facts / simulate arms —
+      the executor body of a run that ends without dispatching to Stage B
+      (``lock_held=False``).
+    - ``_run_calibration_sync``, at the close of its own run (``lock_held=False``).
+    - ``_run_pending_event_resume``'s disk-venue arm, at both its
+      resume-blocked and its normal-completion exit (the weights venue
+      routes through ``_run_stage_b_cycle``'s worker above instead)
+      (``lock_held=False``).
+    - ``_run_active_store_migration_sync``'s early return when the pending
+      migration's state file is already gone (the real migration work
+      routes through ``_run_stage_b_cycle``'s worker above instead)
+      (``lock_held=False``).
     - ``_consolidation_run_done`` (the executor future's done callback)
       (``lock_held=False``).
     """
@@ -19098,8 +19137,9 @@ class _PendingExtraction:
     The stage NEVER raises ``ExtractionFailed``: an abort is reported in
     *aborted* so the caller can restore the voice pipeline with the
     ``lock_held`` value its own lock context demands.  Raising would leave
-    the caller no way to learn whether voice was evicted, and a
-    ``finally``-based restore would fire with the GPU lock still held.
+    the caller no way to reach its own terminal with the right lock
+    context, and a ``finally``-based restore would fire with the GPU lock
+    still held.
 
     Attributes
     ----------
@@ -19124,9 +19164,6 @@ class _PendingExtraction:
     speaker_ids:
         Speaker id per successfully-extracted session (the interim path
         takes the last one as the cycle's primary speaker).
-    evicted_voice:
-        ``True`` when the batch contained a document session and the stage
-        moved the voice pipeline to CPU.  The CALLER owns the restore.
     pending:
         The fold's input — this batch's merged extraction product, captured
         (and the extraction graph's keying surface reset) exactly once, at
@@ -19163,7 +19200,6 @@ class _PendingExtraction:
     session_ids: list[str]
     failed_session_ids: set[str]
     speaker_ids: list[str]
-    evicted_voice: bool
     pending: "PendingRelations"
     per_session: list[dict]
     chunk_failures: list[dict]
@@ -19239,22 +19275,6 @@ def _extract_pending_sessions(loop, *, lock_held: bool) -> _PendingExtraction:
     UNIDENTIFIABLE sessions and retired expired HOLDABLE ones; this filters the
     executor-time snapshot so extraction never runs on an unattributed session.
 
-    Voice eviction fires when the pending batch contains ANY document session.
-    Document chunks have no density bound — a dense ~934-word chunk (the
-    current ``paramem.graph.document_chunker._DOC_MAX_TOKENS`` ceiling,
-    derived from the anonymize-call token envelope — was ~1500 words before
-    that derivation landed) is the regime that exhausts VRAM on this 8 GiB
-    host once the ~1.5 GiB STT+TTS GPU pair sits on top of the 4-bit base
-    and the extraction chain's working-set peak.  A *mixed* batch (one
-    transcript probe + several dense docs) is the
-    case that bit us: one transcript session used to keep voice resident through
-    the dense doc extraction and the plausibility filter's KV-cache growth OOM'd
-    mid-generate.  Eviction is cheap — the CPU STT/TTS pair stays resident, so
-    voice still works during the cycle, just on CPU.  A pure-transcript batch
-    keeps the GPU voice pair resident: turn-by-turn dialog is not the dense
-    regime and likely implies recent voice activity where the lazy GPU reload
-    would add latency.
-
     Failure handling:
 
     - ``VramExhausted`` is per-chunk isolation: log, record in
@@ -19275,8 +19295,8 @@ def _extract_pending_sessions(loop, *, lock_held: bool) -> _PendingExtraction:
       ``loop.merger.graph``.  ALL sessions stay pending, an
       ``extraction_failed`` incident is recorded keyed by the failing phase,
       and the abort is RECORDED in :attr:`_PendingExtraction.aborted` —
-      never raised, so the caller can still see
-      :attr:`_PendingExtraction.evicted_voice` and restore voice itself.
+      never raised, so the caller can still reach its own terminal and
+      restore voice there.
       The session loop ``break``s rather than returning, so every path
       reaches the single
       :meth:`~paramem.training.consolidation.ConsolidationLoop.take_pending_relations`
@@ -19297,8 +19317,7 @@ def _extract_pending_sessions(loop, *, lock_held: bool) -> _PendingExtraction:
             does not (the interim tick runs in an executor thread), in which
             case this function acquires the lock for the extraction and RELEASES
             it before returning — so the caller's voice restore then runs
-            OUTSIDE the lock (``lock_held=False``).  The eviction itself always
-            happens inside the lock (``lock_held=True``).
+            OUTSIDE the lock (``lock_held=False``).
     """
     from paramem.server.consolidation import SessionClass, classify_session
     from paramem.server.gpu_lock import gpu_lock_sync
@@ -19328,8 +19347,6 @@ def _extract_pending_sessions(loop, *, lock_held: bool) -> _PendingExtraction:
         session_ids=[],
         failed_session_ids=set(),
         speaker_ids=[],
-        evicted_voice=bool(pending_sessions)
-        and any(s.get("source_type") == "document" for s in pending_sessions),
         pending=PendingRelations(episodic=[], procedural=[]),
         per_session=[],
         chunk_failures=[],
@@ -19339,9 +19356,6 @@ def _extract_pending_sessions(loop, *, lock_held: bool) -> _PendingExtraction:
     _headroom_sink: dict = {}
 
     with nullcontext() if lock_held else gpu_lock_sync():
-        if result.evicted_voice:
-            _set_voice_pipeline_profile("cpu", lock_held=True)
-
         for session in pending_sessions:
             session_id = session["session_id"]
             session_speaker_id = session.get("speaker_id")
@@ -19542,9 +19556,10 @@ def _extract_and_start_training():
     if extraction.aborted is not None:
         # Whole-batch abort (ExtractionFailed): every session stays pending and
         # the next tick retries the batch.  The stage already logged it and
-        # recorded the incident; reclaim the voice pipeline it evicted (the
-        # cycle drops out without reaching any finalize) and clear the flag so
-        # the retry path is not blocked by "deferred_already_running".
+        # recorded the incident; restore voice here (the dispatch evicted it
+        # at submission, and this cycle drops out without reaching any other
+        # finalize) and clear the flag so the retry path is not blocked by
+        # "deferred_already_running".
         _end_voice_eviction(lock_held=False)
         _consolidation_terminal(None)
         return
@@ -20058,7 +20073,7 @@ def _run_full_consolidation_sync(event: "Literal['full', 'reconcile']") -> None:
         # below, and trains them into the main tiers.  The standard full cycle
         # (count > 0)
         # collapses already-trained interim slots into main and runs no
-        # extraction chain at all — hence no pre-stage and no voice eviction.
+        # extraction chain at all — hence no pre-stage.
         # A reconcile event never consumes pending sessions by definition —
         # pending sessions stay pending — so the pre-stage does not run there
         # at any count.
@@ -20399,6 +20414,7 @@ def _run_active_store_migration_sync() -> None:
         _state["pending_rehydration"] = False
         _state["effective_mode"] = config.consolidation.mode
         logger.info("Active-store migration: state file absent — clearing pending flag")
+        _end_voice_eviction(lock_held=False)
         _consolidation_terminal(None)
         return
 

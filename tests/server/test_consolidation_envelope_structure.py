@@ -461,3 +461,61 @@ class TestFullCycleVoiceRestoreAfterTheFold:
                     f"the restore must fire only AFTER the fold, at _run_stage_b_cycle's own "
                     f"worker wrapper"
                 )
+
+
+# ---------------------------------------------------------------------------
+# Every _dispatch_to_executor submission evicts voice up front, so every
+# entry point it ever wraps must restore it before EVERY terminal that
+# entry point's own body reaches -- not just the ones a prior fix happened
+# to cover.  Checked directly on each entry point's own function body (not
+# _run_stage_b_cycle's worker, which has its own coverage in
+# TestFullCycleVoiceRestoreAfterTheFold and a structural pin of its own via
+# TestVoiceRestoreSingleCallSite): for every `_consolidation_terminal(`
+# call inside the body, at least one `_end_voice_eviction(` call appears
+# earlier in the same body (line order -- the same heuristic
+# TestFullCycleVoiceRestoreAfterTheFold already uses).  _run_full_consolidation_sync
+# is included for completeness even though it delegates its only terminal
+# to _run_stage_b_cycle and so has zero direct _consolidation_terminal(
+# calls of its own -- the per-function assertion is then vacuously true for
+# it, which is why the aggregate sanity count below exists: it fails loudly
+# if a rename ever made every per-function check vacuous at once.
+# ---------------------------------------------------------------------------
+
+
+class TestEveryConsolidationTerminalIsPrecededByVoiceRestore:
+    _ENTRY_POINTS = (
+        "_run_pending_event_resume",
+        "_run_active_store_migration_sync",
+        "_run_full_consolidation_sync",
+        "_run_calibration_sync",
+        "_extract_and_start_training",
+    )
+
+    def _call_linenos(self, func: ast.FunctionDef, callee_name: str) -> list[int]:
+        return [
+            node.lineno
+            for node in ast.walk(func)
+            if isinstance(node, ast.Call) and getattr(node.func, "id", None) == callee_name
+        ]
+
+    def test_every_terminal_call_has_a_preceding_restore_in_the_same_body(self) -> None:
+        total_terminal_calls = 0
+        for entry_point in self._ENTRY_POINTS:
+            func = _find_function(_APP_TREE, entry_point)
+            terminal_linenos = self._call_linenos(func, "_consolidation_terminal")
+            restore_linenos = self._call_linenos(func, "_end_voice_eviction")
+            total_terminal_calls += len(terminal_linenos)
+            for terminal_lineno in terminal_linenos:
+                assert any(r < terminal_lineno for r in restore_linenos), (
+                    f"{entry_point}: _consolidation_terminal( at line {terminal_lineno} "
+                    f"has no preceding _end_voice_eviction( call in the same function "
+                    f"body (restore call lines: {restore_linenos!r})"
+                )
+
+        # Sanity: at least one entry point must actually own a direct
+        # terminal call, or every assertion above passed vacuously and this
+        # test proves nothing.
+        assert total_terminal_calls > 0, (
+            "no _consolidation_terminal( call found in any of the five entry "
+            "points -- the per-function checks above are vacuous"
+        )

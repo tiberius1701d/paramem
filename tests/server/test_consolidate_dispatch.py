@@ -660,8 +660,38 @@ def _make_interim_slot(adapter_dir, stamp: str, *, payload: str | None) -> None:
         (slot / "adapter_model.safetensors").write_bytes(b"")
 
 
+def _unwrap_evicted(fn):
+    """Unwrap ``_dispatch_to_executor``'s ``functools.partial(_run_evicted, fn)``
+    wrapper down to the entry point it wraps.
+
+    Every real dispatch wraps its submission this way (see
+    ``_dispatch_to_executor`` in ``paramem/server/app.py``) so the executor
+    evicts the GPU voice pair before the run's own entry point starts.  This
+    is the ONE unwrap site in this module: ``_ExecutorSpy`` calls it at
+    capture time, so every identity/bound-args assertion below reads the
+    unwrapped entry point without its own unwrap logic.  Asserts the wrapper
+    shape it expects, so a submission that is NOT wrapped this way fails
+    loudly here rather than producing a confusing identity mismatch three
+    frames away.
+    """
+    import paramem.server.app as app_module
+
+    assert getattr(fn, "func", None) is app_module._run_evicted, (
+        f"expected _dispatch_to_executor to wrap every submission in "
+        f"functools.partial(_run_evicted, fn); got {fn!r}"
+    )
+    (inner,) = fn.args
+    return inner
+
+
 class _ExecutorSpy:
-    """Stand-in for the event loop: records what was submitted, runs nothing."""
+    """Stand-in for the event loop: records what was submitted, runs nothing.
+
+    Records the UNWRAPPED entry point (:func:`_unwrap_evicted`) — the
+    eviction wrapper itself is an envelope property with its own coverage
+    (``tests/server/test_extraction_stage_lifecycle.py``), not something
+    every arbitrator test in this module should have to see.
+    """
 
     def __init__(self) -> None:
         self.submitted: list[object] = []
@@ -669,7 +699,7 @@ class _ExecutorSpy:
         self.loop.run_in_executor.side_effect = self._submit
 
     def _submit(self, executor, fn):
-        self.submitted.append(fn)
+        self.submitted.append(_unwrap_evicted(fn))
         future = MagicMock()
         future.add_done_callback.return_value = None
         return future
