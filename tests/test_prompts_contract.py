@@ -1139,16 +1139,80 @@ class TestPlausibilityPromptContract:
         assert label_line.endswith(":")
         assert "conversation" not in label_line.lower()
 
+    def test_speaker_identity_contract_section_precedes_drop_rules_with_keep_and_drop_examples(
+        self,
+    ):
+        """The speaker-token carve-out is now taught by a top-placed
+        contract section, not the buried R4 parenthetical the earlier
+        version relied on — the strong-teaching position a model actually
+        attends to (see `test_r4_carve_out_for_speaker_tokens_is_explicit`
+        for R4's own residual pointer clause). This test pins the
+        section's structure: its heading appears BEFORE ``## Drop
+        rules``, and the span between that heading and the next ``## ``
+        heading carries a worked pair — a keep-annotated example whose
+        subject is a `speaker{N}` token, and a drop-annotated example
+        whose subject is a genuine conversation-role reference (the R4
+        target). Matched on stable substrings (`## Speaker-identity
+        contract`, `Example — KEEP`, `Example — DROP (R4)`) so the
+        annotations' prose can keep evolving without this test going
+        stale.
+        """
+        tmpl = _load_prompt("cloud_plausibility.txt")
+        contract_idx = tmpl.index("## Speaker-identity contract")
+        drop_rules_idx = tmpl.index("## Drop rules")
+        assert contract_idx < drop_rules_idx, (
+            "The speaker-identity contract section must appear before the "
+            "drop rules — position is the load-bearing property."
+        )
+
+        # The span from the contract heading up to (not including) the
+        # NEXT `## ` heading.
+        next_header_match = re.search(r"\n## ", tmpl[contract_idx + 1 :])
+        assert next_header_match, "No section header found after the speaker-identity contract."
+        section_end = contract_idx + 1 + next_header_match.start()
+        section = tmpl[contract_idx:section_end]
+
+        assert "Example — KEEP" in section, (
+            "Speaker-identity contract section is missing a KEEP-annotated example."
+        )
+        assert "Example — DROP (R4)" in section, (
+            "Speaker-identity contract section is missing a DROP-annotated example."
+        )
+
+        keep_marker = section.index("Example — KEEP")
+        drop_marker = section.index("Example — DROP (R4)")
+        markers = sorted([(keep_marker, "keep"), (drop_marker, "drop")])
+        bounds = [pos for pos, _label in markers] + [len(section)]
+        blocks = {
+            label: section[bounds[i] : bounds[i + 1]] for i, (_pos, label) in enumerate(markers)
+        }
+
+        keep_subject_match = re.search(r'"subject":\s*"([^"]+)"', blocks["keep"])
+        assert keep_subject_match, "KEEP example has no subject field to check."
+        assert is_speaker_id(keep_subject_match.group(1)), (
+            "KEEP example's subject must be a speaker{N} token."
+        )
+
+        drop_subject_match = re.search(r'"subject":\s*"([^"]+)"', blocks["drop"])
+        assert drop_subject_match, "DROP example has no subject field to check."
+        assert not is_speaker_id(drop_subject_match.group(1)), (
+            "DROP example's subject must be a conversation-role reference, not a speaker{N} token."
+        )
+
     def test_r4_carve_out_for_speaker_tokens_is_explicit(self):
         """R4 ("conversation-role reference") lexically targets the
         English WORD "Speaker" as a generic role label example, not the
-        `speaker{N}` identity-anchor token — but that distinction was only
-        implicit (survey finding, not stated in the prompt). This test
-        pins the explicit carve-out: R4 must state it targets the role
-        LABEL, never a `speaker{N}`-shaped subject/object, and this same
-        template drives BOTH the cloud AND local judges
-        (`judge_plausibility`, `paramem/graph/extractor.py`) — no
-        separate judge-specific override text exists.
+        `speaker{N}` identity-anchor token. The load-bearing teaching now
+        lives in the top-placed speaker-identity contract section (see
+        `test_speaker_identity_contract_section_precedes_drop_rules_with_keep_and_drop_examples`);
+        R4's own line keeps a one-clause pointer back to that section, so
+        a reader who lands on R4 directly still sees the carve-out
+        stated without R4 re-teaching the full KEEP/DROP pair inline.
+        This test pins that pointer clause: R4's own span must still
+        state it targets the role LABEL, never a `speaker{N}`-shaped
+        subject/object, and this same template drives BOTH the cloud AND
+        local judges (`judge_plausibility`, `paramem/graph/extractor.py`)
+        — no separate judge-specific override text exists.
         """
         tmpl = _load_prompt("cloud_plausibility.txt")
         r4_start = tmpl.index("R4.")

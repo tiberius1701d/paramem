@@ -3,17 +3,34 @@ You are filtering enriched personal facts extracted from a source text. For each
 - ADD its index under the rule that matches — only when one of the rules R1-R6 below matches.
 Ground every decision against the source text. Never echo, modify, or add facts.
 
-Example — IGNORE: `{{"subject": "Alex", "predicate": "lives_in", "object": "Portland"}}` — supported by the source text, so keep it.
-Example — ADD: `{{"subject": "Person_1", "predicate": "has_name", "object": "Person_1"}}` — matches R1, so add its index under R1.
+## Speaker-identity contract
 
-## Drop rules — ADD a fact's index under the rule when any rule matches
+A `speaker{{N}}` token (e.g. `speaker0`) is the session's own anonymized speaker — a real entity, never a conversation-role label. This contract overrides R4 for every fact where a `speaker{{N}}` token is the subject or the object.
+
+Example — KEEP: `{{"subject": "speaker0", "predicate": "works_at", "object": "Northwind Labs"}}` — subject is the session's own anonymized speaker, a real entity, R4 never applies.
+Example — DROP (R4): `{{"subject": "Assistant", "predicate": "recommended", "object": "a jazz playlist"}}` — subject is a genuine conversation-role reference, not a real entity.
+
+## KEEP
+
+Default action for every fact: IGNORE — keep it unless one of the rules below matches.
+
+Example — IGNORE: `{{"subject": "Alex", "predicate": "lives_in", "object": "Portland"}}` — supported by the source text, so keep it.
+Example — IGNORE: `{{"subject": "speaker0", "predicate": "manages", "object": "Ana Kowalski"}}` — two different people, not a self-loop, so R1 does not apply.
+Example — IGNORE: `{{"subject": "speaker0", "predicate": "speaks", "object": "Finnish"}}` — a short but concrete object; nothing here is empty or a placeholder, so R5 does not apply.
+
+## Drop rules — ADD a fact's index under the rule when any rule matches. A rule fires only when its own literal test matches; never drop a fact because it seems trivial, generic, vague, or unimportant.
 
 R1. Self-loop. `subject` and `object` are the same string, regardless of predicate
+Example — DROP (R1): `{{"subject": "Northwind Labs", "predicate": "partnered_with", "object": "Northwind Labs"}}` — subject and object are the same string.
 R2. Name-swap pair. Both `A has_name B` and `B has_name A` are present (also `named`, `is`, `equals`). Add both indices.
-R3. Source contradiction. The source text states a different value for the same subject and predicate.
-R4. Conversation-role reference. Subject or object refers to a conversation-role label (e.g. "Assistant", "User", "Speaker", "the bot", "the model") rather than a real-world entity introduced by the transcript. (A `speaker{{N}}` token such as `speaker0` is a real entity — the session's anonymized speaker — not a conversation-role label; R4 does not apply to it.)
-R5. Content-free object. Object provides no transcript-grounded claim — empty, whitespace-only, or a content-free placeholder (e.g. "Unknown", "None", "Various", "Something", "N/A").
-R6. Namespaced system identifier. Subject or object is a system / automation identifier — a dot-separated or URI-shaped namespaced token (e.g. `media_player.sonos_office`, `sensor.temperature_kitchen`, `climate.kitchen_thermostat`) referring to a device, sensor, or service rather than a personal entity.
+R3. Source contradiction. The source text states a different value for the same subject and predicate. A fact the source does not mention is not an R3 drop; R3 requires the source to state a different value.
+R4. Conversation-role reference. Subject or object is a label for a participant of the dialogue itself — "Assistant", "User", "the bot", "the model" — naming who is speaking rather than a real-world entity. A job title, position, or occupational role (e.g. "Team Lead", "Project Manager") is NEVER an R4 match — R4 is about who talks in the conversation, not what anyone works as. A `speaker{{N}}` token is never dropped under R4 — see the speaker-identity contract above.
+R5. Placeholder object. The object string, after trimming, is empty or is exactly one of: "Unknown", "None", "N/A", "Various", "Something", "TBD" (case-insensitive). No other object ever matches R5 — a short, specific, or generic-category object is a claim, not a placeholder — placeholders are content-free tokens, nothing more.
+Example — DROP (R5): `{{"subject": "speaker0", "predicate": "hometown", "object": "Unknown"}}` — the object is a placeholder token.
+Example — IGNORE: `{{"subject": "hydrofoil kite design", "predicate": "is", "object": "a discipline"}}` — a generic category word is still a claim; R5 targets placeholder tokens, never vague ones.
+R6. Namespaced system identifier. Subject or object is a dot-separated or URI-shaped namespaced token (e.g. `media_player.sonos_office`, `sensor.temperature_kitchen`, `climate.kitchen_thermostat`) referring to a device, sensor, or service. The namespaced token shape is required — an ordinary word or phrase, however technical-sounding, never matches R6.
+Example — DROP (R6): `{{"subject": "speaker0", "predicate": "controls", "object": "media_player.sonos_office"}}` — object is a dot-separated namespaced token.
+Example — IGNORE: `{{"subject": "calibration engineer", "predicate": "works_at", "object": "Northwind Labs"}}` — no dot-separated or URI-shaped token, so R6 does not apply.
 
 ## Input
 
