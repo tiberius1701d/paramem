@@ -420,7 +420,7 @@ The local anonymizer's SCAN step is a CPU-resident detection model, configured u
 |---|---|---|---|
 | `span_tagger.checkpoint` | `urchade/gliner_multi_pii-v1` | Hugging Face model id of the detection model. | Change only to move to a different pinned detection checkpoint; re-run the labelled calibration gate afterward. |
 | `span_tagger.revision` | (pinned commit) | Exact commit of that checkpoint, so an upstream change to the model cannot silently alter what a deployment scrubs. | Bump deliberately, alongside re-verifying the calibration gate — never left to float. |
-| `span_tagger.score_threshold` | `0.5` | Minimum confidence for a tagged span to be treated as in scope. Lower marks more (over-scrubbing costs cloud utility); higher marks less (under-scrubbing sends real data). | Re-measure against a labelled sample after any checkpoint change; the shipped default favours over-marking over under-marking. |
+| `span_tagger.score_threshold` | `0.4` | Minimum confidence for a tagged span to be treated as in scope. Lower marks more (over-scrubbing costs cloud utility); higher marks less (under-scrubbing sends real data). | Re-measure against a labelled sample after any checkpoint change; the shipped default favours over-marking over under-marking. |
 | `span_tagger.threads` | `8` | CPU threads the detector may use. Process-wide — applied once, at load. | Host-dependent: too many oversubscribes the machine and gets slower, not faster; tune down on a host with fewer cores rather than assuming more threads helps. |
 
 Config loading is strict: an unknown key anywhere in `configs/server.yaml`

@@ -673,7 +673,7 @@ sanitization:
 span_tagger:
   checkpoint: urchade/gliner_multi_pii-v1
   revision: 1fcf13e85f4eef5394e1fcd406cf2ca9ea82351d
-  score_threshold: 0.5
+  score_threshold: 0.4
   threads: 8
 
 # ============================================================================

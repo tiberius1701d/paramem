@@ -758,7 +758,7 @@ class SpanTaggerConfig:
 
     checkpoint: str = "urchade/gliner_multi_pii-v1"
     revision: str = "1fcf13e85f4eef5394e1fcd406cf2ca9ea82351d"
-    score_threshold: float = 0.5
+    score_threshold: float = 0.4
     threads: int = 8
 
     def __post_init__(self) -> None:

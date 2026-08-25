@@ -15,7 +15,7 @@ class TestSpanTaggerConfigDefaults:
         cfg = SpanTaggerConfig()
         assert cfg.checkpoint == "urchade/gliner_multi_pii-v1"
         assert cfg.revision == "1fcf13e85f4eef5394e1fcd406cf2ca9ea82351d"
-        assert cfg.score_threshold == 0.5
+        assert cfg.score_threshold == 0.4
         assert cfg.threads == 8
 
 
@@ -66,5 +66,5 @@ class TestSpanTaggerConfigParsesFromBothYamls:
         assert isinstance(config.span_tagger, SpanTaggerConfig)
         assert config.span_tagger.checkpoint == "urchade/gliner_multi_pii-v1"
         assert config.span_tagger.revision == "1fcf13e85f4eef5394e1fcd406cf2ca9ea82351d"
-        assert config.span_tagger.score_threshold == 0.5
+        assert config.span_tagger.score_threshold == 0.4
         assert config.span_tagger.threads == 8
