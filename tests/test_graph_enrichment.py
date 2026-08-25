@@ -17,7 +17,7 @@ import networkx as nx
 import pytest
 from peft import PeftModel
 
-from paramem.cloud.anonymize import anonymize_transcript as _real_anonymize_transcript
+from paramem.config.taxonomy import resolve_scrub_categories
 from paramem.graph.schema import SessionGraph
 from paramem.memory.persistence import _EDGE_SOURCE_ATTR
 from paramem.training.consolidation import ConsolidationLoop, PendingRelations
@@ -32,18 +32,23 @@ from paramem.utils.config import AdapterConfig, ConsolidationConfig, TrainingCon
 
 @pytest.fixture(autouse=True)
 def _stub_local_anonymize(monkeypatch):
-    """Default stub for ``anonymize_transcript``.
+    """Default stub for ``anonymize`` (THE one anonymize chain).
 
-    ``graph_enrich.enrich_graph`` now runs the local anonymizer
-    (the SAME primitive session-tier extraction uses) over each chunk
-    BEFORE the cloud call, to derive real-name entity types the fold graph
-    itself cannot supply (see that function's docstring). ``_make_loop``'s
+    ``graph_enrich.enrich_graph`` runs the local anonymizer (the SAME
+    primitive session-tier extraction uses) over each chunk BEFORE the
+    cloud call, to derive real-name entity types the fold graph itself
+    cannot supply (see that function's docstring). ``_make_loop``'s
     model/tokenizer are ``MagicMock()``s, so a real call always fails to
     parse (there is no JSON in a ``MagicMock``'s generated output), which
     would fail every chunk closed (skip the cloud call entirely) before
     ``request_graph_enrichment`` is ever reached — breaking every test below
     that mocks ``request_graph_enrichment`` to verify cloud-response
-    consumption.
+    consumption. The patch target is ``paramem.training.graph_enrich.
+    anonymize`` — the NAME ``graph_enrich.py`` binds via its own
+    module-level ``from paramem.cloud.anonymize import anonymize`` import
+    and calls bare. ``anonymize()`` is the one entry point every caller,
+    including this stub, replaces wholesale — there is no lower-level
+    single-call primitive underneath the chain to intercept instead.
 
     The default therefore lands on the SAFE side rather than the unsafe
     one: :func:`_stub_local_model_types` with an empty override dict, which
@@ -63,7 +68,7 @@ def _stub_local_anonymize(monkeypatch):
     fixture.
     """
     monkeypatch.setattr(
-        "paramem.cloud.anonymize.anonymize_transcript",
+        "paramem.training.graph_enrich.anonymize",
         _stub_local_model_types({}),
     )
 
@@ -93,7 +98,7 @@ def _make_loop(tmp_path, **kwargs) -> ConsolidationLoop:
     defaults = dict(
         extraction_enrichment_provider="anthropic",
         extraction_enrichment_provider_model="claude-sonnet-4-6",
-        extraction_scrub={"person name"},
+        extraction_scrub_categories=resolve_scrub_categories(["person name"]),
         # Graph-tier enrichment is cloud egress and now routes through the
         # shared cloud-admission verdict, whose first term is the master
         # switch — so it must be ON for any enrichment test to reach a call.
@@ -208,64 +213,6 @@ def _populate_graph(graph: nx.MultiDiGraph, n_persons: int = 10) -> None:
             sessions=["s000"],
             speaker_id="speaker0",
         )
-
-
-def _populate_disjoint_clusters(
-    graph: nx.MultiDiGraph, n_clusters: int = 3, leaves_per_cluster: int = 3
-) -> None:
-    """Build *n_clusters* disconnected hub-and-leaves stars.
-
-    Each cluster is its own connected component (no cross-cluster edges), so
-    with ``neighborhood_hops=1`` and ``max_entities_per_pass ==
-    leaves_per_cluster + 1`` (a whole cluster, no trim), every cluster maps
-    to exactly one chunk with NO node overlap between chunks — unlike
-    ``_populate_graph``'s single hub topology, where every ego-graph
-    includes the shared hub. Hub reinforcement counts are strictly
-    descending (cluster 0 highest) so ``nodes_by_recurrence`` visits the
-    hubs in cluster order, making chunk order deterministic: chunk *i* is
-    always cluster *i*.
-
-    Used by the multi-chunk VRAM-degrade tests, which need to assert that a
-    fault on chunk 2 of 3 keeps chunk 1's already-merged relations and never
-    reaches chunk 3.
-
-    Every leaf-hub edge carries a ``speaker_id`` — one speaker per cluster
-    (``f"speaker{c}"``), since a cluster is exactly one chunk here and the
-    merger never leaves a real edge unattributed (Case-3 insert,
-    ``merger.py``); this is the enrichment attribution pass's evidence.
-    """
-    for c in range(n_clusters):
-        hub = f"hub{c}"
-        graph.add_node(
-            hub,
-            entity_type="organization",
-            display_name=f"Hub{c}",
-            reinforcement_count=10_000 - c,
-            sessions=[f"s{c}00"],
-            first_seen=f"s{c}00",
-            last_seen=f"s{c}00",
-        )
-        for j in range(leaves_per_cluster):
-            person = f"c{c}_person{j}"
-            graph.add_node(
-                person,
-                entity_type="person",
-                display_name=f"Cluster{c}Person{j}",
-                reinforcement_count=1,
-                sessions=[f"s{c}{j:02d}"],
-                first_seen=f"s{c}{j:02d}",
-                last_seen=f"s{c}{j:02d}",
-            )
-            graph.add_edge(
-                person,
-                hub,
-                predicate="works at",
-                relation_type="factual",
-                confidence=1.0,
-                source="extraction",
-                sessions=[f"s{c}{j:02d}"],
-                speaker_id=f"speaker{c}",
-            )
 
 
 # ---------------------------------------------------------------------------
@@ -1293,499 +1240,6 @@ class TestNoModelSkipsGracefully:
         call_spy.assert_not_called()
 
 
-class TestVramExhaustedDegradesGracefully:
-    """A VramExhausted mid-pass degrades gracefully instead of aborting the
-    fold.  ``VramExhausted`` must NOT escape ``run_enrichment()``: there is
-    no retry that could help (a retry in the same VRAM state faults the same
-    way).  The pass stops, keeps whatever it already merged, and the caller
-    (``ConsolidationLoop.stage_event``, via ``_record_enrichment_incident``)
-    records an incident.  Enrichment self-heals next cycle — the pass runs
-    over the cumulative graph every fold.
-
-    The fault is raised from the ``anonymize`` leg — the only leg in the
-    chunk body that touches the GPU, and so the only one where
-    ``VramExhausted`` can originate in production.  Raising it from
-    ``request_graph_enrichment`` instead would exercise a branch production
-    cannot reach: the cloud leg does no GPU work.
-
-    Mutation: revert the ``except VramExhausted`` branch to ``raise`` ->
-    this test's ``run_enrichment()`` call raises instead of returning a
-    degrade result that keeps the first chunk's merged relations.
-    """
-
-    def test_vram_exhausted_stops_pass_keeps_completed_chunks(self, tmp_path, monkeypatch):
-        from paramem.utils.vram_guard import VramExhausted
-
-        loop = _make_loop(
-            tmp_path,
-            graph_enrichment_max_entities_per_pass=4,
-            graph_enrichment_neighborhood_hops=1,
-        )
-        graph = loop.merger.graph
-        _populate_disjoint_clusters(graph, n_clusters=3, leaves_per_cluster=3)
-
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-
-        calls = {"n": 0}
-
-        def _anonymize_side_effect(facts, *args, **kwargs):
-            i = calls["n"]
-            calls["n"] += 1
-            if i == 1:
-                # Fault on chunk 2 of 3 (0-indexed) — the leg that actually
-                # touches the GPU, matching production (VramExhausted
-                # originates inside anonymize_transcript's generate() call,
-                # wrapped by vram_scope inside `anonymize`).
-                raise VramExhausted("graph_enrichment_test")
-            payload, _ = _payload_and_graph_for(facts, {})
-            return payload
-
-        canned_cloud_result = (
-            [
-                {
-                    "subject": "hub0",
-                    "predicate": "hub_partner_of",
-                    "object": "c0_person0",
-                    "relation_type": "social",
-                    "confidence": 0.9,
-                }
-            ],
-            [],  # no same_as
-            "raw",
-            0,  # no relations dropped
-        )
-        with (
-            patch(
-                "paramem.training.graph_enrich.anonymize",
-                side_effect=_anonymize_side_effect,
-            ),
-            patch(
-                "paramem.training.graph_enrich.request_graph_enrichment",
-                return_value=canned_cloud_result,
-            ) as call_spy,
-        ):
-            result = _refiner_for(loop).run_enrichment()
-
-        assert result["skipped"] is False
-        assert result["aborted_reason"] == "vram"
-        # Only chunk 1 (cluster 0) reached the cloud call before the fault
-        # on chunk 2 stopped the pass; chunk 3 (cluster 2) is never reached.
-        assert result["chunks"] == 1
-        call_spy.assert_called_once()
-        # Chunk 1's enrichment relation is still merged into the graph —
-        # completed chunks keep their work (degrade granularity is the CHUNK).
-        assert result["new_edges"] >= 1
-
-
-class TestEmptyMappingProceeds:
-    """A local anonymizer mapping that comes back completely EMPTY
-    (``{}``) — even for a chunk with real (non-speaker) node names —
-    means the anonymizer ran and classified
-    NOTHING in scope against ``scrub``. That is a legitimate verdict, not
-    a classification failure, so egress PROCEEDS: the cloud call fires
-    with an empty ``chunk_mapping`` (nothing to substitute) rather than
-    being skipped. Mirrors the session-tier ``mapping == {}`` proceed
-    path in :func:`~paramem.graph.flows.anonymize_turn`.
-
-    Mutation: reintroduce a bare ``not chunk_mapping`` guard (dropping the
-    ``_llm_mapping and`` qualifier) in ``graph_enrich.enrich_graph``
-    -> this test fails (the cloud call is skipped and
-    ``privacy_skipped_chunks`` increments instead of staying 0).
-    """
-
-    def test_empty_mapping_proceeds_with_cloud_call(self, tmp_path, monkeypatch):
-        loop = _make_loop(tmp_path)
-        graph = loop.merger.graph
-        _populate_graph(graph, n_persons=10)
-
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-        # Deliberately override the (masked-by-default) autouse fixture
-        # with a genuinely empty-mapping stub — this test exists
-        # specifically to exercise that proceed path.
-        monkeypatch.setattr(
-            "paramem.cloud.anonymize.anonymize_transcript",
-            lambda *args, **kwargs: ({}, "", "stub-raw"),
-        )
-        canned_result = ([], [], "raw", 0)
-        with patch(
-            "paramem.training.graph_enrich.request_graph_enrichment",
-            return_value=canned_result,
-        ) as call_spy:
-            result = _refiner_for(loop).run_enrichment()
-
-        assert not result["skipped"]
-        assert result["privacy_skipped_chunks"] == 0
-        call_spy.assert_called()
-
-    def test_all_speaker_chunk_is_not_falsely_skipped(self, tmp_path, monkeypatch):
-        """A chunk whose ONLY real content is speaker-to-speaker relations
-        legitimately has an empty (non-speaker) entity mapping — this must
-        NOT trip the fail-closed guard, since there was never any
-        non-speaker content to classify in the first place."""
-        loop = _make_loop(tmp_path)
-        graph = loop.merger.graph
-
-        for sid in ("speaker0", "speaker1"):
-            graph.add_node(
-                sid,
-                entity_type="person",
-                speaker_id=sid,
-                display_name=sid,
-                reinforcement_count=1,
-                sessions=["s000"],
-                first_seen="s000",
-                last_seen="s000",
-            )
-        # Pad past the 10-node floor with disconnected concept nodes so this
-        # chunk (built from the speaker-pair ego-graph) stays speaker-only.
-        for i in range(9):
-            graph.add_node(
-                f"filler{i}",
-                entity_type="concept",
-                attributes={},
-                reinforcement_count=0,
-                sessions=[],
-                first_seen="",
-                last_seen="",
-            )
-        graph.add_edge(
-            "speaker0",
-            "speaker1",
-            predicate="knows",
-            relation_type="social",
-            confidence=1.0,
-            speaker_id="speaker0",
-            source="extraction",
-            sessions=["s000"],
-        )
-
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-        monkeypatch.setattr(
-            "paramem.cloud.anonymize.anonymize_transcript",
-            lambda *args, **kwargs: ({}, "", "stub-raw"),
-        )
-        canned_result = ([], [], "raw", 0)
-        with patch(
-            "paramem.training.graph_enrich.request_graph_enrichment",
-            return_value=canned_result,
-        ) as call_spy:
-            result = _refiner_for(loop).run_enrichment()
-
-        assert not result["skipped"]
-        assert result["privacy_skipped_chunks"] == 0
-        call_spy.assert_called()
-
-
-class TestPrivacyFailClosedOnReconciliationFailure:
-    """Leg 2 — a local anonymizer mapping that NAMED
-    something but NONE of it survived reconciliation onto the
-    chunk's actual node keys, while the chunk has real (non-speaker)
-    node names, is a classification/identity-match failure — distinct
-    from a genuinely EMPTY mapping (see ``TestEmptyMappingProceeds``,
-    which now proceeds). ``canonical()``
-    matching (tested directly in ``tests/test_placeholders.py::
-    TestSubstituteWholeWordsCanonicalMatching``) cannot fix this leg —
-    the named entity simply isn't one of this chunk's nodes.
-
-    Mutation: drop the ``_llm_mapping and`` qualifier from the
-    ``graph_enrich.enrich_graph`` guard -> this test's cloud call
-    would no longer be distinguished from the empty-mapping proceed case
-    and would fire instead of being skipped.
-    """
-
-    def test_reconciliation_drops_everything_skips_cloud_call(self, tmp_path, monkeypatch):
-        loop = _make_loop(tmp_path)
-        graph = loop.merger.graph
-        _populate_graph(graph, n_persons=10)
-
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-        # The local anonymizer DID name something — but a name matching
-        # none of this chunk's actual node keys, so reconciliation
-        # drops it, leaving chunk_mapping empty despite a non-empty
-        # _llm_mapping.
-        monkeypatch.setattr(
-            "paramem.cloud.anonymize.anonymize_transcript",
-            lambda *args, **kwargs: (
-                {"nobody in this chunk": "Person_1"},
-                "stub-anon",
-                "stub-raw",
-            ),
-        )
-        call_spy = MagicMock()
-        with patch("paramem.training.graph_enrich.request_graph_enrichment", call_spy):
-            result = _refiner_for(loop).run_enrichment()
-
-        assert not result["skipped"]
-        assert result["privacy_skipped_chunks"] >= 1
-        assert result["new_edges"] == 0
-        assert result["same_as_merges"] == 0
-        call_spy.assert_not_called()
-
-
-class TestPrivacyFailClosedOnShapeValidationDrop:
-    """The domain-scoped fail-closed guard fires whether
-    the mapping was emptied by node-key reconciliation (see
-    ``TestPrivacyFailClosedOnReconciliationFailure`` above) OR by the
-    model's own placeholder-shape validation dropping the entry BEFORE
-    reconciliation ever runs (e.g. a 7B emitting a lowercase placeholder
-    that fails ``PLACEHOLDER_SHAPE_RE`` on both sides). ``rekey_dropped``
-    stays ``0`` in this case — the reconciliation loop never sees an
-    entry ``_normalize_anonymization_mapping`` already removed — so the
-    caller must discriminate the cause via ``payload.failure``, not
-    ``payload.rekey_dropped``. Both causes are counted in
-    ``privacy_skipped_chunks`` identically.
-
-    Mutation: branch ``graph_enrich.enrich_graph`` on
-    ``payload.rekey_dropped`` instead of ``payload.failure == "guard"`` ->
-    this test's chunk is misclassified as a parse failure and
-    ``privacy_skipped_chunks`` stays at 0 (undercount).
-    """
-
-    def test_shape_validation_drop_still_counted_in_privacy_skipped_chunks(
-        self, tmp_path, monkeypatch
-    ):
-        loop = _make_loop(tmp_path)
-        graph = loop.merger.graph
-        _populate_graph(graph, n_persons=10)
-
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-        # The local anonymizer DID name a real node in this chunk
-        # ("Person0") but with a lowercase placeholder value that fails
-        # the shape regex on both sides — dropped entirely by
-        # ``_normalize_anonymization_mapping``, never reaching the
-        # reconciliation loop that increments ``rekey_dropped``.
-        monkeypatch.setattr(
-            "paramem.cloud.anonymize.anonymize_transcript",
-            lambda *args, **kwargs: (
-                {"Person0": "person_1"},
-                "stub-anon",
-                "stub-raw",
-            ),
-        )
-        call_spy = MagicMock()
-        with patch("paramem.training.graph_enrich.request_graph_enrichment", call_spy):
-            result = _refiner_for(loop).run_enrichment()
-
-        assert not result["skipped"]
-        assert result["privacy_skipped_chunks"] >= 1
-        assert result["new_edges"] == 0
-        assert result["same_as_merges"] == 0
-        call_spy.assert_not_called()
-
-
-class TestGuardDomainSeparation:
-    """The domain-scoped fail-closed guard is derived from
-    ``graph.relations``' subject/object endpoints — NOT from
-    ``identity_domain`` (``chunk_nodes``).  A chunk whose (larger,
-    pre-edge-trim) ``chunk_nodes`` still lists a non-speaker node that has
-    NO surviving edge in the trimmed subgraph must NOT trip the guard,
-    even when the local anonymizer named something that reconciles to
-    nothing.
-
-    Mutation: fuse the guard domain onto ``identity_domain``/``chunk_nodes``
-    instead of ``graph.relations`` -> this chunk's guard fires (status
-    flips to "failed", ``privacy_skipped_chunks`` increments, the cloud
-    call is skipped) even though every SURVIVING edge is speaker-only.
-    """
-
-    def test_guard_does_not_fire_when_surviving_edges_are_speaker_only(self, tmp_path, monkeypatch):
-        loop = _make_loop(
-            tmp_path,
-            graph_enrichment_max_entities_per_pass=3,
-            graph_enrichment_neighborhood_hops=2,
-        )
-        graph = loop.merger.graph
-
-        for sid in ("speaker0", "speaker1"):
-            graph.add_node(
-                sid,
-                entity_type="person",
-                speaker_id=sid,
-                display_name=sid,
-                reinforcement_count=100,
-                sessions=["s000"],
-                first_seen="s000",
-                last_seen="s000",
-            )
-        graph.add_edge(
-            "speaker0",
-            "speaker1",
-            predicate="knows",
-            relation_type="social",
-            confidence=1.0,
-            speaker_id="speaker0",
-            source="extraction",
-            sessions=["s000"],
-        )
-        # A low-degree bridge node — connects the focal speaker0 to X, but
-        # is itself low-degree so the trim below drops IT, not X.
-        graph.add_node(
-            "bridge",
-            entity_type="concept",
-            display_name="Bridge",
-            reinforcement_count=1,
-            sessions=[],
-            first_seen="",
-            last_seen="",
-        )
-        graph.add_edge(
-            "speaker0",
-            "bridge",
-            predicate="related_to",
-            relation_type="factual",
-            confidence=1.0,
-            source="extraction",
-            sessions=["s000"],
-        )
-        graph.add_node(
-            "x_node",
-            entity_type="concept",
-            display_name="XNode",
-            reinforcement_count=1,
-            sessions=[],
-            first_seen="",
-            last_seen="",
-        )
-        graph.add_edge(
-            "bridge",
-            "x_node",
-            predicate="related_to",
-            relation_type="factual",
-            confidence=1.0,
-            source="extraction",
-            sessions=["s000"],
-        )
-        # Boost speaker1's and x_node's full-graph degree above bridge's
-        # (degree 2: speaker0, x_node) so the top-2-by-degree trim keeps
-        # {speaker1, x_node} and drops {bridge} — leaving x_node IN
-        # chunk_nodes with NO surviving edge (its only edge was to the
-        # now-excluded bridge).
-        for i in range(4):
-            filler = f"s1_filler{i}"
-            graph.add_node(
-                filler,
-                entity_type="concept",
-                display_name=filler,
-                reinforcement_count=0,
-                sessions=[],
-                first_seen="",
-                last_seen="",
-            )
-            graph.add_edge(
-                "speaker1",
-                filler,
-                predicate="related_to",
-                relation_type="factual",
-                confidence=1.0,
-                source="extraction",
-                sessions=["s000"],
-            )
-        for i in range(3):
-            filler = f"x_filler{i}"
-            graph.add_node(
-                filler,
-                entity_type="concept",
-                display_name=filler,
-                reinforcement_count=0,
-                sessions=[],
-                first_seen="",
-                last_seen="",
-            )
-            graph.add_edge(
-                "x_node",
-                filler,
-                predicate="related_to",
-                relation_type="factual",
-                confidence=1.0,
-                source="extraction",
-                sessions=["s000"],
-            )
-
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-
-        # Several chunks form (one per high-reinforcement focal node); only
-        # the speaker0/speaker1 chunk (surviving edges == speaker-only,
-        # after x_node's bridge is trimmed) is the one under test — the
-        # local anonymizer names something that matches NEITHER
-        # speaker0/speaker1 NOR x_node for THAT chunk, so reconciliation
-        # drops it, leaving chunk_mapping empty (rekey_dropped >= 1).
-        # Under the CORRECT (relation-endpoints) guard domain this must
-        # NOT fire, since the only surviving edge is speaker-only. Other
-        # chunks (e.g. focal=x_node, with real non-speaker filler edges)
-        # get a harmless empty mapping so they don't pollute the count
-        # this test asserts on.
-        def _stub(facts, model, tokenizer, transcript="", **kwargs):
-            # ``facts`` is a plain fact-dict list — never a ``SessionGraph``.
-            names = {str(f.get("subject", "")) for f in facts} | {
-                str(f.get("object", "")) for f in facts
-            }
-            if names == {"speaker0", "speaker1"}:
-                return {"nobody in this chunk": "Person_1"}, "stub-anon", "stub-raw"
-            return {}, "stub-anon", "stub-raw"
-
-        monkeypatch.setattr(
-            "paramem.cloud.anonymize.anonymize_transcript",
-            _stub,
-        )
-        canned_result = ([], [], "raw", 0)
-        with patch(
-            "paramem.training.graph_enrich.request_graph_enrichment",
-            return_value=canned_result,
-        ) as call_spy:
-            result = _refiner_for(loop).run_enrichment()
-
-        assert not result["skipped"]
-        assert result["privacy_skipped_chunks"] == 0
-        assert result["mapping_rekey_dropped"] >= 1
-        call_spy.assert_called()
-
-
-class TestScrubEmptyOptsOutWithoutModelCall:
-    """With ``scrub=set()`` (operator opt-out), graph-tier enrichment must
-    make NO anonymizer call and the chunk's triples must egress VERBATIM —
-    the same operator opt-out contract session-tier extraction and
-    chat egress already honour.  This is a behaviour CHANGE from
-    pre-unification graph-tier enrichment (which called the local
-    anonymizer unconditionally, regardless of ``scrub``); pinned here as
-    the INTENDED outcome, not an oversight.
-    """
-
-    def test_no_anonymizer_call_and_verbatim_egress(self, tmp_path, monkeypatch):
-        loop = _make_loop(tmp_path, extraction_scrub=set())
-        graph = loop.merger.graph
-        _populate_graph(graph, n_persons=10)
-
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-        anonymizer_spy = MagicMock()
-        captured_mapping: list[dict] = []
-        captured_facts: list[list[dict]] = []
-
-        def _capture(payload, graph, *args, **kwargs):
-            captured_mapping.append(dict(payload.forward))
-            captured_facts.append(list(payload.facts))
-            return [], [], "raw", 0
-
-        with (
-            patch("paramem.cloud.anonymize.anonymize_transcript", anonymizer_spy),
-            patch("paramem.training.graph_enrich.request_graph_enrichment", side_effect=_capture),
-        ):
-            result = _refiner_for(loop).run_enrichment()
-
-        assert not result["skipped"]
-        anonymizer_spy.assert_not_called()
-        assert captured_mapping, "expected request_graph_enrichment to be called"
-        # Verbatim egress: an empty forward mapping substitutes nothing.
-        assert all(m == {} for m in captured_mapping)
-        # BLOCKING-2 regression guard: the opted-out contract must carry
-        # the chunk's input triples verbatim in payload.facts — a
-        # facts=[] opt-out would silently drop every triple from a
-        # payload the operator asked to egress unmasked.
-        assert captured_facts, "expected payload.facts to be captured"
-        assert all(facts for facts in captured_facts), (
-            "opted-out payload.facts must carry the chunk's triples verbatim, not []"
-        )
-
-
 class TestDroppedRelations:
     """Graph-tier enrichment's per-relation drop count (``dropped_relations``
     — replaces the retired ``totality_rejected_chunks`` whole-chunk gate,
@@ -1879,241 +1333,6 @@ class TestDroppedRelations:
         assert result["dropped_relations"] == 0
 
 
-class TestSliceCounters:
-    """Fact-boundary slicing counters — ``anonymize_slices`` (total local
-    ``anonymize()`` calls across all chunks, ``sum(payload.slices)``) and
-    ``privacy_skipped_slices`` (``sum(payload.slices_failed)``), plus the
-    per-chunk partial-fail-closed-drop WARNING (``0 < slices_failed < slices``).
-    Parallel to :class:`TestDroppedRelations`'s pattern: patches
-    ``paramem.training.graph_enrich.anonymize`` directly to control
-    ``payload.slices``/``payload.slices_failed`` without needing the real
-    packer to produce multiple slices.
-    """
-
-    def _payload(self, *, status="ok", slices=1, slices_failed=0, failure=None):
-        from paramem.cloud.anonymize import AnonymizedContract
-
-        return AnonymizedContract(
-            status=status,
-            forward={},
-            reverse={},
-            anon_transcript="",
-            declared=frozenset(),
-            norm_stats={"inverted": 0, "dropped": 0},
-            rekey_dropped=0,
-            raw="raw",
-            failure=failure,
-            facts=[],
-            slices=slices,
-            slices_failed=slices_failed,
-        )
-
-    def test_empty_dict_carries_zeroed_counters_on_every_skip_path(self, tmp_path, monkeypatch):
-        """``no_model`` / ``floor`` / ``cloud_egress_blocked`` all short-circuit
-        before any ``anonymize()`` call — both counters stay 0."""
-        loop = _make_loop(tmp_path)
-        graph = loop.merger.graph
-
-        # no_model
-        loop.model = None
-        result = _refiner_for(loop).run_enrichment()
-        assert result["anonymize_slices"] == 0
-        assert result["privacy_skipped_slices"] == 0
-
-        # floor (graph too small — no nodes added)
-        loop.model = MagicMock()
-        result = _refiner_for(loop).run_enrichment()
-        assert result["skip_reason"] == "floor"
-        assert result["anonymize_slices"] == 0
-        assert result["privacy_skipped_slices"] == 0
-
-        # cloud_egress_blocked (no provider configured)
-        _populate_graph(graph, n_persons=10)
-        loop2 = _make_loop(tmp_path, extraction_enrichment_provider="")
-        loop2.merger = loop.merger
-        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-        result = _refiner_for(loop2).run_enrichment()
-        assert result["skip_reason"] == "cloud_egress_blocked"
-        assert result["anonymize_slices"] == 0
-        assert result["privacy_skipped_slices"] == 0
-
-    def test_anonymize_slices_counts_local_calls_for_a_single_chunk(self, tmp_path, monkeypatch):
-        loop = _make_loop(tmp_path)
-        graph = loop.merger.graph
-        _populate_graph(graph, n_persons=10)  # 11 nodes -> one chunk by default
-
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-        with (
-            patch(
-                "paramem.training.graph_enrich.anonymize",
-                return_value=self._payload(status="ok", slices=3, slices_failed=0),
-            ),
-            patch(
-                "paramem.training.graph_enrich.request_graph_enrichment",
-                return_value=([], [], "raw", 0),
-            ),
-        ):
-            result = _refiner_for(loop).run_enrichment()
-
-        assert not result["skipped"]
-        assert result["chunks"] == 1
-        assert result["anonymize_slices"] == 3
-        assert result["privacy_skipped_slices"] == 0
-
-    def test_privacy_skipped_slices_sums_across_multiple_chunks(self, tmp_path, monkeypatch):
-        """Two chunks, each contributing a different ``slices_failed`` —
-        the counter SUMS across chunks, not just the last one."""
-        loop = _make_loop(
-            tmp_path,
-            graph_enrichment_max_entities_per_pass=10,
-            graph_enrichment_neighborhood_hops=1,
-        )
-        graph = loop.merger.graph
-        org = "hubcorp"
-        graph.add_node(
-            org,
-            entity_type="organization",
-            attributes={},
-            reinforcement_count=25,
-            sessions=[],
-            first_seen="s000",
-            last_seen="s000",
-        )
-        for i in range(25):
-            name = f"emp{i}"
-            graph.add_node(
-                name,
-                entity_type="person",
-                display_name=f"Emp{i}",
-                reinforcement_count=i + 1,
-                sessions=[],
-                first_seen=f"s{i:03d}",
-                last_seen=f"s{i:03d}",
-            )
-            graph.add_edge(
-                name,
-                org,
-                predicate="works_at",
-                relation_type="factual",
-                confidence=1.0,
-                source="extraction",
-                sessions=[],
-            )
-
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-        # First two chunks carry the interesting shape; any further chunk
-        # (this graph's chunk_cap may exceed 2) falls back to a plain
-        # single-slice success — its contribution is accounted for below
-        # via ``extra_chunks`` rather than assumed away.
-        scripted = [
-            self._payload(status="ok", slices=2, slices_failed=1),
-            self._payload(status="ok", slices=3, slices_failed=0),
-        ]
-        fallback_calls = {"n": 0}
-
-        def _fake_anonymize(*args, **kwargs):
-            if scripted:
-                return scripted.pop(0)
-            fallback_calls["n"] += 1
-            return self._payload(status="ok", slices=1, slices_failed=0)
-
-        with (
-            patch("paramem.training.graph_enrich.anonymize", side_effect=_fake_anonymize),
-            patch(
-                "paramem.training.graph_enrich.request_graph_enrichment",
-                return_value=([], [], "raw", 0),
-            ),
-        ):
-            result = _refiner_for(loop).run_enrichment()
-
-        assert not result["skipped"]
-        assert result["chunks"] >= 2
-        expected_slices = 2 + 3 + fallback_calls["n"] * 1
-        assert result["anonymize_slices"] == expected_slices
-        assert result["privacy_skipped_slices"] == 1
-
-    def test_whole_chunk_failure_still_counts_slices_and_slices_failed(self, tmp_path, monkeypatch):
-        """A whole-chunk fail-closed payload (``status="failed"``,
-        ``slices_failed == slices``) still contributes to both counters —
-        they are not gated on ``status == "ok"``."""
-        loop = _make_loop(tmp_path)
-        graph = loop.merger.graph
-        _populate_graph(graph, n_persons=10)
-
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-        with (
-            patch(
-                "paramem.training.graph_enrich.anonymize",
-                return_value=self._payload(
-                    status="failed", slices=2, slices_failed=2, failure="guard"
-                ),
-            ),
-            patch("paramem.training.graph_enrich.request_graph_enrichment") as call_spy,
-        ):
-            result = _refiner_for(loop).run_enrichment()
-
-        call_spy.assert_not_called()
-        assert result["chunks"] == 0
-        assert result["privacy_skipped_chunks"] == 1
-        assert result["anonymize_slices"] == 2
-        assert result["privacy_skipped_slices"] == 2
-
-    def test_partial_withholding_logs_warning(self, tmp_path, monkeypatch, caplog):
-        """A chunk whose payload is ``"ok"`` but carries ``0 < slices_failed
-        < slices`` (a partial fail-closed drop) logs a per-chunk WARNING
-        naming the dropped/surviving slice counts — the operator-visibility
-        gap this closes."""
-        import logging
-
-        loop = _make_loop(tmp_path)
-        graph = loop.merger.graph
-        _populate_graph(graph, n_persons=10)
-
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-        caplog.set_level(logging.WARNING, logger="paramem.training.graph_enrich")
-        with (
-            patch(
-                "paramem.training.graph_enrich.anonymize",
-                return_value=self._payload(status="ok", slices=3, slices_failed=1),
-            ),
-            patch(
-                "paramem.training.graph_enrich.request_graph_enrichment",
-                return_value=([], [], "raw", 0),
-            ),
-        ):
-            _refiner_for(loop).run_enrichment()
-
-        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
-        assert any("partial drop" in m for m in warnings), warnings
-        assert any("1/3" in m for m in warnings), warnings
-
-    def test_no_partial_withholding_warning_when_no_slices_failed(
-        self, tmp_path, monkeypatch, caplog
-    ):
-        import logging
-
-        loop = _make_loop(tmp_path)
-        graph = loop.merger.graph
-        _populate_graph(graph, n_persons=10)
-
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-        caplog.set_level(logging.WARNING, logger="paramem.training.graph_enrich")
-        with (
-            patch(
-                "paramem.training.graph_enrich.anonymize",
-                return_value=self._payload(status="ok", slices=2, slices_failed=0),
-            ),
-            patch(
-                "paramem.training.graph_enrich.request_graph_enrichment",
-                return_value=([], [], "raw", 0),
-            ),
-        ):
-            _refiner_for(loop).run_enrichment()
-
-        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
-        assert not any("partial drop" in m for m in warnings), warnings
-
-
 class TestSameAsUndeclaredOrphanShapeBackstop:
     """``deanonymize_text`` runs no
     undeclared-orphan shape backstop for the ``same_as`` arm — verify the
@@ -2148,12 +1367,18 @@ class TestSameAsUndeclaredOrphanShapeBackstop:
 def _payload_and_graph_for(triples: list[dict], llm_mapping: dict[str, str]):
     """Build the ``(payload, graph)`` pair ``request_graph_enrichment`` now
     takes, from a caller-supplied ``llm_mapping`` (real_name -> placeholder)
-    and the chunk's ``triples`` — mirroring what
-    ``graph_enrich.enrich_graph`` produces via
-    ``anonymize`` (with ``identity_domain=None``, matching a
-    direct unit-level call with no reconciliation domain), so these tests
-    exercise the REAL table-building primitive rather than a hand-rolled
-    substitute.
+    and the chunk's ``triples``.
+
+    ``request_graph_enrichment`` only ever reads ``payload.forward``/
+    ``payload.facts`` — it has no notion of HOW a forward table was
+    produced — so this helper constructs the table directly from
+    *llm_mapping* rather than replaying the SCAN/MINT machinery
+    (:func:`~paramem.cloud.placeholders.build_forward_table` now mints
+    every placeholder value itself; a caller-dictated exact placeholder
+    string, as several tests below rely on, is no longer an input that
+    primitive accepts). This mirrors the pre-split helper's own scope: it
+    never modeled the model call either, only assembled a payload from a
+    given mapping.
 
     ``graph`` carries no relations of its own (interface narrowing,
     2026-07-21): ``request_graph_enrichment`` derives its anonymized
@@ -2164,17 +1389,17 @@ def _payload_and_graph_for(triples: list[dict], llm_mapping: dict[str, str]):
     successful (non-fail-closed) call.
     """
     from paramem.cloud.anonymize import AnonymizedContract
-    from paramem.cloud.placeholders import _build_anonymization_mapping
+    from paramem.cloud.placeholders import invert_forward_mapping
     from paramem.graph.schema import SessionGraph
 
-    forward, reverse = _build_anonymization_mapping(dict(llm_mapping), speaker_name=None)
+    forward = dict(llm_mapping)
+    reverse = invert_forward_mapping(forward)
     payload = AnonymizedContract(
         status="ok",
         forward=forward,
         reverse=reverse,
         anon_transcript="",
         declared=frozenset(reverse.keys()),
-        norm_stats={"inverted": 0, "dropped": 0},
         rekey_dropped=0,
         raw="",
         facts=triples,
@@ -3116,7 +2341,7 @@ class TestHarvestKeylessEdges:
             output_dir=tmp_path,
             extraction_enrichment_provider="anthropic",
             extraction_enrichment_provider_model="claude-sonnet-4-6",
-            extraction_scrub={"person name"},
+            extraction_scrub_categories=resolve_scrub_categories(["person name"]),
             extraction_max_tokens=8192,
             extraction_plausibility_max_tokens=8192,
             extraction_anonymize_token_envelope=8192,
@@ -3932,9 +3157,10 @@ class TestGraphTierAnonymizationContract:
         """No name present as a key in the caller-supplied ``mapping``
         reaches the payload handed to ``_cloud_call``; it renders as its
         placeholder token instead.  A bare ``speaker{N}`` id is never a
-        ``mapping`` key in production (the local anonymizer prompt
-        forbids mapping it — see :func:`_build_anonymization_mapping`'s
-        speaker-anchor invariants), so it legitimately reaches the
+        ``mapping`` key in production (SCAN verification drops any
+        speaker-id-shaped value before ``build_forward_table`` ever mints
+        for it — see that function's speaker-anchor invariants), so it
+        legitimately reaches the
         payload UNMASKED — ``request_graph_enrichment`` applies no scope
         gate of its own; it substitutes exactly what ``mapping`` says
         (the model's own mapping is the sole scope authority).
@@ -4273,9 +3499,9 @@ class TestGraphTierAnonymizationContract:
         from paramem.graph.schema import SessionGraph
         from paramem.utils.identity import is_speaker_id
 
-        # Hand-built payload (bypassing _build_anonymization_mapping's
-        # speaker-key-drop guard on purpose — see docstring: a legal input
-        # to this pure function, never how a real caller populates it).
+        # Hand-built payload (bypassing build_forward_table's speaker-key-drop
+        # guard on purpose — see docstring: a legal input to this pure
+        # function, never how a real caller populates it).
         # Realistic shape otherwise: Cloud can only propose a same_as pair
         # naming placeholders it was actually SHOWN, so the chunk's
         # ``triples`` (fed to ``request_graph_enrichment`` directly, per
@@ -4298,7 +3524,6 @@ class TestGraphTierAnonymizationContract:
             reverse=reverse,
             anon_transcript="",
             declared=frozenset(reverse.keys()),
-            norm_stats={"inverted": 0, "dropped": 0},
             rekey_dropped=0,
             raw="",
             facts=triples,
@@ -4444,37 +3669,105 @@ def _populate_untyped_graph(graph: nx.MultiDiGraph, n_persons: int = 10) -> None
         )
 
 
-def _stub_local_model_types(type_by_name: dict[str, str]):
-    """Build a stand-in for ``anonymize_transcript`` typing real names
-    per ``type_by_name`` (default ``"person"`` for anything unlisted),
-    minting ``Prefix_N`` tokens in sorted-name order — simulating what the
-    LOCAL model's own anonymization pass would classify each real name as.
+def _reconciled_contract_for_stub(
+    raw_forward: dict[str, str],
+    facts: list[dict],
+    identity_domain,
+    *,
+    raw: str = "stub-raw",
+):
+    """Shared tail for every ``anonymize`` stand-in below: given the
+    stub's own real-name -> placeholder table (standing in for what
+    ``paramem.cloud.placeholders.build_forward_table`` would have
+    minted from a SCAN result — placeholder VALUES are code-minted in
+    production and no longer caller-dictated, but this test-only
+    shortcut keeps the caller-given value rather than re-minting, since
+    nothing here exercises the minting rule itself), replay the REAL
+    identity-reconciliation and domain-guard primitives
+    (:func:`~paramem.cloud.anonymize._index_identity_domain`,
+    :func:`~paramem.cloud.anonymize._reconcile_to_domain`,
+    :func:`~paramem.cloud.anonymize._domain_guard_fires`) against the
+    caller's own ``identity_domain``/``facts`` — so behavioral tests of
+    THAT logic (reconciliation drops, the domain-scoped fail-closed
+    guard) stay faithful to production without re-deriving it a second
+    time inside a bespoke stub.
 
-    Returns the post-redesign three-artifact shape
-    (``mapping, anonymized_transcript, raw``) — every name the stub mints
-    a placeholder for is also substituted into a synthetic
-    ``anonymized_transcript`` so callers that thread the fail-closed
-    check (a missing/empty transcript blocks the chunk) see a realistic
-    non-empty value.
+    Returns a ``status="failed", failure="guard"`` contract when the
+    guard fires; otherwise a ``status="ok"`` contract carrying the
+    reconciled forward table and ``facts`` verbatim (mirroring what
+    ``anonymize()`` itself returns on a successful, transcript-less
+    call).
     """
-    from paramem.cloud.placeholders import _substitute_whole_words
+    from paramem.cloud.anonymize import (
+        AnonymizedContract,
+        _domain_guard_fires,
+        _index_identity_domain,
+        _reconcile_to_domain,
+    )
+    from paramem.cloud.placeholders import invert_forward_mapping
+    from paramem.utils.identity import is_speaker_id
+
+    if identity_domain is not None:
+        canon_to_domain, ambiguous = _index_identity_domain(identity_domain)
+        forward, dropped = _reconcile_to_domain(raw_forward, canon_to_domain, ambiguous)
+    else:
+        forward, dropped = dict(raw_forward), 0
+
+    if identity_domain is not None and _domain_guard_fires(
+        dict.fromkeys(raw_forward), forward, facts
+    ):
+        return AnonymizedContract(
+            status="failed",
+            forward={},
+            reverse={},
+            anon_transcript="",
+            declared=frozenset(),
+            rekey_dropped=dropped,
+            raw=raw,
+            failure="guard",
+            facts=[],
+            model_calls=1,
+        )
+
+    reverse = invert_forward_mapping({k: v for k, v in forward.items() if not is_speaker_id(v)})
+    return AnonymizedContract(
+        status="ok",
+        forward=forward,
+        reverse=reverse,
+        anon_transcript="",
+        declared=frozenset(reverse.keys()),
+        rekey_dropped=dropped,
+        raw=raw,
+        failure=None,
+        facts=list(facts),
+        model_calls=1,
+    )
+
+
+def _stub_local_model_types(type_by_name: dict[str, str]):
+    """Build a stand-in for ``anonymize`` (THE one anonymize chain)
+    typing real names per ``type_by_name`` (default ``"person"`` for
+    anything unlisted), minting ``Prefix_N`` tokens in sorted-name order
+    — simulating what the LOCAL model's own SCAN classification would
+    produce for each real name — then replaying the real reconciliation
+    + guard logic via :func:`_reconciled_contract_for_stub`.
+    """
     from paramem.config.taxonomy import entity_type_to_prefix
 
-    def _stub(facts, model, tokenizer, transcript="", **kwargs):
+    def _stub(facts, model, tokenizer, *, transcript="", identity_domain=None, **kwargs):
         # ``facts`` is a plain fact-dict list (interface narrowing,
         # 2026-07-21) — never a ``SessionGraph`` — so names come off
         # ``subject``/``object`` keys directly, not ``.relations``.
         names = sorted(
             {str(f.get("subject", "")) for f in facts} | {str(f.get("object", "")) for f in facts}
         )
-        mapping: dict[str, str] = {}
+        raw_forward: dict[str, str] = {}
         counters: dict[str, int] = {}
         for name in names:
             prefix = entity_type_to_prefix(type_by_name.get(name, "person"))
             counters[prefix] = counters.get(prefix, 0) + 1
-            mapping[name] = f"{prefix}_{counters[prefix]}"
-        anon_transcript = _substitute_whole_words(transcript, mapping) or "stub-anon-transcript"
-        return mapping, anon_transcript, "stub-raw"
+            raw_forward[name] = f"{prefix}_{counters[prefix]}"
+        return _reconciled_contract_for_stub(raw_forward, facts, identity_domain)
 
     return _stub
 
@@ -4517,7 +3810,7 @@ class TestGraphTierLocalModelTypeDerivation:
         stub = _stub_local_model_types({"acmecorp": "organization"})
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with (
-            patch("paramem.cloud.anonymize.anonymize_transcript", side_effect=stub),
+            patch("paramem.training.graph_enrich.anonymize", side_effect=stub),
             patch("paramem.graph.extractor._cloud_call", side_effect=_capture),
         ):
             result = _refiner_for(loop).run_enrichment()
@@ -4551,22 +3844,24 @@ class TestGraphTierLocalModelTypeDerivation:
             captured.append(prompt)
             return '{"relations": [], "same_as": []}'
 
-        def _stub_omits_acmecorp(facts, model, tokenizer, transcript="", **kwargs):
+        def _stub_omits_acmecorp(
+            facts, model, tokenizer, *, transcript="", identity_domain=None, **kwargs
+        ):
             # ``facts`` is a plain fact-dict list — never a ``SessionGraph``.
             names = sorted(
                 {str(f.get("subject", "")) for f in facts}
                 | {str(f.get("object", "")) for f in facts}
             )
-            mapping = {
+            raw_forward = {
                 name: f"Person_{i + 1}"
                 for i, name in enumerate(n for n in names if n != "acmecorp")
             }
-            return mapping, "stub-anon-transcript", "stub-raw"
+            return _reconciled_contract_for_stub(raw_forward, facts, identity_domain)
 
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with (
             patch(
-                "paramem.cloud.anonymize.anonymize_transcript",
+                "paramem.training.graph_enrich.anonymize",
                 side_effect=_stub_omits_acmecorp,
             ),
             patch("paramem.graph.extractor._cloud_call", side_effect=_capture),
@@ -4611,7 +3906,7 @@ class TestGraphTierLocalModelTypeDerivation:
 
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with (
-            patch("paramem.cloud.anonymize.anonymize_transcript", side_effect=stub),
+            patch("paramem.training.graph_enrich.anonymize", side_effect=stub),
             patch("paramem.graph.extractor._cloud_call", side_effect=_cloud_response),
         ):
             result = _refiner_for(loop).run_enrichment()
@@ -4708,8 +4003,10 @@ class TestGraphTierMappingReconciliation:
             return '{"relations": [], "same_as": []}'
 
         monkeypatch.setattr(
-            "paramem.cloud.anonymize.anonymize_transcript",
-            lambda *args, **kwargs: ({"Yang Ming": "Person_1"}, "stub-anon-transcript", "stub-raw"),
+            "paramem.training.graph_enrich.anonymize",
+            lambda facts, model, tokenizer, *, identity_domain=None, **kwargs: (
+                _reconciled_contract_for_stub({"Yang Ming": "Person_1"}, facts, identity_domain)
+            ),
         )
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch("paramem.graph.extractor._cloud_call", side_effect=_capture):
@@ -4721,42 +4018,6 @@ class TestGraphTierMappingReconciliation:
         assert "yang ming" not in payload.lower(), f"Real name leaked into payload: {payload}"
         assert "Person_1" in payload, f"Expected the node masked as Person_1; got: {payload}"
         assert result["mapping_rekey_dropped"] == 0
-
-    def test_mapping_key_naming_nothing_in_chunk_is_dropped_and_counted(
-        self, tmp_path, monkeypatch
-    ):
-        """A local-mapping entry whose (canonicalized) key matches no node
-        in this chunk names nothing here — it must be dropped rather than
-        minted as a phantom Entity, and the drop must be counted.
-
-        Mutation: skip the reconciliation and use the mapping as-is ->
-        ``mapping_rekey_dropped`` stays 0 and a phantom entity is minted
-        for a name absent from the chunk -> this test fails.
-        """
-        loop = _make_loop(tmp_path)
-        graph = loop.merger.graph
-        _populate_untyped_graph(graph, n_persons=10)
-
-        monkeypatch.setattr(
-            "paramem.cloud.anonymize.anonymize_transcript",
-            lambda *args, **kwargs: (
-                {"Someone Else": "Person_1"},
-                "stub-anon-transcript",
-                "stub-raw",
-            ),
-        )
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-        call_spy = MagicMock()
-        with patch("paramem.training.graph_enrich.request_graph_enrichment", call_spy):
-            result = _refiner_for(loop).run_enrichment()
-
-        assert not result["skipped"]
-        assert result["mapping_rekey_dropped"] >= 1
-        # "Someone Else" names nothing in the chunk -- chunk_mapping ends
-        # up empty, tripping the pre-existing empty-mapping fail-closed
-        # guard (leg 2), so no cloud call fires at all.
-        call_spy.assert_not_called()
-        assert result["privacy_skipped_chunks"] >= 1
 
     def test_ambiguous_canonical_node_keys_are_both_dropped(self, tmp_path, monkeypatch):
         """Two distinct node keys that canonicalize identically are a real
@@ -4798,8 +4059,10 @@ class TestGraphTierMappingReconciliation:
             )
 
         monkeypatch.setattr(
-            "paramem.cloud.anonymize.anonymize_transcript",
-            lambda *args, **kwargs: ({"Yang Ming": "Person_1"}, "stub-anon-transcript", "stub-raw"),
+            "paramem.training.graph_enrich.anonymize",
+            lambda facts, model, tokenizer, *, identity_domain=None, **kwargs: (
+                _reconciled_contract_for_stub({"Yang Ming": "Person_1"}, facts, identity_domain)
+            ),
         )
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         call_spy = MagicMock()
@@ -4820,7 +4083,7 @@ class TestGraphEnrichmentUsesSharedPrimitives:
 
     _PLACEHOLDER_PRIMITIVE_NAMES = frozenset(
         {
-            "_build_anonymization_mapping",
+            "build_forward_table",
             "_apply_bindings",
             "_normalize_anonymization_mapping",
             "_resolution_map",
@@ -4907,7 +4170,7 @@ class TestGraphEnrichmentUsesSharedPrimitives:
 
     _CLOUD_ROUNDTRIP_ONLY_PRIMITIVES = frozenset(
         {
-            "_build_anonymization_mapping",
+            "build_forward_table",
             "_binding_collisions",
             "_apply_bindings",
             "_resolution_map",
@@ -5041,7 +4304,7 @@ class TestGraphEnrichmentFailureLoudness:
         stub = _stub_local_model_types({})
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with (
-            patch("paramem.cloud.anonymize.anonymize_transcript", side_effect=stub),
+            patch("paramem.training.graph_enrich.anonymize", side_effect=stub),
             patch("paramem.graph.extractor._load_prompt", side_effect=_bad_prompt),
             patch(
                 "paramem.graph.extractor._cloud_call",
@@ -5050,176 +4313,6 @@ class TestGraphEnrichmentFailureLoudness:
             pytest.raises(KeyError, match="oops"),
         ):
             _refiner_for(loop).run_enrichment()
-
-    def test_graph_enrichment_cuda_driver_fault_degrades_the_pass(self, tmp_path, monkeypatch):
-        """A CUDA "device not ready" fault from the local ``generate()`` is
-        converted to ``VramExhausted`` by ``vram_scope`` (``anonymize.py``)
-        BEFORE it ever reaches ``graph_enrich.enrich_graph``'s exception
-        handlers — so this test patches ``generate_answer``, the actual GPU
-        call, rather than ``anonymize_transcript`` (which would bypass
-        ``vram_scope`` entirely and exercise a branch production cannot
-        reach).
-
-        The pass degrades: it stops, keeps whatever it already merged
-        (nothing here — the fault is on the only chunk), and returns
-        normally with ``aborted_reason == "vram"`` rather than raising or
-        silently "skipping the chunk" and continuing.
-
-        Mutation: revert the ``except VramExhausted`` branch to ``raise`` ->
-        this test's ``run_enrichment()`` call raises instead of returning a
-        degrade result.
-        """
-        loop = _make_loop(tmp_path)
-        _populate_untyped_graph(loop.merger.graph)
-
-        def _boom(*args, **kwargs):
-            raise RuntimeError("CUDA error: device not ready")
-
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-        with (
-            # This suite runs with CUDA_VISIBLE_DEVICES="" (tests/conftest.py's
-            # CUDA isolation gate), under which vram_scope no-ops entirely — so
-            # without this, the fault would propagate WITHOUT going through
-            # vram_scope's conversion, silently re-introducing the bypass this
-            # test exists to close. Mirrors tests/test_vram_guard.py's own
-            # pattern for exercising vram_scope's real branches off-GPU.
-            patch("paramem.utils.vram_guard.torch.cuda.is_available", return_value=True),
-            patch("paramem.utils.vram_guard.torch.cuda.empty_cache"),
-            # Restore the REAL anonymize_transcript (the autouse fixture at
-            # the top of this file stubs it out for every other test in this
-            # module) so the fault travels through vram_scope, exactly as it
-            # does in production.
-            patch(
-                "paramem.cloud.anonymize.anonymize_transcript",
-                side_effect=_real_anonymize_transcript,
-            ),
-            patch("paramem.cloud.anonymize.generate_answer", side_effect=_boom),
-            patch(
-                "paramem.graph.extractor._cloud_call",
-                side_effect=AssertionError("the cloud must not be called for a faulted chunk"),
-            ),
-        ):
-            result = _refiner_for(loop).run_enrichment()
-
-        assert result["skipped"] is False
-        assert result["aborted_reason"] == "vram"
-        assert result["chunks"] == 0, "no cloud call may be made for a chunk that faulted locally"
-        assert result["new_edges"] == 0
-
-    def test_graph_enrichment_non_driver_runtime_error_skips_the_chunk(self, tmp_path, monkeypatch):
-        """A genuinely non-driver-fault ``RuntimeError`` from the local
-        ``generate()`` is NOT converted by ``vram_scope`` (it only converts
-        the "device not ready" / "CUDA driver error" marker classes) — it
-        propagates unchanged and reaches ``enrich_graph``'s ``except
-        RuntimeError`` branch, which is genuinely reachable for this case
-        (unlike the CUDA-driver-fault case above). It skips just this chunk
-        and lets the pass finish normally, ``aborted_reason`` staying
-        ``None`` — the "honestly scoped" counterpart to the driver-fault
-        test above.
-
-        Mutation: narrow the handler to nothing (delete the ``except
-        RuntimeError``) -> the RuntimeError kills the whole fold -> this
-        test fails.
-        """
-        loop = _make_loop(tmp_path)
-        _populate_untyped_graph(loop.merger.graph)
-
-        def _boom(*args, **kwargs):
-            raise RuntimeError("some unrelated local generate failure")
-
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-        with (
-            # See the driver-fault test above for why CUDA must be reported
-            # available and the real anonymize_transcript restored here.
-            patch("paramem.utils.vram_guard.torch.cuda.is_available", return_value=True),
-            patch("paramem.utils.vram_guard.torch.cuda.empty_cache"),
-            patch(
-                "paramem.cloud.anonymize.anonymize_transcript",
-                side_effect=_real_anonymize_transcript,
-            ),
-            patch("paramem.cloud.anonymize.generate_answer", side_effect=_boom),
-            patch(
-                "paramem.graph.extractor._cloud_call",
-                side_effect=AssertionError("the cloud must not be called for a failed chunk"),
-            ),
-        ):
-            result = _refiner_for(loop).run_enrichment()
-
-        assert result["skipped"] is False
-        assert result["aborted_reason"] is None
-        assert result["chunks"] == 0, "no cloud call may be made for a chunk that failed locally"
-        assert result["new_edges"] == 0
-
-    def test_graph_enrichment_fatal_cuda_fault_propagates(self, tmp_path, monkeypatch):
-        """A sticky, process-fatal CUDA context fault (``vram_guard.
-        is_fatal_cuda_fault``'s contract — recovery is ``os._exit`` + process
-        restart, never an in-process release) must escape ``enrich_graph``
-        rather than being logged and swallowed as a skipped chunk.
-
-        Mutation: drop the ``if is_fatal_cuda_fault(exc): raise`` guard at
-        the top of the ``except RuntimeError`` branch -> this test's
-        ``run_enrichment()`` call swallows the fault instead of propagating
-        it.
-        """
-        loop = _make_loop(tmp_path)
-        _populate_untyped_graph(loop.merger.graph)
-
-        def _boom(*args, **kwargs):
-            raise RuntimeError("CUDA error: an illegal memory access was encountered")
-
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-        with (
-            # See the driver-fault test above for why CUDA must be reported
-            # available and the real anonymize_transcript restored here.
-            patch("paramem.utils.vram_guard.torch.cuda.is_available", return_value=True),
-            patch("paramem.utils.vram_guard.torch.cuda.empty_cache"),
-            patch(
-                "paramem.cloud.anonymize.anonymize_transcript",
-                side_effect=_real_anonymize_transcript,
-            ),
-            patch("paramem.cloud.anonymize.generate_answer", side_effect=_boom),
-            patch(
-                "paramem.graph.extractor._cloud_call",
-                side_effect=AssertionError(
-                    "the cloud must not be called for a fatally-faulted chunk"
-                ),
-            ),
-            pytest.raises(RuntimeError, match="illegal memory access"),
-        ):
-            _refiner_for(loop).run_enrichment()
-
-    def test_graph_tier_gates_on_mapping_not_facts(self, tmp_path, monkeypatch):
-        """The graph tier gates parse-failure on ``_llm_mapping is
-        None``, regardless of the (fail-closed, empty) ``anonymized_transcript``
-        the anonymizer returns alongside it.
-
-        Mutation: gate on the transcript instead of ``_llm_mapping is
-        None`` -> the gate silently never fires -> this test fails.
-        """
-        loop = _make_loop(tmp_path)
-        _populate_untyped_graph(loop.merger.graph)
-
-        def _parse_failure(*args, **kwargs):
-            return None, "", "not json"
-
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-        with (
-            patch(
-                "paramem.cloud.anonymize.anonymize_transcript",
-                side_effect=_parse_failure,
-            ),
-            patch(
-                "paramem.graph.extractor._cloud_call",
-                side_effect=AssertionError(
-                    "the cloud must not be called for a chunk with no local mapping"
-                ),
-            ),
-        ):
-            result = _refiner_for(loop).run_enrichment()
-
-        assert not result["skipped"]
-        assert result["chunks"] == 0, "no cloud call may be made when the mapping is None"
-        assert result["new_edges"] == 0
 
 
 class TestChunkTelemetryLogging:

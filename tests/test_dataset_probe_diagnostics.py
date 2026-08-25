@@ -167,21 +167,6 @@ class TestRawFactCountRegression:
         diag = _call_diag(_make_session(), graph, episodic_rels=episodic_rels)
         assert isinstance(diag["extraction"]["raw_fact_count"], int)
 
-    def test_raw_fact_count_equals_post_plausibility_plus_all_drops(self):
-        """raw_fact_count == post_plausibility_count + sum of all coerced drops."""
-        graph = _make_graph(
-            {
-                "residual_dropped_facts": [{"text": "x"}, {"text": "y"}],  # 2
-                "plausibility_dropped_deanon": 5,  # 5
-                "mapping_ambiguous_dropped": 1,  # 1
-            }
-        )
-        # 3 surviving QA pairs (post_plausibility_count = 3)
-        episodic_rels = [{"q": f"Q{i}", "a": f"A{i}"} for i in range(3)]
-        diag = _call_diag(_make_session(), graph, episodic_rels=episodic_rels)
-        # Expected: 3 + 2 + 5 + 1 = 11
-        assert diag["extraction"]["raw_fact_count"] == 11
-
     def test_raw_fact_count_all_zeros_no_qa(self):
         """With no QA and no drops, raw_fact_count is 0."""
         graph = _make_graph({})
@@ -248,69 +233,3 @@ class TestEntityRelationDistributions:
         assert diag["graph"]["entity_type_distribution"] == {}
         assert diag["graph"]["relation_type_distribution"] == {}
         assert diag["extraction"]["drops"]["plausibility_dropped"] == 0
-
-
-class TestNewDiagnosticsKeysDoNotEnterTheSum:
-    """Several new ``graph.diagnostics`` keys sit beside the ones
-    ``_build_session_diagnostics`` already reads — list-shaped attribution
-    payloads, judge-state dicts, and a new ``residual_dropped`` INT
-    counter alongside the pre-existing ``residual_dropped_facts`` LIST.
-    ``_build_session_diagnostics`` reads exactly four named keys into
-    ``drops``; this pins that the new keys are invisible to it — the
-    probe's ``drops`` dict and ``raw_fact_count`` stay byte-identical to a
-    diagnostics dict that never carried them, and ``residual_dropped`` is
-    never summed alongside ``residual_dropped_facts`` (which would
-    double-count the same drop under two different keys)."""
-
-    def test_new_keys_present_drops_dict_unaffected(self):
-        """New int/list/dict diagnostics keys sit beside the four the
-        probe already reads; ``drops`` and ``raw_fact_count`` are
-        byte-identical to a diagnostics dict that never had them."""
-        base_diagnostics = {
-            "residual_dropped_facts": [{"text": "x"}],
-            "predicate_placeholder_dropped_facts": [{"text": "y"}, {"text": "z"}],
-            "plausibility_dropped_anon": 1,
-            "plausibility_dropped_deanon": 2,
-            "plausibility_dropped_fallback": 0,
-            "mapping_ambiguous_dropped": 1,
-        }
-        new_only_keys = {
-            # The new unconditional counter — same session, same drop
-            # count, under a DIFFERENT key than the list the probe reads.
-            "residual_dropped": 1,
-            "predicate_placeholder_dropped": 2,
-            "plausibility_dropped_anon_facts": [{"text": "y"}],
-            "plausibility_out_of_range_anon": [],
-            "plausibility_out_of_range_deanon": [],
-            "plausibility_out_of_range_fallback": [],
-            "plausibility_state_anon": {"state": "ran", "reason": None},
-            "plausibility_state_deanon": {"state": "ran", "reason": None},
-            "mapping_ambiguous_dropped_entries": [
-                {"side": "value", "text": "x", "counterpart_len": 3}
-            ],
-            "declared_unobserved_tokens": ["Person_2"],
-            "anonymizer_unapplied_tokens": [],
-            "pipeline_injected_tokens": [],
-            "cloud_binding_collisions": [],
-        }
-
-        session = _make_session()
-        episodic_rels = [{"question": "q1", "answer": "a1"}]
-
-        graph_before = _make_graph(dict(base_diagnostics))
-        diag_before = _call_diag(session, graph_before, episodic_rels=episodic_rels)
-
-        graph_after = _make_graph({**base_diagnostics, **new_only_keys})
-        diag_after = _call_diag(session, graph_after, episodic_rels=episodic_rels)
-
-        assert diag_after["extraction"]["drops"] == diag_before["extraction"]["drops"]
-        assert set(diag_after["extraction"]["drops"]) == {
-            "residual_dropped_facts",
-            "predicate_placeholder_dropped_facts",
-            "plausibility_dropped",
-            "mapping_ambiguous_dropped",
-        }
-        assert (
-            diag_after["extraction"]["raw_fact_count"]
-            == diag_before["extraction"]["raw_fact_count"]
-        )

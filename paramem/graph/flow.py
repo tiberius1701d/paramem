@@ -39,6 +39,7 @@ if TYPE_CHECKING:
     # not "no domain type may be named in an annotation".
     from paramem.cloud.anonymize import AnonymizedContract
     from paramem.cloud.deanonymize import CloudScope
+    from paramem.config.taxonomy import ScrubCategory
     from paramem.graph.schema import SessionGraph
 
 
@@ -79,7 +80,7 @@ class StageContext:
     plausibility_stage: str
     plausibility_model: str
     plausibility_endpoint: str | None
-    scrub: set[str] | frozenset[str]
+    scrub_categories: tuple[ScrubCategory, ...]
     correction_entity_types: set[str] | frozenset[str] | None
     anonymize_token_envelope: int
 

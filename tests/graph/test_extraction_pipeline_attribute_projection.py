@@ -16,6 +16,7 @@ from unittest.mock import MagicMock
 
 from peft import PeftModel
 
+from paramem.config.taxonomy import resolve_scrub_categories
 from paramem.graph.extraction_pipeline import ExtractionConfig, ExtractionPipeline
 from paramem.graph.schema import Entity, Relation, SessionGraph
 
@@ -36,7 +37,7 @@ def _peft_model_mock() -> MagicMock:
 
 
 def _pipeline(**config_overrides) -> ExtractionPipeline:
-    config_overrides.setdefault("scrub", {"person name"})
+    config_overrides.setdefault("scrub_categories", resolve_scrub_categories(["person name"]))
     return ExtractionPipeline(
         model=_peft_model_mock(),
         tokenizer=MagicMock(),

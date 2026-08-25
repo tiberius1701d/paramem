@@ -1,0 +1,652 @@
+{
+  "_about": "Calibration fixture for the local cloud-egress anonymizer (scripts/dev/calibrate_cloud_anonymizer.py and the span-tagger SCAN step it exercises, paramem.cloud.span_tagger). Fictional payloads only -- no real personal data. Reconstructed 2026-08-25 from the live-gate calibration record; every name, number, address, email and handle is invented. \n\nSchema: one JSON document with a top-level \"payloads\" list. Each entry has: \"id\" (a short descriptive slug, unique within the file); \"kind\" (one of \"transcript\", \"facts\", \"dense\", \"planted\", \"document\" -- what shape of input the payload feeds into the anonymizer); \"language\" (an ISO 639-1 code); \"description\" (what the payload exercises, in plain language); \"transcript\" (a marker-bearing string using \"[user]\"/\"[assistant]\" line prefixes, present for every kind except \"facts\") or \"facts\" (a list of {subject, predicate, object, relation_type, confidence, speaker_id} objects, present only for kind \"facts\"); \"speaker_id\" and \"speaker_name\" (the session's own speaker; \"speaker_name\" is null throughout this fixture, matching production's default shape where the speaker is identified by voice enrollment and never states their own name in the text); \"expected\" (the personal values the anonymizer must recognise, one array per category -- \"person\", \"phone\", \"email\", \"address\", \"profile\" -- using the exact surface form expected to be tagged); and \"must_not_tag\" (near-miss values -- organisation names, platform names, generic domains, digit strings that resemble an in-scope value -- that must stay untagged).",
+  "payloads": [
+    {
+      "id": "phone_dual_number",
+      "kind": "transcript",
+      "language": "en",
+      "description": "Two phone numbers (a personal mobile and a shared support line) plus one person name, both surfaced under casual urgency language.",
+      "transcript": "[user] Hi, I'm Lena Fischer. Call +49 160 5550177 -- it's urgent!\n[assistant] Thanks. If that line is busy, the support desk is 0800 555 0123.\n[user] Perfect, I'll try both this afternoon.\n[assistant] Noted.",
+      "speaker_id": "speaker0",
+      "speaker_name": null,
+      "expected": {
+        "person": [
+          "Lena Fischer"
+        ],
+        "phone": [
+          "+49 160 5550177",
+          "0800 555 0123"
+        ],
+        "email": [],
+        "address": [],
+        "profile": []
+      },
+      "must_not_tag": []
+    },
+    {
+      "id": "email_cc_and_referral",
+      "kind": "transcript",
+      "language": "en",
+      "description": "Two person names and two email addresses, one introduced as a cc recipient rather than the message's primary addressee.",
+      "transcript": "[user] Nadia Okonjo asked me to send the quote to omar.haddad@example.com.\n[assistant] Understood. Anything else before I file it?\n[user] Yes -- copy contracts@example.org and let Felix Braun know.\n[assistant] Will do.",
+      "speaker_id": "speaker0",
+      "speaker_name": null,
+      "expected": {
+        "person": [
+          "Nadia Okonjo",
+          "Felix Braun"
+        ],
+        "phone": [],
+        "email": [
+          "omar.haddad@example.com",
+          "contracts@example.org"
+        ],
+        "address": [],
+        "profile": []
+      },
+      "must_not_tag": []
+    },
+    {
+      "id": "address_single_recipient",
+      "kind": "transcript",
+      "language": "en",
+      "description": "One postal address and one recipient name split across two conversational turns (the address is given before the name).",
+      "transcript": "[user] Ship the parcel to Rosenweg 8, 80331 München, please.\n[assistant] Got it. Who should I put down as the recipient?\n[user] Priya Raman.\n[assistant] Recorded.",
+      "speaker_id": "speaker0",
+      "speaker_name": null,
+      "expected": {
+        "person": [
+          "Priya Raman"
+        ],
+        "phone": [],
+        "email": [],
+        "address": [
+          "Rosenweg 8, 80331 München"
+        ],
+        "profile": []
+      },
+      "must_not_tag": []
+    },
+    {
+      "id": "office_move_phone_address",
+      "kind": "transcript",
+      "language": "en",
+      "description": "A relocated office: a postal address and a phone number correction, plus one person name given as a contact to ask for.",
+      "transcript": "[user] Our western office moved to 27 Quay Street, Galway last month.\n[assistant] Thanks -- is the number still the same?\n[user] No, it's +353 91 555 0146 now. Ask for Jonas Lindgren.\n[assistant] Updated.",
+      "speaker_id": "speaker0",
+      "speaker_name": null,
+      "expected": {
+        "person": [
+          "Jonas Lindgren"
+        ],
+        "phone": [
+          "+353 91 555 0146"
+        ],
+        "email": [],
+        "address": [
+          "27 Quay Street, Galway"
+        ],
+        "profile": []
+      },
+      "must_not_tag": []
+    },
+    {
+      "id": "profile_handle_and_link",
+      "kind": "transcript",
+      "language": "en",
+      "description": "A social handle and a profile URL for the same person, alongside platform-name and generic-domain decoys that must stay untagged.",
+      "transcript": "[user] Mara Lindqvist posts as @mara_lindqvist and her page is linkedin.com/in/mara-lindqvist.\n[assistant] Should I check LinkedIn or wiki.example.net for the bio?\n[user] Neither -- the repo at github.com/acme-tools has the current one.\n[assistant] Understood.",
+      "speaker_id": "speaker0",
+      "speaker_name": null,
+      "expected": {
+        "person": [
+          "Mara Lindqvist"
+        ],
+        "phone": [],
+        "email": [],
+        "address": [],
+        "profile": [
+          "@mara_lindqvist",
+          "linkedin.com/in/mara-lindqvist"
+        ]
+      },
+      "must_not_tag": [
+        "LinkedIn",
+        "wiki.example.net",
+        "github.com/acme-tools"
+      ]
+    },
+    {
+      "id": "handle_and_delivery_address",
+      "kind": "transcript",
+      "language": "en",
+      "description": "One social handle and one postal address for the same person, introduced through a casual forum reference.",
+      "transcript": "[user] Omar Haddad goes by @omar_h on the forum.\n[assistant] Noted. Where does he collect post?\n[user] 14 Harbour Lane, Bristol BS1 5TY.\n[assistant] Saved.",
+      "speaker_id": "speaker0",
+      "speaker_name": null,
+      "expected": {
+        "person": [
+          "Omar Haddad"
+        ],
+        "phone": [],
+        "email": [],
+        "address": [
+          "14 Harbour Lane, Bristol BS1 5TY"
+        ],
+        "profile": [
+          "@omar_h"
+        ]
+      },
+      "must_not_tag": []
+    },
+    {
+      "id": "repeated_person_mentions_with_org_decoy",
+      "kind": "transcript",
+      "language": "en",
+      "description": "Two people mentioned multiple times across turns, plus an organisation name decoy that has historically been mis-tagged as a person.",
+      "transcript": "[user] Alex Turner called about the audit.\n[assistant] Did Dana Whitfield join the call?\n[user] She did. Alex Turner will send the notes; Harrison & Cole are handling the filing.\n[assistant] I'll flag it for Harrison & Cole then.",
+      "speaker_id": "speaker0",
+      "speaker_name": null,
+      "expected": {
+        "person": [
+          "Alex Turner",
+          "Dana Whitfield"
+        ],
+        "phone": [],
+        "email": [],
+        "address": [],
+        "profile": []
+      },
+      "must_not_tag": [
+        "Harrison & Cole"
+      ]
+    },
+    {
+      "id": "two_people_shared_email",
+      "kind": "transcript",
+      "language": "en",
+      "description": "Two people joining a meeting, with a work email address belonging to only one of them.",
+      "transcript": "[user] Elena Varga and Yusuf Demir are joining the review.\n[assistant] Do you have a contact address for either of them?\n[user] Elena's work address is elena.varga@example.net.\n[assistant] Added both to the invite.",
+      "speaker_id": "speaker0",
+      "speaker_name": null,
+      "expected": {
+        "person": [
+          "Elena Varga",
+          "Yusuf Demir"
+        ],
+        "phone": [],
+        "email": [
+          "elena.varga@example.net"
+        ],
+        "address": [],
+        "profile": []
+      },
+      "must_not_tag": []
+    },
+    {
+      "id": "german_person_phone_address_email",
+      "kind": "transcript",
+      "language": "de",
+      "description": "A German-language self-introduction carrying a phone number and a postal address, plus a colleague's name and email address, with a numeric order-id decoy.",
+      "transcript": "[user] Guten Tag, hier ist Jonas Weber. Meine Nummer ist 0176 5550188 und ich wohne in der Lindenstraße 44, 10115 Berlin.\n[assistant] Danke. Auf welche Bestellung bezieht sich das?\n[user] Bestellnummer 4471-0921. Meine Kollegin Anna Schulz hat sie aufgegeben; ihre Adresse ist anna.schulz@example.de.\n[assistant] Alles notiert.",
+      "speaker_id": "speaker0",
+      "speaker_name": null,
+      "expected": {
+        "person": [
+          "Jonas Weber",
+          "Anna Schulz"
+        ],
+        "phone": [
+          "0176 5550188"
+        ],
+        "email": [
+          "anna.schulz@example.de"
+        ],
+        "address": [
+          "Lindenstraße 44, 10115 Berlin"
+        ],
+        "profile": []
+      },
+      "must_not_tag": [
+        "4471-0921"
+      ]
+    },
+    {
+      "id": "planted_values_long_document",
+      "kind": "planted",
+      "language": "en",
+      "description": "A long neutral-filler document (about 1200 words) with five personal values planted at scattered positions, none near each other. Exercises windowed scanning: the values must be recovered even though a single unwindowed pass over this much text would miss most of them.",
+      "transcript": "[user] the quarterly review covered scheduling throughput and the backlog of open items across every workstream while the team recorded decisions in the shared minutes and agreed to revisit the estimates once the next measurement window closes so that planning stays grounded in observed numbers rather than projections the quarterly review covered scheduling Priya Raman throughput and the backlog of open items across every workstream while the team recorded decisions in the shared minutes and agreed to revisit the estimates once the next measurement window closes so that planning stays grounded in observed numbers rather than projections the quarterly review covered scheduling throughput and the backlog of open items across every workstream while the team recorded decisions in the shared minutes and agreed to revisit the estimates once the next measurement window closes so that planning stays grounded in observed numbers rather than projections the quarterly review covered scheduling throughput and the backlog of open items across every workstream while the team recorded decisions in the shared minutes and agreed to revisit the estimates once the next measurement window closes so that planning stays grounded in observed numbers rather than projections the quarterly review covered scheduling throughput and the backlog of open items across every workstream while the team recorded decisions in the shared minutes and agreed to revisit the estimates once the next measurement window closes so that planning stays grounded in observed numbers rather than projections the quarterly review covered scheduling throughput and the backlog of open items across every workstream while the team recorded decisions in the shared minutes and agreed to revisit the estimates once the next measurement window closes so that planning stays grounded in observed numbers rather than projections the quarterly review covered scheduling throughput and the backlog of open items across every workstream while the team recorded decisions in the shared minutes and agreed to revisit the estimates once the next measurement window closes so that planning stays grounded in observed numbers rather than projections the quarterly review covered scheduling throughput and the backlog of open items across every workstream while the team recorded decisions in the shared minutes and agreed to revisit the estimates once the next measurement window closes so that planning stays grounded in observed numbers rather than projections the quarterly review covered scheduling throughput and the backlog of open items +33 1 55 50 01 77 across every workstream while the team recorded decisions in the shared minutes and agreed to revisit the estimates once the next measurement window closes so that planning elena.varga@example.net stays grounded in observed numbers rather than projections the quarterly review covered scheduling throughput and the backlog of open items across every workstream while the team recorded decisions in the shared minutes and agreed to revisit the estimates once the next measurement window closes so that planning stays grounded in observed numbers rather than projections the quarterly review covered scheduling throughput and the backlog of open items across every workstream while the team recorded decisions in the shared minutes and agreed to revisit the estimates once the next measurement window closes so that planning stays grounded in observed numbers rather than projections the quarterly review covered scheduling throughput and the backlog of open items across every workstream while the team recorded decisions in the shared minutes and agreed to revisit the estimates once the next measurement window closes so that planning stays grounded in observed numbers rather than projections the quarterly review covered scheduling throughput and the backlog of open items across every workstream while the team recorded decisions in the shared minutes and agreed to revisit the estimates once the next measurement window closes so that planning stays grounded in observed numbers rather than projections the quarterly review covered scheduling throughput and the backlog of open items across every workstream while the team recorded decisions in the shared minutes and agreed to revisit the estimates once the next measurement window closes so that planning stays grounded in observed numbers rather than projections the quarterly review covered scheduling throughput and the backlog of open items across every workstream while the team recorded decisions in the shared minutes and agreed to revisit the estimates once the next measurement window closes so that planning stays grounded in observed numbers rather than projections the quarterly review covered scheduling throughput and the backlog of open items across every workstream while Jonas Lindgren the team recorded decisions in the shared minutes and agreed to revisit the estimates once the next measurement window closes so that planning stays grounded in observed numbers rather than projections the quarterly review covered scheduling throughput and the backlog of open items across every workstream while the team recorded decisions in the shared minutes and agreed to revisit the estimates once the next measurement window closes so that planning stays grounded in observed numbers rather than projections the quarterly review covered scheduling throughput and the backlog of open items across every workstream while the team recorded decisions in the shared minutes and agreed to revisit the estimates once the next measurement window closes so that planning stays grounded in observed numbers rather than projections the quarterly review covered scheduling throughput and the backlog of open items across every workstream while the team recorded decisions in the shared minutes and agreed to revisit the estimates once the next measurement window closes so that planning stays grounded in observed numbers rather than projections the quarterly review covered scheduling throughput and the backlog of open items across every workstream while the team recorded decisions in the shared minutes and agreed to revisit the estimates once the next measurement window closes so that planning stays grounded in observed numbers rather than projections the quarterly review covered scheduling throughput and the backlog of open items across every workstream while the team recorded decisions in the shared minutes and agreed to revisit the estimates once the next measurement window closes so that planning stays grounded in observed numbers rather than projections the quarterly review covered scheduling throughput and the backlog of open items across every workstream while the team recorded decisions in the shared minutes and agreed to revisit the estimates once the next measurement window closes so that planning stays grounded in observed numbers rather than projections the quarterly review covered scheduling throughput and the backlog of open items across every workstream while the team recorded decisions in the shared minutes and agreed to revisit the estimates once the next measurement window closes so that planning stays grounded in observed numbers rather than projections the quarterly review covered scheduling throughput and the backlog of open items across every workstream while the team recorded decisions in the shared minutes and agreed to revisit the estimates once the next measurement window closes so that planning stays grounded in observed numbers rather than projections the quarterly review covered scheduling throughput and the backlog of open items across every workstream while the team recorded decisions in the shared minutes and agreed to revisit the estimates once the next measurement window closes so that planning stays grounded in observed numbers rather than projections the quarterly yusuf.demir@example.org review covered scheduling throughput and the backlog of open items across every workstream while the team recorded decisions in the shared minutes and agreed to revisit the estimates once the next measurement window closes so that planning stays grounded in observed numbers rather than projections the quarterly review covered scheduling throughput and\n[assistant] Understood.",
+      "speaker_id": "speaker0",
+      "speaker_name": null,
+      "expected": {
+        "person": [
+          "Priya Raman",
+          "Jonas Lindgren"
+        ],
+        "phone": [
+          "+33 1 55 50 01 77"
+        ],
+        "email": [
+          "elena.varga@example.net",
+          "yusuf.demir@example.org"
+        ],
+        "address": [],
+        "profile": []
+      },
+      "must_not_tag": []
+    },
+    {
+      "id": "dense_german_contact_list_single_window",
+      "kind": "dense",
+      "language": "de",
+      "description": "Ten German contacts (name, phone, email, postal address) listed back to back, dense enough to stress per-value recall even though the whole list fits in one scan window. Exercises address recall specifically: addresses recall much lower on this dense shape than in ordinary prose.",
+      "transcript": "[user] Kontaktliste fuer die Zustellung:\nJonas Weber, Telefon 0176 5550188, E-Mail jonas.weber@example.de, Anschrift Lindenstraße 44, 10115 Berlin.\nAnna Schulz, Telefon 0151 5550199, E-Mail anna.schulz@example.de, Anschrift Rosenweg 8, 80331 München.\nKarl Brenner, Telefon 0170 5550122, E-Mail karl.brenner@example.de, Anschrift Ahornweg 12, 20095 Hamburg.\nIngrid Falk, Telefon 0162 5550133, E-Mail ingrid.falk@example.de, Anschrift Birkenstraße 7, 50667 Köln.\nPeter Ostwald, Telefon 0175 5550144, E-Mail peter.ostwald@example.de, Anschrift Uferpromenade 91, 60311 Frankfurt.\nSabine Kurz, Telefon 0173 5550155, E-Mail sabine.kurz@example.de, Anschrift Marktplatz 3, 70173 Stuttgart.\nDetlef Ronneberg, Telefon 0176 5550166, E-Mail detlef.ronneberg@example.de, Anschrift Hafenstraße 28, 28195 Bremen.\nMargarethe Vogelsang, Telefon 0178 5550177, E-Mail margarethe.vogelsang@example.de, Anschrift Königsallee 152, 40212 Düsseldorf.\nWilhelmine Stauffer, Telefon 0179 5550188, E-Mail wilhelmine.stauffer@example.de, Anschrift Prinzregentenstraße 9, 80538 München.\nFriedrich Ammerschläger, Telefon 0171 5550199, E-Mail friedrich.ammerschlaeger@example.de, Anschrift Schillerpromenade 63, 12049 Berlin.\nAlle Eintraege notiert.\n[assistant] Notiert.",
+      "speaker_id": "speaker0",
+      "speaker_name": null,
+      "expected": {
+        "person": [
+          "Jonas Weber",
+          "Anna Schulz",
+          "Karl Brenner",
+          "Ingrid Falk",
+          "Peter Ostwald",
+          "Sabine Kurz",
+          "Detlef Ronneberg",
+          "Margarethe Vogelsang",
+          "Wilhelmine Stauffer",
+          "Friedrich Ammerschläger"
+        ],
+        "phone": [
+          "0176 5550188",
+          "0151 5550199",
+          "0170 5550122",
+          "0162 5550133",
+          "0175 5550144",
+          "0173 5550155",
+          "0176 5550166",
+          "0178 5550177",
+          "0179 5550188",
+          "0171 5550199"
+        ],
+        "email": [
+          "jonas.weber@example.de",
+          "anna.schulz@example.de",
+          "karl.brenner@example.de",
+          "ingrid.falk@example.de",
+          "peter.ostwald@example.de",
+          "sabine.kurz@example.de",
+          "detlef.ronneberg@example.de",
+          "margarethe.vogelsang@example.de",
+          "wilhelmine.stauffer@example.de",
+          "friedrich.ammerschlaeger@example.de"
+        ],
+        "address": [
+          "Lindenstraße 44, 10115 Berlin",
+          "Rosenweg 8, 80331 München",
+          "Ahornweg 12, 20095 Hamburg",
+          "Birkenstraße 7, 50667 Köln",
+          "Uferpromenade 91, 60311 Frankfurt",
+          "Marktplatz 3, 70173 Stuttgart",
+          "Hafenstraße 28, 28195 Bremen",
+          "Königsallee 152, 40212 Düsseldorf",
+          "Prinzregentenstraße 9, 80538 München",
+          "Schillerpromenade 63, 12049 Berlin"
+        ],
+        "profile": []
+      },
+      "must_not_tag": []
+    },
+    {
+      "id": "dense_german_contact_list_multi_window",
+      "kind": "dense",
+      "language": "de",
+      "description": "The same ten German contacts repeated four times (forty contact lines), long enough to span several scan windows. Exercises window-boundary behaviour: one contact's email address happens to straddle a window seam, producing an extra partial-email span alongside the correctly recovered full address; the full value is still what reaches the outbound text, so the partial span costs nothing tagged as under-scrub.",
+      "transcript": "[user] Kontaktliste für die Zustellung:\n[user] Jonas Weber, Telefon 0176 5550188, E-Mail jonas.weber@example.de, Anschrift Lindenstraße 44, 10115 Berlin, Abteilung 0.\n[user] Anna Schulz, Telefon 0151 5550199, E-Mail anna.schulz@example.de, Anschrift Rosenweg 8, 80331 München, Abteilung 0.\n[user] Karl Brenner, Telefon 0170 5550122, E-Mail karl.brenner@example.de, Anschrift Ahornweg 12, 20095 Hamburg, Abteilung 0.\n[user] Ingrid Falk, Telefon 0162 5550133, E-Mail ingrid.falk@example.de, Anschrift Birkenstraße 7, 50667 Köln, Abteilung 0.\n[user] Peter Ostwald, Telefon 0175 5550144, E-Mail peter.ostwald@example.de, Anschrift Uferpromenade 91, 60311 Frankfurt, Abteilung 0.\n[user] Sabine Kurz, Telefon 0173 5550155, E-Mail sabine.kurz@example.de, Anschrift Marktplatz 3, 70173 Stuttgart, Abteilung 0.\n[user] Detlef Ronneberg, Telefon 0176 5550166, E-Mail detlef.ronneberg@example.de, Anschrift Hafenstraße 28, 28195 Bremen, Abteilung 0.\n[user] Margarethe Vogelsang, Telefon 0178 5550177, E-Mail margarethe.vogelsang@example.de, Anschrift Königsallee 152, 40212 Düsseldorf, Abteilung 0.\n[user] Wilhelmine Stauffer, Telefon 0179 5550188, E-Mail wilhelmine.stauffer@example.de, Anschrift Prinzregentenstraße 9, 80538 München, Abteilung 0.\n[user] Friedrich Ammerschläger, Telefon 0171 5550199, E-Mail friedrich.ammerschlaeger@example.de, Anschrift Schillerpromenade 63, 12049 Berlin, Abteilung 0.\n[user] Jonas Weber, Telefon 0176 5550188, E-Mail jonas.weber@example.de, Anschrift Lindenstraße 44, 10115 Berlin, Abteilung 1.\n[user] Anna Schulz, Telefon 0151 5550199, E-Mail anna.schulz@example.de, Anschrift Rosenweg 8, 80331 München, Abteilung 1.\n[user] Karl Brenner, Telefon 0170 5550122, E-Mail karl.brenner@example.de, Anschrift Ahornweg 12, 20095 Hamburg, Abteilung 1.\n[user] Ingrid Falk, Telefon 0162 5550133, E-Mail ingrid.falk@example.de, Anschrift Birkenstraße 7, 50667 Köln, Abteilung 1.\n[user] Peter Ostwald, Telefon 0175 5550144, E-Mail peter.ostwald@example.de, Anschrift Uferpromenade 91, 60311 Frankfurt, Abteilung 1.\n[user] Sabine Kurz, Telefon 0173 5550155, E-Mail sabine.kurz@example.de, Anschrift Marktplatz 3, 70173 Stuttgart, Abteilung 1.\n[user] Detlef Ronneberg, Telefon 0176 5550166, E-Mail detlef.ronneberg@example.de, Anschrift Hafenstraße 28, 28195 Bremen, Abteilung 1.\n[user] Margarethe Vogelsang, Telefon 0178 5550177, E-Mail margarethe.vogelsang@example.de, Anschrift Königsallee 152, 40212 Düsseldorf, Abteilung 1.\n[user] Wilhelmine Stauffer, Telefon 0179 5550188, E-Mail wilhelmine.stauffer@example.de, Anschrift Prinzregentenstraße 9, 80538 München, Abteilung 1.\n[user] Friedrich Ammerschläger, Telefon 0171 5550199, E-Mail friedrich.ammerschlaeger@example.de, Anschrift Schillerpromenade 63, 12049 Berlin, Abteilung 1.\n[user] Jonas Weber, Telefon 0176 5550188, E-Mail jonas.weber@example.de, Anschrift Lindenstraße 44, 10115 Berlin, Abteilung 2.\n[user] Anna Schulz, Telefon 0151 5550199, E-Mail anna.schulz@example.de, Anschrift Rosenweg 8, 80331 München, Abteilung 2.\n[user] Karl Brenner, Telefon 0170 5550122, E-Mail karl.brenner@example.de, Anschrift Ahornweg 12, 20095 Hamburg, Abteilung 2.\n[user] Ingrid Falk, Telefon 0162 5550133, E-Mail ingrid.falk@example.de, Anschrift Birkenstraße 7, 50667 Köln, Abteilung 2.\n[user] Peter Ostwald, Telefon 0175 5550144, E-Mail peter.ostwald@example.de, Anschrift Uferpromenade 91, 60311 Frankfurt, Abteilung 2.\n[user] Sabine Kurz, Telefon 0173 5550155, E-Mail sabine.kurz@example.de, Anschrift Marktplatz 3, 70173 Stuttgart, Abteilung 2.\n[user] Detlef Ronneberg, Telefon 0176 5550166, E-Mail detlef.ronneberg@example.de, Anschrift Hafenstraße 28, 28195 Bremen, Abteilung 2.\n[user] Margarethe Vogelsang, Telefon 0178 5550177, E-Mail margarethe.vogelsang@example.de, Anschrift Königsallee 152, 40212 Düsseldorf, Abteilung 2.\n[user] Wilhelmine Stauffer, Telefon 0179 5550188, E-Mail wilhelmine.stauffer@example.de, Anschrift Prinzregentenstraße 9, 80538 München, Abteilung 2.\n[user] Friedrich Ammerschläger, Telefon 0171 5550199, E-Mail friedrich.ammerschlaeger@example.de, Anschrift Schillerpromenade 63, 12049 Berlin, Abteilung 2.\n[user] Jonas Weber, Telefon 0176 5550188, E-Mail jonas.weber@example.de, Anschrift Lindenstraße 44, 10115 Berlin, Abteilung 3.\n[user] Anna Schulz, Telefon 0151 5550199, E-Mail anna.schulz@example.de, Anschrift Rosenweg 8, 80331 München, Abteilung 3.\n[user] Karl Brenner, Telefon 0170 5550122, E-Mail karl.brenner@example.de, Anschrift Ahornweg 12, 20095 Hamburg, Abteilung 3.\n[user] Ingrid Falk, Telefon 0162 5550133, E-Mail ingrid.falk@example.de, Anschrift Birkenstraße 7, 50667 Köln, Abteilung 3.\n[user] Peter Ostwald, Telefon 0175 5550144, E-Mail peter.ostwald@example.de, Anschrift Uferpromenade 91, 60311 Frankfurt, Abteilung 3.\n[user] Sabine Kurz, Telefon 0173 5550155, E-Mail sabine.kurz@example.de, Anschrift Marktplatz 3, 70173 Stuttgart, Abteilung 3.\n[user] Detlef Ronneberg, Telefon 0176 5550166, E-Mail detlef.ronneberg@example.de, Anschrift Hafenstraße 28, 28195 Bremen, Abteilung 3.\n[user] Margarethe Vogelsang, Telefon 0178 5550177, E-Mail margarethe.vogelsang@example.de, Anschrift Königsallee 152, 40212 Düsseldorf, Abteilung 3.\n[user] Wilhelmine Stauffer, Telefon 0179 5550188, E-Mail wilhelmine.stauffer@example.de, Anschrift Prinzregentenstraße 9, 80538 München, Abteilung 3.\n[user] Friedrich Ammerschläger, Telefon 0171 5550199, E-Mail friedrich.ammerschlaeger@example.de, Anschrift Schillerpromenade 63, 12049 Berlin, Abteilung 3.\n[assistant] Alle Einträge notiert.",
+      "speaker_id": "speaker0",
+      "speaker_name": null,
+      "expected": {
+        "person": [
+          "Jonas Weber",
+          "Anna Schulz",
+          "Karl Brenner",
+          "Ingrid Falk",
+          "Peter Ostwald",
+          "Sabine Kurz",
+          "Detlef Ronneberg",
+          "Margarethe Vogelsang",
+          "Wilhelmine Stauffer",
+          "Friedrich Ammerschläger"
+        ],
+        "phone": [
+          "0176 5550188",
+          "0151 5550199",
+          "0170 5550122",
+          "0162 5550133",
+          "0175 5550144",
+          "0173 5550155",
+          "0176 5550166",
+          "0178 5550177",
+          "0179 5550188",
+          "0171 5550199"
+        ],
+        "email": [
+          "jonas.weber@example.de",
+          "anna.schulz@example.de",
+          "karl.brenner@example.de",
+          "ingrid.falk@example.de",
+          "peter.ostwald@example.de",
+          "sabine.kurz@example.de",
+          "detlef.ronneberg@example.de",
+          "margarethe.vogelsang@example.de",
+          "wilhelmine.stauffer@example.de",
+          "friedrich.ammerschlaeger@example.de"
+        ],
+        "address": [
+          "Lindenstraße 44, 10115 Berlin",
+          "Rosenweg 8, 80331 München",
+          "Ahornweg 12, 20095 Hamburg",
+          "Birkenstraße 7, 50667 Köln",
+          "Uferpromenade 91, 60311 Frankfurt",
+          "Marktplatz 3, 70173 Stuttgart",
+          "Hafenstraße 28, 28195 Bremen",
+          "Königsallee 152, 40212 Düsseldorf",
+          "Prinzregentenstraße 9, 80538 München",
+          "Schillerpromenade 63, 12049 Berlin"
+        ],
+        "profile": []
+      },
+      "must_not_tag": []
+    },
+    {
+      "id": "case_variant_retention",
+      "kind": "transcript",
+      "language": "en",
+      "description": "The same first name spoken twice with different capitalisation (sentence-initial vs. mid-sentence), plus a second person's name. Exercises that both casings of the same name are recognised as the same person and share one placeholder rather than minting two.",
+      "transcript": "[user] Lena said she would come by at six.\n[assistant] Which Lena -- the one from the choir?\n[user] Yes, lena from the choir. Her sister Marta will drive her.\n[assistant] Understood.",
+      "speaker_id": "speaker0",
+      "speaker_name": null,
+      "expected": {
+        "person": [
+          "Lena",
+          "lena",
+          "Marta"
+        ],
+        "phone": [],
+        "email": [],
+        "address": [],
+        "profile": []
+      },
+      "must_not_tag": []
+    },
+    {
+      "id": "german_surname_inflection",
+      "kind": "transcript",
+      "language": "de",
+      "description": "A German surname appearing in four grammatical forms in one conversation: the full name once, the genitive form twice, and the bare dative surname once, plus an email address built from the same surname. Exercises a known residual: the anonymizer matches exact surfaces only, so the inflected surname forms are not caught by the same match as the full name and can reach the outbound text verbatim even though the full name and the email are correctly scrubbed.",
+      "transcript": "[user] Lena Fischer hat angerufen. Fischers Nummer ist +49 160 5550177.\n[assistant] Soll ich Fischers Termin auf morgen verschieben?\n[user] Ja, und schick Fischer die Bestätigung an lena.fischer@example.de.\n[assistant] Erledigt.",
+      "speaker_id": "speaker0",
+      "speaker_name": null,
+      "expected": {
+        "person": [
+          "Lena Fischer"
+        ],
+        "phone": [
+          "+49 160 5550177"
+        ],
+        "email": [
+          "lena.fischer@example.de"
+        ],
+        "address": [],
+        "profile": []
+      },
+      "must_not_tag": []
+    },
+    {
+      "id": "empty_case_no_personal_values",
+      "kind": "transcript",
+      "language": "en",
+      "description": "A short exchange with zero in-scope personal values: a build identifier, an internal hostname, a building name and a generic channel name, all of which look superficially identifier-like but must not be tagged under any configured category.",
+      "transcript": "[user] The build 4471-0921 finished on the runner at ci.example.internal.\n[assistant] Which building did that run in?\n[user] The Fitzgerald Annex, third floor. It was pushed to the Slack channel.\n[assistant] Noted.",
+      "speaker_id": "speaker0",
+      "speaker_name": null,
+      "expected": {
+        "person": [],
+        "phone": [],
+        "email": [],
+        "address": [],
+        "profile": []
+      },
+      "must_not_tag": [
+        "4471-0921",
+        "ci.example.internal",
+        "the Fitzgerald Annex",
+        "the Slack channel"
+      ]
+    },
+    {
+      "id": "graph_facts_person_and_contact_endpoints",
+      "kind": "facts",
+      "language": "en",
+      "description": "Twenty-two extracted graph facts: fourteen carry a person or contact endpoint (names, phone numbers, email addresses, postal addresses, a social handle and a profile URL) and eight are plain facts with no personal endpoint at all. Exercises the graph-tier anonymization path (as opposed to the transcript path): the fact structure's own field names must never be tagged, and organisation names must stay untagged even when they resemble the person-name decoy seen in prose.",
+      "facts": [
+        {
+          "subject": "Lena Fischer",
+          "predicate": "works at",
+          "object": "Northwind Labs",
+          "relation_type": "factual",
+          "confidence": 1.0,
+          "speaker_id": "speaker0"
+        },
+        {
+          "subject": "Lena Fischer",
+          "predicate": "has phone",
+          "object": "+49 160 5550177",
+          "relation_type": "attribute",
+          "confidence": 1.0,
+          "speaker_id": "speaker0"
+        },
+        {
+          "subject": "Lena Fischer",
+          "predicate": "has email",
+          "object": "lena.fischer@example.de",
+          "relation_type": "attribute",
+          "confidence": 1.0,
+          "speaker_id": "speaker0"
+        },
+        {
+          "subject": "Omar Haddad",
+          "predicate": "lives in",
+          "object": "14 Harbour Lane, Bristol BS1 5TY",
+          "relation_type": "factual",
+          "confidence": 1.0,
+          "speaker_id": "speaker0"
+        },
+        {
+          "subject": "Omar Haddad",
+          "predicate": "has handle",
+          "object": "@omar_h",
+          "relation_type": "attribute",
+          "confidence": 1.0,
+          "speaker_id": "speaker0"
+        },
+        {
+          "subject": "Mara Lindqvist",
+          "predicate": "has profile",
+          "object": "linkedin.com/in/mara-lindqvist",
+          "relation_type": "attribute",
+          "confidence": 1.0,
+          "speaker_id": "speaker0"
+        },
+        {
+          "subject": "Priya Raman",
+          "predicate": "reports to",
+          "object": "Dana Whitfield",
+          "relation_type": "social",
+          "confidence": 1.0,
+          "speaker_id": "speaker0"
+        },
+        {
+          "subject": "Dana Whitfield",
+          "predicate": "works at",
+          "object": "Harrison & Cole",
+          "relation_type": "factual",
+          "confidence": 1.0,
+          "speaker_id": "speaker0"
+        },
+        {
+          "subject": "Jonas Lindgren",
+          "predicate": "based in",
+          "object": "27 Quay Street, Galway",
+          "relation_type": "factual",
+          "confidence": 1.0,
+          "speaker_id": "speaker0"
+        },
+        {
+          "subject": "Elena Varga",
+          "predicate": "has email",
+          "object": "elena.varga@example.net",
+          "relation_type": "attribute",
+          "confidence": 1.0,
+          "speaker_id": "speaker0"
+        },
+        {
+          "subject": "Yusuf Demir",
+          "predicate": "collaborates with",
+          "object": "Felix Braun",
+          "relation_type": "social",
+          "confidence": 1.0,
+          "speaker_id": "speaker0"
+        },
+        {
+          "subject": "Nadia Okonjo",
+          "predicate": "has phone",
+          "object": "0800 555 0123",
+          "relation_type": "attribute",
+          "confidence": 1.0,
+          "speaker_id": "speaker0"
+        },
+        {
+          "subject": "Jonas Weber",
+          "predicate": "lives in",
+          "object": "Lindenstraße 44, 10115 Berlin",
+          "relation_type": "factual",
+          "confidence": 1.0,
+          "speaker_id": "speaker0"
+        },
+        {
+          "subject": "Anna Schulz",
+          "predicate": "has email",
+          "object": "anna.schulz@example.de",
+          "relation_type": "attribute",
+          "confidence": 1.0,
+          "speaker_id": "speaker0"
+        },
+        {
+          "subject": "speaker0",
+          "predicate": "prefers",
+          "object": "dark roast coffee",
+          "relation_type": "preference",
+          "confidence": 1.0,
+          "speaker_id": "speaker0"
+        },
+        {
+          "subject": "speaker0",
+          "predicate": "uses",
+          "object": "a standing desk",
+          "relation_type": "preference",
+          "confidence": 1.0,
+          "speaker_id": "speaker0"
+        },
+        {
+          "subject": "the quarterly review",
+          "predicate": "scheduled for",
+          "object": "Thursday",
+          "relation_type": "temporal",
+          "confidence": 1.0,
+          "speaker_id": "speaker0"
+        },
+        {
+          "subject": "the backlog",
+          "predicate": "contains",
+          "object": "eleven open items",
+          "relation_type": "factual",
+          "confidence": 1.0,
+          "speaker_id": "speaker0"
+        },
+        {
+          "subject": "the runner",
+          "predicate": "hosts",
+          "object": "the nightly build",
+          "relation_type": "factual",
+          "confidence": 1.0,
+          "speaker_id": "speaker0"
+        },
+        {
+          "subject": "the minutes",
+          "predicate": "record",
+          "object": "every decision",
+          "relation_type": "factual",
+          "confidence": 1.0,
+          "speaker_id": "speaker0"
+        },
+        {
+          "subject": "the estimates",
+          "predicate": "revisited after",
+          "object": "each measurement window",
+          "relation_type": "temporal",
+          "confidence": 1.0,
+          "speaker_id": "speaker0"
+        },
+        {
+          "subject": "Northwind Labs",
+          "predicate": "operates",
+          "object": "two data halls",
+          "relation_type": "factual",
+          "confidence": 1.0,
+          "speaker_id": "speaker0"
+        }
+      ],
+      "speaker_id": "speaker0",
+      "speaker_name": null,
+      "expected": {
+        "person": [
+          "Lena Fischer",
+          "Omar Haddad",
+          "Mara Lindqvist",
+          "Priya Raman",
+          "Dana Whitfield",
+          "Jonas Lindgren",
+          "Elena Varga",
+          "Yusuf Demir",
+          "Felix Braun",
+          "Nadia Okonjo",
+          "Jonas Weber",
+          "Anna Schulz"
+        ],
+        "phone": [
+          "+49 160 5550177",
+          "0800 555 0123"
+        ],
+        "email": [
+          "lena.fischer@example.de",
+          "elena.varga@example.net",
+          "anna.schulz@example.de"
+        ],
+        "address": [
+          "14 Harbour Lane, Bristol BS1 5TY",
+          "27 Quay Street, Galway",
+          "Lindenstraße 44, 10115 Berlin"
+        ],
+        "profile": [
+          "@omar_h",
+          "linkedin.com/in/mara-lindqvist"
+        ]
+      },
+      "must_not_tag": [
+        "Northwind Labs",
+        "Harrison & Cole"
+      ]
+    }
+  ]
+}

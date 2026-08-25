@@ -69,7 +69,7 @@ def _make_ctx(**overrides) -> StageContext:
         plausibility_stage="deanon",
         plausibility_model="",
         plausibility_endpoint=None,
-        scrub=frozenset(),
+        scrub_categories=(),
         correction_entity_types=None,
         anonymize_token_envelope=8192,
     )

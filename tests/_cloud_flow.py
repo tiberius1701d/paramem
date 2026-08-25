@@ -23,6 +23,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from paramem.cloud.anonymize import _DEFAULT_ANONYMIZER_TOKEN_ENVELOPE
+from paramem.config.taxonomy import resolve_scrub_categories
 from paramem.graph.extractor import _DEFAULT_FILTER_MAX_TOKENS, EnrichmentDelta
 from paramem.graph.flow import StageContext, StageSpec, StageState, run_flow
 from paramem.graph.flows import SESSION_EXTRACT
@@ -82,11 +83,15 @@ def run_cloud_stages(
             the guards that skip local LLM calls.
         speaker_id: Provenance stamped onto every rebuilt relation.
         scrub: PII-vocabulary hints; empty is the operator opt-out.
+            Resolved to ``StageContext.scrub_categories`` via
+            :func:`~paramem.config.taxonomy.resolve_scrub_categories`
+            (schema row order, not *scrub* order) before the flow runs.
         Remaining arguments map 1:1 onto ``StageContext`` fields.
 
     Returns:
         ``state.graph`` after the walk — whatever stage last ran.
     """
+    scrub_categories = resolve_scrub_categories(sorted(scrub))
     ctx = StageContext(
         model=model,
         tokenizer=tokenizer,
@@ -113,7 +118,7 @@ def run_cloud_stages(
         plausibility_stage=plausibility_stage,
         plausibility_model=plausibility_model,
         plausibility_endpoint=plausibility_endpoint,
-        scrub=scrub,
+        scrub_categories=scrub_categories,
         correction_entity_types=correction_entity_types,
         anonymize_token_envelope=anonymize_token_envelope,
     )

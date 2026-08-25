@@ -71,6 +71,7 @@ def _make_loop(tmp_path, *, procedural: bool = False) -> ConsolidationLoop:
     loop.graph_enrichment_neighborhood_hops = 2
     loop.graph_enrichment_max_entities_per_pass = 50
     loop.cloud_enabled = False
+    loop.prompts_dir = None
     loop._incidents_state_dir = None
 
     loop.merger = GraphMerger(model=None, tokenizer=None)

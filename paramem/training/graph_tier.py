@@ -18,6 +18,7 @@ handle, and the small set of scalars/callables listed on
 
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
 from paramem.cloud.admission import evaluate_cloud_egress
@@ -78,6 +79,7 @@ class GraphTierRefiner:
         cloud_enabled: bool,
         neighborhood_hops: int,
         max_entities_per_pass: int,
+        prompts_dir: "str | Path | None" = None,
         gc_disable: "Callable[[], None] | None" = None,
         gc_enable: "Callable[[], None] | None" = None,
     ) -> None:
@@ -94,8 +96,8 @@ class GraphTierRefiner:
                 (not the owning ``ExtractionPipeline`` — the pipeline is a
                 second base-model holder this refiner has no business
                 reaching). Only ``enrichment_provider``, ``enrichment_provider_model``,
-                ``enrichment_provider_endpoint``, ``scrub``, and ``max_tokens`` are
-                read, across both passes.
+                ``enrichment_provider_endpoint``, ``scrub_categories``, and
+                ``max_tokens`` are read, across both passes.
 
                 Deferred, not a resolved value. Every one of this refiner's
                 skip paths — ``no_model`` above all, which is what a released
@@ -119,6 +121,10 @@ class GraphTierRefiner:
             neighborhood_hops: Ego-graph radius for enrichment chunking.
             max_entities_per_pass: Max high-recurrence entities considered per
                 enrichment pass.
+            prompts_dir: Operator ``paths.prompts`` override, threaded
+                unchanged to :func:`~paramem.training.graph_enrich.enrich_graph`'s
+                own ``load_anonymizer_prompts`` call. ``None`` (default)
+                resolves only the shipped ``configs/prompts/`` copy.
             gc_disable: Zero-arg callable that disables gradient checkpointing,
                 or ``None`` for a no-op. Toggled per chunk by
                 :meth:`run_enrichment` around each cloud call — normalization
@@ -135,6 +141,7 @@ class GraphTierRefiner:
         self._cloud_enabled = cloud_enabled
         self._neighborhood_hops = neighborhood_hops
         self._max_entities_per_pass = max_entities_per_pass
+        self._prompts_dir = prompts_dir
         self._gc_disable = gc_disable
         self._gc_enable = gc_enable
 
@@ -171,6 +178,7 @@ class GraphTierRefiner:
             extraction_config_provider=self._extraction_config_provider,
             neighborhood_hops=self._neighborhood_hops,
             max_entities_per_pass=self._max_entities_per_pass,
+            prompts_dir=self._prompts_dir,
             gc_disable=self._gc_disable,
             gc_enable=self._gc_enable,
         )
@@ -582,12 +590,11 @@ class GraphTierRefiner:
             if not enrichment.get("skipped"):
                 logger.info(
                     "graph_enrichment complete: chunks=%d new_edges=%d same_as_merges=%d "
-                    "anonymize_slices=%d privacy_skipped_slices=%d aborted_reason=%s",
+                    "privacy_skipped_chunks=%d aborted_reason=%s",
                     enrichment.get("chunks", 0),
                     enrichment.get("new_edges", 0),
                     enrichment.get("same_as_merges", 0),
-                    enrichment.get("anonymize_slices", 0),
-                    enrichment.get("privacy_skipped_slices", 0),
+                    enrichment.get("privacy_skipped_chunks", 0),
                     enrichment.get("aborted_reason"),
                 )
 

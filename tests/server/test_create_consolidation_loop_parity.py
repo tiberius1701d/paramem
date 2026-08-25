@@ -213,7 +213,7 @@ def test_factory_threads_every_config_knob(
         captured["extraction_anonymize_token_envelope"]
         == cfg.consolidation.extraction_anonymize_token_envelope
     )
-    assert captured["extraction_scrub"] == set(cfg.sanitization.scrub)
+    assert captured["extraction_scrub_categories"] == cfg.sanitization.scrub_categories
 
     # --- Misc knobs ---
     assert captured["prompts_dir"] == cfg.prompts_dir

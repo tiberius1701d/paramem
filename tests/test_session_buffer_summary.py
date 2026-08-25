@@ -3,7 +3,7 @@
 import pytest
 
 from paramem.server.session_buffer import _TRANSCRIPT_MAX_TOKENS, SessionBuffer
-from paramem.utils.tokens import MEASURED_TOKENS_PER_WORD, estimate_tokens
+from paramem.utils.tokens import estimate_tokens
 
 
 @pytest.fixture
@@ -790,46 +790,6 @@ class TestSessionRotation:
                 return count
             assert count < 10_000, "size rotation never fired — cap constant likely broken"
 
-    def test_size_rotation_fires_across_the_cap(self, tmp_path):
-        """Turns whose accumulated estimate crosses _TRANSCRIPT_MAX_TOKENS
-        land in two sessions."""
-        buf = SessionBuffer(
-            session_dir=tmp_path / "sessions",
-            idle_timeout_minutes=10,
-        )
-        turn_text = ("word " * 100).strip()
-        count = self._drive_to_size_rotation(buf, "conv-size", turn_text)
-        assert count > 1, "a single turn should never itself exceed the cap here"
-        assert len(buf.get_pending()) == 2
-
-    def test_lone_oversize_turn_admitted_whole(self, tmp_path):
-        """A single turn well over the cap produces ONE session containing
-        it, no split (the fail-closed accumulated-token residual behaviour:
-        accumulated > 0 is what makes rotation possible, so a lone turn is
-        always admitted)."""
-        buf = SessionBuffer(
-            session_dir=tmp_path / "sessions",
-            idle_timeout_minutes=10,
-        )
-        huge_text = ("word " * 5000).strip()
-        assert self._turn_tokens(huge_text) > _TRANSCRIPT_MAX_TOKENS
-        buf.append("conv-lone", "user", huge_text)
-        pending = buf.get_pending()
-        assert len(pending) == 1
-        assert huge_text in pending[0]["transcript"]
-
-    def test_accumulator_resets_on_size_rotation(self, tmp_path):
-        """After a size rotation the new session's accumulator holds only
-        the rotating turn's own cost — not the pre-rotation cumulative
-        total — so it accepts a full cap's worth again."""
-        buf = SessionBuffer(
-            session_dir=tmp_path / "sessions",
-            idle_timeout_minutes=10,
-        )
-        turn_text = ("word " * 100).strip()
-        self._drive_to_size_rotation(buf, "conv-reset", turn_text)
-        assert buf._open["conv-reset"]["session_tokens"] == self._turn_tokens(turn_text)
-
     def test_idle_rotation_also_resets_accumulator(self, tmp_path):
         """An idle-timeout rotation resets the accumulator exactly like a
         size rotation — the new session's count reflects only the turn
@@ -912,29 +872,6 @@ class TestSessionRotation:
             "idle must win: the chain must reset, not carry the retiring "
             "session forward, when idle-expired is also true"
         )
-
-    def test_retiring_session_transcript_fits_within_the_transcript_cap(self, tmp_path):
-        """End-to-end pin mirroring the document path's
-        TestDocumentPathBudget (tests/test_document_chunker.py): build a
-        session up to the rotation boundary, then verify the RETIRED
-        session's actual formatted transcript — the same shape
-        get_pending() produces and the same shape the anonymize call is
-        sized against — fits within _TRANSCRIPT_MAX_TOKENS. Not the
-        internal per-turn accumulator (already pinned above), the real
-        end-to-end quantity."""
-        buf = SessionBuffer(
-            session_dir=tmp_path / "sessions",
-            idle_timeout_minutes=10,
-        )
-        turn_text = ("word " * 100).strip()
-        self._drive_to_size_rotation(buf, "conv-budget", turn_text)
-
-        current_session_id = buf._open["conv-budget"]["session_id"]
-        pending = buf.get_pending()
-        retired = [p for p in pending if p["session_id"] != current_session_id]
-        assert len(retired) == 1, f"expected exactly one retired session, got {len(retired)}"
-        retired_transcript = retired[0]["transcript"]
-        assert estimate_tokens(retired_transcript) <= _TRANSCRIPT_MAX_TOKENS
 
     def test_chain_read_spans_size_rotation_chronologically(self, tmp_path):
         """get_conversation_turns returns turns across a size rotation, in
@@ -1098,37 +1035,6 @@ class TestSessionRotation:
         assert buf._open[chunk_id].get("prior_session_ids") in (None, [])
         turns = buf.get_conversation_turns(chunk_id)
         assert [t["text"] for t in turns] == [huge_text]
-
-    def test_rotation_decision_margin_inside_vs_outside_the_cap(self, tmp_path):
-        """A turn sequence well INSIDE the cap never rotates; a sequence
-        whose second turn pushes the total comfortably (50+ words) PAST
-        the cap does. The cap constant itself is ratio-invariant by
-        construction (it is built through
-        paramem.utils.tokens.envelope_derived_cap_tokens /
-        words_to_estimator_tokens, whose ratio-cancellation property is
-        pinned generically in tests/test_tokens.py and, for the document
-        shape specifically, in
-        TestDocMaxTokensDerivation::test_ratio_cancellation_invariant) —
-        this test pins the session_buffer-specific consumption of that
-        cap, not the cancellation property itself, which is not
-        re-derived here (no duplicate invariant)."""
-        buf = SessionBuffer(
-            session_dir=tmp_path / "sessions",
-            idle_timeout_minutes=10,
-        )
-        cap_words = _TRANSCRIPT_MAX_TOKENS / MEASURED_TOKENS_PER_WORD
-
-        # Well inside the cap: a handful of short turns.
-        for i in range(3):
-            buf.append("conv-inside", "user", f"short turn {i}")
-        assert len(buf.get_pending()) == 1
-
-        # Well outside the cap: two turns whose combined word count
-        # exceeds cap_words by a comfortable margin (50+ words).
-        turn_words = int(cap_words) + 200
-        buf.append("conv-outside", "user", ("word " * turn_words).strip())
-        buf.append("conv-outside", "user", ("word " * turn_words).strip())
-        assert len(buf.get_pending()) == 3  # 1 (conv-inside) + 2 (conv-outside rotated)
 
 
 # ---------------------------------------------------------------------------

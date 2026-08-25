@@ -251,8 +251,9 @@ def run_gpu_extraction_check(out_dir: Path) -> dict:
         # Same 5-category default the server config ships
         # (SanitizationConfig.scrub) — no cloud egress happens in this
         # probe (enrichment_provider="off"), but ConsolidationLoop's
-        # ExtractionPipeline requires a scrub value regardless.
-        extraction_scrub=set(SanitizationConfig().scrub),
+        # ExtractionPipeline requires a resolved scrub_categories value
+        # regardless.
+        extraction_scrub_categories=SanitizationConfig().scrub_categories,
         extraction_max_tokens=8192,
         extraction_plausibility_max_tokens=8192,
         extraction_anonymize_token_envelope=ANONYMIZE_ENVELOPE_TOKENS,

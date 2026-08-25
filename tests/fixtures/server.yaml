@@ -446,36 +446,27 @@ tools:
 # ============================================================================
 # SANITIZATION & CLOUD EGRESS POLICY
 # ============================================================================
-# Two layered knobs control what happens to cloud-bound text:
-#
-#   `mode`        — sanitizer detection layer
-#                     off    : no PII detection, queries flow through unchanged
-#                     warn   : log findings, queries flow through unchanged
-#                     block  : null-return personal-marker queries, suppressing
-#                              the cloud call at the first checkpoint
+# Two knobs control what happens to cloud-bound text:
 #
 #   `cloud_mode`  — egress policy for direct cloud escalation
 #                     block      : PERSONAL queries dropped before cloud;
 #                                  non-PERSONAL sent verbatim. Default,
 #                                  zero anonymizer cost, smallest cloud surface.
-#                     anonymize  : cloud-bound text is anonymized via the
-#                                  local LLM (categories chosen by `scrub`),
-#                                  sent to cloud as placeholders, and
-#                                  de-anonymized on the way back. PERSONAL
-#                                  queries reach cloud as redacted text.
+#                     anonymize  : cloud-bound text is anonymized before it
+#                                  leaves (categories chosen by `scrub`), sent
+#                                  to cloud as placeholders, and de-anonymized
+#                                  on the way back. PERSONAL queries reach
+#                                  cloud as redacted text.
 #                     both       : strictest privacy posture — PERSONAL is
 #                                  blocked AND non-PERSONAL is anonymized.
 #                                  Cloud only ever sees non-personal text, and
 #                                  even that is placeholder-substituted.
 #
-# There is no runtime check-and-abort that re-verifies the model's
-# classification.  The model authors BOTH the `mapping` and the rewritten
-# `anonymized_transcript` in one call; verification is an offline
-# calibration gate (recall + transcript fidelity) run before ship, not a
-# runtime check.  `scrub` is a list of PII-vocabulary HINTS given verbatim
-# to the anonymizer prompt — THE PROMPT is the sole scope authority; there
-# is no code-side entity-type gate.  See SECURITY.md for the residual this
-# leaves.
+# `scrub` names what counts as in scope: a small, dedicated, CPU-only
+# detection model (`span_tagger` below) marks every value belonging to a
+# configured hint, and the pipeline, never a model, mints and substitutes
+# every placeholder — there is no code-side entity-type gate. See
+# SECURITY.md for the residual this leaves.
 #
 # HA path (HA conversation agent) is NOT affected by `cloud_mode`. HA receives
 # cleartext, gated by intent classification. Hardening the HA hop is a planned
@@ -485,13 +476,47 @@ tools:
 # env var), no queries reach cloud regardless of `cloud_mode`.
 sanitization:
   cloud_mode: anonymize  # block | anonymize | both — direct-cloud egress policy
-  scrub:                 # reduced person-only set (NOT the shipped default) — exercises both
-                         # the mask path (name terms) and the not-in-scope verbatim pass-through
-                         # path (phone/email/address, absent here) in the same test suite
-    - person name
-    - full name
-    - given name
-    - family name
+  # Empty on purpose: this fixture is egress-capable unconditionally
+  # (cloud.enabled: true above, cloud_mode: anonymize on this same block),
+  # so a non-empty scrub would make span_tagger load the real checkpoint
+  # at every test run. Anonymize tests set categories in code and inject
+  # a tagger test double instead (the project's per-test value-override
+  # rule).
+  scrub: []
+
+# ============================================================================
+# SPAN TAGGER (cloud-egress anonymizer)
+# ============================================================================
+# The local anonymizer identifies the values named by `sanitization.scrub`
+# with a small CPU-only detection model, loaded once at startup from the
+# Hugging Face cache exactly like the conversational model.  It runs on the
+# CPU and never competes for the GPU.  It is loaded only when this
+# deployment can actually reach a cloud with scrubbing on — a non-empty
+# `sanitization.scrub` together with either a usable cloud enrichment
+# provider or `cloud.enabled` plus `cloud_mode: anonymize|both`.  In that
+# case the server refuses to start when the model cannot be resolved;
+# otherwise it starts without it.  With the model absent, no anonymized
+# payload is ever produced — outbound calls that would need one are
+# declined rather than sent unmasked.  The first start on a machine that
+# has never loaded it downloads it (about 1.2 GB, plus its encoder's
+# tokenizer); afterwards it is served from the cache.
+#
+# checkpoint:      Hugging Face model id of the detection model.
+# revision:        exact commit of that model — pinned so an upstream
+#                  change cannot alter what this deployment scrubs.
+# score_threshold: minimum confidence for a value to be treated as in
+#                  scope.  Lower marks more (over-scrubbing costs cloud
+#                  utility); higher marks less (under-scrubbing sends real
+#                  data).  Re-measure against a labelled sample after any
+#                  checkpoint change.
+# threads:         CPU threads the detector may use.  Host-dependent: too
+#                  many oversubscribes the machine and gets dramatically
+#                  SLOWER, not faster.  This setting is process-wide.
+span_tagger:
+  checkpoint: urchade/gliner_multi_pii-v1
+  revision: 1fcf13e85f4eef5394e1fcd406cf2ca9ea82351d
+  score_threshold: 0.5
+  threads: 8
 
 # ============================================================================
 # ABSTENTION — LAST-RESORT CONFABULATION GUARD

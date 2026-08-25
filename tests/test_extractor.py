@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from paramem.cloud.deanonymize import CloudScope, DeanonResult
+from paramem.config.taxonomy import resolve_scrub_categories
 from paramem.graph.extractor import (
     LOCAL_EXTRACTION_PHASES,
     PLAUSIBILITY_OFF,
@@ -39,6 +40,14 @@ def _make_graph(relations, entities=None):
         entities=entities if entities is not None else [],
         relations=relations,
     )
+
+
+def _scrub_categories(*hints: str):
+    """Resolve raw ``sanitization.scrub`` hint strings into the
+    ``scrub_categories`` tuple ``extract_graph``/``StageContext`` now
+    require — these tests only care that a category is configured, not
+    its exact resolved shape."""
+    return resolve_scrub_categories(list(hints))
 
 
 class TestExtractJsonBlock:
@@ -996,7 +1005,7 @@ class TestSecondOrderExtractPhase:
                 transcript="I live in Berlin.",
                 session_id="s001",
                 speaker_id="speaker0",
-                scrub={"person name"},
+                scrub_categories=_scrub_categories("person name"),
             )
         assert mock_gen.call_count == 1, (
             "second_order_extract must not call _generate_extraction when its gate fails"
@@ -1021,7 +1030,7 @@ class TestSecondOrderExtractPhase:
                 transcript="My brother Nadeem lives in Porto.",
                 session_id="s001",
                 speaker_id="speaker0",
-                scrub={"person name"},
+                scrub_categories=_scrub_categories("person name"),
             )
         phase_names = [p.name for p in get_phases(graph)]
         assert "second_order_extract" in phase_names
@@ -1048,7 +1057,7 @@ class TestSecondOrderExtractPhase:
                 transcript="Sam picked the kids up from school today.",
                 session_id="s001",
                 speaker_id="speaker0",
-                scrub={"person name"},
+                scrub_categories=_scrub_categories("person name"),
             )
         phase_names = [p.name for p in get_phases(graph)]
         assert "second_order_extract" in phase_names, (
@@ -1074,7 +1083,7 @@ class TestSecondOrderExtractPhase:
                     transcript="My brother Nadeem lives in Porto.",
                     session_id="s001",
                     speaker_id="speaker0",
-                    scrub={"person name"},
+                    scrub_categories=_scrub_categories("person name"),
                 )
         phase_names = [p.name for p in get_phases(graph)]
         assert phase_names == ["local_extract", "second_order_extract"]
@@ -1105,7 +1114,7 @@ class TestSecondOrderExtractPhase:
                 transcript="My brother Nadeem lives in Porto.",
                 session_id="s001",
                 speaker_id="speaker0",
-                scrub={"person name"},
+                scrub_categories=_scrub_categories("person name"),
             )
         assert captured["extra_slots"] == {"named_people": "Nadeem"}
 
@@ -1184,7 +1193,7 @@ class TestSecondOrderExtractPhase:
                 transcript="My brother Nadeem_Ali lives somewhere. Priya too.",
                 session_id="s001",
                 speaker_id="speaker0",
-                scrub={"person name"},
+                scrub_categories=_scrub_categories("person name"),
             )
         assert any(r.subject == "nadeem ali" and r.object == "Porto" for r in graph.relations), (
             "canonical-variant subject of a gate-set entity must be kept"
@@ -1271,7 +1280,7 @@ class TestSecondOrderExtractPhase:
                 session_id="s001",
                 speaker_id="speaker0",
                 speaker_name=speaker_name,
-                scrub={"person name"},
+                scrub_categories=_scrub_categories("person name"),
             )
 
     def test_addressee_display_name_subject_is_remapped_not_dropped(self):
@@ -1415,7 +1424,7 @@ class TestExtractGraphTimestampPropagation:
                     session_id="s001",
                     speaker_id="speaker0",
                     timestamp="2026-06-28T23:21:30+00:00",
-                    scrub={"person name"},
+                    scrub_categories=_scrub_categories("person name"),
                 )
         assert graph.relations, "fake output must parse successfully, not fall back"
         assert graph.timestamp == "2026-06-28T23:21:30+00:00"
@@ -1436,7 +1445,7 @@ class TestExtractGraphTimestampPropagation:
                     transcript="I like tea.",
                     session_id="s001",
                     speaker_id="speaker0",
-                    scrub={"person name"},
+                    scrub_categories=_scrub_categories("person name"),
                 )
         after = datetime.now(timezone.utc)
         assert graph.relations, "fake output must parse successfully, not fall back"
@@ -1464,7 +1473,7 @@ class TestEmptyRelationsTerminal:
                 transcript="Just saying hello.",
                 session_id="s001",
                 speaker_id="speaker0",
-                scrub={"person name"},
+                scrub_categories=_scrub_categories("person name"),
                 # Later phases are configured ON; the empty-relations
                 # terminal must still short-circuit before any of them.
                 validate=True,
@@ -1525,7 +1534,7 @@ class TestAttributeTypedFactsSurviveTheFlow:
             plausibility_stage="deanon",
             plausibility_model="claude-sonnet-4-6",
             plausibility_endpoint=None,
-            scrub=frozenset({"person name"}),
+            scrub_categories=_scrub_categories("person name"),
             correction_entity_types=None,
             anonymize_token_envelope=8192,
         )
@@ -1633,7 +1642,7 @@ class TestLocalParseFailureDetection:
                 transcript="Some transcript text.",
                 session_id="s001",
                 speaker_id="speaker0",
-                scrub={"person name"},
+                scrub_categories=_scrub_categories("person name"),
             )
         assert graph.relations == []
         found = local_parse_failure(get_phases(graph))

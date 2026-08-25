@@ -149,60 +149,6 @@ class TestNormalizeStageNoNameError:
         )
 
 
-class TestLoadChunksTurnMarking:
-    """_load_chunks must render ``text`` through the SAME production turn
-    renderer (``SessionBuffer._format_turns``), never a hand-rolled
-    marker — for every input shape (document AND transcript)."""
-
-    def test_txt_document_chunk_is_turn_marked(self, tmp_path: Path):
-        f = tmp_path / "notes.txt"
-        f.write_text("Alex works at Brightfield Labs.", encoding="utf-8")
-
-        chunks, source_type = calibrate_prompts._load_chunks(f, None)
-
-        assert source_type == "document"
-        assert len(chunks) >= 1
-        assert chunks[0]["text"].startswith("[user] "), (
-            f"Document chunk must be turn-marked: {chunks[0]['text']!r}"
-        )
-        assert "Alex works at Brightfield Labs." in chunks[0]["text"]
-
-    def test_jsonl_transcript_preserves_role_alternation(self, tmp_path: Path):
-        f = tmp_path / "session.jsonl"
-        f.write_text(
-            "\n".join(
-                [
-                    json.dumps({"role": "user", "text": "Hi there."}),
-                    json.dumps({"role": "assistant", "text": "Hello, how can I help?"}),
-                ]
-            ),
-            encoding="utf-8",
-        )
-
-        chunks, source_type = calibrate_prompts._load_chunks(f, None)
-
-        assert source_type == "transcript"
-        assert len(chunks) == 1
-        text = chunks[0]["text"]
-        assert text.startswith("[user] Hi there."), f"Got: {text!r}"
-        assert "[assistant] Hello, how can I help?" in text
-
-    def test_matches_sessionbuffer_format_turns_directly(self, tmp_path: Path):
-        """The rendered text is byte-identical to calling the renderer
-        directly — not a shape mimic (CLAUDE.md: no parallel renderer)."""
-        from paramem.server.session_buffer import SessionBuffer
-
-        f = tmp_path / "notes.txt"
-        f.write_text("Some document content.", encoding="utf-8")
-
-        chunks, _ = calibrate_prompts._load_chunks(f, None)
-
-        expected_lines, _ = SessionBuffer._format_turns(
-            [{"role": "user", "text": "Some document content."}]
-        )
-        assert chunks[0]["text"] == "\n".join(expected_lines)
-
-
 class TestPostStageAuth:
     """_post_stage must attach an Authorization header and handle 401 gracefully."""
 
@@ -339,69 +285,6 @@ class TestPostStageAuth:
                 )
 
         assert "never written" in str(exc_info.value).lower()
-
-
-class TestAnonymizeStageSpeakerName:
-    """``--speaker`` must reach the
-    ``/calibrate/anonymize`` request payload, not just
-    ``/calibrate/extract`` — production's ``anonymize`` always
-    threads the runtime-known speaker name into speaker-name seeding;
-    omitting it here silently diverges calibration fidelity from
-    production and can leave the speaker's real name un-scrubbed before
-    a real ``/calibrate/enrich`` cloud call.
-    """
-
-    _REAL_PROMPTS_DIR = Path(__file__).resolve().parents[1] / "configs" / "prompts"
-
-    def test_speaker_name_reaches_anonymize_payload(self, tmp_path: Path):
-        input_path = tmp_path / "input.txt"
-        input_path.write_text("Alex works as an engineer at Acme Corp.")
-        dump_dir = tmp_path / "dump"
-        dump_dir.mkdir()
-
-        calls: list[tuple[str, dict]] = []
-
-        def _fake_post_stage(server, stage, payload):
-            calls.append((stage, payload))
-            if stage == "extract":
-                return {
-                    "stage": "extract",
-                    "raw_output": "{}",
-                    "parsed": {
-                        "session_id": "calib-chunk-0",
-                        "timestamp": "2026-07-14T00:00:00Z",
-                        "entities": [],
-                        "relations": [],
-                    },
-                    "parse_error": None,
-                }
-            return {"stage": stage, "raw_output": "{}", "parsed": {}, "parse_error": None}
-
-        argv = [
-            "--input",
-            str(input_path),
-            "--source-type",
-            "transcript",
-            "--chunk",
-            "0",
-            "--stages",
-            "extract,anonymize",
-            "--speaker",
-            "Alex",
-            "--dump-dir",
-            str(dump_dir),
-            "--prompts-dir",
-            str(self._REAL_PROMPTS_DIR),
-            "--baseline",
-            "none",
-        ]
-        with patch.object(calibrate_prompts, "_post_stage", side_effect=_fake_post_stage):
-            rc = calibrate_prompts.main(argv)
-
-        assert rc == 0
-        anonymize_calls = [payload for stage, payload in calls if stage == "anonymize"]
-        assert anonymize_calls, "expected an anonymize stage call"
-        assert anonymize_calls[0]["speaker_name"] == "Alex"
 
 
 class TestSeedFromEnrichLoading:

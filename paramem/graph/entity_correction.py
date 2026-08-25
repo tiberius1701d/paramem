@@ -224,7 +224,7 @@ def correct_entity_surfaces(
 
     Args:
         reverse_mapping: ``{placeholder: real_surface}`` produced by
-            :func:`paramem.cloud.placeholders._build_anonymization_mapping`
+            :func:`paramem.cloud.placeholders.build_forward_table`
             (via :func:`~paramem.cloud.anonymize.anonymize`).
             Read-only — never mutated by this function.
         entities: ``graph.entities`` — read-only, never mutated by this

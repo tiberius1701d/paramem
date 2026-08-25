@@ -763,61 +763,6 @@ class TestRelayNoIdentityShortCircuit:
         ha_client.conversation_process.assert_not_called()
         cloud_agent.call.assert_not_called()
 
-    def test_local_mode_personal_declarative_reaches_cloud_anonymized_only(self):
-        """Owner-ruled fix (relay sanitize + full fallback): in LOCAL mode
-        (live model/tokenizer passed, ``identity_absent=True``), a personal
-        declarative reaches the cloud only in ANONYMIZED form — never the
-        real place name verbatim.  The current turn goes through
-        ``answer_via_cloud``'s anonymize branch exactly like every other
-        leg, instead of skipping sanitization because no speaker resolved."""
-        from paramem.cloud.anonymize import AnonymizedContract
-        from paramem.cloud.providers.base import CloudResponse
-        from paramem.server.app import _relay_route
-
-        config = self._config()
-        config.sanitization.cloud_mode = "anonymize"
-
-        payload = AnonymizedContract(
-            status="ok",
-            forward={"Kelkham": "Place_1"},
-            reverse={"Place_1": "Kelkham"},
-            anon_transcript="I live in Place_1.",
-            declared=frozenset({"Place_1"}),
-            norm_stats={"inverted": 0, "dropped": 0},
-            rekey_dropped=0,
-            raw="",
-        )
-
-        cloud_agent = MagicMock()
-        cloud_agent.call.return_value = CloudResponse(text="Got it, noted.")
-        model = MagicMock()
-        tokenizer = MagicMock()
-
-        with (
-            patch("paramem.graph.flows.anonymize_turn", return_value=payload) as mock_anon,
-            patch(
-                "paramem.cloud.deanonymize.deanonymize_text",
-                return_value="Got it, noted.",
-            ),
-        ):
-            result = _relay_route(
-                text="I live in Kelkham.",
-                history=[],
-                config=config,
-                cloud_permitted=True,
-                ha_client=None,
-                cloud_agent=cloud_agent,
-                identity_absent=True,
-                model=model,
-                tokenizer=tokenizer,
-            )
-
-        mock_anon.assert_called_once()
-        sent_query = cloud_agent.call.call_args.kwargs["query"]
-        assert "Kelkham" not in sent_query
-        assert sent_query == "I live in Place_1."
-        assert result.text == "Got it, noted."
-
     def test_base_model_fallback_fires_when_ha_and_cloud_unavailable(self):
         """The relay's final link, when HA and cloud both fail/are
         unavailable and a local model is loaded (LOCAL mode,

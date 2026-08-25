@@ -232,6 +232,7 @@ class TestDetachAdaptersSurvivorFollowsMainTiersOrderNotInsertionOrder:
 
 class TestConsolidationLoopModelIdentity:
     def test_loop_extraction_and_merger_model_alias_loop_model(self, tmp_path):
+        from paramem.config.taxonomy import resolve_scrub_categories
         from paramem.memory.store import MemoryStore
         from paramem.training.consolidation import ConsolidationLoop
 
@@ -244,7 +245,7 @@ class TestConsolidationLoopModelIdentity:
             tier_adapters={"episodic": _adapter_cfg(), "semantic": _adapter_cfg()},
             memory_store=MemoryStore(),
             output_dir=tmp_path,
-            extraction_scrub={"person name"},
+            extraction_scrub_categories=resolve_scrub_categories(["person name"]),
             extraction_max_tokens=8192,
             extraction_plausibility_max_tokens=8192,
             extraction_anonymize_token_envelope=8192,

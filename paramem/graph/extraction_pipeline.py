@@ -53,6 +53,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from paramem.cloud.anonymize import _DEFAULT_ANONYMIZER_TOKEN_ENVELOPE
+from paramem.config.taxonomy import ScrubCategory
 from paramem.graph.extractor import (
     DEFAULT_PROCEDURAL_USER_PROMPT_FILENAME,
     DEFAULT_SYSTEM_PROMPT_FILENAME,
@@ -108,15 +109,16 @@ class ExtractionConfig:
     plausibility_model: str = "claude-sonnet-4-6"
     plausibility_endpoint: str | None = None
     # Required, no default (kw_only so it can sit after defaulted fields
-    # without violating dataclass field ordering) — the model's
-    # anonymizer prompt is the sole scope authority and the single
-    # declared default is ``SanitizationConfig.scrub``
-    # (``paramem/server/config.py``). A hidden fallback here would
-    # duplicate that policy in the graph layer and silently scrub against
-    # a value the operator never configured — see
-    # ``paramem.cloud.placeholders._build_anonymization_mapping``'s
+    # without violating dataclass field ordering) — the resolved scrub
+    # categories are the single declared default,
+    # ``SanitizationConfig.scrub_categories``
+    # (``paramem/server/config.py``), resolved once at config construction
+    # from the operator's ``sanitization.scrub`` hints. A hidden fallback
+    # here would duplicate that policy in the graph layer and silently
+    # scrub against a value the operator never configured — see
+    # ``paramem.cloud.placeholders.build_forward_table``'s
     # docstring for the same reasoning applied one layer down.
-    scrub: set[str] | frozenset[str] = field(kw_only=True)
+    scrub_categories: tuple[ScrubCategory, ...] = field(kw_only=True)
     correction_entity_types: set[str] | frozenset[str] | None = None
     # Total (prompt + output) token budget one local anonymize() call may
     # occupy — forwarded to extract_graph's anonymize_token_envelope
@@ -280,7 +282,7 @@ class ExtractionPipeline:
             plausibility_stage=pick("plausibility_stage", cfg.plausibility_stage),
             plausibility_model=pick("plausibility_model", cfg.plausibility_model),
             plausibility_endpoint=pick("plausibility_endpoint", cfg.plausibility_endpoint),
-            scrub=pick("scrub", cfg.scrub),
+            scrub_categories=pick("scrub_categories", cfg.scrub_categories),
             correction_entity_types=pick("correction_entity_types", cfg.correction_entity_types),
             anonymize_token_envelope=pick("anonymize_token_envelope", cfg.anonymize_token_envelope),
             speaker_id=_require_speaker_id(overrides),

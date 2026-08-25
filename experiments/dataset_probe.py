@@ -332,7 +332,7 @@ def _build_session_diagnostics(
             + _as_count(diag.get("plausibility_dropped_deanon"))
             + _as_count(diag.get("plausibility_dropped_fallback"))
         ),
-        "mapping_ambiguous_dropped": _as_count(diag.get("mapping_ambiguous_dropped")),
+        "scan_dropped": _as_count(diag.get("scan_dropped")),
     }
 
     # raw_fact_count: facts from the original extraction (before cloud enrichment).
@@ -934,7 +934,7 @@ def main() -> None:
                             "residual_dropped_facts": 0,
                             "predicate_placeholder_dropped_facts": 0,
                             "plausibility_dropped": 0,
-                            "mapping_ambiguous_dropped": 0,
+                            "scan_dropped": 0,
                         },
                         "plausibility_judge_actual": None,
                         "fallback_path": None,

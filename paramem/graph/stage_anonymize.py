@@ -23,11 +23,11 @@ from __future__ import annotations
 
 import logging
 
-from paramem.cloud.anonymize import anonymize
+from paramem.cloud.anonymize import anonymize, opted_out_contract
+from paramem.graph.anonymizer_prompts import load_anonymizer_prompts
 from paramem.graph.extractor import _fallback_plausibility_on_raw, _vram_snapshot
 from paramem.graph.flow import StageContext, StageState
 from paramem.graph.phase_trace import phase_trace
-from paramem.graph.prompts import _load_prompt
 from paramem.graph.schema import facts_from_relations
 
 logger = logging.getLogger(__name__)
@@ -46,35 +46,52 @@ def _stage_anonymize(ctx: StageContext, state: StageState) -> StageState:
 
     Two branches:
 
-    1. ``ctx.scrub`` empty — operator opt-out: no anonymizer call, no
-       phase trace (mirrors the pre-carve structure exactly — including
-       that a ``stop_at("anonymize")`` request does NOT short-circuit
-       here, since there is nothing to stop after: the "anonymize" phase
-       never fires). The transcript egresses verbatim, sourced from the
-       passed-in transcript — never a model artifact. The ``enrich``
-       stage derives the (empty-mapping, identity) anonymized fact array
-       from the returned ``payload``.
-    2. Non-empty ``scrub`` — the local model is the SOLE scope authority:
-       it classifies real values against ``scrub`` and returns BOTH the
-       real_name -> placeholder mapping AND its own rewrite of the
-       transcript with those values placeholdered. The ``anonymize``
-       phase trace captures the raw model JSON so calibration can diff
-       prompt variants on the anonymizer in isolation.
+    1. ``ctx.scrub_categories`` empty — operator opt-out: no tagger call,
+       no anonymizer call, no phase trace (mirrors the pre-carve structure
+       exactly — including that a ``stop_at("anonymize")`` request does
+       NOT short-circuit here, since there is nothing to stop after: the
+       "anonymize" phase never fires). The transcript egresses verbatim,
+       sourced from the passed-in transcript — never a model artifact.
+       The ``enrich`` stage derives the (empty-mapping, identity)
+       anonymized fact array from the returned ``payload``.
+    2. Non-empty ``scrub_categories`` — the span tagger's configured
+       labels are the SOLE scope authority: it tags real values against
+       those labels, and code-side substitution
+       (:func:`~paramem.cloud.placeholders._substitute_whole_words`)
+       produces both the real_name -> placeholder mapping AND the
+       rewritten transcript with those values placeholdered. The one
+       remaining local model call is the ANCHOR self-introduction
+       question. The ``anonymize`` phase trace captures the raw tagger +
+       ANCHOR record, plus ``status``/``failure``/``model_calls``/
+       ``call_tokens`` (the SAME per-call telemetry
+       :func:`~paramem.server.calibrate.dispatch_anonymize_facts`
+       surfaces for the graph tier — one carrier, both calibration doors,
+       and every production debug snapshot that serializes
+       ``graph.diagnostics`` for free), so calibration can diagnose a
+       failed run's specific cause from the same record.
 
-    Fail-closed divert: a parse failure or a missing/empty
-    ``anonymized_transcript`` (``payload.status == "failed"``) falls back
-    to local plausibility on the LOCAL-EXTRACT facts (never to the
-    original real-name transcript over the cloud) and returns
-    ``payload=None`` — the stage's ``terminal_when`` — so ``enrich`` does
-    not run on a payload that was never produced.
+    Fail-closed divert: ``payload.status == "failed"`` (``failure`` is
+    ``"guard"`` or ``"tagger"`` — see
+    :attr:`~paramem.cloud.anonymize.AnonymizedContract.failure` —
+    recorded on this stage's own phase-trace record, never just a
+    generic "failed") falls back to local plausibility on the
+    LOCAL-EXTRACT facts (never to the original real-name transcript over
+    the cloud) and returns ``payload=None`` — the stage's
+    ``terminal_when`` — so ``enrich`` does not run on a payload that was
+    never produced.
 
-    On the ``ctx.scrub``-non-empty branch (whether the call ends up
-    ``"ok"`` or ``"failed"``), this stage also writes
-    ``mapping_ambiguous_dropped``/``mapping_ambiguous_dropped_entries``
-    (the table normalizer's own drop count and per-entry attribution) and
-    the anonymizer self-inconsistency measurement,
-    ``anonymizer_unapplied_tokens``/``pipeline_injected_tokens`` — see
-    :attr:`~paramem.cloud.anonymize.AnonymizedContract.injected_tokens`.
+    On the ``ctx.scrub_categories``-non-empty branch (whether the call
+    ends up ``"ok"`` or ``"failed"``), this stage also writes
+    ``scan_dropped``/``inert_dropped``/``rekey_dropped``/
+    ``scan_dropped_entries`` (the scan step's, the inert-key prune's, and
+    the identity-reconciliation step's own per-entry drop counts and
+    attribution — see
+    :attr:`~paramem.cloud.anonymize.AnonymizedContract.scan_dropped` /
+    :attr:`~paramem.cloud.anonymize.AnonymizedContract.inert_dropped` /
+    :attr:`~paramem.cloud.anonymize.AnonymizedContract.rekey_dropped`,
+    named for what each actually is — the diagnostic entries carry
+    ``category``/``side``/``reason`` only, never the dropped surface's
+    real text, which stays in-memory on the contract).
 
     This stage body deliberately does NOT check ``chain_stopped()``
     itself, though an earlier version of this code did and returned early
@@ -84,65 +101,44 @@ def _stage_anonymize(ctx: StageContext, state: StageState) -> StageState:
     stage boundary now performs exactly the same early return the in-body
     check used to. A ``stop_at("anonymize")`` caller still gets back
     ``graph.relations`` at the local-extract output with the anonymize
-    result in ``phases["anonymize"].parsed`` — verified by
-    ``tests/test_extraction_pipeline.py``.
+    result in ``phases["anonymize"].parsed``.
     """
     graph = state.graph
     original_count = len(graph.relations)
 
     _vram_snapshot(f"cloud_pipeline_entry session={graph.session_id}")
-    if not ctx.scrub:
-        # Operator opt-out: no anonymizer call, no phase trace (mirrors
-        # the pre-unification structure exactly — including that a
-        # ``stop_at("anonymize")`` request does NOT short-circuit here,
-        # since there is nothing to stop after: the "anonymize" phase
-        # never fires, so ``chain_stopped()`` can never become true from
-        # it on this branch).  The transcript egresses verbatim, sourced
-        # from the passed-in transcript — never a model artifact.  Facts
-        # follow via the ``enrich`` stage's (empty-mapping, identity)
-        # ``insert_placeholders`` call over this payload.  No prompt load
-        # on this branch either — ``anonymize`` returns before touching
-        # ``user_prompt_template``/``system_prompt``, so passing ``""``
-        # for both here is safe.
-        payload = anonymize(
-            facts_from_relations(graph.relations),
-            ctx.model,
-            ctx.tokenizer,
-            transcript=ctx.transcript,
-            scrub=ctx.scrub,
-            speaker_name=ctx.speaker_name,
-            speaker_id=ctx.speaker_id,
-            user_prompt_template="",
-            system_prompt="",
-        )
+    if not ctx.scrub_categories:
+        # Operator opt-out: no tagger call, no anonymizer call, no phase
+        # trace, no prompt load — the ONE opt-out constructor, called
+        # directly rather than routing through ``anonymize()`` purely to
+        # reach it (mirrors the pre-unification structure exactly —
+        # including that a ``stop_at("anonymize")`` request does NOT
+        # short-circuit here, since there is nothing to stop after: the
+        # "anonymize" phase never fires, so ``chain_stopped()`` can never
+        # become true from it on this branch).  The transcript egresses
+        # verbatim, sourced from the passed-in transcript — never a
+        # model artifact.  Facts follow via the ``enrich`` stage's
+        # (empty-mapping, identity) ``insert_placeholders`` call over
+        # this payload.
+        payload = opted_out_contract(ctx.transcript, facts=facts_from_relations(graph.relations))
         graph.diagnostics["anonymize"] = "opted_out"
     else:
         # Anonymization step — THE one anonymize chain (A), shared with
-        # every other cloud-egress path.  The local model is the SOLE
-        # scope authority: it classifies real values against ``scrub``
-        # and returns BOTH the real_name -> placeholder mapping AND its
-        # own rewrite of the transcript with those values placeholdered.
-        # Phase trace captures the raw model JSON so calibration can diff
-        # prompt variants on the anonymizer in isolation.
+        # every other cloud-egress path.  The span tagger's configured
+        # labels are the SOLE scope authority: it tags real values in
+        # scope, and code-side substitution rewrites both the forward
+        # table and the transcript.  The one remaining local model call
+        # is the ANCHOR self-introduction question.  Phase trace captures
+        # the raw record so calibration can diagnose the anonymizer in
+        # isolation.
         with phase_trace("anonymize") as t:
-            anon_prompt = _load_prompt(
-                "anonymization.txt",
-                prompts_dir=ctx.prompts_dir,
-            )
-            anon_system = _load_prompt(
-                "anonymization_system.txt",
-                prompts_dir=ctx.prompts_dir,
-            )
-            anon_anchor_prompt = _load_prompt(
-                "anonymization_speaker_anchor.txt",
-                prompts_dir=ctx.prompts_dir,
-            )
+            anon_prompts = load_anonymizer_prompts(prompts_dir=ctx.prompts_dir)
             payload = anonymize(
                 facts_from_relations(graph.relations),
                 ctx.model,
                 ctx.tokenizer,
                 transcript=ctx.transcript,
-                scrub=ctx.scrub,
+                categories=ctx.scrub_categories,
                 speaker_name=ctx.speaker_name,
                 # Session-tier egress feeds the graph, never the reply
                 # boundary — ctx.speaker_id is required/non-empty
@@ -150,57 +146,61 @@ def _stage_anonymize(ctx: StageContext, state: StageState) -> StageState:
                 # chat egress's reply-boundary-gated anchor (see
                 # paramem.graph.flows.anonymize_turn).
                 speaker_id=ctx.speaker_id,
-                speaker_anchor_template=anon_anchor_prompt,
                 token_envelope=ctx.anonymize_token_envelope,
                 seed=ctx.seed,
-                user_prompt_template=anon_prompt,
-                system_prompt=anon_system,
+                prompts=anon_prompts,
             )
             t.set_raw(payload.raw)
             t.set_parsed(
                 {
                     "mapping": dict(payload.forward),
                     "mapping_size": len(payload.forward),
-                    "parse_ok": payload.status != "failed",
+                    "status": payload.status,
+                    "failure": payload.failure,
                     "anonymized_transcript_len": len(payload.anon_transcript or ""),
+                    "tagger_windows": payload.tagger_windows,
+                    "model_calls": payload.model_calls,
+                    "scan_dropped": payload.scan_dropped,
+                    "call_tokens": list(payload.call_tokens),
                 }
             )
             if payload.status == "failed":
                 t.set_outcome(
                     "failed",
-                    reason="anonymization parse failed or missing/empty anonymized_transcript",
+                    reason=f"anonymization failed: {payload.failure}",
                 )
             elif not graph.relations:
                 t.set_outcome("no_input", reason="graph has 0 relations")
         _vram_snapshot(f"after_anonymize session={graph.session_id}")
-        # ``payload.norm_stats``/``norm_dropped_entries`` are LIVE signals
-        # from the one normalize call in the chain (see
-        # paramem.cloud.anonymize) — written unconditionally, and BEFORE
-        # the fail-closed return below, so a guard-failure fold (every
-        # entry dropped by shape validation) still records what happened
-        # instead of the key being silently absent.
-        graph.diagnostics["mapping_ambiguous_dropped"] = payload.norm_stats["dropped"]
-        if payload.norm_dropped_entries:
-            graph.diagnostics["mapping_ambiguous_dropped_entries"] = payload.norm_dropped_entries
-        # Anonymizer self-inconsistency telemetry (measurement only — see
-        # AnonymizedContract.injected_tokens): which declared tokens the
-        # anonymizer never applied to its own rewrite, kept distinct from
-        # the tokens the PIPELINE minted (which can never appear in that
-        # rewrite by construction).
-        graph.diagnostics["anonymizer_unapplied_tokens"] = sorted(
-            tok
-            for tok in payload.declared
-            if tok not in payload.anon_transcript and tok not in payload.injected_tokens
-        )
-        graph.diagnostics["pipeline_injected_tokens"] = sorted(
-            payload.injected_tokens & payload.declared
-        )
+        # ``payload.scan_dropped``/``inert_dropped``/``rekey_dropped``/
+        # ``scan_dropped_entries`` are LIVE signals from the scan,
+        # inert-key-prune, and identity-reconciliation steps (see
+        # paramem.cloud.anonymize.anonymize) — written unconditionally,
+        # and BEFORE the fail-closed return below, so a guard-failure
+        # terminal (the scan ran; pruning ran; the reconciliation guard
+        # fired afterward, on the pruned table) still carries the real
+        # accumulated counts instead of any key being silently absent; a
+        # tagger-failure terminal (the scan never ran) carries them at
+        # their 0/empty default instead, since there is nothing to
+        # report.  Diagnostics carry counts and categories only — never a
+        # dropped entry's real text (that stays in-memory on ``payload``
+        # itself), matching the keys-and-counts-only rule this module's
+        # diagnostics already follow.
+        graph.diagnostics["scan_dropped"] = payload.scan_dropped
+        graph.diagnostics["inert_dropped"] = payload.inert_dropped
+        graph.diagnostics["rekey_dropped"] = payload.rekey_dropped
+        if payload.scan_dropped_entries:
+            graph.diagnostics["scan_dropped_entries"] = [
+                {"category": e["category"], "side": e["side"], "reason": e["reason"]}
+                for e in payload.scan_dropped_entries
+            ]
         if payload.status == "failed":
-            # Fail-closed: parse failure OR a missing/empty
-            # anonymized_transcript.  Never fall back to raw plausibility
-            # on the ORIGINAL real-name transcript — fall back to local
-            # plausibility on the LOCAL-EXTRACT facts instead (no cloud
-            # egress at all).
+            # Fail-closed: the identity-reconciliation guard fired
+            # (payload.failure == "guard"), or the span tagger was
+            # unavailable (payload.failure == "tagger").  Never fall back
+            # to raw plausibility on the ORIGINAL real-name transcript —
+            # fall back to local plausibility on the LOCAL-EXTRACT facts
+            # instead (no cloud egress at all).
             logger.warning("Anonymization failed — falling back to raw plausibility")
             graph.diagnostics["anonymize"] = "failed"
             return StageState(

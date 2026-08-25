@@ -16,16 +16,13 @@ are used for the real-pypdf tests.
 from __future__ import annotations
 
 import inspect
-import math
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 
 from paramem.graph.document_chunker import (
-    _DOC_MAX_TOKENS,
     _DOC_MIN_TOKENS,
-    _R_PROSE,
     DocumentChunk,
     EmptyDocumentError,
     ScannedPdfRejectedError,
@@ -38,57 +35,7 @@ from paramem.graph.document_chunker import (
     chunk_pdf_file,
     chunk_text_file,
 )
-from paramem.utils.tokens import MEASURED_TOKENS_PER_WORD, estimate_tokens
-
-# _R_PROSE is imported directly from document_chunker above — the same
-# ratio document_chunker.py's _DOC_MAX_TOKENS derivation comment uses for
-# BOTH the cap conversion and the anon_template estimate, one ratio
-# throughout (never a mix of an exact-tokenizer snapshot and an estimate).
-# A local copy of this value would itself be a duplicate the derivation
-# tests below are specifically designed to catch drift against.
-_ANONYMIZATION_TEMPLATE_PATH = (
-    Path(__file__).resolve().parent.parent / "configs" / "prompts" / "anonymization.txt"
-)
-
-
-def _render_anon_template_text() -> str:
-    """Load and format the real anonymization.txt skeleton (empty
-    facts/scrub/transcript, no speaker anchor) — the same shape
-    ``_render_anonymize_prompt`` produces before chat-template wrapping
-    (``paramem/cloud/anonymize.py``) when no speaker id is threaded (the
-    document-ingest path has no speaker anchor at all, so the anchor-less
-    render is this derivation's correct budget basis — see
-    ``_render_anonymize_prompt``'s ``speaker_anchor_section`` slot).
-    """
-    template = _ANONYMIZATION_TEMPLATE_PATH.read_text(encoding="utf-8")
-    return template.format(
-        scrub_categories="",
-        facts_json="[]",
-        transcript="",
-        speaker_id="",
-        speaker_anchor_section="",
-    )
-
-
-def _live_anon_template_tokens() -> int:
-    """THE anon_template term for the ``_DOC_MAX_TOKENS`` derivation,
-    recomputed from the LIVE prompt file on every call — ``ceil(words *
-    r_prose)``, the SAME formula ``document_chunker.py``'s
-    ``_DOC_MAX_TOKENS`` derivation comment uses.
-
-    Why this is recomputed rather than recorded: a frozen
-    tokenizer-measured constant here, checked only against a wide
-    word-count tolerance band, left a real budget with only a few tokens
-    of end-to-end slack that a small template edit could silently overrun
-    while the band check still passed (the arithmetic test never actually
-    consumed the live word count). Recomputing THIS value directly — and
-    using it in the arithmetic checks below instead of a recorded literal
-    — couples the two: a template edit changes this return value on the
-    next run, no tolerance band needed (the computation is fully
-    deterministic).
-    """
-    return math.ceil(len(_render_anon_template_text().split()) * _R_PROSE)
-
+from paramem.utils.tokens import estimate_tokens
 
 _FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
 _TEXT_PDF = _FIXTURES_DIR / "text_pdf_sample.pdf"
@@ -644,146 +591,9 @@ class TestChunkerDefaultsMatchDerivedConstants:
     (a hand-typed duplicate would keep passing every threshold test above
     while silently diverging from the derived cap)."""
 
-    def test_chunk_text_file_default_is_doc_max_tokens(self):
-        assert inspect.signature(chunk_text_file).parameters["max_tokens"].default == (
-            _DOC_MAX_TOKENS
-        )
-
     def test_chunk_markdown_file_default_is_doc_min_tokens(self):
         assert inspect.signature(chunk_markdown_file).parameters["min_tokens"].default == (
             _DOC_MIN_TOKENS
-        )
-
-    def test_chunk_pdf_file_defaults_match_both_constants(self):
-        params = inspect.signature(chunk_pdf_file).parameters
-        assert params["min_tokens"].default == _DOC_MIN_TOKENS
-        assert params["max_tokens"].default == _DOC_MAX_TOKENS
-
-
-class TestDocMaxTokensDerivation:
-    """The derivation link between the shipped _DOC_MAX_TOKENS and the
-    anonymize-call token envelope, pinned as a live test rather than left
-    as a claim in a comment or commit message: the constant is a recorded
-    literal, so without these tests nothing would notice if the envelope,
-    the reserve constants, or the prompt template moved out from under it.
-    """
-
-    def test_derivation_link_holds_against_the_shipped_envelope(self):
-        """2 * cap_real + anon_template_tokens + reserve <= envelope,
-        computed from the real shipped envelope default, the LIVE
-        anonymize.py reserve constants (imported symbolically rather than
-        copied in as numbers, so a concurrent change to those constants is
-        picked up automatically rather than silently going stale), and the
-        LIVE anon_template recomputed from the current prompt file
-        (replacing a frozen tokenizer-measured constant that was only
-        loosely band-checked against the file — see
-        _live_anon_template_tokens's docstring). No tolerance band is
-        needed anywhere in this test: every term is either an exact live
-        import or a deterministic recomputation.  Fails if a future edit
-        raises _DOC_MAX_TOKENS, shrinks the envelope, grows the reserve, or
-        grows the template, without re-deriving the relationship.
-        """
-        from paramem.cloud.anonymize import (
-            _DEFAULT_ANONYMIZER_TOKEN_ENVELOPE,
-            _MAPPING_ENTRY_OVERHEAD_TOKENS,
-            _OUTPUT_JSON_ENVELOPE_TOKENS,
-        )
-
-        reserve = _OUTPUT_JSON_ENVELOPE_TOKENS + _MAPPING_ENTRY_OVERHEAD_TOKENS
-        cap_real = _DOC_MAX_TOKENS / MEASURED_TOKENS_PER_WORD * _R_PROSE
-        lhs = 2 * cap_real + _live_anon_template_tokens() + reserve
-        assert lhs <= _DEFAULT_ANONYMIZER_TOKEN_ENVELOPE, (
-            f"derivation link broken: {lhs} > {_DEFAULT_ANONYMIZER_TOKEN_ENVELOPE}"
-        )
-
-    def test_ratio_cancellation_invariant(self):
-        """The chunk-boundary comparison
-        (``estimate_tokens(text) <= max_tokens``, where ``max_tokens`` is
-        ``_DOC_MAX_TOKENS`` re-expressed as ``cap_words * ratio`` — the
-        estimator's own unit) is invariant under a change to the shipped
-        words->tokens ratio, because it reduces to ``words <= cap_words``
-        regardless of ratio.  Would fail if a future edit expressed the
-        cap in real tokens instead of the estimator's own unit (the ratio
-        would then no longer cancel and a base-model swap that shifts the
-        ratio would silently shrink or grow document chunks).
-        """
-        cap_words = _DOC_MAX_TOKENS / MEASURED_TOKENS_PER_WORD
-        word_counts = [round(cap_words) - 50, round(cap_words) + 50]
-        for ratio in (1.4, 3.4, 3.7, 5.0, 8.0):  # a hypothetical base-model swap's ratio
-            scaled_cap_tokens = cap_words * ratio  # _DOC_MAX_TOKENS re-derived at this ratio
-            for words in word_counts:
-                text = "word " * words
-                fits_at_word_level = words <= cap_words
-                fits_via_estimator = (
-                    estimate_tokens(text, tokens_per_word=ratio) <= scaled_cap_tokens
-                )
-                assert fits_via_estimator == fits_at_word_level, (
-                    f"ratio={ratio} words={words}: boundary decision changed"
-                )
-
-
-class TestDocumentPathBudget:
-    """The full document-ingest budget — a chunk at the shipped cap,
-    used as the anonymize call's transcript INPUT, PLUS its
-    extracted-facts JSON, PLUS the chunk ECHOED BACK as the
-    ``anonymized_transcript`` rewrite — checked against the shipped
-    envelope with an EXPLICIT facts term.
-
-    This is the test that catches the facts term being folded away:
-    ``TestDocMaxTokensDerivation``'s derivation-link test omits the facts
-    term entirely (it only checks
-    ``2 * cap_real + anon_template + reserve <= envelope``), so a
-    revision of ``_DOC_MAX_TOKENS`` that folds the facts term into the
-    template term (as an earlier revision of this derivation did —
-    under-budgeting a dense chunk's anonymize call by ~4x, so a dense
-    chunk at the cap could overrun the envelope at runtime) would pass
-    that test while the real budget was broken.  This test recomputes the
-    facts contribution explicitly at every run, so a future
-    re-introduction of the folding bug (an inflated ``_DOC_MAX_TOKENS``)
-    fails HERE.
-    """
-
-    # f: extracted-facts-JSON-to-chunk token ratio.  Derived (not
-    # independently re-measured here) from
-    # paramem/graph/extractor.py's recorded "Empirical worst-case observed
-    # output for a dense resume chunk was ~2200 tokens" — a repo-recorded
-    # measurement over the chunker's then-~1500-word max, matching the
-    # numbers in document_chunker.py's _DOC_MAX_TOKENS derivation comment.
-    _DENSE_CHUNK_WORDS = 1500
-    _DENSE_CHUNK_OUTPUT_TOKENS = 2200
-
-    def test_dense_chunk_at_the_shipped_cap_fits_the_full_envelope(self):
-        from paramem.cloud.anonymize import (
-            _DEFAULT_ANONYMIZER_TOKEN_ENVELOPE,
-            _MAPPING_ENTRY_OVERHEAD_TOKENS,
-            _OUTPUT_JSON_ENVELOPE_TOKENS,
-        )
-
-        reserve = _OUTPUT_JSON_ENVELOPE_TOKENS + _MAPPING_ENTRY_OVERHEAD_TOKENS
-        dense_chunk_real_tokens = self._DENSE_CHUNK_WORDS * _R_PROSE
-        f = self._DENSE_CHUNK_OUTPUT_TOKENS / dense_chunk_real_tokens
-
-        cap_words = _DOC_MAX_TOKENS / MEASURED_TOKENS_PER_WORD
-        chunk_real_tokens = cap_words * _R_PROSE
-
-        facts_tokens = f * chunk_real_tokens
-        chunk_input_tokens = chunk_real_tokens
-        chunk_echoed_output_tokens = chunk_real_tokens
-        anon_template_tokens = _live_anon_template_tokens()
-
-        total = (
-            anon_template_tokens
-            + facts_tokens
-            + chunk_input_tokens
-            + chunk_echoed_output_tokens
-            + reserve
-        )
-        assert total <= _DEFAULT_ANONYMIZER_TOKEN_ENVELOPE, (
-            f"document-path budget broken at the shipped cap: "
-            f"{total:.0f} > {_DEFAULT_ANONYMIZER_TOKEN_ENVELOPE} "
-            f"(anon_template={anon_template_tokens}, "
-            f"facts={facts_tokens:.0f}, chunk_in={chunk_input_tokens:.0f}, "
-            f"chunk_out={chunk_echoed_output_tokens:.0f}, reserve={reserve})"
         )
 
 

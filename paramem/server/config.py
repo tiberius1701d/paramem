@@ -9,6 +9,7 @@ import yaml
 
 from paramem.backup.types import FatalConfigError
 from paramem.cloud.providers.base import CloudAgentConfig
+from paramem.config.taxonomy import ScrubCategory, resolve_scrub_categories
 from paramem.utils.config import (
     AdapterConfig,
     ConsolidationConfig,
@@ -689,10 +690,26 @@ class SanitizationConfig:
     HA path is independent of ``cloud_mode`` and ``scrub``: HA
     receives cleartext gated by intent classification.  Hardening the
     HA hop is a planned follow-up.
+
+    ``scrub_categories`` is derived, not operator-facing: ``__post_init__``
+    resolves it from ``scrub`` via
+    :func:`~paramem.config.taxonomy.resolve_scrub_categories` on every
+    construction, so the pair can never disagree regardless of which
+    construction site (YAML load via :func:`build_server_config`, or a
+    dev script's direct ``SanitizationConfig()``) built this object. Each
+    category pairs a ``configs/schema.yaml`` ``anonymizer.prefixes`` row's
+    configured ``scrub`` hints with that row's span-tagger label
+    vocabulary (``tagger_labels``).
     """
 
     cloud_mode: str = "block"  # block, anonymize, both
     scrub: list[str] = field(default_factory=lambda: list(_DEFAULT_SCRUB))
+    # Derived, never set by the operator or by YAML — resolved once below
+    # from `scrub` via `paramem.config.taxonomy.resolve_scrub_categories` so
+    # the pair can never disagree, regardless of which of the three
+    # construction sites (YAML load, or a dev script's `SanitizationConfig()`)
+    # built this object.
+    scrub_categories: tuple[ScrubCategory, ...] = field(default_factory=tuple, init=False)
 
     def __post_init__(self):
         valid_cloud_mode = {"block", "anonymize", "both"}
@@ -708,6 +725,53 @@ class SanitizationConfig:
                 f"Invalid sanitization scrub '{self.scrub}'. "
                 f"Must be a list of non-empty strings (may be empty list to disable)."
             )
+        self.scrub_categories = resolve_scrub_categories(self.scrub)
+
+
+@dataclass
+class SpanTaggerConfig:
+    """The local anonymizer's SCAN step: a CPU-resident GLiNER span-tagging
+    model, loaded once per process the way the base model is loaded —
+    eager ``from_pretrained`` against a Hugging Face cache checkpoint, no
+    build step of our own.
+
+    ``checkpoint`` / ``revision`` / ``score_threshold`` / ``threads`` are
+    the ONLY model settings this design hardcodes anywhere — every other
+    tagger parameter (``max_len``, ``max_width``, window size, overlap,
+    the label vocabulary) is read off the loaded model or off
+    ``configs/schema.yaml`` at runtime, never typed twice.
+
+    * ``checkpoint`` — Hugging Face model id of the detection model.
+    * ``revision`` — exact commit of that model, pinned so an upstream
+      change cannot silently alter what a deployment scrubs.
+    * ``score_threshold`` — minimum confidence for a tagged span to be
+      treated as in scope. Lower marks more (over-scrubbing costs cloud
+      utility); higher marks less (under-scrubbing sends real data).
+      Re-measure against a labelled sample after any checkpoint change.
+    * ``threads`` — CPU threads the detector may use. Host-dependent:
+      too many oversubscribes the machine and gets dramatically SLOWER,
+      not faster. Process-wide.
+
+    An absent ``span_tagger:`` block in ``server.yaml`` yields these
+    defaults unchanged — this class, not the YAML, is the default source.
+    """
+
+    checkpoint: str = "urchade/gliner_multi_pii-v1"
+    revision: str = "1fcf13e85f4eef5394e1fcd406cf2ca9ea82351d"
+    score_threshold: float = 0.5
+    threads: int = 8
+
+    def __post_init__(self) -> None:
+        if not self.checkpoint:
+            raise ValueError(f"span_tagger.checkpoint must be non-empty; got {self.checkpoint!r}")
+        if not self.revision:
+            raise ValueError(f"span_tagger.revision must be non-empty; got {self.revision!r}")
+        if not (0.0 < self.score_threshold <= 1.0):
+            raise ValueError(
+                f"span_tagger.score_threshold must be in (0, 1]; got {self.score_threshold!r}"
+            )
+        if self.threads < 1:
+            raise ValueError(f"span_tagger.threads must be >= 1; got {self.threads!r}")
 
 
 _ABSTENTION_RESPONSE_FALLBACK = "I don't have that information stored yet."
@@ -1797,6 +1861,7 @@ class ServerConfig:
     ha_agent_id: str = ""  # HA conversation agent for escalation; empty disables HA escalation
     tools: ToolsConfig = field(default_factory=ToolsConfig)
     sanitization: SanitizationConfig = field(default_factory=SanitizationConfig)
+    span_tagger: SpanTaggerConfig = field(default_factory=SpanTaggerConfig)
     abstention: AbstentionConfig = field(default_factory=AbstentionConfig)
     intent: IntentConfig = field(default_factory=IntentConfig)
     sentence_type: SentenceTypeConfig = field(default_factory=SentenceTypeConfig)
@@ -2251,7 +2316,10 @@ def build_server_config(raw: dict, *, source_path: str | Path) -> ServerConfig:
     # Sanitization
     sanitization_raw = raw.get("sanitization", {})
     if sanitization_raw:
-        config.sanitization = SanitizationConfig(**sanitization_raw)
+        try:
+            config.sanitization = SanitizationConfig(**sanitization_raw)
+        except ValueError as exc:
+            raise FatalConfigError(f"Invalid sanitization config in {path}: {exc}") from exc
 
     # Abstention
     abstention_raw = raw.get("abstention", {})
@@ -2290,6 +2358,10 @@ def build_server_config(raw: dict, *, source_path: str | Path) -> ServerConfig:
     text_lang_raw = raw.get("text_lang_detection", {})
     if text_lang_raw:
         config.text_lang_detection = TextLangDetectionConfig(**text_lang_raw)
+
+    span_tagger_raw = raw.get("span_tagger", {})
+    if span_tagger_raw:
+        config.span_tagger = SpanTaggerConfig(**span_tagger_raw)
 
     mobile_pwa_raw = raw.get("mobile_pwa", {})
     if mobile_pwa_raw:

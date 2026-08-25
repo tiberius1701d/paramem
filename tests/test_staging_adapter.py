@@ -491,6 +491,7 @@ class TestStaleInTrainingCleanup:
     """_clean_stale_staging_dir must remove stale in_training checkpoints on startup."""
 
     def test_stale_in_training_dir_removed(self, tmp_path):
+        from paramem.config.taxonomy import resolve_scrub_categories
         from paramem.training.consolidation import ConsolidationLoop
         from paramem.utils.config import (
             AdapterConfig,
@@ -522,7 +523,7 @@ class TestStaleInTrainingCleanup:
             tier_adapters={"episodic": AdapterConfig(), "semantic": AdapterConfig()},
             memory_store=_MS(),
             output_dir=tmp_path,
-            extraction_scrub={"person name"},
+            extraction_scrub_categories=resolve_scrub_categories(["person name"]),
             extraction_max_tokens=8192,
             extraction_plausibility_max_tokens=8192,
             extraction_anonymize_token_envelope=8192,

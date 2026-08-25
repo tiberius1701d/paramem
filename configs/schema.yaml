@@ -19,24 +19,74 @@ fallback_relation_type: factual
 # <-> entity-type resolution on the de-anonymization / repair path
 # (paramem.config.taxonomy.entity_type_to_prefix /
 # prefix_to_entity_type, via that module's anonymizer_type_to_prefix /
-# anonymizer_prefix_to_type). It is NOT rendered into any prompt —
-# anonymization.txt has exactly three format slots (scrub_categories,
-# facts_json, transcript) and the render call passes only those three;
-# the descriptions below are documentation for this file's readers, not
-# prompt content.
+# anonymizer_prefix_to_type), AND — via `scrub_categories` / `tagger_labels`
+# — for grouping `sanitization.scrub` hints into the local anonymizer's
+# per-category span-tagger calls
+# (paramem.config.taxonomy.resolve_scrub_categories).
 #
 # prefix           — the literal token ("Person", "City", etc.)
 # entity_type      — the graph type that this prefix represents. Must be one
 #                    of entity_types above. Multiple prefixes may map to the
 #                    same entity_type (City → place, Country → place).
 # description      — human-readable label for this file's readers only.
-# primary_for_type — only one prefix per entity_type may set this.
-#                    Used by the repair path to pick a canonical prefix when
-#                    re-anonymizing a leaked real name.
+# primary_for_type — only one prefix per entity_type may set this. Used by
+#                    the repair path to pick a canonical prefix when
+#                    re-anonymizing a leaked real name; a second row
+#                    setting it for the same entity_type fails config load.
+# scrub_categories — optional list of `sanitization.scrub` hints this row
+#                    serves. A configured hint claimed by this row groups
+#                    into ONE scan category named after this row's prefix.
+#                    A hint claimed by two rows, or a configured hint no
+#                    row claims, fails config load.
+# tagger_labels    — the span tagger's OWN label vocabulary for this row:
+#                    the strings handed to the GLiNER model, distinct from
+#                    the operator-facing `scrub_categories` hints. Every
+#                    row that declares `scrub_categories` AND is activated
+#                    by the operator's `sanitization.scrub` (at least one
+#                    of its hints configured) must declare at least one
+#                    tagger label — an activated row with none is refused
+#                    at config load rather than silently scrubbing
+#                    nothing. These strings are pinned to the checkpoint
+#                    configured at `span_tagger.checkpoint` (server.yaml)
+#                    — they are the measured labels that checkpoint scores
+#                    well against, not free prose — and must be
+#                    re-measured whenever that checkpoint changes.
+#
+# This file is the ONE declaration of both vocabularies — every reader
+# (relation types, entity types, the placeholder-prefix map, and
+# `resolve_scrub_categories`) resolves through it, and a load failure
+# (missing file, malformed YAML, a missing required key) is a hard
+# failure at that reader's first use, never a silent fallback.
+#
+# The four contact-identifier rows below (Phone / Email / Address /
+# Profile) declare `entity_type: person` even though they are not person
+# NAMES — they are private identifiers OF a person, and `person` is the
+# only closed-vocabulary entity_type structurally outside the
+# entity-correction rewrite path
+# (paramem.graph.entity_correction._CORRECTABLE), so a restored phone
+# number, address, or handle is never routed through a "correction" that
+# could mutate it. City / Country / Place are the OPPOSITE case: they
+# declare `entity_type: place`, because a place name is NOT a private
+# identifier of a person — it is a legitimately correctable entity class
+# (`place` IS a member of `_CORRECTABLE`), so world-knowledge entity
+# correction is exactly the repair pass a restored place name should be
+# eligible for. Place carries no `scrub_categories` below — its hints have
+# no measured tagger label yet, and declaring them without one would
+# refuse config load the moment an operator activated them.
 anonymizer:
   prefixes:
-    - { prefix: Person,  entity_type: person,       description: "Person names",                                      primary_for_type: true }
-    - { prefix: City,    entity_type: place,         description: "City/town names",                                   primary_for_type: true }
-    - { prefix: Country, entity_type: place,         description: "Country names" }
+    - { prefix: Person,  entity_type: person,       description: "Person names",                                      primary_for_type: true, scrub_categories: [person name, full name, given name, family name], tagger_labels: [person] }
+    - { prefix: Phone,   entity_type: person,       description: "Phone numbers",                                     scrub_categories: [phone number, mobile number, landline number], tagger_labels: [phone number] }
+    - { prefix: Email,   entity_type: person,       description: "Email addresses",                                   scrub_categories: [email address], tagger_labels: [email] }
+    # tagger_labels measured 2026-08-25 against checkpoint revision 1fcf13e8... (urchade/gliner_multi_pii-v1):
+    # `address` @ threshold 0.5 reaches dense-contact-list recall 10/10 on both measured dense shapes vs 2/10 and 1/10
+    # for `full address` on the same two shapes, with no loss on prose (4/4 addresses, 23/24 non-addresses) and no new
+    # false positives; measured cost is one over-long span on the multi-window dense list that contains the true
+    # address (over-scrub direction, never under-scrub).
+    - { prefix: Address, entity_type: person,       description: "Postal/street addresses",                           scrub_categories: [street address, postal address], tagger_labels: [address] }
+    - { prefix: Profile, entity_type: person,       description: "Profile URLs / social media handles",               scrub_categories: [profile URL, social media handle], tagger_labels: [social media handle, username] }
+    - { prefix: City,    entity_type: place,        description: "City/town names",                                   primary_for_type: true }
+    - { prefix: Country, entity_type: place,        description: "Country names" }
+    - { prefix: Place,   entity_type: place,        description: "Generic place/location names" }
     - { prefix: Org,     entity_type: organization,  description: "Organization names",                                primary_for_type: true }
     - { prefix: Thing,   entity_type: concept,       description: "Other identifying things (apps, products, brands)", primary_for_type: true }

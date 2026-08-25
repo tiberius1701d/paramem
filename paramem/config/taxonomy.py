@@ -1,10 +1,10 @@
 """Single source of truth for knowledge-graph taxonomy.
 
-Loads entity types and relation types from configs/schema.yaml.
-Import-time IO is cached via lru_cache; a YAML
-parse error falls back to a hardcoded mirror with a logged error so a
-typo cannot brick ``from paramem.graph.schema import Entity`` for the
-whole package.
+Loads entity types, relation types, and the anonymizer vocabulary from
+configs/schema.yaml. Import-time IO is cached via lru_cache. This file is
+the ONE declaration of that taxonomy — there is no fallback: an unreadable
+file, a YAML parse error, or a missing required key raises ``ValueError``
+naming the file and the remediation, at the first reader that touches it.
 
 Static type checkers cannot introspect ``Literal[entity_types()]`` —
 expected; IDE autocomplete on ``entity.entity_type`` will degrade to
@@ -13,7 +13,8 @@ expected; IDE autocomplete on ``entity.entity_type`` will degrade to
 
 from __future__ import annotations
 
-import logging
+from collections.abc import Sequence
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
@@ -22,62 +23,21 @@ import yaml
 from paramem.utils.identity import canonical
 from paramem.utils.paths import find_project_root
 
-logger = logging.getLogger(__name__)
-
 _DEFAULT_SCHEMA_PATH = (
     (find_project_root(Path(__file__)) or Path(__file__).resolve().parents[2])
     / "configs"
     / "schema.yaml"
 )
 
-# Hardcoded mirror of configs/schema.yaml.  Updated here whenever the YAML
-# gains a new entry; never removed without a schema migration.
-_HARDCODED_FALLBACK: dict = {
-    "entity_types": {
-        "person": {"anchor": "schema:Person"},
-        "place": {"anchor": "schema:Place"},
-        "organization": {"anchor": "schema:Organization"},
-        "event": {"anchor": "schema:Event"},
-        "preference": {"anchor": "internal"},
-        "concept": {"anchor": "schema:Thing"},
-    },
-    "fallback_entity_type": "concept",
-    "relation_types": ["factual", "temporal", "preference", "social", "attribute"],
-    "fallback_relation_type": "factual",
-    "anonymizer": {
-        "prefixes": [
-            {
-                "prefix": "Person",
-                "entity_type": "person",
-                "description": "Person names",
-                "primary_for_type": True,
-            },
-            {
-                "prefix": "City",
-                "entity_type": "place",
-                "description": "City/town names",
-                "primary_for_type": True,
-            },
-            {
-                "prefix": "Country",
-                "entity_type": "place",
-                "description": "Country names",
-            },
-            {
-                "prefix": "Org",
-                "entity_type": "organization",
-                "description": "Organization names",
-                "primary_for_type": True,
-            },
-            {
-                "prefix": "Thing",
-                "entity_type": "concept",
-                "description": "Other identifying things (apps, products, brands)",
-                "primary_for_type": True,
-            },
-        ]
-    },
-}
+_REQUIRED_SCHEMA_KEYS = frozenset(
+    {
+        "entity_types",
+        "fallback_entity_type",
+        "relation_types",
+        "fallback_relation_type",
+        "anonymizer",
+    }
+)
 
 
 @lru_cache(maxsize=4)
@@ -89,40 +49,34 @@ def load_schema_config(path: str | None = None) -> dict:
               ``configs/schema.yaml`` in the project root.
 
     Returns:
-        Parsed YAML as a dict.  Falls back to ``_HARDCODED_FALLBACK`` on
-        any IO or parse error, logging a loud error so the failure is not
-        silent.
+        Parsed YAML as a dict.  This function is the ONE place every
+        reader in this module reaches ``configs/schema.yaml`` through;
+        there is no fallback dict.
+
+    Raises:
+        ValueError: The file could not be read or parsed, or is missing
+            one of the required top-level keys. The message names the
+            file path and the remediation.
     """
-    _REQUIRED_KEYS = frozenset(
-        {
-            "entity_types",
-            "fallback_entity_type",
-            "relation_types",
-            "fallback_relation_type",
-            "anonymizer",
-        }
-    )
     target = Path(path) if path else _DEFAULT_SCHEMA_PATH
     try:
         raw = yaml.safe_load(target.read_text()) or {}
-        missing = _REQUIRED_KEYS - raw.keys()
-        if missing:
-            logger.error(
-                "Schema config at %s is missing required keys: %s. "
-                "Using hardcoded fallback — taxonomy may be stale.",
-                target,
-                sorted(missing),
-            )
-            return _HARDCODED_FALLBACK
-        return raw
     except Exception as exc:
-        logger.error(
-            "Failed to load schema config from %s (%s). "
-            "Using hardcoded fallback — taxonomy may be stale.",
-            target,
-            exc,
+        raise ValueError(
+            f"Failed to load schema config from {target} ({exc}). "
+            "This file is the one declaration of the knowledge-graph "
+            "taxonomy and the anonymizer vocabulary — fix or restore it; "
+            "there is no fallback."
+        ) from exc
+    missing = _REQUIRED_SCHEMA_KEYS - raw.keys()
+    if missing:
+        raise ValueError(
+            f"Schema config at {target} is missing required keys: "
+            f"{sorted(missing)}. This file is the one declaration of the "
+            "knowledge-graph taxonomy and the anonymizer vocabulary — add "
+            "the missing keys; there is no fallback."
         )
-        return _HARDCODED_FALLBACK
+    return raw
 
 
 def reset_cache() -> None:
@@ -225,6 +179,154 @@ def anonymizer_type_to_prefix(path: str | None = None) -> dict[str, str]:
         for entry in cfg["anonymizer"]["prefixes"]
         if entry.get("primary_for_type", False)
     }
+
+
+@dataclass(frozen=True)
+class ScrubCategory:
+    """One local-anonymizer SCAN category: a placeholder prefix, the
+    ``sanitization.scrub`` hints it groups, and the span tagger's own
+    label vocabulary for it.
+
+    Attributes:
+        name: The category's display name — the owning
+            ``configs/schema.yaml`` ``anonymizer.prefixes`` row's
+            ``prefix``.
+        prefix: The placeholder-minting prefix for this category — the
+            owning row's ``prefix``.
+        hints: This category's configured ``scrub`` hints, in ``scrub``
+            order. Never empty — :func:`resolve_scrub_categories` only
+            emits a category for a row with at least one configured hint.
+        tagger_labels: The owning row's ``tagger_labels`` — the strings
+            handed to the span tagger for this category. Never empty —
+            :func:`resolve_scrub_categories` refuses a row that is
+            activated (at least one hint configured) but declares none.
+    """
+
+    name: str
+    prefix: str
+    hints: tuple[str, ...]
+    tagger_labels: tuple[str, ...]
+
+
+def resolve_scrub_categories(
+    scrub: Sequence[str], path: str | None = None
+) -> tuple[ScrubCategory, ...]:
+    """Group configured ``sanitization.scrub`` hints into SCAN categories.
+
+    A category is a ``configs/schema.yaml`` ``anonymizer.prefixes`` row
+    that claims at least one hint present in *scrub* — all of that row's
+    claimed hints, in *scrub* order, become one category named after the
+    row's prefix, carrying that row's ``tagger_labels`` verbatim. Category
+    order is schema row order.
+
+    Five conditions are refused at this door rather than resolved
+    arbitrarily or silently under-scrubbing:
+
+    1. A ``scrub_categories`` hint claimed by two distinct prefix rows —
+       an ambiguous owner for one hint has no correct answer.
+    2. A ``tagger_labels`` label claimed by two distinct prefix rows — a
+       tagged span would have two owning categories, and the partition
+       the span tagger's caller performs by label would be arbitrary.
+    3. A hint present in *scrub* that no row claims — it can carry no
+       tagger label, so it would silently scrub nothing.
+    4. A row activated by *scrub* (at least one of its ``scrub_categories``
+       hints configured) that declares no ``tagger_labels`` — it would
+       contribute no label, yield zero tagged spans, and report success.
+    5. More than one prefix row setting ``primary_for_type: true`` for the
+       same ``entity_type`` — the placeholder-prefix map assumes exactly
+       one primary row per entity type.
+
+    Args:
+        scrub: The configured PII-vocabulary hints
+            (``SanitizationConfig.scrub``), in operator order — trusted as
+            given, never re-sorted. An empty sequence resolves to an empty
+            tuple (the operator opt-out — no category, no scan call).
+        path: Optional override path for the schema YAML.
+
+    Returns:
+        Categories in schema row order. Never contains a category with
+        empty ``hints`` or empty ``tagger_labels``.
+
+    Raises:
+        ValueError: On any of the five conditions above.
+    """
+    cfg = load_schema_config(path)
+    prefixes = cfg["anonymizer"]["prefixes"]
+
+    hint_owner: dict[str, str] = {}
+    label_owner: dict[str, str] = {}
+    primary_owner: dict[str, str] = {}
+    for row in prefixes:
+        for hint in row.get("scrub_categories") or []:
+            owner = hint_owner.get(hint)
+            if owner is not None and owner != row["prefix"]:
+                raise ValueError(
+                    f"Scrub hint {hint!r} is claimed by both prefix row "
+                    f"{owner!r} and {row['prefix']!r} in schema.yaml's "
+                    "anonymizer.prefixes — a hint may be claimed by at most "
+                    "one prefix row."
+                )
+            hint_owner[hint] = row["prefix"]
+        for label in row.get("tagger_labels") or []:
+            owner = label_owner.get(label)
+            if owner is not None and owner != row["prefix"]:
+                raise ValueError(
+                    f"Tagger label {label!r} is claimed by both prefix row "
+                    f"{owner!r} and {row['prefix']!r} in schema.yaml's "
+                    "anonymizer.prefixes — a tagger label may be claimed by "
+                    "at most one prefix row."
+                )
+            label_owner[label] = row["prefix"]
+        if row.get("primary_for_type", False):
+            entity_type = row["entity_type"]
+            owner = primary_owner.get(entity_type)
+            if owner is not None and owner != row["prefix"]:
+                raise ValueError(
+                    f"entity_type {entity_type!r} has more than one "
+                    f"primary_for_type row in schema.yaml's "
+                    f"anonymizer.prefixes: {owner!r} and {row['prefix']!r} — "
+                    "only one prefix row per entity_type may set "
+                    "primary_for_type: true."
+                )
+            primary_owner[entity_type] = row["prefix"]
+
+    configured = list(scrub)
+    categories: list[ScrubCategory] = []
+    covered: set[str] = set()
+    for row in prefixes:
+        row_claims = set(row.get("scrub_categories") or [])
+        if not row_claims:
+            continue
+        row_hints = tuple(hint for hint in configured if hint in row_claims)
+        if not row_hints:
+            continue
+        tagger_labels = tuple(row.get("tagger_labels") or [])
+        if not tagger_labels:
+            raise ValueError(
+                f"Prefix row {row['prefix']!r} is activated by configured "
+                f"scrub hint(s) {row_hints!r} but declares no tagger_labels "
+                "in schema.yaml's anonymizer.prefixes — it would contribute "
+                "no label to the span tagger and silently scrub nothing."
+            )
+        categories.append(
+            ScrubCategory(
+                name=row["prefix"],
+                prefix=row["prefix"],
+                hints=row_hints,
+                tagger_labels=tagger_labels,
+            )
+        )
+        covered.update(row_hints)
+
+    uncovered = [hint for hint in configured if hint not in covered]
+    if uncovered:
+        raise ValueError(
+            f"Configured scrub hint(s) {uncovered!r} are not claimed by any "
+            "prefix row in schema.yaml's anonymizer.prefixes — an uncovered "
+            "hint can carry no tagger label and would silently scrub "
+            "nothing."
+        )
+    return tuple(categories)
 
 
 # ---------------------------------------------------------------------------

@@ -93,7 +93,6 @@ from paramem.graph.phase_trace import (
     start_at,
     stop_at,
 )
-from paramem.graph.prompts import _load_prompt
 from paramem.graph.schema import SessionGraph
 from paramem.server import lang_id
 from paramem.server.session_buffer import SessionBuffer
@@ -226,20 +225,21 @@ class CalibrateAnonymizeFactsRequest(BaseModel):
     anonymize.anonymize` reconciles the model's mapping against) is
     derived server-side from the resolved facts' own subject/object
     endpoints — mirroring a production chunk's node list — never supplied
-    by the caller.  ``scrub`` and ``token_envelope`` are read from the
-    SAME ``ExtractionConfig`` production reads (never a request
+    by the caller.  ``scrub_categories`` and ``token_envelope`` are read
+    from the SAME ``ExtractionConfig`` production reads (never a request
     override), so this calibrates against the operator's actual
     configuration, not a synthetic one.
 
-    ``prompt_variants`` carries the operator's prompt variants, resolved
-    the same way every other calibration use case resolves them (see
-    :func:`resolve_prompt_variants`); the one basename this stage loads
-    is ``anonymization_facts.txt``.
+    Carries no ``prompt_variants``: this door's only anonymizer prompt,
+    ``anonymization.txt``, is anchor-only, and a facts-only call
+    (``transcript=""``) never reaches the ANCHOR gate, so a variant of
+    that prompt would never be exercised — see
+    ``/calibrate/anonymize`` for the transcript-bearing door, which does
+    carry variants.
     """
 
     facts: list[dict] | None = None
     snapshot_path: str | None = None
-    prompt_variants: dict[str, str] = Field(default_factory=dict)
     params: CalibrateParams = Field(default_factory=CalibrateParams)
 
 
@@ -1153,15 +1153,13 @@ def validate_anonymize_facts(state: dict, req: CalibrateAnonymizeFactsRequest) -
                 "not both and not neither."
             ),
         )
-    resolved: dict[str, Any] = {"overrides": resolve_prompt_variants(state, req.prompt_variants)}
     facts = req.facts if has_facts else _relations_from_snapshot(req.snapshot_path)  # type: ignore[arg-type]
     if not facts:
         raise HTTPException(
             status_code=400,
             detail="No facts to anonymize (empty facts list, or snapshot has no edges).",
         )
-    resolved["facts"] = facts
-    return resolved
+    return {"facts": facts, "overrides": {}}
 
 
 def dispatch_anonymize_facts(
@@ -1177,8 +1175,16 @@ def dispatch_anonymize_facts(
     one either, so this opens ``phase_trace("anonymize")`` itself, around
     the identical primitive call, the same way the session-tier
     ``anonymize`` stage body does.
+
+    ``parsed["call_tokens"]`` surfaces
+    :attr:`~paramem.cloud.anonymize.AnonymizedContract.call_tokens`
+    verbatim — one ``{label, prompt_tokens, output_tokens}`` record per
+    local ``generate()`` call this run actually issued, the per-call
+    token telemetry :func:`~paramem.cloud.anonymize_steps._generate`
+    measures.
     """
     from paramem.cloud.anonymize import anonymize
+    from paramem.graph.anonymizer_prompts import load_anonymizer_prompts
     from paramem.server.consolidation import get_or_create_consolidation_loop
 
     loop = get_or_create_consolidation_loop(state)
@@ -1191,20 +1197,24 @@ def dispatch_anonymize_facts(
         | {str(f.get("object", "")) for f in facts if f.get("object")}
     )
     with phase_trace("anonymize") as t:
-        anon_prompt = _load_prompt("anonymization_facts.txt")
-        anon_system = _load_prompt("anonymization_system.txt")
+        anon_prompts = load_anonymizer_prompts(prompts_dir=loop.extraction.prompts_dir)
         payload = anonymize(
             facts,
             loop.model,
             loop.tokenizer,
             transcript="",
-            scrub=ext_cfg.scrub,
+            categories=ext_cfg.scrub_categories,
             identity_domain=identity_domain,
             token_envelope=ext_cfg.anonymize_token_envelope,
             seed=req.params.seed,
-            user_prompt_template=anon_prompt,
-            system_prompt=anon_system,
+            prompts=anon_prompts,
         )
+        # ``t.set_raw`` carries ``_render_scan_raw``'s output verbatim — the
+        # tagged span list plus the anchor's raw text, and on a
+        # ``failure="tagger"`` terminal the tagger's own refusal message —
+        # into the phase record only, never ``graph.diagnostics`` (counts
+        # only).  On this facts-only door it includes no history surfaces
+        # (``history=()`` here), unlike the session-tier door.
         t.set_raw(payload.raw)
         t.set_parsed(
             {
@@ -1212,16 +1222,22 @@ def dispatch_anonymize_facts(
                 "mapping_size": len(payload.forward),
                 "status": payload.status,
                 "failure": payload.failure,
-                "slices": payload.slices,
-                "slices_failed": payload.slices_failed,
+                "tagger_windows": payload.tagger_windows,
+                "model_calls": payload.model_calls,
+                "scan_dropped": payload.scan_dropped,
+                "call_tokens": list(payload.call_tokens),
             }
         )
     parsed: dict[str, Any] = {
         "status": payload.status,
         "failure": payload.failure,
         "mapping": dict(payload.forward),
-        "slices": payload.slices,
-        "slices_failed": payload.slices_failed,
+        "tagger_windows": payload.tagger_windows,
+        "model_calls": payload.model_calls,
+        "scan_dropped": payload.scan_dropped,
+        "inert_dropped": payload.inert_dropped,
+        "rekey_dropped": payload.rekey_dropped,
+        "call_tokens": list(payload.call_tokens),
         "identity_domain_size": len(identity_domain),
         "facts_count": len(facts),
     }

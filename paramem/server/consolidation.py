@@ -166,15 +166,16 @@ def create_consolidation_loop(
         cloud_enabled=config.cloud.enabled,
         graph_enrichment_neighborhood_hops=config.consolidation.graph_enrichment_neighborhood_hops,
         graph_enrichment_max_entities_per_pass=config.consolidation.graph_enrichment_max_entities_per_pass,
-        # Same `scrub` knob as inference-time cloud egress: the cloud
+        # Same scrub categories as inference-time cloud egress: the cloud
         # enrichment cycle sends placeholders to the cloud just like the
         # cloud_anonymizer egress path, so the privacy policy must match.
-        # The model's anonymizer prompt is the sole scope authority —
-        # this is a flat list of PII-vocabulary hints, not an entity-type
-        # selector.  Empty list disables anonymization entirely (the
-        # operator's opt-out): no anonymizer call, content egresses
+        # ``config.sanitization.scrub_categories`` is resolved once at
+        # config construction from the operator's ``scrub`` hints — the
+        # span tagger's configured labels are the sole scope authority.
+        # An empty tuple disables anonymization entirely (the operator's
+        # opt-out): no tagger call, no anonymizer call, content egresses
         # verbatim.
-        extraction_scrub=set(config.sanitization.scrub),
+        extraction_scrub_categories=config.sanitization.scrub_categories,
         extraction_correction_entity_types=set(
             config.consolidation.extraction_correction_entity_types
         ),

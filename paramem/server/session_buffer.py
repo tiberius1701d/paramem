@@ -48,33 +48,57 @@ from paramem.backup.encryption import (
     envelope_encrypt_bytes,
 )
 from paramem.utils.tokens import (
+    ANONYMIZE_ANCHOR_MAX_CANDIDATES,
+    ANONYMIZE_ANCHOR_PROMPT_SKELETON_TOKENS,
     ANONYMIZE_ENVELOPE_TOKENS,
-    ANONYMIZE_OUTPUT_RESERVE_TOKENS,
-    CONVERSATION_FACTS_RATIO,
-    SESSION_ANON_SKELETON_TOKENS,
     TRANSCRIPT_TOKENS_PER_WORD,
-    envelope_derived_cap_tokens,
+    anchor_output_reserve_tokens,
+    anonymize_payload_cap_tokens,
     estimate_tokens,
 )
+from paramem.utils.turn_markers import format_turn
 
 logger = logging.getLogger(__name__)
 
 # Size-rotation cap for a conversation's open session, in the estimator's
-# unit — see paramem.utils.tokens.envelope_derived_cap_tokens's docstring
-# for the identity (a session transcript is paid for TWICE against one
-# anonymize-call envelope: once as input, once echoed back as the rewrite,
-# plus its extracted-facts JSON), and paramem.graph.document_chunker's
-# _DOC_MAX_TOKENS for the sibling derivation over the document-ingest path.
-# 431 words -> 1594 estimator tokens: deliberately sized against the
-# CONFIGURED 8192 envelope, worst-case facts ratio, not the live
-# VRAM-clamped envelope (a dense session can still fail anonymize under a
-# tight free-VRAM moment — self-healing incident, not silent loss).
-_TRANSCRIPT_MAX_TOKENS: int = envelope_derived_cap_tokens(
+# unit. HELD at the operating-point value the shipped extraction quality
+# was measured at, rather than computed at import time: the per-call-shape
+# (SCAN, APPLY) two-shape cap door that originally derived it is retired
+# now that the anonymizer's SCAN step is a span tagger with no envelope of
+# its own. That retired derivation combined the single per-call token
+# envelope (paramem.utils.tokens.ANONYMIZE_ENVELOPE_TOKENS, 8192) against a
+# session-tier SCAN call (payload once plus its extracted-facts JSON,
+# CONVERSATION_FACTS_RATIO = 3.15 — worst of three measured values over
+# four real transcript/extraction pairs, 2026-08-03 — which is what makes
+# a session's tag payload roughly four times the transcript's own token
+# count) and an APPLY call (payload twice, once as input and once echoed
+# back as the rewrite), taking the MINIMUM of both — see
+# paramem.graph.document_chunker's _DOC_MAX_TOKENS for the sibling
+# derivation over the document-ingest path (that path's own prose ratio,
+# _R_PROSE = 1.9126, played the same role TRANSCRIPT_TOKENS_PER_WORD played
+# here).
+# 1098 words -> 4062 estimator tokens (MEASURED_TOKENS_PER_WORD = 3.7):
+# deliberately sized against the CONFIGURED 8192 envelope, worst-case facts
+# ratio, not the live VRAM-clamped envelope (a dense session can still fail
+# anonymize under a tight free-VRAM moment — self-healing incident, not
+# silent loss).
+_TRANSCRIPT_MAX_TOKENS: int = 4062
+
+# Slack tripwire, not a tight bound: the ANCHOR call (the one local
+# generate() left in the anonymizer) is far cheaper than the retired
+# SCAN+APPLY pair, so this assertion passes with room to spare — it is not
+# a re-derivation of the held value above. It fires only if
+# ANONYMIZE_ENVELOPE_TOKENS is lowered, _TRANSCRIPT_MAX_TOKENS is raised,
+# or the ANCHOR prompt is inflated far enough that a cap-sized transcript
+# could no longer fit the one remaining envelope-bearing call.
+assert _TRANSCRIPT_MAX_TOKENS <= anonymize_payload_cap_tokens(
     envelope_tokens=ANONYMIZE_ENVELOPE_TOKENS,
-    skeleton_tokens=SESSION_ANON_SKELETON_TOKENS,
-    reserve_tokens=ANONYMIZE_OUTPUT_RESERVE_TOKENS,
-    facts_ratio=CONVERSATION_FACTS_RATIO,
+    anchor_skeleton_tokens=ANONYMIZE_ANCHOR_PROMPT_SKELETON_TOKENS,
+    anchor_reserve_tokens=anchor_output_reserve_tokens(ANONYMIZE_ANCHOR_MAX_CANDIDATES),
     payload_tokens_per_word=TRANSCRIPT_TOKENS_PER_WORD,
+), (
+    "_TRANSCRIPT_MAX_TOKENS exceeds the anchor-shape cap — the envelope, "
+    "the held cap, or the ANCHOR prompt moved; re-measure jointly."
 )
 
 
@@ -1232,11 +1256,14 @@ class SessionBuffer:
         """Format turns into ``[user]`` / ``[assistant]`` marker lines.
 
         ``[user]`` / ``[assistant]`` is the single transcript marker
-        format the extraction prompt's few-shots use.  Document chunks
-        (which arrive at ``buffer.append`` with ``role="user"`` and no
-        turn structure of their own) come out as a single
-        ``[user] <chunk text>`` line — same surface form as the leading
-        user turn of a transcript.
+        format the extraction prompt's few-shots use; the marker itself
+        is minted by :func:`~paramem.utils.turn_markers.format_turn`, the
+        one owner of that vocabulary — this method's job is assembling
+        the session transcript (turn iteration, speaker-id majority
+        vote), not the marker text.  Document chunks (which arrive at
+        ``buffer.append`` with ``role="user"`` and no turn structure of
+        their own) come out as a single ``[user] <chunk text>`` line —
+        same surface form as the leading user turn of a transcript.
 
         Speaker identity is bound via the ``{speaker_context}`` slot in
         the user template (see ``paramem/graph/extractor.py:437``
@@ -1244,12 +1271,14 @@ class SessionBuffer:
         here.  ``speaker_id`` continues to track per-turn for downstream
         provenance.
 
-        Second caller: ``anonymize_turn`` (cloud-egress
-        chat escalation, ``paramem/graph/extractor.py``) calls this with a
-        single synthetic ``{"role": "user", "text": <bare chat text>}``
-        turn to put the model-facing copy of a bare chat sentence back
-        in-distribution for the extraction/anonymization few-shots, which
-        are calibrated exclusively on this marker surface.
+        This method is the session-transcript assembler: it turns a
+        session's own recorded turns into the ``[user]``/``[assistant]``
+        marker lines, in order, that become the session-tier transcript.
+        Every other marker producer reaches the ``[user]``/``[assistant]``
+        vocabulary through :func:`~paramem.utils.turn_markers.format_turn`
+        directly at its own call site, rather than round-tripping through
+        this method — ``anonymize_turn`` (cloud-egress chat escalation,
+        ``paramem/graph/flows.py``) among them.
         """
         formatted = []
         speaker_ids = []
@@ -1261,14 +1290,7 @@ class SessionBuffer:
             if sid:
                 speaker_ids.append(sid)
 
-            marker = (
-                "[user]"
-                if role == "user"
-                else "[assistant]"
-                if role == "assistant"
-                else f"[{role}]"
-            )
-            formatted.append(f"{marker} {text}")
+            formatted.append(format_turn(role, text))
 
         session_speaker_id = None
         if speaker_ids:

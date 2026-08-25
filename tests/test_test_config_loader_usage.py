@@ -47,6 +47,10 @@ EXAMPLE_VERIFY_ALLOWLIST = frozenset(
         # Validates that the shipped example loads under all dataclass
         # validators (sanitization.cloud_mode, etc.).
         "tests/server/test_config.py",
+        # Verifies span_tagger: parses identically from both shipped YAMLs.
+        "tests/test_span_tagger_config.py",
+        # Verifies the shipped example is not egress-capable.
+        "tests/test_scrubbing_reachable.py",
     }
 )
 

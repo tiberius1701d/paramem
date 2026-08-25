@@ -26,12 +26,11 @@ same reason as the rest of this module: per
 ``paramem/cloud/admission.py``'s placement principle ("a primitive every
 tier needs, owned by none of them" — why that module is a stdlib-only
 leaf), :func:`~paramem.cloud.admission.evaluate_cloud_egress` is the
-primitive, :func:`~paramem.cloud.anonymize.anonymize` is the shared
-component operating on a plain fact list, and ``anonymize_turn`` is a
-COMPOSITE of ``extract_graph`` (this module) and ``anonymize`` — so it
-belongs at the flow layer, not with the primitives. It is the
-conversation-egress composite; its callers are
-``paramem/server/inference.py`` and
+primitive and :func:`~paramem.cloud.anonymize.anonymize` is the shared
+component every cloud-egress path composes through — so
+``anonymize_turn``, the conversation-egress composition of that shared
+component, belongs at the flow layer rather than with the primitives.
+Its callers are ``paramem/server/inference.py`` and
 ``scripts/dev/calibrate_cloud_anonymizer.py``.
 """
 
@@ -39,6 +38,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+from collections.abc import Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -47,9 +47,11 @@ from paramem.cloud.anonymize import (
     _DEFAULT_ANONYMIZER_TOKEN_ENVELOPE,
     AnonymizedContract,
     anonymize,
-    opted_out_contract,
+    failed_contract,
 )
 from paramem.cloud.deanonymize import deanonymize_facts
+from paramem.config.taxonomy import ScrubCategory
+from paramem.graph.anonymizer_prompts import load_anonymizer_prompts
 from paramem.graph.empty_cause import (
     CAUSE_DEANON_JUDGE,
     CAUSE_DEANON_SUBSTITUTION,
@@ -73,18 +75,17 @@ from paramem.graph.extractor import (
 )
 from paramem.graph.flow import StageContext, StageSpec, StageState, run_flow
 from paramem.graph.phase_trace import chain_seed, chain_stopped, extraction_trace, phase_trace
-from paramem.graph.prompts import _load_prompt
 from paramem.graph.relation_build import (
     apply_rebuild,
     build_relations,
     recovery_gate,
 )
-from paramem.graph.schema import SessionGraph, facts_from_relations
+from paramem.graph.schema import SessionGraph
 from paramem.graph.stage_anonymize import _stage_anonymize
 from paramem.graph.stage_enrich import _stage_enrich
 from paramem.models.loader import base_model_inference
-from paramem.server.session_buffer import SessionBuffer
 from paramem.utils.identity import canonical, is_speaker_id
+from paramem.utils.turn_markers import format_turn
 
 logger = logging.getLogger(__name__)
 
@@ -683,7 +684,7 @@ def extract_graph(
     plausibility_model: str = "claude-sonnet-4-6",
     plausibility_endpoint: str | None = None,
     *,
-    scrub: set[str] | frozenset[str],
+    scrub_categories: Sequence[ScrubCategory],
     correction_entity_types: set[str] | frozenset[str] | None = None,
     system_prompt_filename: str = DEFAULT_SYSTEM_PROMPT_FILENAME,
     user_prompt_filename: str = DEFAULT_USER_PROMPT_FILENAME,
@@ -749,11 +750,12 @@ def extract_graph(
         plausibility_endpoint: Endpoint override for a self-hosted
             OpenAI-compatible judge. ``None`` accepts the provider's
             default; ignored for native-SDK providers.
-        scrub: PII-vocabulary hints (``SanitizationConfig.scrub``) forwarded
-            to the anonymize stage's local anonymizer call — the prompt is
-            the sole scope authority (see :func:`~paramem.cloud.anonymize.anonymize_transcript`).
-            Required — no implicit default; an empty ``set``/``frozenset``
-            is the operator opt-out.
+        scrub_categories: Resolved scrub categories
+            (``SanitizationConfig.scrub_categories``) forwarded to the
+            anonymize stage's local anonymizer call, whose configured
+            tagger labels are the sole scope authority (see
+            :func:`~paramem.cloud.anonymize.anonymize`). Required — no
+            implicit default; an empty tuple is the operator opt-out.
         correction_entity_types: Scope-and-enable knob for the local
             entity-surface correction stage (see
             :func:`paramem.graph.entity_correction.correct_entity_surfaces`).
@@ -867,7 +869,7 @@ def extract_graph(
                 plausibility_stage=plausibility_stage,
                 plausibility_model=plausibility_model,
                 plausibility_endpoint=plausibility_endpoint,
-                scrub=scrub,
+                scrub_categories=scrub_categories,
                 correction_entity_types=correction_entity_types,
                 anonymize_token_envelope=anonymize_token_envelope,
             )
@@ -885,274 +887,130 @@ def anonymize_turn(
     model,
     tokenizer,
     *,
+    history: Sequence[dict] = (),
     speaker_id: str | None = None,
     speaker_name: str | None = None,
     prompts_dir: str | Path | None = None,
-    scrub: set[str] | frozenset[str],
+    categories: Sequence[ScrubCategory],
     token_envelope: int,
 ) -> AnonymizedContract:
-    """Local extract + local anonymize for cloud egress.
+    """Local anonymize for cloud egress - a thin composition over the one
+    shared anonymize chain (:func:`~paramem.cloud.anonymize.anonymize`),
+    the same chain the session flow's ``anonymize`` stage
+    (:func:`~paramem.graph.stage_anonymize._stage_anonymize`) and
+    :func:`~paramem.training.graph_enrich.enrich_graph` call.
 
-    Composition over existing primitives — same anonymization chain the
-    session flow's ``anonymize`` stage (``paramem.graph.stage_anonymize``)
-    runs every consolidation cycle, minus the ``enrich`` stage's cloud
-    enrichment call:
+    ``transcript`` (the current turn's bare text) and every turn of
+    ``history`` are rendered through
+    :func:`~paramem.utils.turn_markers.format_turn` into the
+    ``[<role>] <text>`` surface every anonymization few-shot is
+    calibrated on, then handed to :func:`~paramem.cloud.anonymize.anonymize`
+    as its ``transcript`` and ``history`` arguments respectively - the
+    same tagger pass that scans the current turn also scans the
+    drop-gated history, and both surfaces build ONE forward table, so a
+    value named only in an earlier turn is placeholdered exactly like one
+    named in the current turn. ``history`` is already the drop-gated,
+    ``{role, text}``-shaped turn list the caller resolved (``()`` for a
+    text-only ``/chat`` request with no prior turns).
 
-    0. **Turn-marking (model-facing only).** ``transcript`` — a bare,
-       unmarked chat sentence at this call site — is rendered through
-       :meth:`~paramem.server.session_buffer.SessionBuffer._format_turns`
-       (single source of truth for the ``[user] <text>`` /
-       ``[assistant] <text>`` marker surface every extraction/
-       anonymization few-shot is calibrated on) into
-       ``model_facing_transcript``.  Only the two LLM calls below see the
-       turn-marked copy — the marker exists solely to keep the model
-       in-distribution while it authors the anonymized transcript. A bare
-       sentence was observed to glue a possessive into a single
-       anonymization token (``"Pat's dog"`` minted as one placeholder
-       instead of splitting ``"Pat"`` + ``"dog"``) because it is
-       off-distribution from every few-shot example.
-    1. ``extract_graph(validate=False)`` — local extraction only,
-       produces a SessionGraph whose relations anchor the anonymizer
-       (rendered to facts via :func:`~paramem.graph.schema.facts_from_relations`
-       — see step 2).  An EMPTY relation set is a legitimate outcome, not
-       a failure: it is the ordinary shape of a non-personal question
-       ("What is the capital of France?"), and ``anonymize`` serves the
-       resulting ``facts=[]`` + transcript shape by contract — the same
-       signature, no flag, no branch.  The anonymizer LLM, not the
-       extractor's relation count, is the scope authority for what may
-       egress (``SECURITY.md``: single-model classification, no second
-       code-side detector); the anchor narrows its search, it does not
-       authorize the call.
-    2. :func:`~paramem.cloud.anonymize.anonymize` — THE one anonymize
-       chain, shared with every other cloud-egress path (identical to
-       what the session flow's ``anonymize`` stage
-       (:func:`~paramem.graph.stage_anonymize._stage_anonymize`) and
-       :func:`~paramem.training.graph_enrich.enrich_graph` call).
-       ``identity_domain`` is not passed — this path has no closed
-       node-key domain to reconcile against (free-text chat, not a fold
-       graph).
+    This path passes no facts - ``facts=[]`` - the anonymize chain's
+    documented shape for "transcript but no facts" (chat egress). No
+    local extraction runs here: the earlier design ran a full local
+    extraction pass solely to anchor the anonymizer's self-introduction
+    question with entity spans, a job the span tagger now performs
+    directly against the tagged payload.
 
-    This helper anonymizes a TRANSCRIPT for cloud egress — it never
-    builds or returns facts (``graph.relations`` is discarded after
-    anchoring the anonymizer — see step 1 — so a caller deriving the
-    anonymized fact array from this contract via
-    :func:`~paramem.cloud.placeholders.insert_placeholders` would always
-    get ``[]``; nothing does, since this path's only output is the
-    anonymized transcript).
-
-    ``scrub`` is the operator's PII-vocabulary hint list
-    (``SanitizationConfig.scrub``), rendered verbatim into the
-    anonymizer prompt's ``{scrub_categories}`` slot — the prompt is the
-    SOLE scope authority; there is no code-side entity-type gate.
-    Required — an omitted ``scrub`` would silently anonymize against a
-    hidden default on a security-critical egress path.  An EMPTY
-    ``scrub`` is the meaningful operator opt-out: it short-circuits
-    before any LLM call (before even the local extraction pass — no
-    compute is wasted anchoring an anonymizer that will never run), and
-    the helper returns ``status="opted_out"`` with ``anon_transcript``
-    sourced from the passed-in ``transcript`` verbatim, never a model
-    artifact.
+    ``categories`` is the resolved scrub-category tuple
+    (``SanitizationConfig.scrub_categories``) - the tagger's configured
+    labels are the sole scope authority; there is no code-side
+    entity-type gate. Required - an omitted value would silently
+    anonymize against a hidden default on a security-critical egress
+    path. An empty tuple is the operator opt-out, handled entirely inside
+    :func:`~paramem.cloud.anonymize.anonymize`'s own ``categories``-empty
+    door - this helper has no door of its own to duplicate it.
 
     ``token_envelope`` is the total (prompt + output) token budget the
-    ``anonymize`` call below may occupy — forwarded verbatim as its own
+    ``anonymize`` call below may occupy - forwarded verbatim as its own
     ``token_envelope`` argument. Required keyword-only, no module
     default: this is a VRAM-safety-critical parameter by the same
-    standard as ``scrub`` above, and an unbudgeted anonymize call is a
-    defect to trace, not a value to fall back on silently. Production's
+    standard as ``categories`` above, and an unbudgeted anonymize call is
+    a defect to trace, not a value to fall back on silently. Production's
     only caller, :func:`~paramem.server.inference.answer_via_cloud`,
     sources it from ``config.consolidation.extraction_anonymize_token_envelope``
-    — the one operator envelope value that also sizes session-tier
+    - the one operator envelope value that also sizes session-tier
     extraction and graph-tier enrichment (:data:`_DEFAULT_ANONYMIZER_TOKEN_ENVELOPE`
     remains the module default for those other paths' own signatures; it
     is not read here).
 
-    ``speaker_id`` is the resolved speaker store ID, threaded to
-    :func:`extract_graph` (which requires it) and stamped on the
-    ephemeral graph's relations as provenance.  That graph exists only
-    to anchor anonymization and is discarded immediately, so the value
-    is never persisted.  Text-only ``/chat`` requests with no enrolled
-    speaker pass ``None``; the helper falls back to the ``"cloud_egress"``
-    sentinel for THIS call only, so extraction's required, non-empty
-    ``speaker_id`` parameter is always satisfied.
-
-    That ``extract_graph`` fallback is deliberately NOT reused for the
-    anonymizer's own speaker-anchor slot.  The anonymizer's
-    ``{speaker_anchor_section}`` may only carry a value that satisfies
-    :func:`~paramem.utils.identity.is_speaker_id` — every other case (no
-    speaker, or an unrecognised/non-token-shaped id) renders anchor-less.
-    ``"cloud_egress"`` itself fails that test: it is a session label, not
-    a speaker id, so it would teach the local anonymizer model to fold
-    the caller's real name onto a token :func:`~paramem.cloud.placeholders.
-    _normalize_anonymization_mapping` then drops as neither
-    placeholder-shaped nor speaker-id-shaped — emptying the forward map
-    and letting the real name egress unscrubbed.  Anonymous-enrolled
-    speakers KEEP the anchor (deliberate): a well-shaped
-    ``speaker_id`` is sufficient regardless of whether ``speaker_name``
-    resolves to a display name — their session facts and cloud payloads
-    stay in token space exactly like a named speaker's; what the reply
-    boundary later renders for that token is a separate concern from
-    this gate.  See :func:`~paramem.cloud.anonymize.anonymize`'s
-    ``speaker_id`` docstring for the render-time contract this gate
-    feeds (fold-onto-token anonymization).
+    ``speaker_id`` is the resolved speaker store ID. It is NOT threaded
+    to a local extraction call (there is none) - its only use here is the
+    anonymizer's own speaker-anchor slot, which may carry a value only
+    when it satisfies :func:`~paramem.utils.identity.is_speaker_id` -
+    every other case (no speaker, or an unrecognised/non-token-shaped id)
+    renders anchor-less. Anonymous-enrolled speakers KEEP the anchor
+    (deliberate): a well-shaped ``speaker_id`` is sufficient regardless
+    of whether ``speaker_name`` resolves to a display name - their
+    session facts and cloud payloads stay in token space exactly like a
+    named speaker's; what the reply boundary later renders for that
+    token is a separate concern from this gate. See
+    :func:`~paramem.cloud.anonymize.anonymize`'s ``speaker_id`` docstring
+    for the render-time contract this gate feeds (fold-onto-token
+    anonymization).
 
     ``AnonymizedContract.status``:
 
-    * ``"ok"`` — anonymization ran; ``anon_transcript`` is the MODEL's
-      own rewrite (the single synthetic turn marker from step 0 stripped
-      back off, restoring the bare-text contract this helper's callers
-      expect).  ``forward``/``reverse`` may still be empty — a
-      legitimate "ran, found nothing in scope" verdict, not a failure;
-      egress PROCEEDS.
-    * ``"opted_out"`` — operator opted out (``scrub`` empty).
-    * ``"failed"`` — block.  Every other early exit lands here:
-      empty/whitespace-only input, local extraction raising, the
-      anonymizer raising, an anonymizer parse failure, or the model's
-      rewritten transcript coming back empty after the marker strip.
+    * ``"ok"`` - anonymization ran. ``forward``/``reverse`` may still be
+      empty - a legitimate "ran, found nothing in scope" verdict, not a
+      failure; egress PROCEEDS. The caller derives the anonymized
+      current turn the same way it derives every history turn -
+      substituting ``payload.forward`` over the bare turn text - this
+      helper does not rewrite or invert anything on the contract it
+      returns.
+    * ``"opted_out"`` - operator opted out (``categories`` empty).
+    * ``"failed"`` - block, with ``failure`` naming the cause
+      (``"guard"`` or ``"tagger"``) - see
+      :class:`~paramem.cloud.anonymize.AnonymizedContract`. Also covers
+      this helper's own precondition: empty/whitespace-only ``transcript``.
       Callers must NEVER fall back to the original real-name transcript
       on this status.
+
+    A raise out of :func:`~paramem.cloud.anonymize.anonymize` is a
+    defect and propagates unchanged - this helper installs no handler
+    around the call. Callers reach it on their own existing error path
+    rather than have it laundered into a "block" verdict indistinguishable
+    from a privacy decision.
 
     The companion :func:`~paramem.cloud.deanonymize.deanonymize_text`
     is the caller's exit gate for the cloud's response text.
     """
-    # ``failure`` left unset (``None``) on this sentinel: it belongs to
-    # ``anonymize``'s own "parse"/"guard" vocabulary (see
-    # :class:`~paramem.cloud.anonymize.AnonymizedContract`), and none of
-    # this helper's own early exits below (empty input, extraction
-    # exception, anonymizer exception) are that call's parse/guard
-    # distinction — they're this helper's own failure modes, and no
-    # caller here branches on cause.
-    _failed = AnonymizedContract(
-        status="failed",
-        forward={},
-        reverse={},
-        anon_transcript="",
-        declared=frozenset(),
-        norm_stats={"inverted": 0, "dropped": 0},
-        rekey_dropped=0,
-        raw="",
-        failure=None,
-    )
     if not transcript or not transcript.strip():
-        return _failed
+        return failed_contract()
 
-    # Empty scrub = operator opt-out.  Skip the entire LLM-driven
-    # anonymization path (and the local extraction pass that would only
-    # exist to anchor it) — the caller forwards the transcript verbatim.
-    # Distinguished from the "failed" block status by non-empty text.
-    # Shares the ONE opt-out constructor with ``anonymize``'s own
-    # ``scrub``-empty branch (see :func:`~paramem.cloud.anonymize.
-    # opted_out_contract`'s docstring for why this call site cannot just
-    # call ``anonymize`` itself and let IT branch).
-    if not scrub:
-        # This path has no facts at all — it returns BEFORE the local
-        # extraction pass (step 1 below) that would otherwise produce
-        # them, and this function's own docstring already states that a
-        # caller deriving the anonymized fact array from this contract
-        # "would always get []" (chat egress never reads payload.facts).
-        return opted_out_contract(transcript, facts=[])
+    anon_prompts = load_anonymizer_prompts(prompts_dir=prompts_dir)
+    # The anonymizer's speaker-anchor slot may only carry a value that
+    # satisfies is_speaker_id - every other case (no speaker, or an
+    # unrecognised/non-token-shaped id) renders anchor-less.  See this
+    # function's docstring for why anonymous-enrolled speakers keep it.
+    anchor_speaker_id = speaker_id if is_speaker_id(speaker_id) else None
+    history_lines = [format_turn(turn["role"], turn["text"]) for turn in history]
+    model_facing_transcript = format_turn("user", transcript)
 
-    # The local_extract and anonymization few-shots (configs/prompts/
-    # extraction.txt, configs/prompts/anonymization.txt) are calibrated
-    # exclusively on the ``[user] <text>`` / ``[assistant] <text>``
-    # turn-marked surface produced by ``SessionBuffer._format_turns`` (the
-    # single source of truth for that rendering — see its docstring,
-    # which already names this call site as the intended second caller).
-    # A bare, unmarked sentence puts the model off-distribution from
-    # every example it was tuned on and has been observed to glue a
-    # possessive into a single anonymization token (e.g. "Pat's dog" ->
-    # one placeholder instead of "Pat" + "dog" separately).
-    turn_marked_lines, _ = SessionBuffer._format_turns([{"role": "user", "text": transcript}])
-    model_facing_transcript = "\n".join(turn_marked_lines)
-    # The single synthetic turn always renders as ``"<marker> " + transcript``
-    # (see ``_format_turns``) — derive the marker prefix mechanically rather
-    # than hardcoding the literal, so a future marker-format change (single
-    # source of truth: ``_format_turns``) cannot silently desync this strip.
-    _turn_marker_prefix = model_facing_transcript[: len(model_facing_transcript) - len(transcript)]
-
-    # Both LLM calls below (extraction + anonymization) are structured
-    # extraction and must run on the base weights, never the training-active
-    # adapter.  One shared scope disables the adapter and keeps the KV cache
-    # live for both generates, restoring the model's entry state on exit.
+    # The ANCHOR call inside ``anonymize`` is structured extraction and
+    # must run on the base weights, never the training-active adapter.
+    # This scope disables the adapter and keeps the KV cache live for
+    # that generate, restoring the model's entry state on exit.
     with base_model_inference(model):
-        try:
-            graph = extract_graph(
-                model,
-                tokenizer,
-                model_facing_transcript,
-                session_id="cloud_egress",
-                # Ephemeral graph: extracted only to anchor anonymization, then
-                # discarded — the stamped provenance is never persisted.  Use the
-                # resolved speaker_id when the caller has one (text-only /chat
-                # requests may not), falling back to the "cloud_egress" sentinel
-                # that already names the session.
-                speaker_id=speaker_id or "cloud_egress",
-                speaker_name=speaker_name,
-                # No model_alias: cloud-egress extraction is deliberately
-                # model-independent.  This graph exists only to anchor PII
-                # anonymization (entity spans), not to build the knowledge graph,
-                # and entity/attribute extraction is reliable across models — the
-                # per-model prompt overrides target relation decomposition, which
-                # is not load-bearing here.  So the shared base prompt is used
-                # regardless of the configured model.
-                prompts_dir=prompts_dir,
-                validate=False,
-                enrichment_provider="",
-                scrub=scrub,
-            )
-        except Exception:
-            logger.exception("Cloud egress: local extraction failed; treating as block")
-            return _failed
+        payload = anonymize(
+            [],
+            model,
+            tokenizer,
+            transcript=model_facing_transcript,
+            history=history_lines,
+            categories=categories,
+            speaker_name=speaker_name,
+            speaker_id=anchor_speaker_id,
+            token_envelope=token_envelope,
+            prompts=anon_prompts,
+        )
 
-        try:
-            anon_prompt = _load_prompt("anonymization.txt", prompts_dir=prompts_dir)
-            anon_system = _load_prompt("anonymization_system.txt")
-            anon_anchor_prompt = _load_prompt(
-                "anonymization_speaker_anchor.txt",
-                prompts_dir=prompts_dir,
-            )
-            # The anonymizer's speaker-anchor slot may only carry a value
-            # that satisfies is_speaker_id — every other case (no speaker,
-            # or an unrecognised/non-token-shaped id) renders anchor-less.
-            # Anonymous-enrolled speakers are full speakers and KEEP the
-            # anchor (deliberate): their session facts and cloud
-            # payloads stay in token space exactly like named speakers;
-            # what the reply boundary renders for their token is a
-            # separate concern.  See this function's docstring for why
-            # the extract_graph call above keeps its own unconditional
-            # "cloud_egress" fallback while this one does not.
-            anchor_speaker_id = speaker_id if is_speaker_id(speaker_id) else None
-            payload = anonymize(
-                facts_from_relations(graph.relations),
-                model,
-                tokenizer,
-                transcript=model_facing_transcript,
-                scrub=scrub,
-                speaker_name=speaker_name,
-                speaker_id=anchor_speaker_id,
-                speaker_anchor_template=anon_anchor_prompt,
-                token_envelope=token_envelope,
-                user_prompt_template=anon_prompt,
-                system_prompt=anon_system,
-            )
-        except Exception:
-            logger.exception("Cloud egress: anonymization raised; treating as block")
-            return _failed
-
-    if payload.status == "failed":
-        return payload
-
-    # The returned transcript is the MODEL's own rewrite — never
-    # mechanically rebuilt from the mapping.  Strip the single synthetic
-    # turn marker (step 0) back off so the bare-text contract this
-    # helper's callers rely on is preserved; best-effort (the model is
-    # instructed to preserve everything outside the substitutions
-    # verbatim, including the marker, but a strip that finds nothing to
-    # strip is a no-op).
-    anon_transcript = payload.anon_transcript
-    if _turn_marker_prefix and anon_transcript.startswith(_turn_marker_prefix):
-        anon_transcript = anon_transcript[len(_turn_marker_prefix) :]
-
-    if not anon_transcript:
-        return _failed
-
-    return dataclasses.replace(payload, anon_transcript=anon_transcript)
+    return payload

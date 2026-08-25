@@ -354,8 +354,8 @@ def _extraction_trace_scope():
     every :func:`phase_trace` call to fire inside an active
     :func:`extraction_trace` — production runs through ``extract_graph``
     which establishes that scope.  Tests that exercise pipeline
-    internals (the ``anonymize``/``enrich`` stage bodies,
-    ``anonymize_transcript``, etc.) directly would otherwise trip
+    internals (the ``anonymize``/``enrich`` stage bodies, the anonymize
+    chain's own step calls, etc.) directly would otherwise trip
     the "outside an active trace" guard.
 
     The fixture is no-op when nesting (``extraction_trace`` is

@@ -24,6 +24,7 @@ import hashlib
 
 import pytest
 
+from paramem.config.taxonomy import resolve_scrub_categories
 from paramem.graph.phase_trace import (
     PHASE_NAMES,
     PhaseRecord,
@@ -42,6 +43,14 @@ from paramem.graph.schema import SessionGraph
 
 def _empty_graph() -> SessionGraph:
     return SessionGraph(session_id="test", timestamp="2026-05-05T00:00:00Z")
+
+
+def _scrub_categories(*hints: str):
+    """Resolve raw ``sanitization.scrub`` hint strings into the
+    ``scrub_categories`` tuple ``extract_graph`` now requires — the
+    tests below only care that a category is configured, not its exact
+    resolved shape."""
+    return resolve_scrub_categories(list(hints))
 
 
 class TestPhaseTraceContract:
@@ -228,11 +237,11 @@ class TestRecordPrompt:
 
     def test_record_prompt_outside_active_scope_is_noop(self):
         """No active phase_trace scope: record_prompt must no-op, never
-        raise. Two real production call paths run the prompt loader with
-        no phase scope open — ``anonymize_transcript`` reached from
+        raise. Real production call paths run the prompt loader with
+        no phase scope open — the anonymize chain reached from
         ``anonymize_turn`` (the live chat egress,
         ``paramem.graph.flows``) and from ``paramem.training.consolidation``
-        (consolidation.py:2739) — so this must never become a raise the
+        — so this must never become a raise the
         way phase_trace's own missing-scope case is."""
         from paramem.graph.phase_trace import _ACTIVE_SCOPE
 
@@ -438,7 +447,7 @@ class TestExtractGraphStopPhase:
                 speaker_id="speaker0",
                 speaker_name="Alex",
                 validate=False,  # don't try the cloud pipeline
-                scrub={"person name"},
+                scrub_categories=_scrub_categories("person name"),
             )
 
         phase_names = [p["name"] for p in graph.diagnostics.get("phases", [])]
@@ -484,7 +493,7 @@ class TestExtractGraphStopPhase:
                 speaker_id="speaker0",
                 speaker_name="Alex",
                 validate=False,
-                scrub={"person name"},
+                scrub_categories=_scrub_categories("person name"),
             )
 
         assert graph.relations, "must be the parsed graph, not the empty stub"
@@ -535,7 +544,7 @@ class TestExtractGraphStopPhase:
                 session_id="test-stop-phase-union",
                 speaker_id="speaker0",
                 validate=False,
-                scrub={"person name"},
+                scrub_categories=_scrub_categories("person name"),
             )
 
         phase_names = [p["name"] for p in graph.diagnostics.get("phases", [])]

@@ -7292,6 +7292,49 @@ def _report_intent_classifier_health(config, encoder_handle, exemplar_bank) -> N
     )
 
 
+def _load_span_tagger(config) -> None:
+    """Load the span tagger when this configuration can reach a cloud with scrubbing on.
+
+    The ONLY site that maps ``ServerConfig`` onto
+    :func:`~paramem.cloud.admission.scrubbing_reachable`'s terms:
+    ``scrub_enabled=bool(config.sanitization.scrub_categories)``, and the
+    same cloud-egress terms (``cloud_enabled``, ``provider``, ``model``,
+    ``endpoint``) that ``_session_egress_permitted``
+    (``paramem/graph/flows.py``) already gates session-tier cloud
+    enrichment on, plus the chat-egress ``cloud_mode`` term. When the
+    configuration cannot reach a cloud with scrubbing on, this logs at
+    INFO and returns — no model download is attempted, and the tagger
+    stays unloaded (every ``anonymize()`` call then fails closed via its
+    ``"tagger"`` contract member). When it can, delegates to
+    :func:`~paramem.cloud.span_tagger.load_at_startup`, which is
+    idempotent on an unchanged ``(checkpoint, revision)`` pair and raises
+    ``RuntimeError`` naming the checkpoint and revision on a resolution
+    failure — deliberately left to propagate to this function's caller.
+
+    Parameters
+    ----------
+    config:
+        The live ``ServerConfig``.
+    """
+    from paramem.cloud import span_tagger
+    from paramem.cloud.admission import scrubbing_reachable
+
+    reachable = scrubbing_reachable(
+        scrub_enabled=bool(config.sanitization.scrub_categories),
+        cloud_enabled=config.cloud.enabled,
+        cloud_mode=config.sanitization.cloud_mode,
+        provider=config.consolidation.extraction_enrichment_provider,
+        model=config.consolidation.extraction_enrichment_provider_model,
+        endpoint=config.consolidation.extraction_enrichment_provider_endpoint,
+    )
+    if not reachable:
+        logger.info(
+            "span_tagger: not loaded — this configuration cannot reach a cloud with scrubbing on"
+        )
+        return
+    span_tagger.load_at_startup(config.span_tagger)
+
+
 def _build_runtime_components(
     config,
     *,
@@ -7335,7 +7378,7 @@ def _build_runtime_components(
     8. exemplar banks + ``set_classifier_model``
        — ``full_rebuild=True`` only for exemplar banks; ``set_classifier_model``
        runs on both paths so the freshly loaded model is registered.
-    9. language_tracker + lang_id  — ``full_rebuild=True`` only.
+    9. language_tracker + lang_id + span_tagger  — ``full_rebuild=True`` only.
 
     Parameters
     ----------
@@ -7667,7 +7710,7 @@ def _build_runtime_components(
 
             load_personal_referent_exemplars(config.personal_referent)
 
-    # ── 9. language_tracker + lang_id ────────────────────────────────────────
+    # ── 9. language_tracker + lang_id + span_tagger ──────────────────────────
     # Only on full_rebuild: plain reclaim keeps the existing tracker (same config).
     if full_rebuild:
         from paramem.server.language_tracker import LanguageTracker
@@ -7681,6 +7724,16 @@ def _build_runtime_components(
             from paramem.server import lang_id
 
             lang_id.load_at_startup(config.text_lang_detection.model_path)
+
+        # Span tagger fails CLOSED at load (a failure propagates out of
+        # this function and is handled by each caller — see
+        # ``_load_span_tagger``'s docstring), where lang_id above fails
+        # open. It holds a CPU-resident model only, never
+        # ``_state["model"]``: not a base-model holder (no
+        # ``# BASE-MODEL HOLDER`` tag), invisible to
+        # ``_release_base_model_in_process``, and left resident by both
+        # ``POST /gpu/release`` and ``POST /gpu/acquire``.
+        _load_span_tagger(config)
 
 
 def _remount_adapters_from_disk(config) -> None:

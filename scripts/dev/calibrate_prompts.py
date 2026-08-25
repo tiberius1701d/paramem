@@ -8,14 +8,18 @@ later steps.  Iterate on prompt files and inference params; measure
 compliance variance across seeds; compare candidate vs production
 baseline side-by-side.
 
-Stages: the live, authoritative list of stage names is the ``_STAGE_PROMPTS``
-mapping below — each key is a stage and maps 1:1 onto ``POST
-/calibrate/<stage>``.  Most stages (``extract``, ``anonymize``, ``enrich``,
-``plausibility``) run a chunk through the extraction pipeline; ``normalize``
-and ``anonymize_facts`` run against a stored graph snapshot (``--snapshot``);
-``name`` runs against a turn transcript (``--turns-jsonl``); ``respond`` runs
-one live serving turn against a bare utterance (``--utterance``).  See each
-stage's guard code in ``main()`` for its required input flag.
+Stages: the live, authoritative list of stage names carrying prompt variants
+is the ``_STAGE_PROMPTS`` mapping below — each key is a stage and maps 1:1
+onto ``POST /calibrate/<stage>``.  Most stages (``extract``, ``anonymize``,
+``enrich``, ``plausibility``) run a chunk through the extraction pipeline;
+``normalize`` runs against a stored graph snapshot (``--snapshot``); ``name``
+runs against a turn transcript (``--turns-jsonl``); ``respond`` runs one live
+serving turn against a bare utterance (``--utterance``).  See each stage's
+guard code in ``main()`` for its required input flag.  ``anonymize_facts`` is
+a stage outside this mapping: it runs against a stored graph snapshot
+(``--snapshot``) like ``normalize``, but the only prompt it composes
+(``anonymization.txt``) never issues a model call on this facts-only,
+transcript-free door, so it carries no prompt variants.
 
 Usage::
 
@@ -137,7 +141,6 @@ _STAGE_PROMPTS: dict[str, tuple[str, ...]] = {
     "enrich": ("enrich",),
     "plausibility": ("plausibility",),
     "normalize": ("normalize_filter",),
-    "anonymize_facts": ("anonymize_facts",),
     "name": ("name_user", "name_system"),
     "respond": (
         "serving_system",
@@ -697,11 +700,6 @@ _STAGE_FILENAME = {
     "enrich": "cloud_enrichment.txt",
     "plausibility": "cloud_plausibility.txt",
     "normalize_filter": "predicate_normalization.txt",
-    # Graph-tier facts-only anonymize variant — see
-    # configs/prompts/anonymization_facts.txt. Distinct from "anonymize"
-    # (the session-tier, transcript-bearing template) above; POST
-    # /calibrate/anonymize_facts, not /calibrate/anonymize.
-    "anonymize_facts": "anonymization_facts.txt",
     "name_user": "name_extraction.txt",
     "name_system": "name_extraction_system.txt",
     # Serving prompts — the branch-dependent subset of these five templates
@@ -1137,11 +1135,12 @@ def main(argv: list[str] | None = None) -> int:
             )
 
     # ----- anonymize_facts stage (graph-level, runs outside the chunk loop) -
-    # The facts-only anonymize variant graph-tier enrichment uses
-    # (configs/prompts/anonymization_facts.txt) — distinct from the
-    # session-tier "anonymize" chunk stage above. Reads the same --snapshot
-    # artifact "normalize" reads; the server derives facts + identity_domain
-    # from it (paramem.server.calibrate.calibrate_anonymize_facts).
+    # The facts-only anonymize use case graph-tier enrichment uses —
+    # composes the SAME sectioned home (configs/prompts/anonymization.txt)
+    # as the session-tier "anonymize" chunk stage above, just with no
+    # transcript. Reads the same --snapshot artifact "normalize" reads;
+    # the server derives facts + identity_domain from it
+    # (paramem.server.calibrate.dispatch_anonymize_facts).
     if "anonymize_facts" in stages:
         anonymize_facts_runs: list[dict] = []
         for seed in seeds:
@@ -1152,9 +1151,6 @@ def main(argv: list[str] | None = None) -> int:
                 "anonymize_facts",
                 {
                     "snapshot_path": args.snapshot,
-                    "prompt_variants": _variants(
-                        prompts_dir, args.prompt_prefix, "anonymize_facts"
-                    ),
                     "params": {k: v for k, v in params.items() if v is not None},
                 },
             )

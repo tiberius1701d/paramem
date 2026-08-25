@@ -15,6 +15,7 @@ from unittest.mock import MagicMock
 import pytest
 from peft import PeftModel
 
+from paramem.config.taxonomy import resolve_scrub_categories
 from paramem.training.consolidation import ConsolidationLoop
 from paramem.training.graph_tier import GraphTierRefiner
 from paramem.training.recall_eval import RecallProbe
@@ -159,7 +160,9 @@ class TestExtractionPathParity:
 
         from paramem.memory.store import MemoryStore as _MS
 
-        loop_kwargs.setdefault("extraction_scrub", {"person name"})
+        loop_kwargs.setdefault(
+            "extraction_scrub_categories", resolve_scrub_categories(["person name"])
+        )
         loop_kwargs.setdefault("extraction_max_tokens", 8192)
         loop_kwargs.setdefault("extraction_plausibility_max_tokens", 8192)
         loop_kwargs.setdefault("extraction_anonymize_token_envelope", 8192)
@@ -515,7 +518,7 @@ class TestExtractionPathParity:
         pipeline = ExtractionPipeline(
             model=MagicMock(),
             tokenizer=MagicMock(),
-            config=ExtractionConfig(scrub={"person name"}),
+            config=ExtractionConfig(scrub_categories=resolve_scrub_categories(["person name"])),
         )
         result = pipeline.kwargs(source_type="document", speaker_id="speaker0")
         assert result["source_type"] == "document"
@@ -572,7 +575,7 @@ class TestLocalParseFailureAbortsFold:
             tier_adapters=tier_adapters,
             memory_store=_MS(),
             output_dir=tmp_path,
-            extraction_scrub={"person name"},
+            extraction_scrub_categories=resolve_scrub_categories(["person name"]),
             extraction_max_tokens=8192,
             extraction_plausibility_max_tokens=8192,
             extraction_anonymize_token_envelope=8192,
@@ -1002,7 +1005,7 @@ class TestInterimRefinementGate:
             tier_adapters={"episodic": AdapterConfig(), "semantic": AdapterConfig()},
             memory_store=_MS(),
             output_dir=tmp_path,
-            extraction_scrub={"person name"},
+            extraction_scrub_categories=resolve_scrub_categories(["person name"]),
             cloud_enabled=cloud_enabled,
             extraction_max_tokens=8192,
             extraction_plausibility_max_tokens=8192,
@@ -2546,7 +2549,7 @@ class TestSameAsSpeakerPairGuard:
 
     @pytest.fixture(autouse=True)
     def _stub_local_anonymize(self, monkeypatch):
-        """Stub ``anonymize_transcript`` for every test in this class.
+        """Stub the anonymize chain for every test in this class.
 
         ``graph_enrich.enrich_graph`` now runs the local anonymizer
         (the SAME primitive session-tier extraction uses) over each chunk
@@ -2570,6 +2573,7 @@ class TestSameAsSpeakerPairGuard:
         failure mode the docstring above already describes for a
         MagicMock parse failure.
         """
+        from paramem.cloud.anonymize import AnonymizedContract
         from paramem.config.taxonomy import entity_type_to_prefix
 
         def _stub(facts, model, tokenizer, transcript="", **kwargs):
@@ -2584,10 +2588,19 @@ class TestSameAsSpeakerPairGuard:
             prefix = entity_type_to_prefix("person")
             for i, name in enumerate(names, start=1):
                 mapping[name] = f"{prefix}_{i}"
-            return mapping, "stub-anon-transcript", "stub-raw"
+            return AnonymizedContract(
+                status="ok",
+                forward=mapping,
+                reverse={v: k for k, v in mapping.items()},
+                anon_transcript="",
+                declared=frozenset(mapping.values()),
+                rekey_dropped=0,
+                raw="stub-raw",
+                facts=facts,
+            )
 
         monkeypatch.setattr(
-            "paramem.cloud.anonymize.anonymize_transcript",
+            "paramem.training.graph_enrich.anonymize",
             _stub,
         )
 
@@ -2625,7 +2638,7 @@ class TestSameAsSpeakerPairGuard:
             output_dir=tmp_path,
             extraction_enrichment_provider="anthropic",
             extraction_enrichment_provider_model="claude-sonnet-4-6",
-            extraction_scrub={"person name"},
+            extraction_scrub_categories=resolve_scrub_categories(["person name"]),
             # Graph-tier enrichment is cloud egress: the shared cloud-admission
             # verdict's first term is the master switch, so it must be ON for
             # this test to reach a (mocked) cloud call.
@@ -3237,7 +3250,7 @@ class TestRunGraphNormalizationApply:
 
         from paramem.graph.extraction_pipeline import ExtractionConfig as _ExtCfg
 
-        loop.extraction = _SNS(config=_ExtCfg(scrub=set()))
+        loop.extraction = _SNS(config=_ExtCfg(scrub_categories=()))
 
         return loop
 

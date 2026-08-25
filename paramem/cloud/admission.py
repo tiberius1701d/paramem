@@ -15,6 +15,12 @@ the agent) — the decision itself is not re-derived anywhere.
 The switch it takes is the ONE master switch, ``cloud.enabled``
 (:class:`paramem.server.config.CloudConfig`).
 
+:func:`scrubbing_reachable` answers a related, narrower question — whether a
+configuration can reach a cloud LLM *with scrubbing on* — by composing
+:func:`evaluate_cloud_egress` with the chat-egress path, so a caller
+deciding whether to load a scrubbing-dependent resource has one function to
+call rather than re-deriving the composition itself.
+
 Leaf module by construction: stdlib only.  It must not import from
 ``paramem.graph``, ``paramem.training`` or ``paramem.server`` — the graph
 layer's ``extraction_pipeline`` imports the extractor, which imports this
@@ -184,3 +190,73 @@ def evaluate_cloud_egress(
         api_key=api_key if not gaps else "",
         gaps=tuple(gaps),
     )
+
+
+def scrubbing_reachable(
+    *,
+    scrub_enabled: bool,
+    cloud_enabled: bool,
+    cloud_mode: str,
+    provider: str,
+    model: str,
+    endpoint: str | None,
+) -> bool:
+    """Decide whether a configuration can reach a cloud LLM with scrubbing on.
+
+    ``True`` iff *scrub_enabled* AND at least one of two cloud-reaching
+    paths holds:
+
+    1. :func:`evaluate_cloud_egress` (called with *cloud_enabled*,
+       *provider*, *model*, *endpoint*) reports ``permitted`` — the exact
+       verdict session-tier cloud enrichment
+       (``paramem.graph.flows._session_egress_permitted``) and graph-tier
+       enrichment (``paramem.training.graph_enrich.enrich_graph``) already
+       gate on.
+    2. ``cloud_enabled`` is on and *cloud_mode* is ``"anonymize"`` or
+       ``"both"`` (the closed vocabulary validated by
+       ``SanitizationConfig.cloud_mode``, ``paramem/server/config.py``) —
+       the chat-egress path, which reaches a cloud LLM independently of
+       :func:`evaluate_cloud_egress`'s provider/key/endpoint terms.
+
+    The graph tier's ``refinement_enrichment == "on"`` setting is not a
+    third term here: it is path 1 plus one extra flag, so it can never be
+    true where path 1 is false — its absence from this predicate is
+    derived, not forgotten.
+
+    Path 1 resolves an API key from the process environment
+    (:func:`evaluate_cloud_egress` calls :func:`resolve_api_key`, which
+    reads ``os.environ``), so this predicate is **not a pure function of
+    YAML config**: the same configuration satisfies path 1 with the
+    provider's key exported and does not without it. That is why a caller
+    deciding whether to load a resource gated on this predicate must still
+    treat that resource's own runtime failure as the actual egress
+    guarantee — this function only decides whether to attempt the load.
+
+    Args:
+        scrub_enabled: Whether any scrub category is configured
+            (``bool(config.sanitization.scrub_categories)`` at the one
+            call site that maps ``ServerConfig`` onto this function).
+        cloud_enabled: The master switch, ``ServerConfig.cloud.enabled``.
+        cloud_mode: Configured chat-egress policy, one of ``"block"``,
+            ``"anonymize"``, ``"both"``.
+        provider: Configured cloud provider name, passed through to
+            :func:`evaluate_cloud_egress`.
+        model: Configured model id for that provider, passed through to
+            :func:`evaluate_cloud_egress`.
+        endpoint: Explicit endpoint override, or ``None``, passed through
+            to :func:`evaluate_cloud_egress`.
+
+    Returns:
+        ``True`` when scrubbing is configured and at least one egress path
+        can reach a cloud LLM.
+    """
+    if not scrub_enabled:
+        return False
+    if evaluate_cloud_egress(
+        cloud_enabled=cloud_enabled,
+        provider=provider,
+        model=model,
+        endpoint=endpoint,
+    ).permitted:
+        return True
+    return cloud_enabled and cloud_mode in {"anonymize", "both"}

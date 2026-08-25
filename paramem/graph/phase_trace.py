@@ -116,12 +116,13 @@ shared loader that cannot know whether it is being called from inside a
 phase; one real production call path still runs it with no phase scope
 open — the full-fold graph-tier enrichment pass
 (``GraphTierRefiner.run_enrichment`` → ``enrich_graph`` → ``anonymize`` →
-``anonymize_transcript``, none of which open
+its per-category ``scan_values`` calls in
+:mod:`paramem.cloud.anonymize_steps`, none of which open
 ``extraction_trace``/``phase_trace``) — so a raise there would break
-legitimate production behaviour. The live chat egress's own
-``anonymize_transcript`` call (``answer_via_cloud`` → ``anonymize_turn``)
-no longer belongs on that list: it runs inside the ``serve_turn`` phase
-scope :func:`paramem.server.inference.handle_chat` opens around its
+legitimate production behaviour. The live chat egress's own calls into
+``anonymize`` (``answer_via_cloud`` → ``anonymize_turn``) no longer
+belong on that list: they run inside the ``serve_turn`` phase scope
+:func:`paramem.server.inference.handle_chat` opens around its
 whole dispatch, so those prompt loads ARE recorded onto the trace.
 ``phase_trace``'s caller, by contrast, has explicitly declared a phase
 boundary — a lost record there is a contract breach the raise is meant
@@ -724,12 +725,13 @@ def record_prompt(*, path: str | None, content: str) -> None:
       open at CALL time — the full-fold graph-tier enrichment pass
       (``GraphTierRefiner.run_enrichment`` in
       ``paramem/training/graph_tier.py`` → ``enrich_graph`` in
-      ``paramem/training/graph_enrich.py`` → ``anonymize`` →
-      ``anonymize_transcript``), none of which open
+      ``paramem/training/graph_enrich.py`` → ``anonymize`` → its
+      per-category ``scan_values`` calls in
+      ``paramem/cloud/anonymize_steps.py``), none of which open
       ``extraction_trace``/``phase_trace``.  The live chat egress's own
-      ``anonymize_transcript`` call (``answer_via_cloud`` →
+      calls into ``anonymize`` (``answer_via_cloud`` →
       ``anonymize_turn``, ``paramem/server/inference.py``) no longer
-      belongs on this list: it runs inside the ``serve_turn`` phase scope
+      belong on this list: they run inside the ``serve_turn`` phase scope
       ``handle_chat`` opens around its whole dispatch, so those prompt
       loads ARE recorded.
 

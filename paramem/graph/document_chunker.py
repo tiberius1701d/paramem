@@ -25,9 +25,11 @@ in memory.  ``max_tokens``/``min_tokens`` below are estimated-token
 thresholds under that same fallback, not raw word counts; see
 ``estimate_tokens``'s module docstring for where the fallback ratio comes
 from.  The default ``max_tokens`` (:data:`_DOC_MAX_TOKENS`) is not chosen
-independently — it is derived from the single per-call anonymize token
-envelope a document chunk's downstream local calls must fit inside; see
-the derivation comment above :data:`_DOC_MAX_TOKENS`.  ``min_tokens``
+independently — it is HELD at the operating-point value a document chunk's
+downstream local calls were measured to fit inside the single per-call
+anonymize token envelope; see the provenance comment above
+:data:`_DOC_MAX_TOKENS` for the retained derivation and the import-time
+tripwire that still checks it against that envelope.  ``min_tokens``
 (:data:`_DOC_MIN_TOKENS`) is a context floor, not a budget, and is not
 envelope-derived.
 
@@ -48,10 +50,12 @@ from markdown_it import MarkdownIt
 from markdown_it.token import Token
 
 from paramem.utils.tokens import (
+    ANONYMIZE_ANCHOR_MAX_CANDIDATES,
+    ANONYMIZE_ANCHOR_PROMPT_SKELETON_TOKENS,
     ANONYMIZE_ENVELOPE_TOKENS,
-    ANONYMIZE_OUTPUT_RESERVE_TOKENS,
     MEASURED_TOKENS_PER_WORD,
-    envelope_derived_cap_tokens,
+    anchor_output_reserve_tokens,
+    anonymize_payload_cap_tokens,
     estimate_tokens,
     words_to_estimator_tokens,
 )
@@ -74,89 +78,88 @@ class ScannedPdfRejectedError(ValueError):
 
 
 # ---------------------------------------------------------------------------
-# Document-chunk cap — derived from the anonymize-call token envelope
+# Document-chunk cap — a HELD operating-point constant
 # ---------------------------------------------------------------------------
 #
-# Derived from the single per-call token envelope
-# (``consolidation.extraction_anonymize_token_envelope``, default 8192 —
-# ``paramem.utils.tokens.ANONYMIZE_ENVELOPE_TOKENS``), NOT an independent
-# heuristic. A document chunk is consumed by two local calls, in order:
-# session-tier extraction (``configs/prompts/extraction.txt``, the chunk
-# fills its ``{transcript}`` slot), then anonymize on the extracted facts
-# AND the chunk itself (``paramem/graph/stage_anonymize.py`` threads
+# A document chunk is consumed by two local calls, in order: session-tier
+# extraction (``configs/prompts/extraction.txt``, the chunk fills its
+# ``{transcript}`` slot), then anonymize on the extracted facts AND the
+# chunk itself (``paramem/graph/stage_anonymize.py`` threads
 # ``ctx.transcript`` — the same chunk text — into
-# ``anonymize(transcript=...)``). The binding call is the second one: its
-# OUTPUT must echo the chunk back as the ``anonymized_transcript`` rewrite,
-# so the chunk's real-token cost is paid TWICE against the SAME envelope
-# (once as transcript input, once as echoed output) PLUS the
-# extracted-facts JSON the same call also carries as input — the identity
-# and the estimator-unit rule are stated ONCE, in
-# :func:`~paramem.utils.tokens.envelope_derived_cap_tokens`'s docstring;
-# this comment records only this path's TERMS.
+# ``anonymize(transcript=...)``). ``_DOC_MAX_TOKENS`` is HELD at the
+# operating-point value the shipped extraction quality was measured at,
+# rather than computed at import time from the anonymize-call token
+# envelope: the per-call-shape (SCAN, APPLY) two-shape cap door that
+# originally derived it is retired now that the anonymizer's SCAN step is
+# a span tagger with no envelope of its own — the identity that formula
+# encoded now lives only as a compile-time tripwire (below), not as this
+# constant's own derivation.
 #
-# Two paragraphs of design rationale that are NOT part of the derivation
-# arithmetic, and must survive any future trim of this comment:
+# Two paragraphs of design rationale that are NOT part of the retired
+# derivation arithmetic, and must survive any future trim of this comment:
 #
-# 1. These constants are compiled-in literals, not read from
-#    ``configs/``/yaml at import time: ``configs/prompts/`` is not packaged
+# 1. This constant is a compiled-in literal, not read from ``configs/``/yaml
+#    at import time: ``configs/prompts/`` is not packaged
 #    (``pyproject.toml``'s ``[tool.setuptools.package-data]`` ships only
 #    ``web/static/*`` and ``training/donor_fixture.json``) and this
 #    module's own docstring above states the CLI must stay portable to a
 #    host that does not have the operator's server-side config/prompts
 #    checked out — an import-time file read here would make ``import
 #    paramem.graph.document_chunker`` (and therefore the CLI) fail outside
-#    a full repo checkout. The literal's honesty is enforced from the
-#    OUTSIDE instead: ``tests/test_document_chunker.py``'s derivation
-#    tests recompute the same formula from the live prompt file on every
-#    run (exact equality, no tolerance band — the formula is
-#    deterministic), so a prompt edit that changes the template's word
-#    count is caught by construction.
+#    a full repo checkout.
 # 2. The cap is stored in the estimator's own unit
 #    (:func:`~paramem.utils.tokens.words_to_estimator_tokens`), never real
 #    tokens — see that function's docstring for why (ratio cancellation at
-#    every runtime ``estimate_tokens(text) <= max_tokens`` comparison).
-#    Pinned by ``tests/test_document_chunker.py``'s
-#    ``TestDocMaxTokensDerivation::test_ratio_cancellation_invariant``.
+#    every runtime ``estimate_tokens(text) <= max_tokens`` comparison): the
+#    fallback ratio appears on both sides of the comparison and cancels, so
+#    the held word figure below is exact regardless of which ratio produced
+#    it.
 #
-# Terms (``f`` and ``anon_template`` measured with the production tokenizer,
-# Mistral 7B, 2026-07-28, COUNTS ONLY — that measurement runs over real
-# personal records, so nothing but the resulting integers may be written
-# down here or anywhere else tracked; see ``paramem/utils/tokens.py``'s
-# module docstring for the same privacy rule):
-#   envelope   = paramem.utils.tokens.ANONYMIZE_ENVELOPE_TOKENS   = 8192 tok
-#   reserve    = paramem.utils.tokens.ANONYMIZE_OUTPUT_RESERVE_TOKENS = 58 tok
-#   r_prose    = 1.9126 tokens/word  (document shape — the same measurement
-#                recorded as tokens.py's "document shape (CV)" row)
-#   anon_template words = 1961 words (configs/prompts/anonymization.txt,
-#                rendered empty, current file — recomputed live by tests)
-#   skeleton   = ceil(1961 * 1.9126)                              = 3751 tok
-#   dense_chunk_real_tokens = 1500 words * r_prose (extractor.py's ~1500-word
-#                dense-chunk reference point)                    ~= 2869 tok
-#   f = 2200 (extractor.py's recorded dense-chunk output) / 2869  ~= 0.767
+# Retired derivation and its measured inputs (2026-08-24 re-measurement
+# against the shipped sectioned home, configs/prompts/anonymization.txt —
+# see tokens.py's ANCHOR-skeleton comment for the measurement method):
+#   envelope       = paramem.utils.tokens.ANONYMIZE_ENVELOPE_TOKENS = 8192 tok
+#   scan_skeleton  = 555 tok, apply_skeleton = 253 tok (the retired SCAN/
+#                    APPLY prompt-skeleton pair)
+#   scan_reserve   = 616 tok (the retired SCAN output reserve, evaluated at
+#                    its own worst-case candidate-count ceiling)
+#   apply_reserve  = 16 tok (the retired APPLY output reserve)
+#   r_prose        = 1.9126 tokens/word (document shape — the same
+#                    measurement recorded as tokens.py's "document shape
+#                    (CV)" row) — retained below as ``_R_PROSE``, the
+#                    document-shape ratio the import-time tripwire still
+#                    uses
+#   dense_chunk_real_tokens = 1500 words * r_prose (extractor.py's
+#                ~1500-word dense-chunk reference point, COUNTS ONLY — see
+#                paramem/utils/tokens.py's module docstring for the privacy
+#                rule that measurement runs under) ~= 2869 tok
+#   f = 2200 (extractor.py's recorded dense-chunk output) / 2869 ~= 0.767
 #       (``extractor.py``'s ``_DEFAULT_FILTER_MAX_TOKENS`` comment records
 #       "Empirical worst-case observed output for a dense resume chunk was
-#       ~2200 tokens" — local EXTRACTION's raw triples-JSON output, used
-#       here as the anonymize call's "facts" term proxy; ``f`` is carried
-#       as its OWN term rather than folded into the template term — a
-#       prior revision that folded it under-budgeted the facts term by
-#       ~4x, letting a dense chunk's anonymize call overrun the envelope)
+#       ~2200 tokens" — local EXTRACTION's raw triples-JSON output, used as
+#       the retired SCAN call's "facts" term proxy)
+# 2070 words -> 7662 estimator tokens (the retired APPLY shape was the
+# binding one: multiplicity 2.0 > SCAN's 1 + f ~= 1.767).
 _R_PROSE: float = 1.9126
-_ANON_SKELETON_TOKENS: int = 3751  # ceil(1961 words * _R_PROSE)
-_DENSE_CHUNK_WORDS: int = 1500
-_DENSE_CHUNK_OUTPUT_TOKENS: int = 2200
-# UNROUNDED — passing a rounded f (e.g. 0.77) shifts cap_words from 828 to
-# 827 and _DOC_MAX_TOKENS from 3063 to 3059; see the ratio-cancellation
-# comment above for why the estimator-unit re-encoding, not this ratio's
-# precision, is what keeps the runtime comparison exact.
-_F_DOC: float = _DENSE_CHUNK_OUTPUT_TOKENS / (_DENSE_CHUNK_WORDS * _R_PROSE)
+_DOC_MAX_TOKENS: int = 7662
 
-_DOC_MAX_TOKENS: int = envelope_derived_cap_tokens(
+# Slack tripwire, not a tight bound: the ANCHOR call (the one local
+# generate() left in the anonymizer) is far cheaper than the retired
+# SCAN+APPLY pair, so this assertion passes with room to spare — it is not
+# a re-derivation of the held value above. It fires only if
+# ANONYMIZE_ENVELOPE_TOKENS is lowered, _DOC_MAX_TOKENS is raised, or the
+# ANCHOR prompt is inflated far enough that a cap-sized document chunk
+# could no longer fit the one remaining envelope-bearing call.
+assert _DOC_MAX_TOKENS <= anonymize_payload_cap_tokens(
     envelope_tokens=ANONYMIZE_ENVELOPE_TOKENS,
-    skeleton_tokens=_ANON_SKELETON_TOKENS,
-    reserve_tokens=ANONYMIZE_OUTPUT_RESERVE_TOKENS,
-    facts_ratio=_F_DOC,
+    anchor_skeleton_tokens=ANONYMIZE_ANCHOR_PROMPT_SKELETON_TOKENS,
+    anchor_reserve_tokens=anchor_output_reserve_tokens(ANONYMIZE_ANCHOR_MAX_CANDIDATES),
     payload_tokens_per_word=_R_PROSE,
-)  # 828 words -> 3063 estimator tokens
+), (
+    "_DOC_MAX_TOKENS exceeds the anchor-shape cap — the envelope, the "
+    "held cap, or the ANCHOR prompt moved; re-measure jointly."
+)
+
 # Context floor, not a budget (unlike _DOC_MAX_TOKENS above, this is not
 # derived from the envelope). Real threshold is unchanged from before this
 # migration (200 words — "enough context for extraction"), re-expressed in
@@ -218,8 +221,9 @@ def chunk_text_file(path: Path, *, max_tokens: int = _DOC_MAX_TOKENS) -> list[Do
         path: Path to the ``.txt`` file.
         max_tokens: Estimated-token ceiling per chunk (see
             :func:`paramem.utils.tokens.estimate_tokens`).  Defaults to
-            :data:`_DOC_MAX_TOKENS`, derived from the anonymize-call token
-            envelope (see the derivation comment above that constant).
+            :data:`_DOC_MAX_TOKENS`, held at the operating-point value
+            measured against the anonymize-call token envelope (see the
+            provenance comment above that constant).
 
     Returns:
         List of :class:`DocumentChunk` instances, one per merged group.
@@ -532,9 +536,10 @@ def chunk_pdf_file(
             above this size are split at sentence boundaries.  A single
             sentence whose own estimated-token count exceeds ``max_tokens``
             is kept whole — the chunk will exceed the cap rather than cut
-            mid-sentence.  Defaults to :data:`_DOC_MAX_TOKENS`, derived from
-            the anonymize-call token envelope (see the derivation comment
-            above that constant).
+            mid-sentence.  Defaults to :data:`_DOC_MAX_TOKENS`, held at the
+            operating-point value measured against the anonymize-call
+            token envelope (see the provenance comment above that
+            constant).
         overlap_tokens: When splitting a section, the trailing word span of
             the just-emitted chunk whose estimated-token cost is closest to
             this many tokens is copied into the next chunk's prefix (see

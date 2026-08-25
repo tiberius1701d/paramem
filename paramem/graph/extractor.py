@@ -92,17 +92,12 @@ class ExtractionFailed(RuntimeError):
 # chain.
 #
 # 8192 is sized for Mistral 7B against document chunks up to
-# ``paramem.graph.document_chunker._DOC_MAX_TOKENS``, the local chunker's
-# max — currently ~828 words (_DOC_MAX_TOKENS is DERIVED from the
-# anonymize-call token envelope rather than an independent ~1500-word
-# heuristic, and that derivation itself consumes the empirical figure
-# below). Empirical worst-case observed output for a dense resume chunk was
-# ~2200 tokens against the PRIOR ~1500-word max; 8192 still gives ample
-# headroom against the smaller current max (a smaller chunk produces
-# proportionally less extraction output, not more). If the chunker contract
-# changes again, revisit jointly with that change — this comment AND
-# ``_DOC_MAX_TOKENS``'s own derivation comment both consume the ~2200-token
-# figure and must be updated together.
+# ``paramem.graph.document_chunker._DOC_MAX_TOKENS`` = 7662 estimator
+# tokens / 2070 words; the recorded worst-case dense-chunk output is ~2200
+# tokens; revisit jointly if either moves. This is a stated manual
+# invariant, not a computed term: ``_DOC_MAX_TOKENS`` is a HELD
+# operating-point constant, not read by this module, so there is no
+# executable link between the two figures to keep in sync automatically.
 #
 # Plausibility output couples to chunk density. The filter's contract
 # (configs/prompts/cloud_plausibility.txt) is a small ``{"drop": {"R1":
@@ -1684,9 +1679,7 @@ def request_enrichment(
     model; it defaults to the production template. ``prompt_filename``
     overrides the file name within that directory (the production caller,
     the ``enrich`` stage, keeps the default); consistent with the
-    ``prompt_filename`` parameter on
-    :func:`~paramem.cloud.anonymize.anonymize_transcript` and
-    :func:`judge_plausibility`.
+    ``prompt_filename`` parameter on :func:`judge_plausibility`.
 
     ``speaker_id`` fills the prompt's ``{speaker_id}`` slot — THIS
     session's own speaker anchor (e.g. ``"speaker0"``, ``"speaker1"``),
@@ -1816,10 +1809,13 @@ def request_graph_enrichment(
     guard) before calling this function; this function applies no scope
     gate of its own — it only substitutes and de-anonymizes.
 
-    ``payload.reverse`` is produced exclusively by
-    :func:`~paramem.cloud.placeholders._build_anonymization_mapping`
-    inside (A) — the speaker-value guard applies here by construction; no
-    code path in this function inverts an unfiltered forward map.
+    ``payload.reverse`` is (A)'s own inversion of the cross-slice merged
+    forward table (:func:`~paramem.cloud.placeholders.invert_forward_mapping`,
+    called from :func:`~paramem.cloud.anonymize.anonymize` after every
+    slice's :func:`~paramem.cloud.placeholders.build_forward_table` output
+    has been merged and any placeholder collision re-minted) — the
+    speaker-value guard applies here by construction; no code path in
+    this function inverts an unfiltered forward map.
 
     The chunk's anonymized ``subject``/``object`` fields come from
     :func:`~paramem.cloud.placeholders.insert_placeholders` applied

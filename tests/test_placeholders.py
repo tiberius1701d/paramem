@@ -2,7 +2,7 @@
 placeholder primitive kit.
 
 Most of this module's functions (``_apply_bindings``, ``_resolution_map``,
-``_build_anonymization_mapping``, ...) already have extensive coverage in
+``build_forward_table``, ...) already have extensive coverage in
 ``tests/test_extraction_pipeline.py`` (moved there unchanged when this
 module was carved out of ``paramem.graph.extractor``). This file covers
 the NEW unified primitives introduced by that carve-out: ``mint_placeholder``,
@@ -19,20 +19,21 @@ taxonomy (``configs/schema.yaml``).
 
 from __future__ import annotations
 
-import inspect
 import logging
 
 from paramem.cloud.placeholders import (
     _MAX_MAPPING_TEXT_CHARS,
     PLACEHOLDER_SHAPE_RE,
     PLACEHOLDER_TOKEN_RE,
-    _build_anonymization_mapping,
+    _applied_whole_word_keys,
     _fact_orphans,
     _fact_tokens,
     _normalize_anonymization_mapping,
     _placeholder_tokens,
     _substitute_whole_words,
+    _substitute_whole_words_and_applied,
     braced,
+    insert_placeholders,
     invert_forward_mapping,
     mint_placeholder,
     placeholder_prefix,
@@ -43,7 +44,6 @@ from paramem.config.taxonomy import (
     placeholder_entity_type,
     prefix_to_entity_type,
 )
-from paramem.utils.identity import is_speaker_id
 
 
 class TestMintPlaceholder:
@@ -292,7 +292,7 @@ class TestSubstituteWholeWordsLongestFirst:
         length-sort half, but the two only cooperate correctly together.
 
         Mutation: remove the length-descending sort
-        (``paramem/graph/placeholders.py`` sort in ``_substitute_whole_words``)
+        (``paramem/cloud/placeholders.py`` sort in ``_substitute_whole_words``)
         OR the trailing word-boundary check -> this test (or its siblings
         above) fails.
         """
@@ -320,6 +320,88 @@ class TestSubstituteWholeWordsLongestFirst:
         mapping = {"New York": "City_2", "New York City": "City_1"}
         out = _substitute_whole_words("I visited New York City yesterday.", mapping)
         assert out == "I visited City_1 yesterday."
+
+
+class TestAppliedWholeWordKeys:
+    """The reporting form of :func:`_substitute_whole_words` —
+    :func:`_applied_whole_word_keys` — the ONE substitution walk
+    (:func:`_substitute_whole_words_and_applied`) shared by both. Used by
+    :func:`~paramem.cloud.anonymize.anonymize` to prune a forward table
+    down to keys that are actually live over one payload.
+    """
+
+    def test_returns_only_the_keys_that_actually_matched(self) -> None:
+        mapping = {"Alex": "Person_1", "Riley": "Person_2"}
+        applied = _applied_whole_word_keys("Alex went to the store.", mapping)
+        assert applied == {"Alex"}
+
+    def test_a_key_present_nowhere_in_text_is_not_applied(self) -> None:
+        mapping = {"Alex": "Person_1"}
+        assert _applied_whole_word_keys("Nothing here matches.", mapping) == set()
+
+    def test_overlapping_non_nesting_spans_only_the_first_applied_key_survives(self) -> None:
+        # Longest-first substitution consumes the first key's match; the
+        # second key's own text is gone from the walk by the time its
+        # turn to match would come, so it applies nowhere — the exact
+        # shape behind the "inert forward key" defect.
+        text = "Schillerpromenade 63, 12049 Berlin, Abteilung 3."
+        mapping = {
+            "Schillerpromenade 63, 12049 Berlin": "Address_1",
+            "12049 Berlin, Abteilung 3": "Address_2",
+        }
+        applied = _applied_whole_word_keys(text, mapping)
+        assert applied == {"Schillerpromenade 63, 12049 Berlin"}
+
+    def test_applied_keys_agree_with_the_str_only_forms_own_substitutions(self) -> None:
+        mapping = {"Person_10": "Riley", "Person_1": "Alex"}
+        text = "Person_10 met Person_1"
+        substituted, applied = _substitute_whole_words_and_applied(text, mapping)
+        assert substituted == _substitute_whole_words(text, mapping)
+        assert applied == {"Person_10", "Person_1"}
+
+    def test_empty_text_or_mapping_yields_an_empty_applied_set(self) -> None:
+        assert _applied_whole_word_keys("", {"Alex": "Person_1"}) == set()
+        assert _applied_whole_word_keys("Alex", {}) == set()
+
+
+class TestInsertPlaceholders:
+    """``insert_placeholders`` — the one consumer that substitutes
+    ``subject``/``object`` through a forward mapping and copies every
+    other field verbatim, never touching the predicate.
+    """
+
+    def test_subject_and_object_are_substituted_predicate_is_untouched(self) -> None:
+        facts = [{"subject": "Alex", "predicate": "lives at", "object": "Riley's place"}]
+        mapping = {"Alex": "Person_1", "Riley's place": "Address_1"}
+        out = insert_placeholders(facts, mapping)
+        assert out == [{"subject": "Person_1", "predicate": "lives at", "object": "Address_1"}]
+
+    def test_fields_other_than_subject_and_object_pass_through_unchanged(self) -> None:
+        facts = [
+            {
+                "subject": "Alex",
+                "predicate": "lives at",
+                "object": "somewhere",
+                "relation_type": "attribute",
+                "confidence": 0.8,
+                "speaker_id": "speaker1",
+            }
+        ]
+        out = insert_placeholders(facts, {"Alex": "Person_1"})
+        assert out[0]["relation_type"] == "attribute"
+        assert out[0]["confidence"] == 0.8
+        assert out[0]["speaker_id"] == "speaker1"
+
+    def test_a_quote_backslash_and_non_ascii_value_substitutes_correctly(self) -> None:
+        raw_value = 'Lindenstraße 44, "Hinterhof"\\Path'
+        facts = [{"subject": "speaker1", "predicate": "lives at", "object": raw_value}]
+        out = insert_placeholders(facts, {raw_value: "Address_1"})
+        assert out[0]["object"] == "Address_1"
+
+    def test_a_mapping_key_absent_from_the_fact_leaves_the_fact_unchanged(self) -> None:
+        facts = [{"subject": "Alex", "predicate": "lives at", "object": "somewhere"}]
+        out = insert_placeholders(facts, {"Riley": "Person_2"})
+        assert out == facts
 
 
 class TestSubstituteWholeWordsEdgeAwareBoundaries:
@@ -649,289 +731,19 @@ class TestFactOrphans:
         assert _fact_orphans(fact, {"Person_1", "Person_2"}) == {"Person_9"}
 
 
-class TestSpeakerAnchorReverseSkip:
-    """Pins the most dangerous half of invariant 5 (currently asserted
-    only implicitly by the module docstring): ``reverse`` must
-    NEVER gain a ``speaker{N}``-keyed entry, even from a hostile LLM hint
-    that scrubs a real name onto the anchor.
-
-    Mutation: drop the ``if is_speaker_id(v): continue`` guard in the
-    LLM-hint merge loop (``_build_anonymization_mapping``,
-    ``paramem/graph/placeholders.py``) -> ``reverse["speaker0"] =
-    "RealName"`` and a real display name is restored onto every
-    speaker-subject fact at deanon time.
-    """
-
-    def test_hostile_llm_hint_never_creates_speaker_keyed_reverse_entry(self):
-        forward, reverse = _build_anonymization_mapping(
-            {"RealName": "speaker0"},  # hostile/hallucinated LLM hint
-            speaker_name=None,
-        )
-        assert "speaker0" not in reverse
-        assert is_speaker_id("speaker0")
-        # The forward scrub is harmless and still useful (keeps "RealName"
-        # out of anon_transcript) — only the reverse write is dangerous.
-        assert forward.get("RealName") == "speaker0"
-
-
-class TestLlmHintMergeUnconditional:
-    """Post cloud-egress-PII redesign: ``_build_anonymization_mapping``
-    holds NO entity walk and NO scope gate of its own — the model's
-    anonymizer prompt is the SOLE scope authority. Every LLM hint not
-    keyed/valued on the speaker anchor is
-    merged in as-is; this builder does not re-judge, re-walk, or float a
-    graph-derived completeness floor under the model's scope decision.
-
-    Supersedes the deleted ``TestLlmHintMergeScopedToPiiScope`` (pinned
-    the now-removed ``pii_scope`` gate via ``placeholder_entity_type``).
-    """
-
-    def test_llm_hint_of_any_entity_type_is_merged(self):
-        """Mutation: reintroduce a type-based gate -> 'Acme Corp' is
-        dropped instead of merged -> this test fails.
-        """
-        forward, reverse = _build_anonymization_mapping(
-            {"Acme Corp": "Org_1"},
-            speaker_name=None,
-        )
-        assert forward.get("Acme Corp") == "Org_1"
-        assert reverse.get("Org_1") == "Acme Corp"
-        text = "I work at Acme Corp in the automotive division."
-        out = _substitute_whole_words(text, forward)
-        assert out == "I work at Org_1 in the automotive division."
-
-    def test_person_llm_hint_is_kept(self):
-        forward, reverse = _build_anonymization_mapping(
-            {"Kim": "Person_1"},
-            speaker_name=None,
-        )
-        assert forward.get("Kim") == "Person_1"
-        assert reverse.get("Person_1") == "Kim"
-        assert _substitute_whole_words("Kim called yesterday.", forward) == (
-            "Person_1 called yesterday."
-        )
-
-    def test_speaker_id_hint_key_still_dropped(self):
-        """The speaker-id key guard is unconditional (never gated on
-        scope) — a hallucinated ``{"speaker0": "Person_1"}`` hint
-        (observed in real logs) is dropped forward AND reverse.
-        """
-        forward, reverse = _build_anonymization_mapping(
-            {"speaker0": "Person_1"},
-            speaker_name=None,
-        )
-        assert "speaker0" not in forward
-        assert "Person_1" not in reverse
-
-
-class TestNoEntityWalk:
-    """The deterministic entity walk is DELETED
-    outright, not scoped or gated. ``_build_anonymization_mapping`` no
-    longer accepts an ``entities`` argument at all: the model's
-    ``llm_mapping`` is the SOLE source of the built table.
-    """
-
-    def test_signature_has_no_entities_parameter(self):
-        params = inspect.signature(_build_anonymization_mapping).parameters
-        assert "entities" not in params
-        # No ``person_prefix`` parameter either: the speaker-name-seeding
-        # mint resolves its placeholder prefix directly via
-        # ``paramem.config.taxonomy.entity_type_to_prefix`` — a leaf
-        # package ``paramem.cloud`` may import without crossing the
-        # cloud/graph boundary — rather than taking it as a caller-supplied
-        # value.
-        assert list(params) == ["llm_mapping", "speaker_name"]
-
-    def test_empty_llm_mapping_and_no_speaker_name_yields_empty_tables(self):
-        """With no entity walk, an empty model mapping and no runtime
-        speaker name produces nothing to scrub — there is no
-        graph-derived floor to fall back on."""
-        forward, reverse = _build_anonymization_mapping({}, speaker_name=None)
-        assert forward == {}
-        assert reverse == {}
-
-    def test_name_absent_from_llm_mapping_is_not_scrubbed(self):
-        """A real name the model did not classify in scope is NOT
-        independently discovered or minted by this builder — confirms
-        there is no completeness floor over any entity inventory."""
-        forward, _reverse = _build_anonymization_mapping(
-            {"Alex": "Person_1"},
-            speaker_name=None,
-        )
-        assert "Riley" not in forward
-
-
-class TestSpeakerNameSeeding:
-    """The one remaining seeding mechanism (the deterministic entity walk
-    stays deleted): a
-    runtime-known speaker display name the model never sees as an
-    explicit prompt field is guaranteed coverage — reusing the model's
-    own hint when it happened to name the speaker, or minting a fresh
-    placeholder otherwise.
-    """
-
-    def test_reuses_exact_llm_hint_for_speaker_name(self):
-        forward, reverse = _build_anonymization_mapping(
-            {"Alex": "Person_1"},
-            speaker_name="Alex",
-        )
-        assert forward["Alex"] == "Person_1"
-        assert reverse["Person_1"] == "Alex"
-
-    def test_reuses_full_name_llm_hint_for_first_name_speaker_name(self):
-        forward, reverse = _build_anonymization_mapping(
-            {"Alex Rivera": "Person_1"},
-            speaker_name="Alex",
-        )
-        assert forward["Alex"] == "Person_1"
-        assert reverse["Person_1"] == "Alex Rivera"
-
-    def test_mints_fresh_placeholder_when_no_llm_hint_names_speaker(self):
-        forward, reverse = _build_anonymization_mapping(
-            {"Riley": "Person_1"},
-            speaker_name="Alex",
-        )
-        assert forward["Alex"] == "Person_2"
-        assert reverse["Person_2"] == "Alex"
-
-    def test_speaker_name_already_in_mapping_is_left_untouched(self):
-        forward, reverse = _build_anonymization_mapping(
-            {"Alex": "Person_5"},
-            speaker_name="Alex",
-        )
-        assert forward["Alex"] == "Person_5"
-        assert reverse["Person_5"] == "Alex"
-
-
-class TestSpeakerNameSeedingReinstatementGuard:
-    """Regression guard for the reinstatement bug ``not
-    is_speaker_id(speaker_name)`` fixes (see the comment above the
-    seeding site in ``_build_anonymization_mapping``): a caller passing
-    a profile display name that is ITSELF speaker-id-shaped (anonymous
-    profiles have ``name == speaker_id`` — production-reachable via the
-    forced-route path and the pre-fix ``/debug/probe``) must never have
-    that value seeded back into ``forward``/``reverse``.
-
-    Mutation: remove the ``not is_speaker_id(speaker_name)`` clause from
-    the seeding gate -> this test fails (the dropped KEY from invariant 1
-    is silently reinstated by the seeding block's own unfiltered
-    ``llm_mapping`` scan).
-    """
-
-    def test_speaker_id_shaped_display_name_never_seeded(self):
-        forward, reverse = _build_anonymization_mapping(
-            {"speaker3": "Person_1"},
-            speaker_name="speaker3",
-        )
-        assert forward == {}
-        assert reverse == {}
-
-
 class TestReverseMapInversionAgreement:
-    """The session tier and the graph tier
-    (:func:`~paramem.graph.extractor.request_graph_enrichment`) both reach
-    their reverse ``{placeholder: real_name}`` table through the SAME
-    :func:`_build_anonymization_mapping` — the graph tier no longer
-    inverts a forward map itself at all; it receives
-    ``AnonymizedContract.reverse`` (built by
-    :func:`~paramem.cloud.anonymize.anonymize`'s call to
-    :func:`_build_anonymization_mapping`) directly as a caller-supplied
-    argument. Before the fix the two sites disagreed on the tie-break for
-    a many-to-one forward map (two real names scrubbed onto the SAME
-    placeholder): the session tier was first-wins
-    (``reverse.setdefault(v, k)``), the graph tier was last-wins (a plain
-    dict comprehension) — so de-anonymizing the identical placeholder
-    restored a DIFFERENT real name depending on which tier ran the deanon.
-
-    Mutation: reintroduce a graph-tier-local inversion (raw
-    ``invert_forward_mapping(mapping)`` or a hand-rolled dict comprehension
-    inside ``request_graph_enrichment``) instead of taking
-    ``payload.reverse`` as-is -> these tests fail.
+    """Both the session tier and the graph tier reach their reverse
+    ``{placeholder: real_name}`` table through the SAME
+    :func:`build_forward_table` -> :func:`invert_forward_mapping` chain —
+    :func:`invert_forward_mapping`'s first-wins tie-break on a many-to-one
+    forward map is exercised directly here (the map-construction side is
+    covered by the scan/anchor/seeding tests above).
     """
 
     _MANY_TO_ONE = {"Alice": "Person_1", "Bob": "Person_1"}
 
     def test_invert_forward_mapping_is_first_wins(self):
         assert invert_forward_mapping(self._MANY_TO_ONE) == {"Person_1": "Alice"}
-
-    def test_session_tier_reverse_agrees_with_shared_helper(self):
-        _forward, reverse = _build_anonymization_mapping(dict(self._MANY_TO_ONE), speaker_name=None)
-        assert reverse == invert_forward_mapping(self._MANY_TO_ONE) == {"Person_1": "Alice"}
-
-    def test_graph_tier_uses_the_same_shared_helper(self):
-        """The graph tier's cloud round trip uses EXACTLY the reverse table
-        :func:`_build_anonymization_mapping` produced — not a
-        re-derivation — proven by round-tripping a placeholder through
-        ``request_graph_enrichment`` and confirming it resolves to the
-        SAME first-wins real name the shared helper picked.
-        """
-        from unittest.mock import patch
-
-        from paramem.cloud.anonymize import AnonymizedContract
-        from paramem.graph.extractor import request_graph_enrichment
-        from paramem.graph.schema import SessionGraph
-
-        forward, reverse = _build_anonymization_mapping(dict(self._MANY_TO_ONE), speaker_name=None)
-        assert reverse == {"Person_1": "Alice"}
-        # Realistic shape: Cloud can only propose a relation naming a
-        # placeholder it was actually SHOWN — ``request_graph_enrichment``
-        # derives the anonymized triples directly from ``payload.facts`` +
-        # ``payload.forward`` via ``insert_placeholders``.
-        triples = [
-            {
-                "subject": "Alice",
-                "predicate": "knows",
-                "object": "acme",
-                "relation_type": "factual",
-                "speaker_id": "",
-            }
-        ]
-        payload = AnonymizedContract(
-            status="ok",
-            forward=forward,
-            reverse=reverse,
-            anon_transcript="",
-            declared=frozenset(reverse.keys()),
-            norm_stats={"inverted": 0, "dropped": 0},
-            rekey_dropped=0,
-            raw="",
-            facts=triples,
-        )
-        graph = SessionGraph(session_id="t", timestamp="", entities=[], relations=[])
-        canned_raw = (
-            '{"relations": [{"subject": "Person_1", "predicate": "knows", '
-            '"object": "Person_1", "relation_type": "social", "confidence": 0.9}], '
-            '"same_as": []}'
-        )
-        with patch("paramem.graph.extractor._cloud_call", return_value=canned_raw):
-            result = request_graph_enrichment(
-                payload=payload,
-                graph=graph,
-                api_key="test-key",
-                provider="anthropic",
-                filter_model="claude-sonnet-4-6",
-            )
-
-        assert result is not None
-        new_rels, _same_as, _raw, _verdict = result
-        assert len(new_rels) == 1
-        assert new_rels[0]["subject"] == "Alice"
-        assert new_rels[0]["object"] == "Alice"
-
-    def test_graph_tier_hostile_speaker_value_hint_never_reaches_reverse(self):
-        """The graph-tier twin of :class:`TestSpeakerAnchorReverseSkip` (above) —
-        a hostile LLM hint scrubbing a real name onto the speaker anchor
-        must never produce a ``speaker0``-keyed reverse entry reachable
-        from the graph tier.  Since the graph tier's ONLY route to a
-        reverse map is the caller-supplied ``payload.reverse`` (built by
-        :func:`_build_anonymization_mapping`, whose speaker-value guard
-        already dropped ``speaker0`` — see :class:`TestSpeakerAnchorReverseSkip`),
-        there is no code path left in ``request_graph_enrichment`` that
-        could reintroduce it.
-        """
-        forward, reverse = _build_anonymization_mapping({"RealName": "speaker0"}, speaker_name=None)
-        assert "speaker0" not in reverse
-        assert forward.get("RealName") == "speaker0"
 
 
 class TestUnbraced:

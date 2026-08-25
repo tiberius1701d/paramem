@@ -1,10 +1,16 @@
-"""Empirical calibration tool for the cloud_anonymizer contract test.
+"""Empirical calibration tool for the local cloud-egress anonymizer
+(``paramem.graph.flows.anonymize_turn``, the span-tagger SCAN + local
+ANCHOR chain — placeholder substitution is deterministic string
+replacement, not a local model call).
 
-``tests/test_cloud_anonymizer_contract_gpu.py`` ships with
-``_MATCH_THRESHOLD = 0.6`` as an initial guess.  Run this script against
-a real GPU + model to measure the actual Mistral 7B baseline on the
-shipped fixture, eyeball failure-mode distribution, and recommend a
-calibrated threshold.
+Owns its own fixture and threshold (2026-08-24): the prior CI contract
+test this script shared them with, ``tests/test_cloud_anonymizer_contract_gpu.py``,
+was retired by the anonymizer-split design — the fixed-threshold CI gate
+it enforced is superseded by a post-implementation GPU validation ladder
+run separately against real traffic. This script keeps its calibration
+role standalone: run it against a real GPU + model to measure the
+current baseline on the shipped fixture and eyeball the failure-mode
+distribution.
 
 Mirrors the calibration pattern of
 ``tests/test_plausibility_contract_gpu.py`` (75% measured baseline).
@@ -52,8 +58,11 @@ Outcome classification per query:
                        in the anonymizer prompt.
 
 The script does NOT update ``_MATCH_THRESHOLD`` automatically.
-Eyeball the report and update the test docstring + threshold by
-hand to keep the calibration decision auditable.
+Eyeball the report — there is no longer a CI contract test to update in
+lockstep; a re-measured baseline is applied by hand once the live
+calibration gate (against ``tests/fixtures/anonymizer_gate.json``, the
+labelled fixture this script and the span-tagger SCAN step's live gate
+share) reports a new one.
 """
 
 from __future__ import annotations
@@ -67,18 +76,69 @@ import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-# Re-use the contract test's fixture and threshold as the single source
-# of truth — calibration and CI must agree on the bar they're measuring
-# against, otherwise the calibrator's "currently shipped" line drifts
-# from reality after every threshold bump.
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tests"))
-try:
-    from test_cloud_anonymizer_contract_gpu import _FIXTURE, _MATCH_THRESHOLD  # noqa: E402
-except ImportError as e:
-    raise SystemExit(
-        f"could not import _FIXTURE / _MATCH_THRESHOLD from "
-        f"tests/test_cloud_anonymizer_contract_gpu.py: {e}"
-    )
+from paramem.config.taxonomy import ScrubCategory, resolve_scrub_categories
+
+# Ensure repo-relative paths resolve the same way regardless of the
+# caller's cwd — mirrors the ``_REPO_ROOT`` pattern used by every other
+# ``scripts/dev/*.py`` calibration tool (e.g. ``calibrate_prompts.py``).
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+# Reference floor only (2026-08-24) — threshold re-derived from the live
+# labelled calibration gate against the fixture below once the
+# span-tagger SCAN step is running; kept at the prior conservative value
+# until that gate measures a new one.
+_MATCH_THRESHOLD = 0.80
+
+# Tracked, fictional calibration corpus shared with the span-tagger's own
+# live threshold-measurement gate — single-turn and multi-turn
+# transcripts, the production input shape ``answer_via_cloud``
+# (``paramem.server.inference``) passes to ``anonymize_turn`` (the
+# cloud-egress entry point anonymizes only the current-turn text;
+# conversation history flows separately through ``_sanitize_history``).
+_FIXTURE_PATH = _REPO_ROOT / "tests" / "fixtures" / "anonymizer_gate.json"
+
+
+def _load_fixture(path: Path = _FIXTURE_PATH) -> list[dict]:
+    """Load the shared calibration corpus and project it to the shape
+    ``_run_one``/``main`` consume.
+
+    Reads ``tests/fixtures/anonymizer_gate.json`` — a tracked, fictional
+    payload set (single- and multi-turn transcripts, dense contact lists,
+    a long planted-value document, a case-variant and a German-inflection
+    probe) that also backs the span-tagger live calibration gate. Only
+    payloads carrying a ``transcript`` field apply here — this script's
+    ``anonymize_turn`` round-trip only takes bare transcript text, so the
+    JSON's one ``facts``-kind payload (which exercises the separate
+    ``/calibrate/anonymize_facts`` door) is skipped. Each returned entry
+    carries exactly the fields ``_run_one`` reads: ``id``, ``speaker_id``,
+    ``speaker_name``, ``transcript``, and ``expected_names`` — the
+    payload's ``expected.person`` list, the one category this script's
+    privacy-contract check scores (the query text's own scrub scope may
+    include phone/email/address/profile values too, but the round-trip
+    check here has always been name-scoped).
+    """
+    with path.open(encoding="utf-8") as f:
+        doc = json.load(f)
+    entries = []
+    for entry in doc["payloads"]:
+        if "transcript" not in entry:
+            continue
+        entries.append(
+            {
+                "id": entry["id"],
+                "speaker_id": entry["speaker_id"],
+                "speaker_name": entry["speaker_name"],
+                "transcript": entry["transcript"],
+                "expected_names": list(entry["expected"].get("person", [])),
+            }
+        )
+    return entries
+
+
+# ``token_envelope`` — the total (prompt + output) token budget one
+# ``anonymize_turn`` call may occupy; matches the shipped operator
+# default (``consolidation.extraction_anonymize_token_envelope``).
+_TOKEN_ENVELOPE = 8192
 
 
 def _normalise(text: str) -> str:
@@ -130,30 +190,43 @@ def _run_one(
     model,
     tokenizer,
     *,
+    speaker_id: str,
     speaker_name: str,
-    scrub: set[str],
+    scrub_categories: tuple[ScrubCategory, ...],
+    token_envelope: int = _TOKEN_ENVELOPE,
 ) -> tuple[str, dict, str]:
     from paramem.cloud.deanonymize import CloudScope, deanonymize_text
+    from paramem.cloud.placeholders import _substitute_whole_words
     from paramem.graph.flows import anonymize_turn
 
     payload = anonymize_turn(
         transcript,
         model,
         tokenizer,
+        speaker_id=speaker_id,
         speaker_name=speaker_name,
-        scrub=scrub,
+        categories=scrub_categories,
+        token_envelope=token_envelope,
     )
     if payload.status != "ok":
-        # Covers both "failed" (fail-closed) and "opted_out" (scrub=set())
-        # — neither has anything to round-trip.  Note this also fixes a
-        # latent truthiness bug the old ``if not mapping or not anon_text``
-        # check had: a legitimate "ran, found nothing in scope" verdict
-        # (status == "ok", forward == {}) is no longer misclassified as a
-        # failure — CLAUDE.md forbids truthiness checks on registries.
-        return payload.anon_transcript or "", dict(payload.forward), ""
-    scope = CloudScope.response(payload, cloud_bindings=None, sent=(payload.anon_transcript,))
-    round_trip = deanonymize_text(scope, payload.anon_transcript)
-    return payload.anon_transcript, dict(payload.forward), round_trip or ""
+        # Covers both "failed" (fail-closed) and "opted_out"
+        # (categories=()) — neither has anything to round-trip.  Note this
+        # also fixes a latent truthiness bug the old
+        # ``if not mapping or not anon_text`` check had: a legitimate "ran,
+        # found nothing in scope" verdict (status == "ok", forward == {})
+        # is no longer misclassified as a failure — CLAUDE.md forbids
+        # truthiness checks on registries.
+        return "", dict(payload.forward), ""
+    # Derived the same way production's chat-egress path derives it
+    # (``paramem.server.inference.answer_via_cloud``): whole-word
+    # substitution of the bare turn text against ``payload.forward``, not
+    # ``payload.anon_transcript`` — that field stays marker-bearing on
+    # this call, since the marker strip lives only in the session-tier
+    # transcript path.
+    anon_text = _substitute_whole_words(transcript, payload.forward)
+    scope = CloudScope.response(payload, cloud_bindings=None, sent=(anon_text,))
+    round_trip = deanonymize_text(scope, anon_text)
+    return anon_text, dict(payload.forward), round_trip or ""
 
 
 def _print_summary(results: list[QueryResult], total_personal: int) -> tuple[int, float]:
@@ -295,30 +368,43 @@ def main(argv: list[str] | None = None) -> int:
 
     # Resolve the scrub scope.  CLI override wins; otherwise inherit from
     # the fixture so the calibration result reflects the contract test's
-    # default scope unless explicitly varied.
+    # default scope unless explicitly varied.  Hints resolve to the
+    # ``ScrubCategory`` tuple ``anonymize_turn`` actually takes
+    # (``categories=``) via the same
+    # ``paramem.config.taxonomy.resolve_scrub_categories`` production
+    # reads off ``SanitizationConfig``.
     if args.scope is None:
-        scope = set(server_cfg.sanitization.scrub)
+        # Already resolved by SanitizationConfig.__post_init__ at
+        # ``server_cfg`` load time — reuse it rather than re-running
+        # resolve_scrub_categories over a re-sorted set, which would
+        # alphabetise the operator's configured order.
+        scrub_categories = server_cfg.sanitization.scrub_categories
+        print(f"  scope: {[c.name for c in scrub_categories] or '[]  (anonymization disabled)'}")
     else:
-        scope = set(args.scope)
-    print(f"  scope: {sorted(scope) or '[]  (anonymization disabled)'}")
+        scrub_categories = resolve_scrub_categories(args.scope)
+        print(f"  scope: {args.scope or '[]  (anonymization disabled)'}")
 
     if args.query is not None:
         # Ad-hoc input: wrap as a single-turn transcript so the helper
-        # gets the production input shape.  Caller intent is "treat
-        # this as one [user] turn".  Synthesize a speaker_name so the
-        # extraction prompt's {SPEAKER_NAME} slot resolves cleanly --
+        # gets the production input shape.  Bare text, same as every
+        # fixture entry — ``anonymize_turn`` is the one marker
+        # producer (it renders the turn through
+        # ``turn_markers.format_turn`` itself); a hand-built ``[user]``
+        # prefix here would double-mark it.  Synthesize a speaker_name so
+        # the extraction prompt's {SPEAKER_NAME} slot resolves cleanly --
         # production always has a real speaker by the time cloud
         # egress runs (greeting flow).
         entries = [
             {
                 "id": "ad-hoc",
+                "speaker_id": "speaker0",
                 "speaker_name": "Anna",
-                "transcript": f"[user] {args.query}",
+                "transcript": args.query,
                 "expected_names": [],
             }
         ]
     else:
-        entries = list(_FIXTURE)
+        entries = _load_fixture()
 
     results: list[QueryResult] = []
     for entry in entries:
@@ -329,8 +415,9 @@ def main(argv: list[str] | None = None) -> int:
                 entry["expected_names"],
                 model,
                 tokenizer,
+                speaker_id=entry["speaker_id"],
                 speaker_name=entry["speaker_name"],
-                scrub=scope,
+                scrub_categories=scrub_categories,
             )
             outcome = _classify(
                 expected_names=entry["expected_names"],

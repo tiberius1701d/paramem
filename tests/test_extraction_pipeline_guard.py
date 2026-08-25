@@ -20,6 +20,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from paramem.config.taxonomy import resolve_scrub_categories
 from paramem.memory.store import MemoryStore as _MS
 from paramem.utils.artifacts import on_session_extracted
 from tests._guard_utils import enters_context_manager, tracked_python_files
@@ -138,7 +139,7 @@ def _make_pipeline(model=None, tokenizer=None, **config_overrides):
     """
     from paramem.graph.extraction_pipeline import ExtractionConfig, ExtractionPipeline
 
-    config_overrides.setdefault("scrub", {"person name"})
+    config_overrides.setdefault("scrub_categories", resolve_scrub_categories(["person name"]))
     return ExtractionPipeline(
         model=model if model is not None else _peft_model_mock(),
         tokenizer=tokenizer if tokenizer is not None else MagicMock(),
@@ -184,7 +185,7 @@ def test_kwargs_emits_model_alias():
     pipeline = ExtractionPipeline(
         model=MagicMock(),
         tokenizer=MagicMock(),
-        config=ExtractionConfig(scrub={"person name"}),
+        config=ExtractionConfig(scrub_categories=resolve_scrub_categories(["person name"])),
         model_name="qwen3-4b",
     )
     kw = pipeline.kwargs(source_type="transcript", speaker_id="speaker0")
@@ -195,7 +196,7 @@ def test_kwargs_emits_model_alias():
     pipeline_base = ExtractionPipeline(
         model=MagicMock(),
         tokenizer=MagicMock(),
-        config=ExtractionConfig(scrub={"person name"}),
+        config=ExtractionConfig(scrub_categories=resolve_scrub_categories(["person name"])),
     )
     kw_base = pipeline_base.kwargs(source_type="transcript", speaker_id="speaker0")
     assert kw_base["model_alias"] is None
@@ -571,6 +572,7 @@ def test_consolidation_loop_constructor_threads_extraction_flags(tmp_path):
     """
     from peft import PeftModel
 
+    from paramem.config.taxonomy import resolve_scrub_categories
     from paramem.training.consolidation import ConsolidationLoop
     from paramem.utils.config import AdapterConfig, ConsolidationConfig, TrainingConfig
 
@@ -582,7 +584,7 @@ def test_consolidation_loop_constructor_threads_extraction_flags(tmp_path):
         "extraction_enrichment_provider_endpoint": "http://custom:8080/v1",
         "extraction_plausibility_judge": "off",
         "extraction_plausibility_stage": "anon",
-        "extraction_scrub": {"email address"},
+        "extraction_scrub_categories": resolve_scrub_categories(["email address"]),
     }
 
     # Skip adapter wiring — we only care about flag storage on
@@ -629,6 +631,7 @@ def test_consolidation_loop_threads_model_name_to_extraction_pipeline(tmp_path):
     """
     from peft import PeftModel
 
+    from paramem.config.taxonomy import resolve_scrub_categories
     from paramem.training.consolidation import ConsolidationLoop
     from paramem.utils.config import AdapterConfig, ConsolidationConfig, TrainingConfig
 
@@ -649,7 +652,7 @@ def test_consolidation_loop_threads_model_name_to_extraction_pipeline(tmp_path):
         memory_store=_MS(),
         output_dir=tmp_path,
         model_name="qwen3-4b",
-        extraction_scrub={"person name"},
+        extraction_scrub_categories=resolve_scrub_categories(["person name"]),
         extraction_max_tokens=8192,
         extraction_plausibility_max_tokens=8192,
         extraction_anonymize_token_envelope=8192,
@@ -830,7 +833,7 @@ def test_kwargs_honors_prompts_dir_override():
     pipeline = ExtractionPipeline(
         model=MagicMock(),
         tokenizer=MagicMock(),
-        config=ExtractionConfig(scrub={"person name"}),
+        config=ExtractionConfig(scrub_categories=resolve_scrub_categories(["person name"])),
         prompts_dir="configs/prompts",
     )
 
@@ -932,6 +935,7 @@ def _build_loop_with_session_dump(tmp_path, monkeypatch, *, fake_graph):
     """
     from peft import PeftModel
 
+    from paramem.config.taxonomy import resolve_scrub_categories
     from paramem.training.consolidation import ConsolidationLoop
     from paramem.utils.config import AdapterConfig, ConsolidationConfig, TrainingConfig
 
@@ -962,7 +966,7 @@ def _build_loop_with_session_dump(tmp_path, monkeypatch, *, fake_graph):
         output_dir=tmp_path,
         save_cycle_snapshots=True,
         snapshot_dir=tmp_path,
-        extraction_scrub={"person name"},
+        extraction_scrub_categories=resolve_scrub_categories(["person name"]),
         extraction_max_tokens=8192,
         extraction_plausibility_max_tokens=8192,
         extraction_anonymize_token_envelope=8192,

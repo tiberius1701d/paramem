@@ -1,137 +1,39 @@
-Identify every value in the extracted personal facts and transcript that is an instance of one of the listed PII categories, decide a type-prefixed placeholder for each, and rewrite the transcript with those values replaced. The facts point you at CANDIDATE values — they do not enumerate the mapping: typically only a minority of fact values is an instance of a listed category, and a value with no listed category gets NO placeholder and NO mapping entry. Return BOTH a `real_value → placeholder` mapping AND the rewritten `anonymized_transcript` as a JSON array of turn strings, one element per turn — no other keys.
+# Sectioned prompt home for local anonymization. Every render is the SAME
+# two sections below, regardless of the configured scrub categories —
+# `sanitization.scrub` selects nothing in this file; the category label
+# union it drives lives in the span tagger's model vocabulary, not here.
+# The local model keeps exactly one anonymizer duty: deciding which tagged
+# value, if any, the speaker introduced as their own name. Sections are
+# composed by paramem.graph.anonymizer_prompts and parsed via the `===`
+# sentinel format (paramem/graph/prompts.py::_load_prompt_sections).
 
-## Scope
+=== ANCHOR-SYSTEM ===
+You decide which of the given values, if any, the speaker introduced as their own name. Output valid JSON only.
 
-Categories to scrub: {scrub_categories}
+=== ANCHOR ===
+`{speaker_id}` is this session's own speaker anchor — the anonymous handle for the person speaking as `[user]` in the transcript below.
 
-Placeholder a value ONLY if it is an instance of one of these categories. Everything else — city, organization, product, or any category not listed — stays verbatim, even if it is a proper noun or an identifying name of some kind.
+Below is a list of values that were flagged for anonymization. Decide which of these values, if any, the `[user]` introduces as THEIR OWN name — a self-introduction such as "I'm Priya", "my name is Priya", "call me Priya". Every spelling the `[user]` uses to introduce themselves folds onto the SAME anchor — if they say both "Priya" and "Priya Sharma" as self-introductions, list both. A value belonging to someone else — a friend, colleague, or anyone the `[user]` talks ABOUT rather than introduces as themselves — is NOT self-introduced, no matter what any other fact claims about them.
 
-Doubt can come from two different questions. They are not the same question, and they resolve in opposite directions:
-- **Membership: is this category listed above at all?** A lookup, not a judgment — e.g. checking whether "city" appears in the category list. When THIS is what you're unsure about, leave the value verbatim.
-- **Instance: the category IS listed — is this particular value really an instance of it?** e.g. "phone number" is listed — is `+49 151 2345` a phone number or an order reference? When THIS is what you're unsure about, placeholder the value. Over-scrubbing here costs nothing lasting — it becomes an opaque token restored locally when the reply comes back. Under-scrubbing sends real PII to the cloud, and that can never be undone.
+Values: {values}
 
-## Placeholder shape contract
+Transcript:
+{text}
 
-Each placeholder is `<Prefix>_<N>` where:
-- `Prefix` is a PascalCase noun naming the value's category, and that category MUST be one of the listed scrub categories. Common prefixes are `Person`, `Phone`, `Email`, `Address`, `Profile`; use another PascalCase prefix only when a LISTED category needs one. If the truthful prefix for a value would name a category that is NOT listed (a date word, a project, an event, an animal, a city, a job, ...), that value is out of scope: leave it verbatim and add NO mapping entry. There is no catch-all prefix — being out of scope means NO entry at all, never a made-up prefix.
-- `N` is a positive integer. Allocate the smallest free index per prefix in order of first appearance (`Person_1` before `Person_2`).
-- Each real value must map to a UNIQUE placeholder. No two real values share the same placeholder.
+POSITIVE — self-introduction in the transcript:
+Values: ["Priya"]
+Transcript: "[user] Hi, I'm Priya."
+Output: {{"self_introduced": ["Priya"]}}
 
-## Rules
+POSITIVE — NO self-introduction, the name belongs to someone else:
+Values: ["Mira"]
+Transcript: "[user] Mira, my friend, moved away for a new job."
+Output: {{"self_introduced": []}}
+Note: the `[user]` never says "I'm Mira" — Mira is the speaker's friend, not the speaker.
 
-- **`speaker{{N}}` (e.g. `speaker0`) is already anonymous — leave it VERBATIM wherever it already appears.** NEVER add a `speaker{{N}} → Person_N` entry to `mapping`.
-- **Totality:** once you HAVE decided a value is in scope, you MUST add its `real_value → placeholder` entry to `mapping` in the same response — every placeholder decision you make must be backed by a mapping entry, with no exceptions.
-- Mapping direction is `real_value → placeholder`: the real value is the JSON KEY, the placeholder is the JSON VALUE.
-- Use the SAME placeholder for every occurrence of a value across the facts, the transcript, and your `anonymized_transcript` output.
-- The facts and transcript below are the material to work from. Common nouns are NEVER added to the mapping, even if the extractor capitalised them. "Dog", "Partner", "Friend", "Assistant", "User" are common nouns — they are never PII regardless of scope.
-- Numeric values, dates, and currencies that do not belong to one of the listed categories stay verbatim. A phone number IS in scope when "phone number" is listed — mint a placeholder for it like any other in-scope value.
-- **`anonymized_transcript` is a JSON array of turn strings, one element per turn, in the same order as the input, each a faithful rewrite of that turn changing ONLY the values you placeholdered.** Keep every `[user]`/`[assistant]` marker with its turn. Wording, punctuation, and structure everywhere else must be identical to the original. Do not summarize, paraphrase, drop, merge turns, or add content beyond the substitutions.
-{speaker_anchor_section}
-## Examples
+POSITIVE — two self-naming surface forms, both self-introduced:
+Values: ["Priya Sharma", "Priya"]
+Transcript: "[user] Hi, I'm Priya Sharma. [assistant] Nice to meet you. [user] You can just call me Priya."
+Output: {{"self_introduced": ["Priya Sharma", "Priya"]}}
 
-POSITIVE — multi-fact input, exactly ONE value in scope (the ordinary case):
-scrub categories: person name
-facts: [{{"subject": "speaker0", "predicate": "plans_to_meet", "object": "Chris", "relation_type": "factual", "confidence": 0.9}}, {{"subject": "speaker0", "predicate": "meeting_time", "object": "tomorrow", "relation_type": "factual", "confidence": 0.8}}, {{"subject": "Chris", "predicate": "works_on", "object": "budget_review", "relation_type": "factual", "confidence": 0.9}}]
-Transcript: "[user] Should I check with Chris tomorrow about the budget review deadline?"
-Output:
-{{"mapping": {{"Chris": "Person_1"}}, "anonymized_transcript": ["[user] Should I check with Person_1 tomorrow about the budget review deadline?"]}}
-Note: three facts, six subject/object values — but only "Chris" is an instance of a listed category. `speaker0` stays verbatim, "tomorrow" is a date word, `budget_review` is a work item; "date" and "project" are not listed categories, so none of them enters the mapping and all stay verbatim in the transcript.
-
-POSITIVE — in-scope name substituted, out-of-scope place left verbatim (membership doubt — resolves to verbatim):
-scrub categories: person name
-facts: [{{"subject": "Alice", "predicate": "lives_in", "object": "Berlin", "relation_type": "factual", "confidence": 1.0}}]
-Transcript: "[user] My friend Alice lives in Berlin. [assistant] Got it."
-Output:
-{{"mapping": {{"Alice": "Person_1"}}, "anonymized_transcript": ["[user] My friend Person_1 lives in Berlin. [assistant] Got it."]}}
-Note: "Berlin" fails the MEMBERSHIP question — "city" is not a listed category at all — not the instance question. It stays verbatim.
-
-POSITIVE — instance-ambiguous value in a listed category, placeholdered on doubt (instance doubt — resolves to placeholder):
-scrub categories: physical address
-facts: [{{"subject": "Rowan", "predicate": "mentioned", "object": "Lindenstraße 44", "relation_type": "factual", "confidence": 1.0}}]
-Transcript: "[user] The label just said Lindenstraße 44, I couldn't tell if that was their home address or the name of the shop."
-Output:
-{{"mapping": {{"Lindenstraße 44": "Address_1"}}, "anonymized_transcript": ["[user] The label just said Address_1, I couldn't tell if that was their home address or the name of the shop."]}}
-Note: "physical address" IS listed, and the value is address-SHAPED even though the transcript voices doubt about what it refers to — that is instance doubt, not membership doubt, so it resolves to a placeholder. ("Rowan" stays verbatim here since "person name" is not in this example's scrub list.)
-
-POSITIVE — phone number:
-scrub categories: person name, phone number
-facts: [{{"subject": "Jordan", "predicate": "has_phone", "object": "+49 151 2345678", "relation_type": "factual", "confidence": 1.0}}]
-Transcript: "[user] Jordan's number is +49 151 2345678."
-Output:
-{{"mapping": {{"Jordan": "Person_1", "+49 151 2345678": "Phone_1"}}, "anonymized_transcript": ["[user] Person_1's number is Phone_1."]}}
-
-POSITIVE — name and email in the same pass:
-scrub categories: person name, email address
-facts: [{{"subject": "Dana", "predicate": "has_email", "object": "dana@example.com", "relation_type": "factual", "confidence": 1.0}}]
-Transcript: "[user] My colleague Dana's email is dana@example.com."
-Output:
-{{"mapping": {{"Dana": "Person_1", "dana@example.com": "Email_1"}}, "anonymized_transcript": ["[user] My colleague Person_1's email is Email_1."]}}
-
-POSITIVE — common noun stays verbatim:
-scrub categories: person name
-facts: [{{"subject": "Pat", "predicate": "noticed", "object": "Dog", "relation_type": "factual", "confidence": 1.0}}]
-Transcript: "[user] My partner Pat noticed our dog was sick last week."
-Output:
-{{"mapping": {{"Pat": "Person_1"}}, "anonymized_transcript": ["[user] My partner Person_1 noticed our dog was sick last week."]}}
-Note: "Dog" appears in the fact, but the transcript context ("our dog") makes clear it is a common noun, and it is not one of the listed categories either way. Pat is anonymized; "Dog" does NOT appear in the mapping.
-
-POSITIVE — multi-turn transcript, one array element per turn:
-scrub categories: person name
-facts: [{{"subject": "Riley", "predicate": "works_with", "object": "Sam", "relation_type": "factual", "confidence": 1.0}}]
-Transcript: "[user] My colleague Riley mentioned Sam is joining the project. [assistant] Got it, I'll remember that. [user] Sam starts on Monday."
-Output:
-{{"mapping": {{"Riley": "Person_1", "Sam": "Person_2"}}, "anonymized_transcript": ["[user] My colleague Person_1 mentioned Person_2 is joining the project.", "[assistant] Got it, I'll remember that.", "[user] Person_2 starts on Monday."]}}
-Note: the transcript has three turns, so `anonymized_transcript` has three array elements in the same order, each carrying its own `[user]`/`[assistant]` marker. Turns are never merged into one element or split across extra ones.
-
-NEGATIVE — out-of-scope category over-scrubbed:
-scrub categories: person name
-facts: [{{"subject": "Charlie", "predicate": "works_at", "object": "Siemens", "relation_type": "factual", "confidence": 1.0}}]
-Transcript: "[user] I work at Siemens in the R&D group."
-WRONG: minting a placeholder for "Siemens" and substituting it into `anonymized_transcript`.
-"Siemens" is an organization, not one of the listed categories — placeholdering it over-scrubs. The same applies to products, cities, or any other category you were not told to scrub.
-RIGHT: {{"mapping": {{"Charlie": "Person_1"}}, "anonymized_transcript": ["[user] I work at Siemens in the R&D group."]}}
-
-POSITIVE — every fact endpoint except the person stays verbatim:
-scrub categories: person name
-facts: [{{"subject": "Noor", "predicate": "organizes", "object": "workshop", "relation_type": "factual", "confidence": 0.9}}, {{"subject": "Noor", "predicate": "has_pet", "object": "dog", "relation_type": "factual", "confidence": 0.9}}, {{"subject": "Noor", "predicate": "lives_in", "object": "Hamburg", "relation_type": "factual", "confidence": 0.9}}]
-Transcript: "[user] Will Noor from Hamburg bring her dog to the workshop on Friday?"
-Output:
-{{"mapping": {{"Noor": "Person_1"}}, "anonymized_transcript": ["[user] Will Person_1 from Hamburg bring her dog to the workshop on Friday?"]}}
-Note: "workshop" and "dog" are common nouns, "Friday" is a date word, "Hamburg" is a city — none of their categories is listed, so all four stay verbatim with no mapping entry, even though the facts mention every one of them. A fact's `subject`/`object` values are candidates to CHECK against the listed categories — never automatic mapping entries.
-
-NEGATIVE — mapping direction reversed:
-WRONG: {{"mapping": {{"Person_1": "Alice"}}}}
-RIGHT: {{"mapping": {{"Alice": "Person_1"}}}}
-The real value is the KEY; the placeholder is the VALUE.
-
-NEGATIVE — incomplete mapping (a decided-on value omitted):
-scrub categories: person name, phone number
-facts: [{{"subject": "Honda", "predicate": "has_phone", "object": "+1 555 0100", "relation_type": "factual", "confidence": 1.0}}]
-Transcript: "[user] Their sales line is +1 555 0100, and my number is +1 555 0199."
-WRONG: {{"mapping": {{"+1 555 0100": "Phone_1"}}, "anonymized_transcript": ["[user] Their sales line is Phone_1, and my number is +1 555 0199."]}}
-"+1 555 0199" is also an in-scope phone number — deciding to anonymize the first number but leaving the second unmapped is incomplete. Every value you decide to anonymize gets an entry, not just some of them.
-RIGHT: {{"mapping": {{"+1 555 0100": "Phone_1", "+1 555 0199": "Phone_2"}}, "anonymized_transcript": ["[user] Their sales line is Phone_1, and my number is Phone_2."]}}
-
-NEGATIVE — duplicate placeholder for two distinct values (uniqueness violation):
-WRONG: {{"mapping": {{"Alice": "Person_1", "Pat": "Person_1"}}}}
-Each real value must map to a unique placeholder. Allocate `Pat → Person_2`, not a duplicate of `Person_1`.
-
-NEGATIVE — self-mapped placeholder (key is a placeholder shape):
-WRONG: {{"mapping": {{"Person_1": "Person_1"}}}}
-Every mapping KEY must be a real value copied verbatim from the input facts or transcript. Never use a placeholder shape (`<Prefix>_<N>`) as a KEY. A self-mapped entry is kept as-is at canonicalisation (it is not dropped), but it is a useless no-op: it never captures the real value you meant to anonymize, so that value is never actually scrubbed.
-
-NEGATIVE — transcript rewritten beyond the substitutions:
-Given a transcript "[user] My friend Alice lives in Berlin, she's great." with only "person name" in scope:
-WRONG: {{"mapping": {{"Alice": "Person_1"}}, "anonymized_transcript": ["[user] My friend Person_1 lives in Berlin."]}}
-Dropping "she's great." is not a substitution — it is content loss. `anonymized_transcript` must preserve everything except the listed substitutions.
-RIGHT: {{"mapping": {{"Alice": "Person_1"}}, "anonymized_transcript": ["[user] My friend Person_1 lives in Berlin, she's great."]}}
-
-Extracted facts (candidate values — most are usually OUT of scope; map ONLY the values that are instances of a listed category):
-{facts_json}
-
-Conversation transcript (rewrite it into `anonymized_transcript` as an array of one string per turn, changing only the in-scope values):
-{transcript}
-
-Final check — apply to EVERY mapping entry before returning: say which LISTED scrub category the entry's value instantiates. If you cannot name a listed category for it, DELETE the entry and keep its value verbatim in the transcript.
-
-Return JSON only with exactly the keys `mapping` and `anonymized_transcript` (a JSON array of turn strings). No prose, no markdown, no extra keys.
+Return JSON only with exactly the key "self_introduced" (a JSON array of strings, a subset of the listed values). No prose, no markdown, no extra keys.

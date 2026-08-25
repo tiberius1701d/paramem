@@ -23,7 +23,7 @@ from paramem.graph.extractor import (
     DEFAULT_PROCEDURAL_USER_PROMPT_FILENAME,
     load_extraction_prompts,
 )
-from paramem.graph.prompts import _DEFAULT_PROMPT_DIR, _load_prompt  # was load_anonymization_prompt
+from paramem.graph.prompts import _DEFAULT_PROMPT_DIR, _load_prompt
 
 # Matches single-brace placeholders like {transcript} that are NOT part of
 # a double-brace escape ({{ or }}).  After a successful .format() call all
@@ -35,10 +35,10 @@ _LEFTOVER_PLACEHOLDER = re.compile(r"(?<!\{)\{[A-Za-z_]+\}(?!\})")
 # model recognises it as a substitution target rather than a literal name.
 # It is produced by writing ``{{SPEAKER_NAME}}`` in the prompt source.
 #
-# `{N}` appears literally in anonymization.txt: it documents the
-# placeholder shape (`<Prefix>_<N>`) and the `speaker{N}` id pattern —
-# both produced by writing ``{{N}}`` in the prompt source, same mechanism
-# as `{SPEAKER_NAME}` above.
+# `{N}` appears literally in several prompt files (e.g. cloud_plausibility.txt,
+# cloud_graph_enrichment.txt): it documents an indexed placeholder pattern —
+# produced by writing ``{{N}}`` in the prompt source, same mechanism as
+# `{SPEAKER_NAME}` above.
 _INTENTIONAL_LITERALS = {"{SPEAKER_NAME}", "{N}"}
 
 
@@ -347,38 +347,6 @@ class TestDocumentContextSlotAllVariants:
             del kwargs["document_context"]
             with pytest.raises(KeyError):
                 tmpl.format(**kwargs)
-
-
-class TestAnonymizationPromptRender:
-    """anonymization.txt renders with a rendered {scrub_categories} slot —
-    the config-driven ``sanitization.scrub`` scope authority."""
-
-    def _render(self):
-        tmpl = _load_prompt("anonymization.txt")
-        return tmpl.format(
-            scrub_categories="person name, email address, phone number",
-            facts_json="[]",
-            transcript="sample",
-            speaker_id="speaker0",
-            speaker_anchor_section="",
-        )
-
-    def test_renders_without_exception(self):
-        rendered = self._render()
-        assert isinstance(rendered, str)
-
-    def test_no_leftover_placeholders(self):
-        rendered = self._render()
-        leftover = [
-            m for m in _LEFTOVER_PLACEHOLDER.findall(rendered) if m not in _INTENTIONAL_LITERALS
-        ]
-        assert leftover == [], f"Leftover placeholders after render: {leftover}"
-
-    def test_scrub_categories_reach_rendered_output(self):
-        """A non-default scrub value must actually reach the prompt — the
-        guard against re-introducing a dead config knob."""
-        rendered = self._render()
-        assert "person name, email address, phone number" in rendered
 
 
 class TestPredicateNormalizationPromptRender:

@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Callable, Literal, Optional, Sequence
 from torch.utils.data import Dataset
 
 from paramem.cloud.admission import evaluate_cloud_egress
-from paramem.config.taxonomy import fallback_relation_type, relation_types
+from paramem.config.taxonomy import ScrubCategory, fallback_relation_type, relation_types
 from paramem.graph.extraction_pipeline import ExtractionConfig, ExtractionPipeline
 from paramem.graph.extractor import ExtractionFailed, local_parse_failure
 from paramem.graph.merger import GraphMerger, attribute_fact, min_nonempty, node_display
@@ -695,7 +695,7 @@ class ConsolidationLoop:
         extraction_plausibility_stage: str = "deanon",
         extraction_plausibility_model: str = "claude-sonnet-4-6",
         extraction_plausibility_endpoint: str | None = None,
-        extraction_scrub: set[str] | frozenset[str],
+        extraction_scrub_categories: tuple[ScrubCategory, ...],
         extraction_correction_entity_types: set[str] | frozenset[str] | None = None,
         graph_config: Optional[GraphConfig] = None,
         cloud_enabled: bool = False,
@@ -786,15 +786,16 @@ class ConsolidationLoop:
         # extractors through ``self.extraction.run`` / ``run_procedural`` —
         # no direct ``extract_graph(...)`` calls in this module.
         #
-        # Cloud egress PII anonymization scope (``extraction_scrub``) is
-        # sourced at the bootstrap call site from
-        # ``ServerConfig.sanitization.scrub`` so consolidation honours the
-        # same operator policy as inference-time cloud egress.  Required —
-        # no implicit default anywhere below the config layer (the model's
-        # anonymizer prompt is the sole scope authority; a graph-layer
-        # fallback constant would be a duplicated, out-of-layer privacy
-        # policy — see ``paramem/graph/placeholders.py``'s
-        # ``_build_anonymization_mapping`` docstring).
+        # Cloud egress PII anonymization scope (``extraction_scrub_categories``)
+        # is sourced at the bootstrap call site from
+        # ``ServerConfig.sanitization.scrub_categories`` — the ``scrub`` hint
+        # list already resolved once at config construction — so consolidation
+        # honours the same operator policy as inference-time cloud egress.
+        # Required — no implicit default anywhere below the config layer (the
+        # tagger's configured labels are the sole scope authority; a
+        # graph-layer fallback constant would be a duplicated, out-of-layer
+        # privacy policy — see ``paramem/cloud/placeholders.py``'s
+        # ``build_forward_table`` docstring).
         # BASE-MODEL HOLDER (loop.extraction.model): ExtractionPipeline stores
         # model on self.extraction.model; released via loop.release() →
         # self.extraction.model = None.
@@ -813,7 +814,7 @@ class ConsolidationLoop:
                 plausibility_stage=extraction_plausibility_stage,
                 plausibility_model=extraction_plausibility_model,
                 plausibility_endpoint=extraction_plausibility_endpoint,
-                scrub=extraction_scrub,
+                scrub_categories=extraction_scrub_categories,
                 correction_entity_types=extraction_correction_entity_types,
                 cloud_enabled=cloud_enabled,
             ),
@@ -3022,30 +3023,51 @@ class ConsolidationLoop:
             cloud_enabled=self.cloud_enabled,
             neighborhood_hops=self.graph_enrichment_neighborhood_hops,
             max_entities_per_pass=self.graph_enrichment_max_entities_per_pass,
+            prompts_dir=self.prompts_dir,
             gc_disable=self._disable_gradient_checkpointing,
             gc_enable=self._enable_gradient_checkpointing,
         )
 
+    #: Per-``aborted_reason`` incident summaries for
+    #: :meth:`_record_enrichment_incident`. The key derives the incident's
+    #: own ``key`` (``f"graph_enrich_{aborted_reason}"``) — no rename of
+    #: the existing ``graph_enrich_vram`` key, so no persisted-incident
+    #: migration.
+    _ENRICHMENT_ABORT_SUMMARIES = {
+        "vram": (
+            "Graph-tier cloud enrichment degraded (merged graph, full fold "
+            "only) — VRAM exhausted; kept already-merged chunks"
+        ),
+        "tagger": (
+            "Graph-tier cloud enrichment degraded (merged graph, full fold "
+            "only) — span tagger unavailable; kept already-merged chunks"
+        ),
+    }
+
     def _record_enrichment_incident(self, result: "graph_tier.RefineResult") -> None:
-        """Surface a VRAM-driven enrichment degrade as an operator-visible
+        """Surface a graph-tier enrichment degrade as an operator-visible
         incident — the SAME ``record_incident`` surface ``extract_session``'s
         ``cloud_enrichment_degraded`` path uses.
 
         ``result.enrichment`` is the raw diagnostics dict
-        :func:`~paramem.training.graph_enrich.enrich_graph` returns;
-        ``aborted_reason == "vram"`` means the chunk loop stopped early on
-        :class:`~paramem.utils.vram_guard.VramExhausted` but kept whatever it
-        already merged rather than aborting the fold. Severity ``"warning"``
-        (the fold succeeds regardless): enrichment self-heals at the next
-        FULL fold, since the pass runs over the cumulative graph every full
-        fold (never at an intervening interim cycle — full-fold only), so
-        there is nothing to retry here.
+        :func:`~paramem.training.graph_enrich.enrich_graph` returns.
+        ``aborted_reason`` names which degrade stopped the chunk loop
+        early — ``"vram"`` (:class:`~paramem.utils.vram_guard.VramExhausted`)
+        or ``"tagger"`` (the span tagger unavailable, or its model call
+        raised) — while keeping whatever the pass already merged rather
+        than aborting the fold. Each reason records under its own key
+        (``graph_enrich_vram`` / ``graph_enrich_tagger``) so the two
+        degrades are distinguishable in the incident store. Severity
+        ``"warning"`` (the fold succeeds regardless): enrichment
+        self-heals at the next FULL fold, since the pass runs over the
+        cumulative graph every full fold (never at an intervening interim
+        cycle — full-fold only), so there is nothing to retry here.
 
-        A pass that ran to completion is the success this incident resolves
-        on, and this is the only site that observes it — with one sanctioned
-        exception: :meth:`_arbitrate_one_enrichment_signal`'s cloud-disabled
-        sweep resolves this key too (by type), since a completed pass can
-        never happen while cloud egress is refused.
+        A pass that ran to completion (``aborted_reason is None``)
+        resolves the WHOLE ``enrichment_degraded`` family by type — the
+        same by-type sweep :meth:`_arbitrate_one_enrichment_signal`'s
+        cloud-disabled arm already uses for this key, since a completed
+        pass can never happen while cloud egress is refused.
         ``result.enrichment is None`` means the pass never ran (enrichment
         off, or an interim scope), which is not evidence of recovery and
         must not clear a standing incident — a no-op in that case.
@@ -3053,18 +3075,16 @@ class ConsolidationLoop:
         if result.enrichment is None or self._incidents_state_dir is None:
             return
 
-        from paramem.server.incidents import record_incident, resolve_incident
+        from paramem.server.incidents import record_incident, resolve_incidents_by_type
 
-        if result.enrichment.get("aborted_reason") == "vram":
+        aborted_reason = result.enrichment.get("aborted_reason")
+        if aborted_reason is not None:
             record_incident(
                 self._incidents_state_dir,
                 type="enrichment_degraded",
-                key="graph_enrich_vram",
+                key=f"graph_enrich_{aborted_reason}",
                 severity="warning",
-                summary=(
-                    "Graph-tier cloud enrichment degraded (merged graph, full fold "
-                    "only) — VRAM exhausted; kept already-merged chunks"
-                ),
+                summary=self._ENRICHMENT_ABORT_SUMMARIES[aborted_reason],
                 detail={
                     "type": "enrichment_degraded",
                     "chunks": result.enrichment.get("chunks", 0),
@@ -3072,7 +3092,7 @@ class ConsolidationLoop:
                 },
             )
         else:
-            resolve_incident(self._incidents_state_dir, "enrichment_degraded", "graph_enrich_vram")
+            resolve_incidents_by_type(self._incidents_state_dir, "enrichment_degraded")
 
     #: Ledger reasons whose collapse is an independent sighting of the fact and
     #: may therefore EARN a reinforcement (subject to the store's temporal-order

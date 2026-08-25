@@ -706,46 +706,43 @@ def answer_via_cloud(
         from paramem.cloud.placeholders import _substitute_whole_words
         from paramem.graph.flows import anonymize_turn
 
-        # Anonymize ONLY the current-turn text — the model-facing
-        # anonymized transcript comes back on ``payload.anon_transcript``.
+        # History is drop-gated FIRST — content-only, no ``speaker_id``
+        # (see ``is_self_referential``'s docstring: it takes no
+        # ``speaker_id`` parameter) — and the surviving turns are handed to
+        # ``anonymize_turn`` alongside the current turn so both are tagged
+        # in the same payload and substituted from the same forward table
+        # (no second LLM call).  Neither the current turn nor a history
+        # turn goes through ``payload.anon_transcript`` — that field is
+        # still marker-bearing on this call, since the model-facing marker
+        # strip lives only in the transcript-bearing session-tier path.
+        # Both are instead derived the same way: whole-word substitution of
+        # the bare turn text against ``payload.forward``.
+        drop_gated_history = _sanitize_history(history)
         payload = anonymize_turn(
             text,
             model,
             tokenizer,
+            history=drop_gated_history,
             speaker_id=speaker_id,
             speaker_name=speaker,
-            scrub=set(config.sanitization.scrub),
+            categories=config.sanitization.scrub_categories,
             token_envelope=config.consolidation.extraction_anonymize_token_envelope,
         )
         if payload.status == "failed":
-            # Per-query block: extraction error, anonymizer parse failure or
-            # a missing/empty model-authored transcript (fail-closed), or
-            # an empty model-authored transcript after the marker strip.
-            # Privacy-safe — cloud call is suppressed.  Distinct from
-            # ``status == "opted_out"``, which proceeds with the verbatim
-            # transcript below.
+            # Per-query block: the span tagger is unavailable, or the
+            # domain-scoped fail-closed guard fired.  Privacy-safe — cloud
+            # call is suppressed.  Distinct from ``status == "opted_out"``,
+            # which proceeds with the verbatim transcript below.
             return None
 
-        # History: under an anonymizing cloud_mode, history is
-        # NOT bundled into a single anonymized transcript with the current
-        # turn (that would show the cloud the history twice and forces
-        # multi-turn text reproduction on the local 7B model, which it
-        # doesn't do reliably).  Instead: (i) drop-gate each turn via
-        # ``_sanitize_history`` — content-only, no ``speaker_id`` (see
-        # ``is_self_referential``'s docstring: it takes no speaker_id
-        # parameter) — then (ii) substitute through ``payload.forward``
-        # — no second LLM call.  Accepted residual: ``payload.forward``
-        # only covers entities the anonymizer named in the CURRENT turn,
-        # so a personal entity appearing ONLY in history is dropped by the
-        # gate but not placeholdered.  See benchmarking.md.
-        drop_gated_history = _sanitize_history(history)
+        anon_text = _substitute_whole_words(text, payload.forward)
         sanitized_history = [
             {**turn, "text": _substitute_whole_words(turn["text"], payload.forward)}
             for turn in drop_gated_history
         ]
 
         result = _escalate_to_cloud(
-            payload.anon_transcript,
+            anon_text,
             cloud_agent,
             config,
             sanitized_history=sanitized_history,
@@ -765,7 +762,7 @@ def answer_via_cloud(
         scope = CloudScope.response(
             payload,
             cloud_bindings=None,
-            sent=(payload.anon_transcript, *(turn["text"] for turn in sanitized_history)),
+            sent=(anon_text, *(turn["text"] for turn in sanitized_history)),
         )
         deanon_text = deanonymize_text(scope, result.text)
         if deanon_text is None:

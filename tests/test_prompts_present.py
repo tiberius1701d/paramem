@@ -40,18 +40,6 @@ class TestPromptFilesPresent:
         assert "{speaker_id}" in content
         assert "{speaker_name}" in content
 
-    def test_anonymization_speaker_anchor_txt_exists(self):
-        """Companion prompt fragment split out of ``anonymization.txt``
-        2026-08-02 — the fold-onto-token speaker-anchor rule + worked
-        examples, rendered into the base template's
-        ``{speaker_anchor_section}`` slot only when a speaker id is
-        threaded."""
-        assert (_PROMPTS_DIR / "anonymization_speaker_anchor.txt").exists()
-
-    def test_anonymization_speaker_anchor_txt_has_speaker_id_placeholder(self):
-        content = (_PROMPTS_DIR / "anonymization_speaker_anchor.txt").read_text()
-        assert "{speaker_id}" in content
-
     def test_extraction_txt_has_transcript_placeholder(self):
         content = (_PROMPTS_DIR / "extraction.txt").read_text()
         assert "{transcript}" in content
@@ -177,9 +165,9 @@ class TestPromptFilesPresent:
 
 
 class TestSystemPromptFilesPresent:
-    """Presence + brace guard for the ten externalized SYSTEM-prompt files.
+    """Presence + brace guard for the nine externalized SYSTEM-prompt files.
 
-    Seven follow the companion ``<base>_system.txt`` pattern for an
+    Six follow the companion ``<base>_system.txt`` pattern for an
     already-external USER template (``extraction.txt`` /
     ``extraction_system.txt``); three are serving-path system prompts
     (``serving_system.txt``, ``intent_classifier.txt``,
@@ -196,7 +184,6 @@ class TestSystemPromptFilesPresent:
     _SYSTEM_PROMPT_FILES = (
         "entity_correction_system.txt",
         "merger_coexistence_system.txt",
-        "anonymization_system.txt",
         "cloud_plausibility_system.txt",
         "cloud_enrichment_system.txt",
         "predicate_normalization_system.txt",
@@ -211,9 +198,6 @@ class TestSystemPromptFilesPresent:
 
     def test_merger_coexistence_system_txt_exists(self):
         assert (_PROMPTS_DIR / "merger_coexistence_system.txt").exists()
-
-    def test_anonymization_system_txt_exists(self):
-        assert (_PROMPTS_DIR / "anonymization_system.txt").exists()
 
     def test_cloud_plausibility_system_txt_exists(self):
         assert (_PROMPTS_DIR / "cloud_plausibility_system.txt").exists()
@@ -246,7 +230,7 @@ class TestSystemPromptFilesPresent:
 
 
 class TestSystemPromptGoldens:
-    """Byte-for-byte preservation goldens for the eight externalized files
+    """Byte-for-byte preservation goldens for the seven externalized files
     that were single Python literals before being externalized.
 
     Each golden string was captured programmatically from the pre-change
@@ -268,10 +252,6 @@ class TestSystemPromptGoldens:
     def test_merger_coexistence_system_golden(self):
         content = (_PROMPTS_DIR / "merger_coexistence_system.txt").read_text().strip()
         assert content == "You classify relationship cardinality."
-
-    def test_anonymization_system_golden(self):
-        content = (_PROMPTS_DIR / "anonymization_system.txt").read_text().strip()
-        assert content == "You anonymize data. Output valid JSON only."
 
     def test_cloud_plausibility_system_golden(self):
         content = (_PROMPTS_DIR / "cloud_plausibility_system.txt").read_text().strip()
@@ -556,49 +536,6 @@ class TestEnsurePromptAssets:
         from paramem.graph.prompts import ensure_prompt_assets
 
         ensure_prompt_assets(prompts_dir=tmp_path)
-
-    def _write_required_files(self, prompts_mod, tmp_path):
-        """Populate *tmp_path* with every required prompt file — the two
-        extraction user templates that are also always-supplied-slot
-        gated (``extraction.txt``, ``extraction_procedural.txt``) carry
-        every slot; the rest are arbitrary placeholder content (not
-        slot-checked)."""
-        slotted_template = "Transcript:\n{document_context}{speaker_context}{transcript}"
-        for filename in prompts_mod._REQUIRED_PROMPT_FILES:
-            content = (
-                slotted_template
-                if filename in prompts_mod._EXTRACTION_USER_TEMPLATES
-                else "placeholder"
-            )
-            (tmp_path / filename).write_text(content)
-
-    def test_raises_when_model_override_drops_a_required_slot(self, monkeypatch, tmp_path):
-        """A per-model copy of an extraction user template that omits one
-        of the always-supplied slots is a config-load failure: ``str.format``
-        ignores surplus kwargs, so the drop would otherwise silently revert
-        that model to cue-less/context-less extraction."""
-        import paramem.graph.prompts as prompts_mod
-
-        self._write_required_files(prompts_mod, tmp_path)
-        model_dir = tmp_path / "some-model"
-        model_dir.mkdir()
-        # Drops {document_context} — every other required slot present.
-        (model_dir / "extraction.txt").write_text("Transcript:\n{speaker_context}{transcript}")
-        monkeypatch.setattr(prompts_mod, "_DEFAULT_PROMPT_DIR", tmp_path)
-        with pytest.raises(RuntimeError, match="document_context"):
-            prompts_mod.ensure_prompt_assets()
-
-    def test_passes_when_model_override_carries_every_required_slot(self, monkeypatch, tmp_path):
-        import paramem.graph.prompts as prompts_mod
-
-        self._write_required_files(prompts_mod, tmp_path)
-        model_dir = tmp_path / "some-model"
-        model_dir.mkdir()
-        (model_dir / "extraction.txt").write_text(
-            "Transcript:\n{document_context}{speaker_context}{transcript}"
-        )
-        monkeypatch.setattr(prompts_mod, "_DEFAULT_PROMPT_DIR", tmp_path)
-        prompts_mod.ensure_prompt_assets()
 
     def test_passes_against_the_real_shipped_tree(self):
         """The real shipped ``configs/prompts/`` tree — base plus every

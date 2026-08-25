@@ -14,9 +14,30 @@ unexpected fallback path fires.
 
 from unittest.mock import patch
 
+from paramem.cloud.anonymize import AnonymizedContract
 from paramem.graph.extractor import PlausibilityVerdict
-from paramem.graph.schema import Entity, SessionGraph
+from paramem.graph.schema import Entity, SessionGraph, facts_from_relations
 from tests._cloud_flow import enrichment_side_effect, run_cloud_stages
+
+
+def _anon_payload(graph: SessionGraph, mapping: dict) -> AnonymizedContract:
+    """Build the ``AnonymizedContract`` a real anonymize chain would
+    return for *graph* under *mapping* — ``facts`` is the REAL-NAME
+    rendering of ``graph.relations`` so the ``enrich`` stage's own
+    ``insert_placeholders(payload.facts, payload.forward)`` reproduces
+    the anonymized fact list these tests assert against, exactly as
+    production derives it (never a pre-substituted array stored on the
+    contract)."""
+    return AnonymizedContract(
+        status="ok",
+        forward=mapping,
+        reverse={v: k for k, v in mapping.items()},
+        anon_transcript="anonymized transcript",
+        declared=frozenset(mapping.values()),
+        rekey_dropped=0,
+        raw="",
+        facts=facts_from_relations(graph.relations),
+    )
 
 
 def _verdict_dropping(facts: list[dict], predicates: set[str]) -> PlausibilityVerdict:
@@ -124,8 +145,8 @@ class TestAlignmentSmoke:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.cloud.anonymize.anonymize_transcript",
-                return_value=(mapping, "anonymized transcript", ""),
+                "paramem.graph.stage_anonymize.anonymize",
+                return_value=_anon_payload(graph, mapping),
             ),
             patch(
                 "paramem.graph.stage_enrich.request_enrichment",
@@ -175,8 +196,8 @@ class TestAlignmentSmoke:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.cloud.anonymize.anonymize_transcript",
-                return_value=(mapping, "anonymized transcript", ""),
+                "paramem.graph.stage_anonymize.anonymize",
+                return_value=_anon_payload(graph, mapping),
             ),
             patch(
                 "paramem.graph.stage_enrich.request_enrichment",
@@ -213,8 +234,8 @@ class TestAlignmentSmoke:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.cloud.anonymize.anonymize_transcript",
-                return_value=(mapping, "anonymized transcript", ""),
+                "paramem.graph.stage_anonymize.anonymize",
+                return_value=_anon_payload(graph, mapping),
             ),
             patch(
                 "paramem.graph.stage_enrich.request_enrichment",

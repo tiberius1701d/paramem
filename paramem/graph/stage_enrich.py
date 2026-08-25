@@ -101,10 +101,13 @@ def _stage_enrich(ctx: StageContext, state: StageState) -> StageState:
 
     # ``anon_transcript`` is the chain's output regardless of which
     # ``anonymize`` branch ran — THE speaker-value guard in
-    # ``_build_anonymization_mapping`` (paramem/cloud/placeholders.py)
-    # applies on every path by construction (``payload.reverse`` is
-    # produced exclusively by that function inside
-    # :func:`~paramem.cloud.anonymize.anonymize`).
+    # ``build_forward_table`` (paramem/cloud/placeholders.py)
+    # applies on every path by construction: ``payload.reverse`` is
+    # :func:`~paramem.cloud.anonymize.anonymize`'s own inversion of the
+    # cross-slice MERGED forward table (via
+    # :func:`~paramem.cloud.placeholders.invert_forward_mapping`), never a
+    # single slice's own ``build_forward_table`` reverse (which a
+    # cross-slice placeholder re-mint can make stale).
     anon_transcript = payload.anon_transcript
 
     # Phase — entity_correction.  Local model classifies+corrects misspelled

@@ -1,17 +1,15 @@
 """THE token-estimation primitive — one estimator for every payload this
 system sizes before a local ``generate()`` call.
 
-Four independent renderings of "how big is this payload" existed before
-this module: two identically try/except-guarded exact counts (each
-returning a ``-1`` sentinel on failure) at
-:func:`paramem.cloud.anonymize.anonymize_transcript` and
-:func:`paramem.graph.extractor.judge_plausibility`, a third (same
-guard/sentinel shape) in :func:`paramem.server.calibrate._count_tokens`,
-and a fourth — tokenizer-free — whitespace-word counter in
-:mod:`paramem.graph.document_chunker`. :func:`estimate_tokens` collapses
-all four into one function: exact when a tokenizer is supplied, a
-conservative words-based bound otherwise. Callers never re-implement
-counting locally.
+Independent renderings of "how big is this payload" once existed at
+multiple local-generate call sites: try/except-guarded exact counts (each
+returning a ``-1`` sentinel on failure) such as
+:func:`paramem.graph.extractor.judge_plausibility` and
+:func:`paramem.server.calibrate._count_tokens`, and a tokenizer-free
+whitespace-word counter in :mod:`paramem.graph.document_chunker`.
+:func:`estimate_tokens` collapses every one of those into one function:
+exact when a tokenizer is supplied, a conservative words-based bound
+otherwise. Callers never re-implement counting locally.
 
 Boundary — why this module and not one of the four call sites' packages:
 it cannot live in ``paramem.cloud`` (``document_chunker`` and the ingest
@@ -159,13 +157,15 @@ def encode_rendered(tokenizer, text: "RenderedPrompt | list[RenderedPrompt]", **
 MEASURED_TOKENS_PER_WORD: float = 3.7
 
 # ---------------------------------------------------------------------------
-# Envelope-derived budget primitives — the ONE encoding of
-# "(envelope - skeleton - reserve) / (2 + facts_ratio)" plus the
+# Anonymize-envelope budget primitives — the ONE encoding of
+# "envelope - skeleton - reserve" (payload carried once) plus the
 # ratio-cancellation unit rule, shared by every caller that must fit a
 # payload (a document chunk, a conversation transcript) inside one
-# anonymize-call token envelope alongside its extracted-facts JSON and its
-# own echoed-back rewrite.  See :func:`envelope_derived_cap_tokens`'s
-# docstring for the identity itself.
+# anonymize-call token envelope. The anonymizer's SCAN step is a span
+# tagger — no envelope, no local ``generate()`` — so there is exactly ONE
+# local-call shape left to size a payload against: the ANCHOR
+# self-introduction question, which carries the payload once. See
+# :func:`anonymize_payload_cap_tokens`'s docstring for the identity itself.
 # ---------------------------------------------------------------------------
 
 # Total tokens (prompt + output) one local anonymize() call may occupy.
@@ -175,29 +175,99 @@ MEASURED_TOKENS_PER_WORD: float = 3.7
 # without the cloud package) and session_buffer both need the value, so a
 # third recorded literal would have existed without this inversion.
 ANONYMIZE_ENVELOPE_TOKENS: int = 8192
-# The anonymize response's fixed JSON skeleton (48 tokens) plus one
-# mapping-entry's overhead (10 tokens) = 58.  A CHECKED MIRROR of
-# paramem.cloud.anonymize's ``_OUTPUT_JSON_ENVELOPE_TOKENS`` +
-# ``_MAPPING_ENTRY_OVERHEAD_TOKENS`` — not an import, because those two
-# constants are also used independently inside that module and cannot be
-# inverted the way ``ANONYMIZE_ENVELOPE_TOKENS`` was.
-# tests/test_tokens.py pins the two live symbols equal to this value.
-ANONYMIZE_OUTPUT_RESERVE_TOKENS: int = 58
+
+# ANCHOR prompt skeleton — the fixed system-prompt + chat-markup + call-body
+# token cost of the one remaining local anonymize call, excluding the
+# candidate values list (``{values}``) and the evidence text (``{text}``).
+# Measured 2026-08-24 via the ACTUAL runtime render path
+# (``paramem.models.loader.render_chat_prompt`` over the ``ANCHOR-SYSTEM`` +
+# ``ANCHOR`` sections as
+# ``paramem.graph.anonymizer_prompts.load_anonymizer_prompts`` composes
+# them, ``{speaker_id}`` filled with ``"speaker1"``, ``{values}`` an empty
+# JSON array, ``{text}`` empty, ``add_generation_prompt=True``), counted
+# with the production tokenizer (Mistral 7B,
+# ``mistralai/Mistral-7B-Instruct-v0.3``), CPU-only (tokenizer load, no
+# model, no GPU).
+ANONYMIZE_ANCHOR_PROMPT_SKELETON_TOKENS: int = 523
+
+# ---------------------------------------------------------------------------
+# ANCHOR OUTPUT reserve constants — re-measured 2026-08-24 against the
+# shipped JSON envelope shape (``{"self_introduced": [...]}``), via a direct
+# tokenizer call on the envelope text (no chat-template render — this is the
+# MODEL's own completion, not a rendered prompt). Base measurements (a
+# markdown-code-fenced empty envelope, plus a handful of realistic person
+# names) were 5-15 tokens; each constant below adds slack over that base for
+# output-format variation (fence style, whitespace) the exact base samples
+# do not exhaust.
+# ---------------------------------------------------------------------------
+ANONYMIZE_ANCHOR_OUTPUT_SKELETON_TOKENS: int = 20  # `{"self_introduced": []}` fenced + slack
+ANONYMIZE_MIN_ANCHOR_OUTPUT_TOKENS: int = 24
+# Per-candidate-surface overhead (quotes + comma + separator) for ONE
+# candidate value — `"...",`, no placeholder value is emitted (unlike a
+# {real: placeholder} mapping entry). Consumed by
+# :func:`anchor_output_reserve_tokens` below, never applied per WORD of the
+# evidence text the call was shown — ANCHOR output is bounded by the number
+# of candidate VALUES the call was shown, never by how much evidence text
+# it was shown.
+ANONYMIZE_ANCHOR_ENTRY_OVERHEAD_TOKENS: int = 6
+# Structural ceiling on the number of distinct candidate surfaces one
+# ANCHOR call's reserve is sized for — a reasoned (not live-measured) cap,
+# comfortably above the person-row candidate counts any single call is
+# expected to carry, and its resulting reserve (below) stays well under the
+# 8192-token envelope. A call whose TRUE output would exceed this cap (a
+# name-dense outlier) truncates at `max_new_tokens`, fails JSON parsing, and
+# fails closed — the safe direction, never a silent under-reserve.
+ANONYMIZE_ANCHOR_MAX_CANDIDATES: int = 100
+
 # Conversation-transcript prose ratio (the session-tier payload shape),
 # measured 2026-08-03 against the production tokenizer over real
 # transcript/extraction pairs (counts only — see the module docstring's
 # privacy rule; the median of 4 pairs, ~7% above the previous 1.44 estimate).
 TRANSCRIPT_TOKENS_PER_WORD: float = 1.54
-# Session-tier anonymize prompt skeleton: the anchor section + system prompt
-# + chat markup, on top of the document path's 3751 (re-measured 2026-08-03
-# after the anonymization-prompt revision; same derivation shape as
-# document_chunker.py's document-path skeleton).
-SESSION_ANON_SKELETON_TOKENS: int = 4708
-# Extracted-facts-JSON-to-transcript token ratio. Worst case of three
-# measured values (1.19 / 1.53 / 3.15 — min/median/max over the same 4
-# transcript/extraction pairs); the max is shipped because the derived cap
-# must bound the facts term, not average it.
-CONVERSATION_FACTS_RATIO: float = 3.15
+
+
+def anchor_output_reserve_tokens(candidate_count: int) -> int:
+    """THE one ANCHOR-call output-reserve formula: bounded by the number of
+    distinct candidate VALUES a call was shown, never by the size of the
+    evidence text.
+
+    ``max(ANONYMIZE_MIN_ANCHOR_OUTPUT_TOKENS,
+    ANONYMIZE_ANCHOR_OUTPUT_SKELETON_TOKENS +
+    ANONYMIZE_ANCHOR_ENTRY_OVERHEAD_TOKENS * min(candidate_count,
+    ANONYMIZE_ANCHOR_MAX_CANDIDATES))`` — *candidate_count* is clamped to
+    :data:`ANONYMIZE_ANCHOR_MAX_CANDIDATES` so the reserve plateaus at a
+    constant well under the envelope regardless of how large
+    *candidate_count* is; a call whose true output would exceed that
+    plateau truncates, fails to parse, and fails closed (the safe
+    direction — never a silent under-reserve that risks truncating a
+    *valid* small answer).
+
+    ONE formula, TWO consumers, so the runtime precondition and the
+    compile-time cap door can never drift apart:
+
+    * The runtime precondition
+      (:func:`~paramem.cloud.anonymize_steps.ask_speaker_anchor`) calls this
+      with ``len(values)`` — the call's actual candidate-surface count.
+    * The compile-time cap door (:mod:`paramem.graph.document_chunker`,
+      :mod:`paramem.server.session_buffer`, via
+      :func:`anonymize_payload_cap_tokens`'s callers) calls this with
+      :data:`ANONYMIZE_ANCHOR_MAX_CANDIDATES` itself — the worst case a
+      compile-time literal can assume, since neither module knows a real
+      payload's candidate count in advance.
+
+    Args:
+        candidate_count: Distinct candidate-surface count for one ANCHOR
+            call. Values ``< 0`` are treated as ``0``.
+
+    Returns:
+        The output-token reserve for one ANCHOR call, never evidence-text
+        scaled.
+    """
+    bounded = max(0, min(candidate_count, ANONYMIZE_ANCHOR_MAX_CANDIDATES))
+    return max(
+        ANONYMIZE_MIN_ANCHOR_OUTPUT_TOKENS,
+        ANONYMIZE_ANCHOR_OUTPUT_SKELETON_TOKENS + ANONYMIZE_ANCHOR_ENTRY_OVERHEAD_TOKENS * bounded,
+    )
 
 
 def words_to_estimator_tokens(
@@ -229,40 +299,48 @@ def words_to_estimator_tokens(
     return math.floor(words * tokens_per_word)
 
 
-def envelope_derived_cap_tokens(
+def anonymize_payload_cap_tokens(
     *,
     envelope_tokens: int,
-    skeleton_tokens: int,
-    reserve_tokens: int,
-    facts_ratio: float,
+    anchor_skeleton_tokens: int,
+    anchor_reserve_tokens: int,
     payload_tokens_per_word: float,
     tokens_per_word: float = MEASURED_TOKENS_PER_WORD,
 ) -> int:
-    """THE anonymize-envelope budget derivation, in estimator units.
+    """THE one door every anonymize-payload cap consumer calls — the payload
+    size ceiling that fits the one remaining local ``generate()`` call
+    shape (ANCHOR).
 
-    A payload of ``P`` real tokens sent to one anonymize call costs,
-    against a single envelope: itself as input, its extracted-facts JSON
-    (``facts_ratio * P``), and itself echoed back as the rewritten
-    transcript/chunk — plus the prompt skeleton and the fixed output
-    reserve::
+    A payload of ``P`` real tokens is carried once by the ANCHOR call,
+    alongside its fixed prompt skeleton and its candidate-bounded output
+    reserve, against a single envelope::
 
-        envelope  >=  skeleton + facts_ratio*P + P + P + reserve
-        P         <=  (envelope - skeleton - reserve) / (2 + facts_ratio)
+        envelope  >=  skeleton + P + reserve
+        P         <=  envelope - skeleton - reserve
         cap_words  =  floor(P / payload_tokens_per_word)
 
     The result is re-expressed in the estimator's own unit via
     :func:`words_to_estimator_tokens` — see that function's docstring for
-    why (ratio cancellation at every runtime comparison).
+    why (ratio cancellation at every runtime comparison). Unlike the
+    retired two-shape (SCAN, APPLY) derivation this superseded, there is
+    only one call shape left to evaluate, so the identity is inlined here
+    directly rather than split into a per-shape helper with a single caller.
 
     Args:
         envelope_tokens: Total (prompt + output) token budget for one
-            anonymize call.
-        skeleton_tokens: Fixed prompt-template token cost (system prompt +
-            chat markup + any anchor section), excluding the payload.
-        reserve_tokens: Fixed output-side reserve (JSON envelope + mapping
-            overhead).
-        facts_ratio: Extracted-facts-JSON-to-payload token ratio for this
-            payload shape.
+            anonymize call — the operator ceiling
+            (:data:`ANONYMIZE_ENVELOPE_TOKENS`), not the live VRAM-clamped
+            effective envelope (see the callers' own docstrings for why a
+            compile-time cap is sized against the CONFIGURED ceiling).
+        anchor_skeleton_tokens: The ANCHOR call's fixed prompt-template
+            token cost (see :data:`ANONYMIZE_ANCHOR_PROMPT_SKELETON_TOKENS`).
+        anchor_reserve_tokens: The ANCHOR call's output-side reserve —
+            callers pass
+            ``anchor_output_reserve_tokens(ANONYMIZE_ANCHOR_MAX_CANDIDATES)``,
+            the same formula the runtime budget precondition uses,
+            evaluated at its own structural candidate-count ceiling (a
+            compile-time cap cannot know a real payload's candidate count
+            in advance).
         payload_tokens_per_word: The payload shape's own prose ratio (real
             tokens per word), used only to convert the real-token payload
             budget into a word count.
@@ -274,21 +352,20 @@ def envelope_derived_cap_tokens(
         output), never real tokens.
 
     Raises:
-        ValueError: When ``envelope_tokens - skeleton_tokens -
-            reserve_tokens <= 0`` — a mis-measured skeleton or a shrunken
-            envelope leaves no payload budget at all, which is a
+        ValueError: When ``envelope_tokens - anchor_skeleton_tokens -
+            anchor_reserve_tokens <= 0`` — a mis-measured skeleton or a
+            shrunken envelope leaves no payload budget at all, which is a
             configuration error, not a legitimate zero-word cap.
     """
-    available = envelope_tokens - skeleton_tokens - reserve_tokens
+    available = envelope_tokens - anchor_skeleton_tokens - anchor_reserve_tokens
     if available <= 0:
         raise ValueError(
-            f"envelope_derived_cap_tokens: no payload budget left — "
-            f"envelope_tokens ({envelope_tokens!r}) - skeleton_tokens "
-            f"({skeleton_tokens!r}) - reserve_tokens ({reserve_tokens!r}) "
-            f"= {available!r}, must be > 0"
+            f"anonymize_payload_cap_tokens: no payload budget left — "
+            f"envelope_tokens ({envelope_tokens!r}) - anchor_skeleton_tokens "
+            f"({anchor_skeleton_tokens!r}) - anchor_reserve_tokens "
+            f"({anchor_reserve_tokens!r}) = {available!r}, must be > 0"
         )
-    payload_real_tokens = available / (2 + facts_ratio)
-    cap_words = math.floor(payload_real_tokens / payload_tokens_per_word)
+    cap_words = math.floor(available / payload_tokens_per_word)
     return words_to_estimator_tokens(cap_words, tokens_per_word=tokens_per_word)
 
 
