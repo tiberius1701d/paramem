@@ -18,13 +18,13 @@
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
-source .env 2>/dev/null || true
-# Machine-level GPU env (PYTORCH_CUDA_ALLOC_CONF, HF_DEACTIVATE_ASYNC_LOAD,
-# …) lives in ~/.config/gpu-guard/config.toml [env].  Soft fallback when
-# gpu-guard is installed on this host; the shipped systemd template takes
-# host environment from .env or an operator drop-in instead.
-if command -v gpu-guard >/dev/null 2>&1; then
-    eval "$(gpu-guard env --export)"
+# .env carries credentials and the machine-level GPU / model-load environment;
+# export it so the server process inherits every value.
+if [ -f .env ]; then
+    set -a
+    # shellcheck disable=SC1091
+    source .env
+    set +a
 fi
 
 PYTHON=${PARAMEM_PYTHON:-python}
