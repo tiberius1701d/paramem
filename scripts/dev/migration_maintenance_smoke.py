@@ -33,8 +33,8 @@ tmp session dir before any run.  On success the tmp tree is removed; on failure
 it is kept for forensics.
 
 **GPU cooldown.**
-``wait_for_cooldown`` (from ``~/.local/bin/gpu-cooldown.sh``) is called between
-the seed consolidation cycle and the migration trial to honour the 8 GB VRAM /
+``paramem.training.thermal_throttle.wait_for_cooldown`` is called between the
+seed consolidation cycle and the migration trial to honour the 8 GB VRAM /
 60 W TGP thermal contract.
 
 Usage
@@ -62,7 +62,6 @@ import gc
 import hashlib
 import json
 import logging
-import os
 import re
 import shutil
 import socket
@@ -91,6 +90,7 @@ from paramem.server.trial_state import (  # noqa: E402
     write_trial_marker,
 )
 from paramem.training.stage_ledger import data_state_dir  # noqa: E402
+from paramem.training.thermal_throttle import wait_for_cooldown  # noqa: E402
 from paramem.utils.vram_guard import safe_empty_cache  # noqa: E402
 
 logging.basicConfig(
@@ -114,8 +114,8 @@ logger = logging.getLogger("migration_maintenance_smoke")
 # ---------------------------------------------------------------------------
 
 _FIXTURE_CONFIG = _REPO_ROOT / "tests" / "fixtures" / "server.yaml"
-_GPU_COOLDOWN_SCRIPT = Path(os.path.expanduser("~/.local/bin/gpu-cooldown.sh"))
 _COOLDOWN_THRESHOLD_C: int = 52
+_COOLDOWN_MAX_WAIT_S: int = 600
 
 # Minimum registry size needed for gate 4 to run recall (not skip).
 # Must match paramem/server/gates.py::GATE_4_MIN_REGISTRY_SIZE.
@@ -229,35 +229,6 @@ def _assert_gpu_free() -> None:
         logger.info("GPU pre-flight OK: %d MiB VRAM in use", used_mib)
     except (subprocess.CalledProcessError, ValueError, FileNotFoundError) as exc:
         logger.warning("GPU pre-flight: could not read VRAM — %s; proceeding", exc)
-
-
-# ---------------------------------------------------------------------------
-# GPU cooldown
-# ---------------------------------------------------------------------------
-
-
-def _wait_for_cooldown(threshold_c: int = _COOLDOWN_THRESHOLD_C) -> None:
-    """Block until GPU temperature ≤ threshold_c (default 52°C).
-
-    Sources ``~/.local/bin/gpu-cooldown.sh`` and calls ``wait_for_cooldown``.
-    Returns immediately if the GPU is already cool.
-    """
-    if not _GPU_COOLDOWN_SCRIPT.exists():
-        logger.warning(
-            "GPU cooldown script not found at %s — skipping cooldown",
-            _GPU_COOLDOWN_SCRIPT,
-        )
-        return
-    logger.info("Cooldown: waiting for GPU ≤ %d°C", threshold_c)
-    subprocess.run(
-        [
-            "bash",
-            "-lc",
-            f"source {_GPU_COOLDOWN_SCRIPT} && wait_for_cooldown {threshold_c}",
-        ],
-        check=True,
-    )
-    logger.info("Cooldown: GPU at or below %d°C — proceeding", threshold_c)
 
 
 # ---------------------------------------------------------------------------
@@ -1088,7 +1059,9 @@ def run_smoke(*, keep_on_success: bool = False) -> bool:
 
         # ── Step 3: GPU cooldown between seed and trial ───────────────────────
         logger.info("=== GPU cooldown between seed cycle and trial ===")
-        _wait_for_cooldown(_COOLDOWN_THRESHOLD_C)
+        wait_for_cooldown(
+            _COOLDOWN_THRESHOLD_C, _COOLDOWN_MAX_WAIT_S, label="migration maintenance smoke"
+        )
 
         # ── Step 4: Drive apply path ──────────────────────────────────────────
         logger.info("=== Driving _apply_config_live (in-process) ===")

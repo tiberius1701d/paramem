@@ -59,7 +59,7 @@ class AdapterConfig:
 class TrainingConfig:
     batch_size: int = 1
     gradient_accumulation_steps: int = 8
-    max_seq_length: int = 512
+    max_seq_length: int = 1024
     num_epochs: int = 3
     # Absolute-step warmup count, passed straight to HF TrainingArguments as
     # the sole warmup knob. There is deliberately no ratio-based sibling
@@ -189,7 +189,6 @@ class GraphConfig:
 @dataclass
 class ConsolidationConfig:
     promotion_threshold: int = 3
-    decay_window: int = 10
     # Ship-safe posture: base defaults OFF (no refinement). Operator YAMLs
     # (fixture/local) opt in explicitly.
     # The cloud master switch is NOT here: it is `cloud.enabled`

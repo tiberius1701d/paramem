@@ -1,36 +1,31 @@
 # ParaMem systemd service — parametric memory server
 #
 # Before installing, update the paths below to match your environment:
-#   - User, WorkingDirectory, ExecStart
+#   - WorkingDirectory, ExecStart
 #
-# Install:
-#   sudo cp scripts/server/paramem-server.service /etc/systemd/system/
-#   sudo systemctl daemon-reload
-#   sudo systemctl enable --now paramem-server
+# Install (user-scope service — no root required):
+#   mkdir -p ~/.config/systemd/user
+#   cp scripts/server/paramem-server.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now paramem-server
 #
 # Logs:
-#   journalctl -u paramem-server -f
+#   journalctl --user -u paramem-server -f
 
 [Unit]
 Description=ParaMem Server — parametric memory for personal LLM agents
-After=network.target
-Wants=network-online.target
+After=default.target
 
 [Service]
 Type=simple
 # --- UPDATE THESE FOR YOUR ENVIRONMENT ---
-User=YOUR_USERNAME
 WorkingDirectory=/path/to/paramem
 ExecStart=/path/to/python -m paramem.server.app --config configs/server.yaml
 # --- END USER CONFIG ---
-# Machine-level GPU env (PYTORCH_CUDA_ALLOC_CONF, HF_DEACTIVATE_ASYNC_LOAD,
-# …) is owned by gpu-guard.  Single source of truth: ~/.config/gpu-guard/
-# config.toml [env] (lab-tools/gpu_guard).  Render to runtime tmpdir before
-# ExecStart so the unit inherits whatever the [env] table currently holds.
-# `gpu-guard` must be on PATH; install lab-tools and symlink to ~/.local/bin
-# (see lab-tools/gpu_guard/README.md).
-ExecStartPre=/bin/sh -c 'gpu-guard env > %t/paramem-gpu.env'
-EnvironmentFile=-%t/paramem-gpu.env
+# Host-specific environment (GPU allocator tuning, feature flags, secrets)
+# comes from an editable install's own .env, loaded by the server at
+# startup, or from an operator drop-in under paramem-server.service.d/
+# with a [Service] Environment= line for a non-editable install.
 Restart=on-failure
 RestartSec=30
 TimeoutStartSec=120
@@ -40,4 +35,4 @@ StandardError=journal
 SyslogIdentifier=paramem
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target

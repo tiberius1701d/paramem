@@ -7,15 +7,17 @@ Two roles, both consumed by the server lifespan:
    per-hardware-tier fit verdict. Logged at boot for operator visibility;
    cached on ``_state["topology_assessment"]`` for the live-reload path's
    drain-wait pre-flight. No CUDA calls, safe before the model is loaded.
-2. :func:`check_post_load_budget` — the authoritative reject. Runs in the
-   lifespan AFTER the base model + STT/TTS are on the device, reads
-   ``torch.cuda.memory_allocated(0)``, refuses startup (``sys.exit(1)``)
-   when the measured allocation leaves less than the configured headroom.
+2. :func:`check_post_load_budget` — the authoritative post-load check. Runs
+   in the lifespan AFTER the base model + STT/TTS are on the device, reads
+   ``torch.cuda.memory_allocated(0)``, and degrades the server to
+   cloud-only when the measured allocation leaves less than the configured
+   headroom.
 
 The boot path uses ``_wait_for_gpu_drain`` (in ``app.py``) to wait for
 VRAM and degrade to cloud-only on timeout; the live-reload path uses the
-same drain-wait. ``check_post_load_budget`` is the only check that can
-actually reject the configured topology.
+same drain-wait. No gate here refuses the configured topology outright —
+both the drain-wait and ``check_post_load_budget`` resolve an overflow by
+degrading to cloud-only.
 
 Working set formula (informational, used by :func:`assess_topology`)::
 
@@ -336,8 +338,8 @@ def assess_topology(
     Pure math — no CUDA, no live measurements. Safe to call before the base
     model is loaded and from test harnesses. The returned assessment drives
     the startup banner and the ``vram_config_overflow`` attention warning;
-    the authoritative reject is :func:`check_post_load_budget` after the
-    model is on the device.
+    the authoritative post-load check is :func:`check_post_load_budget` after
+    the model is on the device.
 
     Args:
         adapter_config: LoRA config for interim/episodic adapters — interims

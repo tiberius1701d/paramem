@@ -21,8 +21,10 @@ Two checks:
 * test_operator_yaml_keys_subset_of_example
     Developer-only (skipped in CI when configs/server.yaml is absent).
     Catches keys an operator pinned locally that the example no longer
-    ships — those keys are silently ignored by the loader and probably
-    represent a stale local override.
+    ships. An orphan key either fails the loader (sections built via
+    ``**raw``) or is read by nothing (field-by-field sections and
+    unrecognized top-level keys) — either way it is a stale local
+    override to remove.
 """
 
 from __future__ import annotations
@@ -90,8 +92,10 @@ def test_example_and_fixture_have_same_options():
 )
 def test_operator_yaml_keys_subset_of_example():
     """Developer-only. Catches keys the operator pinned that the example
-    no longer ships — those keys are silently ignored by the loader and
-    probably represent a stale local override.
+    no longer ships. An orphan key either fails the loader (sections
+    built via ``**raw``) or is read by nothing (field-by-field sections
+    and unrecognized top-level keys) — either way it is a stale local
+    override to remove.
     """
     operator_keys = _leaf_keys(OPERATOR)
     example_keys = _leaf_keys(EXAMPLE)
@@ -100,9 +104,9 @@ def test_operator_yaml_keys_subset_of_example():
     assert not orphans, (
         f"configs/server.yaml has keys not in {EXAMPLE}:\n  "
         + "\n  ".join(sorted(orphans))
-        + "\n\nThese are silently ignored by the loader. Either remove "
-        "them from your local server.yaml, or land them in the example "
-        "first."
+        + "\n\nEach either fails the loader or is read by nothing. Either "
+        "remove them from your local server.yaml, or land them in the "
+        "example first."
     )
 
 

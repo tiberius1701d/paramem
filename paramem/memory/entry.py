@@ -178,7 +178,8 @@ def _build_response(entry: dict) -> str:
 def format_entry_training(
     entries: list[dict],
     tokenizer,
-    max_length: int = 1024,
+    *,
+    max_length: int,
 ) -> list[dict]:
     """Build training examples — one keyed-recall example per entry.
 
@@ -190,7 +191,10 @@ def format_entry_training(
             ``predicate``, ``object``).
         tokenizer: HuggingFace tokenizer compatible with
             :func:`paramem.training.dataset._tokenize_with_prompt_masking`.
-        max_length: Maximum token length per example (passed to the tokenizer).
+        max_length: Maximum token length per example (passed to the
+            tokenizer). Callers declare the bound explicitly — there is no
+            default, so a caller cannot silently diverge from the
+            configured ``training_max_seq_length``.
 
     Returns:
         List of pre-tokenized training example dicts with ``input_ids``,

@@ -264,7 +264,7 @@ def post_chunks(
 _UNREACHABLE_HINT = (
     "Run `pstatus` to diagnose — if startup was refused by the encryption "
     "gate, pstatus prints the Reason / Cause / Remedy block. "
-    "See SECURITY.md for recovery."
+    'See DEPLOYMENT.md, "Encryption & recovery operations" for recovery.'
 )
 
 
@@ -272,7 +272,7 @@ def _exit_unreachable(server_url: str, exc: Exception) -> None:
     """Print the standard 'server not reachable' error and exit 1.
 
     Centralises the message so every caller surfaces the same pstatus /
-    SECURITY.md hint when the server is down (commonly: gate-refused
+    DEPLOYMENT.md hint when the server is down (commonly: gate-refused
     startup under ``require_encryption: true``).
 
     Args:

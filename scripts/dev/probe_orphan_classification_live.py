@@ -66,6 +66,8 @@ from dotenv import dotenv_values
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_PROJECT_ROOT))
 
+from paramem.training.thermal_throttle import wait_for_cooldown  # noqa: E402
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -138,27 +140,6 @@ def _resolve_api_token() -> str | None:
     if dotenv_path.is_file():
         return dotenv_values(dotenv_path).get("PARAMEM_API_TOKEN")
     return None
-
-
-def _wait_for_cooldown(target: int = 52) -> None:
-    """Block until GPU temperature drops to *target* °C.
-
-    Shells out to gpu-cooldown.sh.  Falls back to a 60-second sleep when
-    the script is unavailable (e.g. non-GPU CI runner).
-    """
-    try:
-        subprocess.run(
-            [
-                "bash",
-                "-c",
-                f"source ~/.local/bin/gpu-cooldown.sh && wait_for_cooldown {target}",
-            ],
-            check=True,
-            timeout=600,
-        )
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as e:
-        logger.warning("Cooldown script unavailable (%s), sleeping 60 s instead.", e)
-        time.sleep(60)
 
 
 def _port_free(port: int) -> bool:
@@ -686,7 +667,7 @@ def main() -> int:
 
     Steps:
     1. Wipe isolated data dir; write config; seed speaker profiles.
-    2. Wait for GPU cooldown (via ``_wait_for_cooldown``).
+    2. Wait for GPU cooldown (via ``wait_for_cooldown``).
     3. Launch isolated server subprocess on port 8421.
     4. Poll /health until ready (up to 300 s).
     5. Inject 3 pending sessions via POST /chat.
@@ -728,7 +709,7 @@ def main() -> int:
     # Step 2: GPU cooldown.
     # ------------------------------------------------------------------
     logger.info("Waiting for GPU cooldown before launching isolated server ...")
-    _wait_for_cooldown()
+    wait_for_cooldown(52, 600, label="orphan-classification probe")
 
     # ------------------------------------------------------------------
     # Step 3: Confirm port is free; launch isolated server subprocess.

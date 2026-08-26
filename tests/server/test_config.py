@@ -389,6 +389,25 @@ class TestRejectedConsolidationRetryCapKey:
             load_server_config(yaml_file)
 
 
+class TestRejectedDecayWindowKey:
+    """``consolidation.decay_window`` is a rejected key: unreinforced keys
+    are never evicted. Same dedicated named-guard convention as
+    ``consolidation_retry_cap``.
+    """
+
+    def test_stale_decay_window_key_raises_named_value_error(self, tmp_path):
+        yaml_file = _write_yaml(
+            tmp_path,
+            """\
+            model: mistral
+            consolidation:
+              decay_window: 10
+            """,
+        )
+        with pytest.raises(ValueError, match="consolidation.decay_window"):
+            load_server_config(yaml_file)
+
+
 class TestAnonymizeTokenEnvelopeAndRatioConfig:
     """The envelope/ratio defaults and their ``<= 0`` load-time rejection."""
 
@@ -861,6 +880,17 @@ class TestTrainingHyperparamsFromYaml:
         assert tc.seed == 42
         assert tc.max_grad_norm == 1.0
         assert tc.gradient_checkpointing is True
+
+    def test_consolidation_max_seq_length_default_matches_training_config_default(self):
+        """``ConsolidationScheduleConfig.training_max_seq_length`` and
+        ``TrainingConfig.max_seq_length`` are two literals for one bound --
+        this pins them to the same value so the two cannot drift apart."""
+        from paramem.server.config import ConsolidationScheduleConfig
+        from paramem.utils.config import TrainingConfig
+
+        assert (
+            ConsolidationScheduleConfig().training_max_seq_length == TrainingConfig().max_seq_length
+        )
 
     def test_training_hyperparams_yaml_override_flows_through(self, tmp_path):
         """Explicit consolidation.training_* yaml values flow through to TrainingConfig."""

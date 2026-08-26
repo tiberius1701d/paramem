@@ -278,7 +278,7 @@ class TestBackgroundTrainerTraining:
         def _do_train():
             from paramem.memory.entry import format_entry_training
 
-            examples = format_entry_training(keyed, tokenizer)
+            examples = format_entry_training(keyed, tokenizer, max_length=tc.max_seq_length)
             train_adapter(
                 model=model,
                 tokenizer=tokenizer,
@@ -452,7 +452,7 @@ class TestStagingAdapterGPU:
             from paramem.memory.entry import format_entry_training
 
             hooks = bt.training_hooks_for_job()
-            examples = format_entry_training(keyed, tokenizer)
+            examples = format_entry_training(keyed, tokenizer, max_length=tc.max_seq_length)
             m = train_adapter(
                 model=model,
                 tokenizer=tokenizer,
@@ -567,7 +567,7 @@ class TestStagingAdapterGPU:
             model.delete_adapter("in_training")
 
         keyed = assign_keys([("Alex", f"fact_{i}", f"value_{i}") for i in range(5)])
-        examples = format_entry_training(keyed, tokenizer)
+        examples = format_entry_training(keyed, tokenizer, max_length=1024)
         ac = AdapterConfig()
 
         # --- Leg 1: train + retain the checkpoint tree -----------------

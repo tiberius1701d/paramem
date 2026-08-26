@@ -634,6 +634,43 @@ class TestResolveDonorCheckpoint:
         assert captured_kwargs["donor_checkpoint_dir"] == resolved_dir
 
 
+class TestTrainTierAdapterEntryFormatting:
+    def test_funnel_threads_configured_max_seq_length_to_format_entry_training(self, tmp_path):
+        """The funnel's entry-formatting call carries the caller's own
+        ``training_config.max_seq_length`` as ``format_entry_training``'s
+        ``max_length`` -- the bound is read from configuration, never a
+        literal at the call site."""
+        loop = _make_bare_loop(tmp_path)
+        loop._indexed_dataset = MagicMock(return_value=MagicMock())
+        loop._enable_gradient_checkpointing = MagicMock()
+        loop._maybe_make_recall_callback = MagicMock(return_value=(None, None))
+        loop._build_training_hooks = MagicMock(return_value=MagicMock())
+        loop.training_config = TrainingConfig(max_seq_length=257)
+        loop._resolve_donor_checkpoint = MagicMock()
+
+        with (
+            patch(
+                "paramem.training.consolidation.format_entry_training",
+                return_value=[{"input_ids": [1], "labels": [1]}],
+            ) as mock_format,
+            patch(
+                "paramem.training.trainer.train_adapter",
+                return_value={"train_loss": 0.1, "aborted": False, "init": "cold"},
+            ),
+        ):
+            loop._train_tier_adapter(
+                [{"key": "graph1", "subject": "s", "predicate": "p", "object": "o"}],
+                adapter_name="episodic",
+                adapter_config=loop.tier_adapters["episodic"],
+                training_config=loop.training_config,
+                output_dir=tmp_path / "scratch",
+                run_name="test",
+                phase_name="test",
+            )
+
+        assert mock_format.call_args.kwargs["max_length"] == 257
+
+
 class TestLoadDonorIntoTransientSlot:
     def test_raises_when_no_checkpoint(self, tmp_path):
         model = MagicMock()

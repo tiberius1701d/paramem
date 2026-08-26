@@ -643,8 +643,8 @@ def assert_mode_consistency(
             f"  - paramem encrypt-infra --dry-run  # preview what would change\n"
             f"  - paramem encrypt-infra            # migrate plaintext files in-place\n"
             f"\n"
-            f"See SECURITY.md for a full reset procedure that\n"
-            f"preserves speaker_profiles.json."
+            f'See DEPLOYMENT.md, "Encryption & recovery operations" for a\n'
+            f"full reset procedure that preserves speaker_profiles.json."
         )
 
     # Plaintext files while the daily identity is loaded → encryption enabled
@@ -663,8 +663,8 @@ def assert_mode_consistency(
             f"  - paramem encrypt-infra  # migrate plaintext files in-place\n"
             f"  - OR unset {DAILY_PASSPHRASE_ENV_VAR} to run in the Security-OFF posture.\n"
             f"\n"
-            f"See SECURITY.md for a full reset procedure that\n"
-            f"preserves speaker_profiles.json."
+            f'See DEPLOYMENT.md, "Encryption & recovery operations" for a\n'
+            f"full reset procedure that preserves speaker_profiles.json."
         )
 
     # age files present without the daily identity → unreadable.
@@ -683,8 +683,8 @@ def assert_mode_consistency(
             f"  - Confirm ~/.config/paramem/daily_key.age exists and is readable.\n"
             f"  - If you've lost the passphrase, see: paramem restore --help\n"
             f"\n"
-            f"See SECURITY.md for a full reset procedure that\n"
-            f"preserves speaker_profiles.json."
+            f'See DEPLOYMENT.md, "Encryption & recovery operations" for a\n'
+            f"full reset procedure that preserves speaker_profiles.json."
         )
 
     # Otherwise the store is consistent with the loaded keys — proceed.

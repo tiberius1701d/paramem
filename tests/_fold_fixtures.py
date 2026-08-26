@@ -283,7 +283,7 @@ def _make_loop(tmp_path, *, procedural: bool = False, resident_tiers=()) -> Cons
     loop = object.__new__(ConsolidationLoop)
     loop.model = _make_fake_driver_model(resident_tiers=resident_tiers)
     loop.tokenizer = _FakeTokenizer()
-    loop.config = ConsolidationConfig(promotion_threshold=3, decay_window=10)
+    loop.config = ConsolidationConfig(promotion_threshold=3)
     loop.training_config = TrainingConfig(
         num_epochs=1,
         gradient_checkpointing=False,

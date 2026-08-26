@@ -7,8 +7,6 @@ replacement flow still works after a daily rotation.
 
 Preconditions:
 
-- Server stopped (advisory check — a running server will race with the
-  rename cycle; the command warns and refuses unless ``--force``).
 - ``PARAMEM_DAILY_PASSPHRASE`` set + ``~/.config/paramem/daily_key.age``
   present so the OLD daily is loadable.
 - ``~/.config/paramem/recovery.pub`` present so the NEW envelopes still
@@ -31,8 +29,10 @@ Crash-safety:
 
 Operator guidance: the old daily passphrase continues to work after the
 rotation because the new daily is wrapped with the same passphrase. To
-change the passphrase itself, run ``paramem generate-key --force`` (a
-separate flow — full re-key rather than rotation).
+change the passphrase itself, run ``paramem change-passphrase`` (a
+non-destructive rewrap of the existing identity — never
+``generate-key --force``, which mints a new identity and invalidates
+every existing envelope).
 """
 
 from __future__ import annotations

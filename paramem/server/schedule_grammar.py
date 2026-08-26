@@ -39,9 +39,10 @@ digits):
 * ``"HH:MM"`` / ``"daily HH:MM"``                   → daily at HH:MM
 * ``"Nh"`` / ``"Nm"`` / ``"every Nh"`` / ``"every Nm"`` → interval
 
-Regex usage here is one of the project's two permitted sites (the other is
-``cloud/placeholders.py``); both are recorded in ``ARCHITECTURE.md``.  The
-admissibility rule is structural, not a judgement about this module: each
+Regex usage here is a declared-syntax matcher, admitted under
+``ARCHITECTURE.md``, AD-22: Regex Confined to Declared Syntax, and pinned
+by ``tests/test_regex_confinement.py``.  The admissibility rule is
+structural, not a judgement about this module: each
 shape is declared exactly ONCE as a fragment constant and composed into the
 patterns that need it, so a grammar change is a single edit and no second
 renderer can drift from it.  Operators write these strings into

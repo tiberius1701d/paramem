@@ -183,7 +183,7 @@ A consolidation works from the memory it recalled when it started, so a fact a c
 **Fold merge input is registry-true, in both venues.** The fold sources its merge input from the registry-true subject/predicate/object for every active key — never from the reconstruction result, and never from a direct disk read. Reconstruction exists only in the `train` venue and is a **health/retry signal**: a key whose reconstructed content disagrees with its registry-true content is flagged and retrained with its registry-true content — it is never silently dropped. A recall miss does not delete a key. In the `simulate` venue there is no reconstruction and nothing is ever flagged.
 
 Key design decisions:
-- **Capacity / passive decay:** Keys are never evicted by age and there is no configured ceiling on how many a tier holds. Unreinforced keys passively decay: those not re-seen for `decay_window` cycles are logged as decay candidates but are never actively deleted. Reconstruction noise causes unimportant facts to drift over time — the forgetting curve emerging from the mechanism rather than a policy.
+- **Capacity / passive decay:** Keys are never evicted by age and there is no configured ceiling on how many a tier holds. An unreinforced key is never actively removed; reconstruction noise causes unimportant facts to fade as the adapter is retrained around them — the forgetting curve emerges from the mechanism rather than from a policy.
 - **SimHash registry per adapter:** Each adapter (episodic, semantic) maintains its own SimHash registry. Keys promoted from episodic to semantic are registered in the semantic registry and removed from episodic.
 
 ### AD-10: Key-Addressable Replay
@@ -196,7 +196,7 @@ During the compression phase, each session's knowledge graph is stored in the ad
 
 Dedup also fires at the interim mini-fold, not only at the full fold: a session that recites a fact already stored in a main tier, or already keyed in an earlier interim slot still awaiting the next full fold, is deduped against the recalled, session-scoped facts from either source, so the recital never mints a transient interim key. The recital instead credits the surviving key's reinforcement count, exactly as a full-fold collapse would — provided it comes from a later session than the one that key was last seen in. Repetition within a single conversation is not reinforcement, so it does not raise the count. The interim fold merges these dedup targets — main-tier or sibling-interim — for Case-1 adoption and reinforcement credit only — they are excluded from the training set — and the interim fold runs no graph-tier refinement (enrichment or normalization) at all; both passes are full-fold only (see AD-15 above).
 
-Key insight: reconstruction does not need to be perfect. Facts that matter get reinforced by coming up again in a later conversation — repetition inside one conversation does not count. Decay is passive: keys not re-seen for `decay_window` cycles are logged as decay candidates; there is no active deletion.
+Key insight: reconstruction does not need to be perfect. Facts that matter get reinforced by coming up again in a later conversation — repetition inside one conversation does not count. Decay is passive and unbounded: an unreinforced key is never evicted, it simply fades as reconstruction noise accumulates around it.
 
 ## Training Contract
 
@@ -464,6 +464,33 @@ cloud-backed HA conversation agent forwards the household's turns to a third
 party outside every switch above, regardless of how well the payload itself
 is scrubbed.
 
+### AD-22: Regex Confined to Declared Syntax
+
+Pattern matching over text decides nothing semantic in this system. A regex
+captures the cases its author thought of and stays silent on everything
+else — the project has been bitten by that brittleness more than once — so
+no personal-turn verdict, no speaker resolution, no fact boundary, and no
+PII surface is ever a pattern's output. Those decisions belong to the
+classifier, the encoder, or the model that already carries the semantics; a
+regex is never asked to stand in for them.
+
+What remains admissible is syntax the project itself declares and fully
+specifies, not syntax merely observed in text: the schedule grammar, the
+placeholder and speaker token shapes the system mints, the identity-folding
+rules a canonical form composes from, and the turn-marker framing every
+transcript is built with. Each such shape is declared exactly once, as a
+single fragment, and every site that recognises or renders it composes from
+that one declaration — never a second, independently spelled pattern
+re-describing the same shape.
+
+A structural guard, not a style rule, keeps the boundary honest: a test
+pins the exact set of modules permitted to author a pattern by importing
+`re` at all, so a new pattern appearing anywhere else in the server's own
+source fails before it ships. The guard targets authorship, not
+consumption — a module that receives an already-compiled pattern from one
+of the declared-syntax modules and applies it is not itself authoring a
+pattern, and the guard has nothing to say about it.
+
 ### AD-18: Multi-Engine Multilingual TTS
 
 Local text-to-speech via pluggable engines behind a common interface:
@@ -496,4 +523,4 @@ Both paths feed the transcript into the same shared turn-handling path as `POST 
 | WSL2 CUDA memory reporting can be inaccurate | Unexpected OOM during training | Set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`; keep training data on Linux filesystem |
 | Multi-adapter simultaneous training not natively batched in PEFT | Must train adapters sequentially per consolidation cycle | Acceptable — each adapter trains independently anyway |
 | Graph extractor quality depends on base model capability | Poor extraction → poor consolidation signal | Extraction runs on the configured base model, so extraction quality moves with model selection and is measured per model |
-| Key reconstruction quality degrades with many keys | Adapter capacity limits reliable reconstruction | Reconstruction-based replay reinforces active keys each cycle; unreinforced keys passively decay via reconstruction noise (`decay_window` log-candidate, no deletion). |
+| Key reconstruction quality degrades with many keys | Adapter capacity limits reliable reconstruction | Reconstruction-based replay reinforces active keys each cycle; unreinforced keys are never evicted and fade passively through reconstruction noise as the adapter is retrained around them. |

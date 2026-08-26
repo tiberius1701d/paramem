@@ -164,8 +164,9 @@ adapters:
 #
 # THE ONLY SCHEDULING KNOB — refresh_cadence
 # - `refresh_cadence` is how often a NEW interim adapter is minted (the
-#   interim tick interval). Grammar: "every Nh" / "every Nm" / "HH:MM"
-#   (daily) / "daily" / "" (manual only, no timer).
+#   interim tick interval). Grammar: "" / "off" / "disabled" / "none"
+#   (manual only, no timer) / "weekly" / "daily" / "HH:MM" / "daily HH:MM"
+#   / "Nh" / "Nm" / "every Nh" / "every Nm".
 # - The FULL consolidation period is DERIVED, not configured:
 #       full_cycle = refresh_cadence × max_interim_count
 #   Exception: when max_interim_count=0 (full-fold-only consume-pending
@@ -240,14 +241,13 @@ adapters:
 # Server refuses to start if the configured topology exceeds the GPU.
 # ============================================================================
 consolidation:
-  refresh_cadence: "12h"       # "every Nh" / "every Nm" / "HH:MM" / "daily" / "" (manual)
+  refresh_cadence: "12h"       # "" / "off" / "disabled" / "none" (manual) / "weekly" / "daily" / "HH:MM" / "daily HH:MM" / "Nh" / "Nm" / "every Nh" / "every Nm"
                                # 12h + max_interim_count=7 → full cycle every 84h (derived).
   mode: train                  # "train" writes LoRA weights into the tier's slot; "simulate" writes graph.json into the tier's slot (no weight training)
                                # Closed vocabulary: any other value is rejected at config load.
                                # "simulate" + max_interim_count: 0 is also rejected (no training venue at all).
   promotion_threshold: 3       # reinforcement_count threshold for key promotion to semantic
   retain_sessions: true        # archive transcripts after consolidation (false = delete)
-  decay_window: 10             # cycles before unreinforced keys decay
   refinement_enrichment: "on"   # graph-stage cloud enrichment — on in tests; requires the top-level `cloud.enabled: true` master switch. This is the flag that actually triggers the graph-content cloud call — same real-name-leak residual on misclassification.
   refinement_normalization: "on"  # full-fold predicate-synonym collapse (per-group cluster model call); local-7B precision ~0.89 accepted
   refinement_contradiction: "on"  # Case-2 recency-backed contradiction: freshest last_seen wins; empty/tied → coexist. off|on.
@@ -780,7 +780,7 @@ vram:
 # ----------------------------------------------------------------------------
 # backups.schedule / backups.artifacts / backups.max_total_disk_gb
 # ----------------------------------------------------------------------------
-# schedule: "daily HH:MM" / "every Nh" / "every Nm" / "off". Same grammar as
+# schedule: "" / "off" / "disabled" / "none" / "weekly" / "daily" / "HH:MM" / "daily HH:MM" / "Nh" / "Nm" / "every Nh" / "every Nm". Same grammar as
 # consolidation.refresh_cadence. "off" disables the scheduled backup timer
 # (manual backups via the CLI still work).
 #

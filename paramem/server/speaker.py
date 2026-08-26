@@ -17,12 +17,11 @@ this module only stores and matches pre-computed embeddings.
 import json
 import logging
 import math
-import re
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from paramem.backup.encryption import read_maybe_encrypted, write_infra_bytes
 from paramem.graph.prompts import _load_prompt_section
@@ -32,6 +31,12 @@ from paramem.utils.identity import (
     SPEAKER_TOKEN_RE,
     canonical,
 )
+
+if TYPE_CHECKING:
+    # Type-only: this module authors no pattern of its own — it consumes the
+    # compiled patterns declared in paramem.utils.identity and only names
+    # the stdlib match type in an annotation.
+    import re
 
 logger = logging.getLogger(__name__)
 
@@ -134,7 +139,7 @@ def resolve_speaker_tokens(
         *text* with every ``speaker{N}`` token replaced.
     """
 
-    def _sub(match: re.Match) -> str:
+    def _sub(match: "re.Match") -> str:
         token = canonical(match.group(0))
         name = speaker_store.resolve_speaker_name(token) if speaker_store else None
         if name:

@@ -37,8 +37,9 @@ For the research context, experiment results, and architecture overview see
 - **NVIDIA GPU with 8 GB+ VRAM** (tested on RTX 5070). All supported base
   models run with NF4 4-bit quantization; loading without a CUDA-capable GPU
   is not supported.
-- **CUDA toolkit via conda** — on WSL2 do not use system CUDA packages;
-  install through conda (the `environment.yml` path handles this automatically).
+- **CUDA arrives as pip wheels bundled with PyTorch** — on WSL2 never
+  install system CUDA packages; the `pip install -e` step below pulls the
+  CUDA-enabled PyTorch wheel automatically.
 - **RTX 50-series (Blackwell sm_120)?** The stable `bitsandbytes` release
   lacks native sm_120 kernels and will crash on the larger supported models.
   Install the pre-release build before continuing:
@@ -52,19 +53,20 @@ For the research context, experiment results, and architecture overview see
 
 ### Install paths
 
-**Option A — conda (recommended for full GPU stack):**
+**Option A — conda (recommended, provides the interpreter):**
 
 ```bash
 git clone https://github.com/tiberius1701d/paramem.git
 cd paramem
 conda env create -f environment.yml
 conda activate paramem
-pip install -e ".[voice,dev]"   # add voice stack + dev tools on top of conda base
+pip install -e ".[voice,dev]"
 ```
 
-`environment.yml` pins Python 3.11, PyTorch, and CUDA via the pytorch/nvidia
-conda channels. The `pip install -e` step adds the server extras not included
-in the conda recipe.
+`environment.yml` provides the Python 3.11 interpreter only. Every package,
+including PyTorch and its CUDA wheels, is installed by the `pip install -e`
+step from `pyproject.toml` — `pyproject.toml` is the one dependency
+authority for the project.
 
 **Option B — pip only:**
 
@@ -123,11 +125,10 @@ Recommended installs:
   CUDA allocator fragmentation under QLoRA training.
 - **Modern Standby (laptop GPUs).** Windows Modern Standby can power-cycle the
   GPU during idle, causing a TDR BSOD (bugcheck 0x116) if a CUDA workload is
-  active. The `acquire_gpu()` context manager (`experiments/utils/gpu_guard.py`)
-  holds `ES_CONTINUOUS | ES_SYSTEM_REQUIRED` via a background process for the
-  duration of GPU work — automatic for any experiment that uses it. A cooling
-  pad helps thermal recovery between runs (TGP is the binding constraint under
-  sustained load).
+  active. The experiment tooling's GPU hold keeps a sleep inhibitor active
+  via a background process for the duration of GPU work — automatic for any
+  experiment that uses it. A cooling pad helps thermal recovery between runs
+  (TGP is the binding constraint under sustained load).
 
 ### One-time assets
 
@@ -187,33 +188,16 @@ set (env or `.env`).
 
 ### systemd service
 
-A systemd unit template is provided at `scripts/server/paramem-server.service`,
-written as a **system**-level unit (it targets `/etc/systemd/system/` and
-runs as a fixed `User=`). Installed instead as a systemd **user** unit —
-the topology this guide and the rest of the server tooling assume — it
-needs four edits to the copy before it will start and survive a reboot:
-
-- Remove the `User=YOUR_USERNAME` line entirely — a user-manager unit
-  already runs as the session's own user; `User=` is a system-unit-only
-  directive.
-- Set `WorkingDirectory` and `ExecStart` to this host's checkout path and
-  Python interpreter (as the template already instructs).
-- Change `WantedBy=multi-user.target` to `WantedBy=default.target` —
-  `multi-user.target` does not exist in the user manager, so `enable`
-  against it writes a symlink that never activates and the unit will not
-  start at login or boot.
-- The `ExecStartPre=/bin/sh -c 'gpu-guard env > %t/paramem-gpu.env'` line
-  shells out to `gpu-guard`, a separate tool this repo does not install.
-  On a host without it, that line fails and blocks the whole unit from
-  starting. Prefix it with `-` (`ExecStartPre=-/bin/sh -c '...'`) so a
-  missing `gpu-guard` is tolerated, or delete both that line and the
-  `EnvironmentFile=-%t/paramem-gpu.env` line below it if you don't use
-  `gpu-guard` on this host.
+A systemd **user**-unit template is provided at
+`scripts/server/paramem-server.service` — the topology this guide and the
+rest of the server tooling assume. Install it, setting the two
+host-specific paths in the copy:
 
 ```bash
 mkdir -p ~/.config/systemd/user
 cp scripts/server/paramem-server.service ~/.config/systemd/user/
-# apply the four edits above to the copy
+# Set WorkingDirectory and ExecStart in the copy to this host's checkout
+# path and Python interpreter.
 
 systemctl --user daemon-reload
 systemctl --user enable --now paramem-server
@@ -222,6 +206,12 @@ systemctl --user enable --now paramem-server
 systemctl --user status paramem-server
 journalctl --user -u paramem-server -f
 ```
+
+Host-specific environment (API keys, per-host overrides) belongs in `.env`
+at the checkout root — the server loads it at startup — or, for a
+non-editable install with no `.env` to find, in an operator drop-in under
+`~/.config/systemd/user/paramem-server.service.d/` carrying `[Service]
+Environment=` lines.
 
 The restart-policy drop-in under
 `~/.config/systemd/user/paramem-server.service.d/` is written by
@@ -427,13 +417,14 @@ options. A short map of the top-level sections:
 
 #### Memory tiers
 
-Two knobs under `consolidation:` govern how a fact moves between the episodic
-and semantic adapters over its lifetime. Neither ever deletes anything.
+One knob under `consolidation:` governs how a fact moves between the episodic
+and semantic adapters over its lifetime. It never deletes anything —
+unreinforced facts fade passively through reconstruction noise as the
+adapter is retrained around them, rather than through any active removal.
 
 | Parameter | Default | Effect | When to adjust |
 |---|---|---|---|
 | `promotion_threshold` | `3` | How much standing a fact needs before it moves from the episodic adapter to the semantic one. Standing comes from being said again in a *later* conversation — repetition inside one conversation does not count — and a fact also keeps the standing of any duplicate merged into it, so consolidating two records of the same fact never costs it its place. This applies uniformly regardless of how the fact is stored — a relationship between two things and a single attribute (a phone number, an email, a job title) reinforce and promote the same way. A newly learned fact starts with one observation, so the smallest value that still means "confirmed again" is `2`; a value below that is rejected at boot, and at every point a new configuration is validated for promotion or restore (see [Config validation](#config-validation) below), when the semantic tier is enabled. | Raise to keep the semantic tier smaller and more selective, so only facts confirmed across several conversations settle there. Lower to promote sooner, at the cost of promoting things that turned out to be passing remarks — never below `2`. |
-| `decay_window` | `10` | How many consolidation cycles a fact may go unmentioned before it is logged as a decay candidate. Advisory only — nothing is deleted, and the fact stays recallable; unimportant facts fade on their own as the adapter is retrained around them. | Lower to see fading candidates sooner in the logs; raise to quieten them. Purely diagnostic — changing it does not change what the server keeps. |
 
 #### Config validation
 
@@ -474,6 +465,7 @@ The training funnel inside every consolidation fold takes its per-step hyperpara
 | `training_gradient_checkpointing` | `true` | Trades a slower training step for a smaller activation-memory footprint — the mechanism that, together with 4-bit quantization and a small per-step batch size, makes training fit the shipped 8 GB device at all. | Leave on for the shipped hardware; disabling it raises peak VRAM use and needs a device with room to spare. |
 | `training_max_grad_norm` | `1.0` | Gradient-clipping threshold applied each step. | Leave at the shipped default; a diverging training run (loss spikes or NaN) is a signal to investigate the data, not to raise this first. |
 | `training_seed` | `42` | Random seed for a fold's training run. | Change only when deliberately comparing runs under different seeds; the shipped value is not load-bearing for recall quality. |
+| `training_max_seq_length` | `1024` | The longest tokenized training example a fold will build. A longer example is cut to this length; a fold refuses to train on an example whose prompt alone already exceeds the bound, since truncating past the prompt would leave the example with no label signal at all. | Raise if your fact values run long enough to be cut; there is no reason to lower it below the shipped default. |
 
 #### Span tagger (local PII detection)
 
@@ -1052,13 +1044,11 @@ curl -X POST http://localhost:8420/gpu/release
 
 #### Deferred-mode hold and orphan recovery
 
-ML workloads started through `experiments/utils/gpu_guard.py` (or
-`scripts/dev/training-control.sh`'s resume flow) set
-`PARAMEM_EXTRA_ARGS=--defer-model` in the systemd user environment so the
-server stays cloud-only for the duration of the run.  The holder also
-stamps a PID, a start time, and a command hint so the server can tell a
-legitimate mid-training hold apart from an orphaned hold left behind by a
-killed process.
+A resumed training run sets `PARAMEM_EXTRA_ARGS=--defer-model` in the
+systemd user environment so the server stays cloud-only for the duration of
+the run. The holder also stamps a PID, a start time, and a command hint so
+the server can tell a legitimate mid-training hold apart from an orphaned
+hold left behind by a killed process.
 
 `/status` surfaces the hold as:
 

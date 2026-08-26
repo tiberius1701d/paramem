@@ -1,7 +1,7 @@
 """Consolidation loop orchestrator.
 
 Runs the full consolidation pipeline: extract graph from session,
-merge into cumulative graph, score for promotion/decay, train
+merge into cumulative graph, score for promotion, train
 episodic and semantic adapters.
 """
 
@@ -645,11 +645,10 @@ class ConsolidationLoop:
     Each cycle:
     1. Extract knowledge graph from session transcript
     2. Merge into cumulative graph
-    3. Score nodes for promotion/decay
+    3. Score nodes for promotion
     4. Generate QA training pairs from graph
     5. Train episodic adapter (new + replay)
     6. Train semantic adapter (promoted + replay)
-    7. Decay unreinforced episodic memories
     """
 
     # Class-level default so instances built via ``object.__new__`` (test
@@ -3334,7 +3333,9 @@ class ConsolidationLoop:
         """
         from paramem.training.trainer import train_adapter
 
-        examples = format_entry_training(entries, self.tokenizer, max_length=1024)
+        examples = format_entry_training(
+            entries, self.tokenizer, max_length=training_config.max_seq_length
+        )
         if not examples:
             return None, None
 
@@ -3792,8 +3793,8 @@ class ConsolidationLoop:
         tier — the every-known-key-has-a-row invariant, established at
         recall (:meth:`_recall_working_tiers`), means there is no rowless
         case left to skip here; a regression surfaces as ``KeyError`` naming
-        the key.  Logs decay candidates; deletes nothing (passive-fade
-        policy).
+        the key.  Never deletes a key — an unreinforced key is simply never
+        evicted.
 
         Does NOT mutate ``self.promoted_keys`` directly — this runs during
         STAGING, before the event is known to go live.  A key decided
@@ -3814,8 +3815,6 @@ class ConsolidationLoop:
         if "episodic" not in working or "semantic" not in working:
             return []
         threshold = self.config.promotion_threshold
-        decay_window = self.config.decay_window
-        current_cycle = self.cycle_count
         episodic = working["episodic"]
         semantic = working["semantic"]
         newly_promoted: list[str] = []
@@ -3826,7 +3825,6 @@ class ConsolidationLoop:
                 continue
             bk = episodic.rows[key]
             rec = bk.get("reinforcement_count", 1)
-            last = bk.get("last_reinforced_cycle", 0)
             if rec >= threshold:
                 row = semantic.adopt_key_from(episodic, key)
                 row["promoted"] = True
@@ -3838,15 +3836,6 @@ class ConsolidationLoop:
                     key,
                     rec,
                     threshold,
-                )
-            elif decay_window > 0 and (current_cycle - last) >= decay_window:
-                logger.info(
-                    "_promote_working_keys: key=%s decay candidate "
-                    "(last_reinforced_cycle=%d, current_cycle=%d, window=%d)",
-                    key,
-                    last,
-                    current_cycle,
-                    decay_window,
                 )
 
         for key in list(semantic.registry.list_active()):

@@ -154,7 +154,7 @@ def run(args: argparse.Namespace) -> int:
             f"  To create a key pair:  paramem generate-key\n"
             f"  Then export the env var before running encrypt-infra.\n"
             f"\n"
-            f"  See SECURITY.md for a full reset procedure.",
+            f'  See DEPLOYMENT.md, "Encryption & recovery operations" for a full reset procedure.',
             file=sys.stderr,
         )
         return 1

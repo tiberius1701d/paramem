@@ -75,8 +75,8 @@ def bookkeeping_row(
     may change it after minting; see there for the exact rule.  Default 1
     (a new key has been seen once).
     ``last_reinforced_cycle``: the most recent consolidation cycle at which
-    this key's fact was reinforced (cycle counter; drives promotion/decay).
-    Default 0 (unknown).
+    this key's fact was reinforced (cycle counter; provenance only —
+    ``reinforcement_count`` is what drives promotion). Default 0 (unknown).
     ``last_seen``: ISO 8601 wall-clock timestamp of the most recent session
     that contained this fact.  Drives contradiction detection and temporal
     reasoning.  Default ``""`` (unknown).

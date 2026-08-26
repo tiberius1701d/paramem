@@ -33,16 +33,14 @@ import os
 import re
 import stat
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
-pytestmark = pytest.mark.integration
+pytestmark = [pytest.mark.integration, pytest.mark.timeout(120)]
 
-PARAMEM_BINARY = os.environ.get(
-    "PARAMEM_BINARY",
-    str(Path.home() / "miniforge3/envs/paramem/bin/paramem"),
-)
+PARAMEM_BINARY = str(Path(sys.executable).parent / "paramem")
 
 AGE_MAGIC = b"age-encryption.org/v1\n"
 RECOVERY_BECH32_RE = re.compile(r"AGE-SECRET-KEY-1[A-Z0-9]+")
@@ -104,7 +102,7 @@ def _run(
 
 def _skip_if_binary_missing():
     if not Path(PARAMEM_BINARY).exists():
-        pytest.skip(f"paramem binary not at {PARAMEM_BINARY}; set PARAMEM_BINARY to override")
+        pytest.skip(f"paramem binary not at {PARAMEM_BINARY}")
 
 
 # ---------------------------------------------------------------------------

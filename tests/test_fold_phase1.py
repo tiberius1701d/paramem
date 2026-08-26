@@ -37,7 +37,7 @@ def _make_loop(tmp_path, *, procedural: bool = False) -> ConsolidationLoop:
     loop = object.__new__(ConsolidationLoop)
     loop.model = None
     loop.tokenizer = None
-    loop.config = ConsolidationConfig(promotion_threshold=3, decay_window=10)
+    loop.config = ConsolidationConfig(promotion_threshold=3)
     loop.training_config = TrainingConfig(
         num_epochs=1,
         gradient_checkpointing=False,
@@ -714,10 +714,9 @@ class TestPromotion:
 
     def test_below_threshold_key_is_left_on_episodic_untouched(self, tmp_path):
         """A key whose reinforcement count sits below ``promotion_threshold``
-        (and whose ``last_reinforced_cycle`` keeps the decay branch inert
-        too) falls through both branches: it is reported as no promotion,
-        stays resident on the working episodic tier, never reaches
-        semantic, and its own row is left exactly as seeded."""
+        is reported as no promotion, stays resident on the working
+        episodic tier, never reaches semantic, and its own row is left
+        exactly as seeded."""
         loop = _make_loop(tmp_path)
         loop.store.registry("episodic").add("graph1")
         loop.store.set_bookkeeping(

@@ -387,7 +387,7 @@ class TestEncodeBoundaryWeightCoupledPin:
             "predicate": "works at",
             "object": "acme corp",
         }
-        training_example = format_entry_training([entry], tokenizer)[0]
+        training_example = format_entry_training([entry], tokenizer, max_length=1024)[0]
         serving_prompt = build_inference_prompts(
             [trained_recall_template().format(key=entry["key"])], tokenizer
         )[0]

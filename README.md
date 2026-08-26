@@ -116,7 +116,7 @@ A **simulation mode** (`consolidation.mode: simulate`) stores each tier's knowle
 
 - Python 3.11+
 - GPU with 8GB+ VRAM (tested on RTX 5070)
-- CUDA toolkit (via conda on WSL2 — see [Installation](DEPLOYMENT.md#installation) in the deployment guide)
+- CUDA via the PyTorch pip wheels (see [Installation](DEPLOYMENT.md#installation) in the deployment guide)
 
 ### Install via AI agent
 
@@ -274,7 +274,7 @@ archive/              # Failed approaches (part of the research story)
 ## Hardware Requirements
 
 - **Minimum:** GPU with 8GB VRAM (QLoRA 4-bit quantization)
-- **Tested on:** NVIDIA RTX 5070, WSL2, CUDA via conda
+- **Tested on:** NVIDIA RTX 5070, WSL2, CUDA via the PyTorch pip wheels
 - **Models tested:** Gemma 2 9B Instruct, Mistral 7B Instruct v0.3, Qwen 2.5 3B
 - **Training budget:** derived per fold from the number of keys it carries; recall-based early stopping usually halts sooner
 
@@ -289,7 +289,7 @@ Platform-specific notes for Blackwell GPUs and WSL2 live under [Platform notes](
 5. **Train:** LoRA adapters learn the key→fact mapping via chat-template formatted training
 6. **Verify:** SimHash registry detects hallucination with continuous confidence scoring
 7. **Promote:** Keys whose per-key reinforcement_count reaches the promotion threshold move from the episodic to the semantic adapter at the consolidation fold
-8. **Review:** keys not reinforced within `consolidation.decay_window` cycles are reported; nothing is removed automatically
+8. **Fade:** a key that stops being reinforced is never evicted; it fades passively through reconstruction noise as the adapter is retrained around it
 
 ## Prompt Engineering
 

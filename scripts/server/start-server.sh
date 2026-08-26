@@ -10,9 +10,10 @@
 #   PARAMEM_CONFIG  — Server config path (default: configs/server.yaml)
 #
 # For persistent deployment, install the systemd service instead:
-#   sudo cp scripts/server/paramem-server.service /etc/systemd/system/
-#   sudo systemctl daemon-reload
-#   sudo systemctl enable --now paramem-server
+#   mkdir -p ~/.config/systemd/user
+#   cp scripts/server/paramem-server.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now paramem-server
 
 set -euo pipefail
 cd "$(dirname "$0")/../.."
@@ -20,8 +21,8 @@ cd "$(dirname "$0")/../.."
 source .env 2>/dev/null || true
 # Machine-level GPU env (PYTORCH_CUDA_ALLOC_CONF, HF_DEACTIVATE_ASYNC_LOAD,
 # …) lives in ~/.config/gpu-guard/config.toml [env].  Soft fallback when
-# gpu-guard is not installed; the systemd path is the production deployment
-# and uses the [env] file directly via ExecStartPre + EnvironmentFile.
+# gpu-guard is installed on this host; the shipped systemd template takes
+# host environment from .env or an operator drop-in instead.
 if command -v gpu-guard >/dev/null 2>&1; then
     eval "$(gpu-guard env --export)"
 fi

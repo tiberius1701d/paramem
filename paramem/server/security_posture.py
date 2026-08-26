@@ -114,8 +114,8 @@ def assert_startup_posture(
             f"  - If no key exists yet, run: paramem generate-key\n"
             f"  - OR set security.require_encryption: false to fall back to AUTO posture.\n"
             f"\n"
-            f"See SECURITY.md for a full reset procedure that\n"
-            f"preserves speaker_profiles.json."
+            f'See DEPLOYMENT.md, "Encryption & recovery operations" for a\n'
+            f"full reset procedure that preserves speaker_profiles.json."
         )
 
     try:
@@ -135,6 +135,6 @@ def assert_startup_posture(
             f"    `paramem generate-key` / the most recent `paramem change-passphrase`.\n"
             f"  - If the daily key file is corrupt, recover via: paramem restore --help\n"
             f"\n"
-            f"See SECURITY.md for a full reset procedure that\n"
-            f"preserves speaker_profiles.json."
+            f'See DEPLOYMENT.md, "Encryption & recovery operations" for a\n'
+            f"full reset procedure that preserves speaker_profiles.json."
         ) from exc

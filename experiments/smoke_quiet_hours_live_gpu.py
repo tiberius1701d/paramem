@@ -54,6 +54,7 @@ sys.path.insert(0, str(project_root))
 import torch  # noqa: E402
 
 from experiments.utils.gpu_guard import acquire_gpu as reserve_gpu  # noqa: E402
+from experiments.utils.production import wait_for_cooldown  # noqa: E402
 from experiments.utils.test_harness import setup_logging  # noqa: E402
 from paramem.server.gpu_lock import gpu_lock_sync  # noqa: E402
 from paramem.training.thermal_throttle import (  # noqa: E402
@@ -73,6 +74,7 @@ COOLDOWN_SECONDS = 25  # between phases: give the GPU time to shed heat
 THROTTLE_CHECK_EVERY = 5  # invoke _thermal_throttle every N matmul steps
 POLL_INTERVAL = 0.25  # wattage sample period
 TEMP_LIMIT = 52  # just above baseline idle — throttle fires within seconds of load
+COOLDOWN_TARGET_C = 50  # below TEMP_LIMIT, so the cooldown never masks what the smoke measures
 MIN_DELTA_WATTS = 10.0  # assertion margin
 
 
@@ -180,18 +182,6 @@ def _run_phase(label: str, mode: str) -> list[float]:
     return [w for _, w in poller.samples]
 
 
-def _cooldown() -> None:
-    target = 50
-    deadline = time.time() + COOLDOWN_SECONDS
-    while time.time() < deadline:
-        t = _gpu_temp()
-        if t is not None and t <= target:
-            logger.info("Cooldown: GPU at %d°C ≤ %d°C — proceeding.", t, target)
-            return
-        time.sleep(1)
-    logger.info("Cooldown: hit %ds budget, temp=%s°C — proceeding anyway.", COOLDOWN_SECONDS, t)
-
-
 def main() -> int:
     reserve_gpu(interactive=False)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -203,7 +193,7 @@ def main() -> int:
     logger.info("Baseline GPU power: %.1fW temp=%s°C", _gpu_power() or 0.0, _gpu_temp())
 
     samples_off = _run_phase("A", "always_off")
-    _cooldown()
+    wait_for_cooldown(COOLDOWN_TARGET_C, COOLDOWN_SECONDS, poll_s=1, label="quiet-hours smoke")
     samples_on = _run_phase("B", "always_on")
 
     mean_off = statistics.mean(samples_off) if samples_off else 0.0

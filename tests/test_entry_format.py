@@ -578,7 +578,7 @@ class TestFormatQuadrupleTraining:
         quads = [
             {"key": "graph1", "subject": "Alice", "predicate": "lives_in", "object": "Berlin"},
         ]
-        examples = format_entry_training(quads, mock_tokenizer)
+        examples = format_entry_training(quads, mock_tokenizer, max_length=1024)
         assert len(examples) == 1
 
     def test_multiple_quads(self, mock_tokenizer):
@@ -586,12 +586,12 @@ class TestFormatQuadrupleTraining:
             {"key": "graph1", "subject": "Alice", "predicate": "lives_in", "object": "Berlin"},
             {"key": "graph2", "subject": "Bob", "predicate": "has_job", "object": "engineer"},
         ]
-        examples = format_entry_training(quads, mock_tokenizer)
+        examples = format_entry_training(quads, mock_tokenizer, max_length=1024)
         assert len(examples) == 2
 
     def test_example_has_required_keys(self, mock_tokenizer):
         quads = [{"key": "graph1", "subject": "Alice", "predicate": "lives_in", "object": "Berlin"}]
-        examples = format_entry_training(quads, mock_tokenizer)
+        examples = format_entry_training(quads, mock_tokenizer, max_length=1024)
         for ex in examples:
             assert "input_ids" in ex
             assert "attention_mask" in ex
@@ -618,6 +618,10 @@ class _AddSpecialTokensAwareMaskBoundaryTokenizer:
     calls diverge on ``add_special_tokens`` would shift every id in the
     longer encoding by one position, breaking the token-level prefix match
     this test checks, not merely the reported prompt length.
+
+    ``truncation``/``max_length`` are honoured (unlike
+    ``TestFormatQuadrupleTraining.mock_tokenizer`` above) so this stub also
+    exercises ``_tokenize_with_prompt_masking``'s prompt-truncation guard.
     """
 
     def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True):
@@ -639,6 +643,8 @@ class _AddSpecialTokensAwareMaskBoundaryTokenizer:
         ids = list(range(len(text.split())))
         if add_special_tokens:
             ids = [-1, *ids]
+        if truncation:
+            ids = ids[:max_length]
         return {
             "input_ids": torch.tensor([ids]),
             "attention_mask": torch.ones(1, len(ids), dtype=torch.long),
@@ -716,3 +722,33 @@ class TestTokenizeWithPromptMaskingBoundarySymmetry:
         prompt_ids_consistent = tok(prompt_text, add_special_tokens=False)["input_ids"][0]
 
         assert full_ids_mismatched[:prompt_length_false].tolist() != prompt_ids_consistent.tolist()
+
+    def test_raises_when_bound_truncates_the_prompt(self):
+        """A ``max_length`` narrow enough that truncation leaves no room for
+        the assistant turn raises rather than silently producing an
+        all-masked, zero-signal example."""
+        from paramem.training.dataset import _tokenize_with_prompt_masking
+
+        tok = _AddSpecialTokensAwareMaskBoundaryTokenizer()
+
+        with pytest.raises(ValueError, match="max_length=5"):
+            _tokenize_with_prompt_masking(self._messages(), tok, max_length=5)
+
+    def test_does_not_raise_when_bound_leaves_room_for_one_answer_token(self):
+        """A ``max_length`` one token past the prompt length leaves exactly
+        one unmasked label -- the guard must not fire on this bound."""
+        from paramem.training.dataset import _tokenize_with_prompt_masking
+
+        tok = _AddSpecialTokensAwareMaskBoundaryTokenizer()
+
+        prompt_text = tok.apply_chat_template(
+            self._messages()[:-1], tokenize=False, add_generation_prompt=True
+        )
+        prompt_length = len(tok(prompt_text, add_special_tokens=False)["input_ids"][0])
+
+        result = _tokenize_with_prompt_masking(self._messages(), tok, max_length=prompt_length + 1)
+
+        labels = result["labels"]
+        assert len(labels) == prompt_length + 1
+        assert (labels[:prompt_length] == -100).all()
+        assert labels[prompt_length] != -100

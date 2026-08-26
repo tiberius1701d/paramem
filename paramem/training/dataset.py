@@ -92,6 +92,11 @@ def _tokenize_with_prompt_masking(messages: list[dict], tokenizer, max_length: i
     Returns:
         Dict with ``input_ids``, ``attention_mask``, and ``labels`` tensors
         (prompt tokens masked to ``-100``).
+
+    Raises:
+        ValueError: if truncation at *max_length* cuts into the assistant
+            turn (``prompt_length >= len(input_ids)``) — every label would
+            be masked, so the example would carry zero training signal.
     """
     from paramem.models.loader import render_chat_prompt
     from paramem.utils.tokens import encode_rendered
@@ -109,6 +114,14 @@ def _tokenize_with_prompt_masking(messages: list[dict], tokenizer, max_length: i
     input_ids = full_enc["input_ids"].squeeze()
     attention_mask = full_enc["attention_mask"].squeeze()
     prompt_length = prompt_enc["input_ids"].shape[1]
+
+    if prompt_length >= len(input_ids):
+        raise ValueError(
+            f"max_length={max_length} truncates the prompt itself "
+            f"(prompt_length={prompt_length}, encoded_length={len(input_ids)}); "
+            "every label would be masked, leaving zero training signal. "
+            "Raise training_max_seq_length."
+        )
 
     labels = input_ids.clone()
     labels[:prompt_length] = -100

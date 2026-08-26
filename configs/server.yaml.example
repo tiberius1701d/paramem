@@ -152,8 +152,9 @@ adapters:
 #
 # THE ONLY SCHEDULING KNOB — refresh_cadence
 # - `refresh_cadence` is how often a NEW interim adapter is minted (the
-#   interim tick interval). Grammar: "every Nh" / "every Nm" / "HH:MM"
-#   (daily) / "daily" / "" (manual only, no timer).
+#   interim tick interval). Grammar: "" / "off" / "disabled" / "none"
+#   (manual only, no timer) / "weekly" / "daily" / "HH:MM" / "daily HH:MM"
+#   / "Nh" / "Nm" / "every Nh" / "every Nm".
 # - The FULL consolidation period is DERIVED, not configured:
 #       full_cycle = refresh_cadence × max_interim_count
 #   Exception: when max_interim_count=0 (full-fold-only consume-pending
@@ -232,7 +233,7 @@ adapters:
 # Server refuses to start if the configured topology exceeds the GPU.
 # ============================================================================
 consolidation:
-  refresh_cadence: "12h"       # "every Nh" / "every Nm" / "HH:MM" / "daily" / "" (manual)
+  refresh_cadence: "12h"       # "" / "off" / "disabled" / "none" (manual) / "weekly" / "daily" / "HH:MM" / "daily HH:MM" / "Nh" / "Nm" / "every Nh" / "every Nm"
                                # 12h + max_interim_count=7 → full cycle every 84h (derived).
                                # At max_interim_count=0: full cycle every refresh_cadence itself.
   mode: train                  # "train" writes LoRA weights into the tier's slot; "simulate" writes graph.json into the tier's slot (no weight training)
@@ -246,22 +247,19 @@ consolidation:
                                 # to require more re-observations before a fact "graduates"
                                 # out of episodic; the minimum meaningful value is 2.
   retain_sessions: true        # archive transcripts after consolidation (false = delete)
-  decay_window: 10             # cycles before unreinforced keys decay
   refinement_enrichment: "off"  # graph-stage cloud enrichment pass, full-fold only. off|on. Requires the top-level `cloud.enabled: true` master switch to fire. Same cloud-egress risk described there — this is the flag that actually triggers the graph-content cloud call.
   refinement_normalization: "on"  # full-fold predicate-synonym collapse (one model call per candidate (s,o) group). off|on.
   refinement_contradiction: "off"  # Case-2 recency-backed contradiction: freshest last_seen wins; empty/tied → coexist. Applied at ingest, interim, and fold. off|on.
   recall_sanity_threshold: 1.0  # minimum recall fraction (0, 1] for the simulate->train active-store migration's recall gate; 1.0 = sharp (all keys must be recalled). Fold gates require exact recall and do not read this.
-  # Per-fold training-budget derivation (standard mechanism, unconditional --
-  # validated via Test 20). epochs/gradient-accumulation/lr_decay_steps are
-  # ALWAYS derived from the fold's key-triple count at the training funnel
+  # Per-fold training-budget derivation (standard mechanism, unconditional).
+  # epochs/gradient-accumulation/lr_decay_steps are ALWAYS derived from the
+  # fold's key-triple count at the training funnel
   # (N>=128 -> 30 epochs; 16-127 -> 50; <16 -> 80; batch stays 1) -- there is
-  # no fixed-budget mode and no operator ceiling (a prior max_epochs clamp
-  # was retired 2026-07-26). The >=128 bucket is anchored on production fold
-  # telemetry and the 16-127 bucket at N=21 (4 seeds, 21/21 at 50 epochs;
-  # benchmarking.md, Test 20); the rest of that band and the <16 bucket
-  # remain extrapolated. recall_early_stopping (below) is the wall-time
-  # feedback channel -- it usually terminates training before the bucket
-  # cap is reached; hit_cap telemetry records when it does not.
+  # no fixed-budget mode and no operator ceiling. Each bucket is a derived
+  # budget anchored by measurement recorded in benchmarking.md.
+  # recall_early_stopping (below) is the wall-time feedback channel -- it
+  # usually terminates training before the bucket cap is reached; hit_cap
+  # telemetry records when it does not.
   #
   # Donor seeding (standard mechanism, unconditional -- validated via
   # Test 20). A measured-cold target adapter (LoRA-B ~= 0) is seeded from
@@ -446,7 +444,7 @@ consolidation:
   # to the discard sink on debug=true, unlinked on debug=false).
   # "off" = never retire holdable sessions (safe default — voice sessions
   # accumulate until they are attributed and extracted, or cleared manually).
-  # Grammar: "every Nh" / "every Nm" / "HH:MM" / "daily" / "off".
+  # Grammar: "" / "off" / "disabled" / "none" / "weekly" / "daily" / "HH:MM" / "daily HH:MM" / "Nh" / "Nm" / "every Nh" / "every Nm".
   orphan_retirement: "off"
   # --- LoRA training hyperparameters (Test 17 recipe; formerly an in-code default) ---
   # num_epochs, gradient_accumulation_steps, and lr_decay_steps are NOT
@@ -1044,7 +1042,7 @@ vram:
 # ----------------------------------------------------------------------------
 # backups.schedule / backups.artifacts / backups.max_total_disk_gb
 # ----------------------------------------------------------------------------
-# schedule: "daily HH:MM" / "every Nh" / "every Nm" / "off". Same grammar as
+# schedule: "" / "off" / "disabled" / "none" / "weekly" / "daily" / "HH:MM" / "daily HH:MM" / "Nh" / "Nm" / "every Nh" / "every Nm". Same grammar as
 # consolidation.refresh_cadence. "off" disables the scheduled backup timer
 # (manual backups via the CLI still work).
 #

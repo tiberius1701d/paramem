@@ -1052,7 +1052,8 @@ class ConsolidationScheduleConfig(ConsolidationConfig):
     # (subject to the activity gate). Full consolidation fires every
     # refresh_cadence × max_interim_count (derived; see
     # consolidation_period_seconds / consolidation_period_string properties).
-    # Grammar: "every Nh" / "every Nm" / "HH:MM" (daily) / "daily" / "" (manual).
+    # Grammar: "" / "off" / "disabled" / "none" (manual) / "weekly" / "daily"
+    # / "HH:MM" / "daily HH:MM" / "Nh" / "Nm" / "every Nh" / "every Nm".
     refresh_cadence: str = (
         "12h"  # default: one new interim every 12h → 84h full consolidation at count=7
     )
@@ -1274,8 +1275,10 @@ class ConsolidationScheduleConfig(ConsolidationConfig):
     # (retro-claimable) or are anonymous-voice are held pending rather than
     # dropped immediately.  When a holdable session exceeds this age it is
     # retired to the discard sink (debug=True) or unlinked (debug=False).
-    # Grammar: same as refresh_cadence — "every Nh" / "every Nm" / "HH:MM" /
-    #   "daily" / "off" / "" (off = never retire holdable sessions).
+    # Grammar: same as refresh_cadence — "" / "off" / "disabled" / "none" /
+    #   "weekly" / "daily" / "HH:MM" / "daily HH:MM" / "Nh" / "Nm" /
+    #   "every Nh" / "every Nm" (off/""/disabled/none = never retire
+    #   holdable sessions).
     # Default "off" matches the pre-change behaviour: holdable sessions were
     # simply never extracted; now they are explicitly held indefinitely.
     orphan_retirement: str = "off"
@@ -2020,7 +2023,6 @@ class ServerConfig:
         """
         return ConsolidationConfig(
             promotion_threshold=self.consolidation.promotion_threshold,
-            decay_window=self.consolidation.decay_window,
             refinement_enrichment=self.consolidation.refinement_enrichment,
             refinement_normalization=self.consolidation.refinement_normalization,
             refinement_contradiction=self.consolidation.refinement_contradiction,
@@ -2255,6 +2257,11 @@ def build_server_config(raw: dict, *, source_path: str | Path) -> ServerConfig:
             "removed. A resumed consolidation event reads its own stage "
             "ledger rather than retrying a bounded number of times. Remove "
             "`consolidation_retry_cap` from your config file."
+        ),
+        "decay_window": (
+            "config error: `consolidation.decay_window` was removed. "
+            "Unreinforced keys are never evicted. Remove "
+            "`consolidation.decay_window` from your config file."
         ),
     }
     for _retired_key, _message in _retired_consolidation_keys.items():

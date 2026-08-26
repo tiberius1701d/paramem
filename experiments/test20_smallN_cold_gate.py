@@ -125,11 +125,12 @@ is a strict prefix of the N=12 arm, so smaller arms stay comparable and
 the 3 keys have DISTINCT predicates, never near-duplicates). Requesting
 N > 12 fails loud. Built via the same entry/prompt path production uses:
 ``paramem.memory.entry.format_entry_training`` (the live recall template
-at ``entry.py:113``, ``"Recall the fact stored under key '{key}'."``) —
+at ``entry.py``, ``"Recall the fact stored under key '{key}'."``) —
 mirroring the production call path at
 ``paramem.training.consolidation.py::ConsolidationLoop._train_tier_adapter``
-(~line 7086: ``format_entry_training(entries, tokenizer, max_length=1024)``
--> ``IndexedDataset`` -> ``train_adapter``).
+(``format_entry_training(entries, tokenizer,
+max_length=training_config.max_seq_length)`` -> ``IndexedDataset`` ->
+``train_adapter``).
 
 The real key set (``--entries-json``)
 ----------------------------------------
