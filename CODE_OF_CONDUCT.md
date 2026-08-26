@@ -6,8 +6,8 @@ Please read the full text at the link above. In summary: be respectful, construc
 
 ## Reporting
 
-If you experience or witness unacceptable behavior, please open a GitHub issue or contact the maintainers directly.
+Report unacceptable behaviour privately to `tobias.preusser75@gmail.com`. Reports are handled confidentially; do not open a public issue for a code-of-conduct concern.
 
 ## Enforcement
 
-Project maintainers will review and address reported issues promptly and fairly.
+The project maintainer reviews every report, decides the response, and communicates the outcome to the reporter. Responses follow the Contributor Covenant's enforcement ladder, up to and including a permanent ban.

@@ -17,8 +17,7 @@ For the research context, experiment results, and architecture overview see
    - [Backup & Migration](#backup--migration)
    - [Encryption & recovery operations](#encryption--recovery-operations)
    - [Per-user token management](#per-user-token-management)
-   - [Enabling Web Push](#enabling-web-push)
-   - [Troubleshooting](#troubleshooting)
+   - [Health](#health)
    - [GPU Lifecycle](#gpu-lifecycle)
    - [API](#api)
    - [Home Assistant Integration](#home-assistant-integration)
@@ -41,14 +40,15 @@ For the research context, experiment results, and architecture overview see
 - **CUDA toolkit via conda** — on WSL2 do not use system CUDA packages;
   install through conda (the `environment.yml` path handles this automatically).
 - **RTX 50-series (Blackwell sm_120)?** The stable `bitsandbytes` release
-  lacks native sm_120 kernels and will crash on models ≥ 3 B parameters.
+  lacks native sm_120 kernels and will crash on the larger supported models.
   Install the pre-release build before continuing:
   ```bash
   pip install bitsandbytes --upgrade --pre
   # or from source:
   pip install git+https://github.com/bitsandbytes-foundation/bitsandbytes.git
   ```
-  This is a build-infrastructure gap (native sm_120 kernels vs PTX JIT), not a correctness issue; the standard `pip install` works once bitsandbytes 0.50.0 ships.
+  Once a stable release carries native sm_120 kernels, the standard
+  `pip install` is sufficient.
 
 ### Install paths
 
@@ -117,9 +117,8 @@ Recommended installs:
   ```bash
   HF_DEACTIVATE_ASYNC_LOAD=1
   ```
-  As of NVIDIA driver 596.36 + Windows 11 KB5088467 (2026-04), this race no
-  longer reproduced on our test host — try without it first, and only enable if
-  you see the error.
+  Recent driver and Windows builds are not known to reproduce it — try
+  without the setting first, and enable it only if you see the error.
 - Set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` in `.env` to reduce
   CUDA allocator fragmentation under QLoRA training.
 - **Modern Standby (laptop GPUs).** Windows Modern Standby can power-cycle the
@@ -176,26 +175,70 @@ only needed when you want to diverge from the ship-safe defaults.
 python examples/quick_start.py
 ```
 
-`quick_start.py` injects facts via `POST /chat`, runs the real pipeline via
-`POST /consolidate/interim` (extraction → indexed-key training → recall, all per
-`server.yaml`), then asserts recall via `POST /debug/probe`, exiting non-zero
-on failure. Prerequisites: server running, `debug: true` in the active
-`server.yaml`, and `PARAMEM_API_TOKEN` set (env or `.env`).
+`quick_start.py` is a fresh-install check only — it refuses to run against a
+populated store (`keys_count == 0` and `pending_sessions == 0`; point it at
+an empty `paths.data` directory). It injects facts via `POST /chat`, runs
+the real pipeline via `POST /consolidate/interim` (extraction → indexed-key
+training → recall, all per `server.yaml`), then asserts keyed recall via
+`GET /debug/dump` and `POST /debug/recall` and abstention on absent facts
+via `POST /debug/probe`, exiting non-zero on failure. Prerequisites: server
+running, `debug: true` in the active `server.yaml`, and `PARAMEM_API_TOKEN`
+set (env or `.env`).
 
 ### systemd service
 
-A systemd user service file is provided at
-`scripts/server/paramem-server.service`. To enable the server to start with
-your user session (or at boot — see `headless_boot` in `server.yaml`):
+A systemd unit template is provided at `scripts/server/paramem-server.service`,
+written as a **system**-level unit (it targets `/etc/systemd/system/` and
+runs as a fixed `User=`). Installed instead as a systemd **user** unit —
+the topology this guide and the rest of the server tooling assume — it
+needs four edits to the copy before it will start and survive a reboot:
+
+- Remove the `User=YOUR_USERNAME` line entirely — a user-manager unit
+  already runs as the session's own user; `User=` is a system-unit-only
+  directive.
+- Set `WorkingDirectory` and `ExecStart` to this host's checkout path and
+  Python interpreter (as the template already instructs).
+- Change `WantedBy=multi-user.target` to `WantedBy=default.target` —
+  `multi-user.target` does not exist in the user manager, so `enable`
+  against it writes a symlink that never activates and the unit will not
+  start at login or boot.
+- The `ExecStartPre=/bin/sh -c 'gpu-guard env > %t/paramem-gpu.env'` line
+  shells out to `gpu-guard`, a separate tool this repo does not install.
+  On a host without it, that line fails and blocks the whole unit from
+  starting. Prefix it with `-` (`ExecStartPre=-/bin/sh -c '...'`) so a
+  missing `gpu-guard` is tolerated, or delete both that line and the
+  `EnvironmentFile=-%t/paramem-gpu.env` line below it if you don't use
+  `gpu-guard` on this host.
 
 ```bash
-# Install and start
+mkdir -p ~/.config/systemd/user
+cp scripts/server/paramem-server.service ~/.config/systemd/user/
+# apply the four edits above to the copy
+
+systemctl --user daemon-reload
 systemctl --user enable --now paramem-server
 
 # Status
 systemctl --user status paramem-server
 journalctl --user -u paramem-server -f
 ```
+
+The restart-policy drop-in under
+`~/.config/systemd/user/paramem-server.service.d/` is written by
+`scripts/server/start-server.sh` (via `scripts/setup/server-restart-reconcile.sh`),
+not by the unit's own `ExecStart`. Starting the server through the unit
+directly gets no drop-in unless you run
+`bash scripts/setup/server-restart-reconcile.sh` yourself first (or once,
+after editing `process.restart` in `server.yaml`) — the unit's `ExecStart`
+invokes `python -m paramem.server.app` directly and never calls that
+script. The same gap applies to surviving a reboot: systemd user units
+only start at boot with linger enabled, and linger is reconciled by
+`scripts/setup/headless-boot.sh`, itself only invoked from
+`start-server.sh` — never by the unit. Run `bash
+scripts/server/start-server.sh` once after installing the unit (it
+reconciles both the drop-in and linger and then hands off to the same
+`python -m paramem.server.app` the unit runs), or enable linger directly
+with `loginctl enable-linger $USER` if you'd rather not run that script.
 
 ---
 
@@ -219,36 +262,41 @@ detection automatically.
 | `gemma4` | `principled-intelligence/gemma-4-E4B-it-text-only` | nf4, no cpu_offload |
 | `qwen3-4b` | `Qwen/Qwen3-4B-Instruct-2507` | nf4, no cpu_offload |
 
-All entries verified against `MODEL_REGISTRY` in
-`paramem/server/config.py` lines 52–111.
+**8 GB VRAM implication.** A model too large to hold on the device alongside
+the adapter stack and the voice pipeline must be configured for CPU offload
+(`gemma` is the only such entry in the current registry). Do not add a model
+of that size without offload configured — the startup VRAM check does not
+refuse the boot; it degrades the server to cloud-only (local recall off, HA
+and cloud legs still serving) and raises an attention item on `/status`.
 
-**8 GB VRAM implication.** Models with a working set larger than ~7 GB must
-use `cpu_offload=True` with explicit `max_memory` limits (`gemma` is the only
-such entry in the current registry). Models without offload fit on the 8 GB
-device in NF4 with room for the adapter stack, KV cache, and STT/TTS residency.
-Do not add a model with a >7 GB working set without setting `cpu_offload=True`
-and verifying the startup VRAM topology check passes.
+**Switching to a new model on a store that already holds keys is not a
+config-and-restart operation.** The section above describes an empty-store
+switch. On a store with recalled facts already in it, changing `model:`
+must go through the guarded base-swap migration
+(`paramem migrate <candidate>` → preview → confirm — every adapter is
+retrained on the new base and gated at 100% recall before the swap
+commits) rather than a raw restart; see
+[Base-model swaps](#backup--migration) below.
 
 ### Adding a new model
 
-Add one `ModelConfig` entry to `MODEL_REGISTRY` in
-`paramem/server/config.py`. The required fields:
-
-```python
-"my-model": ModelConfig(
-    model_id="org/Model-Name",       # HuggingFace model id
-    quantization="nf4",              # always nf4 for 8 GB devices
-    compute_dtype="bfloat16",        # bfloat16 is the validated default
-    trust_remote_code=True,          # required for most community models
-    cpu_offload=False,               # set True + max_memory_* for >7 GB models
-    # max_memory_gpu="7GiB",         # only when cpu_offload=True
-    # max_memory_cpu="20GiB",        # only when cpu_offload=True
-),
-```
-
-**Chat-template and system-role detection is automatic.** The loader calls
-`tokenizer.apply_chat_template()` and introspects the tokenizer's chat
-template for system-role support — no per-model code change is needed.
+A base model not in the table above needs one addition to the model
+registry in `paramem/server/config.py`. Give the new entry: the
+HuggingFace model id; the quantization scheme (`nf4` for an 8 GB
+device — every shipped entry uses it); the compute dtype (`bfloat16` is the
+validated default); whether the model needs `trust_remote_code` (most
+community models do); and, only for a model whose working set exceeds the
+device's spare capacity, `cpu_offload` plus the GPU/CPU memory split to
+offload into (`gemma` is the only shipped entry that needs this). Two
+properties are worth knowing before you add one: chat-template and
+system-role support are detected automatically from the tokenizer, so no
+per-model code is needed for those; and a model that needs offload but
+doesn't get it is degraded to cloud-only by the startup VRAM check, not
+crashed (see [8 GB VRAM implication](#switching-models-yaml-only) above).
+Once the entry exists, set `model:` in `server.yaml` to the new key and
+restart — on an **empty** store. On a store that already holds keys, the
+same `model:` change is a base-swap migration, not a restart; see
+[Switching models](#switching-models-yaml-only) above.
 
 **`target_modules` override.** The adapter stack defaults to the attention
 projection layers `["q_proj", "v_proj", "k_proj", "o_proj"]` (attention-only
@@ -297,22 +345,20 @@ adapters:
 ```
 
 **Invariants:**
-- `alpha = 2 × rank` — validated across the Test 1–8 campaign. Deviating
-  from this ratio degrades indexed-key recall.
-- **Minimum 30 epochs for indexed keys.** The validated training budget from
-  Test 1–8 for large-N folds (`loss convergence ≠ fact encoding` — loss
-  plateaus at ~15 epochs; 30 epochs are required for 100% indexed-key
-  recall). The training funnel derives this automatically per fold from the
-  key-triple count (`paramem.utils.config._BUDGET_TABLE`: N≥128 → 30 epochs;
-  16–127 → 50; <16 → 80 — smaller folds get a LARGER derived budget, not a
-  smaller one), unconditionally and unclamped — there is no operator
-  ceiling. `hit_cap` telemetry and recall-based early stopping are the
-  wall-time feedback channels: early stopping usually terminates training
-  before the bucket cap is reached, and `hit_cap` telemetry records when it
-  does not.
-- **Procedural is disabled by default** in new deployments that haven't
-  yet collected behavioral data. Enable once the episodic/semantic tiers
-  are stable.
+- `alpha = 2 × rank`. Deviating from this ratio degrades indexed-key recall.
+- **Training length is derived, not configured.** Loss convergence does not
+  mean facts are encoded — a fold that stops training at its loss plateau
+  will not reach full indexed-key recall. Each fold's epoch budget is set
+  from the number of keys it trains, with smaller folds trained longer than
+  larger ones (128 keys or more trains for 30 epochs; 16–127 keys for 50;
+  fewer than 16 for 80). There is no operator knob for the budget itself.
+  When `consolidation.recall_early_stopping` is enabled, recall-based
+  early stopping usually ends a fold before its budget is spent; when it
+  does not, that is recorded for the operator.
+- **Procedural is enabled by default.** Disable it on a deployment that has
+  not yet collected behavioural data, and re-enable once the episodic and
+  semantic tiers are stable — disabling a tier that already holds keys is a
+  drain-first operation (see [Config validation](#config-validation)).
 - Per-tier learning rates from the example config: episodic 1e-4, procedural
   5e-5, semantic 1e-5 (slowest — consolidated knowledge).
 
@@ -337,7 +383,7 @@ curl http://localhost:8420/status
 
 The server listens on port 8420. On startup it auto-detects GPU availability — if another process holds the GPU (e.g., a training run), it starts in cloud-only mode and auto-reclaims once the GPU is free.
 
-Set `headless_boot: true` in `configs/server.yaml` to have the server come up before any interactive login. On every start, `scripts/setup/headless-boot.sh` reconciles OS-level state with the flag: it enables/disables systemd user linger, and on WSL hosts registers/removes a Windows scheduled task (`ParaMem-Start-WSL-Boot`) that launches the WSL VM at system startup. The reconciler is idempotent and non-fatal — if elevation is unavailable it WARNs with the exact manual command. When invoked without a TTY (systemd path), it pops a WSL console window so sudo can be approved interactively.
+Set `headless_boot: true` in `configs/server.yaml` to have the server come up before any interactive login. On every start through `start-server.sh`, `scripts/setup/headless-boot.sh` reconciles OS-level state with the flag: it enables/disables systemd user linger, and on WSL hosts registers/removes a Windows scheduled task (`ParaMem-Start-WSL-Boot`) that launches the WSL VM at system startup. The reconciler is idempotent and non-fatal — if elevation is unavailable it WARNs with the exact manual command. When invoked without a TTY (systemd path), it pops a WSL console window so sudo can be approved interactively.
 
 ### Configuration
 
@@ -358,23 +404,23 @@ options. A short map of the top-level sections:
 | `headless_boot` | Auto-start the server before any interactive login. Reconciles systemd linger + (WSL) a Windows startup task on every start via `scripts/setup/headless-boot.sh`. |
 | `server` | Host, port, auto-reclaim polling, restart policy. |
 | `vram` | Per-process cap fraction (`process_cap_fraction`); KV cache + activation headroom (`vram_cache_headroom_gib`, code default 1.0 GiB, shipped yaml 1.5 GiB). |
-| `model` | Base model (`mistral`, `gemma`, `qwen3b`, `gemma4`). |
+| `model` | Base model — one of the registry keys listed under [Switching models](#switching-models-yaml-only). |
 | `debug` | Diagnostics mode — `true` FORCES retention of consolidated session transcripts regardless of `consolidation.retain_sessions`, and additionally writes per-cycle debug snapshot artifacts. `false` does NOT disable transcript retention: `consolidation.retain_sessions` governs that independently (default `true`; `false` deletes transcripts after consolidation instead of archiving them). Session snapshots still write either way (envelope-encrypted under Security-ON, plaintext under Security-OFF) so mid-turn state survives graceful restarts. |
 | `paths` | Data, sessions, debug, prompts directories. |
 | `adapters` | Per-adapter `enabled` / `rank` / `alpha` / `learning_rate` / `target_modules`. |
-| `inference` | Serving-path options. `preload_cache` (default `true`): selects, once, which of the two serving reads every query uses — `true` serves from the RAM entry mirror kept warm at boot (a single `generate` for reasoning, no per-key probe); `false` turns the cache OFF AT SERVING — the boot fill never runs and every query probes the underlying adapter weights (or the on-disk graph under the simulate venue) directly instead, no fallback between the two. Two further consequences follow the choice: under `true`, a fact the server could not recall when it started is reported to the operator as an incident rather than guessed at, while every fact it did recall keeps answering normally; under `false`, each turn probes every selected key against the weights instead of reading the mirror — far slower than cache serving and not intended for interactive use, the price of validating what the weights themselves hold rather than what the mirror captured at boot. `max_response_tokens` (default `512`): ceiling on how long a single locally-generated reply may get. Sized so a worst-case reply still returns inside the 30s Home Assistant conversation timeout on the measured decode rate; a reply that reaches the ceiling is cut back to its last complete sentence rather than delivered mid-word. Raise only if your HA client timeout is raised to match and you want longer summaries; lower to tighten worst-case turn latency. `temporal_selection_enabled` (default `true`): on/off switch for date-aware recall. The date-selection step runs on every personal turn, not only ones that ask about past conversations — the model first chooses which recorded dates the current turn needs before recalling; that per-turn cost is why this switch exists. Turn off to restore prior behaviour exactly (every recalled fact probed, no date grouping). `temporal_selection_max_new_tokens` (default `160`): output cap for the internal date-selection step that runs when `temporal_selection_enabled` is on. Raise only if selections are observed to truncate. |
+| `inference` | Serving-path options. `preload_cache` (default `true`): chooses, once, where a personal answer's facts come from — `true` serves from a memory mirror built at boot; `false` reads each fact back from the adapters (or the on-disk graph under the simulate venue) on the turn itself. The two never mix. Leave it on for interactive use; turn it off to validate what the weights themselves hold, accepting a much slower turn. Under `true`, a fact the server could not account for at boot is reported as an incident rather than guessed at, and every fact it did recall keeps answering normally. `max_response_tokens` (default `512`): ceiling on a locally-generated reply. Sized so a worst-case reply still returns inside Home Assistant's own 30-second conversation-agent timeout; a reply that reaches the ceiling is cut back to its last complete sentence rather than delivered mid-word. Raise only if your HA client's own conversation timeout is also raised past 30s to match; lower to tighten the worst-case turn. `temporal_selection_enabled` (default `true`): date-aware recall — the server narrows which recorded dates a turn needs before recalling. It runs on every personal turn, not only ones asking about past conversations; turn it off to probe every recalled fact with no date narrowing. `temporal_selection_max_new_tokens` (default `160`): output cap for that date-selection step. Raise only if selections are observed to truncate. |
 | `session` | Per-conversation session lifecycle. `idle_timeout_minutes` (default `10`): the gap since a conversation's last turn after which its next turn opens a fresh session; a conversation also opens a fresh session once it grows past what one consolidation pass can take in. |
-| `consolidation` | **`refresh_cadence` is the only scheduling knob** (default `"12h"`). Full-cycle period is derived: `refresh_cadence × max_interim_count` (default 12h × 7 = 84h). `retain_sessions` (default `true`) governs whether a consolidated session's transcript is archived under the retention root or deleted — independent of `debug` (see the `debug` row above). Archived transcripts land under `data/ha/debug/episodic/cycle_<N>/run_<run_id>/sessions/` (document-ingest chunks grouped in a per-document subdirectory), or `data/ha/debug/cycle_<N>/sessions/` when `debug` is off — always the un-stamped per-cycle root, even for sessions an interim cycle consumed. `recall_sanity_threshold` (default `1.0`) is the minimum recall fraction the simulate→train migration's probe must reach before staged weights are promoted — `1.0` means every key must recall; the consolidation fold's own recall gates always require exact recall and do not read this knob; lower it only with empirical evidence. Also gates the extraction pipeline stages (plausibility, anonymization) and the thermal-throttle quiet-hours policy (`quiet_hours_mode` = `always_on`/`always_off`/`auto` with `start`/`end`). The two full-fold-only graph-refinement passes (`refinement_enrichment`, `refinement_normalization`) and their sizing knobs are covered separately below under [Graph refinement](#graph-refinement). |
-| `cloud` | **The single master switch for all cloud egress.** `cloud.enabled` (default `false`) gates every site alike — the conversation agent, per-session extraction enrichment, graph-tier enrichment and `/calibrate/enrich`. Necessary but not sufficient: each call is admitted by `evaluate_cloud_egress`, which also requires a supported provider, a model, a resolvable API key and (for OpenAI-compatible providers) an endpoint. With no provider and no key there is no cloud mode. `cloud.allow_degraded_serving` (default `false`) decides whether the cloud leg stays open when the local model becomes unavailable for a reason the operator did not choose (GPU held elsewhere, insufficient VRAM, a failed reload/apply, a persistent CUDA fault); the HA leg stays open either way, and a degraded conversation is announced once. Graph-tier enrichment (full-fold only, `consolidation.refinement_enrichment`) is one of the sites this switch gates — see [Graph refinement](#graph-refinement) below. |
-| `agents` | Cloud provider, model and credentials (`agents.cloud` + `agents.cloud_providers`) — these carry **no on-off of their own**; use `cloud.enabled`. Also `agents.ha_agent_id`, which **must point at a LOCAL HA conversation agent** — the HA hop is scrubbed under `sanitization.scrub` like the cloud hop and its reply is restored the same way, but a cloud-backed agent forwards the household's turns to a third party outside every switch above regardless of how well the payload itself is scrubbed. See `SECURITY.md §3`. |
+| `consolidation` | **`refresh_cadence` is the only scheduling knob** (default `"12h"`). Accepted forms: `"off"` (or `""` / `"disabled"` / `"none"`) to disable, `"weekly"`, `"daily"`, `"HH:MM"` / `"daily HH:MM"` for a daily anchor time, or `"Nh"` / `"Nm"` / `"every Nh"` / `"every Nm"` for an interval. Full-cycle period is derived: `refresh_cadence × max_interim_count` (default 12h × 7 = 84h). `retain_sessions` (default `true`) governs whether a consolidated session's transcript is archived under the retention root or deleted — independent of `debug` (see the `debug` row above). Archived transcripts land under `data/ha/debug/episodic/cycle_<N>/run_<run_id>/sessions/` (document-ingest chunks grouped in a per-document subdirectory), or `data/ha/debug/cycle_<N>/sessions/` when `debug` is off — always the un-stamped per-cycle root, even for sessions an interim cycle consumed. `recall_sanity_threshold` (default `1.0`) is the minimum recall fraction the simulate→train migration's probe must reach before staged weights are promoted — `1.0` means every key must recall; the consolidation fold's own recall gates always require exact recall and do not read this knob; lower it only with empirical evidence. Also gates the extraction pipeline stages (plausibility, anonymization) and the thermal-throttle quiet-hours policy (`quiet_hours_mode` = `always_on`/`always_off`/`auto` with `start`/`end`). The two full-fold-only graph-refinement passes (`refinement_enrichment`, `refinement_normalization`) and their sizing knobs are covered separately below under [Graph refinement](#graph-refinement). |
+| `cloud` | **The single master switch for all cloud egress.** `cloud.enabled` (default `false`) gates every site alike — the conversation agent, per-session extraction enrichment, graph-tier enrichment and `/calibrate/enrich`. Necessary but not sufficient: each call is additionally admitted only with a supported provider, a model, a resolvable API key and (for OpenAI-compatible providers) an endpoint. With no provider and no key there is no cloud mode. `cloud.allow_degraded_serving` (default `false`) decides whether the cloud leg stays open when the local model becomes unavailable for a reason the operator did not choose (GPU held elsewhere, insufficient VRAM, a failed reload/apply, a persistent CUDA fault); the HA leg stays open either way, and a degraded conversation is announced once. Graph-tier enrichment (full-fold only, `consolidation.refinement_enrichment`) is one of the sites this switch gates — see [Graph refinement](#graph-refinement) below. |
+| `agents` | Cloud provider, model and credentials (`agents.cloud` + `agents.cloud_providers`) — these carry **no on-off of their own**; use `cloud.enabled`. Also `agents.ha_agent_id`, which **must point at a LOCAL HA conversation agent** — the HA hop is scrubbed under `sanitization.scrub` like the cloud hop and its reply is restored the same way, but a cloud-backed agent forwards the household's turns to a third party outside every switch above regardless of how well the payload itself is scrubbed. See [SECURITY.md — Trust boundaries](SECURITY.md#trust-boundaries). |
 | `tools.ha` | HA URL, token, language filter, entity allowlist, tool timeout. |
 | `sanitization` | External-egress policy. `cloud_mode` (`block` / `anonymize` / `both`, default `block`) decides what may leave via the **cloud** leg: `block` drops personal queries and sends the rest verbatim, `anonymize` placeholders outbound text via the local detection model and de-anonymizes the reply, `both` does both. The **HA** leg is independent of `cloud_mode`: it is always scrubbed under `scrub` and its reply is always restored, on every turn regardless of the personal verdict — entity and area names Home Assistant itself registered stay readable in the text sent to it, so device control keeps working for person-named devices. `scrub` is the PII vocabulary the anonymizer works from, shared by both legs — several related `scrub` entries (e.g. every person-name-flavoured hint) group into one category, but the payload is scanned in one detection pass regardless of how many categories are configured; `scrub` decides *what* is marked, not how much work it costs. A hint that no `configs/schema.yaml` category claims is refused at config load rather than silently scrubbing nothing — a config carrying `place name`, `city`, or `location name` (never part of the shipped default) is refused and those hints must be removed. A query counts as personal when either the intent classifier or the known-entity / first-person detector says so — one verdict, computed once. The first-person check is encoder-based and multilingual when the encoder is loaded; falls back to an English token-set. See `personal_referent` below. The policy applies whether or not the local model is resident — a cloud-only deferral changes nothing about which queries are refused or scrubbed. If no detection model is available, the affected leg is refused rather than sent unscrubbed, and an incident is raised — this applies to the HA leg too, since it scrubs unconditionally. An enrolled speaker's own name leaves as their anonymous identifier and is restored to their display name in the reply. |
-| `intent` | Intent classifier — HA fast-path + content-driven residual. `intent.mode: llm` (default) uses the loaded local LLM with `configs/prompts/intent_classifier.txt`; robust to paraphrase and novel phrasings, no exemplar maintenance. `intent.mode: embeddings` uses the multilingual sentence encoder (`intfloat/multilingual-e5-small`) vs per-class exemplar bank under `configs/intents/<class>.<lang>.txt`; cheaper per query but brittle on shapes the operator hasn't anticipated. In local mode the encoder is loaded regardless of `intent.mode` and reused by `sentence_type` and `personal_referent`, and `llm` mode auto-falls back to `embeddings` when no local model is registered. In **cloud-only** mode none of these encoders is loaded at all, so `classify_intent` returns `UNKNOWN` — cloud-only mode holds no reachable stored knowledge, and the egress policy (`sanitization` above) still applies to every turn. With no encoder loaded, the personal-referent check falls back to an English token set, so a self-referential query written in another language may not be recognised; a server that released the GPU keeps its encoder and its multilingual verdict. |
+| `intent` | Intent classifier — HA fast-path + content-driven residual. `intent.mode: llm` (the shipped default; the built-in default is `embeddings`) uses the loaded local LLM with `configs/prompts/intent_classifier.txt`; robust to paraphrase and novel phrasings, no exemplar maintenance. `intent.mode: embeddings` uses the multilingual sentence encoder (`intfloat/multilingual-e5-small`) vs per-class exemplar bank under `configs/intents/<class>.<lang>.txt`; cheaper per query but brittle on shapes the operator hasn't anticipated. In local mode the encoder is loaded regardless of `intent.mode` and reused by `sentence_type` and `personal_referent`, and `llm` mode auto-falls back to `embeddings` when no local model is registered. In **cloud-only** mode none of these encoders is loaded at all, so intent classification returns `UNKNOWN` — cloud-only mode holds no reachable stored knowledge, and the egress policy (`sanitization` above) still applies to every turn. With no encoder loaded, the personal-referent check falls back to an English token set, so a self-referential query written in another language may not be recognised; a server that released the GPU keeps its encoder and its multilingual verdict. |
 | `sentence_type` | Encoder-based interrogative-vs-non-interrogative classifier with exemplars under `configs/sentence_types/<class>.<lang>.txt`. Adding a language is one new file pair, no code change. Falls back to terminal-punctuation + English first-word lexicon when the encoder isn't available. |
-| `personal_referent` | Encoder-based about-speaker-vs-not-about-speaker classifier with exemplars under `configs/personal_referent/<class>.<lang>.txt`. Closes the multilingual hole in the sanitizer: German / Mandarin / Spanish / etc. self-referential queries are blocked at the cloud-egress gate even though the legacy English token-set wouldn't match. Falls back to that token-set when the encoder isn't available. |
+| `personal_referent` | Encoder-based about-speaker-vs-not-about-speaker classifier with exemplars under `configs/personal_referent/<class>.<lang>.txt`. A self-referential query in German, Mandarin, Spanish and the other exemplar languages is recognised as personal and blocked at the cloud-egress gate. Falls back to an English token set when the encoder isn't available. |
 | `abstention` | Deterministic canned-response guard against confabulation on a personal interrogative parametric memory cannot answer. `enabled` (default `true`). Three messages, each `*_file` (default under `configs/prompts/`) with a `*_override` that pins the text inline instead: `response_file` (a known speaker, coverage gap — this query missed their facts), `cold_start_response_file` (a known speaker with no facts yet), `no_identity_response_file` (no speaker resolved at all — fired on the relay path; NOT gated on `enabled`, since refusing there is a structural impossibility — no identity, no store — not a feature toggle). |
-| `text_lang_detection` | fastText `lid.176` detector for the text-only `/chat` path. STT carries Whisper's language signal on audio; pure-text requests had no equivalent and fell through to English regardless of input language. Eager-loaded at server startup when `enabled` is true (CPU-only, ~126 MB resident, zero VRAM cost). One-time setup: `bash scripts/setup/download-langid-model.sh`. Disabled by default so deployments without the model file do not warn. |
-| `mobile_pwa` | Progressive Web App configuration. `enabled` (default `false`): serve the static PWA shell at `/app` and activate per-user cookie/bearer-token auth (see `SECURITY.md §5`). `static_dir` (default: bundled `paramem/web/static`): filesystem path to the compiled static bundle. `cookie_name` (default: `paramem_token`): name of the cookie the middleware will accept if the client presents one; the server does not issue this cookie — tokens are carried via the `Authorization: Bearer` header in practice. `push_enabled` (default `false`): enable Web Push lock-screen notifications — set to `true` together with `enabled` to activate the `/push/subscribe` endpoint; the VAPID keypair is auto-generated and persisted (see `SECURITY.md §5`). `vapid_contact` (default `mailto:admin@localhost`): operator contact URI in the VAPID JWT; set to your own `mailto:` address. |
+| `text_lang_detection` | fastText `lid.176` detector for the text-only `/chat` path, which carries no language signal of its own (audio turns get one from STT). Eager-loaded at server startup when `enabled` is true; CPU-only, no VRAM cost. One-time setup: `bash scripts/setup/download-langid-model.sh`. Disabled by default so deployments without the model file do not warn. |
+| `mobile_pwa` | Progressive Web App configuration. `enabled` (default `false`): serve the static PWA shell at `/app` and activate per-user cookie/bearer-token auth (see [SECURITY.md — Authentication & authorization](SECURITY.md#authentication--authorization)). `static_dir` (default: bundled `paramem/web/static`): filesystem path to the compiled static bundle. `cookie_name` (default: `paramem_token`): name of the cookie the middleware will accept if the client presents one; the server does not issue this cookie — tokens are carried via the `Authorization: Bearer` header in practice. `push_enabled` (default `false`): enable Web Push lock-screen notifications — set to `true` together with `enabled` to activate the `/push/subscribe` endpoint; the VAPID keypair is auto-generated and persisted (see [SECURITY.md — Authentication & authorization](SECURITY.md#authentication--authorization)). `vapid_contact` (default `mailto:admin@localhost`): operator contact URI in the VAPID JWT; set to your own `mailto:` address. |
 | `voice` | Per-speaker greeting cadence and per-language greeting text (`voice.greetings`). |
 | `speaker` | pyannote thresholds, enrollment flow, embedding caps. |
 | `stt`, `tts` | Whisper model + Wyoming port; Piper/MMS voices per language. |
@@ -411,12 +457,27 @@ Two post-merge passes over the consolidation fold's cumulative graph, both under
 |---|---|---|---|
 | `refinement_enrichment` | `off` | Cross-session second-order relations + `same_as` entity-coreference discovery via a cloud call over the merged graph. Requires `cloud.enabled: true` to fire at all. | Enable when interim-cycle session-tier enrichment isn't surfacing cross-session inferences you expect; cost is cloud egress of graph content (see `SECURITY.md`). |
 | `refinement_normalization` | `on` | Collapses synonym predicates (e.g. "likes"/"enjoys") sharing a subject/object pair. Runs **after** enrichment so a cloud-coined predicate synonym is collapsed before the fold mints keys from the graph. | Disable only if a deployment relies on predicate surface being preserved verbatim; the default is safe to leave on. |
-| `graph_enrichment_neighborhood_hops` | `2` | Ego-graph radius the enrichment pass chunks around each focal entity. | Raise for more cross-entity context per cloud call (higher cost); lower to reduce cost/latency on a smaller deployment. |
+| `graph_enrichment_neighborhood_hops` | `2` | How far out from each focal entity the enrichment pass gathers context. | Raise for more cross-entity context per cloud call (higher cost); lower to reduce cost/latency on a smaller deployment. |
 | `graph_enrichment_max_entities_per_pass` | `50` | Bounds how many high-recurrence entities — and therefore how many cloud calls — one enrichment pass considers. | Lower to bound cost/latency on a large graph; raise for more thorough cross-session coverage per fold. |
+
+#### LoRA training hyperparameters
+
+The training funnel inside every consolidation fold takes its per-step hyperparameters from `consolidation:` in `server.yaml`. Epoch count, gradient-accumulation steps, and LR-decay step count are **not** operator-configurable — they're derived automatically per fold from how many keys it trains (see [Training length is derived, not configured](#tuning-lora-adapters) above).
+
+| Parameter | Default | Effect | When to adjust |
+|---|---|---|---|
+| `consolidation.recall_early_stopping` | `false` | Halts a fold once the staged adapter has memorised its full key set for enough consecutive recall probes, rather than always running its full derived epoch budget. Off means every fold trains its complete budget regardless of how early it reaches full recall. | Enable once you've watched a full cycle complete cleanly on your deployment, to save training wall time on every fold after that. |
+| `training_batch_size` | `1` | Per-device micro-batch size fed to the trainer each step. On the shipped 8 GB hardware this is the value that fits; the effective batch size is reached through gradient accumulation (derived, not a separate knob) rather than by raising this. | Raise only on a device with materially more VRAM than the shipped target; on the shipped hardware, leave at `1`. |
+| `training_warmup_steps` | `0` | Absolute step count of learning-rate warmup at the start of each fold. `0` means warmup is off. | Leave at the shipped default — every adapter in production was trained at zero warmup; turning it on needs the affected tiers re-validated before trusting the result. |
+| `training_lr_scheduler_type` | `linear` | Shape of the learning-rate schedule across a fold's derived epoch budget. | Leave at `linear` for indexed-key training — a constant schedule has been observed to oscillate around the precision threshold recall needs. |
+| `training_weight_decay` | `0.1` | Regularization strength applied by the optimizer. | Leave at the shipped default for indexed-key folds; only revisit alongside a full extended-training re-validation. |
+| `training_gradient_checkpointing` | `true` | Trades a slower training step for a smaller activation-memory footprint — the mechanism that, together with 4-bit quantization and a small per-step batch size, makes training fit the shipped 8 GB device at all. | Leave on for the shipped hardware; disabling it raises peak VRAM use and needs a device with room to spare. |
+| `training_max_grad_norm` | `1.0` | Gradient-clipping threshold applied each step. | Leave at the shipped default; a diverging training run (loss spikes or NaN) is a signal to investigate the data, not to raise this first. |
+| `training_seed` | `42` | Random seed for a fold's training run. | Change only when deliberately comparing runs under different seeds; the shipped value is not load-bearing for recall quality. |
 
 #### Span tagger (local PII detection)
 
-The local anonymizer's SCAN step is a CPU-resident detection model, configured under `span_tagger:`. It loads once per process, only on a configuration that has an external-egress path needing scrubbing — HA or cloud (an empty `sanitization.scrub`, or every egress path unreachable, boots with no model download at all).
+The local anonymizer's detection model runs on CPU and is configured under `span_tagger:`. It loads once per process, only on a configuration that has an external-egress path needing scrubbing — HA or cloud (an empty `sanitization.scrub`, or every egress path unreachable, boots with no model download at all).
 
 | Parameter | Default | Effect | When to adjust |
 |---|---|---|---|
@@ -426,33 +487,28 @@ The local anonymizer's SCAN step is a CPU-resident detection model, configured u
 | `span_tagger.threads` | `8` | CPU threads the detector may use. Process-wide — applied once, at load. | Host-dependent: too many oversubscribes the machine and gets slower, not faster; tune down on a host with fewer cores rather than assuming more threads helps. |
 
 Config loading is strict: an unknown key anywhere in `configs/server.yaml`
-raises `TypeError` at boot rather than being silently ignored. This means a
-config field removed in a later release (e.g. the `extraction_verify_anonymization`
-/ `extraction_ner_check` / `extraction_ner_model` consolidation knobs, retired
-in favour of the unified anonymization table — spaCy NER is gone from the
-pipeline entirely, not an optional extra) will fail to boot an existing
-deployment's `configs/server.yaml` until the stale keys are deleted from it.
-When upgrading, diff your local `configs/server.yaml` against the current
-`configs/server.yaml.example` and remove any key the template no longer
-documents.
+refuses the boot rather than being silently ignored. A key the current
+release does not define will therefore stop an existing deployment's config
+from booting. When upgrading, diff your local `configs/server.yaml` against
+the current `configs/server.yaml.example` and remove any key the template
+does not document.
 
 The `process.restart` block controls the systemd restart policy baked into
 `~/.config/systemd/user/paramem-server.service.d/restart.conf` on each server
 start. Key knobs: `on_failure` (retry on crash vs. never), `max_attempts` /
 `window_seconds` (rate-limit gate), and `permanent_failure_exit_codes` (exit
-codes that are never retried — defaults to `[3]`, the `FatalConfigError` code
-raised by the encryption consistency gate). See `configs/server.yaml.example`
-for the full field reference.
+codes that are never retried — defaults to `[3]`, the code the server exits
+with when a configuration fault makes a restart pointless). See
+`configs/server.yaml.example` for the full field reference.
 
 Operational invariant: consolidation has exactly one user-facing scheduling
 knob (`consolidation.refresh_cadence`). Everything else derives from it.
 Scheduling is owned by a systemd user timer (`paramem-consolidate.timer`)
 with `Persistent=true`. A tick missed while suspended, powered off, or while
 the server itself was still starting is caught up once the server finishes
-starting — for every cadence form (daily, weekly, `HH:MM`, and interval
-cadences alike), not only uneven intervals. A duplicate or repeated tick
-inside the same schedule window is a no-op; the very first scheduled tick on
-a fresh deployment establishes the schedule without folding anything.
+starting, for every cadence form. A duplicate or repeated tick inside the
+same schedule window is a no-op; the very first scheduled tick on a fresh
+deployment establishes the schedule without folding anything.
 
 ### Routing
 
@@ -471,7 +527,7 @@ ParaMem owns memory (speaker identification, entity routing, adapter recall, con
 
 - **Two adapter tiers:** committed main adapters (`episodic` / `semantic` / `procedural`) plus short-lived **interim adapters** minted at each `refresh_cadence` tick. Interim adapters absorb new facts so recall works inside a refresh window without waiting for the full cycle. They accumulate up to `max_interim_count` (default 7), capped by VRAM.
 - **Bounded ring overflow (`interim_overflow_slack`, default 0):** when the interim ring is full (`max_interim_count` slots) up to `interim_overflow_slack` additional later-stamped overflow slots may be minted — each its own adapter, preserving temporal order — instead of immediately keeping sessions pending; the slack is included in the boot-time VRAM budget so the extension is proven to fit before the server starts. When the ring *and* its overflow are exhausted, new sessions are kept pending (lossless), not dropped. Two incidents surface the state: `interim_cap_reached` (warning) when an overflow slot was minted, `interim_overflow_pending` (failed) when capacity is fully exhausted and sessions are held pending. Both auto-resolve on the next successful full fold, which purges the ring — or on an operator-invoked `POST /interim/discard` (see [Discarding the interim ring](#discarding-the-interim-ring) below), which purges it without folding.
-- **Full-fold-only mode (`max_interim_count: 0`):** no interim adapters are minted; every cycle's sessions stay pending in the session buffer and the scheduled full fold extracts and trains them directly into the main tiers. The full cycle runs every `refresh_cadence` itself — the derived period is `refresh_cadence`, not `refresh_cadence × 0`. A non-empty `refresh_cadence` is required: the server refuses to start without one, because at count 0 the full fold is the only training venue and pending sessions would otherwise accumulate unboundedly. It also **requires `consolidation.mode: train`** — the pairing `max_interim_count: 0` + `mode: simulate` is rejected at config load, because in simulate mode the full fold does not consume pending sessions and there is no interim venue either, so ingestion would stall silently.
+- **Full-fold-only mode (`max_interim_count: 0`):** no interim adapters are minted; every cycle's sessions stay pending in the session buffer and the scheduled full fold extracts and trains them directly into the main tiers. The full cycle runs every `refresh_cadence` itself — the derived period is `refresh_cadence`, not `refresh_cadence × 0`. A `refresh_cadence` that actually schedules is required — the disabling forms (`"off"` / `""` / `"disabled"` / `"none"`) are rejected at config load here even though they're valid at count ≥ 1, because at count 0 the full fold is the only training venue and pending sessions would otherwise accumulate unboundedly. It also **requires `consolidation.mode: train`** — the pairing `max_interim_count: 0` + `mode: simulate` is rejected at config load, because in simulate mode the full fold does not consume pending sessions and there is no interim venue either, so ingestion would stall silently.
 - **`consolidation.mode` is a closed vocabulary:** `train` (persist to LoRA weights) or `simulate` (persist `graph.json` per tier). Any other value is rejected at config load rather than being silently treated as `simulate`.
 - **Nothing new → no cycle:** a full or interim consolidation is skipped when its own action has nothing to consume, in both `train` and `simulate` mode and whether the cycle was reached by the schedule or requested directly. For a full cycle that means no payload-bearing interim slot on disk (checked regardless of the current `max_interim_count`, so a slot minted before the count was lowered to 0 still counts) and, only at `max_interim_count: 0`, no pending NAMED session either; for an interim cycle it means no pending NAMED session. `POST /consolidate` and `POST /consolidate/interim` are held to the identical check their scheduled counterpart would apply — a deliberate request drops only the TIME condition (is a cycle due right now), never the CONTENT condition — so the response is `noop_*` rather than an empty GPU cycle. `POST /reconsolidate` is turned away only by an empty store, never by the absence of new material — its input is every tier's own stored keys, main and interim alike, so it dispatches with no pending session waiting. It noops (`noop_no_stored_keys`) only when no tier, main or interim, holds an active key — nothing to rebuild.
 - **Enrichment-incident arbitration:** a failed local-anonymization pass and a degraded cloud-enrichment pass surface as distinct `enrichment_degraded` incidents, so an operator watching `/status` can tell which stage needs attention. A clean or opted-out anonymization pass resolves its own incident and lets the enrichment outcome govern the other; with cloud egress disabled entirely, any still-open incident of either kind resolves the next time a session is processed, recording a reason that distinguishes a clean run from cloud being off.
@@ -488,7 +544,7 @@ ParaMem owns memory (speaker identification, entity routing, adapter recall, con
 | `POST /consolidate` | Collapse the interim slots into main memory now — the same content check the schedule uses to decide a full cycle is due, minus the deadline math: any payload-bearing interim slot on disk (or, at `max_interim_count: 0`, a pending NAMED session) is enough, whatever the schedule would say. |
 | `POST /consolidate/interim` | Absorb recent conversations into memory now. Main memory is untouched. |
 | `POST /reconsolidate` | Rebuild main memory from its own stored knowledge — a full consolidation that absorbs and reaps the interim ring exactly like an ordinary full fold, but never trains pending conversations; they stay pending, so nothing is lost by running it. Use after changing the extraction prompts or the extraction config. |
-| `POST /scheduled-tick` | The systemd user-timer entrypoint — one of two doors (the other is the boot-completion catch-up, run in-process after server startup) that let the schedule's deadline math (`_is_full_cycle_due`) decide between a full fold and an interim absorb, and carry the catch-up gate and the cadence stamp. Skipped when there is nothing new, the same way `POST /consolidate` and `POST /consolidate/interim` are. |
+| `POST /scheduled-tick` | The systemd user-timer entrypoint — one of two doors (the other is the boot-completion catch-up, run in-process after server startup) that let the schedule's own deadline decide between a full fold and an interim absorb, and carry the catch-up gate and the cadence stamp. Skipped when there is nothing new, the same way `POST /consolidate` and `POST /consolidate/interim` are. |
 
 Typical operator flow: `POST /consolidate/interim` → poll `GET /status` until `consolidating` is false → `POST /consolidate` when the interim slots should be folded into the mains, or `POST /reconsolidate` when the mains should be rebuilt from what they already hold.
 
@@ -496,13 +552,13 @@ Typical operator flow: `POST /consolidate/interim` → poll `GET /status` until 
 
 **A refusal is not an error.** These endpoints are non-blocking: they submit the run and return immediately. When the server is busy (another fold running, someone chatting, the GPU held, cloud-only mode) the response is still **200** with `status: "deferred_*"`; when there is nothing to do it is **200** with `status: "noop_*"`. `curl --fail` therefore does **not** exit non-zero on a deferral — read `status`. The only 4xx from this family is **409 `trial_active`** while a migration TRIAL is in progress. All four endpoints — `POST /reconsolidate` included — also defer with `status: "deferred_tier_unverified"` while a main memory tier's on-disk state cannot be verified against its adapter slots, but only when nothing is pending to resume — a pending consolidation event that was still in flight resumes and finishes first, the same precedence the store-quarantine case above follows; the recovery step for a tier that stays unverified is restoring the affected tier from a snapshot bundle (`POST /backup/restore`) — a same-base restore comes back online on its own, while one that also restores configuration needs a restart to converge. The destructive doors — `POST /speaker/forget`, `POST /debug/erase-keys`, `POST /interim/discard`, `POST /admin/assign-orphans`, and `POST /ingest-sessions/cancel` — stay open while a tier is unverified and no consolidation run is pending resume; while one is pending they answer **409**, naming the run and how it clears (finish it with `POST /consolidate`, or wait for the schedule; a run that keeps failing to resume is superseded by restoring a healthy backup via `POST /backup/restore`).
 
-- **Full-cycle go-live:** at the full-consolidation boundary, all interim adapters are rebuilt into the mains via replay on `all_active_keys ∪ all_interim_keys` (facts are regenerated from the merged graph each cycle, not loaded from a stored file). Each rebuilt tier is recall-sanity-checked before it is promoted, and live artifacts are not touched until every tier in the event has passed its gate — the tiers then go live together and the absorbed interim slots are reaped as part of that same step. A gate failure leaves production exactly as it was, because nothing in the event had gone live yet: there is nothing to roll back.
-- **Staging slot:** a reserved `in_training` adapter slot isolates inference from model reload during consolidation — `/chat` never blocks on training.
-- **Epoch-level resume:** `BackgroundTrainer` writes `staging_resume.json` + keeps the two most recent HF Trainer checkpoints in `bg_checkpoint_epoch/` at each epoch boundary. A crash mid-cycle, or a chat-interrupt abort of the cycle, both resume at the last completed epoch after SHA-256 fingerprint validation of the regenerated training dataset + training config. Stale state is discarded.
+- **Full-cycle go-live:** at the full-consolidation boundary, all interim adapters are rebuilt into the mains by replaying every active key the mains and the interim ring hold between them (facts are regenerated from the merged graph each cycle, not loaded from a stored file). Each rebuilt tier is recall-sanity-checked before it is promoted, and live artifacts are not touched until every tier in the event has passed its gate — the tiers then go live together and the absorbed interim slots are reaped as part of that same step. A gate failure leaves production exactly as it was, because nothing in the event had gone live yet: there is nothing to roll back.
+- **Staging slot:** a reserved staging adapter slot isolates inference from model reload during consolidation — `/chat` never blocks on training.
+- **Epoch-level resume:** progress is recorded at every epoch boundary. A crash mid-cycle, or a chat-interrupt abort, resumes at the last completed epoch — but only after the recorded progress is proven to match the training set and config that would be regenerated now; stale state is discarded.
 - **Systemd user timer:** `paramem-consolidate.timer` drives scheduling with `Persistent=true`. A trigger missed while the laptop is suspended, powered off, or still starting up is caught up once the server has finished starting, for every cadence form. A catch-up that would fall during an active migration TRIAL defers instead of running and is retried at the next real tick; the timer's own live tick (`POST /scheduled-tick`) still returns 409 `trial_active` as usual while a TRIAL is in progress.
-- **VRAM topology check + live gate:** `paramem/server/vram_validator.py` reads cache-derived predictions from `paramem/server/vram_predict.py` (HF cache size × quant factor) to assess whether base model + main adapters + `max_interim_count` + staging slot + STT + TTS + KV cache headroom fits the device pre-load. On cache miss the assessment is skipped; the live gate (`vram_guard.vram_measure` records `mem_get_info` deltas around each load + `enforce_post_load_budget` post-load) is authoritative and `sys.exit(1)`s on overrun rather than OOM mid-request.
-- **Extraction anonymize budget (`consolidation.extraction_anonymize_token_envelope`, default `8192`):** ceiling on how much work the one remaining local-model call the anonymize pass issues (session-tier extraction, graph-tier enrichment, chat egress) may take on. Sized to match the `vram` section's KV-cache headroom (`vram_cache_headroom_gib`) above — the shipped defaults for the two keys are matched to each other. This is a ceiling, not a guarantee: the call is additionally clamped to live free VRAM at call time, and a call whose rendered request would not fit inside that clamp is refused rather than issued — the anonymize pass degrades for the content that call was covering, rather than truncating it into a defective response. Raise it only alongside a matching increase in `vram.vram_cache_headroom_gib` on a host with more free VRAM to spare; there is little reason to lower it below the shipped default.
-- **Word-to-token estimate ratio (`consolidation.extraction_token_estimate_ratio`, default `3.7`):** fallback ratio used to size a payload only when no live tokenizer is available (in practice, only the CLI document ingester takes this path). It must match the value the codebase measures against internally — config load raises an error and the server refuses to start if the two disagree, so the key can never silently stop governing anything. After swapping the base model, re-measure this ratio against the new tokenizer and update both together; the server separately re-checks the live tokenizer's own ratio at boot and raises a `/status` attention item if it has drifted past the configured value, so a stale ratio doesn't go unnoticed between deliberate updates.
+- **VRAM check at startup:** before the model loads, the server estimates whether base model, main adapters, the interim ring, the staging slot, STT, TTS and cache headroom fit the device; where that estimate cannot be formed it is skipped. After each load the actual measurement is authoritative — an overrun does not fail the boot: the server releases what it loaded, degrades to cloud-only (local recall off, HA and cloud legs still serving), and raises a persistent attention item on `/status` naming the deficit.
+- **Extraction anonymize budget (`consolidation.extraction_anonymize_token_envelope`, default `8192`):** ceiling on how much text one local scrubbing call may take on — despite the config section it lives under, this governs every local scrubbing call the server issues, including chat egress, not consolidation alone. It is a ceiling, not a guarantee — a call that would not fit in the VRAM actually free at the time is refused rather than issued, and the anonymize pass degrades for the content that call covered rather than truncating it. Raise it only alongside a matching increase in `vram.vram_cache_headroom_gib`, on a host with free VRAM to spare; there is little reason to lower it.
+- **Word-to-token estimate ratio (`consolidation.extraction_token_estimate_ratio`, default `3.7`):** fallback ratio used to size a payload when no tokenizer is available. It must agree with the value the server measures for itself; config load fails and the server refuses to start if the two disagree, so the key can never silently stop governing anything. After swapping the base model, re-measure and update both together; the server also re-checks the live ratio at boot and raises a `/status` attention item if it has drifted.
 - **A dispatch resumes an interrupted run before starting anew:** when a consolidation request finds a run that was interrupted, it resumes that run first rather than starting the requested action fresh; the response names the run that actually ran, which is not necessarily the one requested, and the original request is re-evaluated on the next cycle. A run that keeps failing to resume is superseded by restoring a healthy backup via `POST /backup/restore`, whose wholesale tier rewrite discards the stuck record.
 - **The destructive doors wait for a pending run to clear:** `POST /speaker/forget`, `POST /debug/erase-keys`, `POST /interim/discard`, `POST /admin/assign-orphans`, and `POST /ingest-sessions/cancel` answer **409** naming the pending run and how it clears — finish it with `POST /consolidate`, or wait for the next scheduled tick; a run that keeps failing to resume is superseded by restoring a healthy backup via `POST /backup/restore`.
 - **A conversation-implied removal times differently from a door:** a consolidation works from the memory it recalled when it started, so a fact a conversation implies should be removed stops being served only when that run completes, and a run that is interrupted leaves what is served exactly as it was. The doors above, by contrast, stop serving the keys they name inside the request that calls them.
@@ -569,9 +625,14 @@ security:
     adapter_scope: live         # "live" = main + live interim slots; "main" = finalized mains only
     max_total_disk_gb: 20       # global cap (must be > 0); oldest slots pruned first, writes refused at/over it
     retention:
-      daily:   { keep: 7 }
-      weekly:  { keep: 4 }
-      monthly: { keep: 12 }
+      daily:         { keep: 7 }
+      weekly:        { keep: 4 }
+      monthly:       { keep: 12 }
+      yearly:        { keep: 3 }
+      pre_migration: { keep: 10 }
+      pre_base_swap: { keep: 10 }   # base-swap snapshot bundles; retention-immune for 30 days
+      trial_adapter: { keep: 5 }
+      manual:        { keep: "unlimited", max_disk_gb: 5 }
 ```
 
 A backup — scheduled, manual, or a pre-migration snapshot — is refused once the store has reached `max_total_disk_gb`; `paramem backup-prune` or raising the cap clears the refusal. A restore or a migration rollback is never blocked by it — those are undo anchors, not new accumulation. `max_total_disk_gb` must be greater than zero; to stop taking backups altogether use `schedule: "off"`.
@@ -597,9 +658,9 @@ paramem migrate-cancel      # discard a staged candidate (before confirm)
 > - **STT / TTS port change** — the Wyoming listener must rebind, so the CLI pre-flights the new port and, if it is bindable, asks you to consent to a one-shot restart; if the port is already in use it reports that instead of restarting.
 > - **`paths.data` / `paths.sessions` change** — existing data is **not** moved automatically; the CLI prints a manual-restart hint and leaves the move to you.
 
-> **Base-model swaps.** A `model:` change runs a dedicated base-swap migration (flagged Destructive in preview): each tier's graph is captured from the live adapters (Phase A), the base model is reloaded in-process to the candidate, and every adapter is retrained on the new base and gated at 100% recall before the swap commits (Phase B) — the candidate is exercised end to end. It is resumable across restarts and revertible from the pre-swap snapshot bundle (`POST /backup/restore` with `restore_config: true`; see [`SECURITY.md`](SECURITY.md)). The pre-swap bundle is **retention-immune** (same protection class as pre-migration snapshots — it survives pruning for 30 days even after a rollback clears the trial marker) and carries a `server.yaml.candidate` sidecar so the operator can pull the candidate config and retry later. Because that bundle is a full snapshot, a store already at its disk cap refuses the swap up front, at `POST /migration/confirm` (409 `disk_pressure`), rather than after the swap has started with no rollback anchor written. The gate proves recall parity, not extraction/reasoning quality on the new base — validate those separately before adopting a new base permanently. Exercised Mistral 7B → Qwen3-4B.
+> **Base-model swaps.** A `model:` change runs a dedicated base-swap migration (flagged Destructive in preview): each tier's graph is captured from the live adapters (Phase A), the base model is reloaded in-process to the candidate, and every adapter is retrained on the new base and gated at 100% recall before the swap commits (Phase B) — the candidate is exercised end to end. It is resumable across restarts and revertible from the pre-swap snapshot bundle (`POST /backup/restore` with `restore_config: true`; see [`SECURITY.md`](SECURITY.md)). The pre-swap bundle is **retention-immune** (same protection class as pre-migration snapshots — it survives pruning for 30 days even after a rollback clears the trial marker) and carries a `server.yaml.candidate` sidecar so the operator can pull the candidate config and retry later. Because that bundle is a full snapshot, a store already at its disk cap refuses the swap up front, at `POST /migration/confirm` (409 `disk_pressure`), rather than after the swap has started with no rollback anchor written. The gate proves recall parity, not extraction/reasoning quality on the new base — validate those separately before adopting a new base permanently.
 
-**A config is validated before it can be promoted.** Every candidate is constructed into a full `ServerConfig` before anything is staged or swapped, so a config that would not boot is rejected while the live server is still untouched:
+**A config is validated before it can be promoted.** Every candidate is constructed into a full, validated server configuration before anything is staged or swapped, so a config that would not boot is rejected while the live server is still untouched:
 
 | Response | Endpoint | Meaning |
 |---|---|---|
@@ -672,9 +733,72 @@ Preserved: `data/ha/speaker_profiles.json` (voice enrollment), `data/ha/tts/` (s
 
 Rollback by `mv`-ing each item back from `$SAFETY/` into `data/ha/`. Once the new state has soaked for long enough that you trust it, `rm -rf "$SAFETY"`.
 
+#### Compromised host
+
+The ordered response when this host must be assumed read by someone else —
+see [`SECURITY.md`](SECURITY.md) for the design rationale behind each step.
+
+1. **Know what's exposed.** Every plaintext secret carrier you placed on
+   this host is compromised: `.env`, a systemd drop-in, any per-secret file
+   under `~/.config/paramem/secrets/`, a QR PNG saved by `mint-user-token
+   --png`, and the daily passphrase and `daily_key.age` themselves. The
+   token store is not a carrier — `user_tokens.json` holds only a hash of
+   each token, never the plaintext — but every token whose plaintext value
+   you copied to a file, a screen, or a paper is compromised regardless.
+2. **Revoke and re-mint every token.** `paramem revoke-user-token --list`
+   to see what exists, then one `--speaker <id>` or `--label <name>`
+   invocation per entry — there is no bulk revoke. Mint replacements with
+   `paramem mint-user-token`, and update every consumer that carries a
+   token: `.env`'s `PARAMEM_API_TOKEN`, the consolidation-timer's
+   environment, and the HA component's configured value.
+3. **Stop the server, then rotate the daily identity, the passphrase, and
+   the recovery identity, in that order.** Stop it first
+   (`systemctl --user stop paramem-server`) — a server left running seals
+   every envelope it writes during this step to whatever daily identity it
+   already has loaded in process memory, so if it kept running through the
+   rotation it would silently write files the new identity can't read.
+   `paramem rotate-daily` mints a fresh daily identity and re-encrypts
+   every envelope to it, but rewraps that new identity with the *same*
+   passphrase you already have loaded — it does not change the
+   passphrase. Since the passphrase itself is one of the exposed items in
+   step 1, follow it with `paramem change-passphrase` to rewrap the
+   now-rotated identity under a new passphrase the compromised host never
+   held; export that new passphrase into your shell as
+   `PARAMEM_DAILY_PASSPHRASE` and update it in `.env` (or the systemd
+   drop-in) before continuing — a later step in this same procedure needs
+   it, and the old value left in the shell no longer unlocks anything.
+   Then `paramem rotate-recovery` — it prints the new recovery secret once
+   to the terminal; write it down before the command finishes, since it is
+   never written to disk. The previous paper copy still decrypts bundles
+   written before this rotation, but nothing written after it — whether to
+   destroy it follows the decision in step 6 about those older bundles,
+   not this step on its own.
+4. **Start the server with the new passphrase in its environment**
+   (`systemctl --user start paramem-server`). This step is not optional:
+   a daily identity loaded into a running process stays loaded for that
+   process's life, so a server process that predates the rotation would
+   otherwise keep decrypting (and, worse, re-encrypting new writes) with
+   the identity that's no longer the one on disk.
+5. **Then, not before, run `paramem integrity`** (or `GET /integrity`).
+   Run against a server that hasn't been started since the rotation and
+   every check reads with stale key material and fails meaninglessly —
+   there's nothing to learn from it yet. Run it after the step-4 start and
+   a failure is real: investigate rather than dismiss it.
+6. **Take a fresh backup, and decide the fate of old ones.** Rotation
+   re-keys the live infrastructure files only; the backup store is outside
+   its scope. Existing backup bundles stay encrypted to the superseded
+   identities and will not decrypt under the new ones. Run `paramem
+   backup-create --label <reason>` once the server is back up, and decide
+   knowingly whether to keep the old bundles (recoverable only with the
+   retired identities — see step 3 on how long to also keep the paper
+   recovery copy that decrypts them) or discard them.
+7. **The limit.** Nothing read from this store while the host was
+   compromised is recovered by any of the above — this procedure closes
+   the window going forward, not backward.
+
 ### Per-user token management
 
-When `mobile_pwa.enabled: true` (or after the first `mint-user-token` run, which wires the same store), each device that should access the server must be issued its own bearer token — there is no separate shared-secret credential; every token is a `UserTokenStore` entry. Tokens are minted offline via the CLI, which prints a QR code for one-tap onboarding on mobile devices. For a **personal device**, mint a per-user token (bound to `speaker_id`) via `paramem mint-user-token` — identity is resolved from the token on every request. For a **shared device**, mint an unattributed token (`--unattributed`) instead — the server then identifies speakers by voice embedding and runs the enrollment flow automatically.
+When `mobile_pwa.enabled: true` (or after the first `mint-user-token` run, which wires the same store), each device that should access the server must be issued its own bearer token — there is no separate shared-secret credential; every token is an entry in the same token store. Tokens are minted offline via the CLI, which prints a QR code for one-tap onboarding on mobile devices. For a **personal device**, mint a per-user token (bound to `speaker_id`) via `paramem mint-user-token` — identity is resolved from the token on every request. For a **shared device**, mint an unattributed token (`--unattributed`) instead — the server then identifies speakers by voice embedding and runs the enrollment flow automatically.
 
 ```bash
 paramem mint-user-token [SPEAKER_ID] \
@@ -704,13 +828,13 @@ paramem mint-user-token speaker0 \
     --onboard-url "https://<your-host>.<your-tailnet>.ts.net"
 ```
 
-**Encryption note.** If `PARAMEM_DAILY_PASSPHRASE` is set and the daily key is loaded (Security ON), `user_tokens.json` is age-encrypted; the passphrase must be available when running this command. Without a daily key the store is written in plaintext (Security OFF). See [`SECURITY.md §5`](SECURITY.md) for the full token-store encryption contract.
+**Encryption note.** If `PARAMEM_DAILY_PASSPHRASE` is set and the daily key is loaded (Security ON), `user_tokens.json` is age-encrypted; the passphrase must be available when running this command. Without a daily key the store is written in plaintext (Security OFF). See [SECURITY.md — Authentication & authorization](SECURITY.md#authentication--authorization) for the full token-store encryption contract.
 
-**Upgrade note (shared-token deployments).** An existing deployment that predates per-user tokens set `PARAMEM_API_TOKEN` as a single shared credential validated directly by the server. That validation path is retired: `PARAMEM_API_TOKEN` is now only a carrier env var that infrastructure callers read to source their own `Authorization` header — the server itself never validates its value. Upgrading such a deployment **without** running `mint-user-token` lands it OPEN (`AUTH: OFF`, every REST endpoint reachable without a credential) — the server logs a loud warning naming this exact condition at startup, but the old token no longer protects anything. Run `paramem mint-user-token --unattributed --scope admin --force-admin` once, then update `PARAMEM_API_TOKEN` (and any systemd drop-in / HA component config reading it) to the newly minted value, to restore the server's protected posture.
+**Upgrade note (shared-token deployments).** An existing deployment that predates per-user tokens set `PARAMEM_API_TOKEN` as a single shared credential. The server does not validate that env var's value itself — it is only a carrier that infrastructure callers (systemd, HA) read to source their own `Authorization` header; every actual credential check runs against the minted token store. Upgrading such a deployment **without** running `mint-user-token` lands it OPEN (`AUTH: OFF`, every REST endpoint reachable without a credential) — the server logs a loud warning naming this exact condition at startup. Run `paramem mint-user-token --unattributed --scope admin --force-admin` once, then update `PARAMEM_API_TOKEN` (and any systemd drop-in / HA component config reading it) to the newly minted value, to restore the server's protected posture.
 
 #### Shared (multi-user) device
 
-A device used by more than one person — e.g. a kitchen tablet — is **not** given a per-user token (that would attribute every speaker to a single identity). Instead, mint it an **unattributed** token (no bound `speaker_id`) — there is no separate shared-secret credential; an unattributed token is a normal `UserTokenStore` entry like any other, just without a `speaker_id`:
+A device used by more than one person — e.g. a kitchen tablet — is **not** given a per-user token (that would attribute every speaker to a single identity). Instead, mint it an **unattributed** token (no bound `speaker_id`) — there is no separate shared-secret credential; an unattributed token is a normal token-store entry like any other, just without a `speaker_id`:
 
 ```bash
 paramem mint-user-token --unattributed --scope chat --label "Kitchen Tablet"
@@ -721,7 +845,7 @@ paramem mint-user-token --unattributed --scope chat --label "Kitchen Tablet"
 
 This token reaches `/chat`, `/voice`, `/push/*`, and `/status` but gets 403 on every operational endpoint — the secure default for a shared device. Restrict access at the network layer (Tailscale / LAN — never the public internet) as the outer defence; token scope provides the inner defence. A shared device that genuinely needs admin reach (rare — prefer a personal admin token instead) can be minted `--unattributed --scope admin --force-admin`, which prints a warning that it cannot be revoked by speaker (use `revoke-user-token --label` for it).
 
-**Infrastructure token (systemd / HA carrier).** Non-interactive consumers — the systemd consolidation-tick timer, the HA custom component — read their bearer-token value from the `PARAMEM_API_TOKEN` environment variable at execution time (see `render_service_unit` in `paramem/server/systemd_timer.py`). The server does not validate this env var itself; the value placed in it must be a token actually minted into the store. Mint an unattributed admin token for the timer (it calls `POST /scheduled-tick`, an admin-scoped endpoint) and put its plaintext value into `.env`:
+**Infrastructure token (systemd / HA carrier).** Non-interactive consumers — the systemd consolidation-tick timer, the HA custom component — read their bearer-token value from the `PARAMEM_API_TOKEN` environment variable at execution time. The server does not validate this env var itself; the value placed in it must be a token actually minted into the store. Mint an unattributed admin token for the timer (it calls `POST /scheduled-tick`, an admin-scoped endpoint) and put its plaintext value into `.env`:
 
 ```bash
 paramem mint-user-token --unattributed --scope admin --force-admin --label "systemd infra"
@@ -843,7 +967,7 @@ The VAPID keypair must remain stable: rotating it invalidates all existing brows
 
 Push payloads carry no personal content. The notification is a generic ping; the member opens the app to read the actual reply.
 
-#### Troubleshooting
+#### PWA troubleshooting
 
 - **The PWA URL shows a bearer-token prompt / raw API JSON instead of the chat UI.** Either `mobile_pwa.enabled` is `false` in the server config (check `/status`), or you navigated to `/` instead of `/app`. The PWA shell is served at `/app`.
 - **"Enter your bearer token in Settings to get started" appears on every launch.** The token was not saved — tap the gear icon, paste the token, and tap **Save**.
@@ -858,15 +982,57 @@ Push payloads carry no personal content. The notification is a generic ping; the
   - The PWA must be served over HTTPS — `getUserMedia` is not available on plain HTTP.
 - **401 on every request after revoking a token.** Open Settings in the PWA, clear the token field, and paste a newly minted token.
 
+### Health
+
+How to tell the server is running correctly, and what to check after a host
+event (reboot, network change, Windows update, crash).
+
+- **`GET /health`** — liveness probe. Returns `{"status": "ok"}` and needs no
+  token; safe to poll continuously (e.g. an HA `binary_sensor`). It reports
+  the process is up, not that local recall is working — it returns `ok`
+  even while the server is running degraded in cloud-only mode.
+- **`GET /status`** — the full operational snapshot. A healthy store shows
+  `adapter_loaded: true` (the episodic tier carries trained weights),
+  `store_quarantined: null` (parametric recall is not offline), an empty
+  `attention` block (no open operator incidents), and `consolidating` toggling
+  to `false` once a fold finishes rather than staying `true`. `mode` and
+  `effective_mode` show whether the server is serving locally or has
+  degraded to cloud-only, and `cloud_only_reason` (e.g.
+  `insufficient_vram`) names why — the fields to check after a host event
+  when the process is up (`/health` is `ok`) but local recall isn't
+  answering.
+- **`paramem integrity`** (or `GET /integrity`) — the on-disk check: verifies
+  every tier's registries, SimHash fingerprints, and written payload
+  (adapter weights or graph, depending on venue). Run it after a restore, a
+  crash, or whenever `/status` reports a quarantined store.
+- **`journalctl --user -u paramem-server`** — the server's own log; check
+  here first for a crash or a refused boot.
+
+**After a host event**, run through this checklist:
+
+- WSL IP changed (a Windows restart, a WSL update): re-run
+  `bash scripts/net/win-port-forward.sh` so the NAS and other LAN clients
+  can still reach the server.
+- Confirm the scheduled jobs are still registered: `systemctl --user list-timers`
+  should show `paramem-consolidate.timer` and `paramem-backup.timer` for
+  each of these your config actually schedules (a `refresh_cadence: "off"`
+  or `security.backups.schedule: "off"` removes that timer entirely, by
+  design), each with a sane next-run time; a missing timer you expected to
+  be scheduled, or a stale next-run time, means a fold or a backup
+  silently stopped happening.
+- If `/status` reports `store_quarantined` or an open `attention` incident
+  after the event, work through
+  [Consolidation & Crash Safety](#consolidation--crash-safety) — most
+  causes resolve on the next dispatch without an operator action.
+
 ### GPU Lifecycle
 
-The server shares the GPU with ML workloads.  Release is brokered by
-`gpu_guard` (machine-level arbitration, config-driven consumers).
-ParaMem registers as the ``paramem-server`` consumer in
-``~/.config/gpu-guard/config.toml``:
+The server shares the GPU with other workloads on the same host. It exposes
+the release and reclaim primitives below; any external arbitrator can drive
+them, and none is required.
 
 - **`POST /gpu/release`** → in-process unload, switch to cloud-only.
-  Default release primitive used by `gpu_guard` and other workloads.
+  The default release primitive for another workload that needs the GPU.
   Synchronous; idempotent; returns 503 mid-consolidation, or 409 while a
   base-swap migration is actively running, so the caller can retry either
   way.
@@ -886,52 +1052,51 @@ curl -X POST http://localhost:8420/gpu/release
 
 #### Deferred-mode hold and orphan recovery
 
-ML workloads started through `experiments/utils/gpu_guard.py` (or the
-`tresume` shell flow) set `PARAMEM_EXTRA_ARGS=--defer-model` in the
-systemd user environment so the server stays cloud-only for the duration
-of the run.  The holder also stamps `PARAMEM_HOLD_PID`,
-`PARAMEM_HOLD_STARTED_AT`, and `PARAMEM_HOLD_CMD` so the server can tell
-a legitimate mid-training hold apart from an orphaned env var left
-behind by a `SIGKILL`ed test.
+ML workloads started through `experiments/utils/gpu_guard.py` (or
+`scripts/dev/training-control.sh`'s resume flow) set
+`PARAMEM_EXTRA_ARGS=--defer-model` in the systemd user environment so the
+server stays cloud-only for the duration of the run.  The holder also
+stamps a PID, a start time, and a command hint so the server can tell a
+legitimate mid-training hold apart from an orphaned hold left behind by a
+killed process.
 
 `/status` surfaces the hold as:
 
 ```json
 {"hold": {"hold_active": true, "owner_pid": 12345, "owner_alive": true,
-          "age_seconds": 240, "owner_hint": "python / experiments.test8_large_scale"}}
+          "age_seconds": 240, "owner_hint": "python / experiments.test16_repair_sweep"}}
 ```
 
-`pstatus` renders it inline on the PID row.  Three cases:
+The status helper `scripts/dev/paramem-status.sh` renders it inline on the
+PID row — run it directly from the checkout (`bash
+scripts/dev/paramem-status.sh`); no separate install step is required.
+Three cases:
 
 | State | PID-row annotation | Meaning |
 |-------|--------------------|---------|
-| Alive holder | `(held by [python / experiments.test8_large_scale] (age 4m))` | Legitimate mid-training hold — auto-reclaim respects it. |
-| Orphaned (holder PID dead) | `(orphaned hold by [...] (age 15m) — pstatus --acquire)` (yellow) | `SIGKILL`ed test.  Auto-reclaim has emitted a single WARN and stopped looping. |
-| Orphaned (no holder registered) | `(orphaned hold, no holder registered — pstatus --acquire)` (yellow) | `PARAMEM_EXTRA_ARGS` set by legacy caller / manual tinkering. |
+| Alive holder | `(held by [python / experiments.test16_repair_sweep] (age 4m))` | Legitimate mid-training hold — auto-reclaim respects it. |
+| Orphaned (holder PID dead) | `(orphaned hold by [...] (age 15m) — pstatus --acquire)` (yellow) | The holding process was killed.  Auto-reclaim has emitted a single WARN and stopped looping. |
+| Orphaned (no holder registered) | `(orphaned hold, no holder registered — pstatus --acquire)` (yellow) | The hold was set outside the normal hold flow. |
 
-Operator recovery is a single command:
-
-```bash
-pstatus --acquire
-# → POST /gpu/acquire: clears PARAMEM_EXTRA_ARGS / PARAMEM_HOLD_*
-#   and, if the running server is in --defer-model, reloads the base
-#   model in-process (no service restart needed).
-```
+The annotation's `pstatus` is the operator alias for the status helper
+`scripts/dev/paramem-status.sh`; the actual door it calls is `POST
+/gpu/acquire` — it clears the hold and, if this process is in defer mode,
+reloads the base model in-process (no service restart).
 
 Auto-reclaim **never auto-clears orphans** — by design, visibility over
 silent self-healing.  The loop stops on orphan detection and waits for
 the operator.
 
-`pstatus --config` renders the effective `ServerConfig` (after yaml
-load + env merge) as YAML — useful for verifying what the running server
-actually sees, not what is on disk.  When an active-store migration is
-pending (mode flip detected at startup, see *Background training*),
-`pstatus` prints a `REHYDRATING` banner with per-tier completed/failed
-state until the migration finishes.
+`scripts/dev/paramem-status.sh --config` renders the effective server
+configuration (after yaml load + env merge) as YAML — useful for
+verifying what the running server actually sees, not what is on disk.
+When an active-store migration is pending (mode flip detected at startup,
+see *Background training*), it prints a `REHYDRATING` banner with
+per-tier completed/failed state until the migration finishes.
 
 ### API
 
-Complete REST endpoint reference. Auth scopes: **unauthenticated** — no token required; **chat** — any valid token minted with `--scope chat` (attributed or unattributed); **admin** — admin-scope token required (`require_admin` dependency, app.py:2615).
+Complete REST endpoint reference. Auth scopes: **unauthenticated** — no token required; **chat** — any valid token minted with `--scope chat` (attributed or unattributed); **admin** — an admin-scope token.
 
 | Method | Path | Scope | Description |
 |--------|------|-------|-------------|
@@ -941,7 +1106,7 @@ Complete REST endpoint reference. Auth scopes: **unauthenticated** — no token 
 | POST | `/chat` | chat | Send a conversation turn; returns the assistant reply. Speaker is resolved from the bearer token (attributed per-user token) or voice embedding (unattributed token). Conversation context is assembled server-side from the stored transcript — the request carries no history field, so a client never sends prior turns. See curl example below. |
 | POST | `/voice` | chat | PWA push-to-talk: accepts a raw audio blob (`audio/mp4`, `audio/webm`, `audio/L16`; 25 MB cap), transcribes via Whisper, and returns `{transcript, reply, audio, audio_format, follow_up?}`. Same routing path as `/chat`, including server-assembled context. See [Voice Pipeline](#voice-pipeline). |
 | GET | `/status` | chat | Full operational snapshot — server mode, model id + device, per-adapter specs (`rank`/`alpha`/`lr`/`target_kind`), interim adapter inventory + capacity, speaker embedding backend/model/device, STT/TTS engines, enrolled speakers, pending sessions + orphans + oldest age, consolidating flag + BG trainer state, last consolidation result, schedule + next-run ETA, deferred-mode `hold` block (owner PID + liveness + age + cmd hint), `attention` block (open operator incidents, e.g. `enrichment_degraded`, or an unpublishable tier rendering a condition-specific item naming the tier and why it was held back from mount), `store_quarantined` (memory store offline state — `null` when healthy, otherwise the cause and when it happened; see [Consolidation & Crash Safety](#consolidation--crash-safety)) |
-| GET | `/push/vapid-public-key` | chat | Return the VAPID EC P-256 application server public key for `PushManager.subscribe()`. 503 when push is disabled. See [Enabling Web Push](#enabling-web-push). |
+| GET | `/push/vapid-public-key` | chat | Return the VAPID EC P-256 application server public key a browser's push-subscription flow needs to create a subscription. 503 when push is disabled. See [Enabling Web Push](#enabling-web-push). |
 | POST | `/push/subscribe` | chat | Register a browser push subscription for the authenticated speaker. Requires an attributed per-user token (unattributed tokens have no bound speaker_id). See [Enabling Web Push](#enabling-web-push). |
 | POST | `/consolidate` | admin | Collapse the interim slots into main memory now — the content check the schedule uses to call a full cycle due, minus the deadline math; noops when there is no payload-bearing interim slot (and, at `max_interim_count: 0`, no pending NAMED session either). Non-blocking: returns immediately, poll `GET /status` → `consolidating`. |
 | POST | `/consolidate/interim` | admin | Absorb recent conversations into memory now, without waiting for the schedule. With no pending attributable session the content gate reports a `noop_*` status and nothing is dispatched. |
@@ -950,7 +1115,7 @@ Complete REST endpoint reference. Auth scopes: **unauthenticated** — no token 
 | POST | `/refresh-ha` | admin | Rebuild the HA entity graph from `/api/states` + `/api/services`. |
 | POST | `/ingest-sessions` | admin | Enqueue pre-chunked document segments for the next consolidation cycle (operator CLI: `scripts/ingest_docs.py`). Idempotent — chunks already in the ingest registry are skipped. |
 | POST | `/ingest-sessions/cancel` | admin | Discard queued ingest sessions by session ID without running consolidation. |
-| POST | `/gpu/acquire` | admin | Clear any `PARAMEM_EXTRA_ARGS=--defer-model` hold and, if this process is in defer mode, reload the base model in-process.  Called by `pstatus --acquire`.  Idempotent. A failed in-process reload leaves the server cloud-only and reports it in the response; the service restarts itself only if the reload crashed mid-flight. A reload refused because the configuration contradicts the store on disk is reported the same way and likewise does not restart the service. Refuses with **503** while a consolidation cycle is in flight, or **409** while a base-swap migration is actively running. |
+| POST | `/gpu/acquire` | admin | Clear any `PARAMEM_EXTRA_ARGS=--defer-model` hold and, if this process is in defer mode, reload the base model in-process.  This is the endpoint the status helper's `--acquire` flag calls.  Idempotent. A failed in-process reload leaves the server cloud-only and reports it in the response; the service restarts itself only if the reload crashed mid-flight. A reload refused because the configuration contradicts the store on disk is reported the same way and likewise does not restart the service. Refuses with **503** while a consolidation cycle is in flight, or **409** while a base-swap migration is actively running. |
 | POST | `/gpu/release` | admin | Release the base model in-process and switch to cloud-only mode, freeing VRAM. Refuses with **503** while a consolidation cycle is in flight, or **409** while a base-swap migration is actively running. |
 | POST | `/incidents/{incident_id}/ack` | admin | Acknowledge an active incident, silencing its attention row in `/status`. |
 | GET | `/integrity` | admin | Run the infrastructure integrity check (registries, simhash, and each tier's written payload, verified the same way whether it holds trained weights or a graph) and return a `{ok, checks, failures}` report. Cloud-only-safe — no GPU dependency. |
@@ -968,9 +1133,9 @@ Complete REST endpoint reference. Auth scopes: **unauthenticated** — no token 
 | POST | `/migration/accept` | admin | Promote trial config B to live, archive trial adapter, clear trial state. Valid only when gates finished with `pass` or `no_new_sessions`. See [Backup & Migration](#backup--migration). |
 | POST | `/migration/cancel` | admin | Discard the staged candidate and return to LIVE state. Valid only in STAGING. See [Backup & Migration](#backup--migration). |
 | POST | `/migration/rollback` | admin | Restore config A from backup, archive trial adapter, clear trial state. Valid from TRIAL at any time. See [Backup & Migration](#backup--migration). |
-| POST | `/debug/probe` | admin + `config.debug=true` | Operator-only ephemeral probe of the chat handler with explicit `speaker_id` injection.  Bypasses `_resolve_speaker`; **no buffer mutation, no jsonl rewrite, no consolidation impact** — pure single-call probe in RAM only.  Body: `{text, speaker_id, conversation_id?, route?}` — `route` (`"ha"`, `"cloud"`, or `"cloud:<provider>"`) forces exactly one leg for exercising it directly; omitted, the turn takes the ordinary routed dispatch.  The response also carries the turn's routing and egress diagnostics alongside the reply — including whether the turn left scrubbed or verbatim, or why a leg refused it; the production `/chat` response does not. |
-| POST | `/debug/recall` | admin + `config.debug=true` | Operator-only direct adapter recall probe.  Bypasses the router and reasoning step: activates `adapter` (or disables all when `adapter="none"`), runs `text` through the model, returns raw output + a `parse_recalled_entry` attempt + the active adapter + latency.  Use to measure direct natural-language recall from adapter weights as distinct from the cache-driven enumerate-then-reason path on `/chat`.  Body: `{text, adapter, system_prompt?, max_new_tokens?, temperature?}`. |
-| GET | `/debug/dump` | admin + `config.debug=true` | Operator-only zero-GPU read of the in-memory `MemoryStore`.  Walks `iter_entries()` and returns every `(tier, key, entry)` as a flat list.  ~5 ms for typical operator-scale stores vs ~min for the equivalent per-key `/debug/recall` sweep.  Use for content inventory, cross-model A/B setup, or scoring against a probe-suite output. |
+| POST | `/debug/probe` | admin + `config.debug=true` | Operator-only ephemeral probe of the chat handler with explicit `speaker_id` injection.  Bypasses the normal speaker-resolution flow; **no buffer mutation, no jsonl rewrite, no consolidation impact** — pure single-call probe in RAM only.  Body: `{text, speaker_id, conversation_id?, route?}` — `route` (`"ha"`, `"cloud"`, or `"cloud:<provider>"`) forces exactly one leg for exercising it directly; omitted, the turn takes the ordinary routed dispatch.  The response also carries the turn's routing and egress diagnostics alongside the reply — including whether the turn left scrubbed or verbatim, or why a leg refused it; the production `/chat` response does not. |
+| POST | `/debug/recall` | admin + `config.debug=true` | Operator-only direct adapter recall probe.  Bypasses the router and reasoning step: activates `adapter` (or disables all when `adapter="none"`), runs `text` through the model, returns raw output + an attempted parse of the recalled entry + the active adapter + latency.  Use to measure direct natural-language recall from adapter weights as distinct from the cache-driven enumerate-then-reason path on `/chat`.  Body: `{text, adapter, system_prompt?, max_new_tokens?, temperature?}`. |
+| GET | `/debug/dump` | admin + `config.debug=true` | Operator-only zero-GPU read of the server's in-memory recall store, returning every `(tier, key, entry)` as a flat list.  Returns the whole inventory in one zero-GPU read, where the equivalent per-key `/debug/recall` sweep would take orders of magnitude longer.  Use for content inventory, cross-model A/B setup, or scoring against a probe-suite output. |
 | POST | `/debug/erase-keys` | admin + `config.debug=true` | Operator-only repair tool: stale-marks an explicit list of memory keys — immediately unrecallable, with the identifier retained but its content and bookkeeping retired wholesale at the tier's next consolidation cycle; stale-marked keys are reported back in the response's `staled` list. The targeted scalpel for a key that is wrong for an unknown reason, when the alternatives would be restoring a backup or wiping the store. Works in cloud-only mode and while the memory store is offline for repair; the response's `lifted` field reports whether this call brought the store back online (`null` when it was not offline to begin with). A requested key no on-disk tier registry recognises is reported back in the response's `unknown` list, not treated as an error — a repeat call with the same key list is idempotent. The registry mutation itself is never refused — the response reports per-tier rebind outcomes (`tiers`, `unbound_tiers`), naming any tier left unbound (`"unbound"` or `"rebind_failed"`, the latter when the re-bind attempt itself hits a storage failure — it never stops the tiers after it from being attempted). Requires `{"confirm": true}`; without it, refuses with **409** and previews the keys that would be retired. Refuses with **409** while a fold or background training is running, a migration TRIAL or base-swap is active, or a consolidation event is pending resume (these guard the request, not the rebind). |
 | POST | `/calibrate/extract` | admin + `calibrate_endpoint_enabled` | Run the extraction chain from a transcript. `stop_phase` selects which step's output comes back (default: run to the end); every other calibration route fixes its own. |
 | POST | `/calibrate/procedural` | admin + `calibrate_endpoint_enabled` | Run the procedural extractor on a transcript. |
@@ -1013,11 +1178,8 @@ routes are gated by `consolidation.calibrate_endpoint_enabled=true`
 (default off); none writes weights or production data.
 `/calibrate/respond` is the one route whose downstream effects reach beyond
 the server process — see its row above. `response.json`'s
-`wall_clock_seconds` measures the step's own cost, timed inside the
-envelope's GPU lock rather than around it — it excludes any time the run
-spent waiting for the lock. Values recorded before this contract shipped
-included the lock wait and are not comparable; re-run the baseline before
-diffing a prompt change against an older artifact.
+`wall_clock_seconds` measures the step's own cost and excludes any time the
+run spent queued behind another run.
 
 The local anonymizer's own repeatable test corpus lives in
 `tests/fixtures/anonymizer_gate.json` — a tracked, entirely fictional
@@ -1064,7 +1226,7 @@ ParaMem includes a local voice pipeline for privacy-first operation:
 - **Multilingual TTS:** Piper voices per language with MMS-TTS fallback; language detection on the response text, speaker binding so each speaker's preferred voice persists, routed to media players via HA.
 - **Anti-confabulation voice prompt:** a separate system prompt at the voice turn tells the model not to invent facts about the speaker when the parametric memory has nothing to say, and to fall through to the cloud path cleanly.
 - **Server-assembled context:** conversation history for every voice turn is read from the server's own session store — the same path `POST /chat` uses — not carried in the request; a client never sends prior turns.
-- **Mobile PWA voice path:** The PWA (served at `/app` when `mobile_pwa.enabled: true`) supports push-to-talk voice in addition to text. The browser records audio and POSTs it to `POST /voice` (raw audio blob; `audio/mp4`, `audio/webm`, or `audio/L16`; 25 MB hard cap). The server decodes to 16 kHz int16 mono, transcribes via Whisper, and returns `{transcript, reply, audio, audio_format, follow_up?}` — where `audio` is a base64-encoded WAV of the synthesised reply voiced through the same per-language TTS voices as the HA satellites (e.g. Kokoro `af_heart` for English), or `""` when TTS is unavailable (the PWA falls back to text display). Routing goes through the same `_run_chat_turn` path as `POST /chat`. **Token-type selector:** an attributed per-user token resolves identity from the token (no embedding computed, cheap); an unattributed token triggers voice-embedding identification and the same enrollment/greeting/name-disclosure path as `POST /chat`, with a fresh per-utterance conversation_id on each push-to-talk press. Deployment: personal device → issue an attributed per-user token; shared device → issue an unattributed token with voice enrollment. Error statuses: `404` when `mobile_pwa.enabled` is false, `503` when STT is not loaded (cloud-only mode), `413` for an oversized payload, `400` for an undecodable audio body.
+- **Mobile PWA voice path:** The PWA (served at `/app` when `mobile_pwa.enabled: true`) supports push-to-talk voice in addition to text. The browser records audio and POSTs it to `POST /voice` (raw audio blob; `audio/mp4`, `audio/webm`, or `audio/L16`; 25 MB hard cap). The server decodes to 16 kHz int16 mono, transcribes via Whisper, and returns `{transcript, reply, audio, audio_format, follow_up?}` — where `audio` is a base64-encoded WAV of the synthesised reply voiced through the same per-language TTS voices as the HA satellites (e.g. Kokoro `af_heart` for English), or `""` when TTS is unavailable (the PWA falls back to text display). Routing goes through the same path as `POST /chat`. **Token-type selector:** an attributed per-user token resolves identity from the token (no embedding computed, cheap); an unattributed token triggers voice-embedding identification and the same enrollment/greeting/name-disclosure path as `POST /chat`, with a fresh per-utterance conversation_id on each push-to-talk press. Deployment: personal device → issue an attributed per-user token; shared device → issue an unattributed token with voice enrollment. Error statuses: `404` when `mobile_pwa.enabled` is false, `503` when STT is not loaded (cloud-only mode), `413` for an oversized payload, `400` for an undecodable audio body.
 - **Consolidation/calibration coexistence:** while a consolidation or calibration run is in progress, the voice pipeline serves from its CPU-resident STT/TTS pair and returns to the GPU-resident pair automatically once the run finishes.
 
 ---
@@ -1100,49 +1262,42 @@ editing:
 ### Principles
 
 **Few-shot examples carry the schema.** A prompt does not need to declare
-the entity-type or relation-type taxonomy verbatim. Listing them via
-template slots like `{entity_types}` was empirically harmful: it implicitly
-licensed Mistral 7B to extend the closed set with new type names —
-`phone_number`, `software`, `library`, `degree`, `acronym`, etc. — 23
-invented types in one run on a CV transcript. The same prompt with no
-taxonomy slot and only few-shot examples produced **0 invented types**.
-Mistral treats explicit lists as "you can add to this"; examples anchor a
-closed set without needing a rule.
+the entity-type or relation-type taxonomy verbatim. Listing the types in a
+template slot licenses the model to extend the closed set with invented
+type names; the same prompt with no taxonomy slot and only few-shot
+examples holds the set closed. Examples anchor a closed set without
+needing a rule.
 
 **Declarative text stays minimal and concise — few-shot examples do the
 hard work.** A prompt is a short headline (one sentence — what the model
 is doing), a brief imperative core (the load-bearing structural rules —
 schema fields, output shape), then the body: POSITIVE examples for the
 right shape, NEGATIVE examples (`WRONG: ... → RIGHT: ...`) for the failure
-modes you actually observe. Long declarative prose ("INTENT MATTERS:",
-"PLAUSIBILITY:", "USE THE ASSISTANT'S RESPONSE", taxonomy bullets)
-competes with examples for the model's attention budget; on Mistral 7B,
-removing 50+ lines of such prose and keeping ~30 lines of examples
-flipped contact-attribute capture (`email` / `phone` / `linkedin`) on the
-speaker entity from absent → reliable. The principle generalizes:
+modes you actually observe. Long declarative prose competes with examples
+for the model's attention; cutting declarative prose in favour of examples
+is what makes contact attributes (`email` / `phone` / `linkedin`) reliably
+captured on the speaker entity. The principle generalizes:
 
 - **Multi-task prompts split into labelled sections** (`## KEEP` /
   `## DROP`, `## Part 1 — RELATIONS` / `## Part 2 — SAME_AS`) with each
   section's POSITIVE + NEGATIVE block co-located. Labels prime
-  attention; the imperatives stay one sentence; the examples teach. On
-  `cloud_plausibility.txt`, splitting eliminated chunk-1 over-generation
-  (1 input fact → 51 invented facts in the unified version → 0 in the
-  split version).
+  attention; the imperatives stay one sentence; the examples teach.
+  Splitting a multi-task prompt this way eliminates the over-generation
+  a unified prompt produces on its first, most fact-dense chunk.
 
 - **Load-bearing structural contracts go at the top, not buried lower down.** When
   the downstream pipeline depends on a schema field, a brace-binding
   requirement, or a token like `[ESCALATE]` that the router parses, put
-  it under the headline with its own POSITIVE + NEGATIVE pair. On
-  `cloud_enrichment.txt`, hoisting the brace-binding contract for
-  newly-minted entities to the top doubled the binding emission
-  rate (6 → 16 per session) and recovered 41 personal facts per CV chunk
-  that had been silently dropped at the deanon residual sweep.
+  it under the headline with its own POSITIVE + NEGATIVE pair. Hoisting a
+  binding contract for newly-minted entities to the top of the prompt
+  raises the binding emission rate and recovers facts that would
+  otherwise be silently dropped downstream.
 
 - **NEGATIVE examples teach harder edges than POSITIVE alone.** Add them
-  for the failure modes you observe, not hypothetical ones. On
-  `cloud_graph_enrichment.txt`, a single `WRONG: (Alice, ..., "12 months")
-  — literal value, not a graph node` NEGATIVE eliminated phantom-node
-  introduction (2 violations → 0) without changing anything else.
+  for the failure modes you observe, not hypothetical ones. A single
+  `WRONG: (Alice, ..., "12 months") — literal value, not a graph node`
+  NEGATIVE eliminates phantom-node introduction without changing anything
+  else.
 
 **Closed-set vs. open-set fields behave differently in examples.** The
 model treats fields differently based on whether the prompt examples
@@ -1167,9 +1322,9 @@ attribute keys with `has_` so the prompt should emit bare keys (`email`, not
 
 Don't iterate prompts blindly. The calibration tool
 (`scripts/dev/calibrate_prompts.py`) probes each pipeline phase live
-against the running server with operator-supplied variants, captures the
-per-phase trace (`paramem/graph/phase_trace.py`), and renders a
-baseline-vs-candidate diff per phase. Workflow:
+against the running server with operator-supplied variants, captures what
+each phase produced, and renders a baseline-vs-candidate diff per phase.
+Workflow:
 
 1. Drop a `calib_<original>.txt` variant into the calibration prompt
    directory, `paths.calibration/prompts/` (default
@@ -1179,8 +1334,8 @@ baseline-vs-candidate diff per phase. Workflow:
    refused rather than silently falling back to the shipped prompt.
 2. Run `python scripts/dev/calibrate_prompts.py --input <fixture>
    --baseline auto --stop-phase <phase>` (use `--stop-phase` to skip
-   downstream phases when iterating on early stages — saves compute at
-   ~50–70 s per skipped phase).
+   downstream phases when iterating on early stages — it saves the compute
+   those phases would spend).
 3. The client submits the run, polls `GET /status` until `consolidating`
    clears, then reads the full result back from disk — no calibration route
    returns its result inline. Every run's artifact directory is the
@@ -1225,9 +1380,10 @@ The calibration endpoint is gated by
 consolidation in production).
 
 `transcript` sent to any `/calibrate/*` endpoint MUST be the turn-marked
-production surface (`[user] <text>` / `[assistant] <text>`, rendered by
-`SessionBuffer._format_turns`) — every prompt's few-shots are calibrated
-on it, and a bare, unmarked transcript puts the model off-distribution
+production surface (`[user] <text>` / `[assistant] <text>`, the same
+rendering the server's own session store produces) — every prompt's
+few-shots are calibrated on it, and a bare, unmarked transcript puts the
+model off-distribution
 (the endpoints reject unmarked input with HTTP 400). `calibrate_prompts.py`
 renders this automatically; a manual `curl` call must supply it explicitly.
 The one exception is `/calibrate/respond`, whose `text` field is a bare
@@ -1246,8 +1402,5 @@ Before editing any file under `configs/prompts/`:
 3. **Run the calibration probe.** Read the per-phase diff. If the targeted
    phase moved correctly and downstream phases didn't regress, promote.
 4. **Don't add a verbatim taxonomy slot or a long prose rule** unless a
-   per-phase calibration measurement justifies it. The empirical record is
-   that they make Mistral 7B worse, not better.
-
-The phase-trace and calibration-loop machinery is documented inline in
-`paramem/graph/phase_trace.py` and `paramem/server/calibrate.py`.
+   per-phase calibration measurement justifies it — they make extraction
+   worse, not better.

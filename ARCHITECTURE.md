@@ -12,7 +12,7 @@
 | **Graph Extractor** | LLM-based structured output | Generate-once, parse-once; prompts externalized to `configs/prompts/` |
 | **Knowledge Graph** | NetworkX (in-memory) + JSON persistence | Sufficient for personal-scale data; no external DB dependency |
 | **Experiment Tracking** | Weights & Biases (wandb) | Most popular for research, zero-config HF integration, free tier sufficient |
-| **Evaluation** | Custom probing harness + lm-eval-harness | Probing for personal recall; lm-eval for base capability regression |
+| **Evaluation** | Custom probing harness | Keyed-recall probing against the trained adapters; no external evaluation dependency |
 
 ## Alternatives Considered
 
@@ -20,10 +20,10 @@
 
 | Option | Pros | Cons | Decision |
 |--------|------|------|----------|
-| Qwen 2.5 3B | Best benchmarks at size, Apache 2.0, strong multilingual | Younger community than Llama | **Historical** — initial validation platform; Mistral 7B is now the production default |
-| Llama 3.2 3B | Largest community, most tutorials, well-tested PEFT | Llama Community License (restrictions above 700M MAU) | **Candidate** — swap target for cross-architecture validation (design-supported; not empirically validated) |
+| Qwen 2.5 3B | Best benchmarks at size, Apache 2.0, strong multilingual | Younger community than Llama | Skip for production — validated as a platform; Mistral 7B carries the deployment default |
+| Llama 3.2 3B | Largest community, most tutorials, well-tested PEFT | Llama Community License (restrictions above 700M MAU) | Skip — the license restriction rules it out as a shipped default; the model-agnostic adapter layer accepts it as an operator choice |
 | Gemma 2 2B | Good quality, Google-backed | Smaller at 2B, Gemma license less permissive | Skip — 2B may underperform on graph extraction tasks |
-| Phi-3-mini (3.8B) | Excellent quality, MIT license | 3.8B tight on 8GB with QLoRA for training | Revisit if VRAM headroom allows |
+| Phi-3-mini (3.8B) | Excellent quality, MIT license | 3.8B tight on 8GB with QLoRA for training | Skip — not empirically validated on this project; no evidenced advantage over the three model families actually run |
 | SmolLM2 1.7B | HuggingFace native, Apache 2.0 | 1.7B likely too small for quality consolidation | Skip for primary; potential graph extractor |
 
 ### Graph Extraction
@@ -31,8 +31,8 @@
 | Option | Pros | Cons | Decision |
 |--------|------|------|----------|
 | LLM structured output | Highest accuracy, catches implicit relations, zero-shot | Slower, needs GPU | **Chosen** — accuracy matters more than speed for offline consolidation |
-| spaCy + custom entity/relation extraction | Fast, deterministic, CPU-only | Requires training data, misses implicit relations | Fallback if LLM extraction too slow |
-| GLiNER | Zero-shot entity extraction, lightweight | Entity extraction only, no relations | Potential component within a hybrid pipeline |
+| spaCy + custom entity/relation extraction | Fast, deterministic, CPU-only | Requires training data, misses implicit relations | Rejected — a transcript's load-bearing relations are largely implicit |
+| GLiNER | Zero-shot span tagging, lightweight, CPU-resident | Spans only, no relations | **Chosen for a different job** — it is the anonymizer's detector, not the relation extractor |
 
 ### Experiment Tracking
 
@@ -45,12 +45,7 @@
 
 ### AD-1: Model-Agnostic Adapter Layer
 
-All model-specific logic is isolated behind an abstraction that exposes:
-- `load_base_model(model_config, adapters) -> (PeftModel, tokenizer)`
-- `create_adapter(model, adapter_config, name)` — in place, no return
-- `mount_adapter(model, slot, name)` — in place, no return
-- `switch_adapter(model, name)`
-- `ensure_resident_tiers(model, adapters)` — the wrap primitive
+All model-specific logic is isolated behind a common interface: loading the base model wraps it with every configured adapter tier and returns that one wrapped object; every later operation — creating an adapter, mounting one from disk, or switching which is active — mutates that same object in place and returns nothing, so its identity never changes after the initial load.
 
 The consolidation loop, graph extractor, and evaluation harness operate against this interface, not against specific model implementations. Swapping models requires changing one config value. The production default is Mistral 7B Instruct v0.3. Validated on three model families (Qwen 2.5 3B, Gemma 2 9B, Mistral 7B); broader validation pending.
 
@@ -67,31 +62,31 @@ Base Model (frozen, 4-bit quantized)
 
 During inference, adapters can be switched at near-zero cost. During training, each adapter is optimized independently with its own objective.
 
-Which tiers exist is `adapters.<tier>.enabled`, resolved once by `ServerConfig.tier_config_map()`; `promotion_threshold` governs when keys move episodic→semantic, never whether semantic exists.
+Which tiers exist is `adapters.<tier>.enabled`, resolved in one place, from that setting alone; `promotion_threshold` governs when keys move episodic→semantic, never whether semantic exists.
 
-### AD-11: Procedural Adapter Targets MLP Layers (live in server deployment)
+**One declaration per minted identifier format.** Every identifier format the system mints — interim adapter names, speaker ids, cloud placeholders — is declared once, where it is minted, and every recognizer of that format is built from the same declaration, so a format cannot drift between where it is written and where it is read.
+
+### AD-11: Procedural Adapter Targets MLP Layers
 
 The procedural adapter targets both attention layers (`q/k/v/o_proj`) and MLP layers (`gate/up/down_proj`). Episodic and semantic adapters target attention only.
 
 **Rationale.** Attention-only tunes *routing* — which context to attend to at inference time. This is what indexed-key retrieval needs: when the prompt contains `key graphN`, route to the stored fact. Facts stored this way are retrievable but the model's *representation* of them is unchanged. MLP targeting tunes *representation* — the persistent transformation applied to each token's hidden state. The interpretability literature locates factual associations and stylistic patterns predominantly in MLP feed-forward layers. Preferences and habits are persistent behavioral shifts, not keyed lookups, so they need MLP imprinting to take.
 
-**Implementation.** `paramem/server/config.py::ServerAdapterConfig` carries a `target_modules` field per adapter. `_make_adapter_config` honours it — no more hardcoded list. `ServerAdaptersConfig` defaults procedural to `["q_proj","v_proj","k_proj","o_proj","gate_proj","up_proj","down_proj"]` (attention + MLP). Overridable in `server.yaml`.
+**Implementation.** Each adapter tier declares its own target-module set in `server.yaml`. Procedural ships targeting attention plus MLP; episodic and semantic target attention alone.
 
-**Cost.** Procedural-only: ~3× more trainable params (~8 M → ~25 M at rank 8), ~30 MB → ~95 MB adapter file on disk, ~300–600 MB extra VRAM during training. Fits within the 8 GB budget alongside Mistral 7B NF4 + STT/TTS. Episodic and semantic unchanged.
+**Cost.** The procedural adapter carries several times the trainable parameters of an attention-only tier, with a correspondingly larger adapter file and training footprint. It fits the deployment's VRAM budget alongside the base model and the voice stack; episodic and semantic are unchanged.
 
 Extraction uses a dedicated `extraction_procedural.txt` prompt for preference/behavioral content, separate from the factual extraction prompt.
 
 ### AD-13: Indexed Key Memory
 
-Per-fact addressable recall using sequential keys in a chat-template JSON format. Each fact is assigned a sequential key (`graphN` / `procN`) and the model is trained to reconstruct that fact when prompted with the key. Training stays in the proven chat-template shape that avoids the format collision produced by mixing QA pairs and hashes in a single adapter pass. Shipped default: real minting starts at `graph201` / `proc201` (`ConsolidationLoop._indexed_next_index` / `_procedural_next_index`), not `graph1` — the low band (`graph1`-`graph200`, `proc1`-`proc200`) is reserved unconditionally for the synthetic donor's training population (`paramem.training.donor`), which seeds every measured-cold fold as the unconditional standard mechanism (no config flag; see `benchmarking.md`, "Test 20").
+Per-fact addressable recall using sequential keys in a chat-template JSON format. Each fact is assigned a sequential key (`graphN` / `procN`) and the model is trained to reconstruct that fact when prompted with the key. Training stays in the proven chat-template shape that avoids the format collision produced by mixing two training objectives in a single adapter pass.
 
-**Key insight:** keyed retrieval is the reliable interface for parametric recall; un-keyed natural-language questions yield inconsistent results (see `benchmarking.md`, Test 5 / keyed vs. natural comparison). The model learns the pattern `key → JSON` reliably at rank 8.
+A reserved low band of keys belongs to a synthetic donor population that seeds every cold fold; real keys are minted above that band, so a real key can never collide with a donor key. The seeding is unconditional — there is no switch.
 
-**Two encodings:**
-- **QA-pair encoding** (`"qa"`, legacy/test-only): the LLM QA generator mints a `(question, answer)` pair per graph triple; the adapter is trained on `key → JSON{key, question, answer}`. Recall template: `"Recall the QA pair stored under key 'graphN'."`
-- **Quadruple encoding** (`"quad"`, production): the adapter is trained directly on the merged-graph triple, `key → JSON{key, subject, predicate, object}` (1 training example per fact, no QA-generator LLM step). Recall template: `"Recall the fact stored under key 'graphN'."` A scalar entity attribute (e.g. a phone number or a hobby) is projected into an ordinary attribute-typed fact at extraction time, so it carries the same speaker attribution and assertion window as any other fact and reaches the keyed set the same way — including reinforcement: a re-observed attribute earns standing and promotes from episodic to semantic exactly as a re-observed relationship between two things does. The quad units come from `assign_keys` over the merged graph's edges and node attributes, partitioned to episodic / procedural by `relation_prep.partition_relations`, then formatted by `format_entry_training` (`paramem/memory/entry.py`). Round-trip-clean; ~½ the per-fact training cost.
+**Key insight:** keyed retrieval is the reliable interface for parametric recall; un-keyed natural-language questions yield inconsistent results (see `benchmarking.md`). The model learns the pattern `key → JSON` reliably at rank 8.
 
-A QA-trained adapter probed with the quad template fails (and vice versa), so the inference path reads each adapter's format and uses the matching template + parser.
+The adapter is trained directly on the merged-graph triple — one training example per fact, no intermediate question-generation step. A scalar entity attribute (a phone number, a hobby) is projected into an ordinary attribute-typed fact at extraction time, so it carries the same speaker attribution and assertion window as any other fact, reaches the keyed set the same way, and reinforces and promotes the same way.
 
 ### AD-14: SimHash Registry for Hallucination Detection
 
@@ -103,11 +98,11 @@ Two-layer defense:
 
 Design constraints satisfied:
 - Only 8 bytes stored per key (64-bit integer) — not training content.
-- No modification to the JSON training format (3-field `{key, question, answer}` under the QA encoding, 4-field `{key, subject, predicate, object}` under the quadruple encoding); the fingerprint hashes the rendered content string either way. Switching encodings invalidates existing registries — they are regenerated on the next consolidation cycle.
-- Tolerates minor recall variations (e.g., casing differences score >0.8).
+- No modification to the training format; the fingerprint hashes the rendered content string.
+- Tolerates minor recall variations such as casing differences.
 - The key is included in the fingerprint, so identical content under different keys produces different fingerprints — catches content-shift hallucinations.
 
-Failed alternative: training a check hash into the JSON response caused format collision (0/10 recall). External registry is the only viable approach.
+Training a check hash into the JSON response is rejected: mixing two objectives in one adapter pass collapses both. The registry stays external.
 
 ## Consolidation Pipeline
 
@@ -145,54 +140,51 @@ sees only anonymized placeholders. Every stage falls forward — a failure at st
 N keeps the predecessor's output and continues.
 
 1. **Extract** (`configs/prompts/extraction.txt`): local model emits triples + entities. The session speaker's stable `speaker{N}` system id is injected as the canonical subject of their facts; the display name is passed as comprehension context only, and a name is substituted for the id only at the reply boundary, when a response is about to be shown or spoken to the user.
-2. **Anonymize** — `configs/prompts/anonymization.txt`, one sectioned prompt home shared by the transcript-bearing session tier, chat egress, and the transcript-free graph tier — via `paramem.cloud.anonymize.anonymize`, the ONE anonymize chain every cloud-bound path composes through: a small, offline, local detection model is the sole classifier against the operator-configured `sanitization.scrub` PII-vocabulary hints — no code-side entity-type gate. One dedicated detection pass over the whole payload marks every value the detector judges an instance of a configured category; the pipeline — never a model — mints every placeholder and builds the `{real → placeholder}` table from the marked values. The pipeline builds the anonymized transcript from that same table by exact, case-sensitive substitution — no model rewrites it, so there is nothing left to verify or re-ask. The chain still builds the anonymized fact array deterministically (one entry per `graph.relations`, `subject`/`object` substituted through the table via an edge-aware, case-sensitive `_substitute_whole_words`, `predicate`/`relation_type`/`confidence` copied verbatim — the predicate is never a substitution target), so a fact can never be lost, reworded, or dropped by the anonymizer, and a placeholder can never be glued into a predicate at this stage. Beyond the operating-budget precondition, the chain fails closed for exactly two causes: the graph tier's own identity-reconciliation guard (only where a node domain is supplied — the detector named real content but nothing survived reconciliation onto the actual node domain), or the detection model being unavailable; callers never fall back to the original real-name transcript on an actual fail-closed verdict. Placeholders follow an **open-vocabulary shape contract** (`^[A-Z][A-Za-z]*_\d+$`) — except the speaker's own `speaker{N}` anchor, which is deliberately exempt (already anonymous, never minted, never re-braced) and can appear as a forward-map value without matching that shape. A tagged name links to the speaker's anchor only on evidence: the speaker's own enrolled name links on equality alone, needing no model call; on a transcript-bearing call whose detection pass found a tagged person value inside the transcript region, the conversational model that ran extraction is also asked one further dedicated question — restricted to those tagged values — deciding whether the `[user]` turn's speaker introduced one of them as their own name ("I'm …" / "my name is …" / "call me …"), and a value it confirms folds onto the anchor only when it is consistent with the enrolled name (the enrolled name itself, or an extension/short form of it); a confirmed name that is someone else's (a namesake) is refused. Either way the folded value becomes a forward-map value onto the speaker's own `speaker{N}` anchor, scrubbing it from the outbound payload while the anchor stays the one stable handle. Every other tagged name becomes an ordinary `Person_N` placeholder, no matter what any fact claims about it.
-3. **Entity-surface correction** (`configs/prompts/entity_correction.txt`): the local model reviews real entity surfaces on the anonymization reverse map and node attributes and corrects misspelled place/org/concept names; an apply-gate rejects any proposal targeting an entity not already known, and all verdicts — accepted and rejected — are recorded on `graph.diagnostics["entity_correction_verdicts"]` (persisted as a debug artifact when debug is on). Speaker/person nodes are left untouched.
-4. **Cloud enrichment with delta protocol** (`configs/prompts/cloud_enrichment.txt`): cloud returns a delta envelope `{add, modify, drop, bindings}` — only the changes against the input fact list, plus `bindings: {placeholder: real_name}` for net-new entities. The pipeline applies the delta, merges bindings before de-anonymization, and reconstructs the updated transcript locally. No transcript token-diff and no fact-echo (order-of-magnitude token reduction vs. the prior "echo every fact" envelope). `add`/`modify` entries are restricted to the fields that actually reach a relation (subject/predicate/object/relation_type/confidence/symmetric) — any other key an LLM invents is stripped before the entry enters the pipeline, so it can never later be mistaken for an unresolved placeholder. Rejection is per-action, never whole-delta (2026-07-22 cloud-admission redesign, `_apply_enrichment_delta`): an `add` naming a token neither in the anonymized facts/transcript cloud was shown nor in its own `bindings` (orphan) is dropped; a `modify` whose `fields` would introduce one is discarded and the pre-enrichment fact is kept unchanged instead; `drop` is honored unconditionally. A binding whose key collides with the local map is purely informational (`graph.diagnostics["cloud_binding_collisions"]`) and never a rejection reason — the local value always wins on resolution. Per-cycle counts and the distinct rejected tokens are operator-visible in `graph.diagnostics["cloud_enrichment_report"]` plus a WARNING-level log line.
-5. **De-anonymize** (`_apply_bindings`): the single deanon exit gate, in three ordered steps. First, a **predicate invariant** run BEFORE substitution drops (never repairs) any fact whose `predicate` field contains a token from the declared placeholder vocabulary (the union of the anonymizer's `reverse` map and cloud's `bindings`) — the predicate is never a substitution target, so checking it after substitution would silently miss an already-corrupted predicate. Second, **substitution**: deterministic substring replacement of placeholder tokens with their real values, resolved against an observed-scoped map — the local (real) mapping for tokens cloud was actually shown, cloud's own `bindings` for tokens it minted, with the local mapping always taking precedence on conflict. Third, a **residual sweep** checks every fact field (subject/predicate/object/relation_type/confidence/symmetric — never a non-fact field an LLM invented) against the same declared vocabulary, plus a placeholder-shaped-token regex as a last-resort, fail-closed backstop for an undeclared orphan the vocabulary check can't see; the regex is never load-bearing for resolution or substitution, only for this final net. Both steps are fail-closed (drop, not repair) and both record counters/lists in `graph.diagnostics` (`predicate_placeholder_dropped` / `predicate_placeholder_dropped_facts` for the predicate invariant, written at the deanon stage — a placeholder glued into a predicate can only arrive in cloud's *returned* facts now, since the anonymizer stage never produces facts at all — and `residual_dropped_facts` for the residual sweep) — disjoint categories, never double-counted.
-6. **Plausibility** (`configs/prompts/cloud_plausibility.txt`): grounding-based residual safety net. One prompt and one rubric, applied either by the cloud judge over the anonymized facts or by the local model over the de-anonymized facts, depending on the configured stage — the six rules are prose the judge model applies against the source text, not code. Six rules cover (R1) self-loops, (R2) name-swap and role-leak shapes, (R3) source-text contradiction, (R4) conversation-role leaks, (R5) content-free objects, (R6) namespaced system identifiers. Every drop is recorded with the relation it removed and the rule the judge cited; a judge verdict the pipeline cannot apply is still recorded rather than silently discarded. A drop the judge cannot attribute to one of R1-R6 is not applied — the fact stays kept.
+2. **Anonymize.** One chain — `paramem.cloud.anonymize` — serves every cloud-bound path. A small, offline, local detection model is the sole classifier against the operator-configured `sanitization.scrub` categories; the pipeline, never a model, mints every placeholder and owns the `{real → placeholder}` table. The anonymized transcript and the anonymized fact array are both built from that one table by exact substitution, so a fact can never be lost, reworded or dropped by the anonymizer, and no model rewrites outbound text. The chain fails closed on exactly two causes: the graph tier's identity-reconciliation guard, or the detection model being unavailable; no caller ever falls back to the real-name transcript on a fail-closed verdict. The speaker's own anonymous handle is exempt — already anonymous, never minted. A tagged name links to that handle only on evidence: when no name is enrolled for the speaker, an attested self-introduction alone decides; when a name is enrolled, the enrolled name links on equality alone, and a name the speaker introduces as their own in conversation links only when it is consistent with the enrolled name; a namesake is refused. Every other tagged name becomes an ordinary placeholder, whatever any fact claims about it.
+3. **Entity-surface correction** (`configs/prompts/entity_correction.txt`): the local model reviews real entity surfaces on the anonymization reverse map and node attributes and corrects misspelled place/org/concept names; an apply-gate rejects any proposal targeting an entity not already known, and every verdict, accepted and rejected, is recorded and available for audit. Speaker/person nodes are left untouched.
+4. **Cloud enrichment with delta protocol** (`configs/prompts/cloud_enrichment.txt`): cloud returns a delta envelope of additions, modifications, drops, and entity-name bindings for net-new entities — only the changes against the input fact list, not an echo of it. The pipeline applies the delta, merges bindings before de-anonymization, and reconstructs the updated transcript locally. An addition or modification is restricted to the fields that actually reach a relation (subject/predicate/object/relation_type/confidence/symmetric); any other field an LLM invents is stripped before the entry enters the pipeline, so it can never later be mistaken for an unresolved placeholder. Rejection is per-action, never whole-delta: an addition naming a token cloud was never shown and never bound itself is dropped; a modification that would introduce one is discarded and the pre-enrichment fact is kept unchanged instead; a drop is honored unconditionally. A binding whose key collides with the local map is informational only and never a rejection reason — the local value always wins on resolution. Binding collisions and per-cycle rejection counts are operator-visible in the cycle's diagnostics and logged.
+5. **De-anonymize**: the single de-anonymization exit gate, in three ordered steps. First, a predicate invariant runs before substitution and drops (never repairs) any fact whose predicate field contains a placeholder token — the predicate is never a substitution target, so checking it after substitution would silently miss an already-corrupted predicate. Second, substitution: deterministic substring replacement of placeholder tokens with their real values, resolved against a map scoped to exactly what the cloud was shown, with the local mapping always taking precedence over a value cloud minted. Third, a residual sweep checks every fact field against the same declared placeholder vocabulary as a fail-closed backstop for an undeclared orphan that the vocabulary check alone cannot see; it is never load-bearing for ordinary resolution, only for this final net. Both steps are fail-closed — drop, not repair — and counted separately, never double-counted, so a placeholder glued into a predicate can only arrive in the facts the cloud returns, since the anonymizer stage never produces facts at all.
+6. **Plausibility** (`configs/prompts/cloud_plausibility.txt`): a grounding-based residual safety net. One prompt and one rubric, applied either by the cloud judge over the anonymized facts or by the local model over the de-anonymized facts, depending on the configured stage — the rules are prose the judge model applies against the source text, not code. The rubric covers self-loops, name-swap and role-leak shapes, contradiction with the source text, conversation-role leaks, content-free objects, and namespaced system identifiers. Every drop is recorded with the relation it removed and the rule the judge cited; a judge verdict the pipeline cannot apply is still recorded rather than silently discarded. A drop the judge cannot attribute to one of the rules is not applied — the fact stays kept.
 
 A **fallback path** runs local plausibility on the raw extraction when the primary chain empties out. Per-stage diagnostics record raw outputs, transcript round-trip, and dropped facts for audit.
 
-**No post-hoc scope re-classification between steps 2 and 4** (removed — see SECURITY.md for the residual this leaves and why it was deleted, not weakened). The anonymized FACTS cloud sees are built entirely by the pipeline in step 2 from a table it mints and owns (`build_forward_table`), substituted through `_substitute_whole_words` — an exact, case-sensitive primitive; there is nothing left for a post-hoc scan to verify on that surface. The anonymized TRANSCRIPT cloud sees, by contrast, is built the same way — the pipeline substitutes the same table into the text via the same primitive, so there is nothing left to verify or re-classify on that surface either; it cannot recover a value the detection model never flagged as in-scope in the first place, which is checked offline, at the calibration gate (see SECURITY.md). What needs a runtime check is what cloud sends *back* (step 5), which is a model rewriting content, not a table the pipeline owns.
+The anonymized facts and the anonymized transcript cloud sees are both built entirely by the pipeline in step 2, from the one table it mints and owns, substituted through the same exact, case-sensitive primitive — there is nothing left for a later stage to re-verify on either surface; whatever the detection model did not flag as in scope is checked offline, at the calibration gate (see SECURITY.md). What needs a runtime check is what cloud sends *back* (step 5), which is a model rewriting content, not a table the pipeline owns.
 
 **Session-tier enrichment-incident arbitration.** A failed local-anonymization pass and a degraded cloud-enrichment pass are reconciled as two distinct operator-visible incidents rather than conflated into one: a failed anonymization raises its own incident and the enrichment call for that session never runs, while a clean or opted-out anonymization pass resolves the anonymize incident and lets the enrichment outcome (if any) govern the enrichment incident on its own. When the operator has cloud egress disabled entirely, neither incident can ever self-heal by running cleanly, so any still-open incident of either kind resolves the next time a session is processed, carrying a recorded reason that distinguishes "resolved by a clean run" from "resolved because cloud is off" — the same story the graph-tier incident below already tells, kept coherent rather than duplicated.
 
-**Second call site — graph-tier enrichment.** The privacy envelope above (steps 2–6) is not session-tier-only. `paramem.training.graph_enrich.enrich_graph`'s post-merge, cross-session cloud pass (`paramem.graph.extractor.request_graph_enrichment`) runs the SAME anonymize → cloud → de-anonymize chain, through `paramem.cloud` (`anonymize.py` / `deanonymize.py`) — the one round-trip contract every cloud-egress path (session-tier extraction, graph-tier enrichment, chat egress, and their calibration harnesses) composes through (`paramem.cloud.placeholders` remains the model-free, IO-free primitive kit `paramem.cloud` is built from), before any subgraph triple leaves the process.
+**Second call site — graph-tier enrichment.** The privacy envelope above (steps 2–6) is not session-tier-only. The post-merge, cross-session cloud pass over the cumulative knowledge graph runs the same anonymize → cloud → de-anonymize chain, through the same round-trip contract every cloud-egress path (session-tier extraction, graph-tier enrichment, chat egress, and their calibration harnesses) composes through, before any subgraph triple leaves the process.
 
-The cumulative fold graph carries no reliable entity types of its own (registry-derived relations have none), and this pass does not derive one: before each chunk's cloud call it runs `anonymize` (the SAME chain session-tier extraction uses) over the chunk's triples, passing `identity_domain=chunk_nodes`. The detector returns literal payload substrings — the exact real-value text it found in the chunk, not a classification decision — and `anonymize` reconciles those substrings onto the chunk's actual node-key text via `canonical()` internally: a differently-cased/separated/accented substring (e.g. `"Yang Ming"`) is re-keyed onto the node it names (e.g. `"yang ming"`) with the pipeline-minted placeholder preserved verbatim, and an entry matching no node in the chunk (or an ambiguous multiple) is dropped and counted (`AnonymizedContract.rekey_dropped`, surfaced as `mapping_rekey_dropped`). A second, distinct drop class runs after that reconciliation: a table entry that would substitute nothing anywhere in the outbound payload is dropped before it is ever declared to the cloud call, counted separately (`AnonymizedContract.inert_dropped`) — a table entry surviving reconciliation is not yet a guarantee it does real substitution work. This reconciliation is identity reconciliation, not classification — not inside the shared `_substitute_whole_words` primitive, which matches exactly everywhere, including at this tier. `request_graph_enrichment` receives the already-built `AnonymizedContract` and applies no scope gate of its own on the OUTBOUND side. The RESPONSE side has no whole-chunk gate either (2026-07-22 cloud-admission redesign, retiring the prior `totality_rejected_chunks` behaviour): every `relations` entry here is effectively an `add` (this tier has no local baseline to preserve), so `deanonymize_facts`'s fail-closed residual sweep in `_apply_bindings` simply drops the individual relation(s) it cannot resolve post-substitution, counted in `dropped_relations`.
+The cumulative fold graph carries no reliable entity types of its own, and this pass does not derive one: before each chunk's cloud call it runs the same anonymize chain session-tier extraction uses over the chunk's triples, scoped to the chunk's own node identities. The detector returns the literal payload substrings it found in the chunk, not a classification decision, and the anonymizer reconciles those substrings onto the chunk's actual node identity: a differently-cased, differently-separated, or differently-accented substring is re-keyed onto the node it names, with the pipeline-minted placeholder preserved, and an entry matching no node in the chunk, or matching more than one, is dropped and counted. A second, distinct drop class runs after that reconciliation: a table entry that would substitute nothing anywhere in the outbound payload is dropped before it is ever declared to the cloud call, counted separately — surviving reconciliation is not yet a guarantee an entry does real substitution work. This reconciliation step is identity matching, not classification, and the substitution primitive itself matches exactly everywhere, including at this tier. The pipeline applies no further scope gate of its own on the outbound side. On the response side, every returned relation at this tier is effectively an addition (this tier has no local baseline to preserve), so the fail-closed residual sweep on de-anonymization simply drops the individual relations it cannot resolve after substitution.
 
-A local mapping that comes back completely empty is a legitimate "nothing in scope" verdict and proceeds. A local detection pass that DID name real (non-speaker) content but nothing survived to the final table — whether dropped by the scan's own verification (a speaker-id-shaped surface, or a surface that is not a whole word at its own tagged offset) or by the node-key reconciliation above — is a classification/identity-match failure: the affected facts are held back from that chunk's outbound cloud call rather than sent unmasked, while any of the chunk's other facts that classified successfully still reach it. Only when nothing in a chunk survives classification does `anonymize` fail closed for the whole chunk (`status == "failed"`) and the chunk's cloud call itself is skipped, counted in `privacy_skipped_chunks`. Under the default `sanitization.scrub` (person name, email address, phone number, postal address, social profile URL), the anonymous `speaker{N}` handle is never tokenised at this tier either — a code-level guard drops any speaker-id-shaped surface before it can become a table key, so the handle reaches the payload bare by design (it carries no identifying information); there is no prompt at this tier to forbid anything. **Operator opt-out**: an explicitly empty `sanitization.scrub` short-circuits before any model call — the chunk's triples egress to the cloud VERBATIM, the same opt-out contract every other cloud-egress path honours (see SECURITY.md for the privacy-posture note).
+A local mapping that comes back completely empty is a legitimate "nothing in scope" verdict and proceeds. A local detection pass that did name real (non-speaker) content but nothing survived to the final table — whether dropped by the scan's own verification or by the node-identity reconciliation above — is a classification/identity-match failure: the affected facts are held back from that chunk's outbound cloud call rather than sent unmasked, while any of the chunk's other facts that classified successfully still reach it. Only when nothing in a chunk survives classification does the pass fail closed for the whole chunk and the chunk's cloud call itself is skipped. Under the default `sanitization.scrub` (person name, email address, phone number, postal address, social profile URL), the anonymous `speaker{N}` handle is never tokenised at this tier either — it carries no identifying information and reaches the payload bare by design; there is no prompt at this tier to forbid anything. **Operator opt-out**: an explicitly empty `sanitization.scrub` short-circuits before any model call — the chunk's triples egress to the cloud VERBATIM, the same opt-out contract every other cloud-egress path honours (see SECURITY.md for the privacy-posture note).
 
-A local resource fault (insufficient free VRAM) or a span-tagger unavailability during this pass degrades the PASS, not just the one chunk in progress: `enrich_graph` stops processing further chunks (`aborted_reason="vram"` or `aborted_reason="tagger"` in its returned diagnostics), keeps whatever chunks it already merged, and returns normally rather than raising — the chunk in progress when the fault occurred contributes nothing, but chunks that already completed keep their enrichment relations. `ConsolidationLoop._refine_consolidation_graph` records an `enrichment_degraded` incident and the fold proceeds to train on the merged-but-unenriched graph; enrichment self-heals at the next **full** fold — this pass is full-fold only (see AD-15 below), so recovery does not happen at an intervening interim cycle. The incident clears itself on that recovery: an enrichment pass that runs to completion resolves it, so the attention row on `/status` reflects the current state rather than the worst state ever reached. When the operator has cloud egress disabled entirely, a completed pass can never happen — so the incident instead clears the next time a session is processed, carrying a recorded reason that distinguishes "resolved by a clean run" from "resolved because cloud is off," rather than riding on `/status` forever with no path back to green.
+A local resource fault (insufficient free VRAM) or a detection-model unavailability during this pass degrades the pass, not just the one chunk in progress: the pass stops processing further chunks, keeps whatever chunks it already merged, and returns normally rather than raising — the chunk in progress when the fault occurred contributes nothing, but chunks that already completed keep their enrichment relations. An operator-visible incident naming the cause is recorded and the fold proceeds to train on the merged-but-unenriched graph; enrichment self-heals at the next **full** fold — this pass is full-fold only (see AD-15 below), so recovery does not happen at an intervening interim cycle. The incident clears itself on that recovery: an enrichment pass that runs to completion resolves it, so the attention row on `/status` reflects the current state rather than the worst state ever reached. When the operator has cloud egress disabled entirely, a completed pass can never happen — so the incident instead clears the next time a session is processed, carrying a recorded reason that distinguishes "resolved by a clean run" from "resolved because cloud is off," rather than riding on `/status` forever with no path back to green.
 
-The response's `relations` and `same_as` pairs are de-anonymized via `deanonymize_facts` / `deanonymize_text` — `paramem.cloud`'s exit gates, `observed`-scoped to the exact triples JSON sent to cloud — before `enrich_graph` ever consumes them — load-bearing for the speaker-pair guard (`is_speaker_id`), which cannot recognise a placeholder token as a speaker id. Accepted consequence: person-level `same_as` coreference (nickname/honorific variants of the same person) is lost under the default `scrub`, since both surfaces collapse to opaque tokens before the model sees them; org/place/thing coreference is unaffected (those surfaces stay verbatim under the default `scrub`).
+The response's relations and coreference pairs are de-anonymized before the graph-tier enrichment pass ever consumes them — load-bearing for the speaker-pair guard, which cannot recognise a placeholder token as a speaker id. Accepted consequence: person-level coreference (nickname/honorific variants of the same person) is lost under the default `scrub`, since both surfaces collapse to opaque tokens before the model sees them; org/place/thing coreference is unaffected (those surfaces stay verbatim under the default `scrub`).
 
 **Attribution.** ParaMem is a household system with several speakers, and every remembered fact — enriched or not — is attributed to the speaker who asserted it. A returned enrichment fact inherits attribution from the speakers behind the facts it was synthesized from: when exactly one speaker is behind it, it carries that speaker's attribution; when no speaker can be identified, or the fact was synthesized across more than one speaker's facts, it is not kept — a fact combining two speakers' knowledge is not expressible as one speaker's assertion, and guessing an owner from graph shape is rejected by design. Both drop reasons are counted alongside the enrichment yield in the consolidation log, so the outcome is operator-visible, never silent.
 
-**Single chokepoint.** Every orchestrator reaches the extraction chain through `ExtractionPipeline` (`paramem/graph/extraction_pipeline.py`). Direct calls to `extract_graph(...)` or `extract_procedural_graph(...)` are forbidden by `tests/test_extraction_pipeline_guard.py`. The class exposes `run(transcript, session_id, *, source_type, **overrides)` for transcript-shaped inputs and `run_procedural(...)` for the preference/habits stream.
+**Single chokepoint.** Every orchestrator reaches the extraction chain through one pipeline (`paramem/graph/extraction_pipeline.py`) — one door for transcript-shaped input, one for the preference/habits stream. There is no second way in.
 
 ### AD-15: Indexed Key Consolidation Loop
 
-The consolidation loop integrates indexed key memory (AD-13) with the existing graph extraction and promotion pipeline. Each cycle: extract relations from session → assign sequential keys to new facts → train episodic adapter on all active keys → during the full consolidation fold (`ConsolidationLoop.consolidate`), keys whose per-key `reinforcement_count` meets the promotion threshold are promoted episodic→semantic: the matured key is adopted onto the staged semantic working copy via `WorkingTier.adopt_key_from` — registry standing, fingerprint, entry and bookkeeping row move together — and the move becomes real only when the whole event goes live; an aborted event discards it and the key is reconsidered at the next fold.
+The consolidation loop integrates indexed key memory (AD-13) with the existing graph extraction and promotion pipeline. Each cycle: extract relations from session → assign sequential keys to new facts → train episodic adapter on all active keys → during the full consolidation fold, keys whose per-key reinforcement count meets the promotion threshold are promoted episodic→semantic: the matured key is adopted onto the staged semantic working copy — registry standing, fingerprint, entry and bookkeeping row move together — and the move becomes real only when the whole event goes live; an aborted event discards it and the key is reconsidered at the next fold.
 
-**Transcript-stage boundary (architectural symmetry).** The consolidation fold has two venues that run the SAME stage spine over the SAME input. The input is the in-RAM memory store (`MemoryStore`) in both: registry-true relations for every active key, across the main tiers and every interim slot. The venue is selected by `consolidation.mode` and is carried through the spine as a structural `FoldScope.source` (`weights` | `disk`) — never as a mode string. What the venue selects:
-- **`train` (`source="weights"`)**: additionally probes the adapter weights to compute the recall-miss set and retrains `episodic` / `semantic` / `procedural`, each tier built and written into its own staging slot. The event's tiers then go live together as one bundle — publish, mount, adopt, reload, reap, one ledger write, all inside a single `publish_bundle` call (`paramem/training/go_live.py`) — so a tier that aborts suppresses the whole publish: nothing already written in the same call goes live without it. A retrained tier whose own recall check falls short of its full key set refuses the fold before any tier is promoted, so nothing that was already live is touched and there is nothing to restore.
-- **`simulate` (`source="disk"`)**: skips those weight-only blocks — there are no adapter weights — and, like the `train` venue, writes each tier's payload into a timestamped slot the same way; the payload is the projected graph rather than LoRA weights, and `DiskMemorySource` reads it back when the store is next hydrated.
+**Transcript-stage boundary (architectural symmetry).** The consolidation fold has two venues that run the same stage spine over the same input: the in-RAM memory store, holding registry-true relations for every active key across the main tiers and every interim slot. The venue is selected by the configured consolidation mode:
+- **`train`**: additionally probes the adapter weights to compute the recall-miss set and retrains episodic / semantic / procedural, each tier built and staged on its own. The event's tiers then go live together as one bundle — publish, mount, adopt, reload, reap, one record write, all inside a single joint step — so a tier that aborts suppresses the whole publish: nothing already written in the same event goes live without it. A retrained tier whose own recall check falls short of its full key set refuses the fold before any tier is promoted, so nothing that was already live is touched and there is nothing to restore.
+- **`simulate`**: skips those weight-only steps — there are no adapter weights — and, like the `train` venue, stages each tier's payload the same way; the payload is the projected graph rather than LoRA weights, and it is read back the next time the store is hydrated.
 
-Everything else is one code path in both venues: materialize → refine (enrich / normalize) → promote → build keyed entries → commit (registries + payload) → router reload → interim reap → ledger write. Both venues run `canonical()` node identity + Case-1/Case-2 dedup via `GraphMerger.merge(additive=True)` + `GraphTierRefiner.run_enrichment` (cross-session second-order relations + `same_as` coreference, cloud-cloud) then `GraphTierRefiner.run_normalization` (predicate-synonym collapse via `normalize_predicates`; runs when `refinement_normalization` is on, which is the default) — enrichment runs first so normalization collapses any cloud-coined predicate synonym before the fold's key assembly mints keys from the graph. Both passes are **full-fold only**: the interim scope's `FoldScope.enrich` / `FoldScope.normalize` are pinned `False` structurally, regardless of `refinement_enrichment` / `refinement_normalization` / `cloud_enabled` — see AD-10 below. Grooming logic is shared across scopes too: the interim tick (`run_consolidation_cycle`) and the full fold (`ConsolidationLoop.consolidate`, the single public fold entry) both route through the same two-phase spine — `stage_event` (recall, refine, promote, build entries) then `run_build_and_publish` (build/write/gate per tier, one joint go-live) — and every persist tail — either scope, either venue — writes its tiers and carries them through that same joint go-live. There is no dual-path parity requirement — a grooming change goes in `stage_event` once and both venues inherit it. The fold has no notion of who asked for it: whether there is anything to consolidate at all is decided in the server's dispatch layer before the fold is entered. `POST /reconsolidate` is the on-demand re-grooming pass — it runs the identical fold, absorbing and reaping the interim slots exactly as an ordinary full fold does, but leaves pending sessions out of training rather than including them. The interim reap also has an operator-invoked door, `POST /interim/discard`, that runs it without a fold — discarding the ring instead of absorbing it. `POST /speaker/forget` is a third path: a speaker-wide stale-mark outside any fold — the speaker's keys stop serving in the same request, while the tier's adapter and on-disk artifacts stay in place and the retired keys' remains leave at the tier's next consolidation; no reap happens in-request, unlike the ring-wide `POST /interim/discard` or a fold's own reap of the tiers it just absorbed. `POST /debug/erase-keys` is a fourth path, sharing that same stale-mark sequence with `POST /speaker/forget`: an operator-invoked, explicitly-confirmed retirement of an explicit key list — immediately unrecallable, with the rest of each key's bookkeeping leaving at the tier's next consolidation — the targeted scalpel for a key that is wrong for an unknown reason.
+Everything else is one code path in both venues: materialize → refine (enrich / normalize) → promote → build keyed entries → commit (registries + payload) → router reload → interim reap → record write. Both venues run node-identity resolution and duplicate merge, then cross-session enrichment (second-order relations + coreference, cloud-assisted and off by default, gated on the cloud master switch) and predicate-synonym normalization, which is on by default — enrichment runs first so normalization collapses any cloud-coined predicate synonym before the fold's key assembly mints keys from the graph. Both passes are **full-fold only**: the interim scope never enriches or normalizes, regardless of the operator's enrichment/normalization/cloud settings — see AD-10 below. Grooming logic is shared across scopes too: the interim tick and the full fold both route through the same two-phase spine — stage the event (recall, refine, promote, build entries), then build and publish (build/write/gate per tier, one joint go-live) — and every persist tail, either scope, either venue, writes its tiers and carries them through that same joint go-live. There is no dual-path parity requirement — a grooming change is made once and both venues inherit it. The fold has no notion of who asked for it: whether there is anything to consolidate at all is decided in the server's dispatch layer before the fold is entered. `POST /reconsolidate` is the on-demand re-grooming pass — it runs the identical fold, absorbing and reaping the interim slots exactly as an ordinary full fold does, but leaves pending sessions out of training rather than including them. The interim reap also has an operator-invoked door, `POST /interim/discard`, that runs it without a fold — discarding the ring instead of absorbing it. `POST /speaker/forget` is a third path: a speaker-wide stale-mark outside any fold — the speaker's keys stop serving in the same request, while the tier's adapter and on-disk artifacts stay in place and the retired keys' remains leave at the tier's next consolidation; no reap happens in-request, unlike the ring-wide `POST /interim/discard` or a fold's own reap of the tiers it just absorbed. `POST /debug/erase-keys` is a fourth path, sharing that same stale-mark sequence with `POST /speaker/forget`: an operator-invoked, explicitly-confirmed retirement of an explicit key list — immediately unrecallable, with the rest of each key's bookkeeping leaving at the tier's next consolidation — the targeted scalpel for a key that is wrong for an unknown reason.
 
 A consolidation works from the memory it recalled when it started, so a fact a conversation implies should be removed stops being served only when that run completes — and a run that is interrupted leaves what is served exactly as it was. `POST /speaker/forget` and `POST /debug/erase-keys` time differently: neither is a consolidation, and both stop serving the keys they name inside the request that calls them.
 
 **Commit and reap are separate guards.** Every key a tier's staged registry knows must carry a bookkeeping row — and, on a tier rebuilt this event, its materialized entry — checked per tier just before that tier is written; a tier that fails refuses closed, nothing from the event goes live, and the event's record is held for retry rather than discarded. The commit signal is the registry publish — a tier is not committed until its registry mutations are published as part of the joint go-live. An interim slot is reaped only once every increment that adopted from it has gone live, so a slot's content is never destroyed before a durable copy of the merge exists.
 
-**Fold merge input is registry-true, in both venues.** The fold sources its Stage-2 merge input from `store.get(key)` / `store.bookkeeping_for_key(key)` (registry-true SPO) for every active key — never from the reconstruction result, and never from a direct disk read. Reconstruction exists only in the `train` venue and is a **health/retry signal**: a key whose reconstructed SPO disagrees with its registry-true SPO is flagged in `result["recall_miss_keys"]` and retrained with its registry-true content — it is never silently dropped. A recall miss does not delete a key. In the `simulate` venue there is no reconstruction and `recall_miss_keys` is always empty.
+**Fold merge input is registry-true, in both venues.** The fold sources its merge input from the registry-true subject/predicate/object for every active key — never from the reconstruction result, and never from a direct disk read. Reconstruction exists only in the `train` venue and is a **health/retry signal**: a key whose reconstructed content disagrees with its registry-true content is flagged and retrained with its registry-true content — it is never silently dropped. A recall miss does not delete a key. In the `simulate` venue there is no reconstruction and nothing is ever flagged.
 
 Key design decisions:
-- **Capacity / passive decay:** `max_active_keys` (default 100000) imposes no practical limit; keys are not evicted by age. Unreinforced keys passively decay: those not re-seen for `decay_window` cycles are logged as decay candidates but are never actively deleted. Reconstruction noise causes unimportant facts to drift over time — this is the forgetting curve emerging from the mechanism. Validated to 550 keys with no observed ceiling.
-- **Periodic reconstruction:** Fidelity probing runs every N cycles (default 5), not every cycle. Per-cycle probing consumed 73% of cycle time in entity-replay experiments.
+- **Capacity / passive decay:** Keys are never evicted by age and there is no configured ceiling on how many a tier holds. Unreinforced keys passively decay: those not re-seen for `decay_window` cycles are logged as decay candidates but are never actively deleted. Reconstruction noise causes unimportant facts to drift over time — the forgetting curve emerging from the mechanism rather than a policy.
 - **SimHash registry per adapter:** Each adapter (episodic, semantic) maintains its own SimHash registry. Keys promoted from episodic to semantic are registered in the semantic registry and removed from episodic.
-
-Validated: 10-cycle smoke test, episodic 6/6 (100%), semantic 6/6 (100%), 49.9 min total.
 
 ### AD-10: Key-Addressable Replay
 
@@ -206,98 +198,82 @@ Dedup also fires at the interim mini-fold, not only at the full fold: a session 
 
 Key insight: reconstruction does not need to be perfect. Facts that matter get reinforced by coming up again in a later conversation — repetition inside one conversation does not count. Decay is passive: keys not re-seen for `decay_window` cycles are logged as decay candidates; there is no active deletion.
 
-This replaces an earlier design (periodic full-retrain sweeps on stored QA pairs) which contradicted the core architectural invariant: knowledge lives in weights, not in files.
-
 ## Training Contract
 
-**AD-7: Phased Code Structure** — exploration in notebooks; production code lives in the `paramem/` package (notebooks are exploration-only). Project structure is documented in `README.md`.
+**AD-7: Code Structure** — production code lives in the `paramem/` package; experiment scripts live in `experiments/`. Project structure is documented in `README.md`.
 
 ### AD-6: QLoRA Training with Gradient Checkpointing
 
-8GB VRAM on the RTX 5070 requires:
-- 4-bit quantization of the base model (bitsandbytes NF4)
-- Gradient checkpointing enabled
-- Batch size 1, gradient accumulation steps 8–16
-- Sequence length capped at 512 tokens (safe), 1024 (stretch)
-- `bfloat16` compute dtype (Blackwell architecture native)
+The 8GB VRAM budget on the deployment GPU is met by combining 4-bit quantization of the base model (bitsandbytes NF4), gradient checkpointing, a small per-step batch size with gradient accumulation to reach an effective batch size, and a bounded sequence length. Compute runs in `bfloat16`, native to the deployment GPU's architecture.
 
-These constraints are encoded as defaults in the training config, overridable per-experiment.
+These constraints are encoded as defaults in the training config, overridable per-experiment; the operator-facing values are in `DEPLOYMENT.md`'s configuration reference.
 
 ### AD-20: Staging+Promote Adapter Contract
 
-Every adapter training event — consolidation cycle, interim mint, base-swap Phase B — runs through a two-slot **staging+promote** contract, not directly on the production tier. Training and promotion are separate entry points: `paramem/training/trainer.py::train_adapter` owns the transient staging slot per process (`in_training`) and the training loop only; each venue that trains through it (main-tier fold, interim fold, migration, donor build) then owns its own probe → verdict → promote sequence against the staged weights.
+Every adapter training event — consolidation cycle, interim mint, base-swap migration — runs through a two-slot **staging+promote** contract, not directly on the production tier. Training and promotion are separate entry points: the training entry point owns the transient staging slot per process and the training loop only; each venue that trains through it (main-tier fold, interim fold, migration, donor build) then owns its own probe → verdict → promote sequence against the staged weights.
 
-**Two-slot rationale.** Mutating production weights in place is unsafe across two failure modes: (1) crash mid-training would leave the production slot in a half-trained state with no rollback path; (2) the recall sanity gate can reject the trained adapter — an all-or-nothing verdict, any single key short of exact recall, applied identically to a main tier and an interim slot — and without a separate slot to discard, the production weights would be irrecoverable. Production stays byte-identical to the last committed state until the caller's own verdict on the staged weights passes and the new weights have been promoted by an explicit `copy_adapter_weights(staging → production)` step — verify-then-switch, never switch-then-verify.
+**Two-slot rationale.** Mutating production weights in place is unsafe across two failure modes: (1) crash mid-training would leave the production slot in a half-trained state with no rollback path; (2) the recall sanity gate can reject the trained adapter — an all-or-nothing verdict, any single key short of exact recall, applied identically to a main tier and an interim slot — and without a separate slot to discard, the production weights would be irrecoverable. Production stays byte-identical to the last committed state until the caller's own verdict on the staged weights passes and the new weights have been promoted by an explicit copy-to-production step — verify-then-switch, never switch-then-verify.
 
-**Staging slot lifecycle.** The slot is transient — it exists only from one training event's entry until its caller disposes of it. Each training entry creates a fresh `in_training` slot (LoRA-init, seeded RNG when the target adapter is new); when the target adapter already exists, the slot instead starts from the production adapter's current weights via `copy_adapter_weights(production → in_training)` — this is what makes every scheduled fold warm by default. HF Trainer mutates the slot while production is untouched; on a successful (non-aborted) return the slot stays resident and active — `train_adapter` does NOT promote or delete it. The caller then probes the staged weights, applies its own verdict, and — on pass — promotes and disposes of the slot inside `paramem.training.trainer.staged_weights`, a context manager that disposes of the slot on every exit (pass, refuse, or a probe exception). On abort the slot is deleted by `train_adapter` itself, but `staging_resume.json` and the HF Trainer checkpoint follow the same retain-scratch decision as normal completion, not a fixed abort rule: the production fold retains them, so a tier interrupted by abort resumes from its last epoch checkpoint on the next training call instead of restarting from LoRA-zero; callers that don't retain clean scratch immediately, since abort produced no verdict-worthy weights to promote. An in-flight exception (crash) always preserves `staging_resume.json` and the checkpoint for the next process's crash-resume, regardless of the retain decision; the slot itself is deleted on that path too, deliberately skipped only in the narrow case where deleting it would leave the model with no active adapter at all — that case leaves the slot resident and relies on the lifecycle guard at the next training event to surface it loudly rather than breaking the live model silently. The slot never persists across training events under any other outcome.
+**Staging slot lifecycle.** The slot is transient — it exists only from one training event's entry until its caller disposes of it. Each training entry creates a fresh staging slot (LoRA-init, seeded RNG when the target adapter is new); when the target adapter already exists, the slot instead starts from the production adapter's current weights — this is what makes every scheduled fold warm by default. Training mutates the slot while production is untouched; on a successful (non-aborted) return the slot stays resident and active — training itself does not promote or delete it. The caller then probes the staged weights, applies its own verdict, and — on pass — promotes and disposes of the slot; disposal happens on every exit from that step, whether the verdict passes, refuses, or the probe itself raises. On abort the slot is deleted immediately, but the on-disk training scratch follows the same retain-scratch decision as normal completion, not a fixed abort rule: a production fold retains it, so a tier interrupted by abort resumes from its last epoch checkpoint on the next training call instead of restarting from LoRA-zero; a caller that does not retain scratch discards it immediately, since abort produced no verdict-worthy weights to promote. An in-flight crash always preserves that scratch for the next process's crash-resume, regardless of the retain decision; the slot itself is deleted on that path too, deliberately skipped only in the narrow case where deleting it would leave the model with no active adapter at all — that case leaves the slot resident and relies on the lifecycle guard at the next training event to surface it loudly rather than breaking the live model silently. The slot never persists across training events under any other outcome.
 
-**Consolidation vs. migration asymmetry.** Both paths train through the same `train_adapter` entry point and use the same staging slot; each owns its own promote step afterward. They diverge in the starting weights:
-- **Consolidation:** production weights at training entry are the previous cycle's promoted state; `copy_adapter_weights(production → in_training)` carries them into staging. Incremental — every cycle builds on the previous cycle's adapter.
-- **Base-swap migration:** the production tier is explicitly reset to LoRA-zero before `train_adapter` is called. Training is from scratch on the new base model (LoRA weights of the old base do not transfer across different layer dimensions).
+**Consolidation vs. migration asymmetry.** Both paths train through the same entry point and use the same staging slot; each owns its own promote step afterward. They diverge in the starting weights:
+- **Consolidation:** production weights at training entry are the previous cycle's promoted state, carried into staging as the warm start. Incremental — every cycle builds on the previous cycle's adapter.
+- **Base-swap migration:** the production tier is explicitly reset to LoRA-zero before training is called. Training is from scratch on the new base model (LoRA weights of the old base do not transfer across different layer dimensions).
 
-**Pause and resume.** "Pause" is process exit. On the next boot PEFT loads production from disk; `in_training` is absent (never persisted; excluded from backup). The next `train_adapter` call creates a fresh staging slot and `_resolve_resume_checkpoint` finds the saved checkpoint; HF Trainer's `resume_from_checkpoint` loads its weights into staging before continuing from step/epoch N+1.
+**Pause and resume.** "Pause" is process exit. On the next boot production loads from disk; the staging slot is absent (never persisted; excluded from backup). The next training call creates a fresh staging slot and resumes from the saved checkpoint, loading its weights into staging before continuing training from where it left off.
 
-**Live-reload after base-swap final tier.** After the final `migrate()` returns, the orchestrator calls `_live_reload_base_model` before marking `status=pass`. The reload releases every holder and reloads the base model, re-creating the configured tiers at load, picking up every tier's promoted adapter so the running server serves the new base without a systemctl restart. For the reload to fit on 8 GiB, all base-model holders (`BackgroundTrainer.model`, `ConsolidationLoop.model/.extraction.model`) are released via their encapsulated `release()` methods before the reload.
+**Live-reload after base-swap final tier.** After the final migration step returns, the server reloads the base model in place — releasing every holder first — and re-creates the configured tiers at load, picking up each tier's promoted adapter, so the running server serves the new base without a restart.
 
 ### AD-17: Background Training with Inference Pause
 
-**Every run that touches the model — a consolidation fold or a calibration probe — goes through one execution envelope.** The systemd timer, the four consolidation operator endpoints, and the ten `/calibrate/*` endpoints all dispatch through the single arbitrator, `_dispatch_consolidation`. It is **non-blocking in every case**: the arbitrator decides, submits the run to an executor, and returns immediately with a `status` and the `action` it resolved to. Progress is observed via `GET /status` (`consolidating`). Nothing runs the fold — or a calibration probe — on the request thread. The same `consolidating` mutex, executor hop, GPU lock, cooldown gate, and terminal cover both families; a calibration run in flight makes a consolidation dispatch answer `deferred_already_running`, and vice versa. Calibrate routes carry a request body (unlike the four bodyless consolidation endpoints) and, on a started run, the response additionally carries `run_id` and `artifact_dir` — the run's result is written to `<artifact_dir>/response.json` rather than returned inline.
+**Every run that touches the model — a consolidation fold or a calibration probe — goes through one execution envelope.** The systemd timer, the four consolidation operator endpoints, and the ten `/calibrate/*` endpoints all dispatch through a single arbitrator. It is **non-blocking in every case**: the arbitrator decides, submits the run to an executor, and returns immediately with a status and the action it resolved to. Progress is observed via `GET /status`. Nothing runs the fold — or a calibration probe — on the request thread. The same mutex, executor hop, GPU lock, cooldown gate, and terminal cover both families; a calibration run in flight makes a consolidation dispatch defer, and vice versa. Calibrate routes carry a request body (unlike the four bodyless consolidation endpoints) and, on a started run, the response additionally carries a run id and artifact directory — the run's result is written to disk rather than returned inline.
 
 The arbitrator owns three decisions the fold itself knows nothing about:
 
-- **Who may run:** a busy server (fold in flight, chat in progress, GPU held, cloud-only) returns `deferred_*`; a migration TRIAL is checked both at the REST boundary and by the arbitrator itself (`_consolidation_dispatch_guards` → `deferred_trial_active`). Every REST door (including `POST /scheduled-tick`) returns 409 `trial_active` during a TRIAL. The boot-completion catch-up (below) dispatches in-process rather than through a REST call, so the arbitrator-level check is what makes it defer during a TRIAL instead of running. The arbitrator also defers every action, including `RECONCILE`, with `deferred_tier_unverified` while any main memory tier's on-disk state cannot be verified against its adapter slots — a fold cannot safely run against a tier whose key set it cannot confirm. The operator response is restoring the affected tier from a snapshot bundle (`POST /backup/restore`) — a same-base restore comes back online on its own, while one that also restores configuration needs a restart to converge; the destructive doors — `/speaker/forget`, `/debug/erase-keys`, `/interim/discard`, `/admin/assign-orphans`, and `/ingest-sessions/cancel` — stay open while a tier is unverified and no consolidation run is pending resume, but while one is pending they answer 409 naming it; a run that cannot resume is superseded by restoring a healthy backup (`POST /backup/restore`), whose wholesale tier rewrite discards the stuck record and reopens the doors on its own.
-- **What to run:** `ConsolidationAction` is a closed vocabulary of six members — `AUTO`, `FULL`, `INTERIM`, `RECONCILE`, `CALIBRATE`, `CALIBRATE_PENDING` — each declaring its own `stages_event` property. `AUTO` is requested by `POST /scheduled-tick` and by the boot-completion catch-up task described below — it becomes `FULL` or `INTERIM` via `_is_full_cycle_due`'s deadline math. `POST /consolidate` requests `FULL` directly, `POST /consolidate/interim` requests `INTERIM` directly, and `POST /reconsolidate` requests `RECONCILE` directly — none of them ever resolves `AUTO`, so none of them consults the deadline math or falls back between `FULL`/`INTERIM`. Every `/calibrate/*` route requests `CALIBRATE`; `POST /calibrate/extract_pending` requests `CALIBRATE_PENDING`. `stages_event` is `True` only for `AUTO`, `FULL`, `INTERIM`, `RECONCILE` — the four actions that stage an event (resume an interrupted run, gate on tier-binding verification, retire attributable sessions, stamp the cadence, raise an overdue incident). `CALIBRATE` and `CALIBRATE_PENDING` are non-staging: they run the arbitrator's shared guards (mutex, quarantine, tier-verification, migration checks) but never touch staging bookkeeping, so a calibration run can never retire a session or advance the schedule.
-- **Whether to run at all:** the **catch-up gate** (a scheduled tick that is not yet due against its own cadence mark) and the deadline resolution above are gated on `action is AUTO`, so both belong to the schedule alone — a directly requested `FULL`/`INTERIM` skips past them entirely: it means "now", not "if due". The **content gate** (nothing to consolidate → `noop_*`, no GPU work) is a different property, checked per action: `FULL`'s content is any payload-bearing interim slot on disk (checked regardless of the CURRENT `max_interim_count`, so a slot minted before an operator lowered it to 0 is still absorbed and reaped rather than stranded) or, only at `max_interim_count == 0`, pending NAMED sessions; `INTERIM`'s content is pending NAMED sessions; `RECONCILE`'s content is any active key already held by any tier, main or interim — the operator's rebuild-the-store door is turned away only by an empty store, never by the absence of NEW material (no interim slot, no pending session). It applies identically whether `FULL`/`INTERIM` was resolved from `AUTO` or requested directly — a manual door drops only the TIME condition, never the CONTENT condition. A `noop_*` status is information, not a refusal; there is no bypass flag. Session triage — retiring what can never be attributed — is a side-effect pre-stage that runs on *every* dispatch ahead of the content gate, independent of which branch that gate takes. A directly requested `FULL`/`INTERIM`/`RECONCILE` dispatch does not move the cadence window; the next scheduled tick still has its own content gate and noops on its own if the manual run consumed everything.
+- **Who may run:** a busy server (fold in flight, chat in progress, GPU held, cloud-only) returns a deferral; a migration trial is checked both at the REST boundary and by the arbitrator itself, answering `deferred_trial_active`. Every REST door (including `POST /scheduled-tick`) is refused during a trial. The boot-completion catch-up (below) dispatches in-process rather than through a REST call, so the arbitrator-level check is what makes it defer during a trial instead of running. The arbitrator also defers every action, including a reconcile pass, while any main memory tier's on-disk state cannot be verified against its adapter slots — a fold cannot safely run against a tier whose key set it cannot confirm. The operator response is restoring the affected tier from a snapshot bundle (`POST /backup/restore`) — a same-base restore comes back online on its own, while one that also restores configuration needs a restart to converge; the destructive doors — `/speaker/forget`, `/debug/erase-keys`, `/interim/discard`, `/admin/assign-orphans`, and `/ingest-sessions/cancel` — stay open while a tier is unverified and no consolidation run is pending resume, but while one is pending they refuse and name it; a run that cannot resume is superseded by restoring a healthy backup, whose wholesale tier rewrite discards the stuck record and reopens the doors on its own.
+- **What to run:** the arbitrator resolves one of six named actions — a scheduled tick, a full fold, an interim cycle, a reconcile pass, and two calibration probes. A scheduled tick is requested by `POST /scheduled-tick` and by the boot-completion catch-up task described below — it resolves to a full fold or an interim cycle by its own deadline math. `POST /consolidate` requests a full fold directly, `POST /consolidate/interim` requests an interim cycle directly, and `POST /reconsolidate` requests a reconcile pass directly — none of them ever resolves from the schedule, so none of them consults the deadline math or falls back between full and interim. Every `/calibrate/*` route requests a calibration probe; `POST /calibrate/extract_pending` requests the pending-session variant of it. Four of the six actions — the scheduled tick and its two resolved forms, plus the reconcile pass — stage an event (resume an interrupted run, gate on tier-binding verification, retire attributable sessions, stamp the cadence, raise an overdue incident); the two calibration actions never do: they run the arbitrator's shared guards (mutex, quarantine, tier-verification, migration checks) but never touch staging bookkeeping, so a calibration run can never retire a session or advance the schedule.
+- **Whether to run at all:** the **catch-up gate** (a scheduled tick that is not yet due against its own cadence mark) and the deadline resolution above are gated on the run being schedule-driven, so both belong to the schedule alone — a directly requested full fold or interim cycle skips past them entirely: it means "now", not "if due". The **content gate** (nothing to consolidate → a no-op, no GPU work) is a different property, checked per action: a full fold's content is any payload-bearing interim slot on disk (checked regardless of the current interim-count setting, so a slot minted before an operator lowered it is still absorbed and reaped rather than stranded) or, only when interim minting is disabled, pending named sessions; an interim cycle's content is pending named sessions; a reconcile pass's content is any active key already held by any tier, main or interim — the operator's rebuild-the-store door is turned away only by an empty store, never by the absence of new material (no interim slot, no pending session). It applies identically whether a full fold or interim cycle was resolved from the schedule or requested directly — a manual door drops only the TIME condition, never the CONTENT condition. A no-op status is information, not a refusal; there is no bypass flag. Session triage — retiring what can never be attributed — is a side-effect pre-stage that runs on *every* dispatch ahead of the content gate, independent of which branch that gate takes. A directly requested full fold, interim cycle, or reconcile pass does not move the cadence window; the next scheduled tick still has its own content gate and no-ops on its own if the manual run consumed everything.
 
-`FULL` and `RECONCILE` run the same fold: every active key, interim slots included, is always folded into the main tiers and the absorbed interim slots are always reaped. They differ only in whether pending sessions are trained — `FULL` (at `max_interim_count: 0`) trains any pending session along with the fold; `RECONCILE` never does, leaving pending sessions exactly where they are.
+A full fold and a reconcile pass run the same fold: every active key, interim slots included, is always folded into the main tiers and the absorbed interim slots are always reaped. They differ only in whether pending sessions are trained — a full fold (when interim minting is disabled) trains any pending session along with the fold; a reconcile pass never does, leaving pending sessions exactly where they are.
 
-Every fold — `FULL`, interim, and `RECONCILE` alike — trains warm from the resident adapter's weights (see AD-20's staging-slot warm copy); there is no cold-start arm tied to fold type. A resident adapter whose LoRA config (rank, alpha, target modules) no longer matches the tier's configured LoRA topology is the one case recreated cold, regardless of which door triggered the fold. A forgotten key is excluded from every future training set from the moment it is stale-marked — excluded from keyed recall at once — regardless of which fold next retrains the tier. The other cold path is the recall-gate rejection itself: the gate runs before the interim slot is persisted, so the dominant case has no disk artifact to remove; either way the fold deletes the rejected slot from VRAM and discards the event's resume state, so a same-window retry re-mints, re-extracts, and re-enters cold rather than warm-starting from — or resuming the dataset behind — the rejected weights.
+Every fold — full, interim, or reconcile — trains warm from the resident adapter's weights (see AD-20's staging-slot warm copy); there is no cold-start arm tied to fold type. A resident adapter whose LoRA config (rank, alpha, target modules) does not match the tier's configured LoRA topology is the one case recreated cold, regardless of which door triggered the fold. A forgotten key is excluded from every future training set from the moment it is stale-marked — excluded from keyed recall at once — regardless of which fold next retrains the tier. The other cold path is the recall-gate rejection itself: the gate runs before the interim slot is persisted, so the dominant case has no disk artifact to remove; either way the fold deletes the rejected slot from VRAM and discards the event's resume state, so a same-window retry re-mints, re-extracts, and re-enters cold rather than warm-starting from — or resuming the dataset behind — the rejected weights.
 
-Below the arbitrator the training layer has **no notion of who asked**: the fold call takes only its venue, whether pending sessions are trained, its fold inputs, and its resolved door name (`event`) — nothing else.
+Below the arbitrator the training layer has **no notion of who asked**: the fold call takes only its venue, whether pending sessions are trained, its fold inputs, and its resolved door name — nothing else.
 
-The **cooperative training path** (`_extract_and_start_training`) spawns a `BackgroundTrainer` that releases the GPU lock per step so voice turns interleave. Scheduling is driven by a systemd user timer whose schedule IS `consolidation.refresh_cadence` — the timer never sees the derived full period (`refresh_cadence × max_interim_count`, or `refresh_cadence` itself at `max_interim_count: 0`); that derivation is consumed by `_is_full_cycle_due`, which decides per-tick whether a fired timer runs a full fold or an interim cycle. `refresh_cadence` accepts `"HH:MM"` (daily), `"every Nh"`/`"every Nm"` (interval), `"daily"`, or `""`/`"off"` (manual only). Every rendered timer is `OnCalendar` + `Persistent=true`, so a tick missed during suspend/power-off fires again once systemd resumes — but a tick that fires while the server is still starting has nowhere to land yet (uvicorn hasn't bound the port) and would otherwise be lost. The server closes that gap itself: once its own startup finishes, it checks for a missed cycle and dispatches through the identical `AUTO` door `POST /scheduled-tick` uses. Both the systemd-fired tick and this boot-completion check are gated by the same durable last-attempt stamp (`paramem/server/schedule_state.py`), for every cadence kind — anchored (daily/weekly/HH:MM) and exact-divisor intervals included, not only intervals that don't divide evenly into a day/hour — so a duplicate or redundant tick inside the same mark's window is a no-op (see `paramem/server/systemd_timer.py` module docstring). The first-ever scheduled tick on a fresh deployment seeds the stamp and does not fold. The same boot-completion task runs a missed scheduled backup before any missed consolidation catch-up (so a backup never captures a fold's own output as though it predated the fold), then reconciles both the consolidation and scheduled-backup timers last, off the event loop — both timers reconcile from the same helper on every config apply that changes either, not only at server boot.
+The **cooperative training path** spawns a background trainer that releases the GPU lock per step so voice turns interleave. Scheduling is driven by a systemd user timer whose schedule IS the operator-configured refresh cadence; the timer never sees the derived full-fold period, which is consumed internally to decide per-tick whether a fired timer runs a full fold or an interim cycle. The refresh cadence accepts a daily time-of-day, an hourly or minute interval, `"daily"`, or manual-only. Every rendered timer fires again once systemd resumes after a tick is missed during suspend or power-off — but a tick that fires while the server is still starting has nowhere to land yet and would otherwise be lost. The server closes that gap itself: once its own startup finishes, it checks for a missed cycle and dispatches through the identical scheduled-tick door `POST /scheduled-tick` uses. Both the systemd-fired tick and this boot-completion check are gated by the same durable last-attempt stamp, for every cadence kind — anchored (daily/weekly/time-of-day) and exact-divisor intervals included, not only intervals that don't divide evenly into a day or hour — so a duplicate or redundant tick inside the same mark's window is a no-op. The first-ever scheduled tick on a fresh deployment seeds the stamp and does not fold. The same boot-completion task runs a missed scheduled backup before any missed consolidation catch-up (so a backup never captures a fold's own output as though it predated the fold), then reconciles both the consolidation and scheduled-backup timers last, off the event loop — both timers reconcile from the same logic on every config apply that changes either, not only at server boot.
 
-**`window_stamp` is provenance only.** Main adapter slots are stamped with the full-consolidation window they belong to, and that stamp is written into the slot manifest — but no code compares stamps to decide anything. `_is_full_cycle_due` never reads it. There is consequently no "clear the stamp to force a full cycle" escape hatch (it never worked); the way to run a full cycle on demand is `POST /consolidate`, and the way to rebuild main memory from its own stored knowledge is `POST /reconsolidate`.
+**A cadence stamp is provenance only.** Main adapter slots are stamped with the full-consolidation window they belong to — `window_stamp` in the slot's own manifest — but nothing compares stamps to decide whether to run. The way to run a full cycle on demand is `POST /consolidate`, and the way to rebuild main memory from its own stored knowledge is `POST /reconsolidate`.
 
-`GracefulShutdownCallback` stops training at epoch boundaries on shutdown; a failed interim cycle is logged and pending sessions are left for retry on the next tick. `RecallEarlyStopCallback` (gated by `consolidation.recall_early_stopping`, default OFF) has one responsibility: it fires `should_training_stop` once the staged adapter has memorized its full per-tier key set for enough consecutive probes. It does not itself produce the training-finished verdict — that is the fold's own uncapped per-key probe of the staged weights, run by the caller after `train_adapter` returns and before promotion (see AD-20).
+Training stops at epoch boundaries on shutdown; a failed interim cycle is logged and pending sessions are left for retry on the next tick. Recall-based early stopping (`consolidation.recall_early_stopping`, ship default off) has one responsibility: it halts training once the staged adapter has memorized its full per-tier key set for enough consecutive probes. It does not itself produce the training-finished verdict — that is the fold's own uncapped per-key probe of the staged weights, run by the caller after training returns and before promotion (see AD-20).
 
-A **simulation mode** (`consolidation.mode: simulate`) persists the knowledge graph to disk instead of training LoRA weights. Switching `consolidation.mode` between `train` and `simulate` triggers a per-tier active-store migration on next startup, gated by 100% recall. The same simulate↔train mechanism backs the online **base-model swap**: Phase A captures each tier's graph from the live adapters (`train→simulate`) and deletes the old weight slots; Phase B relearns each tier on the new base (`simulate→train`) under the same 100% recall gate.
+A **simulation mode** (`consolidation.mode: simulate`) persists the knowledge graph to disk instead of training LoRA weights. Switching `consolidation.mode` between `train` and `simulate` triggers a per-tier active-store migration on next startup, gated by full recall of every active key. The same simulate↔train mechanism backs the online **base-model swap**: one phase captures each tier's graph from the live adapters (train→simulate) and deletes the old weight slots; the next phase relearns each tier on the new base (simulate→train) under the same full-recall gate.
 
 ## Inference & Serving
 
 ### AD-19: Intent Classification — LLM-Default with Encoder Fallback
 
-Routing in `/chat` dispatches on a single `Intent` value
-(`PERSONAL` / `COMMAND` / `GENERAL` / `UNKNOWN`) produced by a
-two-tier classifier:
+Routing in `/chat` dispatches on one of four intents — personal,
+command, general, or unknown — produced by a two-tier classifier:
 
 1. **HA fast path (deterministic).** When the HA entity graph matches
    an entity or area in the query text, the classifier short-circuits
-   to `COMMAND`. Reliable because the HA namespace is closed.
+   to command. Reliable because the HA namespace is closed.
 2. **Content-driven residual.** When the HA fast path misses, the
    residual classifier runs, selected by `intent.mode`:
    - `"llm"` (production default) — a single-token generation from
      the loaded local Mistral 7B using
-     `configs/prompts/intent_classifier.txt`. The prompt is name-free: the
-     identity-injection helpers (`_build_speaker_prefix`,
-     `_build_system_prompt`) used by the local reasoning leg are not
-     invoked for classification, so no speaker identity reaches the
-     classifier system message. ~2-4 forward passes
-     per query (one prefill + 1-3 decode); measured end-to-end
-     differential vs. embeddings on this hardware is ~300 ms.
+     `configs/prompts/intent_classifier.txt`. The prompt is name-free —
+     no speaker identity reaches the classifier.
    - `"embeddings"` — `intfloat/multilingual-e5-small` cosine vs.
      per-class exemplar bank under `configs/intents/<class>.<lang>.txt`,
-     gated by a top-1/top-2 margin. ~1 ms per query but brittle on
+     gated by a top-1/top-2 margin — cheap, but brittle on
      phrasings the bank doesn't anticipate.
 
 **Why LLM is the default.** Routing is an open-vocabulary problem.
 A static exemplar bank covers only what the operator anticipated;
-each new user phrasing is a potential miss. Two field-observed gaps
-in one session (named-station play queries, `Stop X` imperatives,
-compound noisy STT transcripts) — each required an exemplar-bank
-patch under `embeddings`, then surfaced the next gap. The LLM is
-already loaded for the PA path; its per-query cost is below typical
-voice-assistant latency budgets; it handles paraphrase, synonyms,
+each new user phrasing is a potential miss, and each patch to the bank
+only postpones the next one. The LLM is already loaded for the PA
+path, so routing adds no new model; it handles paraphrase, synonyms,
 multilingual phrasings, and compound transcripts without
 maintenance.
 
@@ -306,7 +282,7 @@ registered (cloud-only mode, model load failure), the dispatch
 auto-falls back to the encoder path so routing keeps working with
 the encoder + exemplar bank. When intent cannot be positively
 established — below margin, or encoder/exemplars fail to load — the
-query is classified `UNKNOWN`: no personal-memory access, and not
+query is classified unknown: no personal-memory access, and not
 blocked from escalation, so it routes through the normal HA → cloud →
 base-model chain. A classifier unavailable in a mode that requires it
 raises an operator-visible incident, so the degraded state is loud,
@@ -314,10 +290,9 @@ not silent.
 
 **State signal asymmetry.** PA graph match is intentionally NOT a
 state signal here. Speaker enrollment must not classify the
-speaker's own queries as `PERSONAL` (the old "speaker-in-graph →
-PERSONAL" short-circuit caused imperatives from enrolled speakers
-to misroute into the PA path). The router scopes keys by speaker
-but lets the classifier decide intent.
+speaker's own queries as personal: an imperative from an enrolled
+speaker belongs on the command path, not the personal one. The router
+scopes keys by speaker but lets the classifier decide intent.
 
 **Date-aware recall.** The same classifier is the single gate for
 questions about the speaker's own past conversations — "what did we
@@ -351,9 +326,8 @@ and reasoned over like any other fact. The invariant
 governs how the speaker is *referred to*, not which words
 a remembered fact may contain.
 
-One resolver, `resolve_speaker_tokens`
-(`paramem/server/speaker.py`), owns every token-to-name
-substitution, and it fires only where text is about to be
+One resolver (`paramem/server/speaker.py`) owns every
+token-to-name substitution, and it fires only where text is about to be
 shown or spoken to a person; no `speaker{N}` token is
 ever rewritten to a name on its way into a model. Four
 such exits exist: the `/chat` response text, the
@@ -374,7 +348,7 @@ only when every resolution step fails to yield a speaker.**
 Bound-token identity, a voice-embedding match, session
 history, and anonymous-speaker promotion are each tried in
 turn; only when all of them miss does the turn route to
-`_relay_route` — HA, cloud, or the local base model only,
+the relay path — HA, cloud, or the local base model only,
 prefixed with a notice — instead of the local
 parametric-memory dispatch. The relay path touches none of
 the personal machinery: no knowledge-store access, no
@@ -388,8 +362,8 @@ automatically, at every consolidation pass (embedding match
 against enrolled profiles) or on in-conversation name
 enrollment, with an explicit operator door as a further
 option. The relay path also runs no intent classification:
-routing an unattributed turn needs no `RoutingPlan`, since
-there is no `speaker_id` to route personally for. One case is
+routing an unattributed turn needs no per-speaker routing
+plan, since there is no speaker id to route personally for. One case is
 caught before HA or cloud is even tried: a personal
 interrogative with no identity returns the canned no-identity
 abstention response instead of risking a confabulated or
@@ -398,24 +372,20 @@ normal cloud-egress sanitization every other leg applies.
 
 ### AD-21: One Cloud Master Switch, One Personal Verdict, One External-Egress Primitive
 
-**One switch.** `cloud.enabled` (`CloudConfig`) is the single on-off for all
+**One switch.** `cloud.enabled` is the single on-off for all
 cloud egress: the conversation agent, the per-session extraction enrichment
-chain, the graph-tier enrichment pass, and `/calibrate/enrich`. It replaced
-two structurally disjoint switches that answered the same question with no
-cross-reference between them (`consolidation.cloud_enabled` and
-`agents.cloud.enabled`) — a deployment could have the conversation agent live
-while the pipeline believed cloud was off, or the reverse. `agents.cloud` and
-`agents.cloud_providers` carry provider, model and credentials only; they have
-no on-off of their own. The switch is necessary but never sufficient: whether
-a specific call may be placed is decided by
-`paramem.cloud.admission.evaluate_cloud_egress`, which also requires a
+chain, the graph-tier enrichment pass, and `/calibrate/enrich`. `agents.cloud`
+and `agents.cloud_providers` carry provider, model and credentials only; they
+have no on-off of their own. The switch is necessary but never sufficient: whether
+a specific call may be placed is decided by an admission check
+(`paramem/cloud/admission.py`) that also requires a
 supported provider, a model, a resolvable API key and (for OpenAI-compatible
 providers) an endpoint. With no provider and no API key there is no cloud
 mode; only the local model answers. Ship default is `false` — enabling it
 sends knowledge-graph content to a third party under best-effort
 anonymization only.
 
-**Self-hosted is not cloud.** `admission.py`'s provider tables are the
+**Self-hosted is not cloud.** `paramem/cloud/admission.py`'s provider tables are the
 registry of what "cloud" means. A host that speaks the OpenAI-compatible wire
 format but runs on the operator's own hardware has no entry there and never
 reaches an admission check.
@@ -423,14 +393,11 @@ reaches an admission check.
 **One personal verdict.** The intent classifier is the routing authority for
 whether a turn is personal. A single self-reference check (encoder-based,
 first-person fallback) supplements it for first-person queries that name
-nothing the classifier keyed on. The two are unioned into one `is_personal`
-verdict, computed once in `handle_chat` and threaded from there. An earlier
-graph-anchored scrub — matching a query against the speaker's stored entity
-surfaces — was removed: it re-derived a signal the classifier already owns and
-could only add false positives. The sanitizer has no policy knob of its own:
-what to DO about a personal verdict is the caller's decision. Self-referential
-history turns are always dropped from a cloud payload, never
-warned-and-passed.
+nothing the classifier keyed on. The two are combined into one
+personal-turn verdict, computed once and threaded from there. The sanitizer has no policy
+knob of its own: what to DO about a personal verdict is the caller's
+decision. Self-referential history turns are always dropped from a cloud
+payload, never warned-and-passed.
 
 **The verdict gates the cloud leg, not HA.** The HA leg stays reachable on
 every path and is scrubbed under `sanitization.scrub` regardless of the
@@ -439,20 +406,19 @@ verdict.
 **The forwarded query is a distinct artifact.** The text after `[ESCALATE]`
 is authored by the local model after it has recalled facts from parametric
 memory, so it can carry personal content the user never typed. It gets its
-own verdict from the same `is_self_referential` predicate, computed in
-`_maybe_escalate`; a self-referential forwarded query suppresses the HA hop as
+own verdict from the same self-reference check used above, computed at the
+point of escalation; a self-referential forwarded query suppresses the HA hop as
 well as the cloud hop, because `ha_agent_id` is operator-pointed and may be
 cloud-backed.
 
 **History is server-assembled, never client-supplied.**
-`ChatRequest` carries no history field of any kind.
-`_run_chat_turn` — the single turn-handling path shared by
-`/chat` and `POST /voice` — reads the conversation's prior
-turns from the server's own session store
-(`SessionBuffer.get_conversation_turns`) before dispatching
-to either the local or the relay leg, so nothing a client
-sends can inject fabricated turns into the context a reply is
-built from or a cloud payload carries.
+The chat request carries no history field of any kind.
+The shared turn-handling path behind `/chat` and `POST /voice`
+reads the conversation's prior turns from the server's own
+session store before dispatching to either the local or the
+relay leg, so nothing a client sends can inject fabricated
+turns into the context a reply is built from or a cloud
+payload carries.
 
 **One external-egress primitive, two doors.** Both external legs — HA and
 cloud — share one scrub primitive and one exit gate, with different
@@ -500,84 +466,27 @@ is scrubbed.
 
 ### AD-18: Multi-Engine Multilingual TTS
 
-Local text-to-speech via pluggable engines (`ENGINE_REGISTRY`) behind a common `TTSEngine` ABC:
+Local text-to-speech via pluggable engines behind a common interface:
 
-- **Piper** (ONNX runtime): fast, high-quality voices for well-supported languages (en, de, fr, es). Sub-second synthesis on CPU.
+- **Piper** (ONNX runtime): fast, high-quality voices for well-supported languages (en, de, fr, es).
 - **MMS-TTS** (HuggingFace VitsModel): broader language coverage (e.g. Tagalog) where Piper has no voice model.
 - **Kokoro-82M** (optional, opt-in per voice): higher-quality neural voices for en/fr/es and others (no German). Apache-2.0, CPU-capable.
 
-`TTSManager` routes synthesis requests by language code to the configured engine/voice from `server.yaml` (per-voice device, CPU default). Exposed as a Wyoming protocol server (port 10301): it advertises `supports_synthesize_streaming` and handles `SynthesizeStart`/`Chunk`/`Stop`, which is what lets HA's streaming voice pipeline deliver audio to satellites/Sonos.
+Synthesis requests are routed by language code to the configured engine/voice from `server.yaml` (per-voice device, CPU default). Exposed as a Wyoming protocol server (port 10301) with streaming synthesis support, which is what lets HA's streaming voice pipeline deliver audio to satellites/Sonos.
 
 Language detection flows from two sources, both feeding the same resolver in `/chat`:
 
-- **Voice path:** Whisper STT → `TranscriptionResult.language` → `_state["latest_language_detection"]` → `/chat` handler.
+- **Voice path:** Whisper STT produces a detected language for the turn, carried forward to the `/chat` handler.
 - **Text path:** fastText `lid.176` (`paramem/server/lang_id.py`) eager-loaded at server lifespan startup when `text_lang_detection.enabled`. Invoked on the request text only when no STT-derived signal is present and the request carries no voice embedding. CPU-only, zero VRAM cost; fetched once via `scripts/setup/download-langid-model.sh` into `~/.cache/paramem/lang_id/`. Disabled by default in the example config so deployments without the model file do not warn.
 
-`paramem.server.prompts.language_instruction()` injects "Respond in {language}" into system prompts for non-English input. Speaker profiles persist `preferred_language` for cross-session consistency on the voice path.
+A language instruction is injected into the system prompt for non-English input, instructing the model to respond in that language. Speaker profiles persist `preferred_language` for cross-session consistency on the voice path.
 
-**Transport-agnostic STT/embedding seam.** STT transcription and optional voice-embedding extraction are factored into `process_utterance` (`paramem/server/voice_pipeline.py`), called by both the Wyoming satellite handler and the `POST /voice` endpoint. The two callers differ only in how they establish speaker identity:
+**Transport-agnostic STT/embedding seam.** STT transcription and optional voice-embedding extraction are factored into one shared step (`paramem/server/voice_pipeline.py`), called by both the Wyoming satellite handler and the `POST /voice` endpoint. The two callers differ only in how they establish speaker identity:
 
-- **Wyoming satellite path:** `process_utterance` runs STT and computes the voice embedding (`compute_embedding=True`). The embedding is matched against enrolled speaker profiles to identify the caller.
-- **`POST /voice` (mobile PWA) — token-type selector:** when the device carries an attributed per-user bearer token (`auth_speaker_id` set), `process_utterance` runs STT only (`compute_embedding=False`) and identity is resolved from the token. When the device carries an unattributed token or no auth is configured (`auth_speaker_id is None` either way), `compute_embedding=True` and the embedding is passed through `_resolve_and_enroll_speaker`.
+- **Wyoming satellite path:** the shared step runs STT and computes the voice embedding. The embedding is matched against enrolled speaker profiles to identify the caller.
+- **`POST /voice` (mobile PWA) — token-type selector:** when the device carries an attributed per-user bearer token, the shared step runs STT only and identity is resolved from the token. When the device carries an unattributed token or no auth is configured, the voice embedding is computed instead and used to resolve or enroll the speaker.
 
-Both paths feed the transcript into `_run_chat_turn` — the same turn-orchestrator as `POST /chat`.
-
-## Evaluation Infrastructure
-
-### AD-8: RAG Baseline with FAISS
-
-RAG pipeline uses the same embedding model already installed (all-MiniLM-L6-v2) for chunk retrieval. FAISS-CPU for vector search — lightweight, no GPU needed at our scale (hundreds of chunks). Falls back to numpy cosine search if FAISS install fails on WSL2.
-
-The RAG pipeline is evaluation infrastructure, not a competing product. It exists to diagnose where parametric memory wins or loses vs retrieval.
-
-### AD-22: One Declaration Per Name Shape; Regex Confined to Two Modules
-
-Every name format the system mints is declared exactly once, at the mint, and
-parsed by composing from that same declaration. A shape written twice — once
-where it is built, once where it is recognised — drifts silently, because
-nothing links the two.
-
-Applied to the three internal formats:
-
-- **Interim adapter names.** `INTERIM_NAME_PREFIX` and `INTERIM_STAMP_FORMAT`
-  in `paramem/memory/interim_adapter.py` are the sole declaration.
-  `interim_stamp_from_name` validates by round-tripping through the format
-  constant, so the shape has no second expression as a pattern or a literal
-  length — and a stamp that is well-formed but not a real datetime is
-  rejected, which a shape-only check cannot do.
-- **Speaker ids.** `SPEAKER_ID_PREFIX` in `paramem/utils/identity.py` is
-  shared by the mint (`SpeakerStore`) and the structural gate
-  (`is_speaker_id`).
-- **Placeholder tokens.** `_BARE_PLACEHOLDER_SHAPE` in
-  `paramem/cloud/placeholders.py` is composed into both the anchored
-  validator and the in-text scanner.
-
-Regex is permitted in exactly two modules, and the criterion is structural
-rather than a judgement about the text being matched:
-
-| Module | Patterns | Fragment |
-|---|---|---|
-| `paramem/cloud/placeholders.py` | `PLACEHOLDER_SHAPE_RE`, `PLACEHOLDER_TOKEN_RE` | `_BARE_PLACEHOLDER_SHAPE` |
-| `paramem/server/schedule_grammar.py` | `_INTERVAL_RE`, `_HHMM_RE` | none needed — no shape appears twice |
-
-A fragment constant is the remedy for a shape used by more than one pattern,
-not a habit. `schedule_grammar` needs none: the `daily HH:MM` operator idiom
-is a prefix strip inside `parse_schedule_atom`, not a third pattern
-re-spelling the time it already knows how to match.
-
-A pattern is admissible only where it describes genuinely structured text and
-composes from a single fragment declaration. Everywhere else, a string
-primitive expresses the same rule with no pattern to keep in step: prefix and
-suffix tests for minted names, membership tests for character allowlists,
-`partition` for delimiter scans, `groupby` for run collapsing. Adding a
-pattern outside these two modules — or a second, independent spelling of a
-shape inside them — is a defect, not a style preference.
-
-## Superseded Decisions
-
-**AD-9: Curriculum-Aware Replay** — superseded by AD-10. A per-cycle probe-and-weight-sampling mechanism over an external replay pool was designed to address low sampling coverage (~8% per cycle). It was removed when the replay-pool architecture itself was replaced by reconstruction-from-weights (AD-10), which requires no external corpus and uses recall misses as the retry signal instead of curriculum sampling.
-
-**AD-12: Swappable Extraction Backend** — superseded by AD-16. The `backend` parameter on `extract_graph()` was never shipped; the single-backend staged chain of AD-16 replaced it.
+Both paths feed the transcript into the same shared turn-handling path as `POST /chat`.
 
 ## Known Constraints
 
@@ -585,6 +494,6 @@ shape inside them — is a defect, not a style preference.
 |------|--------|------------|
 | 8GB VRAM limits batch size and sequence length | Slower training, potential quality impact | QLoRA + gradient checkpointing + gradient accumulation; monitor for quality issues |
 | WSL2 CUDA memory reporting can be inaccurate | Unexpected OOM during training | Set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`; keep training data on Linux filesystem |
-| Multi-adapter simultaneous training not natively batched in PEFT | Must train adapters sequentially per consolidation cycle | Acceptable for PoC; each adapter trains independently anyway |
-| Graph extractor quality depends on base model capability | Poor extraction → poor consolidation signal | Evaluate extraction quality early; consider separate extractor model if needed |
-| Key reconstruction quality degrades with many keys | Adapter capacity limits reliable reconstruction | Reconstruction-based replay reinforces active keys each cycle; unreinforced keys passively decay via reconstruction noise (`decay_window` log-candidate, no deletion). Validated to 550 keys with no observed ceiling. |
+| Multi-adapter simultaneous training not natively batched in PEFT | Must train adapters sequentially per consolidation cycle | Acceptable — each adapter trains independently anyway |
+| Graph extractor quality depends on base model capability | Poor extraction → poor consolidation signal | Extraction runs on the configured base model, so extraction quality moves with model selection and is measured per model |
+| Key reconstruction quality degrades with many keys | Adapter capacity limits reliable reconstruction | Reconstruction-based replay reinforces active keys each cycle; unreinforced keys passively decay via reconstruction noise (`decay_window` log-candidate, no deletion). |
