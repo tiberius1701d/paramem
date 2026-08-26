@@ -876,8 +876,8 @@ if [[ -n "$tier_lines" ]]; then
             semantic)   _sem_cnt="$_cnt" ;;
             procedural) _proc_cnt="$_cnt" ;;
             *interim*)
-                (( interim_total += _cnt ))
-                (( interim_slots += 1 ))
+                interim_total=$(( interim_total + _cnt ))
+                interim_slots=$(( interim_slots + 1 ))
                 ;;
         esac
     done <<< "$tier_lines"
