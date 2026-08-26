@@ -248,8 +248,7 @@ def _extract_json_block(text: str) -> str:
             # Unwrap HERE — the one primitive boundary every caller
             # shares — rather than returning the outer list's text and
             # letting each caller re-detect and unwrap this exact shape
-            # for itself (formerly duplicated in
-            # ``paramem.graph.extractor._parse_extraction``).
+            # for itself.
             return json.dumps(value[0])
         if verdict == "envelope":
             return src[candidate:end]
@@ -322,10 +321,11 @@ def _extract_json_block(text: str) -> str:
 class CloudScope:
     """The legality/resolution scope for ONE cloud round trip.
 
-    Collapses what was mirrored five times: the construction of
-    ``observed`` (the placeholder tokens actually shown to the cloud) and
-    the two :func:`~paramem.cloud.placeholders._resolution_map` calls
-    (bindings-aware and bindings-free) built from it.
+    THE single construction of ``observed`` (the placeholder tokens
+    actually shown to the cloud) and the two
+    :func:`~paramem.cloud.placeholders._resolution_map` calls
+    (bindings-aware and bindings-free) built from it — every cloud round
+    trip shares this one scope rather than each re-deriving it.
 
     ``core_resolution`` (the bindings-FREE map — CORE only, ``cloud_bindings={}``)
     has exactly ONE production consumer: a ``len()`` in the ``cloud_enrich``
@@ -374,7 +374,7 @@ class CloudScope:
         — the ONE call, not one per caller — and non-``str`` pairs are
         filtered as a side effect of that normalize.
 
-        **Binding-value pruning (2026-07-22 cloud-admission redesign).**
+        **Binding-value pruning.**
         After normalizing, any binding whose own VALUE still carries an
         unresolvable placeholder token (the ``{"Role_1": "Senior Engineer
         at Org_9"}`` case, where ``Org_9`` is never declared anywhere) is
@@ -393,10 +393,8 @@ class CloudScope:
         the ordinary per-fact rule (:func:`~paramem.graph.extractor.
         _apply_enrichment_delta`'s orphan check on ``add``/``modify``, or
         :func:`~paramem.cloud.placeholders._apply_bindings`'s residual
-        sweep) — this replaces the fatal binding-value scan that used to
-        live in the now-retired ``_check_mapping_totality`` (folded into
-        :func:`~paramem.cloud.placeholders._binding_collisions`, which no
-        longer scans binding values at all — that job moved here).
+        sweep). :func:`~paramem.cloud.placeholders._binding_collisions`
+        does not scan binding values at all — that check lives here.
 
         ``declared`` on the returned scope is the UNION of ``contract``'s
         CORE vocabulary and the normalized ``cloud_bindings`` keys (the
@@ -468,11 +466,9 @@ class CloudScope:
 class DeanonResult:
     """Result of :func:`deanonymize_facts`.
 
-    ``facts`` holds the substituted, already-partitioned survivors —
-    ``deanonymize_facts`` always substitutes now (2026-07-22
-    cloud-admission redesign retired the whole-delta accept/reject
-    ``verdict`` this dataclass used to carry): per-triple resolvability is
-    decided earlier, at the point cloud's delta is applied
+    ``facts`` holds the substituted, already-partitioned survivors:
+    per-triple resolvability is decided earlier, at the point cloud's
+    delta is applied
     (:func:`~paramem.graph.extractor._apply_enrichment_delta`), and the
     fail-closed residual sweep in :func:`~paramem.cloud.placeholders.
     _apply_bindings` (surfaced here as ``predicate_dropped`` /
@@ -503,8 +499,8 @@ def deanonymize_facts(
 
     Always substitutes via :func:`~paramem.cloud.placeholders.
     _apply_bindings` (predicate invariant, substitute, residual sweep,
-    fail-closed) — there is no whole-delta accept/reject step here any
-    more.  :func:`~paramem.cloud.placeholders._binding_collisions` still
+    fail-closed) — there is no whole-delta accept/reject step here.
+    :func:`~paramem.cloud.placeholders._binding_collisions` still
     runs, purely for its ``collisions`` diagnostic; per-triple
     resolvability (dropping an unresolvable ``add``, reverting an
     unresolvable ``modify``) is decided earlier, by
@@ -545,13 +541,6 @@ def deanonymize_text(scope: CloudScope, text: str) -> str | None:
        ``scope.resolution`` — the ``observed``-scoped map, NEVER a raw
        reverse map.  The signature makes the unsafe call unexpressible:
        there is no way to hand this function a bare ``reverse`` dict.
-       (This step used to be a dedicated ``deanonymize_text`` primitive in
-       the placeholder kit; that primitive was a pure pass-through null
-       guard already subsumed by ``_substitute_whole_words``'s own
-       ``if not mapping or not text`` guard, so it collapsed into a
-       direct call here rather than surviving as a second name for the
-       same one-line body — see ``paramem.cloud.placeholders`` module
-       docstring.)
     2. :func:`~paramem.cloud.placeholders._contains_declared_token`
        against ``scope.declared`` -> returns ``None``.  Always
        fail-closed.  Declared tokens are machine-minted (``Prefix_N``
@@ -565,13 +554,12 @@ def deanonymize_text(scope: CloudScope, text: str) -> str | None:
     Note: this function does NOT run the undeclared-orphan shape backstop
     (:data:`~paramem.cloud.placeholders.PLACEHOLDER_TOKEN_RE`) that
     :func:`~paramem.cloud.placeholders._apply_bindings` runs for fact
-    fields.  That backstop is out of scope for this round of unification
-    (free conversational prose is a far wider surface for false positives
-    than a structured fact field — e.g. ``GPT_4``, ``COVID_19`` are
-    legitimate shape matches) and is deferred to a follow-up gated on a
-    dedicated probe sweep.  The fact paths (session-tier extraction and
-    graph-tier enrichment, via :func:`deanonymize_facts` ->
-    ``_apply_bindings``) are unaffected — that sweep is unchanged.
+    fields, because free conversational prose is a far wider surface for
+    false positives than a structured fact field — e.g. ``GPT_4``,
+    ``COVID_19`` are legitimate shape matches there.  The fact paths
+    (session-tier extraction and graph-tier enrichment, via
+    :func:`deanonymize_facts` -> ``_apply_bindings``) keep running that
+    backstop.
 
     Callers using this function for something OTHER than free
     conversational prose (the chat-egress response) must independently

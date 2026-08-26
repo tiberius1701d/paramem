@@ -40,7 +40,7 @@ def cloud_arc_specs() -> list[StageSpec]:
     """The ``SESSION_EXTRACT`` specs this harness walks, in flow order."""
     specs = [s for s in SESSION_EXTRACT if s.stage in _ARC_STAGE_NAMES]
     assert [s.stage for s in specs] == list(_ARC_STAGE_NAMES), (
-        f"SESSION_EXTRACT no longer contains {_ARC_STAGE_NAMES} in order: "
+        f"SESSION_EXTRACT does not contain {_ARC_STAGE_NAMES} in order: "
         f"{[s.stage for s in SESSION_EXTRACT]}"
     )
     return specs
@@ -132,37 +132,34 @@ def enrichment_side_effect(
     raw: str | None = None,
     info: dict | None = None,
 ):
-    """Build a ``request_enrichment`` ``side_effect`` reproducing the
-    RETIRED 5-tuple mock contract's final fact list.
+    """Build a ``request_enrichment`` ``side_effect`` that yields the
+    delta needed to reach a desired final fact list.
 
-    Before the cloud-admission redesign (2026-07-22), tests patched
-    ``request_enrichment`` directly with a ``(facts, updated_transcript,
-    bindings, raw, info)`` 5-tuple that fully overrode the stage's
-    enriched output — ``request_enrichment`` no longer applies a delta at
-    all (:func:`~paramem.graph.extractor._apply_enrichment_delta`, called
-    by the ``enrich`` stage itself, does that now), so a bare
-    ``return_value`` can no longer express "this is the final fact list"
-    directly.
+    ``request_enrichment`` returns ``(delta, raw, info)``, where ``delta``
+    is an :class:`~paramem.graph.extractor.EnrichmentDelta` the ``enrich``
+    stage applies to the anon facts via
+    :func:`~paramem.graph.extractor._apply_enrichment_delta`. A caller who
+    wants to specify the FINAL surviving fact list directly, rather than
+    construct a delta by hand, uses this helper.
 
-    ``facts`` here is that OLD mock's first tuple element — the desired
-    FINAL surviving fact list. This helper reconstructs it as an
-    :class:`~paramem.graph.extractor.EnrichmentDelta`, computed at CALL
-    TIME (needs the real ``anon_facts`` the pipeline built, which a bare
-    ``return_value`` cannot see):
+    ``facts`` is the desired FINAL surviving fact list. This helper builds
+    the :class:`~paramem.graph.extractor.EnrichmentDelta` at CALL TIME
+    (it needs the real ``anon_facts`` the pipeline built, which is not
+    known ahead of time):
 
-    * If ``anon_facts`` is a PREFIX of ``facts`` (the common shape — cloud
-      left the local facts untouched and only appended), the prefix is
-      treated as unmodified (KEEP-by-default; ``drop=set()``) and
-      whatever ``facts`` adds beyond that prefix becomes ``add``.
-    * Otherwise (``facts`` does not extend ``anon_facts`` — the old mock
-      fixture replaced the fact set wholesale), every input index is
-      ``drop``ped and every entry of ``facts`` becomes an ``add``.
+    * If ``anon_facts`` is a PREFIX of ``facts`` (the common shape — the
+      enrichment provider left the local facts untouched and only
+      appended), the prefix is treated as unmodified (KEEP-by-default;
+      ``drop=set()``) and whatever ``facts`` adds beyond that prefix
+      becomes ``add``.
+    * Otherwise (``facts`` does not extend ``anon_facts``), every input
+      index is ``drop``ped and every entry of ``facts`` becomes an
+      ``add``.
 
     Tests exercising ``modify`` (a partial field update on an existing
     index) or a ``drop`` NOT paired with a full replace build an
     :class:`~paramem.graph.extractor.EnrichmentDelta` directly instead —
-    this helper only reproduces the two shapes every pre-redesign fixture
-    in this test suite actually used.
+    this helper only reproduces the two shapes above.
     """
 
     def _fake(anon_facts, *_args, **_kwargs):

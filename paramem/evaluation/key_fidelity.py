@@ -151,24 +151,22 @@ _VERB_PREFIX_TO_PREDICATE: dict[str, str] = {
     "collaborates with": "collaborates with",
 }
 
-# "is N…" → has age is handled separately because the original regex
-# pinned the object to start with a digit; replicated below in
-# _parse_age_remainder so a literal-prefix table stays homogeneous.
+# "is N…" → has age is handled separately (see _parse_age_remainder) so
+# the object is pinned to start with a digit, keeping the literal-prefix
+# table above homogeneous.
 
 # Sentence-terminating punctuation used by ``_split_sentences``.
 _SENTENCE_TERMINATORS = ".!?"
 
 # Temporal prefixes stripped from the start of a sentence (each is followed
-# by some date/period text + a comma + optional whitespace).  Replicates
-# the previous ``re.sub(r"^(As of |In |On )[^,]+,\s*", "", sentence)``.
+# by some date/period text + a comma + optional whitespace).
 _TEMPORAL_PREFIXES = ("As of ", "In ", "On ")
 
 
 def _split_sentences(text: str) -> list[str]:
     """Split on sentence-terminating punctuation followed by whitespace.
 
-    Mirrors the previous ``re.split(r"(?<=[.!?])\\s+", …)`` behaviour:
-    the terminator stays attached to the preceding sentence.
+    The terminator stays attached to the preceding sentence.
     """
     if not text:
         return []
@@ -203,10 +201,7 @@ def _strip_temporal_prefix(sentence: str) -> str:
 
 
 def _parse_age_remainder(remainder: str) -> str | None:
-    """If remainder is ``is N…``, return the object ``N…``; else None.
-
-    Replicates the previous ``r"is (\\d+.+)"`` pattern.
-    """
+    """If remainder is ``is N…``, return the object ``N…``; else None."""
     if not remainder.lower().startswith("is "):
         return None
     after_is = remainder[3:]
@@ -220,9 +215,7 @@ def _match_verb_prefix(remainder: str) -> tuple[str, str] | None:
 
     Returns ``(predicate, object)`` on success or ``None``.  Case-
     insensitive match on the prefix; the object preserves the original
-    casing.  Replicates the previous ``re.match(pattern, remainder,
-    re.IGNORECASE)`` loop with a deterministic longest-prefix-first
-    dispatch.
+    casing.  Dispatch is deterministic, longest-prefix-first.
     """
     remainder_lower = remainder.lower()
     for prefix in sorted(_VERB_PREFIX_TO_PREDICATE, key=len, reverse=True):

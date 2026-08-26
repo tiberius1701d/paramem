@@ -5,8 +5,8 @@ Mocked — no GPU, no real model. Mirrors the mocking style of
 
 Coverage
 --------
-- Preview (``confirm`` omitted/false): 409 (owner-ruled
-  ``_INTERIM_DISCARD_UNCONFIRMED_STATUS``), inventory in ``would_discard``,
+- Preview (``confirm`` omitted/false): 409
+  (``_INTERIM_DISCARD_UNCONFIRMED_STATUS``), inventory in ``would_discard``,
   no mutation.
 - Happy path: real store tiers + on-disk dirs + PEFT names all reaped;
   main tiers untouched; response counts match the pre-mutation inventory.
@@ -300,10 +300,9 @@ class TestStrayInvalidStampDir:
 class TestPromotedKeysPruned:
     def test_discarded_tier_keys_pruned_from_promoted_keys(self, tmp_path, monkeypatch):
         """The discard door must prune ``loop.promoted_keys`` of the
-        discarded tiers' keys before rewriting ``key_metadata.json`` — the
-        same defect the forget handler fixes via
-        ``promoted_keys.difference_update``.  A key from a surviving main
-        tier must not be pruned."""
+        discarded tiers' keys before rewriting ``key_metadata.json`` —
+        mirroring the forget handler's own ``promoted_keys.difference_update``
+        pruning.  A key from a surviving main tier must not be pruned."""
         cfg = _make_config(tmp_path)
         store = MemoryStore()
         _seed_interim_slot(store, cfg.adapter_dir, "20260801T0000", "graph1")
@@ -424,10 +423,7 @@ class TestGuardMatrix:
     def test_pending_consolidation_record_refuses_409(self, tmp_path, monkeypatch):
         """A pending stage ledger with ``consolidating`` clear is the SIXTH
         guard verdict (``deferred_event_pending`` -> ``consolidation_pending``)
-        -- distinct from the five busy arms above, and previously untested
-        for this door (verified: no ``deferred_event_pending`` /
-        ``consolidation_pending`` reference anywhere in this file before
-        this pin).  See also
+        -- distinct from the five busy arms above.  See also
         ``tests/server/test_consolidate_dispatch.py::TestFiveDoorPendingRecordGuard``,
         which pins the same arm for the other four mutating doors.
         """
@@ -445,10 +441,10 @@ class TestGuardMatrix:
 
 
 # ---------------------------------------------------------------------------
-# Loop staleness across gpu_lock — a config-apply (or, before this fix, a
-# base-swap orchestration racing ahead of the base_swap_active guard) that
-# releases + recreates the ConsolidationLoop while this door holds gpu_lock
-# must not leave the sync worker mutating the released pre-lock loop.
+# Loop staleness across gpu_lock — a config-apply (or a base-swap
+# orchestration racing ahead of the base_swap_active guard) that releases +
+# recreates the ConsolidationLoop while this door holds gpu_lock must not
+# leave the sync worker mutating the released pre-lock loop.
 # ---------------------------------------------------------------------------
 
 
@@ -681,10 +677,7 @@ class TestFailurePath:
         """A ``record_last_run`` failure must not turn an already-completed
         destructive ring drop into an HTTP 500 — matches the other
         finalizers (e.g. ``_finalize_interim``), which all wrap the call in
-        ``try/except Exception: logger.exception(...)``.  Pre-fix, this call
-        was the only writer left unwrapped, so this raise propagated
-        straight through to a 500 despite the mutation having already
-        fully succeeded.
+        ``try/except Exception: logger.exception(...)``.
         """
         cfg = _make_config(tmp_path)
         store = MemoryStore()

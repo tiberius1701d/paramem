@@ -45,10 +45,8 @@ def _refiner_for(loop: ConsolidationLoop) -> GraphTierRefiner:
 
     Mirrors exactly what ``ConsolidationLoop.build_tier_refiner``
     constructs on every call — the enrichment and normalization surfaces
-    moved off ``ConsolidationLoop`` onto ``GraphTierRefiner`` (the deleted
-    enrichment/normalization SHIM methods that used to live directly on
-    ``ConsolidationLoop``), so tests exercise ``run_enrichment()`` /
-    ``run_normalization()`` on a
+    live on ``GraphTierRefiner``, not on ``ConsolidationLoop``, so tests
+    exercise ``run_enrichment()`` / ``run_normalization()`` on a
     refiner built from the loop rather than calling a loop method directly.
     Called fresh at each use site so a test that mutates ``loop.model`` (or
     other loop state) between calls sees the update, matching production's
@@ -201,9 +199,8 @@ class TestExtractionPathParity:
     ):
         """Call extract_session and capture what run_consolidation_cycle receives.
 
-        Replaces the former ``_run_cycle_and_capture`` (which called the now-deleted
-        ``run_cycle``).  Routes through the live production path:
-        ``extract_session`` → dedup → ``run_consolidation_cycle``.
+        Routes through the live production path: ``extract_session`` →
+        dedup → ``run_consolidation_cycle``.
         """
         captured: dict[str, list[dict]] = {"episodic_rels": [], "procedural_rels": []}
 
@@ -881,9 +878,8 @@ class TestTakePendingRelationsGraphLifetime:
         """Two consecutive ``take_pending_relations`` calls -- as a
         ``/calibrate/extract_pending`` probe immediately followed by a
         LATER, separate interim fold's own extraction would produce -- yield
-        independent products.  This is the leak-regression guard: the
-        second take must carry only what merged since the first take, none
-        of the probe's earlier content."""
+        independent products: the second take carries only what merged
+        since the first take, none of the probe's earlier content."""
         loop = self._make_bare_loop(tmp_path)
 
         # Probe batch: one relation about berlin.
@@ -1550,7 +1546,7 @@ consolidation:
 class TestSessionClassification:
     """classify_session and the extraction-phase session routing.
 
-    The new contract:
+    Session classification:
     - NAMED (speaker_id present and not anonymous_voice) → extracted.
     - HOLDABLE (anonymous_voice OR no speaker_id but has a voice embedding) → NOT extracted.
     - UNIDENTIFIABLE (no speaker_id AND no voice embedding) → NOT extracted.
@@ -1559,7 +1555,7 @@ class TestSessionClassification:
     format — do NOT use 'speaker{N}' string patterns as the anonymity gate.
 
     Note: these tests call _run_extraction_phase directly (in paramem.server.app);
-    run_consolidation was deleted and must not be re-introduced (see
+    paramem.server.consolidation has no run_consolidation function (see
     test_run_consolidation_removed.py).
     """
 
@@ -2296,8 +2292,8 @@ class TestCapturePendingRelations:
 
 class TestSeedKeyMetadata:
     """ConsolidationLoop.seed_key_metadata rebuilds ``promoted_keys`` from
-    the per-key ``promoted`` flag on the store's already-loaded bookkeeping
-    -- not from a global ``promoted_keys`` list, which no longer exists."""
+    the per-key ``promoted`` flag on the store's already-loaded bookkeeping;
+    there is no global ``promoted_keys`` list."""
 
     def _make_loop(self):
         from paramem.memory.store import MemoryStore
@@ -2360,13 +2356,12 @@ class TestSeedKeyMetadata:
 # ---------------------------------------------------------------------------
 
 
-class TestSynthSpeakerEntitiesB1Regression:
+class TestSynthSpeakerEntitiesMatchesSubjectToSpeakerId:
     """_synth_speaker_entities must emit a speaker Entity when subject == speaker_id.
 
-    Under lowercase-uniform identity both subject and speaker_id are lowercase
-    speaker{N}, so plain == is the correct comparison.  The old bridging
-    function speaker_ref_matches is deleted; this class validates that the
-    new plain-== path is correct.
+    Both subject and speaker_id are the canonical lowercase ``speaker{N}``
+    form, so plain ``==`` is the correct comparison; there is no
+    ``speaker_ref_matches`` bridging function.
     """
 
     def test_matching_lowercase_subject_and_speaker_id(self):
@@ -2503,11 +2498,10 @@ class TestGraphTierSymbolsNotReexported:
     ``GraphTierRefiner.run_normalization`` for normalization — runs unmocked.
 
     The last two names in the parametrize list below are on this list too:
-    both SHIM delegator methods on ``ConsolidationLoop`` were deleted, so a
-    ``patch.object`` targeting either of their old names on a live
-    ``ConsolidationLoop`` instance now raises ``AttributeError`` at patch
-    time instead of silently installing a mock that production never
-    calls.
+    ``ConsolidationLoop`` has no delegator methods by those names, so a
+    ``patch.object`` targeting either name on a live ``ConsolidationLoop``
+    instance raises ``AttributeError`` at patch time instead of silently
+    installing a mock that production never calls.
     """
 
     @pytest.mark.parametrize(
@@ -2526,10 +2520,10 @@ class TestGraphTierSymbolsNotReexported:
     def test_tier_symbols_not_reexported_from_consolidation(self, name):
         import paramem.training.consolidation as c
 
-        # The first six names were module-level functions that moved out of
-        # this module entirely; the last two were SHIM methods on
-        # ``ConsolidationLoop`` and were never module-level attributes, so the
-        # class is checked too — a resurrected shim method would be invisible
+        # The first six names live on paramem.training.graph_enrich /
+        # paramem.training.graph_tier, not this module; the last two are
+        # not ``ConsolidationLoop`` methods either, so the class is checked
+        # too — a delegator method reintroduced there would be invisible
         # to a module-only ``hasattr`` check.
         assert not hasattr(c, name)
         assert not hasattr(c.ConsolidationLoop, name)
@@ -2551,7 +2545,7 @@ class TestSameAsSpeakerPairGuard:
     def _stub_local_anonymize(self, monkeypatch):
         """Stub the anonymize chain for every test in this class.
 
-        ``graph_enrich.enrich_graph`` now runs the local anonymizer
+        ``graph_enrich.enrich_graph`` runs the local anonymizer
         (the SAME primitive session-tier extraction uses) over each chunk
         BEFORE the cloud call, to derive real-name entity types the fold
         graph itself cannot supply (see that function's docstring).
@@ -2577,9 +2571,9 @@ class TestSameAsSpeakerPairGuard:
         from paramem.config.taxonomy import entity_type_to_prefix
 
         def _stub(facts, model, tokenizer, transcript="", **kwargs):
-            # ``facts`` is a plain fact-dict list (interface narrowing,
-            # 2026-07-21) — never a ``SessionGraph`` — so names are read
-            # off ``subject``/``object`` keys directly, not ``.relations``.
+            # ``facts`` is a plain fact-dict list, never a ``SessionGraph``
+            # — so names are read off ``subject``/``object`` keys directly,
+            # not ``.relations``.
             names = sorted(
                 {str(f.get("subject", "")) for f in facts}
                 | {str(f.get("object", "")) for f in facts}
@@ -2852,17 +2846,11 @@ class TestSameAsSpeakerPairGuard:
 class TestMergeRegistryRelationsTimestamp:
     """GraphMerger.merge_relations passes timestamp="" to the merger's SessionGraph.
 
-    Regression guard: before the fix, GraphMerger.merge_relations always built the
-    SessionGraph with timestamp=datetime.now(...), so a recon relation with
-    last_seen="" resolved to incoming_ls = "" or now() = now() — making the legacy key
-    appear as the unique freshest and wrongly retiring a genuinely-dated rival.
-
-    With the fix, timestamp="" (the new default param), so incoming_ls = "" or "" = ""
-    for legacy relations.  An empty last_seen sorts as the oldest possible timestamp:
-    a dated candidate always outranks an undated one, so a legacy "" key is retired
-    in favor of any genuinely-dated rival.  The any-empty COEXIST rule applies only
-    when EVERY candidate (incoming + all rivals) is undated — the fold-wide legacy
-    case with no recency signal anywhere.
+    An empty last_seen sorts as the oldest possible timestamp: a dated
+    candidate always outranks an undated one, so a legacy "" key is retired
+    in favor of any genuinely-dated rival.  The any-empty COEXIST rule
+    applies only when EVERY candidate (incoming + all rivals) is undated —
+    the fold-wide legacy case with no recency signal anywhere.
     """
 
     @staticmethod
@@ -3448,7 +3436,7 @@ class TestRunGraphNormalizationApply:
         assert result["groups_collapsed"] == 1
 
     def test_provenance_last_seen_max_on_survivor(self, tmp_path):
-        """NDA-3b: last_seen on the survivor edge equals max(survivor, retired).
+        """last_seen on the survivor edge equals max(survivor, retired).
 
         INVARIANT: whenever edges collapse into a survivor, last_seen = freshest.
         Both edges have rec=1; last_seen tiebreaker selects graph34 (newer) as
@@ -3490,9 +3478,9 @@ class TestRunGraphNormalizationApply:
         )
 
     def test_provenance_first_seen_min_on_survivor(self, tmp_path):
-        """NDA-3c: first_seen on the survivor edge equals min_nonempty(survivor,
-        retired) — the earliest assertion window start, propagated alongside the
-        existing max(last_seen).
+        """first_seen on the survivor edge equals min_nonempty(survivor,
+        retired) — the earliest assertion window start, propagated alongside
+        max(last_seen).
 
         Both edges have rec=1; last_seen tiebreaker selects graph34 (newer) as
         survivor.  graph12 (retired) has the EARLIER first_seen; the survivor's
@@ -4855,8 +4843,8 @@ class TestSchedulerCatchUpGate:
         """last attempt 6h ago + 'every 5h' (period 5h) → due → dispatch
         happens and the stamp is updated. Asserting the dispatch call count
         (not just the return status) is load-bearing — a test that only
-        checks 'not noop_not_due' would also pass on the suspend/regression
-        path where the gate silently blocks the tick forever.
+        checks 'not noop_not_due' would also pass if the gate silently
+        blocked every tick forever.
         """
         from paramem.server.schedule_state import read_last_scheduled_run, write_last_scheduled_run
 

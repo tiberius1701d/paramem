@@ -1,23 +1,19 @@
 """Donor-adapter lifecycle: synthetic key-triple generation, checkpoint
 persistence, and seed-training through the shared funnel.
 
-A NEW module boundary, not a code move: nothing was relocated out of
-``paramem.training.consolidation`` (7000+ lines; per project rule an
-oversized file is a defect to split, not enlarge) to create this file — the
-funnel this module trains through (``ConsolidationLoop._train_tier_adapter``)
-stays exactly where it was. This module owns the donor's three concerns
-instead: (1) deterministically generating the synthetic crowded-cluster
-training population (:func:`donor_entries`), (2) persisting and validating
-each (base model, topology) pair's own trained donor checkpoint as an
-adapter store beside the main tiers
-(:func:`donor_store_dir` / :func:`donor_checkpoint_valid`), and
-(3) building the donor by training it through
+This module owns the donor's three concerns: (1) deterministically
+generating the synthetic crowded-cluster training population
+(:func:`donor_entries`), (2) persisting and validating each (base model,
+topology) pair's own trained donor checkpoint as an adapter store beside
+the main tiers (:func:`donor_store_dir` / :func:`donor_checkpoint_valid`),
+and (3) building the donor by training it through
 ``ConsolidationLoop._train_tier_adapter`` on a transient adapter slot
-(:func:`build_donor`). Consumed by ``ConsolidationLoop._train_tier_adapter``
-(the seeding hook, ``paramem.training.consolidation``) — this module never
-imports ``ConsolidationLoop`` at runtime (only under ``TYPE_CHECKING``),
-so the dependency is one-directional and importing this module never
-triggers a training-machinery import cycle.
+(:func:`build_donor`). The funnel this module trains through
+(``ConsolidationLoop._train_tier_adapter``, the seeding hook,
+``paramem.training.consolidation``) is consumed, never reimplemented,
+here — this module never imports ``ConsolidationLoop`` at runtime (only
+under ``TYPE_CHECKING``), so the dependency is one-directional and
+importing this module never triggers a training-machinery import cycle.
 
 Why the donor exists
 ---------------------
@@ -27,8 +23,8 @@ that seeding a measured-cold adapter from a *task-skilled* (not fact-
 specific) donor beats LoRA-zero as the starting point for the indexed-key
 task. The donor's synthetic content is deliberately NOT drawn from
 PerLTQA/longmemeval (both are live benchmark ground truth the project must
-never retrain on) and NOT the anonymizer's output (by hand, per operator
-direction). It is a seed+recipe pure function over a hand-anonymized 21-key
+never retrain on) and is not the anonymizer's output — it is hand-authored.
+It is a seed+recipe pure function over a hand-anonymized 21-key
 production fixture (``donor_fixture.json``, itself never derived from
 in-repo test data — see the fixture's own provenance note below).
 
@@ -41,42 +37,34 @@ minting floors (``ConsolidationLoop._indexed_next_index`` /
 unconditionally, so real keys can never collide with the reserved band.
 The width bounds the maximum key-surface *divergence depth* the donor's
 OWN fixture/synthesized population is trained at (the separating variable
-in the production failures is cluster depth, not absolute key magnitude —
-see ``experiments/test20_smallN_cold_gate.py``): a 1-200 band spans depths
-1-3, the depth range observed in production at the time this constant was
-set. Widening this constant is a key-NAMESPACE-headroom decision (avoiding
-real-key collision as production keys grow past 200), NOT a donor-teaching
-requirement: Test 20's depth-4 transfer arm (``benchmarking.md``, "Test
-20: Small-N Cold-Init Recall Gate", "Depth scaling" section) showed the
-SAME depth-3-trained donor checkpoint (built once, never rebuilt) rescues
-cold recall on 4-digit (depth-4) target keys at 21/21 on both seeds run,
-zero donor/target key overlap — donor task-skill transfer is depth-general,
-not depth-matched, so a depth-4+ cluster observed in production does NOT
-by itself require rebuilding the donor at a wider band. Depth 5 remains
-the one unmeasured extrapolation (same section, "Remaining gap"). ONE
-shared constant (not two independently-tunable per-prefix widths) because
-both prefixes are reserved at the SAME width symmetrically ("Donors own
-graph1-200 AND proc1-200") — two constants that could drift apart would
-only reintroduce an asymmetry that decision rejected.
+in production cold-fold failures is cluster depth, not absolute key
+magnitude — see ``experiments/test20_smallN_cold_gate.py``): a 1-200 band
+spans depths 1-3. Widening this constant is a key-NAMESPACE-headroom
+decision (avoiding real-key collision as production keys grow past 200),
+NOT a donor-teaching requirement: donor task-skill transfer is
+depth-general, not depth-matched (see ``benchmarking.md``, "Test 20:
+Small-N Cold-Init Recall Gate", "Depth scaling" section), so a depth-4+
+cluster observed in production does NOT by itself require rebuilding the
+donor at a wider band. ONE shared constant (not two independently-tunable
+per-prefix widths) because both prefixes are reserved at the SAME width
+symmetrically ("Donors own graph1-200 AND proc1-200") — two constants
+that could drift apart would only reintroduce an asymmetry.
 
 Fixture provenance
 -------------------
 ``donor_fixture.json``'s 21 entries are a hand-anonymized copy of a
-production fold that failed at recall 0.762 (originally captured live at
-keys ``graph179``-``graph193`` + ``proc35``-``proc40``). Every subject/object
-value naming a real person, place, organisation, or date was replaced with a
-fictional equivalent of similar shape (predicates are preserved verbatim —
-they are the training mechanism, not personal content). The un-anonymized
+production fold's crowded-cluster keys. Every subject/object value naming
+a real person, place, organisation, or date was replaced with a fictional
+equivalent of similar shape (predicates are preserved verbatim — they
+are the training mechanism, not personal content). The un-anonymized
 source never enters this repository.
 
-The fixture's keys were remapped to ``graph101``-``graph115`` +
-``proc101``-``proc106`` after the small-N validation runs (see
-``experiments/test20_smallN_cold_gate.py`` and ``benchmarking.md``) proved
+The fixture's keys are ``graph101``-``graph115`` + ``proc101``-``proc106``
+(see ``experiments/test20_smallN_cold_gate.py`` and ``benchmarking.md``):
 donor seeding transfers with zero key overlap between the donor's own
-population and the target keys being trained — the original verbatim
-production-key overlap was validated-but-unnecessary. The remap preserves
-the failing fold's structural shape exactly (same 21 subject/predicate/object
-triples in the same order; same crowded 7-wide ``expertise`` cluster; same
+population and the target keys being trained. The fixture preserves the
+crowded-cluster shape exactly (same 21 subject/predicate/object triples
+in the same order; same crowded 7-wide ``expertise`` cluster; same
 depth-3 divergence — ``graph101``-``graph109`` share the leading ``"10"``,
 ``graph110``-``graph115`` share ``"11"``) while landing on numerals outside
 every documented live-store key range, so the donor's synthetic population
@@ -94,36 +82,26 @@ Every (base model, LoRA topology) pair gets its OWN donor checkpoint,
 built lazily by the same single call site
 (``ConsolidationLoop._resolve_donor_checkpoint``, inside
 ``_train_tier_adapter``): when the TARGET tier's store holds no valid
-checkpoint, :func:`build_donor` runs INLINE,
-synchronously, at that topology, before that fold's own training. The
-step count is topology-INDEPENDENT: 147 entries -- ``donor_entries``
-returns whole 21-entry blocks, so ``DONOR_MIN_ENTRIES=128`` requested
-rounds up to 147 -- at the anchored 30-epoch bucket: 2220 steps for
-either topology. The measured per-step wall time is now anchored on BOTH
-topologies (Test 20): attention-only ~1.0s/step (~37 min total);
-attention+MLP ~1.2285s/step (~45.5 min total -- 2220 realized steps,
-wall_train_seconds=2727.16, ``donor_build_smoke_procedural``
-20260727_183637/build_results.json) -- a +23% per-step cost for 3.08x the
-trainable parameters (LoRA rank 8 over 7 vs. 4 target modules on Mistral
-7B), confirming the dominant per-step cost is the frozen base model's
-forward/backward, not the LoRA update, rather than scaling with the
-trainable-parameter ratio. The practical consequence: the first
-measured-cold fold of EACH topology in a deployment's lifetime (or after
-a base-model swap) absorbs a full donor training run for that topology IN
-ADDITION TO its own training -- with the shipped two-topology config
-(episodic and semantic share one attention-only topology; procedural is
-the only attention+MLP topology), a deployment pays this cost at most
-twice across its lifetime, never stacked into the same fold (a fold
-trains one tier at a time). This is NOT "roughly doubling that fold's
-wall time" -- the multiplier depends on how small the triggering fold's
-OWN key count is, and it is small by construction (the first
-measured-cold adapter of that topology in a deployment's lifetime).
-Measured (attention-only topology): an N=21 triggering fold (550 of its
-own steps) pays ~5x its own wall time that one cycle
-(``(550 + 2220) / 550``); an N=2 triggering fold (160 of its own steps)
-pays ~14x (``(160 + 2220) / 160``) -- see ``benchmarking.md``, "Test 20",
-for the measurement. Every fold after the triggering one reuses that
-topology's persisted checkpoint and pays no extra cost until it is
+checkpoint, :func:`build_donor` runs INLINE, synchronously, at that
+topology, before that fold's own training. The step count is
+topology-INDEPENDENT: ``donor_entries`` returns whole 21-entry blocks, so
+a ``DONOR_MIN_ENTRIES`` request rounds up to the next whole block, trained
+at the anchored epoch budget for either topology. The dominant per-step
+cost is the frozen base model's forward/backward pass, not the LoRA
+update, so wall time scales only weakly with the trainable-parameter
+count across topologies (see ``benchmarking.md``, "Test 20", for measured
+figures). The practical consequence: the first measured-cold fold of EACH
+topology in a deployment's lifetime (or after a base-model swap) absorbs
+a full donor training run for that topology IN ADDITION TO its own
+training — with the shipped two-topology config (episodic and semantic
+share one attention-only topology; procedural is the only attention+MLP
+topology), a deployment pays this cost at most twice across its
+lifetime, never stacked into the same fold (a fold trains one tier at a
+time). The multiplier this adds to the triggering fold's own wall time
+depends on how small the triggering fold's OWN key count is, and it is
+small by construction (the first measured-cold adapter of that topology
+in a deployment's lifetime). Every fold after the triggering one reuses
+that topology's persisted checkpoint and pays no extra cost until it is
 invalidated again (base-model swap, a shape edit to THAT topology, or a
 donor-recipe change — see :func:`donor_checkpoint_valid`); a shape edit to
 a DIFFERENT tier's topology does not invalidate this one.
@@ -156,7 +134,7 @@ class DonorBuildIncomplete(RuntimeError):
     checkpoint from a run that never actually trained."""
 
 
-# --- Key namespace reservation (owner-resolved) -----------------------------
+# --- Key namespace reservation -----------------------------------------------
 DONOR_KEY_BAND_WIDTH: int = 200
 """Width of the reserved low key band, both prefixes. See module docstring."""
 
@@ -182,8 +160,8 @@ What a donor is NOT is a MEMORY tier: it carries no keyed entries, no
 ``indexed_key_registry.json``, and no ``graph.json``, so it is absent from
 every memory-tier enumeration — including ``_mount_adapters_from_slots``
 (``paramem/server/app.py``), which is what keeps a donor out of inference.
-That exclusion is now a property of the concept ("not a memory tier")
-rather than an accident of a glob failing to match a hidden directory.
+That exclusion is a property of the concept ("not a memory tier"), not
+an artifact of directory naming.
 
 The trailing ``b<base8>`` is a digest over the base model id, so donors for
 different base models occupy different stores instead of overwriting one
@@ -206,19 +184,19 @@ synthesis-logic change, or one of the hyperparameters below)."""
 DONOR_RECIPE_LEARNING_RATE: float = 1e-4
 """The donor's own training learning rate -- fixed by the recipe, NEVER
 read from a live tier's ``AdapterConfig.learning_rate`` (see
-:func:`build_donor`'s docstring). Matches the episodic tier's
-shipped LR (``configs/server.yaml.example``), which is what Test 20's
-donor-uplift evidence measured (``benchmarking.md``, "Test 20") -- an
-operator edit to any tier's own ``learning_rate`` can no longer silently
-change the donor recipe. Changing the recipe deliberately means editing
-this constant (and bumping :data:`DONOR_RECIPE_ID`)."""
+:func:`build_donor`'s docstring). Matches the episodic tier's shipped LR
+(``configs/server.yaml.example``, the LR ``benchmarking.md``'s "Test 20"
+donor-uplift evidence measured), so an operator edit to any tier's own
+``learning_rate`` cannot silently change the donor recipe. Changing the
+recipe deliberately means editing this constant (and bumping
+:data:`DONOR_RECIPE_ID`)."""
 DONOR_RECIPE_DROPOUT: float = 0.0
 """The donor's own training dropout -- fixed by the recipe for the same
 reason as :data:`DONOR_RECIPE_LEARNING_RATE`: a second non-shape field with
 the identical drift property. Pinned independently of the ``AdapterConfig``
 dataclass default (``paramem.utils.config``, ``0.0``) so a future default
 or config change cannot silently alter the donor recipe -- the two happen
-to agree today, but this constant does not read from either the dataclass
+to agree, but this constant does not read from either the dataclass
 default or a live tier's ``AdapterConfig.dropout``. This constant pins the
 donor recipe to what production training actually runs at, and to what the
 measured donor anchor (Test 20, ``benchmarking.md``) was itself trained
@@ -749,9 +727,7 @@ def _draw_unique(rng: "random.Random", pool: tuple[str, ...], used: set[str]) ->
     of these names (``has spouse``, ``graduation date``, ``birth date``)
     can never be asked twice with conflicting objects, and the
     (subject, predicate, object) triple as a whole can never repeat across
-    blocks either (H1 fix — a prior version drew these with replacement per
-    block, producing duplicate triples trained under multiple keys and
-    contradictory birth dates for a reused name).
+    blocks either.
 
     When the pool is fully exhausted (more blocks requested than the pool
     has distinct entries), extends deterministically by appending an

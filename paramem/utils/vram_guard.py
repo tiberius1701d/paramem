@@ -45,19 +45,14 @@ DEFAULT_PROCESS_FRACTION = 0.85
 # Measured VRAM cost per PROMPT token of the adapter-OFF local generate()
 # call's prefill transient (KV-cache + activation growth building the
 # prompt's initial pass) — the constant behind the dynamic
-# anonymize-envelope clamp (paramem.cloud.anonymize.anonymize; clamping
-# the configured envelope to live free VRAM was owner-approved
-# 2026-07-28).
+# anonymize-envelope clamp (paramem.cloud.anonymize.anonymize; the
+# configured envelope is clamped to live free VRAM).
 #
-# Derivation (direct measurement, 2026-08-22): three adapter-OFF
-# anonymize chunks of 7032 / 6760 / 6034 prompt tokens drew
-# 1687 / 1622 / 1449 MiB of transient, i.e. 0.2399 / 0.2399 / 0.2401 MiB
-# per prompt token — corroborated across eleven runs Aug 1-21 2026. The
-# 0.338 MiB/token figure separately observed on zero-slot boots was the
-# loader-identity defect closed in bd31429 (a stale raw-model holder
-# running the generate adapter-ON), not a second modelled state — this
-# constant models exactly one thing: the adapter-OFF prefill transient
-# per prompt token.
+# This constant models exactly one thing: the adapter-OFF prefill
+# transient per prompt token, measured directly against adapter-OFF
+# anonymize chunks. Re-measure at any model swap. A figure taken with the
+# adapter mounted models a different (and higher) transient and must
+# never be substituted here.
 #
 # Unit mismatch, by construction: effective_token_envelope() below
 # divides free MiB by this PROMPT-token constant and compares the result
@@ -315,9 +310,9 @@ def check_vram_headroom(
     surface in ``/status.attention``.  Any ``MutableMapping[str, object]``
     works — this function writes one key and reads nothing else off it.
 
-    Phases proceed regardless. Experiments showed that running below the
-    KV-cache buffer reliably OOMs, but the cleanup is :func:`vram_scope`'s
-    job; this function's role is operator visibility, not enforcement.
+    Phases proceed regardless: running below the KV-cache buffer reliably
+    OOMs, but the cleanup is :func:`vram_scope`'s job; this function's role
+    is operator visibility, not enforcement.
 
     No-op when CUDA is unavailable. ``mem_get_info`` faults are logged and
     swallowed — an unhealthy driver state is for :func:`vram_scope` to surface.
@@ -367,10 +362,10 @@ def safe_empty_cache() -> None:
        allocator (held by libcublas itself). Each unique GEMM shape can
        trigger a fresh workspace allocation; across many ``generate``
        calls in an extraction cycle, these accumulate to hundreds of
-       MiB. ``empty_cache`` cannot touch them. Verified empirically: a
-       simulate-mode cycle on a frozen 4-bit base leaves ~280 MiB held
-       in cuBLAS workspaces that this call returns to the device.
-       Private API but stable across PyTorch 2.x.
+       MiB. ``empty_cache`` cannot touch them. A simulate-mode cycle on
+       a frozen 4-bit base leaves ~280 MiB held in cuBLAS workspaces
+       that this call returns to the device. Private API but stable
+       across PyTorch 2.x.
     3. ``torch.cuda.empty_cache()`` — returns unused PyTorch allocator
        segments to the driver (the inactive split fragments).
 

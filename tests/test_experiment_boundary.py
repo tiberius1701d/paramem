@@ -9,7 +9,7 @@ silently breaking weeks later is exactly the failure mode this guard prevents.
 
 The guard pairs with the retired-symbol stubs in
 :mod:`experiments.utils.test_harness` (which catch the inverse mistake:
-importing a name the harness used to export but no longer does).
+importing a name the harness does not export).
 
 This is an AST-level scan, not a runtime check.  Imports that pass the test
 file's syntax check pass the guard regardless of whether the script's larger
@@ -49,11 +49,9 @@ def _is_boundary_layer(py_file: Path) -> bool:
         return False
 
 
-# Existing private imports as of 2026-08-21 (3 imports across 2 files;
-# test16_repair_sweep.py / test18_probe_batching.py / test20_smallN_cold_gate.py's
-# _adapter_slot_for_load imports were removed here — those three now mount
-# adapter slots through the public paramem.models.loader.mount_adapter
-# primitive instead).
+# Grandfathered private imports. An experiment that needs to mount an
+# adapter slot goes through the public
+# paramem.models.loader.mount_adapter primitive, not a private import.
 # Format: (relative_path_from_repo_root, module, symbol_name).
 # Each entry is a candidate for either (a) promotion to public,
 # (b) rewriting the call site through a public path, or (c) explicit retire.
@@ -79,8 +77,8 @@ _GRANDFATHERED_IMPORTS: frozenset[tuple[str, str, str]] = frozenset(
     }
 )
 
-# Existing public paramem.* imports in consumer experiments as of 2026-06-15
-# (96 imports across 20 files, all outside experiments/utils/).
+# Grandfathered public paramem.* imports in consumer experiments, all
+# outside experiments/utils/.
 # Format: (relative_path_from_repo_root, module, symbol_name).
 # This allowlist is expected to SHRINK, not grow: new experiment code should
 # import through the experiments.utils.production façade instead.  Adding a
@@ -320,14 +318,14 @@ _GRANDFATHERED_PUBLIC_IMPORTS: frozenset[tuple[str, str, str]] = frozenset(
         ("experiments/test20_smallN_cold_gate.py", "paramem.models.loader", "mount_adapter"),
         # atomic_save_adapter: --donor-init (donor-init validation) persists its
         # own donor checkpoint via the SAME primitive every production tier
-        # save uses (added 2026-07-26) -- one implementation, not a copy.
+        # save uses -- one implementation, not a copy.
         (
             "experiments/test20_smallN_cold_gate.py",
             "paramem.models.loader",
             "atomic_save_adapter",
         ),
         # lora_b_frobenius_norm: shared with the consolidation fold-telemetry
-        # measurement (added 2026-07-26) -- one implementation, not a copy.
+        # measurement -- one implementation, not a copy.
         (
             "experiments/test20_smallN_cold_gate.py",
             "paramem.models.loader",
@@ -354,7 +352,7 @@ _GRANDFATHERED_PUBLIC_IMPORTS: frozenset[tuple[str, str, str]] = frozenset(
         # --donor-init (donor-init validation): builds its own donor checkpoint
         # via donor_entries -- the SAME seed+recipe pure function production
         # donor building uses -- rather than duplicating a second synthetic
-        # generator (added 2026-07-26).
+        # generator.
         ("experiments/test20_smallN_cold_gate.py", "paramem.training.donor", "donor_entries"),
         (
             "experiments/test20_smallN_cold_gate.py",
@@ -374,7 +372,6 @@ _GRANDFATHERED_PUBLIC_IMPORTS: frozenset[tuple[str, str, str]] = frozenset(
         # DONOR_META_FILENAME: _read_donor_meta writes/reads the
         # SAME per-slot provenance filename production's own donor.py meta
         # writer uses -- one shared constant, not an invented duplicate name
-        # (added 2026-07-26).
         (
             "experiments/test20_smallN_cold_gate.py",
             "paramem.training.donor",
@@ -385,7 +382,6 @@ _GRANDFATHERED_PUBLIC_IMPORTS: frozenset[tuple[str, str, str]] = frozenset(
         # hyperparameters production's build_donor forces
         # (dataclasses.replace(adapter_config, learning_rate=..., dropout=...))
         # -- derived from these constants, never hand-copied literals
-        # (added 2026-07-27).
         (
             "experiments/test20_smallN_cold_gate.py",
             "paramem.training.donor",
@@ -488,9 +484,8 @@ def test_no_new_private_paramem_imports_in_experiments():
 
 
 def test_allowlist_entries_still_exist():
-    """An allowlist entry that no longer matches anything in the tree is dead
-    weight — either the experiment was deleted, or the import was already
-    rewritten.  Forces the allowlist to track reality.
+    """An allowlist entry that matches nothing in the tree is dead weight.
+    Forces the allowlist to track reality.
     """
     actual: set[tuple[str, str, str]] = set()
     for py_file in sorted(EXPERIMENTS_ROOT.rglob("*.py")):
@@ -614,9 +609,8 @@ def test_no_new_public_paramem_imports_in_experiments():
 
 
 def test_public_allowlist_entries_still_exist():
-    """An allowlist entry that no longer matches anything in the tree is dead
-    weight — either the experiment was deleted, or the import was already
-    rewritten.  Forces :data:`_GRANDFATHERED_PUBLIC_IMPORTS` to track reality.
+    """An allowlist entry that matches nothing in the tree is dead weight.
+    Forces :data:`_GRANDFATHERED_PUBLIC_IMPORTS` to track reality.
     """
     actual: set[tuple[str, str, str]] = set()
     for py_file in sorted(EXPERIMENTS_ROOT.rglob("*.py")):

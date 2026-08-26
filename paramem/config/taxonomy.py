@@ -332,15 +332,12 @@ def resolve_scrub_categories(
 # ---------------------------------------------------------------------------
 # prefix <-> entity_type — both directions.
 #
-# These three functions used to live in ``paramem.graph.placeholders``
-# alongside the cloud round-trip's placeholder-shape/substitution
-# primitives. They moved here (2026-07-21, the ``paramem/cloud/`` package
-# carve) because they have no cloud dependency at all — no substitution, no
-# resolution map, no LLM round trip — they are purely a projection of THIS
-# module's own taxonomy config (``anonymizer.prefixes`` above) onto the
-# entity-type vocabulary, so they belong beside the config they read rather
-# than beside the placeholder-substitution mechanism. This is also what
-# keeps ``paramem/cloud/placeholders.py`` free of any ``paramem.graph``
+# These three functions have no cloud dependency at all — no substitution,
+# no resolution map, no LLM round trip — they are purely a projection of
+# THIS module's own taxonomy config (``anonymizer.prefixes`` above) onto
+# the entity-type vocabulary, so they belong beside the config they read
+# rather than beside the placeholder-substitution mechanism. This is also
+# what keeps ``paramem/cloud/placeholders.py`` free of any ``paramem.graph``
 # import: the primitive kit there needs a placeholder SHAPE, never an
 # entity-type taxonomy.
 # ---------------------------------------------------------------------------
@@ -402,7 +399,7 @@ def placeholder_entity_type(token: str) -> str:
     shape before splitting the prefix off the token, then delegates to
     :func:`prefix_to_entity_type`.
 
-    Token shape today is BARE (``Person_1``); a braced form (``{Person_1}``)
+    The minted token shape is BARE (``Person_1``); a braced form (``{Person_1}``)
     exists only for the in-text detection net
     (:data:`~paramem.cloud.placeholders.PLACEHOLDER_TOKEN_RE`) and the
     cloud round trip's own brace-binding mint protocol. Bypassing the

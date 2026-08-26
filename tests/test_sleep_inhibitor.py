@@ -122,11 +122,9 @@ class TestSleepInhibitor:
 
     def test_atexit_registered_on_start(self):
         """start() does not register per-instance atexit (module-level handles it)."""
-        # The original test verified atexit.register was called once. The new
-        # design moves atexit registration to the module level (registered at
-        # import time via _module_atexit_stop). Per-instance registration was
-        # moved off __init__ per the design-review fix. This test now verifies
-        # no per-instance registration occurs.
+        # atexit registration happens at the module level, at import time,
+        # via _module_atexit_stop. This test verifies no per-instance
+        # registration occurs.
         mock_proc = self._make_mock_proc()
         with (
             patch("gpu_guard.inhibitor._is_wsl2", return_value=True),

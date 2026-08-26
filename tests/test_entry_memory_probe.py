@@ -6,8 +6,8 @@ Covers:
   canonical() upstream; '-' survives). No further substitution happens here.
 
 All tests are CPU-only.
-The QA-shape probe_key tests (TestProbeKeyFormatFields) were removed on
-2026-05-20 when the QA shape was archived to archive/legacy_qa.py.
+The QA shape lives in ``archive/legacy_qa.py``; its probe_key format is not
+covered here.
 ``build_memory_source``'s mode → MemorySource selection contract is covered
 in ``tests/test_mode_fork_guard.py`` and ``tests/test_server.py``, not here.
 """

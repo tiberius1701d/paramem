@@ -219,8 +219,8 @@ def _line_with_prefix(stdout: str, prefix: str) -> str:
     """Return the single ANSI-stripped stdout line starting with ``prefix``.
 
     Fails loudly (with full stdout) on zero or multiple matches rather than
-    silently picking the first — a duplicate or missing line is itself a
-    finding.
+    silently picking the first — a duplicate or missing line means the
+    output is wrong.
     """
     matches = [
         stripped
@@ -325,13 +325,13 @@ class TestAttentionBlockRendered:
             assert "→" not in lines[i + 1]
 
     def test_age_present_hint_none_no_arrow_shift(self):
-        """Regression: item with action_hint=None AND age_seconds=2520 — the
-        shape that broke under IFS=$'\\t' reads. Bash `read` collapses
-        consecutive tab delimiters when a field is empty, so the empty
-        action_hint shifted age_seconds into the hint variable and rendered
-        a bogus '→ 2520' arrow line instead of the '(age 42m)' tag with no
-        arrow (paramem-status.sh:492-500 print, :807-831 read/render — both
-        now use '|' delimiters, mirroring the BACKUP line at :515-531)."""
+        """An item with action_hint=None AND age_seconds=2520 renders the
+        '(age 42m)' tag with no arrow line, never a bogus '→ 2520'. The
+        renderer uses '|' delimiters rather than tabs (paramem-status.sh:
+        492-500 print, :807-831 read/render, mirroring the BACKUP line at
+        :515-531): bash `read` under IFS=$'\\t' collapses consecutive tab
+        delimiters when a field is empty, which would shift age_seconds
+        into the hint variable."""
         status = dict(_BASE_STATUS)
         status["attention"] = {
             "items": [
@@ -464,7 +464,7 @@ class TestMigrateFooter:
         assert "2026-04-18" in result.stdout
 
     def test_status_response_schema_unchanged_for_existing_consumers(self):
-        """JSON from before the attention/migration keys existed → script does not crash."""
+        """JSON missing the attention/migration/server_started_at keys → script does not crash."""
         status = {
             k: v
             for k, v in _BASE_STATUS.items()
@@ -575,12 +575,12 @@ class TestConsolResultRendering:
     train or simulate venue alike -- and ``_finalize_full`` in
     ``paramem/server/app.py``), not stale/never-written key names.
 
-    Each assertion below discriminates the pre-fix script: pre-fix, the
-    ``simulated`` branch read ``detail['episodic_qa']`` (no longer written by
-    any current writer — see b547c73/e4d5587 for its history) and always
-    rendered ``0ep``; the ``trained`` branch read ``detail['jobs']`` (same —
-    no longer written) and always rendered ``(?)``; ``full_trained`` fell
-    through to the bare outcome string with zero detail.
+    Each assertion below pins that a stale key name never drives the
+    render: the ``simulated`` branch must not read ``detail['episodic_qa']``
+    (never written by any current writer) and fall back to ``0ep``; the
+    ``trained`` branch must not read ``detail['jobs']`` (same) and fall back
+    to ``(?)``; ``full_trained`` must not fall through to the bare outcome
+    string with zero detail.
     """
 
     def test_simulated_renders_episodic_and_procedural_rel_counts(self):
@@ -602,7 +602,7 @@ class TestConsolResultRendering:
         assert "simulated 3s" in result.stdout
         assert "5rel" in result.stdout
         assert "2pr" in result.stdout
-        # Pre-fix key ("episodic_qa", no longer written) always rendered "0ep" here.
+        # A stale key ("episodic_qa", never written) would render "0ep" here.
         assert "0ep" not in result.stdout
 
     def test_trained_renders_total_keys_sessions_and_adapter(self):
@@ -622,7 +622,7 @@ class TestConsolResultRendering:
         assert "trained 120 keys" in result.stdout
         assert "4s" in result.stdout
         assert "adapter=episodic_interim_20260801T0000" in result.stdout
-        # Pre-fix key ("jobs", no longer written) always rendered "(?)" here.
+        # A stale key ("jobs", never written) would render "(?)" here.
         assert "(?)" not in result.stdout
 
     def test_trained_consol_line_exact(self):
@@ -665,9 +665,8 @@ class TestConsolResultRendering:
     def test_interim_discarded_renders_tier_and_adapter_counts(self):
         """``fmt_result`` must render the discard writer's real keys
         (``discarded_tiers``/``unloaded_adapters``/``removed_dirs`` —
-        ``interim_discard`` in ``paramem/server/app.py``); pre-fix this
-        outcome fell through to the bare ``interim_discarded`` string with
-        zero detail."""
+        ``interim_discard`` in ``paramem/server/app.py``), never falling
+        through to the bare ``interim_discarded`` string with zero detail."""
         status = dict(_BASE_STATUS)
         status["consolidating"] = False
         status["last_consolidation_result"] = {

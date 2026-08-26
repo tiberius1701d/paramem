@@ -4,10 +4,9 @@
 This module owns the extraction CHOKEPOINT that all orchestrators
 (consolidation, calibration, ad-hoc tools, tests) go through.  It
 centralises the kwarg assembly, prompt-filename resolution, adapter
-guard, and gradient-checkpointing discipline that previously lived as
-``ConsolidationLoop._{extraction_kwargs,run_extract_graph,
-run_extract_procedural_graph}`` — methods whose names announced their
-mishousing in a class whose actual purpose is training orchestration.
+guard, and gradient-checkpointing discipline — a graph-layer concern that
+does not belong on ``ConsolidationLoop``, whose own purpose is training
+orchestration.
 
 Architecture
 ------------
@@ -89,8 +88,8 @@ class ExtractionConfig:
     plausibility_max_tokens: int = 8192
     # RNG seed forwarded to every ``generate_answer`` (``torch.manual_seed``),
     # a sampling knob like ``temperature``/``max_tokens``.  ``None`` (the
-    # default, and the value production runs with today) means no seeding —
-    # today's non-deterministic status quo.  It exists so a calibration probe
+    # default, and the value production runs with) means no seeding —
+    # non-deterministic sampling.  It exists so a calibration probe
     # can pin a seed to sweep sampling variance, AND so production and
     # calibration source the seed through one identical path: reproducibility
     # is the whole point of calibration, so a seed set for a production run is
@@ -228,12 +227,12 @@ class ExtractionPipeline:
         ground truth for extraction; document chunks land in the same
         ``{transcript}`` slot at the chat-template layer (1:1 wrap into
         the user message), and the model adapts to the surface form of
-        the slot content.  This is a deliberate tradeoff against the
-        former two-prompt design: that design produced silent drift on
-        schema-shape rules (speaker fragmentation NEGATIVE, concept
-        POSITIVE) between the transcript and document variants.
+        the slot content.  A separate prompt pair per source type risks
+        silent drift on schema-shape rules (speaker fragmentation
+        NEGATIVE, concept POSITIVE) between the transcript and document
+        variants — the single pair is deliberate to avoid that.
 
-        ``source_type`` no longer selects any gate default — it is
+        ``source_type`` selects no gate default — it is
         forwarded verbatim as the ``source_type`` kwarg and consumed
         only by the document-only speaker rewrite named above.
 
@@ -257,10 +256,7 @@ class ExtractionPipeline:
 
         return dict(
             # Sampling knobs, all sourced the same way: a calibration override
-            # if given, else the config default.  Uniform with ``seed`` below —
-            # before this the two ``*_tokens``/``temperature`` overrides the
-            # calibrate dispatch sets were silently dropped (read straight off
-            # ``cfg``), so a probe could never vary them.
+            # if given, else the config default.  Uniform with ``seed`` below.
             temperature=pick("temperature", cfg.temperature),
             max_tokens=pick("max_tokens", cfg.max_tokens),
             plausibility_max_tokens=pick("plausibility_max_tokens", cfg.plausibility_max_tokens),
@@ -289,8 +285,8 @@ class ExtractionPipeline:
             system_prompt_filename=pick("system_prompt_filename", system_prompt_filename),
             user_prompt_filename=pick("user_prompt_filename", user_prompt_filename),
             # Sourced like every other sampling knob: a calibration override
-            # if given, else the config default (``None`` today = status quo,
-            # no seeding).  Production and calibration thread it identically.
+            # if given, else the config default (``None`` = no seeding).
+            # Production and calibration thread it identically.
             seed=pick("seed", cfg.seed),
             timestamp=overrides.get("timestamp"),
             source_type=source_type,
@@ -395,9 +391,8 @@ class ExtractionPipeline:
         ``prompts_dir``/``seed``/``system_prompt_filename``/
         ``user_prompt_filename`` mirror the same-named overrides on
         :meth:`run` (via :meth:`kwargs`): each defaults to ``None``, which
-        preserves the pre-existing production behaviour (``self.prompts_dir``,
-        no seed, the two ``DEFAULT_*`` prompt filenames) unchanged for every
-        existing caller.
+        resolves to (``self.prompts_dir``, no seed, the two ``DEFAULT_*``
+        prompt filenames) for a caller that does not override them.
 
         The returned graph's ``relations`` include the entity-attribute
         relations projected by :meth:`_run_extractor`, attributed to this
@@ -424,7 +419,7 @@ class ExtractionPipeline:
             system_prompt_filename=resolved_system_prompt_filename,
             user_prompt_filename=resolved_user_prompt_filename,
             # Same sourcing as :meth:`run`: explicit override else the config
-            # default (``None`` today = status quo, no seeding).
+            # default (``None`` = no seeding).
             seed=seed if seed is not None else cfg.seed,
             timestamp=timestamp,
             source_type=source_type,

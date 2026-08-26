@@ -10,7 +10,7 @@ Covers:
 
 The inference path is deliberately NOT gated: STT pre-heats the GPU past
 any near-idle threshold and a per-request stall breaks voice-pipeline
-client timeouts (removed 2026-08-01).
+client timeouts.
 
 All tests run CPU-only — no model loading or GPU required.
 """
@@ -32,11 +32,9 @@ def _first_call_linenos(func, *call_names: str) -> dict[str, int]:
     walking ``func``'s AST body — never its docstring or any other prose.
 
     A raw ``source.find(...)`` string search is fooled the moment a
-    docstring happens to quote the same call the assertion is checking for
-    (an ordering assertion pinned by :class:`TestFoldWorkerCooldownOrder`
-    was broken exactly this way once a docstring started narrating
-    ``body(loop, bt)``). Walking the parsed AST, with the docstring
-    statement excluded, is immune to what the prose says.
+    docstring happens to quote the same call the assertion is checking
+    for. Walking the parsed AST, with the docstring statement excluded,
+    is immune to what the prose says.
     """
     source = textwrap.dedent(inspect.getsource(func))
     tree = ast.parse(source)
@@ -180,7 +178,7 @@ class TestFoldWorkerCooldownOrder:
 
     ``_run_stage_b_cycle`` owns the entry cooldown gate for all three Stage-B
     paths; the per-path bodies (``_run_interim_training`` / ``_run_full_cycle``
-    / ``_run_migration_on_worker``) no longer have their own gate.  These
+    / ``_run_migration_on_worker``) do not have their own gate.  These
     workers are nested closures; source inspection is the only viable CPU-only
     verification without fully driving the outer endpoint functions.  The
     same "assert the invariant directly rather than driving the endpoint"
@@ -193,8 +191,8 @@ class TestFoldWorkerCooldownOrder:
         """_run_stage_b_cycle: wait_for_cooldown appears before body(loop, bt).
 
         AST-based (see ``_first_call_linenos``): a raw string search over
-        the whole source is fooled by the docstring's own narration of
-        ``body(loop, bt)``, which now precedes the real call textually.
+        the whole source can be fooled by the docstring's own narration of
+        ``body(loop, bt)``.
         """
         linenos = _first_call_linenos(app_module._run_stage_b_cycle, "wait_for_cooldown", "body")
         assert "wait_for_cooldown" in linenos, "wait_for_cooldown not called in _run_stage_b_cycle"
@@ -212,7 +210,7 @@ class TestFoldWorkerCooldownOrder:
         )
 
     def test_run_interim_training_has_no_own_cooldown_gate(self):
-        """The interim body no longer duplicates the gate — it is owned by the primitive."""
+        """The interim body does not duplicate the gate — it is owned by the primitive."""
         source = inspect.getsource(app_module._extract_and_start_training)
         assert "wait_for_cooldown" not in source, (
             "_extract_and_start_training must not call wait_for_cooldown directly — "
@@ -220,7 +218,7 @@ class TestFoldWorkerCooldownOrder:
         )
 
     def test_run_full_cycle_has_no_own_cooldown_gate(self):
-        """The full-cycle body no longer duplicates the gate — it is owned by the primitive."""
+        """The full-cycle body does not duplicate the gate — it is owned by the primitive."""
         source = inspect.getsource(app_module._run_full_consolidation_sync)
         assert "wait_for_cooldown" not in source, (
             "_run_full_consolidation_sync must not call wait_for_cooldown directly — "

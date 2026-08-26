@@ -1,19 +1,15 @@
 """Unit tests for paramem.utils.config.budget_for.
 
-budget_for is the pure, module-level per-fold training-budget derivation. It
-is a new function on paramem.utils.config -- a live, non-archived surface
-distinct from tests/test_config.py (which is scoped to the archived
-load_config / default.yaml loader path). A dedicated file keeps the
-pure-function unit tests out of both the archived-loader file and
-tests/server/test_config.py (which covers YAML-to-TrainingConfig threading,
-a different concern).
+budget_for is the pure, module-level per-fold training-budget derivation on
+paramem.utils.config -- a live, non-archived surface distinct from
+tests/test_config.py (which is scoped to the archived load_config /
+default.yaml loader path). A dedicated file keeps the pure-function unit
+tests out of both the archived-loader file and tests/server/test_config.py
+(which covers YAML-to-TrainingConfig threading, a different concern).
 
-Derivation is the unconditional standard mechanism (no feature flag; the
-prior budget_derivation_enabled flag was retired once the validation arms
-passed -- see benchmarking.md's "Test 20" section) -- every call derives
-epochs/accum/lr_decay_steps from n_keys alone (budget_for's ``training_config``
-parameter was retired 2026-07-26 once its sole reader, the max_epochs clamp,
-was removed).
+Derivation is the unconditional standard mechanism (no feature flag; see
+benchmarking.md) -- every call derives epochs/accum/lr_decay_steps from
+n_keys alone. ``budget_for`` takes no ``training_config`` parameter.
 
 No GPU required -- budget_for takes no model/tokenizer arguments.
 """
@@ -68,7 +64,7 @@ class TestBudgetForBoundaries:
 
 
 class TestBudgetForLrDecayPerBucket:
-    """Per-bucket lr_decay_steps defaults to None (today's create_scheduler
+    """Per-bucket lr_decay_steps defaults to None (create_scheduler's
     no-op passthrough) for every bucket.
     """
 

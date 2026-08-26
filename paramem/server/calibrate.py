@@ -95,6 +95,7 @@ from paramem.graph.phase_trace import (
 )
 from paramem.graph.schema import SessionGraph
 from paramem.server import lang_id
+from paramem.server.request_text import NonBlankText
 from paramem.server.session_buffer import SessionBuffer
 from paramem.utils.artifacts import on_session_extracted
 from paramem.utils.tokens import estimate_tokens
@@ -282,15 +283,20 @@ class CalibrateRespondRequest(BaseModel):
     ``config.inference.max_response_tokens`` (there is no production caller
     of either as a per-request override) — offering a ``params`` field here
     that the call silently ignored would be exactly the ``top_p``/``top_k``
-    echo-without-effect pattern this module already documents as a defect
-    for the chain endpoints, reproduced on purpose.
+    echo-without-effect pattern this module already documents for the
+    chain endpoints, reproduced on purpose.
 
     ``prompt_variants`` carries the operator's prompt variants, resolved
     the same way every other calibration use case resolves them (see
     :func:`resolve_prompt_variants`).
+
+    ``text`` reuses :data:`~paramem.server.request_text.NonBlankText`, the
+    same blank-rejection rule every chat door applies — a blank body must
+    not reach the HA door's or the cloud door's anonymize terminal, which
+    have no refusal cause for empty text.
     """
 
-    text: str
+    text: NonBlankText
     speaker_id: str
     conversation_id: str = "calib-respond"
     prompt_variants: dict[str, str] = Field(default_factory=dict)
@@ -581,10 +587,8 @@ def _require_turn_marked_transcript(transcript: str) -> None:
     <text>`` surface :meth:`SessionBuffer._format_turns` renders in
     production (``/chat``, document ingest, cloud egress). A bare,
     unmarked transcript puts the model off-distribution from every
-    example it was tuned on — this is exactly how the ``Pat's dog``
-    cloud-egress leak stayed invisible: the calibration endpoint that
-    exists to tune these prompts was itself feeding them a surface
-    production never sends.
+    example it was tuned on, defeating the purpose of calibrating
+    against the production surface at all.
 
     This is a CHECK, not a repair: an unmarked transcript is an operator
     error, so it is rejected with a message naming the expected surface —
@@ -1296,7 +1300,7 @@ def validate_respond(state: dict, req: CalibrateRespondRequest) -> dict[str, Any
     :func:`dispatch_respond` as the ``respond`` stage's validate/dispatch
     split.
 
-    Rejects empty ``text``, empty or unknown ``speaker_id``
+    Rejects empty or whitespace-only ``text``, empty or unknown ``speaker_id``
     (``store.get_name(...) is None`` — **400, not 404**: the driver script
     at ``scripts/dev/calibrate_prompts.py`` turns any 404 into a
     ``calibrate_endpoint_enabled`` operator hint, which would mislead on an
@@ -1305,8 +1309,8 @@ def validate_respond(state: dict, req: CalibrateRespondRequest) -> dict[str, Any
     :func:`preflight`'s vocabulary), and an unresolvable prompt variant —
     all before any model call.
     """
-    if not req.text:
-        raise HTTPException(status_code=400, detail="text must not be empty.")
+    if not req.text.strip():
+        raise HTTPException(status_code=400, detail="text must not be empty or whitespace-only.")
     if not req.speaker_id:
         raise HTTPException(
             status_code=400,
@@ -1365,7 +1369,7 @@ def dispatch_respond(
       human-display output only), and it would only duplicate
       ``raw_output`` in substance.
     * ``parsed`` carries ``escalated`` (bool), every key of
-      :attr:`~paramem.server.inference.ChatResult.diagnostics` (routing
+      :attr:`~paramem.server.chat_result.ChatResult.diagnostics` (routing
       decision, and — on the personal-probe leg — per-adapter probe counts
       and the temporal selection outcome) flattened in, and
       ``variants_unexercised`` (sorted list, empty when every override
@@ -1389,13 +1393,15 @@ def dispatch_respond(
       :func:`_provenance_from_records`) — which basename that actually is
       depends on which branch the turn took: ``intent_classifier.txt``
       under the shipped ``intent.mode: llm``, ``recall_selection.txt`` on
-      the temporal personal leg under encoder mode, or
-      ``serving_directives.txt`` otherwise.  Always the unsubstituted
-      template, per the project-wide provenance contract, never the
-      rendered prompt actually sent.
+      the temporal personal leg under encoder mode, ``serving_directives.txt``
+      on a locally-reasoned turn, or the anonymizer's own ANCHOR prompt on
+      a turn the HA door answered (the HA leg scrubs on every turn, so its
+      own anonymize call can be the first prompt this phase captures).
+      Always the unsubstituted template, per the project-wide provenance
+      contract, never the rendered prompt actually sent.
     * ``phases`` includes any nested cloud-egress phases (``local_extract``,
       ``cloud_enrich``, …) that a turn escalating through
-      :func:`~paramem.server.inference.answer_via_cloud` opened on this same
+      :func:`~paramem.server.egress.answer_via_cloud` opened on this same
       trace.
 
     This call writes no session-buffer entry, no speaker-store write, and no
@@ -1428,6 +1434,9 @@ def dispatch_respond(
             language=language,
             effective_mode=state.get("effective_mode"),
             memory_store=state["memory_store"],
+            ha_graph=state.get("ha_graph"),
+            # Always the routed turn — this door never forces a leg.
+            forced_leg=None,
         )
     prompts, _ = _provenance_from_records(trace.records, "serve_turn")
     exercised = {
@@ -1471,9 +1480,9 @@ def _effective_params(params: CalibrateParams, *, supports_seed: bool) -> dict:
     :class:`CalibrationRunSpec`. ``/calibrate/respond`` is the one
     ``supports_seed=False`` caller — its request shape carries no sampling
     parameters at all, so ``seed`` is forced to ``null`` rather than echoing
-    a value that was never collected.  top_p / top_k are not yet threaded to
-    any stage's generation call (documented gap).  The field is reported
-    as-requested for transparency.
+    a value that was never collected.  top_p / top_k are not threaded to
+    any stage's generation call.  The field is reported as-requested for
+    transparency, not because it took effect.
     """
     out: dict = {}
     for f in ("temperature", "top_p", "top_k", "max_tokens"):

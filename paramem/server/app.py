@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, Any, Callable, Literal
 
 if TYPE_CHECKING:
     from paramem.adapters.registry_binding import TierBinding
+    from paramem.cloud.providers.base import CloudAgent
     from paramem.server.user_tokens import UserTokenStore
 
 import torch
@@ -59,6 +60,7 @@ from paramem.models.loader import (
 from paramem.server import calibrate as calibrate_module
 from paramem.server.active_store_migration import migrate
 from paramem.server.background_trainer import BackgroundTrainer
+from paramem.server.chat_result import ChatResult
 from paramem.server.config import (
     DEFAULT_SERVER_CONFIG_PATH,
     TTSConfig,
@@ -73,6 +75,7 @@ from paramem.server.consolidation import (
     retire_unattributable_sessions,
 )
 from paramem.server.consolidation_action import ConsolidationAction, consolidation_content_gate
+from paramem.server.egress import LEG_NAMES, OutboundText, answer_via_cloud, answer_via_ha
 from paramem.server.ha_graph import HAEntityGraph
 from paramem.server.incidents import (
     ack_incident,
@@ -81,11 +84,8 @@ from paramem.server.incidents import (
     resolve_incident,
     resolve_incidents_by_type,
 )
-from paramem.server.inference import (
-    ChatResult,
-    answer_via_cloud,
-    handle_chat,
-)
+from paramem.server.inference import handle_chat
+from paramem.server.request_text import NonBlankText
 from paramem.server.router import QueryRouter
 from paramem.server.run_status import read_last_runs, record_last_run
 from paramem.server.sanitizer import is_self_referential
@@ -282,10 +282,9 @@ _state = {
 
 
 class ChatRequest(BaseModel):
-    text: str
+    text: NonBlankText
     conversation_id: str = "default"
     speaker_embedding: list[float] | None = None  # Voice embedding from STT
-    route: str | None = None  # Force routing: "ha", "cloud", or None (auto)
 
 
 class ChatResponse(BaseModel):
@@ -1331,7 +1330,7 @@ def _validate_adapter_slot(
     :class:`~paramem.adapters.registry_binding.TierBinding` for this exact
     ``kind_dir`` (:func:`~paramem.adapters.registry_binding.verify_tier_binding`).
     It carries the hash-match decision, the resolved slot, and the candidate
-    count — this function no longer re-derives any of those.
+    count, which this function reads directly rather than re-deriving.
 
     Returns ``(slot, manifest, should_mount)``:
       * ``slot``: resolved live slot Path, or ``None`` when no matching slot.
@@ -1755,8 +1754,8 @@ def _sweep_keyless_tier_artifacts(config, state: dict) -> list[str]:
     :func:`~paramem.backup.integrity.cleanup_partial_slots`, before any
     binding is computed and self-heals it then.)
 
-    Operator erase doors (``POST /speaker/forget``, ``POST /debug/erase-keys``) no longer
-    empty a tier's registry — they stale-mark, withholding an ACTIVE key as
+    Operator erase doors (``POST /speaker/forget``, ``POST /debug/erase-keys``) stale-mark
+    a tier's registry rather than emptying it — withholding an ACTIVE key as
     a marker that keeps its id in ``list_known()`` (see
     :func:`~paramem.memory.persistence.erase_keys_and_restamp_manifest`), so
     ``list_known()`` never drops as a side effect of an operator erase. The
@@ -3994,110 +3993,6 @@ async def chat(request: ChatRequest, http_request: Request):
     # mode.
     auth_speaker_id: str | None = getattr(http_request.state, "speaker_id", None)
 
-    # Forced routing — bypass normal routing for direct provider testing.
-    # Supports: "ha", "cloud", "cloud:anthropic", "cloud:openai", "cloud:google"
-    if request.route and request.route.startswith(("ha", "cloud")):
-        _speaker_id, speaker = _resolve_speaker(
-            request, buffer, _state.get("speaker_store"), auth_speaker_id=auth_speaker_id
-        )
-        # Same typed boundary decision as the normal /chat path — forced
-        # routing selects the PROVIDER, it does not buy a history-egress
-        # bypass: a speakerless caller gets no history on the forced route
-        # either.
-        _serving = ServingPath.for_speaker(_speaker_id)
-        _forced_history = (
-            []
-            if _serving is ServingPath.RELAY
-            else buffer.get_conversation_turns(request.conversation_id)
-        )
-        loop = asyncio.get_running_loop()
-
-        result = None
-        if request.route == "ha" and _state.get("ha_client") is not None:
-            response_text = await loop.run_in_executor(
-                None,
-                lambda: _state["ha_client"].conversation_process(
-                    request.text, agent_id=_state["config"].ha_agent_id
-                ),
-            )
-            if response_text is not None:
-                result = ChatResult(text=response_text, escalated=True)
-        elif request.route.startswith("cloud"):
-            parts = request.route.split(":", 1)
-            agent = (
-                _state.get("cloud_providers", {}).get(parts[1])
-                if len(parts) == 2
-                else _state.get("cloud_agent")
-            )
-            if agent is not None and _state["mode"] == "cloud-only":
-                # Cloud-only: no local model, so no ParaMem-held knowledge and
-                # no anonymizer — the same plain-cloud-agent posture as
-                # _relay_route.  Routed through the one egress funnel
-                # (model/tokenizer=None selects its cannot-anonymize branch);
-                # history is still drop-gated there.
-                _forced_cloud_permitted = (
-                    _state.get("cloud_only_reason") not in _INVOLUNTARY_CLOUD_ONLY_REASONS
-                    or _state["config"].cloud.allow_degraded_serving
-                )
-                result = await loop.run_in_executor(
-                    None,
-                    lambda: answer_via_cloud(
-                        request.text,
-                        agent,
-                        _state["config"],
-                        model=None,
-                        tokenizer=None,
-                        speaker=speaker,
-                        speaker_id=_speaker_id,
-                        history=_forced_history,
-                        cloud_permitted=_forced_cloud_permitted,
-                    ),
-                )
-            elif agent is not None:
-                # Local mode: forced routing selects the PROVIDER, it does not
-                # buy a policy bypass.  The turn goes through the one egress
-                # funnel, so cloud_mode and the personal verdict apply exactly
-                # as they do on the routed path.  answer_via_cloud reaches the
-                # live model here (anonymizer's extract_graph/anonymize_turn
-                # calls generate() under base_model_inference — see
-                # inference.py:answer_via_cloud), so this dispatch needs the
-                # same GPU discipline as the routed local path: abort any
-                # in-flight background training, then hold the GPU lock for
-                # the duration.
-                _forced_is_personal = is_self_referential(
-                    request.text,
-                    personal_referent_config=_state["config"].personal_referent,
-                )
-                _abort_background_training_for_inference()
-
-                from paramem.server.gpu_lock import gpu_lock
-
-                async with gpu_lock():
-                    result = await loop.run_in_executor(
-                        None,
-                        lambda: answer_via_cloud(
-                            request.text,
-                            agent,
-                            _state["config"],
-                            is_personal=_forced_is_personal,
-                            model=_state.get("model"),
-                            tokenizer=_state.get("tokenizer"),
-                            speaker=speaker,
-                            speaker_id=_speaker_id,
-                            history=_forced_history,
-                        ),
-                    )
-        if result and result.text:
-            resolved_text = resolve_speaker_tokens(
-                result.text, _state.get("speaker_store"), current_speaker_id=_speaker_id
-            )
-            return ChatResponse(text=resolved_text, escalated=True, speaker=speaker)
-        return ChatResponse(
-            text=f"Route '{request.route}' unavailable.",
-            escalated=False,
-            speaker=speaker,
-        )
-
     # Pick up speaker embedding from latest STT if not in request
     latest_embedding = _state.get("latest_embedding")
     if not request.speaker_embedding and latest_embedding is not None:
@@ -4191,9 +4086,9 @@ class ServingPath(Enum):
     same embedding-presence rule every other holdable session uses.
 
     The one constructor, :meth:`for_speaker`, is the sole place this
-    decision is made — every caller (the normal ``/chat`` / ``/voice`` path
-    and forced routing) derives ``ServingPath`` from it rather than
-    re-deriving the ``speaker_id is None`` check locally.
+    decision is made — ``_run_chat_turn`` (the normal ``/chat`` / ``/voice``
+    path) derives ``ServingPath`` from it rather than re-deriving the
+    ``speaker_id is None`` check locally.
     """
 
     PERSONAL = "personal"
@@ -4228,8 +4123,7 @@ class ResolvedSpeaker:
         alongside ``speaker_id`` would let the two drift out of sync if a
         caller ever mutated one without the other.  ``_run_chat_turn``
         (the sole consumer) calls ``ServingPath.for_speaker(speaker_id)``
-        itself; forced routing (the ``/chat`` handler's ``request.route``
-        branch) does the same at its own fork.
+        itself.
     follow_up:
         Server-initiated follow-up prompt (e.g. "What's your name?") when
         the voice is unknown.  ``None`` after successful disclosure or for
@@ -4560,8 +4454,7 @@ async def _run_chat_turn(
     ``ServingPath`` decision is made HERE, from *speaker_id*, via the one
     constructor (:meth:`ServingPath.for_speaker`) — it is not threaded in
     by the caller, so it can never drift from the ``speaker_id`` actually
-    passed (the same constructor forced routing calls independently at its
-    own fork, in the ``/chat`` handler).
+    passed.
 
     Conversation history is server-authoritative: it is read from
     ``SessionBuffer.get_conversation_turns(conversation_id)`` BEFORE this turn's
@@ -4594,7 +4487,7 @@ async def _run_chat_turn(
     -------
     tuple[ChatResult, str]
         ``(result, spoken_text)`` where *result* is the raw
-        :class:`~paramem.server.inference.ChatResult` (token-space, as
+        :class:`~paramem.server.chat_result.ChatResult` (token-space, as
         persisted) and *spoken_text* is *result.text* with every
         ``speaker{N}`` token resolved to a display name (or the third-party
         descriptor) via :func:`~paramem.server.speaker.resolve_speaker_tokens`,
@@ -4644,15 +4537,15 @@ async def _run_chat_turn(
         )
         cloud_permitted = (not degraded) or _state["config"].cloud.allow_degraded_serving
 
-        # The relay leg now runs classifier/encoder calls
-        # (``_is_personal_interrogative`` / ``is_self_referential``) and, in
-        # local mode, live-model calls (anonymize + base-model fallback) —
-        # the same GPU-touching work the local ``handle_chat`` dispatch
-        # below does.  Abort background training and hold the GPU lock for
-        # the duration, mirroring the local leg exactly (see
-        # ``_abort_background_training_for_inference``'s docstring); a
-        # cloud-only server (model is None) still takes the lock, which is
-        # cheap and harmless with no GPU work behind it.
+        # One rule for every cloud-leg dispatch, resident or not: abort
+        # background training and hold the GPU lock for the duration.  A
+        # deferral's local work here is not CPU-only — the sentence
+        # encoder behind the personal verdict
+        # (``_is_personal_interrogative`` / ``is_self_referential``) is a
+        # module singleton that survives ``/gpu/release`` and runs on CUDA
+        # in this deployment — and the lock is cheap with nothing behind
+        # it when there is no local model.  Mirrors the local ``handle_chat``
+        # dispatch below and ``debug_probe``'s cloud-only branch exactly.
         _abort_background_training_for_inference()
 
         from paramem.server.gpu_lock import gpu_lock
@@ -4665,24 +4558,29 @@ async def _run_chat_turn(
                     text=text,
                     # No history egress for a speakerless request, even when the
                     # server is ALSO cloud-only — identity_absent is the stronger
-                    # privacy condition.  Full history (still drop-gated inside
-                    # answer_via_cloud) for a server-wide cloud-only turn from a
-                    # resolved speaker.
+                    # privacy condition.  Full history (still drop-gated via
+                    # OutboundText.gated_history(), which both doors read) for
+                    # a server-wide cloud-only turn from a resolved speaker.
                     history=([] if identity_absent else history),
                     config=_state["config"],
                     cloud_permitted=cloud_permitted,
                     ha_client=_state.get("ha_client"),
                     cloud_agent=_state.get("cloud_agent"),
                     language=language,
+                    speaker=speaker,
                     speaker_id=speaker_id,
                     identity_absent=identity_absent,
                     # Live model/tokenizer in local mode (identity_absent
-                    # turn on an otherwise-healthy server) so the relay's
-                    # cloud leg can sanitize via the local anonymizer and
-                    # the final fallback can reach the local base model;
-                    # genuinely None in server-wide cloud-only mode.
+                    # turn on an otherwise-healthy server) decide the
+                    # self-introduction link and the local base-model
+                    # fallback, NOT whether the turn is sanitized — the
+                    # cloud door applies ``sanitization.cloud_mode`` in
+                    # every residency state (the HA door scrubs
+                    # unconditionally, independent of residency too).
+                    # Genuinely None in server-wide cloud-only mode.
                     model=_state.get("model"),
                     tokenizer=_state.get("tokenizer"),
+                    ha_graph=_state.get("ha_graph"),
                 ),
             )
         buffer.append(
@@ -5052,7 +4950,7 @@ async def voice(http_request: Request):
     )
 
     text = utterance.text
-    if not text:
+    if not text.strip():
         return VoiceResponse(transcript="", reply="")
 
     # Per-utterance transport/enrollment id on the unattributed-caller path
@@ -5331,9 +5229,9 @@ def _resolve_speaker(
             speaker_name = speaker_store.resolve_speaker_name(auth_speaker_id)
         # Record on session state for multi-turn continuity (priority 2 below)
         # and any session-state reader, mirroring the voice branch. Turn
-        # attribution itself no longer depends on this — append() now takes the
-        # resolved speaker_id explicitly — but keeping the two representations
-        # consistent avoids a stale session-state read on later turns.
+        # attribution takes the resolved speaker_id via append()'s own
+        # explicit parameter; keeping the two representations consistent
+        # avoids a stale session-state read on later turns.
         buffer.set_speaker(request.conversation_id, auth_speaker_id, speaker_name or "")
         return auth_speaker_id, speaker_name
 
@@ -6243,7 +6141,7 @@ def _build_store_contents(
     caller local).  The three returned dicts hold NO model reference.
     Setting ``_source = None`` before return releases the only in-frame
     handle.  A surviving reference here would re-introduce the cloud-only
-    VRAM leak fixed 2026-05-21.
+    VRAM leak this invariant guards against.
 
     Parameters
     ----------
@@ -6784,8 +6682,8 @@ def _record_unverified_tier_incidents(config, tier_bindings: dict) -> None:
     store step (:func:`_hydrate_memory_store_in_place`) is still observed and
     reported before the next boot or lift re-runs that step. This is
     reporting only — nothing here changes what the live store currently
-    serves for the tier; the store-publish boundary itself no longer has a
-    per-tier unpublishable arm to report on (a tier that fails verification
+    serves for the tier; the store-publish boundary has no per-tier
+    unpublishable arm to report on (a tier that fails verification
     THERE quarantines the whole store instead — see
     :func:`_enter_store_quarantine` — a single ``store_quarantined``
     incident, not a per-tier one).
@@ -7127,9 +7025,9 @@ def _preload_memory_store(config, *, model, tokenizer):
     # corrupt registry is a different, more severe condition than a deferred
     # or partial cache fill).
     #
-    # cleanup_partial_slots (scratch left by interrupted training) no longer
-    # runs here — it moved pre-mount, into _sweep_keyless_tier_artifacts
-    # (paramem/server/app.py), called from _mount_adapters_from_slots, which
+    # cleanup_partial_slots (scratch left by interrupted training) runs
+    # pre-mount, in _sweep_keyless_tier_artifacts (paramem/server/app.py),
+    # called from _mount_adapters_from_slots, which
     # runs strictly before this function on every boot/reload that loads a
     # local model.  Removing an incomplete slot AFTER _hydrate_memory_store_in_place
     # (a few lines above) had already computed this tier's binding for
@@ -7293,23 +7191,37 @@ def _report_intent_classifier_health(config, encoder_handle, exemplar_bank) -> N
 
 
 def _load_span_tagger(config) -> None:
-    """Load the span tagger when this configuration can reach a cloud with scrubbing on.
+    """Load the span tagger when this configuration has an external-egress
+    path that needs scrubbing.
 
     The ONLY site that maps ``ServerConfig`` onto
     :func:`~paramem.cloud.admission.scrubbing_reachable`'s terms:
-    ``scrub_enabled=bool(config.sanitization.scrub_categories)``, and the
-    same cloud-egress terms (``cloud_enabled``, ``provider``, ``model``,
+    ``scrub_enabled=bool(config.sanitization.scrub_categories)``, the same
+    cloud-egress terms (``cloud_enabled``, ``provider``, ``model``,
     ``endpoint``) that ``_session_egress_permitted``
     (``paramem/graph/flows.py``) already gates session-tier cloud
-    enrichment on, plus the chat-egress ``cloud_mode`` term. When the
-    configuration cannot reach a cloud with scrubbing on, this logs at
-    INFO and returns — no model download is attempted, and the tagger
+    enrichment on, the chat-egress ``cloud_mode`` term, and the HA term
+    (``config.ha_agent_id``, ``config.tools.ha.configured``). When the
+    configuration has no external-egress path needing scrubbing, this logs
+    at INFO and returns — no model download is attempted, and the tagger
     stays unloaded (every ``anonymize()`` call then fails closed via its
     ``"tagger"`` contract member). When it can, delegates to
     :func:`~paramem.cloud.span_tagger.load_at_startup`, which is
     idempotent on an unchanged ``(checkpoint, revision)`` pair and raises
     ``RuntimeError`` naming the checkpoint and revision on a resolution
     failure — deliberately left to propagate to this function's caller.
+
+    This is the clear site for the ``span_tagger_unavailable`` incident
+    (recorded by :func:`~paramem.server.egress._refuse_failed_contract` when
+    a cloud or HA egress turn hits a ``"tagger"`` failure): a successful
+    ``load_at_startup`` here resolves every open incident of that type, the
+    same record-and-resolve-in-one-function shape as
+    :func:`_report_intent_classifier_health`. The unreachable branch above
+    resolves it too, with a ``reason`` — a standing incident recorded while
+    the tagger was needed must not survive an operator reconfiguring away
+    from it (e.g. to ``cloud_mode: block`` with no HA agent configured),
+    since this function is the incident's only clear site and that path
+    never reaches ``load_at_startup``.
 
     Parameters
     ----------
@@ -7326,13 +7238,33 @@ def _load_span_tagger(config) -> None:
         provider=config.consolidation.extraction_enrichment_provider,
         model=config.consolidation.extraction_enrichment_provider_model,
         endpoint=config.consolidation.extraction_enrichment_provider_endpoint,
+        ha_agent_id=config.ha_agent_id,
+        ha_tools_configured=config.tools.ha.configured,
     )
     if not reachable:
         logger.info(
-            "span_tagger: not loaded — this configuration cannot reach a cloud with scrubbing on"
+            "span_tagger: not loaded — this configuration has no external-egress "
+            "path needing the span tagger"
+        )
+        # This configuration has no external-egress path that needs
+        # scrubbing, so an existing span_tagger_unavailable incident
+        # (raised by an earlier boot, or a still-active previous config)
+        # does not apply — resolve it here too, or an operator who moves
+        # to cloud_mode: block with no HA agent configured after a tagger
+        # failure is stuck with a standing incident the tagger can never
+        # clear (this function is its only clear site, and this branch
+        # never reaches the load_at_startup call below).
+        resolve_incidents_by_type(
+            data_state_dir(config.paths.data),
+            "span_tagger_unavailable",
+            reason=(
+                "configuration has no external-egress path needing the span tagger "
+                "(scrubbing unreachable)"
+            ),
         )
         return
     span_tagger.load_at_startup(config.span_tagger)
+    resolve_incidents_by_type(data_state_dir(config.paths.data), "span_tagger_unavailable")
 
 
 def _build_runtime_components(
@@ -7594,7 +7526,7 @@ def _build_runtime_components(
 
         ha_graph = None
         tools_config = config.tools
-        if tools_config.ha.url and tools_config.ha.token:
+        if tools_config.ha.configured:
             ha_client = HAClient(
                 url=tools_config.ha.url,
                 token=tools_config.ha.token,
@@ -8056,8 +7988,8 @@ def _live_reload_base_model(
     # Entry drain: move the voice pipeline to CPU before releasing the base
     # model and before the VRAM gate.  Without this drain the gate sees
     # ~4.3 GiB still occupied by STT large-v3-turbo + TTS on 8 GiB hardware
-    # and defers to cloud-only (observed 2026-05-29: effective free 3.28 GiB,
-    # needed 5.00 GiB).  Idempotent: _set_voice_pipeline_profile early-returns
+    # and defers to cloud-only when effective free VRAM falls short of what
+    # the reload requires.  Idempotent: _set_voice_pipeline_profile early-returns
     # when voice_profile already matches ("cpu" for cloud-only callers).
     # Also closes the double-voice leak in _build_runtime_components
     # full-rebuild: the rebuild overwrites _state["stt_gpu"]/_state["tts_gpu"]
@@ -8307,7 +8239,7 @@ def _live_reload_base_model(
 #  Every reference to the base model (``_state["model"]``) must be dropped on
 #  release so a cloud-only server holds ~0 GiB. Holders accumulate as new
 #  components capture the model; a teardown that silently goes stale leaks the
-#  whole base model (~4 GiB) — exactly what happened pre-2026-05-21.
+#  whole base model (~4 GiB).
 #    • Find every holder:   grep -rn "BASE-MODEL HOLDER" paramem/
 #    • Object / module-global holders  → drop them in this function.
 #    • Lifespan-frame locals           → drop them IN THE LIFESPAN. This
@@ -8346,9 +8278,7 @@ def _release_base_model_in_process() -> None:
        calls ``_stop_callable_worker()``, which sends ``_WORKER_STOP``,
        joins the thread, then nulls ``_worker_thread`` — breaking the
        ``bt ↔ Thread._target (bound method)`` cycle that ``join`` alone
-       does not sever.  Verified by a live ``gc.get_referrers`` walk
-       (2026-05-29): 2.796 GiB still allocated after join-only; 0 GiB
-       after the explicit null.
+       does not sever.
     5. ``intent._classifier_model_singleton`` — the ``_ClassifierModelHandle``
        set by ``set_classifier_model`` for ``intent.mode=llm``. Cleared
        here via ``set_classifier_model(None, None)``.
@@ -9999,14 +9929,79 @@ async def interim_discard(request: InterimDiscardRequest):
 
 
 class DebugProbeRequest(BaseModel):
-    """Probe the chat handler with explicit speaker_id injection."""
+    """Probe the chat handler with explicit speaker_id injection.
 
-    text: str
+    Its own four-field schema (``{text, speaker_id, conversation_id?,
+    route?}``, ``DEPLOYMENT.md``'s ``/debug/probe`` row) — NOT a
+    :class:`ChatRequest` subclass: this door has no STT leg, so
+    ``speaker_embedding`` has no consumer here and must not appear in the
+    schema.  ``text`` reuses :data:`NonBlankText`, the same blank-rejection
+    rule every chat door applies, without inheriting the unused field
+    alongside it — ``/debug/probe`` is a chat door: it reaches the
+    identical dispatch under ``cloud_mode: anonymize|both``.
+
+    ``route`` is this door's own forced-routing field — the operator
+    facility for exercising exactly one leg (``"ha"``, ``"cloud"``, or
+    ``"cloud:<provider>"``), resolved by :func:`_resolve_probe_route`.
+    ``None`` (the default) runs the ordinary routed dispatch.
+    """
+
+    text: NonBlankText
     speaker_id: str  # explicit; bypasses _resolve_speaker
     conversation_id: str = "debug-probe"
+    route: str | None = None  # "ha" | "cloud" | "cloud:<provider>"
 
 
-@app.post("/debug/probe", response_model=ChatResponse, dependencies=[Depends(require_admin)])
+class DebugProbeResponse(ChatResponse):
+    """``/debug/probe``'s own response model — extends :class:`ChatResponse`
+    with the turn's routing/egress diagnostics.
+
+    Production ``/chat``/``/voice`` responses stay on the bare
+    :class:`ChatResponse` schema (unchanged) — the diagnostics dict is an
+    operator-debug surface only, never part of the public response shape.
+    """
+
+    diagnostics: dict[str, Any] = {}
+
+
+def _resolve_probe_route(route: str | None) -> tuple[str | None, "CloudAgent | None"]:
+    """Resolve a probe route to ``(forced_leg, cloud_agent)``.
+
+    Args:
+        route: ``None``, ``"ha"``, ``"cloud"``, or ``"cloud:<provider>"``.
+
+    Returns:
+        ``(None, _state.get("cloud_agent"))`` when *route* is ``None``.
+        ``("ha", _state.get("cloud_agent"))`` for ``"ha"`` — the forced leg
+        alone closes the cloud leg; the agent object is not nulled as a
+        second mechanism.  ``("cloud", _state.get("cloud_agent"))`` for
+        ``"cloud"``.  ``("cloud", _state["cloud_providers"][provider])`` for
+        ``"cloud:<provider>"``.
+
+    Raises:
+        HTTPException: 404 (``provider_not_configured``) when *route* names
+            an unregistered provider; 422 (``unknown_route``) for any other
+            value.
+    """
+    if route is None:
+        return None, _state.get("cloud_agent")
+    if route in LEG_NAMES:
+        # "ha" alone closes the cloud leg; the agent object is not nulled
+        # as a second mechanism. "cloud" alone reuses the default agent.
+        return route, _state.get("cloud_agent")
+    if route.startswith("cloud:"):
+        provider = route.split(":", 1)[1]
+        agent = _state.get("cloud_providers", {}).get(provider)
+        if agent is None:
+            raise HTTPException(
+                status_code=404,
+                detail={"status": "provider_not_configured", "provider": provider},
+            )
+        return "cloud", agent
+    raise HTTPException(status_code=422, detail={"status": "unknown_route", "route": route})
+
+
+@app.post("/debug/probe", response_model=DebugProbeResponse, dependencies=[Depends(require_admin)])
 async def debug_probe(request: DebugProbeRequest):
     """Single-call /chat-equivalent probe with operator-supplied speaker_id.
 
@@ -10022,6 +10017,15 @@ async def debug_probe(request: DebugProbeRequest):
     ``tracker.record``.  The resolved language is forwarded to both the
     cloud-only and local dispatch branches so non-English probe texts are
     handled correctly.
+
+    The response carries the turn's routing and egress diagnostics
+    (``DebugProbeResponse.diagnostics``) alongside the reply — including
+    whether the turn left scrubbed or verbatim, or why the cloud leg
+    refused it — which the production ``/chat`` response does not.
+
+    ``request.route`` resolves to ``(forced_leg, cloud_agent)`` via
+    :func:`_resolve_probe_route` before dispatch; this door owns the route
+    field — the STT leg's ``speaker_embedding`` still has no consumer here.
     """
     # Count as a /chat-equivalent turn for the idle-debounce gate so operator
     # probe calls do not trigger consolidation mid-session.
@@ -10034,9 +10038,11 @@ async def debug_probe(request: DebugProbeRequest):
     if store is None:
         return JSONResponse({"status": "not_ready"}, status_code=503)
 
+    forced_leg, probe_cloud_agent = _resolve_probe_route(request.route)
+
     # get_name is used ONLY for the existence check — it returns the RAW
     # speaker{N} token for an anonymous-enrolled profile (name == id).  That
-    # token is no longer a suppression concern for the LOCAL system-prompt
+    # token is not a suppression concern for the LOCAL system-prompt
     # identity line: _build_system_prompt keys the "You are speaking with X"
     # line off speaker_id presence directly (anonymous included, per the
     # B-form prefix design), so the raw token IS the identity line for an
@@ -10067,25 +10073,59 @@ async def debug_probe(request: DebugProbeRequest):
     buffer = _state["session_buffer"]
     history = buffer.get_conversation_turns(request.conversation_id)
 
-    # Cloud-only mode mirrors /chat dispatch — no GPU lock, no model.
+    # Cloud-only mode mirrors /chat dispatch.  One rule for every
+    # cloud-leg dispatch, resident or not (same rule as the local branch
+    # below and the relay leg in _run_chat_turn): abort background
+    # training and hold the GPU lock for the duration — the sentence
+    # encoder behind the personal
+    # verdict is a module singleton that survives /gpu/release and runs
+    # on CUDA in this deployment, so a deferral's local work here is not
+    # CPU-only, and the lock is cheap with nothing behind it when there
+    # is no local model.  The relay leg's tagger pass, encoder calls and
+    # provider call are synchronous work, same as the local branch below,
+    # so this dispatch takes the same run_in_executor hop rather than
+    # running on the event loop.
     if _state["mode"] == "cloud-only":
-        cloud_result = _relay_route(
-            text=request.text,
-            history=history,
-            config=config,
-            cloud_permitted=(
-                _state.get("cloud_only_reason") not in _INVOLUNTARY_CLOUD_ONLY_REASONS
-                or config.cloud.allow_degraded_serving
-            ),
-            ha_client=_state.get("ha_client"),
-            cloud_agent=_state.get("cloud_agent"),
-            language=detected_language,
-            speaker_id=request.speaker_id,
-        )
+        _abort_background_training_for_inference()
+
+        from paramem.server.gpu_lock import gpu_lock
+
+        async with gpu_lock():
+            loop = asyncio.get_running_loop()
+            cloud_result: ChatResult = await loop.run_in_executor(
+                None,
+                lambda: _relay_route(
+                    text=request.text,
+                    history=history,
+                    config=config,
+                    cloud_permitted=(
+                        _state.get("cloud_only_reason") not in _INVOLUNTARY_CLOUD_ONLY_REASONS
+                        or config.cloud.allow_degraded_serving
+                    ),
+                    ha_client=_state.get("ha_client"),
+                    cloud_agent=probe_cloud_agent,
+                    language=detected_language,
+                    speaker=speaker_name,
+                    speaker_id=request.speaker_id,
+                    model=_state.get("model"),
+                    tokenizer=_state.get("tokenizer"),
+                    ha_graph=_state.get("ha_graph"),
+                    forced_leg=forced_leg,
+                ),
+            )
         resolved_text = resolve_speaker_tokens(
             cloud_result.text, store, current_speaker_id=request.speaker_id
         )
-        return ChatResponse(text=resolved_text, escalated=True, speaker=speaker_name)
+        # ``diagnostics`` is passed through UNRESOLVED — resolve_speaker_tokens
+        # is scoped to display text and must never run over it, or a
+        # speaker{N} token inside a diagnostics value would be rewritten
+        # into a real household display name in an admin debug payload.
+        return DebugProbeResponse(
+            text=resolved_text,
+            escalated=True,
+            speaker=speaker_name,
+            diagnostics=cloud_result.diagnostics,
+        )
 
     # Local mode — abort BG trainer + acquire gpu_lock, mirroring /chat.
     _abort_background_training_for_inference()
@@ -10106,18 +10146,23 @@ async def debug_probe(request: DebugProbeRequest):
                 tokenizer=_state["tokenizer"],
                 config=config,
                 router=_state["router"],
-                cloud_agent=_state.get("cloud_agent"),
+                cloud_agent=probe_cloud_agent,
                 ha_client=_state.get("ha_client"),
                 language=detected_language,
                 effective_mode=_state.get("effective_mode"),
                 memory_store=_state["memory_store"],
+                ha_graph=_state.get("ha_graph"),
+                forced_leg=forced_leg,
             ),
         )
 
-    return ChatResponse(
+    # ``diagnostics`` is passed through UNRESOLVED — see the cloud-only
+    # branch's comment above; the same rule applies here.
+    return DebugProbeResponse(
         text=resolve_speaker_tokens(result.text, store, current_speaker_id=request.speaker_id),
         escalated=result.escalated,
         speaker=speaker_name,
+        diagnostics=result.diagnostics,
     )
 
 
@@ -13419,10 +13464,10 @@ async def _run_base_swap_orchestration(
         # with disk.  Phase B's migrate() promoted weights for every tier and
         # called wrap_lora()/create_adapter() per tier as it iterated; the last
         # tier through migrate leaves the in-RAM PeftModel mounted in its
-        # transient mid-iteration shape (the symptom traced 2026-05-28:
-        # semantic mounted as a Qwen-shape LoRA-zero, hiding the just-promoted
-        # weights from /debug/recall until a manual systemctl restart).  A
-        # plain reclaim-style reload (refresh_config_from_disk=False) tears
+        # transient mid-iteration shape (e.g. semantic mounted as a
+        # Qwen-shape LoRA-zero, hiding the just-promoted weights from
+        # /debug/recall until the process reloads).  A plain reclaim-style
+        # reload (refresh_config_from_disk=False) tears
         # down the PeftModel and rebuilds from disk, picking up each tier's
         # promoted adapter cleanly.
         #
@@ -16198,12 +16243,11 @@ async def backup_restore(req: BackupRestoreRequest):
             },
         ) from exc
 
-    # --- Step 7: this branch's existing restart posture ---
-    # Unchanged mechanism: a config-kind restore only ever swaps
-    # server.yaml on disk — no live-apply dispatch, no adapter tree touched,
-    # no store quarantine. An operator restart is what converges it, same as
-    # before this change; only the response shape is new (see
-    # BackupRestoreResponse's serving field).
+    # --- Step 7: this branch's restart posture ---
+    # A config-kind restore only ever swaps server.yaml on disk — no
+    # live-apply dispatch, no adapter tree touched, no store quarantine. An
+    # operator restart is what converges it (see BackupRestoreResponse's
+    # serving field).
     return BackupRestoreResponse(
         restored={"config": str(live_config_path)},
         backed_up_pre_restore={"config": safety_slot_path},
@@ -16295,10 +16339,13 @@ def _relay_route(
     ha_client=None,
     cloud_agent=None,
     language: str | None = None,
+    speaker: str | None = None,
     speaker_id: str | None = None,
     identity_absent: bool = False,
     model=None,
     tokenizer=None,
+    ha_graph: HAEntityGraph | None = None,
+    forced_leg: str | None = None,
 ) -> ChatResult:
     """Route queries served by the relay path: HA / cloud / local base model, no PA memory.
 
@@ -16310,53 +16357,52 @@ def _relay_route(
     server-wide cloud-only mode ``model``/``tokenizer`` are genuinely
     ``None`` (no local model exists — callers pass ``_state["model"]``
     verbatim); in local mode with ``identity_absent=True`` they are the
-    live base model/tokenizer: a speakerless caller's cloud egress must
-    still go through local sanitization rather than skip it entirely.
+    live base model/tokenizer.
 
-    HA first (has tools for weather, time, devices), cloud as fallback for
-    reasoning, the local base model (adapter-off, no history, no facts, no
-    speaker context) as the final fallback when a local model is loaded and
-    both hops fail or are unavailable — mirroring the documented
-    HA → cloud → local-base-model fallback chain
+    The HA door first (has tools for weather, time, devices), the cloud
+    door as fallback for reasoning, the local base model (adapter-off, no
+    history, no facts, no speaker context) as the final fallback when a
+    local model is loaded and both doors answer nothing — mirroring the
+    documented HA → cloud → local-base-model fallback chain
     (:mod:`paramem.server.inference` module docstring).  In server-wide
     cloud-only mode there is no local model, so the final fallback is the
     canned limited-mode response instead.
 
-    The cloud leg goes through :func:`~paramem.server.inference.
-    answer_via_cloud` — the sole cloud-egress funnel.  With ``model``/
-    ``tokenizer`` both ``None`` (cloud-only mode) it selects the
-    cannot-anonymize branch: no local model means no ParaMem-held knowledge
-    to protect on this path, so the current turn egresses verbatim and
-    history is still drop-gated.  With a live ``model``/``tokenizer``
-    (local mode, ``identity_absent=True``) it selects the normal
-    ``sanitization.cloud_mode`` policy — the SAME anonymize/block/both
-    policy every other leg applies — keyed off ``is_personal`` computed
-    below from :func:`~paramem.server.sanitizer.is_self_referential`.  No
-    intent classification (routing requires a resolved ``speaker_id``, so
-    there is no ``RoutingPlan`` to consult here), and — same as every
-    other leg — no speaker name or id reaches the cloud system prompt.
+    Both doors go through :mod:`paramem.server.egress`: the HA door
+    (:func:`~paramem.server.egress.answer_via_ha`) scrubs always and
+    refuses only on its own three causes; the cloud door
+    (:func:`~paramem.server.egress.answer_via_cloud`) applies
+    ``config.sanitization.cloud_mode`` in EVERY residency state (keyed off
+    ``is_personal`` computed below), decides the ``cloud_permitted``
+    question itself, and records the cause of any refusal into
+    *turn_diags*.  Residency decides only whether the self-introduction
+    anchor inside the anonymize chain can run — never whether either
+    door's policy applies.  No intent classification (routing requires a
+    resolved ``speaker_id``, so there is no ``RoutingPlan`` to consult
+    here).
 
     When ``identity_absent`` is True and the turn is itself a personal
     interrogative (:func:`~paramem.server.inference._is_personal_interrogative`
     — the SAME shared predicate the abstention gate uses, over the
-    ``is_self_referential`` verdict computed here), this returns the
-    canned no-identity response BEFORE the HA leg is even tried — there is
+    ``is_self_referential`` verdict computed below), this returns the
+    canned no-identity response BEFORE the HA door is even tried — there is
     no speaker for a personal question to be about, and asking HA does not
     change that.  This short-circuit is NEVER gated on
     ``config.abstention.enabled`` (see
     :func:`~paramem.server.inference._is_personal_interrogative`'s
     docstring): refusing here is a structural impossibility (no identity,
-    no store), not a feature toggle.  Non-personal and declarative turns
-    fall through to the normal HA → cloud → base-model dispatch below,
-    unaffected by ``identity_absent`` beyond the ``is_personal`` verdict
-    threaded into the cloud leg.
+    no store), not a feature toggle.  The personal verdict is computed for
+    EVERY turn that can reach the cloud leg, not only under
+    ``identity_absent`` — but the short-circuit *call* stays conjuncted
+    with ``identity_absent``, so a resolved-speaker turn is never widened
+    into it.  Non-personal and declarative turns fall through to the
+    normal HA → cloud → base-model dispatch below.
 
     Args:
         text: The user's turn, verbatim.
-        history: Prior conversation turns, or ``None``.  Drop-gated by
-            :func:`~paramem.server.inference._sanitize_history` (inside
-            ``answer_via_cloud``) before it egresses.  Callers pass ``[]``
-            for a speakerless turn — no history egress at all, per the
+        history: Prior conversation turns, or ``None``.  Drop-gated inside
+            the doors before they egress.  Callers pass ``[]`` for a
+            speakerless turn — no history egress at all, per the
             ``ServingPath.RELAY`` contract.
         config: The live :class:`~paramem.server.config.ServerConfig`.
         cloud_permitted: Whether the CLOUD leg may be used.  Computed by the
@@ -16364,16 +16410,34 @@ def _relay_route(
             and ``config.cloud.allow_degraded_serving``: ``False`` closes the
             cloud leg while the server is cloud-only for an involuntary
             reason and the operator has not opted into degraded serving.  The
-            HA leg is unaffected.
+            HA leg is unaffected.  The cloud door itself decides this
+            question and logs the operator remedy.
         ha_client: HA client, or ``None`` when HA is not configured.
         cloud_agent: Cloud agent, or ``None`` when cloud is not configured.
         language: Resolved BCP-47 code for this turn, or ``None``.
+        speaker: ``None`` for a speakerless turn, otherwise
+            ``ResolvedSpeaker.speaker`` verbatim — a disclosed display
+            name, OR, for an anonymous-promoted speaker who has not yet
+            disclosed a name, the raw ``speaker{N}`` token itself (see
+            ``ResolvedSpeaker.speaker``'s own contract: the store's
+            convention until disclosure).  A token-shaped value is
+            harmless here: ``build_forward_table`` treats a token-shaped
+            ``speaker_name`` (``is_speaker_id(speaker_name)``) exactly as an
+            absent one — the fold decides on attestation alone, never on a
+            token standing in for a name.  Production source:
+            ``_run_chat_turn``'s
+            ``speaker`` parameter (from ``_resolve_and_enroll_speaker``) on
+            ``/chat``/``/voice``, ``/debug/probe``'s ``speaker_name``; always
+            ``None`` when ``identity_absent``.  Threaded to both doors as
+            ``speaker=`` so the anonymize chain's speaker-name fold applies
+            on this leg exactly as it does on every other serving path.
         speaker_id: Resolved canonical speaker ID, or ``None`` for a
             speakerless turn.  Live production consumer:
-            :func:`~paramem.graph.flows.anonymize_turn` (via
-            ``answer_via_cloud``'s anonymize branch) when ``model``/
-            ``tokenizer`` are live — always ``None`` on this path since
-            ``identity_absent`` is what selects that branch.
+            :func:`~paramem.graph.flows.anonymize_turn` (via the cloud
+            door's anonymize branch) when ``model``/``tokenizer`` are live —
+            a server-wide-cloud-only turn from a resolved speaker carries a
+            real ``speaker_id`` (and a display name alongside it) into the
+            chain too.
         identity_absent: ``True`` when this turn carries no resolved speaker
             at all (``ServingPath.RELAY``) — gates the no-identity
             short-circuit described above.  ``False`` (default) preserves
@@ -16382,60 +16446,62 @@ def _relay_route(
             branch + base-model fallback), or ``None`` in server-wide
             cloud-only mode (no local model exists).
         tokenizer: Paired with *model*; ``None`` under the same condition.
+        ha_graph: The live HA entity graph (``_state["ha_graph"]``), or
+            ``None`` when HA is not configured or its build failed at
+            boot — retains nothing in that case.
+        forced_leg: The probe door's resolved route (``None`` on every
+            production ``/chat``/``/voice`` turn), or ``"ha"``/``"cloud"``
+            to select exactly one leg.  Forcing never bypasses that leg's
+            own policy.
 
     Returns:
-        The answering leg's :class:`~paramem.server.inference.ChatResult`, or
-        the canned limited-mode result when no leg served the turn.
+        The answering leg's :class:`~paramem.server.chat_result.ChatResult`,
+        or the canned limited-mode result when no leg served the turn.
+        Every returned result carries the record of whichever legs this
+        turn reached.
     """
-    is_personal_turn = False
-    if identity_absent:
-        from paramem.server.inference import _is_personal_interrogative
+    from paramem.server.inference import _base_model_answer, _is_personal_interrogative, _leg_open
 
-        is_personal_turn = is_self_referential(
-            text, personal_referent_config=config.personal_referent
-        )
-        if _is_personal_interrogative(text, config, is_personal=is_personal_turn):
-            logger.info("Relay route: no-identity short-circuit (personal interrogative)")
-            return ChatResult(text=config.abstention.load_no_identity_response())
+    turn_diags: dict[str, Any] = {}
 
-    # Try HA conversation agent — it has tools and real-time data
-    # Language passed via HA's native conversation API parameter
-    if ha_client is not None:
-        logger.debug("Relay route: trying HA agent for: %s", text[:100])
-        ha_languages = config.tools.ha.supported_languages
-        response_text = ha_client.conversation_process(
-            text,
-            agent_id=config.ha_agent_id,
-            language=language,
-            supported_languages=ha_languages,
+    is_personal_turn = is_self_referential(text, personal_referent_config=config.personal_referent)
+    if identity_absent and _is_personal_interrogative(text, config, is_personal=is_personal_turn):
+        logger.info("Relay route: no-identity short-circuit (personal interrogative)")
+        return ChatResult(
+            text=config.abstention.load_no_identity_response(), diagnostics=turn_diags
         )
-        if response_text is not None:
-            logger.info("Relay route: HA agent responded")
-            return ChatResult(text=response_text, escalated=True)
-        logger.info("Relay route: HA agent failed, trying cloud")
 
-    # HA failed or unavailable → try cloud for reasoning
-    if cloud_agent is not None and not cloud_permitted:
-        logger.warning(
-            "Relay route: cloud leg closed (degraded serving; "
-            "set cloud.allow_degraded_serving: true to open it)"
-        )
-    elif cloud_agent is not None:
-        logger.info("Relay route: escalating to cloud")
-        result = answer_via_cloud(
-            text,
-            cloud_agent,
-            config,
-            is_personal=is_personal_turn,
-            model=model,
-            tokenizer=tokenizer,
-            speaker_id=speaker_id,
-            history=history,
-            language=language,
-            cloud_permitted=cloud_permitted,
-        )
+    outbound = OutboundText(
+        text,
+        config,
+        diagnostics=turn_diags,
+        history=history,
+        model=model,
+        tokenizer=tokenizer,
+        speaker=speaker,
+        speaker_id=speaker_id,
+        language=language,
+        is_personal=is_personal_turn,
+    )
+
+    # Try the HA door first — it has tools and real-time data.
+    if _leg_open(forced_leg, "ha"):
+        result = answer_via_ha(outbound, ha_client, ha_graph=ha_graph)
+        if result is not None:
+            logger.info("Relay route: HA door responded")
+            result.diagnostics.update(turn_diags)
+            return result
+        logger.info("Relay route: HA door produced nothing, trying cloud door")
+
+    # HA produced nothing or was skipped → try the cloud door for
+    # reasoning.  The door owns the cloud_permitted decision and its
+    # remedy message.
+    if _leg_open(forced_leg, "cloud"):
+        logger.info("Relay route: trying cloud door")
+        result = answer_via_cloud(outbound, cloud_agent, cloud_permitted=cloud_permitted)
         if result is not None and result.text:
-            logger.info("Relay route: cloud responded")
+            logger.info("Relay route: cloud door responded")
+            result.diagnostics.update(turn_diags)
             return result
 
     if model is not None and tokenizer is not None:
@@ -16448,14 +16514,14 @@ def _relay_route(
         # ``cloud_permitted`` gate, which ``_maybe_escalate``'s internal
         # cloud call does not itself receive).
         logger.info("Relay route: HA and cloud unavailable — falling back to local base model")
-        from paramem.server.inference import _base_model_answer
 
-        return _base_model_answer(
+        result = _base_model_answer(
             text,
             None,
             model,
             tokenizer,
             config,
+            diagnostics=turn_diags,
             cloud_agent=None,
             ha_client=None,
             speaker=None,
@@ -16463,6 +16529,8 @@ def _relay_route(
             language=language,
             is_personal=False,
         )
+        result.diagnostics.update(turn_diags)
+        return result
 
     logger.warning("Relay route: all services failed")
     return ChatResult(
@@ -16471,6 +16539,7 @@ def _relay_route(
         # caller has no use for the "limited mode" label.
         text="I can't answer that right now. Please try again shortly.",
         escalated=True,
+        diagnostics=turn_diags,
     )
 
 
@@ -16829,16 +16898,15 @@ def _store_quarantine_verdict() -> "str | None":
     doors, ``POST /speaker/forget``, and ``POST /interim/discard`` — every
     door that reads or writes the live ``MemoryStore``.
 
-    In the arbitrator specifically, this is no longer an unconditional
-    refusal while quarantined: a PENDING event resumes ahead of this check
+    In the arbitrator specifically, refusal while quarantined is
+    conditional: a PENDING event resumes ahead of this check
     (:func:`_dispatch_consolidation`'s docstring, step 3) and — a resume
     needing nothing from the live store — completes and, on going fully
     live, lifts the quarantine itself (the heal at
-    :func:`_finish_resumed_event`'s tail). This function's own verdict is
-    unchanged for every other case: quarantined with nothing pending still
-    defers here exactly as before, and a still-quarantined dispatch (no
-    pending record, or a resume whose lift failed) reaches this check and
-    refuses same as always.
+    :func:`_finish_resumed_event`'s tail). Every other case still defers
+    here: quarantined with nothing pending, and a still-quarantined
+    dispatch (no pending record, or a resume whose lift failed), both
+    refuse.
 
     Deliberately NOT folded into :func:`_consolidation_dispatch_guards` (the
     shared predicate :func:`active_consolidation` wraps): that predicate
@@ -18519,8 +18587,8 @@ def _run_extraction_phase(
     # below.
     pending_relations = loop.take_pending_relations()
 
-    # Staging-only bookkeeping the extraction stage itself no longer
-    # performs: this batch's enrichment signals are this function's own to
+    # Staging-only bookkeeping that lives outside the extraction stage:
+    # this batch's enrichment signals are this function's own to
     # arbitrate, exactly as _extract_and_start_training and the full
     # pre-stage each do right after their own extraction call.
     loop.arbitrate_enrichment_incidents(enrichment_signals)
@@ -18715,7 +18783,15 @@ def _consolidation_run_done(
     ``_run_full_consolidation_sync``, ``_run_active_store_migration_sync``,
     ``_run_calibration_sync``) has either submitted the next phase to the BG
     trainer (whose own terminal will clear the flag) or already called
-    :func:`_consolidation_terminal` itself.
+    :func:`_consolidation_terminal` itself.  On a non-staging action that
+    completed without exception (``spec is not None`` — a calibration run
+    finished cleanly), this callback additionally resolves the
+    ``calibration_crash`` incident for the run's OWN route
+    (``spec.route_path``) — the same per-route key it was recorded under
+    above — mirroring how the interim/full-cycle terminals resolve
+    ``vram_exhausted`` at the next successful fold (:func:`_finalize_interim`,
+    :func:`_finalize_full`): the clear site for a key recorded here lives
+    here too.
 
     On an uncaught exception this callback is the only terminal reached, so
     it records a typed incident, ends the voice eviction
@@ -18796,6 +18872,10 @@ def _consolidation_run_done(
 
         _end_voice_eviction(lock_held=False)
         _consolidation_terminal(terminal_body)
+    elif not action.stages_event and spec is not None:
+        resolve_incident(
+            data_state_dir(_state["config"].paths.data), "calibration_crash", spec.route_path
+        )
 
 
 def _run_stage_b_cycle(
@@ -19104,7 +19184,7 @@ def _finalize_interim(loop, result: dict, *, extraction=None) -> None:
     # populated only when the event went all_live) rather than re-walking
     # the whole adapter tree.  This narrows what an interim fold observes
     # to the interim slot IT touched: a DIFFERENT tier's binding breaking
-    # is no longer caught here -- it stays open until that tier's own next
+    # is not caught here -- it stays open until that tier's own next
     # publish (interim or full) or the next boot check, sound under the
     # single-writer architecture (tier state changes only at publish).
     # Protected: a fault here must not wedge the finalizer.
@@ -19597,8 +19677,8 @@ def _extract_and_start_training():
     session_ids = extraction.session_ids
     failed_session_ids = extraction.failed_session_ids
 
-    # Staging-only bookkeeping the extraction stage itself no longer
-    # performs: this is an INTERIM dispatch, so the batch's own OOM-skip
+    # Staging-only bookkeeping that lives outside the extraction stage:
+    # this is an INTERIM dispatch, so the batch's own OOM-skip
     # records, enrichment incidents, and low-headroom attention row are
     # this run's to adopt.
     _state.setdefault("chunk_failures", []).extend(extraction.chunk_failures)
@@ -20155,8 +20235,8 @@ def _run_full_consolidation_sync(event: "Literal['full', 'reconcile']") -> None:
         if _consume_pending:
             extraction = _extract_pending_sessions(loop, lock_held=True)
 
-            # Staging-only bookkeeping the extraction stage itself no longer
-            # performs: this is a FULL/consume-pending dispatch, so the
+            # Staging-only bookkeeping that lives outside the extraction stage:
+            # this is a FULL/consume-pending dispatch, so the
             # batch's own OOM-skip records, enrichment incidents, and
             # low-headroom attention row are this run's to adopt.
             _state.setdefault("chunk_failures", []).extend(extraction.chunk_failures)

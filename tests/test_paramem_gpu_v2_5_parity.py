@@ -8,10 +8,9 @@ All tests load the ``[consumers.paramem-server]`` section from a copy of the
 example TOML written to ``tmp_path``, so they neither require nor pollute
 ``~/.config/gpu-guard/config.toml``.
 
-The SIGUSR1 path no longer exists in V2.5.  Test 2 (originally titled
-``test_sigusr1_sent_on_release_when_not_cloud_only``) now asserts that the
-HTTP POST to ``/gpu/release`` is sent via ``urllib.request`` (the primitive
-used by the config-driven ``release_http`` releaser).
+Release in V2.5 is an HTTP POST to ``/gpu/release`` sent via
+``urllib.request`` (the primitive used by the config-driven ``release_http``
+releaser), not a SIGUSR1 signal.
 """
 
 from __future__ import annotations

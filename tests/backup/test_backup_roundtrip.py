@@ -111,7 +111,7 @@ class TestWriteReadRoundtripPlain:
 
 
 class TestWriteFsyncsParentDirAfterRename:
-    """Fix #4 — verify os.fsync is called on at least one directory fd after rename."""
+    """Verify os.fsync is called on at least one directory fd after rename."""
 
     def test_write_fsyncs_parent_dir_after_rename(self, tmp_path, monkeypatch):
         """write() calls os.fsync on at least one directory fd after the rename.
@@ -160,7 +160,7 @@ class TestWriteFsyncsParentDirAfterRename:
 
 
 class TestWriteReadRoundtrip:
-    """Fix #1 — read() must raise FingerprintMismatchError for partial slots."""
+    """read() must raise FingerprintMismatchError for partial slots."""
 
     def test_read_refuses_on_missing_artifact(self, tmp_path):
         """Slot with valid sidecar but deleted artifact raises FingerprintMismatchError.
@@ -187,7 +187,7 @@ class TestWriteReadRoundtrip:
 
 
 class TestWriteConcurrency:
-    """Fix #5 — write() retries on timestamp collision and raises after max attempts."""
+    """write() retries on timestamp collision and raises after max attempts."""
 
     def test_write_retries_on_timestamp_collision(self, tmp_path, monkeypatch):
         """Two writes with the same initial timestamp succeed and produce distinct slots.

@@ -26,8 +26,8 @@ One surface form, project-wide: lower-case, blank runs (including ``_``)
 collapsed to a single space, ``-`` preserved verbatim.  This is the identity
 form — the node key, the stored predicate, the SimHash and dedup key.  It IS
 also the display surface for the predicate: :func:`paramem.memory.entry.entry_fact_text`
-renders the predicate as-is (no ``_``→space substitution happens there any
-more, since the identity form already uses spaces).  Matching names against
+renders the predicate as-is (no ``_``→space substitution happens there,
+since the identity form already uses spaces).  Matching names against
 free prose is a separate contract that does not call this function at all.
 
 :func:`canonical` takes a ``mode`` argument selecting between two folds:
@@ -175,9 +175,7 @@ def prose_fold(text: str) -> str:
             fold for case-insensitive comparison.
 
     Returns:
-        ``text.lower()`` — behavior-preserving; identical to what every
-        prose-matching call site already did before routing through this
-        function.
+        ``text.lower()``.
     """
     return text.lower()
 

@@ -1,20 +1,7 @@
 """Tests for the 4 backup CLI subcommands.
 
-Tests cover dispatch, rendering, --json mode, and error handling.
-
-Tests cover:
-44 — backup-list dispatch
-45 — backup-list renders rows
-46 — backup-list --json mode
-47 — backup-list --kind filter passthrough
-48 — backup-create default kinds
-49 — backup-create explicit kinds + label
-50 — backup-create renders slots and skips
-51 — backup-restore happy path
-52 — backup-restore 409 trial → hint
-53 — backup-restore 400 restore_kind_not_supported
-54 — backup-prune default
-55 — backup-prune --dry-run
+Tests cover dispatch, rendering, --json mode, and error handling for
+backup-list, backup-create, backup-restore, and backup-prune.
 """
 
 from __future__ import annotations
@@ -98,7 +85,7 @@ def _args(server_url="http://127.0.0.1:8420", **kwargs):
 
 
 # ---------------------------------------------------------------------------
-# Test 44 — backup-list dispatch
+# backup-list dispatch
 # ---------------------------------------------------------------------------
 
 
@@ -118,7 +105,7 @@ class TestBackupListDispatch:
 
 
 # ---------------------------------------------------------------------------
-# Test 45 — backup-list renders rows
+# backup-list renders rows
 # ---------------------------------------------------------------------------
 
 
@@ -151,7 +138,7 @@ class TestBackupListRendersRows:
 
 
 # ---------------------------------------------------------------------------
-# Test 46 — backup-list --json mode
+# backup-list --json mode
 # ---------------------------------------------------------------------------
 
 
@@ -169,7 +156,7 @@ class TestBackupListJsonMode:
 
 
 # ---------------------------------------------------------------------------
-# Test 47 — backup-list --kind filter passthrough
+# backup-list --kind filter passthrough
 # ---------------------------------------------------------------------------
 
 
@@ -192,7 +179,7 @@ class TestBackupListKindFilterPassthrough:
 
 
 # ---------------------------------------------------------------------------
-# Test 48 — backup-create default kinds
+# backup-create default kinds
 # ---------------------------------------------------------------------------
 
 
@@ -222,7 +209,7 @@ class TestBackupCreateDefaultKinds:
 
 
 # ---------------------------------------------------------------------------
-# Test 49 — backup-create explicit kinds + label
+# backup-create explicit kinds + label
 # ---------------------------------------------------------------------------
 
 
@@ -244,7 +231,7 @@ class TestBackupCreateExplicitKindsLabel:
 
 
 # ---------------------------------------------------------------------------
-# Test 50 — backup-create renders slots and skips
+# backup-create renders slots and skips
 # ---------------------------------------------------------------------------
 
 
@@ -266,7 +253,7 @@ class TestBackupCreateRendersSlotsAndSkips:
 
 
 # ---------------------------------------------------------------------------
-# Test 51 — backup-restore happy path
+# backup-restore happy path
 # ---------------------------------------------------------------------------
 
 
@@ -414,7 +401,7 @@ class TestBackupRestoreNonServingOutcomes:
 
 
 # ---------------------------------------------------------------------------
-# Test 52 — backup-restore 409 trial_active → operator hint
+# backup-restore 409 trial_active → operator hint
 # ---------------------------------------------------------------------------
 
 
@@ -440,7 +427,7 @@ class TestBackupRestore409TrialPrintsHint:
 
 
 # ---------------------------------------------------------------------------
-# Test 53 — backup-restore 400 restore_kind_not_supported
+# backup-restore 400 restore_kind_not_supported
 # ---------------------------------------------------------------------------
 
 
@@ -469,7 +456,7 @@ class TestBackupRestore400KindRejects:
 
 
 # ---------------------------------------------------------------------------
-# Test 54 — backup-prune default
+# backup-prune default
 # ---------------------------------------------------------------------------
 
 
@@ -493,7 +480,7 @@ class TestBackupPruneDefault:
 
 
 # ---------------------------------------------------------------------------
-# Test 55 — backup-prune --dry-run
+# backup-prune --dry-run
 # ---------------------------------------------------------------------------
 
 

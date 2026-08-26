@@ -81,10 +81,9 @@ def bookkeeping_row(
     that contained this fact.  Drives contradiction detection and temporal
     reasoning.  Default ``""`` (unknown).
     ``promoted``: whether this key has already been promoted from episodic
-    to semantic.  Mandatory, no default — the flag replaces the former
-    event-level ``promoted_keys`` array: it sits on the key's own row, so
-    the promotion cannot exist without the registry move it describes
-    having been published with the same tier state.  Every new-key call
+    to semantic.  Mandatory, no default — the flag sits on the key's own
+    row, so the promotion cannot exist without the registry move it
+    describes having been published with the same tier state.  Every new-key call
     site passes ``promoted=False``; the live writer that flips it to
     ``True`` is ``ConsolidationLoop._promote_working_keys`` (via the
     working row it hands to

@@ -7,9 +7,9 @@ Covers:
   scope around the whole dispatch, recording exactly one ``serve_turn``
   phase per call whose ``raw_output``/``parsed`` fields carry the returned
   reply text and diagnostics dict.
-* Every routing branch (personal-probe, HA, cloud, abstention, base model)
-  stamps the handle_chat-level diagnostics keys onto the result, and only
-  the personal-probe leg additionally carries the probe/temporal keys
+* Every routing branch (personal-probe, abstention, base model) stamps the
+  handle_chat-level diagnostics keys onto the result, and only the
+  personal-probe leg additionally carries the probe/temporal keys
   ``_probe_and_reason`` builds.
 * ``is_residual`` is computed unconditionally, not gated on
   ``config.debug``.
@@ -38,8 +38,9 @@ from peft import PeftModel
 
 from paramem.graph.phase_trace import extraction_trace
 from paramem.memory.store import MemoryStore as _MS
+from paramem.server.chat_result import ChatResult
 from paramem.server.config import ServerConfig
-from paramem.server.inference import ChatResult, _probe_and_reason, handle_chat
+from paramem.server.inference import _probe_and_reason, handle_chat
 from paramem.server.router import Intent, RoutingPlan, RoutingStep
 from tests._serving_door import (
     forbid_both_read_doors,
@@ -54,7 +55,6 @@ _HANDLE_CHAT_KEYS = {
     "conversation_id",
     "intent",
     "paths_attempted",
-    "fallthrough_reason",
     "exit_via",
     "is_residual",
     "is_self_referential",
@@ -125,9 +125,8 @@ class TestServeTurnPhaseRecord:
 
 
 class TestIsResidualUnconditional:
-    """``is_residual`` is computed regardless of ``config.debug`` — a
-    regression pin for the fix that moved the computation out of the
-    debug-gated log block."""
+    """``is_residual`` is computed regardless of ``config.debug`` — it must
+    never be gated on the debug-only log block."""
 
     def test_computed_true_with_debug_off_when_plan_has_no_signal(self):
         config = ServerConfig()
@@ -199,62 +198,6 @@ class TestRoutingBranchDiagnostics:
         assert result.diagnostics["probes"] == {"episodic": {"probed": 1, "recalled": 1}}
         assert result.diagnostics["facts_recalled"] == 1
 
-    def test_ha_branch(self):
-        router = MagicMock()
-        router.route.return_value = RoutingPlan(strategy="direct", intent=Intent.GENERAL)
-        ha_client = MagicMock()
-        ha_client.conversation_process.return_value = "HA handled it"
-        config = ServerConfig()
-
-        result = handle_chat(
-            text="turn on the kitchen light",
-            conversation_id="c1",
-            speaker=None,
-            speaker_id="speaker0",
-            history=None,
-            model=MagicMock(),
-            tokenizer=MagicMock(),
-            config=config,
-            router=router,
-            ha_client=ha_client,
-            memory_store=_MS(),
-        )
-
-        assert result.diagnostics["exit_via"] == "general_ha"
-        assert _HANDLE_CHAT_KEYS <= result.diagnostics.keys()
-        assert "probes" not in result.diagnostics
-        assert "temporal" not in result.diagnostics
-        assert "facts_recalled" not in result.diagnostics
-
-    def test_cloud_branch(self):
-        router = MagicMock()
-        router.route.return_value = RoutingPlan(strategy="direct", intent=Intent.GENERAL)
-        config = ServerConfig()
-
-        with patch(
-            "paramem.server.inference.answer_via_cloud",
-            return_value=ChatResult(text="cloud answer", escalated=True),
-        ):
-            result = handle_chat(
-                text="What's the capital of France?",
-                conversation_id="c1",
-                speaker=None,
-                speaker_id="speaker0",
-                history=None,
-                model=MagicMock(),
-                tokenizer=MagicMock(),
-                config=config,
-                router=router,
-                cloud_agent=MagicMock(),
-                memory_store=_MS(),
-            )
-
-        assert result.diagnostics["exit_via"] == "general_cloud"
-        assert _HANDLE_CHAT_KEYS <= result.diagnostics.keys()
-        assert "probes" not in result.diagnostics
-        assert "temporal" not in result.diagnostics
-        assert "facts_recalled" not in result.diagnostics
-
     def test_abstention_branch(self):
         """Mirrors tests/test_abstention.py's proven self-referential +
         no-steps setup: PERSONAL intent with an empty plan.steps takes
@@ -316,6 +259,34 @@ class TestRoutingBranchDiagnostics:
         assert "temporal" not in result.diagnostics
         assert "facts_recalled" not in result.diagnostics
 
+    def test_ha_answered_branch(self):
+        """A GENERAL-intent turn the HA door answers exits via
+        ``"general_ha"`` — the intent label plus the leg that answered,
+        stamped before the door's result is returned."""
+        router = MagicMock()
+        router.route.return_value = RoutingPlan(strategy="direct", intent=Intent.GENERAL)
+        config = ServerConfig()
+
+        with patch(
+            "paramem.server.inference.answer_via_ha",
+            return_value=ChatResult(text="ha answer", escalated=True),
+        ):
+            result = handle_chat(
+                text="Turn on the lights",
+                conversation_id="c1",
+                speaker=None,
+                speaker_id="speaker0",
+                history=None,
+                model=MagicMock(),
+                tokenizer=MagicMock(),
+                config=config,
+                router=router,
+                memory_store=_MS(),
+            )
+
+        assert result.diagnostics["exit_via"] == "general_ha"
+        assert _HANDLE_CHAT_KEYS <= result.diagnostics.keys()
+
 
 class _ProbeAndReasonHelpers:
     """Shared plan/model builders, mirroring
@@ -339,7 +310,7 @@ class _ProbeAndReasonHelpers:
     @staticmethod
     def make_model(adapter_names):
         """``MagicMock(spec=PeftModel)`` -- passes the ``isinstance(model,
-        PeftModel)`` precondition ``base_model_inference`` now enforces
+        PeftModel)`` precondition ``base_model_inference`` enforces
         wherever ``_probe_and_reason``'s reasoning generate reaches it.
         ``gradient_checkpointing_disable``/``_enable`` are dynamic
         ``__getattr__``-delegated attributes a real (wrapped) PeftModel
@@ -392,23 +363,24 @@ class TestProbeAndReasonProbeDiagnostics(_ProbeAndReasonHelpers):
         assert result.diagnostics["facts_recalled"] == 1
         assert result.diagnostics["temporal"] is None
 
-    def test_no_layers_branch_carries_probes_but_not_facts_recalled(self, monkeypatch):
-        """Every probed key fails: the ``not layers`` fallback sets
-        ``probes`` (probing did happen) but never reaches
-        ``facts_recalled`` (no layer was ever assembled)."""
+
+class TestProbeAndReasonNotLayersDiagnostics(_ProbeAndReasonHelpers):
+    """The ``not layers`` branch (every probed key missed) still carries
+    ``probes`` — populated before that branch is even reached — but never
+    reaches ``facts_recalled``, which is only set on the full
+    probe-assembly path below the branch."""
+
+    def test_not_layers_branch_sets_probes_never_facts_recalled(self, monkeypatch):
         probed = stub_live_door_probe(monkeypatch, failing_keys={"e1"})
-        monkeypatch.setattr("paramem.server.inference._escalate_to_ha_agent", lambda *a, **kw: None)
-        monkeypatch.setattr("paramem.server.inference.answer_via_cloud", lambda *a, **kw: None)
         monkeypatch.setattr(
-            "paramem.server.inference._base_model_answer",
-            lambda *a, **kw: ChatResult(text="base fallback"),
+            "paramem.server.inference.generate_answer", lambda *a, **kw: "final answer."
         )
 
         tokenizer = MagicMock()
+        tokenizer.apply_chat_template = lambda msgs, **kwargs: "prompt"
         model = self.make_model(["episodic"])
 
         config = live_door_config()
-        config.abstention.enabled = False
         config.inference.temporal_selection_enabled = False
 
         memory_store = _MS()
@@ -425,12 +397,9 @@ class TestProbeAndReasonProbeDiagnostics(_ProbeAndReasonHelpers):
             memory_store=memory_store,
         )
 
-        # The key was probed and the source failed it — not "nothing was
-        # probed", which reports the same counts.
         assert probed["keys_by_adapter"] == {"episodic": ["e1"]}
         assert result.diagnostics["probes"] == {"episodic": {"probed": 1, "recalled": 0}}
         assert "facts_recalled" not in result.diagnostics
-        assert result.text == "base fallback"
 
 
 class TestProbeAndReasonTemporalDiagnostics(_ProbeAndReasonHelpers):

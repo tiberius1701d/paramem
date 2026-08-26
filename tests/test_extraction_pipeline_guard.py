@@ -23,7 +23,11 @@ import pytest
 from paramem.config.taxonomy import resolve_scrub_categories
 from paramem.memory.store import MemoryStore as _MS
 from paramem.utils.artifacts import on_session_extracted
-from tests._guard_utils import enters_context_manager, tracked_python_files
+from tests._guard_utils import (
+    enclosing_function_name,
+    enters_context_manager,
+    tracked_python_files,
+)
 
 # Files allowed to call the extractors directly:
 # - extractor.py: the module defining extract_procedural_graph.
@@ -739,13 +743,10 @@ def test_run_uses_default_prompts_for_document(monkeypatch):
     must still use ``DEFAULT_SYSTEM_PROMPT_FILENAME`` and
     ``DEFAULT_USER_PROMPT_FILENAME``.
 
-    The two-prompt design (separate document-variant files) was retired
-    after it produced silent drift on schema-shape rules.  One prompt-pair
-    is the single ground truth for every source type; document chunks land
-    in the same ``{transcript}`` slot at the chat-template layer.
-
-    Regression guard: if any future edit re-introduces a source-type-driven
-    prompt-file fork, this test fails before drift can re-emerge.
+    One prompt-pair is the single ground truth for every source type;
+    document chunks land in the same ``{transcript}`` slot at the
+    chat-template layer, so a source-type-driven prompt-file fork never
+    re-emerges.
     """
     from paramem.graph.extractor import (
         DEFAULT_SYSTEM_PROMPT_FILENAME,
@@ -1015,7 +1016,7 @@ def test_consolidation_dumps_per_session_graph_with_diagnostics(monkeypatch, tmp
     )
 
     loop = _build_loop_with_session_dump(tmp_path, monkeypatch, fake_graph=fake_graph)
-    # 2026-05-15 layout: dumps land under
+    # Dump layout: dumps land under
     # paths.debug/episodic/[interim_<stamp>/]cycle_<N>/run_<run_id>/sessions/<id>/.
     snapshot_root = loop.snapshot_dir_for()
     assert snapshot_root is not None
@@ -1222,23 +1223,6 @@ def test_background_trainer_single_constructor_literal_in_app():
     # _build_bg_trainer.
     hits: list[tuple[int, str, str | None]] = []  # (lineno, source, enclosing_fn)
 
-    # Build a mapping: lineno → enclosing function name (nearest FunctionDef ancestor).
-    fn_ranges: list[tuple[int, int, str]] = []  # (start, end, name)
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            # end_lineno is available for Python 3.8+ AST nodes.
-            end = getattr(node, "end_lineno", node.lineno)
-            fn_ranges.append((node.lineno, end, node.name))
-
-    def _enclosing_fn(lineno: int) -> str | None:
-        # Find the innermost function whose range contains lineno.
-        best: tuple[int, str] | None = None
-        for start, end, name in fn_ranges:
-            if start <= lineno <= end:
-                if best is None or start > best[0]:
-                    best = (start, name)
-        return best[1] if best else None
-
     for node in ast.walk(tree):
         if (
             isinstance(node, ast.Call)
@@ -1246,7 +1230,7 @@ def test_background_trainer_single_constructor_literal_in_app():
             and node.func.id == "BackgroundTrainer"
         ):
             line = lines[node.lineno - 1] if 0 < node.lineno <= len(lines) else ""
-            hits.append((node.lineno, line.strip(), _enclosing_fn(node.lineno)))
+            hits.append((node.lineno, line.strip(), enclosing_function_name(tree, node.lineno)))
 
     assert len(hits) == 1, (
         f"Expected EXACTLY ONE BackgroundTrainer(...) constructor literal in "
@@ -1586,12 +1570,10 @@ def test_handle_chat_enters_grad_checkpointing_disabled():
     """``handle_chat`` (paramem/server/inference.py) must restore gradient
     checkpointing on every exit.
 
-    ``handle_chat`` used to call ``model.gradient_checkpointing_disable()``
-    unconditionally at its top with no restore — a leak that left the KV
-    cache silently disabled for every subsequent ``generate()`` in a session
-    where checkpointing was on at entry. The fix wraps the routing body in
-    ``grad_checkpointing_disabled(model)`` so entry state is always restored,
-    on every one of the function's return paths.
+    The routing body runs inside ``grad_checkpointing_disabled(model)``, so
+    entry state is always restored on every one of the function's return
+    paths — never leaving the KV cache silently disabled for a subsequent
+    ``generate()`` in a session where checkpointing was on at entry.
     """
     target = _find_function("paramem/server/inference.py", "handle_chat")
     assert _enters_grad_checkpointing_disabled(target), (

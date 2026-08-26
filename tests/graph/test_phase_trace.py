@@ -208,7 +208,7 @@ class TestRecordPrompt:
     """record_prompt appends the loader's own resolution to the active
     phase scope. See paramem/graph/prompts.py::_load_prompt for the
     caller and tests/test_prompts_contract.py::TestLoadPromptPhaseTraceRecording
-    for the end-to-end regression pin against the real prompt loader."""
+    for the end-to-end pin against the real prompt loader."""
 
     def test_record_prompt_appends_to_active_scope(self):
         graph = _empty_graph()
@@ -298,7 +298,7 @@ class TestActiveScopeResetDiscipline:
     silently dropping any prompt the outer phase records afterward (or,
     with a different bug shape, cross-attributing it to the wrong
     phase). Nothing else in this test file would notice; these tests
-    exist specifically to catch that class of regression.
+    pin the reset discipline directly.
     """
 
     def test_exception_leaves_active_scope_restored_not_leaked(self):
@@ -459,8 +459,7 @@ class TestExtractGraphStopPhase:
                 pass
 
     def test_stop_phase_local_extract_returns_populated_graph_not_empty_stub(self, monkeypatch):
-        """Regression pin (one of two named in the flag-vs-exception design
-        review): an exception/sentinel-based stop would raise from INSIDE
+        """An exception/sentinel-based stop would raise from INSIDE
         ``_run_local_extraction``'s own ``phase_trace`` scope, before its
         ``return graph`` (after the ``with phase_trace(...)`` block)
         executes — leaving ``extract_graph``'s ``graph`` bound to the EMPTY
@@ -501,8 +500,8 @@ class TestExtractGraphStopPhase:
         assert graph.relations[0].object == "Berlin"
 
     def test_stop_phase_second_order_extract_retains_union(self, monkeypatch):
-        """Regression pin (the second of the two): an exception/sentinel-
-        based stop would raise from inside the second-order pass's own
+        """An exception/sentinel-based stop would raise from inside the
+        second-order pass's own
         nested ``phase_trace`` scope, skipping the
         ``graph.relations.extend(second_order_graph.relations)`` /
         ``.entities.extend(...)`` calls that sit BETWEEN the second-order

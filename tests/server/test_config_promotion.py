@@ -59,9 +59,10 @@ _VALID_CANDIDATE = b"model: mistral\ndebug: true\n"
 
 class TestBuildServerConfigIsBoot:
     def test_build_from_parsed_equals_load_from_path(self):
-        """Boot is unchanged by the split: same file → identical config both ways.
+        """Same file → identical config whether loaded via
+        ``load_server_config`` or built directly via ``build_server_config``.
 
-        ``load_server_config`` now delegates construction to ``build_server_config``;
+        ``load_server_config`` delegates construction to ``build_server_config``;
         this pins that the delegation is behaviour-preserving on the production-shaped
         fixture (adapters, retention tiers, agents, voice — the whole surface).
         """

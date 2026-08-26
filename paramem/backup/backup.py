@@ -839,7 +839,7 @@ def write_bundle(
     """
     # Import find_live_slot inside the function to avoid a potential import cycle:
     # manifest.py imports from paramem.backup.encryption (not backup.py), so there
-    # is no actual cycle today.  The local import is kept as a guard — the comment
+    # is no actual cycle.  The local import is kept as a guard — the comment
     # documents the intent so future refactors don't move the import without review.
     from paramem.adapters.manifest import find_live_slot, tier_registry_sha256
 
@@ -928,8 +928,7 @@ def write_bundle(
         ``MemoryStore.load_registries_from_disk``, which reads a tier's
         ``indexed_key_registry.json`` at the tier root regardless of venue:
         ``indexed_key_registry.json`` (fingerprints live inside its
-        ``"simhash"`` map; ``simhash_registry.json`` no longer exists) and
-        ``key_metadata.json``.
+        ``"simhash"`` map) and ``key_metadata.json``.
 
         Parameters
         ----------
@@ -1030,9 +1029,8 @@ def write_bundle(
                     bundle_key, known, "bundle capture: key_metadata.json missing"
                 )
 
-        # simhash_registry.json has been eliminated; simhashes now live in
-        # indexed_key_registry.json under the "simhash" key.  No separate
-        # simhash file to capture.
+        # Simhashes live in indexed_key_registry.json under the "simhash"
+        # key — there is no separate simhash file to capture.
 
         adapters_record[bundle_key] = {
             "slot_source": str(slot_path) if slot_path is not None else "",
@@ -1052,8 +1050,7 @@ def write_bundle(
             # Venue-blind wording: a torn tier is exactly as torn whether its
             # unbound payload is adapter weights (train) or a graph.json
             # (simulate) — "adapter weights" would be false for a simulate
-            # tier. The incident type stays _WEIGHTLESS_CAPTURE_INCIDENT_TYPE
-            # (an unrelated rename, not part of this wording fix).
+            # tier.
             logger.warning(
                 "write_bundle: %s captured WITHOUT a bound payload (%s) — on-disk "
                 "written payload(s) exist under %s but none match the live registry",
@@ -1441,7 +1438,7 @@ def restore_bundle(
         the bundle's adapters.  Removes orphan main tiers (whole tier absent
         from bundle), orphan interim families, orphan donor stores, stale
         slot dirs inside kept tiers and kept donor stores, stale registries
-        in episodic-as-interim tiers, and legacy top-level entries.  Orphan
+        in episodic-as-interim tiers, and unrecognised top-level entries.  Orphan
         adapter removals are recorded in ``RestoreResult.pruned_orphans``
         (``kind`` is ``"main"``, ``"interim"`` or ``"donor"``); within-store
         stale-slot cleanup is logged at INFO/DEBUG.
@@ -1624,8 +1621,8 @@ def restore_bundle(
     #
     # restored_main_slots: tier name → new slot dir, or None when this tier
     #     carried no bound slot at all (a torn/weightless capture — venue-
-    #     blind, since both train and simulate payloads are SLOT_DURABLE_FILES
-    #     now).
+    #     blind, since both train and simulate payloads are members of
+    #     SLOT_DURABLE_FILES).
     # restored_interim_slots: interim adapter name → (interim_family_dir, new_slot_dir | None).
     # restored_tier_names: every adapter name step 5a actually wrote
     #     SOMETHING for (slot, tier-root files, or both) — the widened
@@ -1873,10 +1870,10 @@ def restore_bundle(
                             # only its new slot dir (when one exists) and the
                             # freshly-written tier-root files (registry,
                             # key_metadata); remove everything else (stale
-                            # slots — including any legacy tier-root
-                            # graph.json, which is stale debris now that
-                            # graph.json lives inside a slot — scratch, stale
-                            # tier-root files).
+                            # slots — including any tier-root graph.json,
+                            # which is stale debris since graph.json belongs
+                            # inside a slot, never at the tier root — scratch,
+                            # stale tier-root files).
                             _islot_for_fam = next(
                                 slot
                                 for (_ifam2, slot) in restored_interim_slots.values()
@@ -1910,9 +1907,9 @@ def restore_bundle(
                         # Orphan interim family: in the tier dir but not in the bundle.
                         if child.name.startswith("interim_") and child.is_dir():
                             # Derive the adapter name for this interim family using
-                            # the current tier name — interims only exist under episodic/
-                            # today, but deriving from tier makes this robust if a future
-                            # tier hosts interim families.
+                            # the current tier name — interim families exist only under
+                            # episodic/, but deriving the name from tier keeps this
+                            # correct for any tier that hosts interim families.
                             _orphan_stamp = child.name[len("interim_") :]
                             _orphan_iname = f"{tier}_interim_{_orphan_stamp}"
                             active_keys = _count_active_keys(child / "indexed_key_registry.json")
@@ -1943,9 +1940,9 @@ def restore_bundle(
                         # episodic content of its own), stale tier-level files
                         # must be removed — otherwise a stale registry would
                         # be mounted as a stale main-episodic at boot. A
-                        # legacy tier-root graph.json (pre-unification debris
-                        # — graph.json lives inside a slot now) is NOT in
-                        # TIER_ROOT_FILES_ORDERED, so it falls through to the
+                        # tier-root graph.json (stale debris — graph.json
+                        # belongs inside a slot, never at the tier root) is
+                        # NOT in TIER_ROOT_FILES_ORDERED, so it falls through to the
                         # stale-tier-child branch below and is swept
                         # regardless of keep_main.
                         if child.name in TIER_ROOT_FILES_ORDERED and not child.is_dir():
@@ -2021,9 +2018,10 @@ def restore_bundle(
                 else:
                     # Top-level entry under adapters/ that is not a recognised
                     # adapter store.
-                    # This covers legacy flat episodic_interim_* dirs (pre-hierarchy-refactor
-                    # layout) and stray files.  Remove unconditionally — the bundle never
-                    # captures these paths and they must not be mounted at boot.
+                    # This covers flat episodic_interim_* dirs directly under adapters/
+                    # (a layout distinct from the nested episodic/interim_*/ layout) and
+                    # stray files.  Remove unconditionally — the bundle never captures
+                    # these paths and they must not be mounted at boot.
                     #
                     # Exception: durable infra files at the adapters root
                     # (see infra_paths()) are NOT captured by the step-4 safety
@@ -2033,7 +2031,7 @@ def restore_bundle(
                         continue
                     if top_entry.is_dir():
                         logger.info(
-                            "restore_bundle: removing legacy/stray top-level entry adapters/%s",
+                            "restore_bundle: removing unrecognised top-level entry adapters/%s",
                             top_entry.name,
                         )
                         shutil.rmtree(top_entry)

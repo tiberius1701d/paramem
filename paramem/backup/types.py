@@ -89,8 +89,8 @@ class ArtifactMeta:
     content_sha256 : str
         Hex digest of the raw bytes *as written to disk* — ciphertext when
         ``encrypted=True``, plaintext otherwise.  Whitespace and key-order
-        changes in the source data are visible as hash changes (Resolved
-        no YAML canonicalization applied).
+        changes in the source data are visible as hash changes — no YAML
+        canonicalization is applied.
     size_bytes : int
         Byte count of the artifact file on disk (after encryption if applied).
     encrypted : bool
@@ -115,13 +115,16 @@ class ArtifactMeta:
     tier: str
     label: str | None = None
     pre_trial_hash: str | None = None
-    """SHA-256 of the live config at the moment /migration/confirm ran step 2.
+    """SHA-256 of the live config at the moment /migration/confirm captures
+    the pre-migration backup.
 
     Written into every pre-migration backup's sidecar by the confirm handler.
-    Used by crash recovery (case 3/4) to correlate an orphan backup with the
-    live config hash.  Optional (default None) — absent in all non-migration
-    backups; adding it is non-breaking per the schema-version contract (see
-    module docstring).
+    Crash recovery matches this hash against the live config hash: a match
+    identifies an orphan backup left by a crash between writing the backup
+    and completing the migration marker, safe to sweep; a mismatch is
+    ambiguous and is left for operator review.  Optional (default None) —
+    absent in all non-migration backups; adding it is non-breaking per the
+    schema-version contract (see module docstring).
     """
 
 

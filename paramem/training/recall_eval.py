@@ -9,11 +9,10 @@ Public API
 :func:`probe_entries` — batched multi-key probe.  Left-pads ``batch_size``
     prompts, generates them in one :meth:`model.generate` call, and pipes
     each decoded suffix through
-    :func:`paramem.memory.entry.finalize_recalled`.  Empirically
-    validated at 137/137 exact-match parity vs the serial path across
-    b ∈ {1, 2, 4, 8, 16, 32, 64, 128} on Mistral 7B nf4; b=16 is the
-    production default (~4.75× per-probe speedup, ~346 MiB peak VRAM delta
-    on RTX 5070 8 GB).
+    :func:`paramem.memory.entry.finalize_recalled`.  Batching preserves
+    exact-match parity with the serial (``batch_size=1``) path; b=16 is
+    the production default (~4.75× per-probe speedup, ~346 MiB peak VRAM
+    delta on RTX 5070 8 GB).
 
 :func:`evaluate_indexed_recall` — full-set recall evaluator.  Used as the
     ``eval_fn`` for
@@ -107,8 +106,8 @@ def evaluate_indexed_recall(
 
     Always delegates to :func:`probe_entries` for all batch sizes.
     ``probe_entries`` handles ``batch_size=1`` correctly as single-prompt
-    chunks — byte-identical parity confirmed at 137/137 across all batch
-    sizes on Mistral 7B nf4 (see module docstring).
+    chunks, producing byte-identical results regardless of batch size
+    (see module docstring).
 
     Args:
         model: A :class:`PeftModel` instance with the target adapter mounted.
@@ -122,7 +121,7 @@ def evaluate_indexed_recall(
         batch_size: Number of prompts to generate per :meth:`model.generate`
             call.  ``1`` produces one prompt at a time; ``16`` (production
             default) is ~4.75× faster at ~346 MiB peak VRAM delta on RTX
-            5070 8 GB. See module docstring for the empirical curve.
+            5070 8 GB. See module docstring.
 
     Returns:
         Dict with ``exact_count``, ``total``, ``rate``, ``mean_confidence``,

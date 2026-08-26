@@ -52,8 +52,8 @@ class TestRouterReadsFromLoopCache:
     def test_router_indexes_from_loop_cache(self, tmp_path):
         """Router picks up keys from the injected MemoryStore.
 
-        The router no longer reads quads.json files. Keys are indexed
-        from the lifespan-owned MemoryStore at reload() time.
+        Keys are indexed from the lifespan-owned MemoryStore at reload()
+        time, not from quads.json files.
         """
         adapter_dir = tmp_path / "adapters"
         adapter_dir.mkdir(parents=True)
@@ -135,9 +135,8 @@ class TestRouterReadsFromLoopCache:
 class TestReadSimhashRegistryPerTierPaths:
     """read_simhash_registry_from_disk reads per-tier indexed_key_registry.json files.
 
-    After the SimHash unification refactor, fingerprints live in the ``"simhash"``
-    key of each tier's ``indexed_key_registry.json`` rather than in a separate
-    ``simhash_registry.json`` sidecar.  The reader merges the ``"simhash"`` maps
+    Fingerprints live in the ``"simhash"`` key of each tier's
+    ``indexed_key_registry.json``.  The reader merges the ``"simhash"`` maps
     from all tiers and interim slots.
     """
 
@@ -167,7 +166,7 @@ class TestReadSimhashRegistryPerTierPaths:
         """Interim adapter registry files are merged in addition to main tiers."""
         adapter_dir = tmp_path / "adapters"
         self._write_registry(adapter_dir / "episodic" / "indexed_key_registry.json", {"graph1": 1})
-        # 2026-05-14 hierarchy: interim slots live under episodic/interim_<stamp>/.
+        # Interim slots live under episodic/interim_<stamp>/.
         self._write_registry(
             adapter_dir / "episodic" / "interim_20260501T1200" / "indexed_key_registry.json",
             {"graph5": 5},
@@ -207,8 +206,8 @@ class TestReadSimhashRegistryPerTierPaths:
     def test_old_simhash_sidecar_not_picked_up(self, tmp_path):
         """Legacy simhash_registry.json sidecars at tier subdirs are NOT read.
 
-        Fingerprints now live in indexed_key_registry.json.  A stale
-        simhash_registry.json must not be picked up by the new reader.
+        Fingerprints live in indexed_key_registry.json.  A stale
+        simhash_registry.json must not be picked up.
         """
         adapter_dir = tmp_path / "adapters"
         (adapter_dir / "episodic").mkdir(parents=True)

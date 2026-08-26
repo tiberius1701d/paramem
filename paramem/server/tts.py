@@ -148,8 +148,7 @@ class PiperTTSEngine(TTSEngine):
             raise RuntimeError("Piper model not loaded")
 
         # piper-tts 1.4: synthesize() yields one AudioChunk per sentence, each
-        # carrying raw int16 PCM bytes and the sample rate (replaces the removed
-        # synthesize_stream_raw()).
+        # carrying raw int16 PCM bytes and the sample rate.
         sample_rate = self._voice.config.sample_rate
         chunks = []
         for chunk in self._voice.synthesize(text):

@@ -150,7 +150,7 @@ def envelope_encrypt_bytes(plaintext: bytes) -> bytes:
     3. **Plaintext** — no key material configured at all; caller should
        gate on this case explicitly if they require encryption.
 
-    New contract: no key configured → plaintext, unchanged AUTO opt-out.
+    Contract: no key configured → plaintext (the AUTO opt-out).
     A key that IS configured but cannot be unwrapped (wrong passphrase,
     corrupt or tampered envelope, key file vanished after the
     availability check) raises instead of degrading to plaintext — an
@@ -351,7 +351,7 @@ def _tier_slot_paths(tier_root: Path) -> list[Path]:
     :data:`_TIER_SLOT_FILENAMES` listed unconditionally at the tier root
     (``indexed_key_registry.json`` and ``key_metadata.json`` live there in
     either venue; ``graph.json`` never does — it lives inside a timestamped
-    slot now, same as a train payload) plus a recursive ``rglob`` for all
+    slot, same as a train payload) plus a recursive ``rglob`` for all
     three filenames — this is what actually finds ``graph.json`` and any
     other nested match, wherever it lives: inside a main-tier timestamped
     slot, inside an ``interim_<stamp>/`` family's own timestamped slot, or
@@ -501,12 +501,11 @@ def infra_paths(data_dir: Path) -> list[Path]:
     # written by publish_tier_registry on the fold path, in both simulate
     # and train modes (commit_tier_slot writes the same pair only on the
     # base-swap migration and trial-tree main-tier copy paths). graph.json
-    # is a SLOT payload now, written inside a timestamped slot under either
+    # is a SLOT payload, written inside a timestamped slot under either
     # root exactly like adapter_model.safetensors is for a train payload —
     # never at the tier root — which is why _tier_slot_paths' rglob (not a
-    # flat tier-root join) is what actually finds it. simhash_registry.json
-    # has been eliminated; simhashes now live inside indexed_key_registry.json
-    # under the "simhash" key.
+    # flat tier-root join) is what actually finds it. Simhashes live inside
+    # indexed_key_registry.json under the "simhash" key.
     adapters_root = data_dir / "adapters"
     for _tier in ("episodic", "semantic", "procedural"):
         paths.extend(_tier_slot_paths(adapters_root / _tier))
@@ -517,8 +516,8 @@ def infra_paths(data_dir: Path) -> list[Path]:
     # fold writes interim slots the same way the live tree does
     # (episodic/interim_<stamp>/) — via write_tier_slot / publish_tier_registry,
     # not commit_tier_slot — so the same per-tier walk
-    # (:func:`_tier_slot_paths`) applies unchanged — a rotation never leaves
-    # a trial-tree interim file permanently undecryptable.
+    # (:func:`_tier_slot_paths`) applies without special-casing — a rotation
+    # never leaves a trial-tree interim file permanently undecryptable.
     trial_adapters_root = data_state_dir(data_dir) / "trial" / "adapters"
     for _tier in ("episodic", "semantic", "procedural"):
         paths.extend(_tier_slot_paths(trial_adapters_root / _tier))

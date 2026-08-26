@@ -36,7 +36,7 @@ from paramem.server.migration import initial_migration_state
 # Fixtures
 # ---------------------------------------------------------------------------
 
-# Both YAMLs must be constructible configs: /migration/preview now builds the
+# Both YAMLs must be constructible configs: /migration/preview builds the
 # candidate (as if it already sat at the live path) and rejects one that cannot
 # boot.  An enabled adapter tier that omits target_modules is exactly such a
 # candidate — see the loader guard in paramem/server/config.py.

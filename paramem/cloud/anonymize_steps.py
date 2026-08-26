@@ -487,7 +487,7 @@ def ask_speaker_anchor(
     # unescaped ``values_set`` below (never re-parsed through JSON), so
     # the model-facing rendering and the check must use the same
     # characters. See `paramem.cloud.anonymize._assemble_payload`'s
-    # `TagPayload.tag_text` docstring for the sibling defect this mirrors.
+    # `TagPayload.tag_text` docstring for the same encoding hazard.
     user_prompt = section.format(
         speaker_id=speaker_id, values=json.dumps(list(values), ensure_ascii=False), text=text
     )

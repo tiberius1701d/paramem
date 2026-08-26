@@ -55,9 +55,9 @@ class TestRenderServiceUnit:
 
 
 # ---------------------------------------------------------------------------
-# render_timer_unit — backup timer renders through the shared
-# systemd_timer.render_timer_unit; paramem.backup.timer no longer carries
-# its own copy (dedup — see paramem/backup/timer.py module docstring).
+# render_timer_unit — the backup timer renders through the shared
+# systemd_timer.render_timer_unit (see paramem/backup/timer.py module
+# docstring).
 # ---------------------------------------------------------------------------
 
 
@@ -71,10 +71,9 @@ class TestRenderTimerUnit:
         assert "Persistent=true" in content
 
     def test_render_timer_unit_heartbeat_for_non_exact_cadence(self):
-        """A non-calendar-exact backup cadence ('every 5h') still renders as
-        OnCalendar + Persistent=true — there is no monotonic fallback left
-        (suspend/power-off catch-up gate rework). The durable last-attempt
-        stamp in backup.json decides which heartbeat wakeups actually run.
+        """A non-calendar-exact backup cadence ('every 5h') renders as
+        OnCalendar + Persistent=true. The durable last-attempt stamp in
+        backup.json decides which heartbeat wakeups actually run.
         """
         spec = backup_timer.parse_schedule("every 5h")
         assert spec is not None
@@ -188,22 +187,11 @@ class TestReconcileWritesUnits:
 
 
 # ---------------------------------------------------------------------------
-# compute_schedule_period_seconds — replaces the deleted
-# _backup_timer_interval_seconds (the third grammar copy; see
-# paramem/backup/timer.py module docstring). The VALUES below are unchanged
-# from the pre-dedup _backup_timer_interval_seconds table for every non-off
-# schedule.
-#
-# NOTE — one value is NOT preserved: _backup_timer_interval_seconds returned
-# 0 for "off"/"" (a non-raising convenience for the two /status stale-check
-# call sites); compute_schedule_period_seconds returns None for the same
-# inputs (its established, pre-existing contract — see
-# schedule_grammar.compute_schedule_period_seconds). The call sites
-# (app.py, attention.py) now guard on parse_schedule_atom(...) is None /
-# check for None explicitly rather than relying on a 0 sentinel — see the
-# TRAP note in the catch-up-gate spec. Flagged per spec instruction ("If any
-# expected value must change, STOP and report") rather than silently
-# absorbed.
+# compute_schedule_period_seconds (see paramem/backup/timer.py module
+# docstring) is the one grammar implementation the backup timer converts a
+# schedule string through. It returns a period in seconds for every
+# calendar/interval schedule, and None for "off"/"" (no period); callers
+# (app.py, attention.py) check for None explicitly.
 # ---------------------------------------------------------------------------
 
 
@@ -231,11 +219,11 @@ class TestComputeSchedulePeriodSecondsBackupValues:
         assert compute_schedule_period_seconds("weekly") == 604800
 
     def test_interval_seconds_for_off(self):
-        """'off' → None (value CHANGED from the pre-dedup 0 — see class docstring)."""
+        """'off' → None (no period)."""
         assert compute_schedule_period_seconds("off") is None
 
     def test_interval_seconds_for_empty(self):
-        """'' → None (value CHANGED from the pre-dedup 0 — see class docstring)."""
+        """'' → None (no period)."""
         assert compute_schedule_period_seconds("") is None
 
     def test_interval_seconds_for_every_30m(self):

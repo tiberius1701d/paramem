@@ -42,7 +42,7 @@ Bypasses all prompts.  Emits the raw ``PreviewResponse`` JSON with
 
 404 fallback
 ------------
-Evergreen version-alignment message; no slice labels.
+Evergreen version-alignment message.
 """
 
 from __future__ import annotations

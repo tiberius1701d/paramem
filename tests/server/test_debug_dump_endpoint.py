@@ -182,11 +182,10 @@ class TestDebugDumpHappyPath:
         """speaker_id and relation_type in the dump row come from bookkeeping_for_key,
         not from the entry payload.
 
-        This is the B3c regression guard: the entry payload may carry stale
-        bookkeeping-shaped fields (store.py:53-58), so the handler must
-        overlay the authoritative _bookkeeping values — read directly, with
-        no ``None``-tolerant default, since the every-known-key-has-a-row
-        invariant guarantees a row exists.
+        The entry payload may carry stale bookkeeping-shaped fields, so the
+        handler must overlay the authoritative _bookkeeping values — read
+        directly, with no ``None``-tolerant default, since the
+        every-known-key-has-a-row invariant guarantees a row exists.
         """
         items = [
             (

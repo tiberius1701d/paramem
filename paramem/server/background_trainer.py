@@ -75,9 +75,7 @@ class BackgroundTrainer:
     """Manages background training that aborts for inference requests.
 
     Production training goes through ``submit()`` / ``submit_and_wait()``,
-    which enqueue callables to a single persistent worker thread.  The
-    ``start_jobs`` / ``_run_jobs`` pattern was dead code (no production
-    callers) and has been removed.
+    which enqueue callables to a single persistent worker thread.
 
     Usage:
         bt = BackgroundTrainer(model, tokenizer, config)
@@ -227,8 +225,7 @@ class BackgroundTrainer:
 
         Equivalent to :meth:`submit` followed by a :class:`threading.Event`
         wait.  This is the single canonical pattern for callers that need
-        synchronous completion semantics — it replaces the inline Event-wait
-        boilerplate that previously appeared in both
+        synchronous completion semantics, used by
         :func:`paramem.server.app._await_bg_cycle` and
         :meth:`paramem.training.consolidation.ConsolidationLoop.train_adapters`.
 
@@ -266,12 +263,11 @@ class BackgroundTrainer:
         process lifetime (persistent daemon thread).  Blocks on
         ``_job_queue.get()`` between jobs so no jobs are ever stranded.
 
-        The previous implementation used ``get_nowait()`` and exited when the
-        queue was empty.  That introduced a race: a concurrent ``submit()``
-        could see ``is_alive() == True`` (thread not yet terminated) and skip
-        starting a new worker, leaving the new job in the queue forever.
-        The persistent-worker design eliminates the race entirely — there is
-        always exactly one worker thread alive after the first submit.
+        The persistent-worker design eliminates the race where a concurrent
+        ``submit()`` sees ``is_alive() == True`` (thread not yet terminated),
+        skips starting a new worker, and leaves the new job in the queue
+        forever — there is always exactly one worker thread alive after the
+        first submit.
 
         Each job runs under ``gpu_lock_sync()`` to prevent concurrent GPU
         access from consolidation training or inference.  A sentinel
@@ -315,7 +311,7 @@ class BackgroundTrainer:
             # prior inference-abort or graceful-shutdown path.  For the
             # singleton reuse case that flag means "abort THIS job" — reset it
             # here so a stale flag from a previous job does not poison the
-            # current one.  (SIGTERM now initiates graceful shutdown, so this
+            # current one.  (SIGTERM initiates graceful shutdown, so this
             # reset may run if a new job starts before the _WORKER_STOP
             # sentinel is processed.)
             self._shutdown_requested = False
@@ -376,8 +372,7 @@ class BackgroundTrainer:
         """Construct TrainingHooks whose shutdown predicate ORs all signals.
 
         The returned predicate returns True when ANY of these is true:
-        - ``_shutdown_requested`` (set by direct attribute write or the former
-          ``stop()`` callers, now replaced with direct flag assignment)
+        - ``_shutdown_requested`` (set by direct attribute write)
         - ``base_shutdown_predicate()`` (caller's own gate, e.g. consolidation
           ``shutdown_requested``)
         - the per-job abort event (set by ``abort_for_inference()``)
@@ -419,7 +414,7 @@ class BackgroundTrainer:
         """Stop the worker and drop base-model references so the model can be freed.
 
         Called by :func:`paramem.server.app._release_base_model_in_process`.
-        Breaks the worker cycle (via :meth:`_stop_callable_worker`, which now
+        Breaks the worker cycle (via :meth:`_stop_callable_worker`, which
         nulls ``_worker_thread`` after joining) and then nulls
         ``model``/``tokenizer``/``_current_job`` so no live attribute on this
         object retains a reference to the base model.

@@ -15,14 +15,13 @@ substitution primitive that already produces the anonymized facts
 (:func:`~paramem.cloud.placeholders._substitute_whole_words`) — there is
 no model-authored rewrite to verify.
 
-Interface narrowing (2026-07-21): :func:`anonymize` takes
-``facts: list[dict]`` — never a ``SessionGraph`` or ``Relation``.  A
-``SessionGraph`` was a CARRIER on this boundary, not an artifact: the
-pre-narrowing ``anonymize_for_cloud(graph, ...)`` touched ``graph`` only to
-(a) render ``graph.relations`` into the prompt's fact payload and (b)
-harvest subject/object surfaces for the identity-reconciliation guard —
-both are plain projections of ``Iterable[Relation]`` a caller can render
-once, caller-side, in ``paramem/graph/``.
+:func:`anonymize` takes ``facts: list[dict]`` — never a ``SessionGraph`` or
+``Relation``.  A ``SessionGraph`` is a CARRIER on this boundary, not an
+artifact: everything this module needs from a graph — the fact payload
+rendered from ``graph.relations``, and the subject/object surfaces the
+identity-reconciliation guard harvests — is a plain projection of
+``Iterable[Relation]`` a caller renders once, caller-side, in
+``paramem/graph/``.
 
 Likewise this module never loads its own prompt file: this package must
 import nothing from ``paramem.graph``, and the prompt-loading + calibration-override +
@@ -44,23 +43,24 @@ depends on ``paramem.cloud``, never the reverse) — this module does not,
 and must not, import ``paramem.graph.anonymizer_prompts`` or anything else
 under ``paramem.graph``.
 
-There is no fact-boundary slicing and no per-category local call: the
-payload partition now lives in the tagger, in the model's own splitter/
-subword units (:mod:`paramem.cloud.span_tagger`), and the only
-envelope-bearing local call left is the ANCHOR, whose input is the
+The payload partition lives in the tagger, in the model's own splitter/
+subword units (:mod:`paramem.cloud.span_tagger`) — there is no
+fact-boundary slicing and no per-category local call. The only
+envelope-bearing local call is the ANCHOR, whose input is the
 history-plus-transcript evidence region, never the fact block. A single
 :func:`anonymize` call therefore costs at most one local ``generate()``
 call, not one per configured category.
 
-Dynamic VRAM clamp (owner-approved 2026-07-28, live-fold evidence: a
-packer-correct 8,192-token call still faulted "device not ready" at 1,191
-MiB free): the configured ``token_envelope`` is the operator CEILING, not
-a guarantee of what live free VRAM can support at call time — free VRAM
-varies within one fold.  :func:`anonymize` measures free VRAM ONCE at its
-own entry, via :func:`~paramem.utils.vram_guard.effective_token_envelope`,
-and threads the resulting effective (possibly smaller) envelope to the
-ANCHOR call — the only envelope-bearing call left; the tagger is CPU-only
-and takes no envelope.
+Dynamic VRAM clamp: the configured ``token_envelope`` is the operator
+CEILING, not a guarantee of what live free VRAM can support at call time —
+free VRAM varies within one fold.  :func:`anonymize` measures free VRAM ONCE, via
+:func:`~paramem.utils.vram_guard.effective_token_envelope`, and threads
+the resulting effective (possibly smaller) envelope to the ANCHOR call —
+the only envelope-bearing call left; the tagger is CPU-only and takes no
+envelope. The measurement runs INSIDE the residency-gated ANCHOR block,
+not unconditionally at entry: a cloud-only deferral
+(``model=None, tokenizer=None``) never reaches it, so it opens no CUDA
+context and measures nothing.
 """
 
 from __future__ import annotations
@@ -73,17 +73,15 @@ from typing import Literal
 
 from paramem.cloud.anonymize_steps import ScanResult, ask_speaker_anchor, scan_values
 from paramem.cloud.placeholders import (
-    _MAX_MAPPING_TEXT_CHARS,
-    _applied_whole_word_keys,
+    ForwardTable,
     _declared_placeholder_tokens,
     _substitute_whole_words,
     build_forward_table,
     invert_forward_mapping,
-    placeholder_prefix,
 )
 from paramem.cloud.span_tagger import TaggedSpan, TaggerUnavailable
 from paramem.config.taxonomy import ScrubCategory, entity_type_to_prefix
-from paramem.utils.identity import canonical, is_speaker_id
+from paramem.utils.identity import is_speaker_id
 from paramem.utils.tokens import ANONYMIZE_ENVELOPE_TOKENS
 from paramem.utils.turn_markers import split_marker
 from paramem.utils.vram_guard import effective_token_envelope
@@ -139,8 +137,7 @@ class TagPayload:
             :func:`~paramem.cloud.placeholders.insert_placeholders` later
             substitutes over (``subject``/``object`` only — ``predicate``
             is never a substitution target and carries nothing here). A
-            rendering that quotes or escapes a fact value (the prior
-            ``json.dumps(facts, ...)`` render did, for any value
+            rendering that quotes or escapes a fact value (for any value
             containing ``"`` or ``\\``) would make the tagger tag the
             ESCAPED surface — a string that never equals the real value
             the consumer substitutes, so the real value would egress
@@ -285,9 +282,9 @@ def _render_scan_raw(spans: Sequence[TaggedSpan], anchor_raw: str) -> str:
     ``ensure_ascii=False``: a span whose ``text`` was correctly tagged
     verbatim (see ``TagPayload.tag_text``'s docstring) must read verbatim
     here too — the default (``ensure_ascii=True``) would escape every
-    non-ASCII character, making a correctly-tagged span look identical to
-    the historical escaped-surface defect this raw record is meant to let
-    an operator rule out.
+    non-ASCII character, making a correctly-tagged span indistinguishable
+    from an escaped-surface tagging defect, which this raw record exists
+    to let an operator diagnose.
     """
     return json.dumps(
         {
@@ -305,31 +302,6 @@ def _render_scan_raw(spans: Sequence[TaggedSpan], anchor_raw: str) -> str:
         },
         ensure_ascii=False,
     )
-
-
-def _dropped_inert_entry(real: str, placeholder: str) -> dict:
-    """Build one ``scan_dropped_entries`` record for a forward-table key
-    pruned by :func:`anonymize`'s inert-key pass: ``side="table"``,
-    ``reason="inert"`` — distinguishing a key dropped because it never
-    substituted anywhere in the payload from a scan-time drop
-    (``side="scan"``, built by
-    :func:`~paramem.cloud.anonymize_steps._dropped_scan_entry`).
-
-    ``category`` is best-effort: *placeholder*'s own minted prefix
-    (:func:`~paramem.cloud.placeholders.placeholder_prefix`), or ``""``
-    when *placeholder* is not shape-matched (a speaker-anchor fold's
-    placeholder is the well-shaped ``speaker{N}`` token itself, which
-    never matches :data:`~paramem.cloud.placeholders.PLACEHOLDER_SHAPE_RE`)
-    — the same truncation cap
-    (:data:`~paramem.cloud.placeholders._MAX_MAPPING_TEXT_CHARS`) the scan
-    path already uses for ``text``.
-    """
-    return {
-        "category": placeholder_prefix(placeholder) or "",
-        "side": "table",
-        "text": real[:_MAX_MAPPING_TEXT_CHARS],
-        "reason": "inert",
-    }
 
 
 @dataclass(frozen=True)
@@ -409,17 +381,19 @@ class AnonymizedContract:
     once the ``side="table"``/``reason="inert"`` entries below are
     appended.
 
-    ``inert_dropped`` is the count of forward-table keys :func:`anonymize`
-    pruned because they substitute nothing anywhere in the payload — a
-    forward key that matches no text is never a real substitution target;
-    keeping it would leave a ``reverse`` entry a cloud reply could pull a
-    real (possibly partial) value back through, without that value ever
-    having actually been scrubbed from anything egressed. Applied
+    ``inert_dropped`` is the count the table build
+    (:func:`~paramem.cloud.placeholders.build_forward_table`) reports for
+    keys pruned because they substitute nothing anywhere in the payload —
+    a forward key that matches no text is never a real substitution
+    target; keeping it would leave a ``reverse`` entry a cloud reply could
+    pull a real (possibly partial) value back through, without that value
+    ever having actually been scrubbed from anything egressed. Applied
     uniformly, including a speaker-anchor fold's own placeholder: an
     anchor entry that never occurs verbatim in the payload is pruned like
     any other key, never carved out. The same ``side="table"``/
     ``reason="inert"`` entries land in ``scan_dropped_entries`` (see
-    :func:`_dropped_inert_entry`), so a single diagnostic list carries
+    :func:`~paramem.cloud.placeholders._dropped_inert_entry`), so a single
+    diagnostic list carries
     every one of the four PER-ENTRY drop reasons (``"speaker_id"``,
     ``"not_whole_word"``, ``"contained"``, ``"inert"``). Two further
     reasons a forward-table key never makes it to ``reverse`` carry no
@@ -502,9 +476,9 @@ def failed_contract(
     fail-closed terminal passes the REAL diagnostics accumulated before
     the terminal fired — the whole point of this parameter set: a failed
     run's calibration artifact must be able to say WHY it failed, not
-    just THAT it failed. The domain guard now runs AFTER inert-key
-    pruning (see :func:`anonymize`'s docstring), so a guard-failure
-    terminal carries a real, possibly non-zero ``inert_dropped`` too.
+    just THAT it failed. The domain guard runs AFTER inert-key pruning
+    (see :func:`anonymize`'s docstring), so a guard-failure terminal
+    carries a real, possibly non-zero ``inert_dropped`` too.
     """
     return AnonymizedContract(
         status="failed",
@@ -523,65 +497,6 @@ def failed_contract(
         scan_dropped_entries=list(scan_dropped_entries),
         inert_dropped=inert_dropped,
     )
-
-
-def _index_identity_domain(
-    identity_domain: Iterable[str] | None,
-) -> tuple[dict[str, str], set[str]]:
-    """Build the canonical-form -> domain-surface index for identity
-    reconciliation ONCE per :func:`anonymize` call.
-
-    ``identity_domain`` is the graph tier's ``chunk_nodes``, up to
-    ``max_entities_per_pass`` — typically 50 entries. Returns
-    ``(canon_to_domain, ambiguous_canon)``: a domain entry whose canonical
-    form collides with an earlier one is a genuine ambiguity, recorded in
-    ``ambiguous_canon`` rather than silently picking one.
-
-    ``identity_domain is None`` (no domain to reconcile against — the
-    session tier / chat egress / calibration) returns two empty
-    collections; the caller gates :func:`_reconcile_to_domain` and
-    :func:`_domain_guard_fires` on ``identity_domain is not None``, so
-    this function is never even called with a domain in that case except
-    to produce the empty pair.
-    """
-    canon_to_domain: dict[str, str] = {}
-    ambiguous_canon: set[str] = set()
-    if identity_domain is None:
-        return canon_to_domain, ambiguous_canon
-    for d in identity_domain:
-        c = canonical(str(d))
-        if c in canon_to_domain and canon_to_domain[c] != d:
-            # Two distinct domain entries canonicalizing identically —
-            # fail closed on this entry rather than silently pick one.
-            ambiguous_canon.add(c)
-        else:
-            canon_to_domain[c] = d
-    return canon_to_domain, ambiguous_canon
-
-
-def _reconcile_to_domain(
-    mapping: dict[str, str],
-    canon_to_domain: dict[str, str],
-    ambiguous_canon: set[str],
-) -> tuple[dict[str, str], int]:
-    """Re-key ``mapping`` (a ``{real: placeholder}`` forward table) onto
-    ``canon_to_domain``'s domain surfaces, preserving each placeholder
-    verbatim.
-
-    Every key is folded through :func:`~paramem.utils.identity.canonical`
-    and matched against ``canon_to_domain``.  A key whose canonical form
-    is ambiguous, or has no domain match, is dropped and counted.
-    Returns ``(reconciled_mapping, dropped_count)``.
-    """
-    reconciled: dict[str, str] = {}
-    dropped = 0
-    for real, placeholder in mapping.items():
-        c = canonical(real)
-        if c in ambiguous_canon or c not in canon_to_domain:
-            dropped += 1
-            continue
-        reconciled[canon_to_domain[c]] = placeholder
-    return reconciled, dropped
 
 
 def _domain_guard_fires(scan_union: dict, mapping: dict, facts: list[dict]) -> bool:
@@ -640,15 +555,29 @@ def anonymize(
     turns a caller wants tagged and substituted alongside the current
     transcript (``()`` on every path except chat egress).
 
-    **Dynamic VRAM clamp (owner-approved 2026-07-28):** ``token_envelope``
-    is the operator-configured CEILING, not a guarantee that live free
-    VRAM can support it at call time. This function measures free VRAM
-    exactly ONCE, at entry, via
+    ``speaker_name`` and ``speaker_id`` are threaded verbatim to
+    :func:`~paramem.cloud.placeholders.build_forward_table`, which decides
+    on its own evidence whether the speaker's name folds onto
+    ``speaker_id`` — an attested self-introduction, or the enrolled name
+    itself — see that function's own docstring for the fold rule. There is
+    no caller-declared policy here: every caller gets the same rule.
+
+    **Dynamic VRAM clamp:** ``token_envelope`` is the operator-configured
+    CEILING, not a guarantee that live free VRAM can support it at call
+    time. This function measures free VRAM exactly ONCE, via
     :func:`~paramem.utils.vram_guard.effective_token_envelope`, and
     threads the resulting effective envelope to the ANCHOR call below —
-    the only envelope-bearing call left. No CUDA available -> the
-    effective envelope equals the configured one (a strict passthrough) —
-    the CPU test suite never needs a GPU to exercise this function.
+    the only envelope-bearing call left. The measurement runs INSIDE the
+    residency-gated ANCHOR block (step 4), not unconditionally at entry:
+    a deferral (``model=None, tokenizer=None``) never reaches it, so it
+    opens no CUDA context and measures nothing.
+    :func:`~paramem.utils.vram_guard.effective_token_envelope` calls
+    ``torch.cuda.mem_get_info()`` when CUDA is available, which would
+    otherwise initialise a CUDA context on a device another process
+    holds on a GPU-conflict boot, breaking the cloud-only ~0 GiB
+    invariant. No CUDA available -> the effective envelope equals the
+    configured one (a strict passthrough) — the CPU test suite never
+    needs a GPU to exercise this function.
 
     In order:
 
@@ -656,60 +585,73 @@ def anonymize(
        :func:`opted_out_contract` — no tagger call, no model call. This is
        the ONE opt-out door: every caller reaches it through this
        function's own ``categories`` argument.
-    2. **Effective envelope** — see above.
-    3. :func:`_assemble_payload` builds the tagger payload and the ANCHOR
+    2. :func:`_assemble_payload` builds the tagger payload and the ANCHOR
        evidence text from ``history``, ``transcript`` and ``facts``.
-    4. :func:`~paramem.cloud.anonymize_steps.scan_values` — one
+    3. :func:`~paramem.cloud.anonymize_steps.scan_values` — one
        :func:`~paramem.cloud.span_tagger.tag` call covering every active
        category's labels. ``TaggerUnavailable`` is caught HERE and only
        here -> ``status="failed"``, ``failure="tagger"``
        (:func:`failed_contract`).
-    5. **ANCHOR** — :func:`_anchor_candidates` names the person-row
+    4. **ANCHOR** — :func:`_anchor_candidates` names the person-row
        surfaces whose tagged span lies inside the transcript region. The
        call is issued when that sequence is non-empty AND ``transcript``
        is non-empty AND ``speaker_id`` is well-shaped
-       (:func:`~paramem.utils.identity.is_speaker_id`); the model is shown
-       ``payload.anchor_evidence`` (history + current transcript, markers
-       intact — never the fact block). Any failure degrades to "no
-       self-introduction decided" and never fails the call — the anchor
-       fold is a linking convenience, not a privacy gate.
-    6. :func:`~paramem.cloud.placeholders.build_forward_table` — code-side
-       MINT of every placeholder, the anchor fold, and speaker-name
-       seeding, all in one call.
-    7. **Identity reconciliation** (only when ``identity_domain is not
-       None`` — the graph tier's own node list, generalized as data), via
-       :func:`_reconcile_to_domain` against the domain index
-       :func:`_index_identity_domain`. A miss or an ambiguous multi-match
-       is dropped and counted into ``rekey_dropped``.
-    8. **Inert-key pruning** (:func:`~paramem.cloud.placeholders.
-       _applied_whole_word_keys`) — every surviving forward-table key is
-       tested against ``payload.tag_text`` (the complete marker-free
-       outbound surface: history + transcript + fact lines). A key that
-       substitutes nowhere in it is not a real substitution target and is
-       dropped, counted into ``inert_dropped``, and recorded into
-       ``scan_dropped_entries`` (``reason="inert"``, ``side="table"`` —
-       see :func:`_dropped_inert_entry`). Runs AFTER reconciliation (which
-       reads the pre-pruning table) and applies uniformly to every key,
-       including a speaker-anchor fold's own placeholder.
-    9. **Domain-scoped fail-closed guard** (:func:`_domain_guard_fires`) —
+       (:func:`~paramem.utils.identity.is_speaker_id`) AND ``model`` and
+       ``tokenizer`` are both present (explicit ``is not None`` — a
+       model object's truthiness is not a residency signal); the model is
+       shown ``payload.anchor_evidence`` (history + current transcript,
+       markers intact — never the fact block). ``model=None,
+       tokenizer=None`` is a DESIGNED input of this chain — a cloud-only
+       deferral (base model not resident) — not an error case: the call
+       is otherwise a full run (tagger scan, forward-table build, and,
+       where applicable, the domain guard), with ``status="ok"`` unless
+       the tagger is unavailable or the guard fires. Any anchor failure,
+       including a closed gate, degrades to "no self-introduction
+       decided" and never fails the call — the anchor fold is a linking
+       convenience, not a privacy gate.
+    5. :func:`~paramem.cloud.placeholders.build_forward_table` — the one
+       table build: resolves every scanned surface to a group (the
+       speaker fold, canonical-equality sharing, or a fresh group),
+       settles containment per category, reconciles onto
+       ``identity_domain`` (when given), prunes members that substitute
+       nowhere in ``payload.tag_text``, and mints one placeholder per
+       surviving non-speaker group. Returns a
+       :class:`~paramem.cloud.placeholders.ForwardTable` — ``forward``,
+       ``rekey_dropped`` (step 6) and ``inert_entries`` (step 7) below are
+       all read off it; see that function's own docstring for the fold
+       rule, the containment rule, and the pass ordering.
+    6. **Identity reconciliation** (only when ``identity_domain is not
+       None`` — the graph tier's own node list, generalized as data) is
+       one of the table build's own passes now: a miss or an ambiguous
+       multi-match is dropped and counted into ``table.rekey_dropped``.
+    7. **Inert-key pruning** is likewise one of the table build's own
+       passes: every group member surviving reconciliation is tested
+       against ``payload.tag_text`` (the complete marker-free outbound
+       surface: history + transcript + fact lines) and, if it substitutes
+       nowhere in it, dropped and recorded into ``table.inert_entries``
+       (``reason="inert"``, ``side="table"``). Applies uniformly to every
+       member, including a speaker-fold surface and the enrolled name
+       itself.
+    8. **Domain-scoped fail-closed guard** (:func:`_domain_guard_fires`) —
        fires ONLY when ``identity_domain is not None`` AND the scan named
-       something AND the PRUNED table came back empty AND ``facts``'
-       subject/object endpoints contain a non-speaker name. Runs AFTER
-       pruning so the guard's verdict is taken on the table that will
-       actually act — a table that reconciliation left non-empty but
-       pruning then emptied out (every surviving entry substituting
-       nowhere) is exactly the case the guard exists to catch, not a
-       reason to skip it. On fire, the call fails closed
+       something AND the table build's PRUNED ``forward`` came back empty
+       AND ``facts``' subject/object endpoints contain a non-speaker
+       name. Runs AFTER the table build so the guard's verdict is taken
+       on the table that will actually act — a table that reconciliation
+       left non-empty but pruning then emptied out (every surviving
+       entry substituting nowhere) is exactly the case the guard exists
+       to catch, not a reason to skip it. On fire, the call fails closed
        (``failure="guard"``), carrying the real ``rekey_dropped`` /
        ``inert_dropped`` / ``scan_dropped_entries`` accumulated up to
        that point.
-    10. ``anon_transcript = _substitute_whole_words(transcript, forward)``
-        — the marker-bearing substituted transcript, over the PRUNED
-        table, by the same primitive that already substitutes the facts
-        (:func:`~paramem.cloud.placeholders.insert_placeholders`, at the
-        caller). ``""`` when ``transcript`` is ``""`` (the graph tier).
-    11. ``reverse`` / ``declared`` / ``raw = _render_scan_raw(spans,
-        anchor_raw)`` — all derived from the pruned table.
+    9. ``anon_transcript = _substitute_whole_words(transcript, table.forward)``
+       — the marker-bearing substituted transcript, over the table
+       build's own ``forward``, by the same primitive that already
+       substitutes the facts
+       (:func:`~paramem.cloud.placeholders.insert_placeholders`, at the
+       caller). ``""`` when ``transcript`` is ``""`` (the graph tier).
+    10. ``reverse`` / ``declared`` / ``raw = _render_scan_raw(spans,
+        anchor_raw)`` — all derived from ``table.forward``.
 
     This function does NOT build the anonymized fact array itself — every
     production reader derives it on demand instead, via
@@ -726,10 +668,6 @@ def anonymize(
     """
     if not categories:
         return opted_out_contract(transcript, facts=facts)
-
-    # ONE measurement for the whole call — see the docstring's "Dynamic
-    # VRAM clamp" paragraph.
-    effective_envelope, _free_mib = effective_token_envelope(token_envelope)
 
     payload = _assemble_payload(history, transcript, facts)
 
@@ -748,7 +686,18 @@ def anonymize(
 
     person_prefix = entity_type_to_prefix("person")
     candidates = _anchor_candidates(scans, tag_result.spans, payload.anchor_range, person_prefix)
-    if candidates and transcript and speaker_id and is_speaker_id(speaker_id):
+    if (
+        candidates
+        and transcript
+        and speaker_id
+        and is_speaker_id(speaker_id)
+        and model is not None
+        and tokenizer is not None
+    ):
+        # ONE measurement for the whole call, and only when the ANCHOR
+        # call is actually about to fire — see the docstring's "Dynamic
+        # VRAM clamp" paragraph.
+        effective_envelope, _free_mib = effective_token_envelope(token_envelope)
         anchor_names, anchor_raw, anchor_call_tokens = ask_speaker_anchor(
             payload.anchor_evidence,
             model,
@@ -764,34 +713,18 @@ def anonymize(
             model_calls += 1
         call_tokens_total.extend(anchor_call_tokens)
 
-    forward = build_forward_table(
+    table: ForwardTable = build_forward_table(
         scans,
+        tag_text=payload.tag_text,
         anchor_names=anchor_names,
         speaker_id=speaker_id,
         speaker_name=speaker_name,
+        identity_domain=identity_domain,
     )
-
-    rekey_dropped = 0
-    if identity_domain is not None:
-        canon_to_domain, ambiguous_canon = _index_identity_domain(identity_domain)
-        forward, rekey_dropped = _reconcile_to_domain(forward, canon_to_domain, ambiguous_canon)
-
-    # Inert-key pruning — a forward key that substitutes nowhere in the
-    # complete outbound surface (payload.tag_text: history + transcript +
-    # fact lines, marker-free) is not a key: it stays a live `reverse`
-    # entry for nothing ever actually scrubbed. Applied uniformly over
-    # every forward key, including a speaker-anchor fold's own
-    # placeholder — see AnonymizedContract's docstring and
-    # _dropped_inert_entry. Runs BEFORE the domain guard below, so the
-    # guard's verdict is taken on the table that will actually act.
-    applied_keys = _applied_whole_word_keys(payload.tag_text, forward)
-    inert_keys = [k for k in forward if k not in applied_keys]
-    inert_dropped = len(inert_keys)
-    if inert_keys:
-        scan_dropped_entries = scan_dropped_entries + [
-            _dropped_inert_entry(k, forward[k]) for k in inert_keys
-        ]
-        forward = {k: v for k, v in forward.items() if k in applied_keys}
+    forward = table.forward
+    rekey_dropped = table.rekey_dropped
+    inert_dropped = len(table.inert_entries)
+    scan_dropped_entries = scan_dropped_entries + list(table.inert_entries)
 
     if identity_domain is not None:
         scan_union = tuple(v for scan in scans for v in scan.values)

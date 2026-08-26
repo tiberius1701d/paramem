@@ -23,7 +23,7 @@ class TestRenamePendingToSlot:
         assert not pending.exists()
 
     def test_rename_pending_to_slot_refuses_existing(self, tmp_path):
-        """If slot_dir already exists, raises FileExistsError; pending_dir is untouched. (NIT 1)"""
+        """If slot_dir already exists, raises FileExistsError; pending_dir is untouched."""
         pending = tmp_path / ".pending" / "20260421-04000000"
         pending.mkdir(parents=True)
         (pending / "artifact.bin").write_bytes(b"data")

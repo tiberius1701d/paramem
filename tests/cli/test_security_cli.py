@@ -278,8 +278,8 @@ class TestGenerateKey:
         assert not args.recovery_pub_path.exists()
 
     def test_recovery_secret_is_never_written_to_disk(self, tmp_path, capsys):
-        """Regression guard: the printed recovery secret must not appear in
-        either daily_key.age (wraps the *daily* secret, not the recovery one)
+        """The printed recovery secret must not appear in either
+        daily_key.age (wraps the *daily* secret, not the recovery one)
         or recovery.pub (holds only the public recipient)."""
         import re
 

@@ -4,7 +4,7 @@ Each artifact in a slot directory has a paired ``.meta.json`` file.  This
 module owns the serialisation / deserialisation of ``ArtifactMeta`` and the
 content-hash fingerprint check that guards against silent on-disk corruption.
 
-Schema version policy (NIT 2)
+Schema version policy
 -------------------------------
 ``read_meta`` enforces a strict schema-version gate:
 
@@ -124,7 +124,7 @@ def write_meta(slot_dir: Path, meta: ArtifactMeta) -> Path:
 def read_meta(slot_dir: Path) -> ArtifactMeta:
     """Read and validate the ``.meta.json`` sidecar in *slot_dir*.
 
-    Schema-version gate (NIT 2):
+    Schema-version gate:
     - Forward version (``schema_version > SCHEMA_VERSION``) → logs ERROR,
       raises ``MetaSchemaError("forward version")``.
     - Legacy version (``schema_version < SCHEMA_VERSION``) → raises
@@ -169,7 +169,7 @@ def read_meta(slot_dir: Path) -> ArtifactMeta:
     except RuntimeError as exc:
         raise MetaSchemaError(f"corrupt sidecar: {meta_file} — {exc}") from exc
 
-    # --- schema_version gate (NIT 2) ---
+    # --- schema_version gate ---
     raw_version = raw.get("schema_version")
     if raw_version is None:
         raise MetaSchemaError(f"sidecar {meta_file} missing required field: schema_version")

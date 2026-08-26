@@ -203,23 +203,19 @@ def test_metrics_returns_copy_of_distinct():
 
 
 # ---------------------------------------------------------------------------
-# Regression: consolidation-executor errors must be inside capture scope
+# Consolidation-executor errors must be inside capture scope
 # ---------------------------------------------------------------------------
 
 
 def test_capture_wraps_consolidation_executor_errors():
     """Errors logged by the consolidation executor are captured.
 
-    Regression guard for the capture-scope bug: the ``with TrialLogCapture()``
-    block in ``_run_trial_consolidation`` (``app.py``) must open BEFORE the
-    consolidation executor call, not after it.  This test pins that behaviour
-    by simulating what the executor block does — logging an error and raising
-    — and asserts that the capture records it.
-
-    If the ``with`` block were placed after the executor (the pre-fix
-    location), ``trial_log_errors`` would be 0 and ``distinct_classes``
-    would be empty, causing ``_row_log_errors`` in ``migration_report.py``
-    to silently undercount real trial failures.
+    The ``with TrialLogCapture()`` block in ``_run_trial_consolidation``
+    (``app.py``) must open BEFORE the consolidation executor call, not after
+    it, or ``_row_log_errors`` in ``migration_report.py`` would silently
+    undercount real trial failures.  This test pins that behaviour by
+    simulating what the executor block does — logging an error and raising —
+    and asserts that the capture records it.
     """
     consolidation_log = logging.getLogger("paramem.server.consolidation")
 
@@ -235,7 +231,7 @@ def test_capture_wraps_consolidation_executor_errors():
     assert cap.metrics["trial_log_errors"] >= 1, (
         "Consolidation-executor errors must be captured inside the with block; "
         "trial_log_errors was 0 — the with TrialLogCapture() is likely placed "
-        "AFTER the executor call (the pre-fix placement)."
+        "AFTER the executor call."
     )
     assert "RuntimeError" in cap.metrics["distinct_classes"], (
         "RuntimeError class must appear in distinct_classes when the exception "

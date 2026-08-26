@@ -386,10 +386,10 @@ class TestMtimeTieBreakPreserved:
         os.utime(slot_b, (t_new, t_new))
 
         # Pre-migration, `read_manifest` (and therefore `find_live_slot`)
-        # cannot read the prior (schema_version=4) shape at all -- exactly
-        # the "an unmigrated slot reads as unreadable" consequence the plan
-        # documents. The pre-migration tie-break is checked directly against
-        # the slot directories' own mtimes instead.
+        # cannot read the prior (schema_version=4) shape at all -- an
+        # unmigrated slot reads as unreadable. The pre-migration tie-break
+        # is checked directly against the slot directories' own mtimes
+        # instead.
         assert slot_b.stat().st_mtime > slot_a.stat().st_mtime, (
             "fixture must establish slot_b as the newer slot before migration"
         )
@@ -822,10 +822,9 @@ def _fake_systemctl_run(returncode: int):
 
 class TestMainLivenessGuard:
     """``main()``'s own liveness guard -- routed through the project's one
-    ``systemctl`` transport seam (fix for the direct ``subprocess.run``
-    call this script used to make). The autouse host-isolation guard
-    already stubs :func:`paramem.utils.systemctl.run`; these tests override
-    its return value to report the server active/inactive."""
+    ``systemctl`` transport seam. The autouse host-isolation guard already
+    stubs :func:`paramem.utils.systemctl.run`; these tests override its
+    return value to report the server active/inactive."""
 
     def test_main_refuses_unconditionally_when_the_server_reports_active(
         self, tmp_path, monkeypatch

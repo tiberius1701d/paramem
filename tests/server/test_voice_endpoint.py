@@ -109,7 +109,7 @@ def _make_speaker_store(
         return (known_ids or {}).get(sid)
 
     store.get_name.side_effect = _get_name
-    # resolve_speaker_name is now called by _resolve_speaker for the
+    # resolve_speaker_name is called by _resolve_speaker for the
     # auth-speaker-id path.  Wire it to the same lookup so tests that
     # construct stores via this helper work regardless of which internal
     # method is invoked.
@@ -167,7 +167,7 @@ def _make_state(
         "pending_enrollments": set(),
         "user_token_store": None,
         # Required by _run_chat_turn's relay leg (_notice_once) whenever
-        # serving is RELAY — which now includes local-mode requests with no
+        # serving is RELAY — which includes local-mode requests with no
         # resolved speaker, not just server-wide cloud-only mode.
         "relay_notice_conversations": set(),
     }
@@ -221,7 +221,7 @@ def _resolved_speaker_patch(speaker_id: str = "speaker0", speaker: str = "Alex")
 
     Several ``/voice`` tests are about LOCAL-mode dispatch specifics
     (training abort, TTS synthesis) that require ``handle_chat`` to be
-    reached — which now only happens for a resolved speaker (a speakerless
+    reached — which only happens for a resolved speaker (a speakerless
     caller is served by the relay path instead, see
     ``test_voice_relay_route``).  The default ``state``/``client`` fixtures
     carry no speaker_store and the mocked STT result carries no embedding,
@@ -937,19 +937,18 @@ def test_voice_name_disclosure_binds(tmp_path, monkeypatch):
 
 
 def test_run_enrollment_turns_chronological_order(tmp_path, monkeypatch):
-    """Regression: prior session turns come BEFORE the live turn.
+    """Prior session turns come BEFORE the live turn.
 
-    ``all_turns`` previously prepended ``extra_turns`` (the live turn) ahead
-    of ``buffer.get_conversation_turns()``'s output, inverting chronological order
-    for the LLM name-extractor.  Pins: buffer turns first, the live turn
-    last.
+    ``all_turns`` places ``buffer.get_conversation_turns()``'s output first
+    and appends ``extra_turns`` (the live turn) last, preserving
+    chronological order for the LLM name-extractor.
     """
     import asyncio
 
     fresh = _make_state(tmp_path)
     fresh["speaker_store"] = MagicMock()
     # spec=PeftModel passes the isinstance(model, PeftModel) precondition
-    # base_model_inference now enforces around the name-enrollment call.
+    # base_model_inference enforces around the name-enrollment call.
     fresh["model"] = MagicMock(spec=PeftModel)
     fresh["model"].gradient_checkpointing_disable = MagicMock()
     fresh["model"].gradient_checkpointing_enable = MagicMock()
@@ -1035,12 +1034,12 @@ def test_voice_shared_token_resolved_speaker_does_not_leak_open_entries(tmp_path
     """Many shared-token utterances from the SAME resolved (known) speaker
     must not accumulate one _open entry per utterance.
 
-    Regression for the orphan-leak: _resolve_and_enroll_speaker calls
-    set_speaker(transport_id, ...) internally (correct for its own
-    unknown-speaker grouping), but the buffer conversation_key
-    ("voice-{speaker_id}") is a DIFFERENT key. Without reconciliation the
-    transport-id _open entry never gets a session_id, so retirement-based
-    pruning can never evict it — one leaked entry per push-to-talk press.
+    ``_resolve_and_enroll_speaker`` calls ``set_speaker(transport_id, ...)``
+    internally (correct for its own unknown-speaker grouping), but the
+    buffer conversation_key ("voice-{speaker_id}") is a DIFFERENT key.
+    Reconciliation gives the transport-id ``_open`` entry the resolved
+    session_id, so retirement-based pruning can evict it instead of
+    leaking one entry per push-to-talk press.
     """
     store = _make_speaker_store(
         known_ids={"speaker0": "Alice"},
@@ -1102,10 +1101,9 @@ def test_chat_anonymous_speaker_raw_id_and_personal_serving(tmp_path, monkeypatc
     derives ``ServingPath.PERSONAL`` from it via ``ServingPath.for_speaker``,
     see ``TestRunChatTurnServingFork`` for that derivation's own coverage).
 
-    Re-spec: the former ``display_speaker`` suppression is gone.  An
-    anonymous-promoted speaker still has a resolved speaker_id, so this is
-    full speaker treatment (B). Suppression of the raw token from
-    HUMAN-facing text is now the reply-boundary resolver's job
+    An anonymous-promoted speaker still has a resolved speaker_id, so this
+    is full speaker treatment. Suppression of the raw token from
+    HUMAN-facing text is the reply-boundary resolver's job
     (``resolve_speaker_tokens``), not a pre-emptive None field threaded
     through the whole call chain.
     """
@@ -1163,20 +1161,20 @@ def test_chat_anonymous_speaker_raw_id_and_personal_serving(tmp_path, monkeypatc
 
 
 # ---------------------------------------------------------------------------
-# Tests: ChatRequest.history retirement — legacy key accepted and ignored
+# Tests: an unrecognized ChatRequest.history key is accepted and ignored
 # ---------------------------------------------------------------------------
 
 
 def test_chat_legacy_history_key_accepted_and_ignored(tmp_path, monkeypatch):
-    """A /chat body carrying a legacy ``history`` key (old HA client, or any
-    caller unaware of the field's retirement) is accepted — Pydantic's
-    ``extra="ignore"`` model default silently drops it — and the turn is
-    served normally rather than rejected with a 422.
+    """A /chat body carrying an unrecognized ``history`` key (an old HA
+    client, or any caller sending a field ChatRequest does not declare) is
+    accepted — Pydantic's ``extra="ignore"`` model default silently drops
+    it — and the turn is served normally rather than rejected with a 422.
 
     Uses a resolved speaker (derives ``ServingPath.PERSONAL`` inside
     ``_run_chat_turn``) so the turn reaches ``handle_chat`` — this test is
-    about the legacy body field being dropped, not about the speakerless
-    relay fork (covered separately)."""
+    about the unrecognized body field being dropped, not about the
+    speakerless relay fork (covered separately)."""
     from paramem.server.app import ResolvedSpeaker
 
     resolved = ResolvedSpeaker(
@@ -1226,6 +1224,106 @@ def test_chat_legacy_history_key_accepted_and_ignored(tmp_path, monkeypatch):
     call_kwargs = mock_handle_chat.call_args.kwargs
     assert call_kwargs["history"] == []
     assert "an old client would have sent this" not in str(call_kwargs["history"])
+
+
+# ---------------------------------------------------------------------------
+# Tests: ChatRequest / DebugProbeRequest — blank-text boundary rejection
+# ---------------------------------------------------------------------------
+
+
+class TestBlankTextRejectedAtRequestBoundary:
+    """A ``text`` field that is empty or whitespace-only is rejected at
+    request-model construction by the shared validator on
+    :data:`~paramem.server.request_text.NonBlankText` — reused by
+    :class:`~paramem.server.app.ChatRequest`,
+    :class:`~paramem.server.app.DebugProbeRequest` (a separate
+    ``BaseModel``, not a subclass of ``ChatRequest``), and
+    :class:`~paramem.server.calibrate.CalibrateRespondRequest` — before
+    the turn can reach ``_run_chat_turn`` and hit
+    ``_refuse_failed_contract``'s invariant violation on a blank turn.
+    Either door's own ``contract()`` call can reach it: the HA leg's is
+    unconditional (it scrubs every turn regardless of
+    ``sanitization.cloud_mode``), while the cloud leg's fires only under
+    ``cloud_mode: anonymize|both``.  Pydantic raises ``ValidationError`` at
+    construction; FastAPI turns that into a 422 response for a request
+    parsed from an HTTP body."""
+
+    @pytest.mark.parametrize("blank", ["", "   ", "\t\n"])
+    def test_chat_request_rejects_blank_text(self, blank):
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError, match="empty or whitespace-only"):
+            app_module.ChatRequest(text=blank)
+
+    @pytest.mark.parametrize("blank", ["", "   ", "\t\n"])
+    def test_debug_probe_request_rejects_blank_text(self, blank):
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError, match="empty or whitespace-only"):
+            app_module.DebugProbeRequest(text=blank, speaker_id="speaker0")
+
+    def test_chat_request_normal_text_unaffected(self):
+        req = app_module.ChatRequest(text="hi there")
+        assert req.text == "hi there"
+
+    def test_chat_request_does_not_strip_stored_value(self):
+        """Text with real content surrounded by whitespace is preserved
+        verbatim — only fully-blank text is rejected; the validator never
+        mutates the stored value."""
+        req = app_module.ChatRequest(text="  hi  ")
+        assert req.text == "  hi  "
+
+    def test_debug_probe_request_normal_text_unaffected(self):
+        req = app_module.DebugProbeRequest(text="hi", speaker_id="speaker0")
+        assert req.text == "hi"
+
+    def test_chat_endpoint_blank_text_returns_422(self, tmp_path, monkeypatch):
+        """End-to-end: a ``{"text": "   "}`` body to ``POST /chat`` never
+        reaches the handler — FastAPI's request-body validation rejects it
+        with 422 before ``_run_chat_turn`` is ever called."""
+        fresh = _make_state(tmp_path)
+        fresh["config"].text_lang_detection.enabled = False
+        monkeypatch.setattr(app_module, "_state", fresh)
+
+        tc = TestClient(app_module.app, raise_server_exceptions=True, headers={})
+
+        resp = tc.post("/chat", json={"text": "   ", "conversation_id": "blank-conv"})
+
+        assert resp.status_code == 422
+
+    def test_chat_endpoint_normal_text_returns_200(self, tmp_path, monkeypatch):
+        """Discriminating counterpart to the 422 case above: a normal body
+        is unaffected by the new validator and still reaches the handler."""
+        from paramem.server.app import ResolvedSpeaker
+
+        resolved = ResolvedSpeaker(
+            speaker_id="speaker0",
+            speaker="Alex",
+            follow_up=None,
+            greeting_prefix=None,
+            effective_language=None,
+        )
+        fake_chat_result = MagicMock()
+        fake_chat_result.text = "OK."
+        fake_chat_result.escalated = False
+
+        fresh = _make_state(tmp_path)
+        fresh["config"].text_lang_detection.enabled = False
+        monkeypatch.setattr(app_module, "_state", fresh)
+
+        tc = TestClient(app_module.app, raise_server_exceptions=True, headers={})
+
+        with (
+            patch(
+                "paramem.server.app._resolve_and_enroll_speaker",
+                new=AsyncMock(return_value=resolved),
+            ),
+            patch("paramem.server.app.handle_chat", return_value=fake_chat_result),
+        ):
+            resp = tc.post("/chat", json={"text": "hi", "conversation_id": "normal-conv"})
+
+        assert resp.status_code == 200
+        assert resp.json()["text"] == "OK."
 
 
 # ---------------------------------------------------------------------------
@@ -1417,8 +1515,7 @@ def test_debug_probe_cloud_only_exit_resolves_speaker_tokens(tmp_path, monkeypat
     """Cloud-only branch of ``debug_probe`` (app.py, the
     ``resolve_speaker_tokens(cloud_result.text, store)`` call): the funnel's
     raw answer is resolved to a display name before the response is built —
-    same reply-boundary contract as every other exit, previously untested
-    for this endpoint."""
+    same reply-boundary contract as every other exit."""
     import asyncio
 
     from paramem.server.app import DebugProbeRequest
@@ -1436,7 +1533,7 @@ def test_debug_probe_cloud_only_exit_resolves_speaker_tokens(tmp_path, monkeypat
     with patch.object(
         app_module,
         "_relay_route",
-        return_value=MagicMock(text="speaker1 asked that too.", escalated=True),
+        return_value=MagicMock(text="speaker1 asked that too.", escalated=True, diagnostics={}),
     ):
         resp = asyncio.run(
             app_module.debug_probe(DebugProbeRequest(text="hi", speaker_id="speaker0"))
@@ -1464,6 +1561,7 @@ def test_debug_probe_local_mode_exit_resolves_speaker_tokens(tmp_path, monkeypat
     fake_result = MagicMock()
     fake_result.text = "speaker1 asked that too."
     fake_result.escalated = False
+    fake_result.diagnostics = {}
 
     with patch("paramem.server.app.handle_chat", return_value=fake_result):
         resp = asyncio.run(
@@ -1484,12 +1582,11 @@ def test_debug_probe_anonymous_speaker_display_name_stays_none(tmp_path, monkeyp
     ``get_name``'s raw token, which exists only for the 404 existence
     check.
 
-    Re-spec note: the local system-prompt identity line
-    (:func:`~paramem.server.inference._build_system_prompt`) no longer
-    gates on ``speaker`` at all — it is driven by ``speaker_id`` presence
-    directly (B-form prefix, anonymous included), so this test is scoped
-    to the ``speaker=`` display-name plumbing only, not to whether an
-    identity line is emitted.
+    The local system-prompt identity line
+    (:func:`~paramem.server.inference._build_system_prompt`) is driven by
+    ``speaker_id`` presence directly (anonymous included), not by
+    ``speaker`` at all, so this test is scoped to the ``speaker=``
+    display-name plumbing only, not to whether an identity line is emitted.
     """
     import asyncio
 
@@ -1506,6 +1603,7 @@ def test_debug_probe_anonymous_speaker_display_name_stays_none(tmp_path, monkeyp
     fake_result = MagicMock()
     fake_result.text = "hi there"
     fake_result.escalated = False
+    fake_result.diagnostics = {}
 
     captured = {}
 
@@ -1523,3 +1621,168 @@ def test_debug_probe_anonymous_speaker_display_name_stays_none(tmp_path, monkeyp
         "None into handle_chat's speaker= argument, never get_name's raw token"
     )
     assert resp.speaker is None
+
+
+# ---------------------------------------------------------------------------
+# Tests: /debug/probe's cloud-only branch runs off the event loop, with the
+# same GPU discipline as the local branch
+# ---------------------------------------------------------------------------
+
+
+def test_debug_probe_cloud_only_branch_runs_off_the_event_loop_with_gpu_discipline(
+    tmp_path, monkeypatch
+):
+    """The cloud-only dispatch branch of ``debug_probe`` takes the same GPU
+    discipline as its local-mode sibling: abort in-flight background
+    training, then hold the shared GPU thread lock for the duration of the
+    dispatch — and the dispatch itself runs off the event loop (a
+    ``run_in_executor`` hop), since the tagger pass, encoder calls, and the
+    provider call are synchronous work."""
+    import asyncio
+    import threading
+
+    from paramem.server.app import DebugProbeRequest
+    from paramem.server.gpu_lock import _gpu_thread_lock
+
+    store = _make_speaker_store(known_ids={"speaker0": "Alex"}, is_anonymous=False)
+    fresh = _make_state(tmp_path, speaker_store=store, mode="cloud-only")
+    fresh["config"].debug = True
+    fresh["config"].text_lang_detection.enabled = False
+    fresh["config"].cloud.allow_degraded_serving = False
+    fresh["cloud_only_reason"] = None
+    monkeypatch.setattr(app_module, "_state", fresh)
+
+    loop_thread_id = threading.get_ident()
+    call_order = []
+
+    def fake_abort():
+        call_order.append("abort")
+
+    def fake_relay_route(**kwargs):
+        call_order.append(("dispatch", threading.get_ident(), _gpu_thread_lock.locked()))
+        return MagicMock(text="cloud answer", escalated=True, diagnostics={})
+
+    with (
+        patch.object(
+            app_module, "_abort_background_training_for_inference", side_effect=fake_abort
+        ) as mock_abort,
+        patch.object(app_module, "_relay_route", side_effect=fake_relay_route),
+    ):
+        asyncio.run(app_module.debug_probe(DebugProbeRequest(text="hi", speaker_id="speaker0")))
+
+    mock_abort.assert_called_once()
+    assert len(call_order) == 2
+    assert call_order[0] == "abort", "training abort must run before the dispatch"
+    _, dispatch_thread_id, lock_held_during_dispatch = call_order[1]
+    assert dispatch_thread_id != loop_thread_id, (
+        "the dispatch must run off the event loop's own thread (run_in_executor)"
+    )
+    assert lock_held_during_dispatch is True, "the dispatch must run with the GPU thread lock held"
+    assert not _gpu_thread_lock.locked(), "the lock must be released after the dispatch"
+
+
+# ---------------------------------------------------------------------------
+# Tests: /debug/probe carries the cloud-egress record; /chat does not
+# ---------------------------------------------------------------------------
+
+
+def test_debug_probe_cloud_only_branch_carries_cloud_egress(tmp_path, monkeypatch):
+    """The cloud-only dispatch branch of ``debug_probe`` reads
+    ``cloud_result.diagnostics`` straight into the response body —
+    ``DebugProbeResponse.diagnostics``, the debug-only surface production
+    ``/chat``/``/voice`` do not carry."""
+    import asyncio
+
+    from paramem.server.app import DebugProbeRequest
+
+    store = _make_speaker_store(known_ids={"speaker0": "Alex"}, is_anonymous=False)
+    fresh = _make_state(tmp_path, speaker_store=store, mode="cloud-only")
+    fresh["config"].debug = True
+    fresh["config"].text_lang_detection.enabled = False
+    fresh["config"].cloud.allow_degraded_serving = False
+    fresh["cloud_only_reason"] = None
+    monkeypatch.setattr(app_module, "_state", fresh)
+
+    with patch.object(
+        app_module,
+        "_relay_route",
+        return_value=MagicMock(
+            text="cloud answer", escalated=True, diagnostics={"cloud_egress": "scrubbed"}
+        ),
+    ):
+        resp = asyncio.run(
+            app_module.debug_probe(DebugProbeRequest(text="hi", speaker_id="speaker0"))
+        )
+
+    assert resp.diagnostics == {"cloud_egress": "scrubbed"}
+
+
+def test_debug_probe_local_branch_carries_cloud_refusal(tmp_path, monkeypatch):
+    """The local dispatch branch of ``debug_probe`` reads
+    ``result.diagnostics`` straight into the response body — same
+    contract as the cloud-only branch above, reached via ``handle_chat``
+    instead of ``_relay_route``."""
+    import asyncio
+
+    from paramem.server.app import DebugProbeRequest
+
+    store = _make_speaker_store(known_ids={"speaker0": "Alex"}, is_anonymous=False)
+    fresh = _make_state(tmp_path, speaker_store=store, mode="local")
+    fresh["config"].debug = True
+    fresh["config"].text_lang_detection.enabled = False
+    monkeypatch.setattr(app_module, "_state", fresh)
+
+    fake_result = MagicMock()
+    fake_result.text = "canned limited-mode reply"
+    fake_result.escalated = False
+    fake_result.diagnostics = {"cloud_refusal": "personal_blocked"}
+
+    with patch("paramem.server.app.handle_chat", return_value=fake_result):
+        resp = asyncio.run(
+            app_module.debug_probe(
+                DebugProbeRequest(text="Where do I live?", speaker_id="speaker0")
+            )
+        )
+
+    assert resp.diagnostics == {"cloud_refusal": "personal_blocked"}
+
+
+def test_chat_response_body_carries_no_diagnostics_field(tmp_path, monkeypatch):
+    """The production ``/chat`` response schema (``ChatResponse``) never
+    carries the cloud-egress record — even when the underlying
+    ``ChatResult`` the dispatch produced has one — because the endpoint's
+    ``response_model=ChatResponse`` has no ``diagnostics`` field to carry
+    it through."""
+    fake_chat_result = MagicMock()
+    fake_chat_result.text = "cloud answer"
+    fake_chat_result.escalated = True
+    fake_chat_result.diagnostics = {"cloud_egress": "scrubbed"}
+
+    fresh = _make_state(tmp_path)
+    fresh["config"].text_lang_detection.enabled = False
+    monkeypatch.setattr(app_module, "_state", fresh)
+
+    tc = TestClient(app_module.app, raise_server_exceptions=True, headers={})
+
+    mock_run_turn = AsyncMock(return_value=(fake_chat_result, "cloud answer"))
+
+    with (
+        patch.object(
+            app_module,
+            "_resolve_and_enroll_speaker",
+            new=AsyncMock(
+                return_value=app_module.ResolvedSpeaker(
+                    speaker_id="speaker0",
+                    speaker="Alex",
+                    follow_up=None,
+                    greeting_prefix=None,
+                    effective_language="en",
+                )
+            ),
+        ),
+        patch("paramem.server.app._run_chat_turn", new=mock_run_turn),
+    ):
+        resp = tc.post("/chat", json={"text": "hi", "conversation_id": "test-diag-conv"})
+
+    assert resp.status_code == 200
+    assert "diagnostics" not in resp.json()

@@ -1,18 +1,14 @@
 """Vocabulary for "why did the working fact set go empty?" — FLOW STATE,
 not relation-rebuilding.
 
-This module used to live inside ``paramem.graph.relation_build`` (the
-gate's own home), on the reasoning that the gate was its only consumer.
-That stopped being true once the extraction flow was carved into
-declarative stages: the vocabulary now has THREE consumers —
-:func:`~paramem.graph.relation_build.recovery_gate` (which still owns the
+Three consumers share this vocabulary:
+:func:`~paramem.graph.relation_build.recovery_gate` (which owns the
 DECISION of whether the all-dropped recovery net must fire),
 the flow tail stages (``deanonymize``/``rebuild`` in ``paramem.graph.flows``,
 which detect and record which site emptied ``StageState.facts``), and the
 ``enrich`` stage (``paramem.graph.stage_enrich``, where the cloud enricher or the
 anon-stage judge can empty the fact set). A vocabulary three call sites
-share is no longer "the gate's own" — it is flow state, and belongs in its
-own module.
+share is flow state, not "the gate's own" — it belongs in its own module.
 
 It must NOT live in ``paramem.graph.flow`` — that module is generic
 topology (``StageContext``/``StageState``/``StageSpec``/``run_flow``) and

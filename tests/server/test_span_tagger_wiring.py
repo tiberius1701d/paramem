@@ -373,14 +373,17 @@ class TestLoadSpanTaggerBootBoundary:
         config.consolidation.extraction_enrichment_provider = "anthropic"
         config.consolidation.extraction_enrichment_provider_model = "claude-test"
         config.consolidation.extraction_enrichment_provider_endpoint = None
+        # Reachable through the cloud term alone — the HA term is closed
+        # explicitly so this fixture isolates term 2.
+        config.ha_agent_id = ""
+        config.tools.ha.configured = False
         return config
 
     def test_reachable_config_with_unresolvable_checkpoint_raises(
         self, monkeypatch, span_tagger_reset
     ) -> None:
         # _build_runtime_components has no try/except around its
-        # _load_span_tagger(config) call (verified in
-        # paramem/server/app.py, step 9) — a raise here propagates
+        # _load_span_tagger(config) call — a raise here propagates
         # straight out of that function to ITS caller (boot / apply).
         def _raise(cfg):
             raise RuntimeError(
@@ -402,6 +405,194 @@ class TestLoadSpanTaggerBootBoundary:
         app_module._load_span_tagger(config)  # must not raise
 
         assert calls == []
+
+
+class TestLoadSpanTaggerResolvesTheIncidentOnSuccess:
+    """A detector failing at runtime closes a leg and records a
+    ``span_tagger_unavailable`` incident (``_refuse_failed_contract``'s
+    ``tagger_unavailable`` refusal terminal, shared by ``answer_via_cloud``
+    and ``answer_via_ha``).  The success side of that
+    contract lives here: a clean load at boot/apply must resolve any
+    incident of that type left over from a prior failed boot — an
+    operator must not see a stale attention item once the detector is
+    reachable again.
+    """
+
+    def _reachable_config(self, tmp_path):
+        config = MagicMock()
+        config.sanitization.scrub_categories = (PERSON,)
+        config.sanitization.cloud_mode = "anonymize"
+        config.cloud.enabled = True
+        config.consolidation.extraction_enrichment_provider = "anthropic"
+        config.consolidation.extraction_enrichment_provider_model = "claude-test"
+        config.consolidation.extraction_enrichment_provider_endpoint = None
+        config.paths.data = tmp_path / "data"
+        return config
+
+    def test_a_successful_load_resolves_a_prior_incident(
+        self, monkeypatch, tmp_path, span_tagger_reset
+    ) -> None:
+        from paramem.server.incidents import read_incidents, record_incident
+        from paramem.training.stage_ledger import data_state_dir
+
+        config = self._reachable_config(tmp_path)
+        state_dir = data_state_dir(config.paths.data)
+
+        record_incident(
+            state_dir,
+            type="span_tagger_unavailable",
+            key=config.sanitization.cloud_mode,
+            severity="warning",
+            summary="Span tagger unavailable — cloud egress refused under an anonymizing policy",
+            detail={"cloud_mode": config.sanitization.cloud_mode},
+        )
+
+        monkeypatch.setattr(span_tagger, "load_at_startup", lambda cfg: None)
+
+        app_module._load_span_tagger(config)
+
+        incidents = read_incidents(state_dir)
+        active = [
+            i for i in incidents if i.type == "span_tagger_unavailable" and i.status == "active"
+        ]
+        assert active == [], "a clean load must resolve the prior span_tagger_unavailable incident"
+
+
+class TestLoadSpanTaggerResolvesTheIncidentWhenNotReachable:
+    """A standing ``span_tagger_unavailable`` incident from an earlier boot
+    or a still-active previous config must also clear when the CURRENT
+    configuration has no cloud-egress path needing the tagger at all (e.g.
+    an operator moves to ``cloud_mode: block`` after a tagger failure) —
+    this function is the incident's only clear site, and the not-reachable
+    branch never reaches ``load_at_startup``, so it must resolve the
+    incident itself, with a reason.
+    """
+
+    def _unreachable_config(self, tmp_path):
+        # cloud.enabled=False closes BOTH cloud-reaching scrubbing_reachable
+        # paths regardless of what API keys happen to be exported in the
+        # test environment: path 1 (evaluate_cloud_egress) requires it as
+        # its own first term, and path 2 requires it alongside cloud_mode.
+        # The HA term is closed explicitly too (a MagicMock's un-configured
+        # attributes read truthy, which would otherwise silently reopen it).
+        config = MagicMock()
+        config.sanitization.scrub_categories = (PERSON,)
+        config.sanitization.cloud_mode = "block"
+        config.cloud.enabled = False
+        config.consolidation.extraction_enrichment_provider = "anthropic"
+        config.consolidation.extraction_enrichment_provider_model = "claude-test"
+        config.consolidation.extraction_enrichment_provider_endpoint = None
+        config.paths.data = tmp_path / "data"
+        config.ha_agent_id = ""
+        config.tools.ha.configured = False
+        return config
+
+    def test_a_not_reachable_config_resolves_a_prior_incident(
+        self, monkeypatch, tmp_path, span_tagger_reset
+    ) -> None:
+        from paramem.server.incidents import read_incidents, record_incident
+        from paramem.training.stage_ledger import data_state_dir
+
+        config = self._unreachable_config(tmp_path)
+        state_dir = data_state_dir(config.paths.data)
+
+        record_incident(
+            state_dir,
+            type="span_tagger_unavailable",
+            key="anonymize",
+            severity="warning",
+            summary="Span tagger unavailable — cloud egress refused under an anonymizing policy",
+            detail={"cloud_mode": "anonymize"},
+        )
+
+        calls = []
+        monkeypatch.setattr(span_tagger, "load_at_startup", lambda cfg: calls.append(cfg))
+
+        app_module._load_span_tagger(config)
+
+        assert calls == [], "the not-reachable branch must never attempt a load"
+        incidents = read_incidents(state_dir)
+        active = [
+            i for i in incidents if i.type == "span_tagger_unavailable" and i.status == "active"
+        ]
+        assert active == [], (
+            "a not-reachable config must resolve a prior span_tagger_unavailable incident too"
+        )
+        resolved = [i for i in incidents if i.type == "span_tagger_unavailable"]
+        assert resolved[0].resolved_reason is not None
+
+
+class TestLoadSpanTaggerHaOnlyLoads:
+    """An HA-only deployment (cloud disabled, no provider) with a
+    non-empty ``scrub`` still reaches ``load_at_startup`` — through the
+    admission HA term alone, not the cloud terms, which this fixture
+    closes explicitly. Pins the call site's own mapping
+    (``ha_agent_id=config.ha_agent_id``, ``ha_tools_configured=
+    config.tools.ha.configured``) directly against a spy on
+    :func:`~paramem.cloud.admission.scrubbing_reachable`, so a swapped or
+    misnamed keyword there fails this test even when both real values
+    happen to be truthy (a plain "was it called" assertion would not
+    distinguish a swap from a correct mapping).
+    """
+
+    def _ha_only_config(self, tmp_path):
+        config = MagicMock()
+        config.sanitization.scrub_categories = (PERSON,)
+        config.cloud.enabled = False
+        config.sanitization.cloud_mode = "block"
+        config.consolidation.extraction_enrichment_provider = ""
+        config.consolidation.extraction_enrichment_provider_model = ""
+        config.consolidation.extraction_enrichment_provider_endpoint = None
+        config.ha_agent_id = "conversation.home"
+        config.tools.ha.configured = True
+        config.paths.data = tmp_path / "data"
+        return config
+
+    def test_ha_only_deployment_reaches_load_at_startup(
+        self, monkeypatch, tmp_path, span_tagger_reset
+    ) -> None:
+        from paramem.cloud import admission as admission_module
+        from paramem.server.incidents import read_incidents, record_incident
+        from paramem.training.stage_ledger import data_state_dir
+
+        config = self._ha_only_config(tmp_path)
+        state_dir = data_state_dir(config.paths.data)
+
+        # A prior open incident (e.g. an earlier boot with the HA client
+        # unbuildable) must resolve on a clean load -- same clear-site
+        # contract as the cloud-reachable case.
+        record_incident(
+            state_dir,
+            type="span_tagger_unavailable",
+            key="ha",
+            severity="warning",
+            summary="Span tagger unavailable -- ha egress refused under an anonymizing policy",
+            detail={"leg": "ha", "cloud_mode": config.sanitization.cloud_mode},
+        )
+
+        real_scrubbing_reachable = admission_module.scrubbing_reachable
+        captured: dict = {}
+
+        def _spy(**kwargs):
+            captured.update(kwargs)
+            return real_scrubbing_reachable(**kwargs)
+
+        monkeypatch.setattr(admission_module, "scrubbing_reachable", _spy)
+
+        calls = []
+        monkeypatch.setattr(span_tagger, "load_at_startup", lambda cfg: calls.append(cfg))
+
+        app_module._load_span_tagger(config)
+
+        assert captured["ha_agent_id"] == config.ha_agent_id
+        assert captured["ha_tools_configured"] == config.tools.ha.configured
+        assert len(calls) == 1, "the HA term alone must make this configuration reachable"
+
+        incidents = read_incidents(state_dir)
+        active = [
+            i for i in incidents if i.type == "span_tagger_unavailable" and i.status == "active"
+        ]
+        assert active == [], "a clean load must resolve the prior span_tagger_unavailable incident"
 
 
 class TestLiveConfigApplyRefusesOnUnresolvableCheckpoint:

@@ -106,7 +106,7 @@ class TimerSpec:
 def _hours_to_calendar(n: int) -> str | None:
     """Return an OnCalendar expression for every-N-hours if 24 % n == 0, else None.
 
-    The exact-grid renderer — unchanged by the catch-up-gate rework.  Also
+    The exact-grid renderer.  Also
     reused by :func:`_period_heartbeat_calendar` to render the coarser
     heartbeat grid for non-exact cadences (``gcd(count, 24)`` always divides
     24, so it is always a valid argument here).
@@ -127,7 +127,7 @@ def _hours_to_calendar(n: int) -> str | None:
 def _minutes_to_calendar(n: int) -> str | None:
     """Return an OnCalendar expression for every-N-minutes if 60 % n == 0, else None.
 
-    The exact-grid renderer — unchanged by the catch-up-gate rework.  Also
+    The exact-grid renderer.  Also
     reused by :func:`_period_heartbeat_calendar` (see :func:`_hours_to_calendar`).
 
     Examples::
@@ -253,9 +253,9 @@ def render_service_unit(endpoint: str, project_root: str) -> str:
     but not gated on readiness: systemd starts the server process and the
     tick unit in process order, not listener-ready order, and the server
     has taken up to ~4 minutes to reach ``listen()``. A firing that lands
-    in that window previously hit connection-refused and was lost outright
-    (there is no cross-firing retry — the next attempt is the *next*
-    scheduled tick). With these flags curl attempts at t=0/2/4/6 minutes
+    in that window without retry would hit connection-refused and be lost
+    outright (there is no cross-firing retry — the next attempt is the
+    *next* scheduled tick). With these flags curl attempts at t=0/2/4/6 minutes
     (fixed ``--retry-delay``, not the default exponential backoff) and then
     gives up until the next scheduled firing.
     ``--retry-connrefused`` (curl 7.52.0+) is required because plain

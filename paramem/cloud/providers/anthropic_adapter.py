@@ -42,8 +42,7 @@ class AnthropicAgent(CloudAgent):
             "max_tokens": 1024,
             # Pin to 0 for the structured-output paths (cloud enrichment emits
             # JSON triples; CLAUDE.md invariant: temperature=0.0 for JSON/QA/
-            # distillation).  Anthropic's default is 1.0 when omitted, which
-            # was the source of run-to-run variance in graph extraction.
+            # distillation).  Anthropic's default is 1.0 when omitted.
             "temperature": 0.0,
         }
 

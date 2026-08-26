@@ -20,8 +20,9 @@ Design tier with the rest of the routing path:
 * **Pattern axis 2 — sentence type** (this module):
   INTERROGATIVE / NON_INTERROGATIVE shape detection.
 * **Pattern axis 3 — personal referent**
-  (``paramem.server.personal_referent``, separate commit):
-  ABOUT_SPEAKER / NOT_ABOUT_SPEAKER, replaces the English regex in
+  (``paramem.server.personal_referent``):
+  ABOUT_SPEAKER / NOT_ABOUT_SPEAKER, providing multilingual coverage
+  beyond the English token-set lookup in
   :func:`paramem.server.sanitizer._contains_first_person`.
 
 All three axes share the same encoder + exemplar pattern; multilingual

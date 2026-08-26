@@ -14,7 +14,7 @@ Trust model
 The passphrase lives in :data:`DAILY_PASSPHRASE_ENV_VAR`
 (``PARAMEM_DAILY_PASSPHRASE``), loaded from the operator's shell env, a
 ``.env`` file, or a per-secret file under ``~/.config/paramem/secrets/``.
-OS key stores (libsecret, DPAPI) are out of scope for this phase — no
+OS key stores (libsecret, DPAPI) are out of scope — no
 libsecret on WSL2 and DPAPI is unavailable pre-login. This module is the
 neutral seam a future ``KeyProtector`` backend can slot in without
 touching call sites.

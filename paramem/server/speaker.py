@@ -258,7 +258,6 @@ class SpeakerStore:
             raise ValueError(
                 f"Unsupported speaker store version {version!r} "
                 f"(expected >= {_PROFILE_VERSION}). "
-                "Migration rungs for v1–v5 have been removed. "
                 "Provide a v6 store or start fresh."
             )
 

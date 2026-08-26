@@ -142,8 +142,7 @@ def wait_for_cooldown(
       sensor, and set by ``tests/conftest.py`` for non-gpu test runs).
     * ``threshold_c <= 0`` (gate disabled).
     * ``_gpu_temp()`` returns ``None`` (sensor unavailable — never block GPU
-      work on a missing sensor; silently degrades to today's no-gate
-      behaviour).
+      work on a missing sensor; silently degrades to no-gate behaviour).
     * GPU is already at or below ``threshold_c``.
 
     Bounded: on timeout it logs a WARNING and returns the still-hot temp so

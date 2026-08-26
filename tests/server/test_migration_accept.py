@@ -251,7 +251,7 @@ class TestAcceptHappyPath:
     def test_accept_archive_slot_has_no_graph_subdir(self, client, state, tmp_path):
         """Rotation slot must NOT contain a 'graph/' subdirectory after accept.
 
-        The trial graph is no longer archived — it is deleted post-accept.
+        The trial graph is deleted post-accept, not archived.
         """
         resp = client.post("/migration/accept")
         assert resp.status_code == 200

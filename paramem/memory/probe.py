@@ -3,8 +3,6 @@
 Contains :func:`probe_keys_grouped_by_adapter` — the live production wrapper
 that switches adapters once per group and delegates to
 :func:`paramem.training.recall_eval.probe_entries` for batched generation.
-
-Relocated from :mod:`paramem.training.indexed_memory` on 2026-05-20.
 """
 
 from __future__ import annotations

@@ -55,8 +55,8 @@ def resolve_token(*, allow_files: bool | None = None) -> str | None:
 
     This is a CLIENT-side resolution order for the CLI's own outbound
     ``Authorization`` header — not a mirror of any server-side token
-    resolution.  The server has no such thing: ``PARAMEM_API_TOKEN`` is no
-    longer a credential the server validates at all (every credential lives
+    resolution.  The server has no such thing: ``PARAMEM_API_TOKEN`` is not
+    a credential the server validates at all (every credential lives
     in a :class:`~paramem.server.user_tokens.UserTokenStore`; see
     ``paramem/server/auth.py``'s module docstring).  The value this function
     returns must itself be a token minted via ``paramem mint-user-token`` —

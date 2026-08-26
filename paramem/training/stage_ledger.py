@@ -273,9 +273,9 @@ def tier_live_stage(*, tier: str, completed_at: str, artifacts: "list[dict]") ->
 def extraction_entry(ledger: StageLedger) -> "dict | None":
     """Return *ledger*'s one ``"extraction"`` stage entry, or ``None`` when absent.
 
-    The one accessor for the extraction entry -- every caller that used to
-    read ``ledger.stages[0]`` by position, or scan ``ledger.stages`` for it
-    via an inline ``next(...)``, goes through this instead.
+    The one accessor for the extraction entry -- every caller reads it
+    through here rather than indexing ``ledger.stages`` by position or
+    scanning it with an inline ``next(...)``.
     """
     for stage in ledger.stages:
         if stage.get("stage") == "extraction":

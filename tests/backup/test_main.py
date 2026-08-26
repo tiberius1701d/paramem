@@ -381,7 +381,7 @@ class TestBackupCatchUpGate:
         assert calls.get("called") is True
 
     def test_recent_failed_attempt_still_gates(self, tmp_path, monkeypatch):
-        """A recent FAILED attempt still gates — the retry-storm regression check.
+        """A recent FAILED attempt still gates the next run.
 
         Gating on last_success_at instead of the last attempt would let a
         persistently failing backup pass the gate on every heartbeat.
@@ -569,11 +569,11 @@ class TestPostJsonToken:
 def test_backup_main_delegates_token_resolution_to_post_json(config_file, monkeypatch):
     """backup/__main__ does not pass an explicit token — auto-resolve runs in post_json.
 
-    Token resolution is no longer the responsibility of backup/__main__; it is
-    handled uniformly at the http_client boundary via resolve_token().  This
-    test verifies that main() passes no explicit token kwarg to post_json and
-    exits 0 (i.e. the delegation still succeeds regardless of whether a token
-    is present in the environment).
+    Token resolution is handled uniformly at the http_client boundary via
+    resolve_token(), not by backup/__main__.  This test verifies that main()
+    passes no explicit token kwarg to post_json and exits 0 (i.e. the
+    delegation still succeeds regardless of whether a token is present in
+    the environment).
     """
     cfg_path, _ = config_file
     calls = {}

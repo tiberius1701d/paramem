@@ -3,15 +3,17 @@ domain-scoped guard, identity-domain reconciliation, the effective
 envelope measured once, the tagger failure vocabulary, and the chat-path
 composition (``anonymize_turn``).
 
-``model=None, tokenizer=None`` and a non-speaker (or ``None``)
-``speaker_id`` throughout, so the ANCHOR call never fires — the one
-exception (``TestAnchorFold``) monkeypatches
-``paramem.cloud.anonymize.ask_speaker_anchor`` directly rather than
-exercising a real local ``generate()`` call.
+``model=None, tokenizer=None`` on most cases: on a deferral the ANCHOR
+gate in :func:`~paramem.cloud.anonymize.anonymize` is closed, so it never
+fires and the VRAM clamp it guards is never measured. Exercising the
+anchor arm itself needs a resident-shaped ``model``/``tokenizer``
+double — this module constructs one, ``_peft_model_mock``, for exactly
+those cases.
 """
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -25,12 +27,12 @@ from paramem.cloud.anonymize import (
     failed_contract,
     opted_out_contract,
 )
-from paramem.cloud.anonymize_steps import ScanResult
 from paramem.cloud.placeholders import _substitute_whole_words, insert_placeholders
 from paramem.cloud.span_tagger import TaggedSpan, TaggerUnavailable, TagResult
 from paramem.config.taxonomy import ScrubCategory
 from paramem.graph.flows import anonymize_turn
 from paramem.utils.turn_markers import format_turn
+from tests._guard_utils import tracked_python_files
 from tests.anonymizer_doubles import basic_prompts
 
 
@@ -76,10 +78,25 @@ def _forbid_tag(monkeypatch) -> None:
     monkeypatch.setattr(span_tagger, "tag", _boom)
 
 
-def _run_anonymize(monkeypatch, *, transcript, history=(), facts=None, categories, **kwargs):
+def _run_anonymize(
+    monkeypatch,
+    *,
+    transcript,
+    history=(),
+    facts=None,
+    categories,
+    model=None,
+    tokenizer=None,
+    **kwargs,
+):
     """Runs the real anonymize() with the tagger stubbed against the
     ACTUAL tag_text the chain assembles (via _assemble_payload), so
     span offsets are always correct without hand computation.
+
+    ``model``/``tokenizer`` default to ``None`` (a deferral) — the shape
+    every existing call site in this module relies on; a caller exercising
+    the ANCHOR call's positive path passes a resident-shaped double
+    explicitly.
     """
     facts = facts if facts is not None else []
     payload = _assemble_payload(list(history), transcript, facts)
@@ -88,8 +105,8 @@ def _run_anonymize(monkeypatch, *, transcript, history=(), facts=None, categorie
     _install_tag(monkeypatch, spans, windows=kwargs.pop("windows", 1))
     return anonymize(
         facts,
-        None,
-        None,
+        model,
+        tokenizer,
         transcript=transcript,
         history=history,
         categories=categories,
@@ -109,7 +126,12 @@ class TestOptOut:
     ) -> None:
         _forbid_tag(monkeypatch)
         contract = anonymize(
-            [], None, None, transcript="[user] hi", categories=[], prompts=basic_prompts()
+            [],
+            None,
+            None,
+            transcript="[user] hi",
+            categories=[],
+            prompts=basic_prompts(),
         )
         assert contract.status == "opted_out"
         assert contract.model_calls == 0
@@ -223,7 +245,12 @@ class TestTaggerWindowsEqualsTagResultWindows:
     def test_windows_field_is_carried_through_verbatim(self, monkeypatch) -> None:
         _install_tag(monkeypatch, spans=(), windows=5)
         contract = anonymize(
-            [], None, None, transcript="", categories=[PERSON], prompts=basic_prompts()
+            [],
+            None,
+            None,
+            transcript="",
+            categories=[PERSON],
+            prompts=basic_prompts(),
         )
         assert contract.tagger_windows == 5
 
@@ -314,93 +341,6 @@ class TestShadowedKeyLiveAtAStandaloneOccurrence:
         assert "Alex Smith" in contract.forward
 
 
-class TestSeededSpeakerNameEntryPrunedLikeAnyOtherKey:
-    """The speaker-name seeding entry :func:`build_forward_table` mints
-    unconditionally (independent of whether the tagger scanned it) is
-    pruned like any other forward-table key when the name never actually
-    occurs in the outbound payload — and kept when it does.
-    """
-
-    def test_a_seeded_name_absent_from_the_payload_is_pruned_to_an_empty_table(
-        self, monkeypatch
-    ) -> None:
-        contract = _run_anonymize(
-            monkeypatch,
-            transcript="[user] the weather is nice today",
-            categories=[PERSON],
-            speaker_id="speaker1",
-            speaker_name="Dana Voss",
-        )
-        assert contract.status == "ok"
-        assert contract.forward == {}
-        assert contract.declared == frozenset()
-        assert contract.inert_dropped == 1
-        inert = [e for e in contract.scan_dropped_entries if e["reason"] == "inert"]
-        assert len(inert) == 1
-        assert inert[0]["text"] == "Dana Voss"
-        assert inert[0]["side"] == "table"
-
-    def test_a_seeded_name_present_in_the_payload_is_kept(self, monkeypatch) -> None:
-        contract = _run_anonymize(
-            monkeypatch,
-            transcript="[user] Dana Voss called earlier",
-            categories=[PERSON],
-            speaker_id="speaker1",
-            speaker_name="Dana Voss",
-        )
-        assert contract.status == "ok"
-        assert contract.forward == {"Dana Voss": "Person_1"}
-        assert contract.inert_dropped == 0
-
-
-class TestAnchorFoldEntryPrunedUniformly:
-    """The speaker-anchor fold entry (``forward[value] = speaker_id``) is
-    pruned the same way any other forward-table key is: when the folded
-    value never occurs in the outbound payload, it is dropped with
-    ``reason="inert"`` — and, since ``speaker_id`` tokens (``speaker1``)
-    are never placeholder-shaped, :func:`~paramem.cloud.anonymize.
-    _dropped_inert_entry` records ``category=""`` for it rather than a
-    minted prefix.
-    """
-
-    def test_an_anchor_folded_value_absent_from_the_payload_is_pruned_with_empty_category(
-        self, monkeypatch
-    ) -> None:
-        import paramem.cloud.anonymize as anonymize_module
-
-        def _fake_scan_values(payload_text, *, categories):
-            span = TaggedSpan(start=0, end=11, text="Ghost Person", label="person", score=0.9)
-            scan = ScanResult(category=PERSON, values=("Ghost Person",), dropped=())
-            return (scan,), TagResult(spans=(span,), windows=1)
-
-        def _fake_anchor(text, model, tokenizer, *, values, speaker_id, **kwargs):
-            return frozenset({"Ghost Person"}), "anchor raw", ()
-
-        monkeypatch.setattr(anonymize_module, "scan_values", _fake_scan_values)
-        monkeypatch.setattr(anonymize_module, "ask_speaker_anchor", _fake_anchor)
-
-        contract = anonymize(
-            [],
-            None,
-            None,
-            transcript="[user] hello there",
-            categories=[PERSON],
-            speaker_id="speaker1",
-            prompts=basic_prompts(),
-        )
-
-        assert contract.status == "ok"
-        assert contract.forward == {}
-        assert contract.reverse == {}
-        assert contract.declared == frozenset()
-        assert contract.inert_dropped == 1
-        inert = [e for e in contract.scan_dropped_entries if e["reason"] == "inert"]
-        assert len(inert) == 1
-        assert inert[0]["category"] == ""
-        assert inert[0]["side"] == "table"
-        assert inert[0]["text"] == "Ghost Person"
-
-
 class TestDomainGuardIsDecidedOnThePrunedTable:
     """The domain-scoped fail-closed guard reads the forward table AFTER
     inert-key pruning, not before: a reconciliation match that re-keys
@@ -424,6 +364,60 @@ class TestDomainGuardIsDecidedOnThePrunedTable:
         )
         assert contract.status == "failed"
         assert contract.failure == "guard"
+
+
+class TestInertEntriesReachTheContract:
+    """Every entry the table build prunes as inert lands in
+    ``scan_dropped_entries``, and ``inert_dropped`` agrees exactly with
+    the count of ``reason == "inert"`` entries in that list — a count
+    that can disagree with the list it summarises is not a field.
+    """
+
+    def test_the_builds_inert_entries_land_in_scan_dropped_entries_and_the_count(
+        self, monkeypatch
+    ) -> None:
+        transcript = "[user] Lives at Schillerpromenade 63, 12049 Berlin, Abteilung 3."
+        contract = _run_anonymize(
+            monkeypatch,
+            transcript=transcript,
+            categories=[ADDRESS],
+            terms=[
+                ("Schillerpromenade 63, 12049 Berlin", "address", 0.9),
+                ("12049 Berlin, Abteilung 3", "address", 0.9),
+            ],
+        )
+        inert_entries = [e for e in contract.scan_dropped_entries if e["reason"] == "inert"]
+        assert contract.inert_dropped == len(inert_entries)
+        assert inert_entries
+        for entry in inert_entries:
+            assert entry["side"] == "table"
+            assert entry["category"] == ADDRESS.prefix
+
+
+class TestFoldedKeyIsPrunedLikeAnyOther:
+    """The enrolled name, entered as a forward key on the speaker group,
+    is pruned exactly like any other key when the payload never contains
+    it — its inert record carries the speaker group's own empty
+    category, not the person prefix.
+    """
+
+    def test_a_folded_key_absent_from_the_payload_is_counted_inert_with_an_empty_category(
+        self, monkeypatch
+    ) -> None:
+        contract = _run_anonymize(
+            monkeypatch,
+            transcript="[user] I went for a walk.",
+            categories=[PERSON],
+            speaker_id="speaker1",
+            speaker_name="Alex Morgan",
+        )
+        assert contract.status == "ok"
+        assert contract.forward == {}
+        assert contract.inert_dropped == 1
+        inert_entries = [e for e in contract.scan_dropped_entries if e["reason"] == "inert"]
+        assert len(inert_entries) == 1
+        assert inert_entries[0]["category"] == ""
+        assert inert_entries[0]["side"] == "table"
 
 
 class TestScanDroppedCountExcludesTableSideDrops:
@@ -476,7 +470,12 @@ class TestNonAsciiAndQuoteSurviveEndToEnd:
         _install_tag(monkeypatch, (span,), windows=1)
 
         contract = anonymize(
-            facts, None, None, transcript="", categories=[ADDRESS], prompts=basic_prompts()
+            facts,
+            None,
+            None,
+            transcript="",
+            categories=[ADDRESS],
+            prompts=basic_prompts(),
         )
 
         assert contract.status == "ok"
@@ -498,29 +497,6 @@ class TestHistoryOnlyValueIsInForward:
         )
         assert "Alex" in contract.forward
         assert contract.status == "ok"
-
-
-class TestEffectiveEnvelopeMeasuredOnce:
-    def test_effective_token_envelope_is_called_exactly_once(self, monkeypatch) -> None:
-        import paramem.cloud.anonymize as anonymize_module
-
-        calls: list[int] = []
-        real = anonymize_module.effective_token_envelope
-
-        def _recording(token_envelope):
-            calls.append(token_envelope)
-            return real(token_envelope)
-
-        monkeypatch.setattr(anonymize_module, "effective_token_envelope", _recording)
-
-        _run_anonymize(
-            monkeypatch,
-            transcript="[user] hello there",
-            categories=[PERSON],
-            token_envelope=4096,
-        )
-
-        assert calls == [4096]
 
 
 # ---------------------------------------------------------------------------
@@ -562,7 +538,12 @@ class TestTaggerFailureVocabulary:
 
         # Must not raise.
         contract = anonymize(
-            [], None, None, transcript="[user] hi", categories=[PERSON], prompts=basic_prompts()
+            [],
+            None,
+            None,
+            transcript="[user] hi",
+            categories=[PERSON],
+            prompts=basic_prompts(),
         )
         assert contract.status == "failed"
 
@@ -599,14 +580,24 @@ class TestContractConstructors:
 
         monkeypatch.setattr(span_tagger, "tag", _raising_tag)
         tagger_failed = anonymize(
-            [], None, None, transcript="[user] hi", categories=[PERSON], prompts=basic_prompts()
+            [],
+            None,
+            None,
+            transcript="[user] hi",
+            categories=[PERSON],
+            prompts=basic_prompts(),
         )
         assert tagger_failed.failure == "tagger"
 
     def test_opted_out_contract_matches_the_chains_own_opt_out_shape(self) -> None:
         via_constructor = opted_out_contract("hello", facts=[{"a": 1}])
         via_chain = anonymize(
-            [{"a": 1}], None, None, transcript="hello", categories=[], prompts=basic_prompts()
+            [{"a": 1}],
+            None,
+            None,
+            transcript="hello",
+            categories=[],
+            prompts=basic_prompts(),
         )
         assert via_constructor == via_chain
 
@@ -616,7 +607,12 @@ class TestContractConstructors:
 
         monkeypatch.setattr(span_tagger, "tag", _raising_tag)
         via_chain = anonymize(
-            [], None, None, transcript="[user] hi", categories=[PERSON], prompts=basic_prompts()
+            [],
+            None,
+            None,
+            transcript="[user] hi",
+            categories=[PERSON],
+            prompts=basic_prompts(),
         )
         via_constructor = failed_contract(failure="tagger", raw="boom message")
         assert via_constructor == via_chain
@@ -642,7 +638,12 @@ class TestContractConstructors:
 
         monkeypatch.setattr(span_tagger, "tag", _raising_tag)
         contract = anonymize(
-            [], None, None, transcript="[user] hi", categories=[PERSON], prompts=basic_prompts()
+            [],
+            None,
+            None,
+            transcript="[user] hi",
+            categories=[PERSON],
+            prompts=basic_prompts(),
         )
         assert "refusal text here" in contract.raw
 
@@ -653,29 +654,6 @@ class TestContractConstructors:
 
 
 class TestAnchorFires:
-    def test_anchor_call_fires_when_the_three_way_precondition_holds(self, monkeypatch) -> None:
-        import paramem.cloud.anonymize as anonymize_module
-
-        captured = {}
-
-        def _fake_anchor(text, model, tokenizer, *, values, speaker_id, **kwargs):
-            captured["values"] = values
-            captured["speaker_id"] = speaker_id
-            return frozenset(), "anchor raw", ()
-
-        monkeypatch.setattr(anonymize_module, "ask_speaker_anchor", _fake_anchor)
-
-        _run_anonymize(
-            monkeypatch,
-            transcript="[user] My name is Alex",
-            categories=[PERSON],
-            speaker_id="speaker1",
-            terms=[("Alex", "person", 0.9)],
-        )
-
-        assert captured["values"] == ("Alex",)
-        assert captured["speaker_id"] == "speaker1"
-
     def test_anchor_call_does_not_fire_without_a_well_shaped_speaker_id(self, monkeypatch) -> None:
         import paramem.cloud.anonymize as anonymize_module
 
@@ -692,6 +670,112 @@ class TestAnchorFires:
             terms=[("Alex", "person", 0.9)],
         )
         assert contract.model_calls == 0
+
+    def test_anchor_call_does_not_fire_on_a_deferral_even_with_candidates_and_speaker_id(
+        self, monkeypatch
+    ) -> None:
+        """``model=None, tokenizer=None`` closes the ANCHOR gate even when
+        the other two preconditions (well-shaped ``speaker_id``, non-empty
+        candidates) hold — the residency term added at the gate.  The VRAM
+        clamp (:func:`~paramem.utils.vram_guard.effective_token_envelope`)
+        has exactly one consumer, the anchor call, so it must not be
+        measured either: on a cloud-only deferral this must open no CUDA
+        context.
+        """
+        import paramem.cloud.anonymize as anonymize_module
+
+        def _fake_anchor(*a, **k):  # pragma: no cover - must not be reached
+            raise AssertionError("ask_speaker_anchor must not be called on a deferral")
+
+        def _fake_envelope(*a, **k):  # pragma: no cover - must not be reached
+            raise AssertionError("effective_token_envelope must not be measured on a deferral")
+
+        monkeypatch.setattr(anonymize_module, "ask_speaker_anchor", _fake_anchor)
+        monkeypatch.setattr(anonymize_module, "effective_token_envelope", _fake_envelope)
+
+        contract = _run_anonymize(
+            monkeypatch,
+            transcript="[user] My name is Alex",
+            categories=[PERSON],
+            speaker_id="speaker1",
+            terms=[("Alex", "person", 0.9)],
+        )
+        assert contract.status == "ok"
+        assert contract.model_calls == 0
+        # The rest of the chain still ran to completion — a deferral is a
+        # designed input, not a failure: the tagger's own scan still mints
+        # a forward-table entry for the candidate.
+        assert "Alex" in contract.forward
+
+    def test_anchor_call_fires_on_a_resident_double_and_measures_the_envelope_once(
+        self, monkeypatch
+    ) -> None:
+        """The positive-path mirror of the two tests above: a
+        resident-shaped ``model``/``tokenizer`` double, a well-shaped
+        ``speaker_id`` and a non-empty candidate set together open the
+        gate — ``ask_speaker_anchor`` is called exactly once and the VRAM
+        clamp is measured exactly once.
+        """
+        import paramem.cloud.anonymize as anonymize_module
+
+        anchor_calls: list[tuple] = []
+        envelope_calls: list[int] = []
+
+        def _fake_anchor(*a, **k):
+            anchor_calls.append((a, k))
+            return (frozenset({"Alex"}), "anchor raw text", ())
+
+        def _fake_envelope(configured_envelope):
+            envelope_calls.append(configured_envelope)
+            return configured_envelope, None
+
+        monkeypatch.setattr(anonymize_module, "ask_speaker_anchor", _fake_anchor)
+        monkeypatch.setattr(anonymize_module, "effective_token_envelope", _fake_envelope)
+
+        contract = _run_anonymize(
+            monkeypatch,
+            transcript="[user] My name is Alex",
+            categories=[PERSON],
+            speaker_id="speaker1",
+            terms=[("Alex", "person", 0.9)],
+            model=_peft_model_mock(),
+            tokenizer=MagicMock(),
+        )
+
+        assert len(anchor_calls) == 1
+        assert len(envelope_calls) == 1
+        assert contract.status == "ok"
+        # The anchor fold, not the mint loop, wrote this entry — "Alex"
+        # folds directly onto speaker_id.
+        assert contract.forward["Alex"] == "speaker1"
+
+
+# ---------------------------------------------------------------------------
+# Structural — no caller declares a speaker-name policy.
+# ---------------------------------------------------------------------------
+
+
+class TestNoCallerDeclaresASpeakerNamePolicy:
+    def test_no_tracked_python_file_mentions_the_retired_keyword(self) -> None:
+        """Every caller of the anonymize chain gets the same fold rule —
+        there is no per-caller keyword declaring a speaker-name linking
+        policy anywhere in the tracked source tree."""
+        this_file = Path(__file__).resolve()
+        repo_root = this_file.parent.parent
+        retired_keyword = "link_speaker_name"
+        offenders = []
+        for py_file in tracked_python_files(repo_root):
+            if py_file.resolve() == this_file:
+                # This guard's own source names the retired keyword (as a
+                # plain string, to search for it) -- not a re-declaration
+                # of the caller-policy the keyword used to select.
+                continue
+            rel = py_file.relative_to(repo_root).as_posix()
+            if not (rel.startswith("paramem/") or rel.startswith("tests/")):
+                continue
+            if retired_keyword in py_file.read_text(encoding="utf-8"):
+                offenders.append(rel)
+        assert offenders == []
 
 
 # ---------------------------------------------------------------------------
@@ -748,6 +832,63 @@ class TestChatPath:
         assert anon_text == "Hello there"  # no Alex in the current turn itself
         assert "Alex" not in sanitized_history[0]["text"]
         assert "Person_1" in sanitized_history[0]["text"]
+
+
+class TestChatPathDeferral:
+    """``anonymize_turn(model=None, tokenizer=None)`` — a cloud-only
+    deferral, a designed input of the chain (see ``anonymize_turn``'s
+    docstring), never a configuration.  The tagger scan and the rest of
+    the chain run identically to the resident case; only the ANCHOR gate
+    inside :func:`~paramem.cloud.anonymize.anonymize` closes.
+    """
+
+    def test_a_deferral_never_enters_base_model_inference(self, monkeypatch) -> None:
+        import paramem.graph.flows as flows_module
+
+        def _boom(model):  # pragma: no cover - must not be reached
+            raise AssertionError("base_model_inference must not be entered when model is None")
+
+        monkeypatch.setattr(flows_module, "base_model_inference", _boom)
+
+        text = "My name is Alex"
+        history_lines = []
+        model_facing_transcript = format_turn("user", text)
+        payload = _assemble_payload(history_lines, model_facing_transcript, [])
+        spans = _spans_for(payload.tag_text, [("Alex", "person", 0.9)])
+        _install_tag(monkeypatch, spans, windows=1)
+
+        result = anonymize_turn(
+            text,
+            None,
+            None,
+            categories=[PERSON],
+            token_envelope=8192,
+        )
+
+        assert result.status == "ok"
+
+    def test_a_deferral_still_reaches_anonymize_and_its_forward_table_comes_from_the_tagger(
+        self, monkeypatch
+    ) -> None:
+        text = "My name is Alex"
+        history_lines = []
+        model_facing_transcript = format_turn("user", text)
+        payload = _assemble_payload(history_lines, model_facing_transcript, [])
+        spans = _spans_for(payload.tag_text, [("Alex", "person", 0.9)])
+        calls = _install_tag(monkeypatch, spans, windows=1)
+
+        result = anonymize_turn(
+            text,
+            None,
+            None,
+            categories=[PERSON],
+            token_envelope=8192,
+        )
+
+        assert calls, "the tagger must still be invoked on a deferral"
+        assert result.status == "ok"
+        assert "Alex" in result.forward
+        assert result.forward["Alex"].startswith("Person_")
 
 
 def _run_anonymize_turn(monkeypatch, *, text, history=(), terms=()):

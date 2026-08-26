@@ -242,8 +242,8 @@ class TestOneLoopConstructor:
         )
 
     def test_no_second_get_or_create_helper_remains_in_app_py(self) -> None:
-        """The former ``_get_or_create_consolidation_loop`` app-local
-        duplicate is retired in favour of the one shared constructor."""
+        """No app-local duplicate of ``get_or_create_consolidation_loop``
+        exists; there is exactly one shared constructor."""
         assert not hasattr(app_module, "_get_or_create_consolidation_loop")
         assert not hasattr(calibrate_module, "_ensure_calibration_loop")
 
@@ -466,8 +466,8 @@ class TestFullCycleVoiceRestoreAfterTheFold:
 # ---------------------------------------------------------------------------
 # Every _dispatch_to_executor submission evicts voice up front, so every
 # entry point it ever wraps must restore it before EVERY terminal that
-# entry point's own body reaches -- not just the ones a prior fix happened
-# to cover.  Checked directly on each entry point's own function body (not
+# entry point's own body reaches, not a subset.  Checked directly on each
+# entry point's own function body (not
 # _run_stage_b_cycle's worker, which has its own coverage in
 # TestFullCycleVoiceRestoreAfterTheFold and a structural pin of its own via
 # TestVoiceRestoreSingleCallSite): for every `_consolidation_terminal(`

@@ -10,10 +10,8 @@ Covers:
   AND live config file is NOT renamed on failure.
 - _arm_active_store_migration with corrupt registry → returns False, does not arm.
 
-The clean-recheck-clears-the-flag and clean-store-arms-migration cases (both
-gated on writing a real adapter-manifest slot for ``verify_tier_binding`` to
-resolve as VERIFIED) have no dedicated suite currently — this file's
-integrity coverage is scoped to the corrupt/degraded shapes listed above.
+This file's integrity coverage is scoped to the corrupt/degraded shapes
+listed above.
 
 Tests use FastAPI TestClient with monkeypatched _state; no live server, no GPU.
 """
@@ -398,8 +396,8 @@ class TestMigrationConfirmBaseSwap409:
     def test_base_swap_corrupt_store_returns_409(self, tmp_path, monkeypatch):
         """POST /migration/confirm on a base-swap candidate with corrupt store → 409.
 
-        Exercises the base-swap integrity gate (already present before these
-        fixes) to confirm the 409 response shape.
+        Exercises the base-swap integrity gate to confirm the 409 response
+        shape.
         """
         cfg = _make_config(tmp_path)
         cfg.consolidation.mode = "train"

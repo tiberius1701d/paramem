@@ -1,7 +1,7 @@
 """ParaMem GPU consumer adapter for the gpu_guard arbitration layer.
 
-Post-V2.5: all detection / release / idle / describe logic for the
-paramem-server process lives in ``~/.config/gpu-guard/config.toml`` under
+All detection / release / idle / describe logic for the paramem-server
+process lives in ``~/.config/gpu-guard/config.toml`` under
 ``[consumers.paramem-server]`` and is handled by the config-driven
 ``ConfigConsumer`` that gpu_guard auto-loads at startup.
 

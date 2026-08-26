@@ -762,11 +762,11 @@ class TestRecallEarlyStopCallbackStateachine:
     def test_gradient_checkpointing_NOT_reenabled_when_args_says_off(self, tmp_path):
         """When args.gradient_checkpointing=False, the probe must NOT re-enable it.
 
-        Catches the regression class where silently turning checkpointing back on
-        after the recall probe breaks the next epoch's ``model.generate`` KV-cache
-        contract (HF disables KV cache when gradient checkpointing is active).
-        Production today defaults to True so this branch is latent, but any debug
-        or VRAM-tuning configuration that flips it False must stay flipped.
+        Silently turning checkpointing back on after the recall probe would
+        break the next epoch's ``model.generate`` KV-cache contract (HF
+        disables KV cache when gradient checkpointing is active). Production
+        defaults to True so this branch is latent, but any debug or
+        VRAM-tuning configuration that flips it False must stay flipped.
         """
         cb, state_out, model = _make_callback(tmp_path, total=2)
         perfect = _make_recall_result(2, 2)
@@ -1077,14 +1077,14 @@ class TestRecallEarlyStopCallbackResume:
         assert state_out.stop_epoch is None
 
     def test_fresh_run_does_not_inherit_stale_epoch_log(self, tmp_path):
-        """Regression: fresh run (global_step==0) must not inherit a completed run's log.
+        """A fresh run (global_step==0) must not inherit a completed run's log.
 
         Seeds a stale epoch_log.json ending at epoch 29 in the output dir,
         constructs the callback, calls on_train_begin with global_step=0, and
         asserts that _last_epoch is still -1 (defaults intact), epoch_log is
         empty, and the seeded file is unlinked.
 
-        Without the on_train_begin fix the old __init__-time rehydrate would
+        ``__init__`` must not rehydrate on its own: rehydrating there would
         set _last_epoch=29, causing the on_epoch_end guard to short-circuit
         every epoch and disable early stopping for the whole run.
         """
@@ -1097,7 +1097,7 @@ class TestRecallEarlyStopCallbackResume:
         first_perfect_log_path.write_text(json.dumps({"graph1": {"epoch_first_perfect": 5}}))
 
         cb, state_out, _ = _make_callback(tmp_path)
-        # Verify __init__ no longer rehydrates on its own.
+        # Verify __init__ does not rehydrate on its own.
         assert cb._last_epoch == -1
         assert state_out.epoch_log == []
 

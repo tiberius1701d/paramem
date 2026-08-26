@@ -75,24 +75,22 @@ class TestConditionLabel:
 
 
 class TestDefaultArmLabel:
-    """``_default_arm_label`` — mode-string signature (was a ``warm: bool``)."""
+    """``_default_arm_label`` takes a mode string, not a ``warm: bool``."""
 
-    def test_synthetic_cold_label_unchanged(self):
-        """Byte-identical to the pre-change ``warm=False`` output — --resume
-        must keep finding runs launched before --donor-init existed."""
+    def test_synthetic_cold_label_format(self):
+        """--resume must keep finding runs whose labels use this format."""
         assert _default_arm_label(3, 60, is_real=False, mode="cold") == "cold_n3_s60"
 
-    def test_synthetic_warm_label_unchanged(self):
-        """Byte-identical to the pre-change ``warm=True`` output."""
+    def test_synthetic_warm_label_format(self):
         assert _default_arm_label(3, 60, is_real=False, mode="warm") == "n3_warm_s60"
 
-    def test_real_cold_label_unchanged(self):
+    def test_real_cold_label_format(self):
         assert _default_arm_label(3, 60, is_real=True, mode="cold") == "real3_cold_s60"
 
-    def test_real_warm_label_unchanged(self):
+    def test_real_warm_label_format(self):
         assert _default_arm_label(3, 60, is_real=True, mode="warm") == "real3_warm_s60"
 
-    def test_synthetic_donor_label_is_new_and_distinct(self):
+    def test_synthetic_donor_label_distinct_from_cold_and_warm(self):
         label = _default_arm_label(12, 180, is_real=False, mode="donor")
         assert label == "n12_donor_s180"
         assert label != _default_arm_label(12, 180, is_real=False, mode="cold")
@@ -163,9 +161,7 @@ class TestExpectedOptimizerStepsDerivation:
     the run actually trains with — never a hardcoded module
     constant. These are real parity checks against
     ``paramem.utils.config.budget_for`` and the loaded fixture, not a
-    self-comparison (the prior ``test_default_accum_matches_recipe_value``
-    compared ``_RECIPE_GRAD_ACCUM_STEPS`` against itself and could never
-    fail — this replaces it)."""
+    self-comparison against a module constant."""
 
     def test_matches_budget_for_at_the_donor_population_size(self):
         """budget_for(147) — the donor's own population size
@@ -368,8 +364,8 @@ class TestRunDonorBuildSmokeTwoMarkerResume:
         # here so a regression that moves the marker check surfaces as a
         # clean assertion failure rather than a real adapter-load attempt.
         # The seed phase mounts the resolved donor slot via mount_adapter
-        # (paramem.models.loader) -- PeftModel.from_pretrained is no longer
-        # on this script's load path.
+        # (paramem.models.loader); this script's load path does not use
+        # PeftModel.from_pretrained.
         mount_adapter_mock = MagicMock()
         monkeypatch.setattr("experiments.test20_smallN_cold_gate.mount_adapter", mount_adapter_mock)
         create_adapter_mock = MagicMock()

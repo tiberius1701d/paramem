@@ -147,10 +147,9 @@ def reconstruct_graph(
     try:
         for adapter_id, keys in keys_by_adapter.items():
             # Per-adapter SimHash registry: read active-only fingerprints from
-            # the store.  Interim adapter IDs have their own registry after the
-            # SimHash unification.  adapter_id is drawn from
-            # loop.store.tiers_with_registry() above, so the tier is
-            # guaranteed to have a registry here.
+            # the store.  Interim adapter IDs have their own registry too.
+            # adapter_id is drawn from loop.store.tiers_with_registry() above,
+            # so the tier is guaranteed to have a registry here.
             simhash_registry = loop.store.tier_simhashes(adapter_id)
 
             logger.debug(

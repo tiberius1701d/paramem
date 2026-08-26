@@ -20,11 +20,10 @@ from paramem.backup.backup import _atomic_write_file
 class TestAtomicWriteFile:
     """Unit tests for _atomic_write_file (stale-temp robustness).
 
-    The prior implementation used a fixed ``.restore-pending`` suffix with
-    ``O_CREAT | O_EXCL``: a crash between create and rename left a stale temp
-    that wedged the next restore with ``FileExistsError``.  The fix uses
-    ``tempfile.mkstemp`` which generates a unique name, so stale temps from a
-    prior crash never block a subsequent restore.
+    ``_atomic_write_file`` writes to a uniquely-named temp file via
+    ``tempfile.mkstemp`` and renames it into place, so a leftover temp file
+    at *dst*'s destination from an earlier interrupted write never blocks a
+    subsequent write.
     """
 
     def test_happy_path_writes_content(self, tmp_path) -> None:
@@ -40,22 +39,22 @@ class TestAtomicWriteFile:
         assert dst.read_bytes() == b"data"
 
     def test_stale_temp_does_not_wedge(self, tmp_path) -> None:
-        """A stale .restore-pending temp left by a prior crash must not cause FileExistsError.
+        """An unrelated file at a fixed ``.restore-pending`` suffix path does not block a write.
 
-        The fixed suffix + O_EXCL used to raise FileExistsError if the
-        same-named temp already existed; mkstemp always picks a unique name
-        so the stale file is ignored.
+        ``_atomic_write_file`` mints a unique temp name per call via
+        ``tempfile.mkstemp``, so a file already present at that fixed suffix
+        path is simply left alone.
         """
         dst = tmp_path / "target.json"
-        # Plant a stale temp file with the old fixed-suffix naming scheme.
+        # Plant a file at the fixed-suffix path _atomic_write_file does not use.
         stale_temp = tmp_path / "target.json.restore-pending"
         stale_temp.write_bytes(b"stale-content")
 
-        # This must NOT raise even though a stale temp exists at the old path.
+        # This must NOT raise even though a file exists at that fixed-suffix path.
         _atomic_write_file(b"fresh-content", dst)
 
         assert dst.read_bytes() == b"fresh-content"
-        # The stale temp is untouched (mkstemp uses a unique name; the old file is orphaned).
+        # The file at the fixed-suffix path is untouched (mkstemp uses a unique name).
         assert stale_temp.exists()
 
     def test_mode_0o600_applied(self, tmp_path) -> None:

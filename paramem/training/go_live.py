@@ -112,10 +112,9 @@ def publish_bundle(
             already live (nothing left to publish, so ``publish_bundle``
             is not called at all). The RAM half (the absorbed tier's
             registry and entries, dropped inside the same
-            ``adopt_increments`` window -- the former
-            ``MemoryStore.drop_registry_and_entries`` primitive, now
-            inlined there) and the disk half (``unload_interim_adapters``,
-            unfiltered) both key off this same list.
+            ``adopt_increments`` window) and the disk half
+            (``unload_interim_adapters``, unfiltered) both key off this
+            same list.
 
     ``ctx.model`` is mutated in place throughout (the mount loop's
     ``ensure_adapter_matching`` call included) — nothing is returned. The
@@ -214,7 +213,7 @@ def publish_bundle(
             # guard; an absent file here is a write defect, not a case to
             # tolerate. The condition is this member's own written_slots
             # entry, not the event's venue -- a member writes a slot in
-            # both venues now, so the same rule covers both.
+            # both venues, so the same rule covers both.
             artifact_paths.append(written_slot / "meta.json")
         live_entries.append(
             tier_live_stage(

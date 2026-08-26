@@ -12,7 +12,7 @@ matching stored embeddings against the new profile.
 
 Session turns are always written to a per-session JSONL file under
 ``session_dir`` as they are appended — there is no RAM-only mode (see
-:meth:`SessionBuffer._append_turn`'s 2026-05-14 invariant). After
+:meth:`SessionBuffer._append_turn`'s always-on write invariant). After
 consolidation, ``retain_sessions``/``debug`` decide the JSONL's fate:
 moved under ``retention_dir`` when either is True, unlinked outright
 when both are False (see :meth:`SessionBuffer.mark_consolidated`). A
@@ -62,35 +62,23 @@ logger = logging.getLogger(__name__)
 
 # Size-rotation cap for a conversation's open session, in the estimator's
 # unit. HELD at the operating-point value the shipped extraction quality
-# was measured at, rather than computed at import time: the per-call-shape
-# (SCAN, APPLY) two-shape cap door that originally derived it is retired
-# now that the anonymizer's SCAN step is a span tagger with no envelope of
-# its own. That retired derivation combined the single per-call token
-# envelope (paramem.utils.tokens.ANONYMIZE_ENVELOPE_TOKENS, 8192) against a
-# session-tier SCAN call (payload once plus its extracted-facts JSON,
-# CONVERSATION_FACTS_RATIO = 3.15 — worst of three measured values over
-# four real transcript/extraction pairs, 2026-08-03 — which is what makes
-# a session's tag payload roughly four times the transcript's own token
-# count) and an APPLY call (payload twice, once as input and once echoed
-# back as the rewrite), taking the MINIMUM of both — see
+# was measured at, rather than computed at import time. The anonymizer's
+# only envelope-bearing call is the ANCHOR generate()
+# (paramem.utils.tokens.ANONYMIZE_ENVELOPE_TOKENS, 8192); the SCAN step is
+# a CPU span tagger with no envelope of its own. See
 # paramem.graph.document_chunker's _DOC_MAX_TOKENS for the sibling
-# derivation over the document-ingest path (that path's own prose ratio,
-# _R_PROSE = 1.9126, played the same role TRANSCRIPT_TOKENS_PER_WORD played
-# here).
+# derivation over the document-ingest path.
 # 1098 words -> 4062 estimator tokens (MEASURED_TOKENS_PER_WORD = 3.7):
-# deliberately sized against the CONFIGURED 8192 envelope, worst-case facts
-# ratio, not the live VRAM-clamped envelope (a dense session can still fail
-# anonymize under a tight free-VRAM moment — self-healing incident, not
-# silent loss).
+# deliberately sized against the CONFIGURED 8192 envelope, not the live
+# VRAM-clamped envelope (a dense session can still fail anonymize under a
+# tight free-VRAM moment — self-healing incident, not silent loss).
 _TRANSCRIPT_MAX_TOKENS: int = 4062
 
-# Slack tripwire, not a tight bound: the ANCHOR call (the one local
-# generate() left in the anonymizer) is far cheaper than the retired
-# SCAN+APPLY pair, so this assertion passes with room to spare — it is not
-# a re-derivation of the held value above. It fires only if
-# ANONYMIZE_ENVELOPE_TOKENS is lowered, _TRANSCRIPT_MAX_TOKENS is raised,
-# or the ANCHOR prompt is inflated far enough that a cap-sized transcript
-# could no longer fit the one remaining envelope-bearing call.
+# Slack tripwire, not a tight bound: the ANCHOR call is far cheaper than a
+# cap-sized transcript, so this assertion passes with room to spare. It
+# fires only if ANONYMIZE_ENVELOPE_TOKENS is lowered, _TRANSCRIPT_MAX_TOKENS
+# is raised, or the ANCHOR prompt is inflated far enough that a cap-sized
+# transcript could no longer fit the one remaining envelope-bearing call.
 assert _TRANSCRIPT_MAX_TOKENS <= anonymize_payload_cap_tokens(
     envelope_tokens=ANONYMIZE_ENVELOPE_TOKENS,
     anchor_skeleton_tokens=ANONYMIZE_ANCHOR_PROMPT_SKELETON_TOKENS,
@@ -100,6 +88,16 @@ assert _TRANSCRIPT_MAX_TOKENS <= anonymize_payload_cap_tokens(
     "_TRANSCRIPT_MAX_TOKENS exceeds the anchor-shape cap — the envelope, "
     "the held cap, or the ANCHOR prompt moved; re-measure jointly."
 )
+
+# How many of a conversation's most recent turns any caller reading history
+# back from this buffer may consider. Owned here, not by a caller, because
+# it is a property of the read this buffer serves: the local reasoning
+# leg's prompt window (``paramem.server.inference._build_messages``) and
+# the external-egress outbound-history gate
+# (``paramem.server.egress._sanitize_history``) both window the SAME
+# ``get_conversation_turns`` result to this same depth. One literal, every
+# consumer imports it from here.
+MAX_HISTORY_TURNS = 10
 
 
 def _snapshots_enabled() -> bool:
@@ -146,7 +144,7 @@ class SessionBuffer:
     Every conversation's turns are written to a per-session JSONL file
     under ``session_dir`` as they are appended — persistence is
     unconditional, not gated by a constructor flag (see
-    :meth:`_append_turn`'s 2026-05-14 invariant). ``retain_sessions`` and
+    :meth:`_append_turn`'s always-on write invariant). ``retain_sessions`` and
     ``debug`` govern what happens to that JSONL once a session retires:
     :meth:`mark_consolidated` moves it under ``retention_dir`` when
     either flag is True, or deletes it when both are False. Serving reads
@@ -347,7 +345,7 @@ class SessionBuffer:
             session_meta["state"] = STATE_IDENTIFIED
 
         # Pending sessions ALWAYS persist on disk until consumed by a
-        # consolidation (2026-05-14 invariant — independent of debug / mode).
+        # consolidation (always-on write invariant — independent of debug / mode).
         # fsync before the handle closes so a served turn survives a host
         # power loss, not just an ordinary process exit.
         path = self.session_dir / f"{session_id}.jsonl"
@@ -468,10 +466,9 @@ class SessionBuffer:
                 schema-compatible — the field is simply absent.
             speaker_id: Resolved speaker ID for this turn. When provided, it is
                 authoritative and written directly — the caller's resolved
-                identity is the single source of truth, so the write path no
-                longer depends on a prior ``set_speaker`` having populated
-                session state (the gap that silently dropped token-authenticated
-                text sessions). When ``None`` (default), falls back to session
+                identity is the single source of truth, and the write path
+                does not depend on a prior ``set_speaker`` having populated
+                session state. When ``None`` (default), falls back to session
                 state via ``get_speaker_id`` — preserving voice / anon-promotion
                 callers that ``set_speaker`` before appending.
             speaker: Display name companion to *speaker_id*, same precedence.
@@ -570,7 +567,7 @@ class SessionBuffer:
             logger.info("Claimed session %s for speaker %s", conv_id, speaker_name)
 
             # Sync to disk — JSONL is the durable representation of pending
-            # sessions (2026-05-14 invariant, always-on). Written via the
+            # sessions (always-on write invariant). Written via the
             # atomic tmp-file + fsync + rename helper so a crash mid-rewrite
             # leaves the original file intact rather than truncated.
             path = self.session_dir / f"{conv_id}.jsonl"
@@ -661,7 +658,7 @@ class SessionBuffer:
                 )
 
         # Disk-only sessions (e.g. pending JSONL on cold start after a
-        # graceful exit or unclean restart).  Per the 2026-05-14 invariant,
+        # graceful exit or unclean restart).  Per the always-on write invariant,
         # JSONL is the durable representation of pending state and is read
         # back unconditionally.
         for path in sorted(self.session_dir.glob("*.jsonl")):
@@ -690,7 +687,7 @@ class SessionBuffer:
         """Load pending JSONL files into ``self._turns`` and ``self._sessions``.
 
         Called at lifespan startup so the in-memory state matches what's on
-        disk before any chat handler can append.  Per the 2026-05-14
+        disk before any chat handler can append.  Per the always-on write
         invariant, pending JSONL is the durable source of truth for
         unconsolidated sessions; cold-start must restore it.
 
@@ -905,7 +902,7 @@ class SessionBuffer:
     ) -> None:
         """Consume consolidated sessions and dispose of their JSONL.
 
-        Disposition (2026-05-14 user spec):
+        Disposition:
 
         - ``retain_sessions=True`` OR ``debug=True``: move JSONL to
           *retention_dir* (caller-supplied, typically
@@ -1079,12 +1076,16 @@ class SessionBuffer:
         routing handle (:meth:`append_document_chunk` never rotates, so it
         never has a ``prior_session_ids`` chain either).
 
-        No window is applied here — ``_build_messages`` applies
-        ``MAX_HISTORY_TURNS`` exactly once, downstream
-        (``paramem/server/inference.py``); a second bound here would
-        duplicate that transformation. The chain is bounded structurally
-        instead: it resets on every idle rotation, and retired chain
-        members are dropped by :meth:`_prune_open_for_retired_sessions`.
+        No window is applied here — :data:`MAX_HISTORY_TURNS` (this
+        module's own constant) is applied exactly once, downstream, by
+        each consumer's own read: the local reasoning leg's
+        ``_build_messages`` (``paramem/server/inference.py``) and the
+        external-egress outbound-history gate
+        (``paramem/server/egress.py``'s ``_sanitize_history``); a second
+        bound here would duplicate that transformation. The chain is
+        bounded structurally instead: it resets on every idle rotation,
+        and retired chain members are dropped by
+        :meth:`_prune_open_for_retired_sessions`.
         """
         open_state = self._open.get(conversation_id, {})
         session_id = open_state.get("session_id") or conversation_id
@@ -1396,9 +1397,9 @@ class SessionBuffer:
             payload = json.loads(plaintext.decode())
 
             # Strict (no .get default) on all three keys: a payload missing
-            # any of them is a malformed/pre-this-change snapshot. Raising
-            # here routes into the except below, which unlinks and discards
-            # — the same "corrupted snapshot" disposition, not a new branch.
+            # any of them is a malformed snapshot. Raising here routes into
+            # the except below, which unlinks and discards — the same
+            # "corrupted snapshot" disposition, not a new branch.
             restored_turns = payload["turns"]
             restored_sessions = payload["sessions"]
             restored_open = payload["open"]

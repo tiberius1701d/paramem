@@ -154,9 +154,8 @@ def test_age_seconds_handles_empty():
 def test_vram_low_headroom_age_seconds_is_int():
     """The vram_low_headroom item's age_seconds honors the int contract.
 
-    Regression: it was computed as a raw ``time.time() - observed_at`` float,
-    which violated ``AttentionItem.age_seconds: int | None`` and crashed the
-    integer-only bash arithmetic in the pstatus duration formatter.
+    ``age_seconds`` must be an int, never a float — the pstatus duration
+    formatter performs integer-only arithmetic on this field.
     """
     import time
 
@@ -323,9 +322,9 @@ def test_migration_trial_exception_emits_failed():
 
 def test_base_swap_reload_deferred_emits_paused():
     """A stuck base-swap (reload_deferred) where a reload was attempted and
-    failed must surface a PAUSED item — previously matched no branch and was
-    silent.  Recoverable → action_required, not failed.  The attempted
-    sub-case (cloud_only_reason set) keeps the acquire/auto-reclaim hint.
+    failed must surface a PAUSED item.  Recoverable → action_required, not
+    failed.  The attempted sub-case (cloud_only_reason set) keeps the
+    acquire/auto-reclaim hint.
     """
     state = _trial_state("reload_deferred")
     state["migration"]["trial"]["gates"]["cloud_only_reason"] = "insufficient_vram"
@@ -361,7 +360,7 @@ def test_base_swap_reload_deferred_never_attempted_emits_restart_hint():
 
 def test_base_swap_phase_b_failed_emits_failed():
     """A failed base-swap (phase_b_failed) must surface a FAILED item with the
-    phase named + a rollback hint — previously silent.
+    phase named + a rollback hint.
     """
     state = _trial_state("phase_b_failed")
     state["migration"]["trial"]["gates"]["exception"] = "recall gate miss on semantic"
@@ -931,7 +930,7 @@ def test_token_ratio_drift_silent_when_no_warning_key():
 
 def test_token_ratio_drift_fires_with_configured_and_observed_ratios():
     """A non-empty ``token_ratio_drift_warning`` dict (written by the
-    lifespan's boot-time ``check_ratio_drift`` call, U3) fires exactly one
+    lifespan's boot-time ``check_ratio_drift`` call) fires exactly one
     ``warning`` item naming both ratios (mirrors
     ``_collect_vram_low_headroom_items``'s severity)."""
     state = _live_state(token_ratio_drift_warning={"configured_ratio": 3.4, "observed_ratio": 4.1})
@@ -957,10 +956,8 @@ def test_token_ratio_drift_included_in_collect_attention_items():
 
 # ---------------------------------------------------------------------------
 # paramem.server.app._check_token_ratio_drift — the writer this module's
-# populator reads. Extracted out of the lifespan body into a named,
-# unit-testable function (missing test 4, code review) — see that
-# function's own docstring for why a lifespan-frame local was the wrong
-# home for it.
+# populator reads. A named, unit-testable function; see its own docstring
+# for why a lifespan-frame local cannot host it.
 # ---------------------------------------------------------------------------
 
 

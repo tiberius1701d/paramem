@@ -1,8 +1,8 @@
 """Unit tests for ``paramem.training.thermal_throttle``.
 
-Covers the new thermal-throttle module that ``train_adapter`` installs as a
+Covers the thermal-throttle module that ``train_adapter`` installs as a
 callback when a non-None ``ThermalPolicy`` is supplied. No GPU required:
-``_gpu_temp`` is patched; the throttle no longer touches the GPU lock.
+``_gpu_temp`` is patched; the throttle does not touch the GPU lock.
 """
 
 from __future__ import annotations

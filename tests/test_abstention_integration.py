@@ -3,9 +3,10 @@
 Uses the REAL sanitizer, REAL ``configs/server.yaml``, and REAL
 ``handle_chat`` code path. Only the model, tokenizer, and router are
 stubbed — all three are unreachable on the short-circuit branch, so
-stubbing them does not weaken the test. Validates the exact failure
-mode from 2026-04-21 (user asked "Where do I live?" on an untrained
-adapter, Mistral confabulated "New York City").
+stubbing them does not weaken the test. Pins the self-referential
+personal query ("Where do I live?") against an untrained adapter: the
+model must never be invoked, since an untrained adapter would otherwise
+confabulate a plausible-sounding personal fact.
 
 Distinct from ``test_abstention.py``: those tests patch
 ``is_self_referential`` and use a ``MagicMock`` config to isolate the
@@ -113,9 +114,8 @@ class TestAbstentionEndToEnd:
     def test_where_do_i_live_returns_canned_response(
         self, server_config, empty_adapter_router, exploding_model
     ):
-        """Reproduces the exact bug: untrained adapter + self-referential
-        query. Before the fix: Mistral confabulated "New York City".
-        After the fix: canned abstention response, model never invoked.
+        """A self-referential query against an untrained adapter returns the
+        canned abstention response; the model is never invoked.
         ``empty_adapter_router`` has no keys for this speaker, so the
         cold-start variant fires (rather than the standard ``response``).
         """
@@ -165,7 +165,7 @@ class TestAbstentionEndToEnd:
         still falls through to ``_base_model_answer`` — base model
         general knowledge is a reasonable last resort there, unlike
         personal-data confabulation."""
-        from paramem.server.inference import ChatResult
+        from paramem.server.chat_result import ChatResult
 
         model = MagicMock()
         model.gradient_checkpointing_disable = MagicMock()

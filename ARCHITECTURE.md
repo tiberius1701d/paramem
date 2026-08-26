@@ -145,7 +145,7 @@ sees only anonymized placeholders. Every stage falls forward — a failure at st
 N keeps the predecessor's output and continues.
 
 1. **Extract** (`configs/prompts/extraction.txt`): local model emits triples + entities. The session speaker's stable `speaker{N}` system id is injected as the canonical subject of their facts; the display name is passed as comprehension context only, and a name is substituted for the id only at the reply boundary, when a response is about to be shown or spoken to the user.
-2. **Anonymize** — `configs/prompts/anonymization.txt`, one sectioned prompt home shared by the transcript-bearing session tier, chat egress, and the transcript-free graph tier — via `paramem.cloud.anonymize.anonymize`, the ONE anonymize chain every cloud-bound path composes through: a small, offline, local detection model is the sole classifier against the operator-configured `sanitization.scrub` PII-vocabulary hints — no code-side entity-type gate. One dedicated detection pass over the whole payload marks every value the detector judges an instance of a configured category; the pipeline — never a model — mints every placeholder and builds the `{real → placeholder}` table from the marked values. The pipeline builds the anonymized transcript from that same table by exact, case-sensitive substitution — no model rewrites it, so there is nothing left to verify or re-ask. The chain still builds the anonymized fact array deterministically (one entry per `graph.relations`, `subject`/`object` substituted through the table via an edge-aware, case-sensitive `_substitute_whole_words`, `predicate`/`relation_type`/`confidence` copied verbatim — the predicate is never a substitution target), so a fact can never be lost, reworded, or dropped by the anonymizer, and a placeholder can never be glued into a predicate at this stage. Beyond the operating-budget precondition, the chain fails closed for exactly two causes: the graph tier's own identity-reconciliation guard (only where a node domain is supplied — the detector named real content but nothing survived reconciliation onto the actual node domain), or the detection model being unavailable; callers never fall back to the original real-name transcript on an actual fail-closed verdict. Placeholders follow an **open-vocabulary shape contract** (`^[A-Z][A-Za-z]*_\d+$`) — except the speaker's own `speaker{N}` anchor, which is deliberately exempt (already anonymous, never minted, never re-braced) and can appear as a forward-map value without matching that shape. That fold is conditional, not automatic: on a transcript-bearing call whose detection pass found a tagged person value inside the transcript region, the conversational model that ran extraction is asked one further dedicated question — restricted to those tagged values — deciding whether the `[user]` turn's speaker introduced one of them as their own name ("I'm …" / "my name is …" / "call me …"); when it does, that self-naming value folds onto the speaker's own `speaker{N}` anchor as a forward-map value, scrubbing it from the outbound payload while the anchor stays the one stable handle. Absent a self-introduction, every tagged name becomes an ordinary `Person_N` placeholder, no matter what any fact claims about it.
+2. **Anonymize** — `configs/prompts/anonymization.txt`, one sectioned prompt home shared by the transcript-bearing session tier, chat egress, and the transcript-free graph tier — via `paramem.cloud.anonymize.anonymize`, the ONE anonymize chain every cloud-bound path composes through: a small, offline, local detection model is the sole classifier against the operator-configured `sanitization.scrub` PII-vocabulary hints — no code-side entity-type gate. One dedicated detection pass over the whole payload marks every value the detector judges an instance of a configured category; the pipeline — never a model — mints every placeholder and builds the `{real → placeholder}` table from the marked values. The pipeline builds the anonymized transcript from that same table by exact, case-sensitive substitution — no model rewrites it, so there is nothing left to verify or re-ask. The chain still builds the anonymized fact array deterministically (one entry per `graph.relations`, `subject`/`object` substituted through the table via an edge-aware, case-sensitive `_substitute_whole_words`, `predicate`/`relation_type`/`confidence` copied verbatim — the predicate is never a substitution target), so a fact can never be lost, reworded, or dropped by the anonymizer, and a placeholder can never be glued into a predicate at this stage. Beyond the operating-budget precondition, the chain fails closed for exactly two causes: the graph tier's own identity-reconciliation guard (only where a node domain is supplied — the detector named real content but nothing survived reconciliation onto the actual node domain), or the detection model being unavailable; callers never fall back to the original real-name transcript on an actual fail-closed verdict. Placeholders follow an **open-vocabulary shape contract** (`^[A-Z][A-Za-z]*_\d+$`) — except the speaker's own `speaker{N}` anchor, which is deliberately exempt (already anonymous, never minted, never re-braced) and can appear as a forward-map value without matching that shape. A tagged name links to the speaker's anchor only on evidence: the speaker's own enrolled name links on equality alone, needing no model call; on a transcript-bearing call whose detection pass found a tagged person value inside the transcript region, the conversational model that ran extraction is also asked one further dedicated question — restricted to those tagged values — deciding whether the `[user]` turn's speaker introduced one of them as their own name ("I'm …" / "my name is …" / "call me …"), and a value it confirms folds onto the anchor only when it is consistent with the enrolled name (the enrolled name itself, or an extension/short form of it); a confirmed name that is someone else's (a namesake) is refused. Either way the folded value becomes a forward-map value onto the speaker's own `speaker{N}` anchor, scrubbing it from the outbound payload while the anchor stays the one stable handle. Every other tagged name becomes an ordinary `Person_N` placeholder, no matter what any fact claims about it.
 3. **Entity-surface correction** (`configs/prompts/entity_correction.txt`): the local model reviews real entity surfaces on the anonymization reverse map and node attributes and corrects misspelled place/org/concept names; an apply-gate rejects any proposal targeting an entity not already known, and all verdicts — accepted and rejected — are recorded on `graph.diagnostics["entity_correction_verdicts"]` (persisted as a debug artifact when debug is on). Speaker/person nodes are left untouched.
 4. **Cloud enrichment with delta protocol** (`configs/prompts/cloud_enrichment.txt`): cloud returns a delta envelope `{add, modify, drop, bindings}` — only the changes against the input fact list, plus `bindings: {placeholder: real_name}` for net-new entities. The pipeline applies the delta, merges bindings before de-anonymization, and reconstructs the updated transcript locally. No transcript token-diff and no fact-echo (order-of-magnitude token reduction vs. the prior "echo every fact" envelope). `add`/`modify` entries are restricted to the fields that actually reach a relation (subject/predicate/object/relation_type/confidence/symmetric) — any other key an LLM invents is stripped before the entry enters the pipeline, so it can never later be mistaken for an unresolved placeholder. Rejection is per-action, never whole-delta (2026-07-22 cloud-admission redesign, `_apply_enrichment_delta`): an `add` naming a token neither in the anonymized facts/transcript cloud was shown nor in its own `bindings` (orphan) is dropped; a `modify` whose `fields` would introduce one is discarded and the pre-enrichment fact is kept unchanged instead; `drop` is honored unconditionally. A binding whose key collides with the local map is purely informational (`graph.diagnostics["cloud_binding_collisions"]`) and never a rejection reason — the local value always wins on resolution. Per-cycle counts and the distinct rejected tokens are operator-visible in `graph.diagnostics["cloud_enrichment_report"]` plus a WARNING-level log line.
 5. **De-anonymize** (`_apply_bindings`): the single deanon exit gate, in three ordered steps. First, a **predicate invariant** run BEFORE substitution drops (never repairs) any fact whose `predicate` field contains a token from the declared placeholder vocabulary (the union of the anonymizer's `reverse` map and cloud's `bindings`) — the predicate is never a substitution target, so checking it after substitution would silently miss an already-corrupted predicate. Second, **substitution**: deterministic substring replacement of placeholder tokens with their real values, resolved against an observed-scoped map — the local (real) mapping for tokens cloud was actually shown, cloud's own `bindings` for tokens it minted, with the local mapping always taking precedence on conflict. Third, a **residual sweep** checks every fact field (subject/predicate/object/relation_type/confidence/symmetric — never a non-fact field an LLM invented) against the same declared vocabulary, plus a placeholder-shaped-token regex as a last-resort, fail-closed backstop for an undeclared orphan the vocabulary check can't see; the regex is never load-bearing for resolution or substitution, only for this final net. Both steps are fail-closed (drop, not repair) and both record counters/lists in `graph.diagnostics` (`predicate_placeholder_dropped` / `predicate_placeholder_dropped_facts` for the predicate invariant, written at the deanon stage — a placeholder glued into a predicate can only arrive in cloud's *returned* facts now, since the anonymizer stage never produces facts at all — and `residual_dropped_facts` for the residual sweep) — disjoint categories, never double-counted.
@@ -396,7 +396,7 @@ abstention response instead of risking a confabulated or
 leaked answer; a personal declarative still reaches the
 normal cloud-egress sanitization every other leg applies.
 
-### AD-21: One Cloud Master Switch, One Personal Verdict, One Egress Funnel
+### AD-21: One Cloud Master Switch, One Personal Verdict, One External-Egress Primitive
 
 **One switch.** `cloud.enabled` (`CloudConfig`) is the single on-off for all
 cloud egress: the conversation agent, the per-session extraction enrichment
@@ -432,8 +432,9 @@ what to DO about a personal verdict is the caller's decision. Self-referential
 history turns are always dropped from a cloud payload, never
 warned-and-passed.
 
-**The verdict gates cloud, not HA.** HA is local and stays reachable as a
-tool fallback on every path.
+**The verdict gates the cloud leg, not HA.** The HA leg stays reachable on
+every path and is scrubbed under `sanitization.scrub` regardless of the
+verdict.
 
 **The forwarded query is a distinct artifact.** The text after `[ESCALATE]`
 is authored by the local model after it has recalled facts from parametric
@@ -453,18 +454,26 @@ to either the local or the relay leg, so nothing a client
 sends can inject fabricated turns into the context a reply is
 built from or a cloud payload carries.
 
-**One egress funnel.** `answer_via_cloud` is the sole cloud-egress entry
-point, in both local and cloud-only mode; `cloud_mode`
-(`block`/`anonymize`/`both`) applies through it. Forced routing
-(`route=cloud:<provider>`) selects the provider, not a policy bypass. The
-funnel branches on one question — can the local model anonymize? In local mode
-it can, and the `cloud_mode` policy runs. In cloud-only mode there is no local
-model: the memory store is absent, no ParaMem-held knowledge can reach the
-cloud by any path, and the current turn egresses verbatim only if the operator
-has permitted the cloud leg. Cloud-only is therefore honestly a plain cloud
-agent — no intent classification, no personal-referent gate, no anonymization
-— gated by the master switch and the degraded-serving decision, not by
-`cloud_mode`.
+**One external-egress primitive, two doors.** Both external legs — HA and
+cloud — share one scrub primitive and one exit gate, with different
+policies: the cloud door applies `cloud_mode` (`block`/`anonymize`/`both`)
+exactly as configured; the HA door scrubs always, refuses only on its own
+three causes, and is never closed by the personal verdict. Each door reads
+the same per-outbound-text object built once per turn, so an HA-miss →
+cloud-fallback turn is scrubbed once, not twice. Forced routing is a probe
+facility on the operator-only `/debug/probe` door (`route`: `"ha"`,
+`"cloud"`, or `"cloud:<provider>"`), never a `/chat` field — selecting a
+leg there is never a policy bypass: `cloud_mode`, the personal verdict, and
+`cloud_permitted` all apply exactly as on the routed path. The cloud door
+applies `cloud_mode` in every residency state: a cloud-only deferral
+never bypasses the policy — a personal query is still refused under
+`block`/`both`, and outbound text is still scrubbed under `anonymize`/`both`.
+The only residency-dependent step is the self-introduction question, which
+needs the local model — the link for the speaker's own enrolled name folds on
+name equality alone and is unaffected by residency. On a cloud-only deferral the memory store is absent, so no
+ParaMem-held knowledge can reach the cloud by any path regardless of policy —
+only the current turn's own text is ever in scope. Degraded serving (below)
+still decides whether the cloud leg is reachable at all.
 
 **Degraded serving is an explicit operator decision.**
 `cloud.allow_degraded_serving` (default `false`) gates the cloud leg when the
@@ -482,9 +491,12 @@ never written to the session buffer and so never able to reach a training
 transcript.
 
 **The HA agent must be local.** `ha_agent_id` names the leg that stays open
-when the cloud leg is closed, and ParaMem sends it cleartext. Pointing it at
-a cloud-backed HA conversation agent re-opens cloud egress one hop away,
-outside every switch above.
+when the cloud leg is closed. The HA hop is scrubbed like the cloud hop, and
+the reply is restored through the same exit gate — but the local-agent
+requirement stands for a different reason: pointing `ha_agent_id` at a
+cloud-backed HA conversation agent forwards the household's turns to a third
+party outside every switch above, regardless of how well the payload itself
+is scrubbed.
 
 ### AD-18: Multi-Engine Multilingual TTS
 
@@ -501,7 +513,7 @@ Language detection flows from two sources, both feeding the same resolver in `/c
 - **Voice path:** Whisper STT → `TranscriptionResult.language` → `_state["latest_language_detection"]` → `/chat` handler.
 - **Text path:** fastText `lid.176` (`paramem/server/lang_id.py`) eager-loaded at server lifespan startup when `text_lang_detection.enabled`. Invoked on the request text only when no STT-derived signal is present and the request carries no voice embedding. CPU-only, zero VRAM cost; fetched once via `scripts/setup/download-langid-model.sh` into `~/.cache/paramem/lang_id/`. Disabled by default in the example config so deployments without the model file do not warn.
 
-`_language_instruction()` injects "Respond in {language}" into system prompts for non-English input. Speaker profiles persist `preferred_language` for cross-session consistency on the voice path.
+`paramem.server.prompts.language_instruction()` injects "Respond in {language}" into system prompts for non-English input. Speaker profiles persist `preferred_language` for cross-session consistency on the voice path.
 
 **Transport-agnostic STT/embedding seam.** STT transcription and optional voice-embedding extraction are factored into `process_utterance` (`paramem/server/voice_pipeline.py`), called by both the Wyoming satellite handler and the `POST /voice` endpoint. The two callers differ only in how they establish speaker identity:
 

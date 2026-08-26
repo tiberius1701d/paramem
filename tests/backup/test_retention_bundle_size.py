@@ -5,9 +5,9 @@ correctly sizes slots whose payload files live in subdirectories, as is the
 case for ``snapshot_bundle`` slots that store adapter weights under
 ``adapters/<tier>/adapter_model.safetensors``.
 
-``_slot_size_bytes`` used to iterate only top-level files (``iterdir()``)
-and returned ~0 for bundle slots, silently bypassing the disk cap and
-retention rules.
+``_slot_size_bytes`` walks a slot directory recursively, so a slot whose
+payload files live under nested subdirectories is sized by the sum of every
+file at every nesting level, not just the top-level files.
 """
 
 from __future__ import annotations
@@ -103,11 +103,11 @@ class TestSlotSizeBytesRecursive:
         assert total == 1200
 
     def test_bundle_slot_with_subdir_files_sized_correctly(self, tmp_path) -> None:
-        """A bundle slot with large file in subdir is sized correctly.
+        """A bundle slot with a large file in a subdirectory is sized correctly.
 
-        Before the fix: _slot_size_bytes returned only the size of
-        bundle.meta.json (the only top-level file), ignoring the subdirs.
-        After the fix: it recursively counts all files.
+        The total includes every file under ``adapters/<tier>/`` and other
+        nested subdirectories, not just top-level files such as
+        ``bundle.meta.json``.
         """
         adapter_size = 80_000  # 80 KB simulating weight bytes
         slot = _make_bundle_slot(tmp_path / "bundle_slot", adapter_size_bytes=adapter_size)

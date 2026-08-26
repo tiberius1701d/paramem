@@ -82,7 +82,7 @@ class TestDataModel:
 
 
 class TestCleanupPartialSlotsUnparseableManifest:
-    """Per the ruled fail-loud design: only a slot with meta.json ABSENT (or
+    """Under the fail-loud design: only a slot with meta.json ABSENT (or
     a readable manifest missing its own kind's payload file) is scratch.  A
     slot whose meta.json is PRESENT but fails to parse (e.g. prior schema)
     is NOT scratch -- nothing here repairs or deletes it; it is left in
@@ -277,11 +277,11 @@ class TestIntegrityReportsOnePayloadRowPerTierBothVenues:
 
 class TestPayloadRowConsultsTheBindingFirstInBothVenues:
     """A non-VERIFIED binding must report ``payload: inconsistent`` in
-    EITHER venue -- before this fix the simulate arm called ``_check_graph``
-    unconditionally, so a corrupted-but-still-PARSEABLE graph.json on a tier
-    whose binding was PAYLOAD_MISMATCH (digest disagreement) reported
-    ``payload: ok``, while the train-venue equivalent correctly reported
-    ``inconsistent`` for the identical binding status."""
+    EITHER venue: the payload row for a simulate-kind tier consults the
+    binding before checking the graph, so a corrupted-but-still-PARSEABLE
+    graph.json on a tier whose binding is PAYLOAD_MISMATCH (digest
+    disagreement) reports ``inconsistent``, the same as the train-venue
+    equivalent for an identical binding status."""
 
     def test_a_payload_mismatch_binding_reports_inconsistent_in_the_simulate_venue(
         self, tmp_path: Path

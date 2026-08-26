@@ -285,7 +285,7 @@ class TestConsolidationLoopStoreOverride:
     def test_run_stage_b_cycle_default_store_is_none(self, monkeypatch) -> None:
         """The three ordinary Stage-B entry points never pass ``store=`` —
         the default ``None`` reaches ``get_or_create_consolidation_loop``
-        unchanged, preserving today's behaviour."""
+        unchanged."""
         import paramem.server.app as app_module
 
         seen_stores: list = []
@@ -634,7 +634,7 @@ def _make_arbitrator_state(
 def _make_interim_slot(adapter_dir, stamp: str, *, payload: str | None) -> None:
     """Create ``episodic/interim_<stamp>/`` with (or without) a venue payload.
 
-    Both venues now write into a timestamped slot SUBDIRECTORY carrying its
+    Both venues write into a timestamped slot SUBDIRECTORY carrying its
     own ``meta.json`` (the uniform slot-candidate shape ``count_slot_candidates``
     checks) -- a bare payload file at the interim dir root, or a payload
     directory with no ``meta.json``, is invisible to the content gate.
@@ -819,11 +819,11 @@ class TestConsolidationArbitrator:
     ) -> None:
         """N=0, scheduled tick, ZERO pending sessions → noop, no executor submission.
 
-        The regression test for the defect this gate exists to fix: at
-        max_interim_count==0 ``_is_full_cycle_due`` is unconditionally True, so
-        every scheduled tick used to retrain every main tier with nothing new to
-        learn.  Asserting the status alone is not enough — the load-bearing
-        assertion is that NOTHING was submitted to the executor.
+        At max_interim_count==0, ``_is_full_cycle_due`` is unconditionally
+        True, so the content gate is what prevents a scheduled tick from
+        retraining every main tier with nothing new to learn.  Asserting
+        the status alone is not enough — the load-bearing assertion is that
+        NOTHING was submitted to the executor.
         """
         from paramem.server.app import ConsolidationAction
 
@@ -844,10 +844,9 @@ class TestConsolidationArbitrator:
         """N=0, scheduled tick, only UNIDENTIFIABLE sessions pending → noop_no_named,
         no executor submission, AND the sessions are retired.
 
-        At max_interim_count==0 the interim path never runs, so nothing else
-        retires UNIDENTIFIABLE/expired-HOLDABLE sessions; before the triage
-        pre-stage existed they accumulated in the buffer forever.  This is the
-        regression test for that leak.
+        At max_interim_count==0 the interim path never runs, so the triage
+        pre-stage is what retires UNIDENTIFIABLE/expired-HOLDABLE sessions —
+        without it they would accumulate in the buffer forever.
         """
         from paramem.server.app import ConsolidationAction
 
@@ -1527,8 +1526,8 @@ class TestStampPredicate:
 # only non-calendar-exact ("heartbeat") ones. TestSchedulerCatchUpGate in
 # tests/test_consolidation.py covers the same contract for non-exact
 # cadences ("every 5h"); this class exercises it for a calendar-exact
-# cadence ("12h", the server.yaml default) to prove the gate is now
-# universal rather than a heartbeat-only special case.
+# cadence ("12h", the server.yaml default) to prove the gate is universal
+# rather than a heartbeat-only special case.
 # ---------------------------------------------------------------------------
 
 
@@ -1551,8 +1550,8 @@ class TestUniversalCatchUpGate:
     ) -> None:
         """Calendar-exact '12h' with no stamp on disk → noop_scheduler_seeded,
         the stamp file is created, and nothing is submitted — the same
-        seed-and-noop contract non-exact cadences have always had, now
-        applying to an exact cadence too.
+        seed-and-noop contract non-exact cadences have always had, applying
+        to an exact cadence too.
         """
         from paramem.server.app import ConsolidationAction
         from paramem.server.schedule_state import read_last_scheduled_run
@@ -1865,19 +1864,19 @@ class TestConsolidationRoutes:
 
 
 class TestCalibrateRespondRouteDoesNotDeferOnItself:
-    """Regression: ``POST /calibrate/respond`` must not self-defer via the
-    arbitrator's own idle debounce.
+    """``POST /calibrate/respond`` must not self-defer via the arbitrator's
+    own idle debounce.
 
-    The route used to stamp ``_state["last_chat_monotonic"]`` (the marker
-    that protects a LIVE chat turn from a fold seizing the GPU seconds
-    later) before dispatching itself — so the idle-debounce check always
-    read an elapsed time of ~0s and answered ``deferred_idle`` on every
-    call, regardless of the debounce window.  A calibration probe of the
-    serving path is not a live turn; the fix is to never stamp the marker
-    from this route.  Runs the REAL arbitrator (``_route_client`` stubs
-    only the executor submission) against ``tests/fixtures/server.yaml``'s
-    real ``consolidation.training_idle_debounce_s`` (30s) — a MagicMock
-    config would risk masking the exact arithmetic the bug lived in.
+    The route must never stamp ``_state["last_chat_monotonic"]`` (the
+    marker that protects a LIVE chat turn from a fold seizing the GPU
+    seconds later) as a side effect of dispatching itself -- doing so
+    would make the idle-debounce check read an elapsed time of ~0s and
+    answer ``deferred_idle`` on every call, regardless of the debounce
+    window.  A calibration probe of the serving path is not a live turn.
+    Runs the REAL arbitrator (``_route_client`` stubs only the executor
+    submission) against ``tests/fixtures/server.yaml``'s real
+    ``consolidation.training_idle_debounce_s`` (30s) rather than a
+    MagicMock config, so the debounce arithmetic is exercised for real.
     """
 
     def _state(self, tmp_path, monkeypatch):
@@ -1898,9 +1897,8 @@ class TestCalibrateRespondRouteDoesNotDeferOnItself:
         return state
 
     def test_started_calibration_when_last_chat_monotonic_is_none(self, tmp_path, monkeypatch):
-        """No prior chat turn at all — the ordinary case, and the one the
-        bug broke: the route's own self-stamp made even a fresh server
-        defer its first /calibrate/respond call."""
+        """No prior chat turn at all: a fresh server's first
+        /calibrate/respond call must still start."""
         state = self._state(tmp_path, monkeypatch)
         assert state["last_chat_monotonic"] is None
 
@@ -1912,17 +1910,16 @@ class TestCalibrateRespondRouteDoesNotDeferOnItself:
         assert body["status"] == "started_calibration"
         assert body["action"] == "calibrate"
         assert len(submitted) == 1
-        # The bug's own signature: the route must not have stamped the
-        # marker as a side effect of this call.
+        # The route must not have stamped the marker as a side effect of
+        # this call.
         assert state["last_chat_monotonic"] is None
 
     def test_still_defers_on_a_genuinely_recent_unrelated_chat_turn(self, tmp_path, monkeypatch):
-        """The debounce itself is unchanged and still protects a genuinely
-        recent LIVE ``/chat`` turn from any GPU-seizing dispatch, calibrate
-        included — the fix is narrowly "this route does not stamp the
-        marker ITSELF", not "this route is exempt from the debounce".  A
-        marker set moments ago by something else (a real chat turn) must
-        still defer this call."""
+        """The debounce still protects a genuinely recent LIVE ``/chat``
+        turn from any GPU-seizing dispatch, calibrate included — this route
+        does not stamp the marker ITSELF, but is not exempt from the
+        debounce.  A marker set moments ago by something else (a real chat
+        turn) must still defer this call."""
         state = self._state(tmp_path, monkeypatch)
         state["last_chat_monotonic"] = time.monotonic()  # a real turn, "just now"
 
@@ -2233,8 +2230,8 @@ class TestFullConsolidationFoldEntry:
     def test_empty_tiers_rebuilt_is_a_noop_terminal(self, monkeypatch, tmp_path) -> None:
         """tiers_rebuilt == [] ends the cycle as a noop for every caller.
 
-        The flag that used to exempt the on-demand fold from this guard is gone:
-        an empty rebuild is a noop no matter who dispatched it, and the
+        An empty rebuild is a noop no matter who dispatched it -- there is
+        no on-demand-fold exemption from this guard -- and the
         ``consolidating`` flag is cleared on the way out.
         """
         state = _make_dispatch_state(tmp_path=tmp_path)
@@ -2380,9 +2377,9 @@ class TestFinalizeFullAbortedResume:
     def test_completed_full_still_records_full_trained_and_resolves(
         self, monkeypatch, tmp_path
     ) -> None:
-        """Control: a completed (non-aborted) result keeps the pre-fix
-        behavior -- outcome ``full_trained``, ``last_consolidation`` stamped,
-        incidents resolved."""
+        """Control: a completed (non-aborted) result records outcome
+        ``full_trained``, stamps ``last_consolidation``, and resolves
+        incidents."""
         import paramem.server.app as app_module
         from paramem.server.incidents import read_incidents, record_incident
         from paramem.server.run_status import read_last_runs
@@ -2510,7 +2507,7 @@ class TestFinalizeInterimAbortedGating:
         )
 
     def test_completed_interim_still_resolves_training_crash(self, monkeypatch, tmp_path) -> None:
-        """Control: a completed interim result keeps the pre-fix behavior."""
+        """Control: a completed interim result resolves the training_crash incident."""
         import paramem.server.app as app_module
         from paramem.server.incidents import read_incidents, record_incident
 
@@ -2552,10 +2549,7 @@ class TestFinalizeInterimAbortedGating:
 # _dispatch_consolidation / _dispatch_resume.  Every dispatch that finds a
 # pending ledger resumes and finishes THAT event before any new one starts,
 # regardless of which action was requested; the resumed action is read off
-# the ledger head, never the request.  _dispatch_resume itself carried zero
-# test references before this class (verified: only _run_pending_event_resume
-# -- reached through it -- was exercised, by tests/test_fold_crash_resume.py,
-# and only by calling it directly, never through the arbitrator).
+# the ledger head, never the request.
 # ---------------------------------------------------------------------------
 
 
@@ -2888,13 +2882,7 @@ class TestResumeArbitrationMatrix:
 # Each door's own five BUSY arms (consolidating / bg-training / cloud-only /
 # trial-active / base-swap-active) live with that door's own test file; this
 # class pins the SIXTH, pending-record arm across all five doors in one
-# place, since ``/admin/assign-orphans`` had no behavioural test at all
-# before this (verified: only route-table/auth introspection exists in
-# ``tests/server/test_require_admin.py``) and neither
-# ``tests/server/test_speaker_forget.py`` nor
-# ``tests/server/test_debug_erase_keys_endpoint.py`` exercised this arm
-# (verified: no ``deferred_event_pending`` / ``consolidation_pending``
-# reference in either file).
+# place.
 # ---------------------------------------------------------------------------
 
 
@@ -3070,8 +3058,7 @@ class TestRetroClaimRunsForEveryAction:
         assert spy.call_count == 1
 
     def test_retro_claim_runs_for_a_staging_action_too(self, tmp_path, monkeypatch) -> None:
-        """Control: retro-claim already ran for staging actions before this
-        change; still true."""
+        """Control: retro-claim runs for staging actions too."""
         from paramem.server.consolidation_action import ConsolidationAction
 
         state = _make_arbitrator_state(tmp_path, max_interim_count=7, named_sessions=1)

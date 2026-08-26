@@ -86,10 +86,9 @@ def _make_bare_loop(tmp_path: Path) -> ConsolidationLoop:
         "procedural": MagicMock(),
     }
     # Real dict mutation on delete -- makes "transient slot deleted/not
-    # deleted" assertions meaningful: the prior fake create_adapter never
-    # registered the transient name, so with a MagicMock delete_adapter
-    # that does nothing either, those assertions passed whether or not the
-    # cleanup code ran at all.
+    # deleted" assertions meaningful: a MagicMock delete_adapter that does
+    # nothing would let those assertions pass whether or not the cleanup
+    # code ran at all, so the fake must mutate peft_config for real.
     loop.model.delete_adapter.side_effect = lambda name: loop.model.peft_config.pop(name, None)
     # Real active_adapter mutation on switch -- drop_adapter_slot re-checks
     # active_adapter_name(model) after its switch attempt (treats a switch
@@ -436,8 +435,7 @@ class TestResolveDonorCheckpoint:
     resolution and gating logic.
 
     Donor resolution is the unconditional standard mechanism (no feature
-    flag -- the prior donor_seeding_enabled flag was retired once the
-    validation arms passed; see benchmarking.md). This method resolves and
+    flag; see benchmarking.md). This method resolves and
     validates a checkpoint directory -- it copies NOTHING; the copy into the
     transient staging slot, and the load-failure degrade, are
     ``train_adapter``'s own job (see ``tests/test_staging_adapter.py``'s

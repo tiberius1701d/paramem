@@ -38,7 +38,6 @@ logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Shape-agnostic SimHash constants and helpers
-# (relocated from paramem.training.indexed_memory on 2026-05-20)
 # ---------------------------------------------------------------------------
 
 SIMHASH_BITS = 64
@@ -99,10 +98,6 @@ def _clean_generation_artifacts(text: str) -> str:
     Some instruct models (notably Gemma 2) inject ``**`` bold markers and
     excess newlines into generated JSON, breaking structure.  This cleans
     the text before JSON parsing.
-
-    NOTE: Artifact patterns may evolve across reinforcement/consolidation
-    cycles as the model retrains on its own output.  Monitor parse failure
-    rates across cycles and extend patterns here if new artifacts emerge.
 
     Args:
         text: Raw model output string.
@@ -355,12 +350,11 @@ def compute_simhash(
     case never reaches the fingerprint; what this narrower fold preserves over
     ``mode="full"`` is the diacritic/NFC distinction — ``"café"`` and
     ``"cafe"`` still hash differently, while only a ``_``/space difference
-    (always the same fact) is merged. This is NOT the full ``canonical()`` fold
-    that once ran here and was removed — that one also folded
-    diacritics/whitespace, which desynced the fingerprint against a raw
-    registry; the spaces-only fold is narrower and applied identically by both
-    callers, so a fingerprint computed at registration still matches the one
-    recomputed from a correct recall.
+    (always the same fact) is merged. Folding diacritics/whitespace as well
+    would desync the fingerprint against a raw registry; the spaces-only
+    fold is narrower and applied identically by both callers, so a
+    fingerprint computed at registration still matches the one recomputed
+    from a correct recall.
 
     Uses unigram+bigram feature tokenization and a bit-vote algorithm. The key is
     included so that identical triple content under different keys produces
@@ -592,8 +586,8 @@ def entry_fact_text(entry: dict) -> str:
     * ``predicate`` is stored in **identity form**, which is already
       space-form (``canonical``'s blank fold collapses ``_``/whitespace to a
       single space, e.g. ``"has sister-in-law"``), so it is used directly —
-      no ``_``→space substitution happens here any more.  ``-`` is not a
-      blank and was never touched.
+      no ``_``→space substitution happens here.  ``-`` is not a blank and
+      is left untouched.
 
     Used by inference consumers so string construction stays in the probe
     layer — callers read ``result["fact_text"]``.

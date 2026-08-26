@@ -14,12 +14,14 @@ imports the other), which are in turn imported by this module. Nothing
 downstream of this module ever needs to be imported back into
 ``extractor.py``, ``stage_anonymize.py`` or ``stage_enrich.py``.
 
-Each stage body below is a VERBATIM lift of the corresponding block that
-used to live inline in ``extractor.extract_graph`` (``local_extract``,
-``second_order_extract``) or in the tail of ``extractor._cloud_pipeline``
-(``deanonymize``, ``rebuild``) — same primitives, same arguments, same
-``phase_trace`` scopes. ``run_flow`` does not open phases itself; every
-``phase_trace`` call below is exactly the one the imperative version made.
+Each stage body below composes the graph-extraction primitives in
+``paramem.graph.extractor`` directly — ``local_extract`` and
+``second_order_extract`` call the local-extraction primitive;
+``deanonymize`` and ``rebuild`` call the deanonymization/rebuild
+primitives — same primitives, same arguments, same ``phase_trace``
+scopes those primitives declare on their own. ``run_flow`` does not open
+phases itself; every ``phase_trace`` call below belongs to the stage
+body that makes it.
 
 ``anonymize_turn`` lives here rather than in ``extractor.py`` for the
 same reason as the rest of this module: per
@@ -30,12 +32,13 @@ primitive and :func:`~paramem.cloud.anonymize.anonymize` is the shared
 component every cloud-egress path composes through — so
 ``anonymize_turn``, the conversation-egress composition of that shared
 component, belongs at the flow layer rather than with the primitives.
-Its callers are ``paramem/server/inference.py`` and
+Its callers are ``paramem/server/egress.py`` and
 ``scripts/dev/calibrate_cloud_anonymizer.py``.
 """
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import logging
 from collections.abc import Sequence
@@ -355,20 +358,19 @@ def _stage_deanonymize(ctx: StageContext, state: StageState) -> StageState:
        ``predicate_placeholder_dropped``/``residual_dropped`` (step 1's
        two loss counters) are written unconditionally.
 
-    The mid-stage ``chain_stopped()`` check after the ``deanon`` phase is
-    the one the imperative version made: a calibration caller stopping at
-    ``deanon`` must not get the judge.
+    The mid-stage ``chain_stopped()`` check after the ``deanon`` phase
+    exists so a calibration caller stopping at ``deanon`` does not get
+    the judge.
     """
     graph = state.graph
     scope = state.scope
     facts = state.facts
     empty_cause = state.empty_cause
 
-    # THE ONE call to ``deanonymize_facts`` for this response (the
-    # ``cloud_enrich`` phase's own call was retired along with the
-    # whole-delta totality gate — see
-    # ``paramem.graph.extractor._apply_enrichment_delta``, which now
-    # decides per-triple resolvability before this stage ever runs).  This
+    # THE ONE call to ``deanonymize_facts`` for this response —
+    # ``paramem.graph.extractor._apply_enrichment_delta`` decides
+    # per-triple resolvability before this stage ever runs, so there is no
+    # earlier ``deanonymize_facts`` call to duplicate this one.  This
     # call is where the actual substitution happens: whatever survived to
     # this point (post per-triple accept/drop/revert AND post anon-stage
     # plausibility, if it ran) has its placeholders resolved to real
@@ -622,10 +624,9 @@ SESSION_EXTRACT: list[StageSpec] = [
         # Every exit that does NOT reach the hand-over point leaves
         # ``facts`` empty: the unsupported-provider and missing-config
         # bails, and the "nothing survived the anon-stage judge" exit
-        # (which clears the graph itself before returning). These used
-        # to be a plain ``return graph`` from the middle of one long
-        # function; here they stop the walk so the tail siblings never
-        # run on a state that was never produced.
+        # (which clears the graph itself before returning). Each one
+        # stops the walk here so the tail siblings never run on a state
+        # that was never produced.
         terminal_when=lambda s: not s.facts,
     ),
     StageSpec(
@@ -650,7 +651,7 @@ SESSION_EXTRACT: list[StageSpec] = [
         stage="rebuild",
         # Pure post-processing plus the recovery action — no LLM phase of
         # its own. The fallback's plausibility call runs outside any
-        # phase_trace scope, as it did before this runner existed.
+        # phase_trace scope.
         trace_names=(),
         run=_stage_rebuild,
         requires=frozenset({"graph", "facts", "scope", "original_relation_count", "empty_cause"}),
@@ -822,7 +823,7 @@ def extract_graph(
     # paramem.graph.stage_anonymize / paramem.graph.stage_enrich) for the
     # per-phase bodies. This function's job is: build the run-constant StageContext
     # once, seed the initial StageState, walk the flow, and keep the
-    # extraction_trace lifecycle (open/attach) exactly as before.
+    # extraction_trace lifecycle (open/attach) around the whole walk.
     with extraction_trace() as trace:
         # A calibration caller entering the chain past ``local_extract``
         # supplies, via :func:`~paramem.graph.phase_trace.start_at`, the graph
@@ -830,9 +831,9 @@ def extract_graph(
         # With no such request open — every production call — ``chain_seed()``
         # is ``None`` and the chain starts from a fresh empty graph.  This is
         # the injected GRAPH; keep it DISTINCT from the sampling ``seed`` (an
-        # int forwarded verbatim to every ``generate_answer`` via ``ctx.seed``).
-        # They shared one name until 2026-07-23, which fed a ``SessionGraph``
-        # into ``int(seed)`` the moment a caller injected a graph.
+        # int forwarded verbatim to every ``generate_answer`` via ``ctx.seed``)
+        # — sharing one name would feed a ``SessionGraph`` into ``int(seed)``
+        # the moment a caller injected a graph.
         injected_graph = chain_seed()
         state = StageState(
             graph=SessionGraph(
@@ -915,10 +916,17 @@ def anonymize_turn(
 
     This path passes no facts - ``facts=[]`` - the anonymize chain's
     documented shape for "transcript but no facts" (chat egress). No
-    local extraction runs here: the earlier design ran a full local
-    extraction pass solely to anchor the anonymizer's self-introduction
-    question with entity spans, a job the span tagger now performs
-    directly against the tagged payload.
+    local extraction runs here: the span tagger anchors the anonymizer's
+    self-introduction question with entity spans directly against the
+    tagged payload.
+
+    ``model`` / ``tokenizer`` may be ``None`` - a cloud-only deferral
+    (base model not resident), never a configuration. ``None`` selects
+    only the anonymize chain's own ANCHOR gate
+    (:func:`~paramem.cloud.anonymize.anonymize`) - the tagger scan and
+    the rest of the chain run identically either way. The adapter-off
+    scope below is entered only when a model is present, since it is a
+    property of the resident PEFT model.
 
     ``categories`` is the resolved scrub-category tuple
     (``SanitizationConfig.scrub_categories``) - the tagger's configured
@@ -935,8 +943,10 @@ def anonymize_turn(
     default: this is a VRAM-safety-critical parameter by the same
     standard as ``categories`` above, and an unbudgeted anonymize call is
     a defect to trace, not a value to fall back on silently. Production's
-    only caller, :func:`~paramem.server.inference.answer_via_cloud`,
-    sources it from ``config.consolidation.extraction_anonymize_token_envelope``
+    only caller, :meth:`~paramem.server.egress.OutboundText.contract`
+    (read by both :func:`~paramem.server.egress.answer_via_ha` and
+    :func:`~paramem.server.egress.answer_via_cloud`), sources it from
+    ``config.consolidation.extraction_anonymize_token_envelope``
     - the one operator envelope value that also sizes session-tier
     extraction and graph-tier enrichment (:data:`_DEFAULT_ANONYMIZER_TOKEN_ENVELOPE`
     remains the module default for those other paths' own signatures; it
@@ -996,10 +1006,15 @@ def anonymize_turn(
     model_facing_transcript = format_turn("user", transcript)
 
     # The ANCHOR call inside ``anonymize`` is structured extraction and
-    # must run on the base weights, never the training-active adapter.
-    # This scope disables the adapter and keeps the KV cache live for
+    # must run on the base weights, never the training-active adapter -
+    # but only when a model is actually resident: on a cloud-only
+    # deferral (model=None) there is no adapter to disable and no KV
+    # cache to keep live, and base_model_inference raises on a non-PeftModel,
+    # so the scope must not be entered at all. When a model IS present,
+    # this scope disables the adapter and keeps the KV cache live for
     # that generate, restoring the model's entry state on exit.
-    with base_model_inference(model):
+    scope = base_model_inference(model) if model is not None else contextlib.nullcontext()
+    with scope:
         payload = anonymize(
             [],
             model,

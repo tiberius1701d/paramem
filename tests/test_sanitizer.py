@@ -4,13 +4,12 @@
 about the speaker themselves.  Detection is two-tier: an encoder-based
 classifier when ``personal_referent_config`` is supplied, falling back to
 an explicit first-person token set.  There is no static keyword list for
-personal *content* — that arm was removed; self-reference is the only
-signal this module contributes to the ``is_personal`` verdict.
+personal *content*; self-reference is the only signal this module
+contributes to the ``is_personal`` verdict.
 
-Re-spec (speakerless-serving boundary decision): the predicate is
-content-only now — it takes no ``speaker_id`` and has no null-target gate.
-The former ``bool(speaker_id) and ...`` gate is deleted; a caller decides
-separately whether a resolved speaker exists to apply the verdict to (see
+The predicate is content-only: it takes no ``speaker_id`` and gates on
+nothing but the text.  A caller decides separately whether a resolved
+speaker exists to apply the verdict to (see
 ``paramem.server.inference.handle_chat``'s speaker-present contract).
 """
 
@@ -28,10 +27,9 @@ from paramem.server.sanitizer import is_self_referential
 class TestFirstPersonResolution:
     """First-person pronouns are classified from content alone.
 
-    The interrogative-vs-declarative split that used to live here was
-    removed once ``Intent`` + ``_is_interrogative`` in inference.py
-    took over as the routing signals; the sanitizer now emits a single
-    boolean verdict for both shapes.
+    Routing on the interrogative-vs-declarative distinction is
+    ``Intent`` + ``_is_interrogative`` in inference.py's responsibility;
+    the sanitizer emits a single boolean verdict for both shapes.
     """
 
     def test_question_is_self_referential(self):
@@ -122,7 +120,7 @@ class TestFirstPersonResolution:
 
 
 class TestSelfReferentialPredicateIsUnconditional:
-    """``sanitization.mode`` (off/warn/block) is deleted.
+    """There is no ``sanitization.mode`` (off/warn/block) policy knob.
 
     Detection always runs and always reports; the caller owns what to do
     about a personal verdict.

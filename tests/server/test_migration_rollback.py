@@ -331,7 +331,7 @@ class TestRollbackHappyPath:
     def test_rollback_archive_slot_has_no_graph_subdir(self, client, state, tmp_path):
         """Rotation slot must NOT contain a 'graph/' subdirectory after rollback.
 
-        The trial graph is no longer archived — it is deleted post-rollback.
+        The trial graph is deleted post-rollback, not archived.
         """
         resp = client.post("/migration/rollback")
         assert resp.status_code == 200
@@ -468,7 +468,7 @@ class TestRollbackRejectsUnbootableBackup:
         assert fresh["migration"]["state"] == "TRIAL"
 
     def test_bootable_a_config_still_restores(self, tmp_path, monkeypatch):
-        """Control: a bootable A config restores exactly as before this change."""
+        """Control: a bootable A config restores normally."""
         fresh = _make_state(tmp_path)  # default _A_YAML is bootable
         monkeypatch.setattr(app_module, "_state", fresh)
         monkeypatch.setattr(app_module, "_apply_config_live", _default_apply_stub_rollback())
@@ -704,7 +704,7 @@ class TestRollbackStep6Failure:
 
 
 # ---------------------------------------------------------------------------
-# Sidecar-vs-artifact regression — rollback restores original A bytes (not the sidecar)
+# Rollback restores original A bytes via the real artifact, never the sidecar
 # ---------------------------------------------------------------------------
 
 
@@ -712,10 +712,10 @@ class TestRollbackRestoresOriginalBytesViaRealWriter:
     """Verify that rollback restores the exact pre-confirm config bytes when the
     A-config backup slot was created by the real backup.write() call path.
 
-    Regression: on some filesystems ``iterdir`` returns the sidecar
-    ``config-<ts>.meta.json`` before the real artifact, causing rollback to
-    overwrite configs/server.yaml with the 415-byte sidecar JSON instead of
-    the real config artifact.
+    A backup slot holds both the config artifact and its
+    ``config-<ts>.meta.json`` sidecar, and ``iterdir`` order is not
+    guaranteed -- rollback must select the real artifact file regardless of
+    iteration order, never the sidecar JSON.
     """
 
     def test_rollback_restores_a_config_bytes_via_real_writer(self, tmp_path, monkeypatch):
@@ -834,14 +834,13 @@ class TestRollbackRestoresOriginalBytesViaRealWriter:
             f"Rollback restored wrong content.  "
             f"Expected A config ({len(a_bytes)} bytes), got {len(restored)} bytes.  "
             f"First 100 chars: {restored[:100]!r}.  "
-            "Sidecar-vs-artifact regression: sidecar JSON was restored instead of "
-            "the config artifact."
+            "Rollback must select the real config artifact, never the "
+            "config-<ts>.meta.json sidecar."
         )
 
 
 # ---------------------------------------------------------------------------
-# Encrypted-artifact regression — rollback must decrypt encrypted A-config artifact
-# (artifact-selection fix correctly picks the artifact, exposing missing decrypt step)
+# Rollback must decrypt an encrypted A-config artifact before restoring it
 # ---------------------------------------------------------------------------
 
 
@@ -849,9 +848,10 @@ class TestRollbackDecryptsEncryptedArtifact:
     """Verify that rollback decrypts the A-config artifact when the daily
     identity is loaded and the backup writer produced an age envelope.
 
-    Regression: rollback used ``os.rename(artifact, live_config_path)``
-    which wrote ciphertext bytes verbatim.  The server then failed to start
-    because ``yaml.safe_load`` raised on binary data.
+    Rollback must decrypt the artifact rather than
+    ``os.rename(artifact, live_config_path)``-ing ciphertext bytes verbatim,
+    which would leave the server unable to start (``yaml.safe_load`` raises
+    on binary data).
 
     This test exercises the FULL encrypt → backup → rollback → decrypt round-trip
     using a real daily identity (key loaded → age envelope on disk).  It asserts
@@ -1003,7 +1003,7 @@ class TestRollbackDecryptsEncryptedArtifact:
         # --- Step 6: post-rollback file is plaintext ---
         restored = live_yaml.read_bytes()
         assert restored == a_bytes, (
-            f"Encrypted-artifact regression: rollback wrote wrong content.  "
+            f"Rollback wrote wrong content.  "
             f"Expected plaintext A config ({len(a_bytes)} bytes), "
             f"got {len(restored)} bytes.  "
             f"First 60 bytes: {restored[:60]!r}."

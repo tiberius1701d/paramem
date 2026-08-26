@@ -6,7 +6,7 @@ Covers:
 - read_trial_marker raises TrialMarkerSchemaError on schema mismatch.
 - write_trial_marker is atomic (crash mid-write leaves no corrupt file).
 - clear_trial_marker is idempotent.
-- Backup paths stored in TrialMarker are absolute (Correction 5).
+- Backup paths stored in TrialMarker are absolute.
 """
 
 from __future__ import annotations
@@ -186,13 +186,13 @@ class TestClearMarker:
 
 
 # ---------------------------------------------------------------------------
-# Backward compatibility: config_artifact_filename absent (pre-3b.3 markers)
+# Backward compatibility: config_artifact_filename absent from older markers
 # ---------------------------------------------------------------------------
 
 
 class TestBackwardCompatConfigArtifactFilename:
     def test_from_dict_missing_config_artifact_filename_defaults_to_empty(self):
-        """Pre-3b.3 markers lack config_artifact_filename; from_dict must default
+        """A marker lacking config_artifact_filename; from_dict must default
         to empty string so rollback can detect and 500 appropriately.
 
         This exercises the ``.get("config_artifact_filename", "")`` backward-compat
@@ -217,7 +217,7 @@ class TestBackwardCompatConfigArtifactFilename:
 
 
 # ---------------------------------------------------------------------------
-# Absolute paths (Correction 5)
+# Absolute paths
 # ---------------------------------------------------------------------------
 
 
@@ -240,7 +240,7 @@ class TestAbsolutePaths:
     def test_trial_marker_backup_paths_are_absolute_from_relative_input(self, tmp_path):
         """write_trial_marker resolves relative path inputs to absolute before writing.
 
-        Fix 10b: tests the production-side Path.resolve() in write_trial_marker.
+        Tests the production-side ``Path.resolve()`` in ``write_trial_marker``.
         A TrialMarker created with relative path strings must be written with
         those paths resolved to absolute paths, so the marker is portable
         across working-directory changes (e.g. systemd units).

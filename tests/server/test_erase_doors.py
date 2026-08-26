@@ -577,7 +577,7 @@ class TestStickyPayloadStatusAcrossAuthorityLevels:
         self, tmp_path
     ):
         """No payload-level marker in play -- a restamp-only caller's own
-        record and resolve behave exactly as before this fix."""
+        record and resolve behave normally."""
         cfg = _config(tmp_path)
         state_dir = data_state_dir(cfg.paths.data)
 

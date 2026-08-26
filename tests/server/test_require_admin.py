@@ -189,12 +189,10 @@ class TestAdminScopeOnAdminRoute:
         assert resp.json()["admin"] is True
 
     def test_unattributed_admin_token_200_on_admin_get(self, tmp_path, monkeypatch):
-        """Re-spec (shared-token retirement, C): the former shared-env-token
-        row is replaced by its store-token equivalent — an UNATTRIBUTED
-        admin-scope token (the infrastructure-carrier pattern:
-        ``mint-user-token --unattributed --scope admin --force-admin``) →
-        200 on admin GET endpoint.  There is no separate shared-secret path
-        any more; every admin credential is a store entry."""
+        """An UNATTRIBUTED admin-scope token (the infrastructure-carrier
+        pattern: ``mint-user-token --unattributed --scope admin
+        --force-admin``) → 200 on admin GET endpoint.  There is no separate
+        shared-secret path; every admin credential is a store entry."""
         _setup_daily(tmp_path, monkeypatch)
         store = _make_store(tmp_path)
         token = store.mint(None, "Infra carrier", scope="admin")
@@ -400,7 +398,8 @@ class TestRouteTableIntrospection:
         ``_EXEMPT_PATHS`` entry is backed by anything executable, so a route
         could be dropped into that bucket by mistake (e.g. a future admin
         route missing its ``require_admin`` dependency) and this suite would
-        never notice. This closes that gap the same way
+        never notice. This test verifies every ``_EXEMPT_PATHS`` entry is
+        backed by an actual middleware exemption, the same way
         ``test_real_app_health_exempt_in_middleware`` does for ``/health``
         alone, generalized to the whole set.
         """
@@ -452,9 +451,8 @@ class TestAssignOrphansPerUserAdmin:
     def test_assign_orphans_has_require_admin_not_inline_check(self):
         """POST /admin/assign-orphans must have require_admin dependency.
 
-        Verifies the inline token check that used to gate this endpoint was
-        removed and replaced by the dependency, so any admin-scope store
-        token can reach it.
+        Verifies any admin-scope store token can reach the endpoint via the
+        require_admin dependency.
         """
         from paramem.server.app import app
 

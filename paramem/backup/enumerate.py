@@ -69,9 +69,10 @@ class BackupRecord:
         encrypted, plaintext otherwise).  For bundle slots this is the
         SHA-256 of the ``bundle.meta.json`` bytes (the index of the bundle).
     pre_trial_hash:
-        Optional SHA-256 of the live config at /migration/confirm step 2
-        time.  Present only on pre-migration backups written by 3b.2+.
-        Always ``None`` for bundle slots.
+        Optional SHA-256 of the live config captured when the pre-migration
+        backup was written (see ``ArtifactMeta.pre_trial_hash``).  Present
+        only on pre-migration backups; ``None`` on every other kind and
+        always ``None`` for bundle slots.
     label:
         Optional operator-supplied annotation from the sidecar.
     meta:

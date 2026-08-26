@@ -194,8 +194,7 @@ class TestEntryCacheCompletenessPostcondition:
     from bookkeeping completeness below) via
     :class:`~paramem.memory.store.EntryCacheInvariantViolation`, raised
     through :func:`~paramem.memory.store.raise_entry_cache_invariant_violation`
-    -- the named-exception family replacing the former bare
-    ``AssertionError``."""
+    -- a named exception, not a bare ``AssertionError``."""
 
     def test_raises_when_rebuilt_member_missing_an_active_entry(self):
         from paramem.memory.store import EntryCacheInvariantViolation

@@ -26,8 +26,8 @@ Train mode is run with a faked weight probe and a stubbed
 ``_train_tier_adapter`` so the test does not require GPU; the assertion is on
 the cycle's data-pipeline output, not on weight values.
 
-The ``BackgroundTrainer``/``ConsolidationLoop`` release/close family that
-used to live in this module now lives in ``tests/test_base_model_release.py``.
+The ``BackgroundTrainer``/``ConsolidationLoop`` release/close family is
+covered in ``tests/test_base_model_release.py``.
 
 ``DiskMemorySource.probe`` is covered in ``tests/test_memory_store.py``;
 ``commit_tier_slot`` (happy path, crash-cleanup, prune interplay) is covered

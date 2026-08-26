@@ -3394,7 +3394,7 @@ sanity-checked before it goes live. Training is crash-resumable — a crash
 or mid-cycle interruption resumes from the last completed checkpoint
 rather than restarting the fold from zero. A training failure leaves the
 previous adapters live rather than promoting a broken result. See
-architecture.md for the underlying mechanism.
+ARCHITECTURE.md for the underlying mechanism.
 
 Operational invariant: every consolidation still retrains the full key set
 via replay. True incremental learning without replay remains unsolved

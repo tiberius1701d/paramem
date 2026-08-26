@@ -17,6 +17,10 @@ source of truth for "in this repo" for a guard that walks the whole tree.
 context manager Y" (the ``base_model_inference`` family of guards). One
 implementation, so a fix to the walk logic (e.g. a new context-manager
 call shape) lands once instead of drifting across per-test-file copies.
+
+``enclosing_function_name`` — the structural-scan primitive that names the
+innermost function containing a line, shared by every guard that keys an
+allow-list or an offender report by ``path::function``.
 """
 
 from __future__ import annotations
@@ -70,6 +74,27 @@ def find_function(tree: ast.AST, fn_name: str) -> ast.FunctionDef | ast.AsyncFun
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == fn_name:
             return node
     return None
+
+
+def enclosing_function_name(tree: ast.AST, lineno: int) -> "str | None":
+    """Return the name of the innermost function/async function enclosing *lineno*.
+
+    Built from every ``FunctionDef``/``AsyncFunctionDef``'s ``(start, end)``
+    line range in *tree*; the innermost (latest-starting) range containing
+    *lineno* wins, so a nested function's own body is attributed to itself
+    rather than its outer enclosing function. Returns ``None`` when no
+    function contains the line (module-level code). Shared by every guard
+    that needs "which function is this line inside" without walking its own
+    ancestor chain — a structural-scan primitive alongside
+    :func:`find_function`.
+    """
+    best: "tuple[int, str] | None" = None
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            end = getattr(node, "end_lineno", node.lineno)
+            if node.lineno <= lineno <= end and (best is None or node.lineno > best[0]):
+                best = (node.lineno, node.name)
+    return best[1] if best else None
 
 
 def enters_context_manager(fn: ast.FunctionDef | ast.AsyncFunctionDef, manager_name: str) -> bool:

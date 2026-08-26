@@ -10,8 +10,7 @@ Unit files point at ``python -m paramem.backup --tier daily`` (oneshot service).
 
 ``daily HH:MM`` normalisation (the ``schedule: "daily 04:00"`` default in
 ``server.yaml``) is handled once, centrally, inside
-``schedule_grammar.parse_schedule_atom`` — this module no longer carries
-its own copy.
+``schedule_grammar.parse_schedule_atom``.
 """
 
 from __future__ import annotations

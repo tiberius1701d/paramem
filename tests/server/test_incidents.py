@@ -344,10 +344,10 @@ class TestResolvedReason:
     def test_ack_after_resolve_then_rerecord_clears_stale_reason(self, tmp_path):
         """resolve(reason=...) -> ack -> record_incident (bump, not reopen —
         status was ``acknowledged``, not ``resolved``) must still clear the
-        stale ``resolved_reason``.  Gating the clear on
-        ``status == "resolved"`` alone misses this path: the row is
-        ``acknowledged`` when the bump happens, so that guard never fires
-        and the reason survives — the bug this test pins."""
+        stale ``resolved_reason``.  The clear must not gate on
+        ``status == "resolved"`` alone: the row is ``acknowledged`` when the
+        bump happens, so that guard would never fire and the reason would
+        survive."""
         _record(tmp_path)
         resolve_incident(tmp_path, "vram_exhausted", "phase1", reason="cloud egress disabled")
         ack_incident(tmp_path, "vram_exhausted:phase1")

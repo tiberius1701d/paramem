@@ -101,8 +101,7 @@ class TestConversationProcessErrorGate:
         """``data.code`` only classifies the response when ``response_type
         == "error"`` (HA only populates ``data.code`` on error-typed
         responses in practice) — a stray code on a non-error envelope must
-        not fail the call. This is the disjunction the gate used to trigger
-        on before the ``response_type``-first split."""
+        not fail the call."""
         ws = _FakeWS(
             _handshake(
                 _envelope(
@@ -169,9 +168,9 @@ class TestConversationProcessErrorGate:
 
     def test_error_without_code_returns_none_and_warns(self, monkeypatch, caplog):
         """An error-typed envelope with no ``data.code`` at all (not merely
-        an unrecognized one) is still classified as a failure — the
-        motivating incident's class, where the agent blew up without
-        reporting a specific code."""
+        an unrecognized one) is still classified as a failure — the class
+        of failure where the agent blows up without reporting a specific
+        code."""
         ws = _FakeWS(
             _handshake(
                 _envelope(

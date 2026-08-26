@@ -2,11 +2,18 @@
 # Integration test for the HA pipeline and tri-path routing.
 # Tests: greeting flow, HA path, cloud path, fallback chains, /refresh-ha.
 # Requires: ParaMem server running, HA reachable, cloud agent configured.
+# The routed sections (2, 3a-3c) exercise POST /debug/probe, which requires
+# admin auth (PARAMEM_ADMIN_TOKEN) and config.debug: true; they are skipped,
+# not failed, when no admin token is available.
 #
 # Usage:
 #   bash scripts/dev/test-ha-pipeline.sh                        # default
 #   bash scripts/dev/test-ha-pipeline.sh http://localhost:8420   # custom URL
 #   bash scripts/dev/test-ha-pipeline.sh --verbose               # show full responses
+#
+# Env:
+#   PARAMEM_ADMIN_TOKEN   Bearer token for the admin-gated /debug/probe door.
+#   PARAMEM_PROBE_SPEAKER Speaker id the routed sections probe as (default: speaker0).
 
 set -uo pipefail
 
@@ -14,6 +21,9 @@ SERVER="${1:-http://localhost:8420}"
 VERBOSE=false
 [[ "${1:-}" == "--verbose" || "${2:-}" == "--verbose" ]] && VERBOSE=true
 [[ "${1:-}" == "--verbose" ]] && SERVER="${2:-http://localhost:8420}"
+
+ADMIN_TOKEN="${PARAMEM_ADMIN_TOKEN:-}"
+PROBE_SPEAKER="${PARAMEM_PROBE_SPEAKER:-speaker0}"
 
 PASS=0
 FAIL=0
@@ -127,7 +137,10 @@ skip() {
 }
 
 # check_routed <label> <text> <route> <expect_pattern> [conversation_id]
-# Forces routing via the "route" parameter (ha, cloud)
+# Forces routing via POST /debug/probe's "route" field (ha, cloud, cloud:<provider>).
+# Skipped (not failed) when no admin token is configured, or when the probe
+# door itself reports a non-routing reason (403/404) — a missing debug
+# posture is not a routing defect.
 check_routed() {
     local label="$1"
     local text="$2"
@@ -135,25 +148,50 @@ check_routed() {
     local expect="$4"
     local conv_id="${5:-integration-routed-$$}"
 
+    if [ -z "$ADMIN_TOKEN" ]; then
+        skip "$label" "no admin token"
+        return 0
+    fi
+
     local start_ms=$(($(date +%s%N) / 1000000))
 
     # Use python3 to build JSON payload safely (no shell interpolation issues)
     local payload
-    payload=$(python3 -c "import json,sys; print(json.dumps({'text': sys.argv[1], 'conversation_id': sys.argv[2], 'route': sys.argv[3]}))" "$text" "$conv_id" "$route")
+    payload=$(python3 -c "
+import json, sys
+print(json.dumps({
+    'text': sys.argv[1],
+    'speaker_id': sys.argv[2],
+    'conversation_id': sys.argv[3],
+    'route': sys.argv[4],
+}))
+" "$text" "$PROBE_SPEAKER" "$conv_id" "$route")
 
-    response=$(curl -sf -X POST "$SERVER/chat" \
+    local http_code
+    response=$(curl -s -w "\n%{http_code}" -X POST "$SERVER/debug/probe" \
         -H "Content-Type: application/json" \
+        -H "Authorization: Bearer $ADMIN_TOKEN" \
         -d "$payload" 2>/dev/null) || {
         echo "  FAIL  $label — server unreachable"
         FAIL=$((FAIL + 1))
         return 1
     }
+    http_code=$(echo "$response" | tail -n1)
+    response=$(echo "$response" | sed '$d')
+
+    if [ "$http_code" = "403" ] || [ "$http_code" = "404" ]; then
+        local probe_status
+        probe_status=$(echo "$response" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status','unknown'))" 2>/dev/null)
+        skip "$label" "probe door: $probe_status"
+        return 0
+    fi
 
     local end_ms=$(($(date +%s%N) / 1000000))
     local elapsed=$(( end_ms - start_ms ))
 
     reply=$(echo "$response" | python3 -c "import sys,json; print(json.load(sys.stdin).get('text',''))" 2>/dev/null)
     escalated=$(echo "$response" | python3 -c "import sys,json; print(json.load(sys.stdin).get('escalated', False))" 2>/dev/null)
+    diagnostics=$(echo "$response" | python3 -c "import sys,json; print(json.load(sys.stdin).get('diagnostics',{}))" 2>/dev/null)
 
     # Fail on error responses — "unavailable" or "couldn't" means the provider is down
     if echo "$reply" | grep -qi "unavailable\|couldn't"; then
@@ -167,6 +205,7 @@ check_routed() {
         echo "  PASS  $label (${elapsed}ms, route=$route)"
         log_verbose "response: $reply"
         log_verbose "escalated: $escalated"
+        log_verbose "diagnostics: $diagnostics"
         PASS=$((PASS + 1))
         return 0
     else

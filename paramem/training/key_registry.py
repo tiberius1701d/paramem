@@ -377,8 +377,7 @@ class KeyRegistry:
         the slot manifest (``registry_sha256``) and compared across process
         boundaries.  The ``"simhash"`` field holds the tier's ONE fingerprint
         map (``_simhashes()``) — active keys only.  This is the unified
-        on-disk layout; the separate ``simhash_registry.json`` file has been
-        removed.
+        on-disk layout for the tier's fingerprint map.
 
         A file written by this method will be read back by :meth:`load`,
         which REQUIRES ``"active_keys"``, ``"stale"`` and ``"simhash"`` to

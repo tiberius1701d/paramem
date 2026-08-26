@@ -415,7 +415,7 @@ def reap_tier_artifacts(tier_root: Path) -> list[Path]:
     finishes anything left stranded in ``.pending-delete/`` at boot.
     *adapter_dir* is derived from *tier_root*'s own shape (interim slot →
     grandparent; main tier → parent) rather than taken as a parameter, so
-    every existing caller keeps working unchanged.
+    no caller needs to pass it separately.
 
     ``INTERIM_DIR_PREFIX`` is imported lazily from
     :mod:`paramem.memory.interim_adapter` — a top-level import would create
@@ -959,7 +959,7 @@ def erase_keys_and_restamp_manifest(
 ) -> dict[str, RestampResult]:
     """Stale-mark *keys* directly against every tier's ON-DISK registry, keeping
     the registry file and (for a bound slot) the manifest in lockstep. This
-    is the ruled erase door: there is no refusal concept, no precondition
+    is the erase door: there is no refusal concept, no precondition
     pre-pass and no auto-heal. A tier is *affected*, and a key is marked,
     iff that tier's registry holds the key ACTIVE — every affected tier
     reported in the return value has its mutation already landed, whatever
@@ -1151,7 +1151,6 @@ def erase_keys_and_restamp_manifest(
 
 # ---------------------------------------------------------------------------
 # Registry I/O and lifecycle helpers
-# (relocated from paramem.training.indexed_memory on 2026-05-20)
 # ---------------------------------------------------------------------------
 
 
@@ -1260,11 +1259,11 @@ def commit_tier_slot(
     the trial tree's copy-forward and the live migration path in
     ``paramem.server.active_store_migration``) is its only production caller.
 
-    A mini-fold's interim tier and a full fold's main-tier rebuild no longer
-    go through this call: the two-phase event driver
+    A mini-fold's interim tier and a full fold's main-tier rebuild use a
+    separate commit path: the two-phase event driver
     (``ConsolidationLoop.stage_event`` / ``run_build_and_publish``) commits
-    each tier's slot via :func:`write_tier_slot` + :func:`publish_tier_registry`
-    instead, parameterised by a :class:`TierIncrement` rather than *tier* /
+    each tier's slot via :func:`write_tier_slot` + :func:`publish_tier_registry`,
+    parameterised by a :class:`TierIncrement` rather than *tier* /
     *adapter_name* / *stamp* / *all_keyed*. Registry is written last as
     the commit signal: its presence on disk means all preceding files
     (weights, simhash) are complete — the same ordering rule both commit
@@ -1298,10 +1297,9 @@ def commit_tier_slot(
          plus the manifest (from step 3, embedded as ``meta.json``) into the
          slot.  Immediately after, a debug weight shadow is written for
          inspection/diff — ``with loop._artifact_scope():
-         on_main_adapters_saved(loop.model, [adapter_name])`` — the per-adapter
-         equivalent of what a whole-fold caller used to batch; the artifact
-         scope resolves to no root when snapshots are off, so this is a no-op
-         with no flag check.
+         on_main_adapters_saved(loop.model, [adapter_name])`` — a per-adapter
+         write; the artifact scope resolves to no root when snapshots are
+         off, so this is a no-op with no flag check.
        - **Simulate mode**: builds a ``MultiDiGraph`` from *all_keyed* (or,
          when *all_keyed* is empty, projects the tier fresh from
          ``loop.store`` via :func:`build_tier_graph_from_store`) and writes it
@@ -1346,9 +1344,9 @@ def commit_tier_slot(
     — candidate slot(s) present, no ``indexed_key_registry.json`` at all —
     and that verdict is flagged LOUD: preserved and logged as an ERROR
     naming ``POST /backup/restore`` as the recovery door, never silently
-    skipped and never reaped (a torn commit is not an interrupted erase, and
-    the operator erase doors no longer produce interrupted erases of this
-    shape at all). The mount
+    skipped and never reaped (a torn commit is not an interrupted erase; the
+    operator erase doors never produce an interrupted erase of this
+    shape). The mount
     loop in :func:`paramem.server.app._mount_adapters_from_slots` separately
     finds no matching slot for the interim tier's (degraded) hash and
     records its own ``registry_unverified`` row. The partial slot survives
@@ -1467,9 +1465,8 @@ def commit_tier_slot(
                 tier,
             )
 
-            # Debug weight shadow — per-adapter equivalent of the whole-fold
-            # batch a caller used to run itself.  Resolves to a no-op when
-            # snapshots are off (no flag check needed here).
+            # Debug weight shadow — a per-adapter write.  Resolves to a no-op
+            # when snapshots are off (no flag check needed here).
             from paramem.utils.artifacts import on_main_adapters_saved
 
             with loop._artifact_scope():
@@ -1536,8 +1533,7 @@ def commit_tier_slot(
 
         # --- Step 7: Registry flush — commit signal (both modes, LAST write) ---
         # The registry carries the tier's one fingerprint map (active keys
-        # only -- a withheld id carries no fingerprint) in its "simhash" key,
-        # so a separate simhash_registry.json is no longer written.
+        # only -- a withheld id carries no fingerprint) in its "simhash" key.
         # After this returns the slot is live on disk.  Any exception before
         # this point is caught by the finally block below which removes the
         # orphan written slot (both modes — see the block's docstring).
@@ -1642,9 +1638,8 @@ def write_tier_slot(
     call is always inert on that path — same outcome as debug being off,
     reached through the scope gate rather than a local flag. The
     base-model fingerprint comes from ``ctx.fingerprint_cache``.  There is no
-    ``verify=`` callback: the post-save recall probe is retired — the
-    recall gate that authorises a write runs once, on the staged weights,
-    immediately before this call.
+    ``verify=`` callback: the recall gate that authorises a write runs
+    once, on the staged weights, immediately before this call.
 
     Args:
         ctx: The write context.  Reads ``model``, ``tokenizer``,

@@ -186,12 +186,12 @@ def compute_pre_flight_check(
     # underestimate. The on-disk file is the durable artifact that the
     # backup itself would capture, so reading it is both correct and avoids
     # a re-serialization. This term is genuinely load-bearing, not a
-    # placeholder: write_bundle's per-tier capture now includes graph.json
+    # placeholder: write_bundle's per-tier capture includes graph.json
     # whenever the tier has a bound slot carrying one (the simulate venue's
     # payload) — the train venue's bound slot carries no graph.json and this
-    # term simply contributes 0 for it. Nothing writes a tier-root
-    # graph.json any more — the payload lives in a timestamped slot under
-    # the tier root, written via :func:`~paramem.adapters.slot.write_slot`.
+    # term simply contributes 0 for it. The payload lives in a timestamped
+    # slot under the tier root, written via
+    # :func:`~paramem.adapters.slot.write_slot`, not at a tier-root path.
     # Resolution composes the same two primitives every other bound-slot
     # reader in the package does (tier_registry_sha256 + find_live_slot) and
     # is deliberately NOT wrapped in a local try/except: a read/decrypt

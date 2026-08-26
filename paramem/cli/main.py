@@ -1,9 +1,9 @@
 """Top-level argparse dispatcher for the ``paramem`` console script.
 
-Each subcommand group lives in a sibling module so later slices can drop
-``migrate_accept.py``, ``migrate_rollback.py``, ``migrate_cancel.py``, and
-``backup.py`` (for ``list/create/restore/prune``) without re-architecting the
-dispatcher.
+Each subcommand group lives in its own sibling module (``migrate_accept.py``,
+``migrate_rollback.py``, ``migrate_cancel.py``, ``backup_create.py`` /
+``backup_list.py`` / ``backup_restore.py`` / ``backup_prune.py``, etc.), so a
+subcommand can be added or removed independently of the dispatcher.
 
 Default server URL is ``http://127.0.0.1:8420`` — the standard local port.
 Override with ``--server-url`` on any subcommand.

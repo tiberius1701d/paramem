@@ -8,7 +8,7 @@ everywhere) and the render-boundary display-name substitution work end-to-end.
        (speaker0) and third-party ``Dana`` (speaker1).
     b) Assert minted IDs are lowercase ``speaker{N}`` — NOT cased.
     c) Assert ``resolve_speaker_name("speaker0")`` returns ``"Alex"`` (works
-       directly on the lowercase token — the old re-casing blocker is gone).
+       directly on the lowercase token, with no re-casing needed).
     d) Migration check: build a synthetic v5 profile-store dict with a CASED
        ``"Speaker0"`` key, write it to disk, reload through ``SpeakerStore``,
        and assert the loaded profile key is the lowercase ``"speaker0"`` (v5→v6

@@ -5,11 +5,11 @@ anonymize component.
 three consumers across three features: session-tier extraction (this
 module's ``anonymize`` stage), graph-tier enrichment
 (``paramem.training.graph_enrich``), and conversation egress
-(``paramem.server.inference`` via
+(``paramem.server.egress`` via
 :func:`~paramem.graph.flows.anonymize_turn`). This module is the SESSION
-FLOW's own projection of that shared call — the stage body that used to
-be the front half of ``extractor._cloud_pipeline`` — not a second
-implementation of the anonymize chain.
+FLOW's own projection of that shared call — a stage body over
+:func:`~paramem.cloud.anonymize.anonymize`, not a second implementation of
+the anonymize chain.
 
 Because this module is the home of the anonymize STAGE CANDIDATE (as
 opposed to a bare function call), it is also where a future
@@ -47,10 +47,10 @@ def _stage_anonymize(ctx: StageContext, state: StageState) -> StageState:
     Two branches:
 
     1. ``ctx.scrub_categories`` empty — operator opt-out: no tagger call,
-       no anonymizer call, no phase trace (mirrors the pre-carve structure
-       exactly — including that a ``stop_at("anonymize")`` request does
-       NOT short-circuit here, since there is nothing to stop after: the
-       "anonymize" phase never fires). The transcript egresses verbatim,
+       no anonymizer call, no phase trace — including that a
+       ``stop_at("anonymize")`` request does NOT short-circuit here, since
+       there is nothing to stop after: the "anonymize" phase never fires.
+       The transcript egresses verbatim,
        sourced from the passed-in transcript — never a model artifact.
        The ``enrich`` stage derives the (empty-mapping, identity)
        anonymized fact array from the returned ``payload``.
@@ -94,14 +94,11 @@ def _stage_anonymize(ctx: StageContext, state: StageState) -> StageState:
     real text, which stays in-memory on the contract).
 
     This stage body deliberately does NOT check ``chain_stopped()``
-    itself, though an earlier version of this code did and returned early
-    on a satisfied ``stop_at("anonymize")`` request. That check is gone
-    from the body — :func:`~paramem.graph.flow.run_flow` already checks
+    itself: :func:`~paramem.graph.flow.run_flow` already checks
     ``chain_stopped()`` after every stage that runs (``flow.py``), so the
-    stage boundary now performs exactly the same early return the in-body
-    check used to. A ``stop_at("anonymize")`` caller still gets back
-    ``graph.relations`` at the local-extract output with the anonymize
-    result in ``phases["anonymize"].parsed``.
+    stage boundary performs the early return. A ``stop_at("anonymize")``
+    caller still gets back ``graph.relations`` at the local-extract output
+    with the anonymize result in ``phases["anonymize"].parsed``.
     """
     graph = state.graph
     original_count = len(graph.relations)
@@ -111,11 +108,10 @@ def _stage_anonymize(ctx: StageContext, state: StageState) -> StageState:
         # Operator opt-out: no tagger call, no anonymizer call, no phase
         # trace, no prompt load — the ONE opt-out constructor, called
         # directly rather than routing through ``anonymize()`` purely to
-        # reach it (mirrors the pre-unification structure exactly —
-        # including that a ``stop_at("anonymize")`` request does NOT
+        # reach it. A ``stop_at("anonymize")`` request does NOT
         # short-circuit here, since there is nothing to stop after: the
         # "anonymize" phase never fires, so ``chain_stopped()`` can never
-        # become true from it on this branch).  The transcript egresses
+        # become true from it on this branch.  The transcript egresses
         # verbatim, sourced from the passed-in transcript — never a
         # model artifact.  Facts follow via the ``enrich`` stage's
         # (empty-mapping, identity) ``insert_placeholders`` call over
@@ -139,12 +135,12 @@ def _stage_anonymize(ctx: StageContext, state: StageState) -> StageState:
                 ctx.tokenizer,
                 transcript=ctx.transcript,
                 categories=ctx.scrub_categories,
-                speaker_name=ctx.speaker_name,
                 # Session-tier egress feeds the graph, never the reply
                 # boundary — ctx.speaker_id is required/non-empty
                 # (StageContext) and threaded unconditionally, unlike
                 # chat egress's reply-boundary-gated anchor (see
                 # paramem.graph.flows.anonymize_turn).
+                speaker_name=ctx.speaker_name,
                 speaker_id=ctx.speaker_id,
                 token_envelope=ctx.anonymize_token_envelope,
                 seed=ctx.seed,

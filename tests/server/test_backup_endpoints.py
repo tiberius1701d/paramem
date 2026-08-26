@@ -180,7 +180,7 @@ def _seed_restorable_bundle(tmp_path: Path, backups_root: Path) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Test 26 — /backup/list empty store
+# /backup/list empty store
 # ---------------------------------------------------------------------------
 
 
@@ -199,7 +199,7 @@ class TestListEmptyStore:
 
 
 # ---------------------------------------------------------------------------
-# Test 27 — /backup/list mixed kinds newest-first
+# /backup/list mixed kinds newest-first
 # ---------------------------------------------------------------------------
 
 
@@ -242,7 +242,7 @@ class TestListMixedKindsNewestFirst:
 
 
 # ---------------------------------------------------------------------------
-# Test 28 — /backup/list filtered by kind
+# /backup/list filtered by kind
 # ---------------------------------------------------------------------------
 
 
@@ -279,7 +279,7 @@ class TestListFilteredByKind:
 
 
 # ---------------------------------------------------------------------------
-# Test 29 — /backup/list invalid kind → 400
+# /backup/list invalid kind → 400
 # ---------------------------------------------------------------------------
 
 
@@ -297,7 +297,7 @@ class TestListInvalidKind:
 
 
 # ---------------------------------------------------------------------------
-# Test 30 — /backup/create default kinds
+# /backup/create default kinds
 # ---------------------------------------------------------------------------
 
 
@@ -319,12 +319,12 @@ class TestCreateDefaultKinds:
         assert resp.status_code == 200, resp.text
         body = resp.json()
         assert body["tier"] == "manual"
-        # Default now produces a bundle slot.
+        # Default produces a bundle slot.
         assert "snapshot_bundle" in body["written_slots"] or body["success"] is True
 
 
 # ---------------------------------------------------------------------------
-# Test 31 — /backup/create custom kinds + label
+# /backup/create custom kinds + label
 # ---------------------------------------------------------------------------
 
 
@@ -345,7 +345,7 @@ class TestCreateCustomKindsLabel:
 
 
 # ---------------------------------------------------------------------------
-# Test 32 — /backup/create unknown kind → 400
+# /backup/create unknown kind → 400
 # ---------------------------------------------------------------------------
 
 
@@ -363,7 +363,7 @@ class TestCreateUnknownKindReturns400:
 
 
 # ---------------------------------------------------------------------------
-# Test 32b — /backup/create honours the tier param (scheduled-timer path)
+# /backup/create honours the tier param (scheduled-timer path)
 # ---------------------------------------------------------------------------
 
 
@@ -402,7 +402,7 @@ class TestCreateTierParam:
 
 
 # ---------------------------------------------------------------------------
-# Test 33 — /backup/create disk pressure → 200 success=False
+# /backup/create disk pressure → 200 success=False
 # ---------------------------------------------------------------------------
 
 
@@ -431,7 +431,7 @@ class TestCreateDiskPressureReturns200SuccessFalse:
 
 
 # ---------------------------------------------------------------------------
-# Test 34 — /backup/create cloud-only → graph skipped gracefully
+# /backup/create cloud-only → graph skipped gracefully
 # ---------------------------------------------------------------------------
 
 
@@ -453,7 +453,7 @@ class TestCreateCloudOnlySkipsGraphGracefully:
 
 
 # ---------------------------------------------------------------------------
-# Test 35 — /backup/restore happy path (config)
+# /backup/restore happy path (config)
 # ---------------------------------------------------------------------------
 
 
@@ -463,8 +463,8 @@ class TestRestoreHappyPathConfig:
 
         A config-kind restore keeps its existing mechanism (no live-apply
         dispatch, no store quarantine) — the response reports
-        ``serving=False`` (an operator restart is still what converges it)
-        rather than the retired ``restart_required``/``restart_hint`` fields.
+        ``serving=False`` (an operator restart is still what converges it);
+        the response carries no ``restart_required``/``restart_hint`` fields.
         """
         config = _make_config(tmp_path)
         backups_root = config.paths.data / "backups"
@@ -555,7 +555,7 @@ class TestPendingConsolidationEventBundleRestoreDisposesLedger:
     ) -> None:
         """A snapshot_bundle restore rewrites the episodic tier wholesale, so
         the pending event's stage ledger would misclassify it FOREIGN on the
-        next resume -- the ruled design discards the record instead: the
+        next resume -- the record is discarded instead: the
         ledger is disposed (file gone, scratch dir removed) and every
         ``consolidation_resume_blocked`` incident naming it is resolved.
 
@@ -718,7 +718,7 @@ class TestRestoreUnbootableConfigReturns400:
         assert len(slots) >= 2, "expected the source slot plus a pre_restore safety slot"
 
     def test_bootable_config_backup_still_restores(self, tmp_path: Path, monkeypatch) -> None:
-        """Control: an ordinary bootable backup restores exactly as before this change."""
+        """Control: an ordinary bootable backup restores normally."""
         config = _make_config(tmp_path)
         backups_root = config.paths.data / "backups"
         backups_root.mkdir(parents=True, exist_ok=True)
@@ -791,7 +791,7 @@ class TestRestoreUnbootableConfigReturns400:
 
 
 # ---------------------------------------------------------------------------
-# Test 36 — /backup/restore not found → 404
+# /backup/restore not found → 404
 # ---------------------------------------------------------------------------
 
 
@@ -808,7 +808,7 @@ class TestRestoreNotFoundReturns404:
 
 
 # ---------------------------------------------------------------------------
-# Test 37 — /backup/restore non-config kind → 400
+# /backup/restore non-config kind → 400
 # ---------------------------------------------------------------------------
 
 
@@ -837,7 +837,7 @@ class TestRestoreNonConfigKindReturns400:
 
 
 # ---------------------------------------------------------------------------
-# Test 38 — /backup/restore during STAGING → 409
+# /backup/restore during STAGING → 409
 # ---------------------------------------------------------------------------
 
 
@@ -856,7 +856,7 @@ class TestRestoreDuringStagingReturns409:
 
 
 # ---------------------------------------------------------------------------
-# Test 39 — /backup/restore during TRIAL → 409
+# /backup/restore during TRIAL → 409
 # ---------------------------------------------------------------------------
 
 
@@ -874,7 +874,7 @@ class TestRestoreDuringTrialReturns409:
 
 
 # ---------------------------------------------------------------------------
-# Test 40 — /backup/restore during consolidation → 409
+# /backup/restore during consolidation → 409
 # ---------------------------------------------------------------------------
 
 
@@ -892,7 +892,7 @@ class TestRestoreDuringConsolidationReturns409:
 
 
 # ---------------------------------------------------------------------------
-# Test 41 — /backup/restore encrypted wrong key → 500, no safety slot written
+# /backup/restore encrypted wrong key → 500, no safety slot written
 # ---------------------------------------------------------------------------
 
 
@@ -963,7 +963,7 @@ class TestRestoreEncryptedWrongKeyReturns500:
 
 
 # ---------------------------------------------------------------------------
-# Test 42 — /backup/prune happy path
+# /backup/prune happy path
 # ---------------------------------------------------------------------------
 
 
@@ -1007,7 +1007,7 @@ class TestPruneHappyPath:
 
 
 # ---------------------------------------------------------------------------
-# Test 43 — /backup/prune dry run
+# /backup/prune dry run
 # ---------------------------------------------------------------------------
 
 
@@ -1162,7 +1162,7 @@ class TestRestoreDecryptErrorCodes:
 
 
 # ---------------------------------------------------------------------------
-# Test: /backup/create snapshot_bundle kind
+# /backup/create snapshot_bundle kind
 # ---------------------------------------------------------------------------
 
 

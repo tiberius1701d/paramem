@@ -20,6 +20,12 @@ A local multi-speaker voice assistant runs as the system's **live load test** �
 **For researchers:** [Findings](#findings-worth-looking-at) · [paper (PDF)](https://doi.org/10.5281/zenodo.19502522) · full protocols in [benchmarking.md](benchmarking.md).
 **For developers / operators:** [Quick Start](#quick-start) · [Deployment guide](DEPLOYMENT.md).
 
+**Documents:**<br>
+[ARCHITECTURE.md](ARCHITECTURE.md) — system design and architecture decisions.<br>
+[DEPLOYMENT.md](DEPLOYMENT.md) — configuration and operator guide.<br>
+[SECURITY.md](SECURITY.md) — threat model and security posture.<br>
+[benchmarking.md](benchmarking.md) — test suite and measured results.
+
 ## Results
 
 | What | Result | Hardware |

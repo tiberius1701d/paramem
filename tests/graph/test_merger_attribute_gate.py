@@ -108,10 +108,10 @@ class TestAttributeKeySupersession:
         be read as a carry-forward (`survivor_key`) even though
         `merge_relations` synthesises a speaker Entity for every call and
         `_upsert_entity`'s speaker refresh runs before the attribute gate
-        reads the incumbent value.  Before the display/fact split, the
-        refresh clobbered the incumbent FACT value with the display token,
-        so a same-value re-observation was misread as a different-value
-        contradiction (`old_object`/`new_object`, no `survivor_key`)."""
+        reads the incumbent value.  The gate reads the record's FACT value,
+        not the display token the refresh writes, so a same-value
+        re-observation is never misread as a different-value contradiction
+        (`old_object`/`new_object`, no `survivor_key`)."""
         merger = GraphMerger()
         old_rel = _attr_relation(predicate="has_name", obj="Alex", indexed_key="graph_old")
         new_rel = _attr_relation(predicate="has_name", obj="Alex", indexed_key="graph_new")

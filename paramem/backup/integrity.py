@@ -230,9 +230,8 @@ def _check_registry(path: Path, tier: str) -> tuple[FileCheck, list[str] | None,
 def _check_simhash(path: Path, tier: str) -> tuple[FileCheck, dict | None]:
     """Extract the simhash fingerprint map from an ``indexed_key_registry.json``.
 
-    The simhash map is now co-located with the registry in a single file
-    (``"simhash"`` key in the registry payload) rather than in a separate
-    ``simhash_registry.json`` sidecar.  *path* MUST be the
+    The simhash map is co-located with the registry in a single file, under
+    the ``"simhash"`` key in the registry payload.  *path* MUST be the
     ``indexed_key_registry.json`` path (the same file passed to
     :func:`_check_registry`).
 
@@ -462,7 +461,7 @@ def _check_payload_row(binding: "TierBinding", tier: str) -> FileCheck:
 
     # Both venues consult the binding first: a non-VERIFIED binding is
     # "inconsistent" regardless of payload kind — see this function's
-    # docstring for why the simulate arm can no longer skip this check.
+    # docstring for why the simulate arm never skips this check.
     if binding.status != VERIFIED:
         return FileCheck(str(payload_path), "payload", tier, _INCONSISTENT, binding.detail)
 
@@ -651,7 +650,7 @@ def verify_infrastructure_integrity(
 ) -> IntegrityReport:
     """Run the full infrastructure integrity check and return an :class:`IntegrityReport`.
 
-    Checks every tier's ``indexed_key_registry.json`` (which now carries the
+    Checks every tier's ``indexed_key_registry.json`` (which carries the
     unified simhash map) and its own ``key_metadata.json``.  Also checks
     ``speaker_profiles.json``, ``observed_languages.json``, and
     ``state/backup.json`` (tier-independent, category ``"common"``).
@@ -732,7 +731,7 @@ def verify_infrastructure_integrity(
         # --- Determine if this tier is "committed" (has any data) ---
         # A partial interim slot (dir present but registry absent) is skipped.
         reg_path = tier_root / "indexed_key_registry.json"
-        # The simhash map now lives inside indexed_key_registry.json under the
+        # The simhash map lives inside indexed_key_registry.json under the
         # "simhash" key.  simhash_path is kept as a display string in
         # FileCheck records so the API output is human-readable.
         simhash_path = reg_path  # same file — display label only
@@ -776,9 +775,9 @@ def verify_infrastructure_integrity(
 
         # --- SimHash check ---
         # Simhashes live in the same indexed_key_registry.json file under the
-        # "simhash" key.  _check_simhash reads from that file and extracts the
-        # fingerprint map; no separate simhash_registry.json exists.
-        # reuse the parsed dict for cross-consistency so the file is read only once.
+        # "simhash" key.  _check_simhash reads from that one file and extracts
+        # the fingerprint map; reuse the parsed dict for cross-consistency so
+        # the file is read only once.
         if not has_keys:
             # Registry loaded ok but is empty → simhash is optional
             simhash_check: FileCheck = FileCheck(
@@ -847,8 +846,7 @@ def verify_infrastructure_integrity(
 
     # -----------------------------------------------------------------------
     # Common files (always optional — fresh installs lack them).
-    # key_metadata is now checked per-tier, inside the per-tier loop above —
-    # there is no global file left to check here.
+    # key_metadata is checked per-tier, inside the per-tier loop above.
     # -----------------------------------------------------------------------
     speaker_profiles_path = data_dir / "speaker_profiles.json"
     observed_languages_path = data_dir / "observed_languages.json"
@@ -868,8 +866,8 @@ def verify_infrastructure_integrity(
         sh_set = set(sh_keys)
 
         # Keys in registry but not in simhash (in-payload self-consistency).
-        # Since simhashes and registry keys are now in the same file, this
-        # detects an in-file invariant violation rather than cross-file desync.
+        # Since simhashes and registry keys live in the same file, this
+        # detects an in-file invariant violation.
         # Uses the tier's already-resolved slot root (interim tiers live at
         # <adapter_dir>/episodic/interim_<stamp>/, not a flat
         # <adapter_dir>/<tier_name>/ join) — the resolver is not called again.

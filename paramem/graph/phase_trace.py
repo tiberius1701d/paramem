@@ -73,8 +73,8 @@ pipeline checks :func:`chain_stopped` — never a phase-name string —
 after each phase block and returns early when it is set.  Three sites
 check it: the stage-flow runner
 (:func:`paramem.graph.flow.run_flow`, after every stage that ran — this
-is what stops the walk at the ``anonymize`` stage boundary now; that
-stage no longer checks the flag itself), the ``deanonymize`` stage body
+is what stops the walk at the ``anonymize`` stage boundary; that
+stage does not check the flag itself), the ``deanonymize`` stage body
 between its two phases, and the ``enrich`` stage body
 (:func:`~paramem.graph.stage_enrich._stage_enrich`) between its own
 sub-phases.  Because the flag lives in a
@@ -120,10 +120,10 @@ its per-category ``scan_values`` calls in
 :mod:`paramem.cloud.anonymize_steps`, none of which open
 ``extraction_trace``/``phase_trace``) — so a raise there would break
 legitimate production behaviour. The live chat egress's own calls into
-``anonymize`` (``answer_via_cloud`` → ``anonymize_turn``) no longer
-belong on that list: they run inside the ``serve_turn`` phase scope
-:func:`paramem.server.inference.handle_chat` opens around its
-whole dispatch, so those prompt loads ARE recorded onto the trace.
+``anonymize`` (``answer_via_cloud`` → ``anonymize_turn``) run inside the
+``serve_turn`` phase scope :func:`paramem.server.inference.handle_chat`
+opens around its whole dispatch, so those prompt loads ARE recorded onto
+the trace.
 ``phase_trace``'s caller, by contrast, has explicitly declared a phase
 boundary — a lost record there is a contract breach the raise is meant
 to catch.
@@ -266,13 +266,11 @@ class PhaseRecord:
         exception propagated through the scope; ``reason`` is set), or
         ``"rejected"`` (the phase produced output but the caller rejected
         it as a unit and fell back to a prior-stage input; ``reason`` is
-        set) — no current phase writer produces ``"rejected"`` (the
-        ``cloud_enrich`` binding-totality gate this example used to name
-        was retired in the 2026-07-22 cloud-admission redesign in favour
-        of per-triple accept/drop/revert, which never discards a whole
-        phase's output as a unit); the value remains part of the generic
-        vocabulary for a future phase that needs it. No consumer branches
-        on the value.
+        set) — no current phase writer produces ``"rejected"``: every
+        cloud-enrichment gate acts per-triple (accept/drop/revert) and
+        never discards a whole phase's output as a unit; the value
+        remains part of the generic vocabulary for a future phase that
+        needs it. No consumer branches on the value.
     wall_clock_seconds:
         Time inside the ``with phase_trace(...)`` block, including all
         nested work.  Captured automatically by the context manager.
@@ -730,10 +728,9 @@ def record_prompt(*, path: str | None, content: str) -> None:
       ``paramem/cloud/anonymize_steps.py``), none of which open
       ``extraction_trace``/``phase_trace``.  The live chat egress's own
       calls into ``anonymize`` (``answer_via_cloud`` →
-      ``anonymize_turn``, ``paramem/server/inference.py``) no longer
-      belong on this list: they run inside the ``serve_turn`` phase scope
-      ``handle_chat`` opens around its whole dispatch, so those prompt
-      loads ARE recorded.
+      ``anonymize_turn``, ``paramem/server/inference.py``) run inside the
+      ``serve_turn`` phase scope ``handle_chat`` opens around its whole
+      dispatch, so those prompt loads ARE recorded.
 
     ``phase_trace``'s raise exists because ITS caller has explicitly
     declared a phase boundary, so a lost record there is a contract

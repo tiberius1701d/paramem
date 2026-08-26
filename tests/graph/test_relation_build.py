@@ -1,10 +1,8 @@
 """Unit tests for paramem.graph.relation_build.
 
 Pure post-processing: no model, no tokenizer, no cloud, no config. Every
-test here is a total function of its inputs — which is exactly why this
-logic was extracted out of the middle of what used to be
-``extractor._cloud_pipeline``, where reaching it required standing up the
-whole anonymize → enrich → judge chain first.
+test here is a total function of its inputs, so this module's behaviour is
+tested standalone without standing up the anonymize → enrich → judge chain.
 
 Covers:
 - schema-validation drop recording (kept vs. dropped, and the record shape)
@@ -13,13 +11,13 @@ Covers:
 - the recovery gate's decision
 
 The ``CAUSE_*`` vocabulary's own classification tests
-(``cause_kind``/``EMPTY_CAUSE_KIND``) live in ``test_empty_cause.py`` now
-that the vocabulary itself lives in ``paramem.graph.empty_cause``.
+(``cause_kind``/``EMPTY_CAUSE_KIND``) live in ``test_empty_cause.py``,
+which is where the vocabulary itself lives (``paramem.graph.empty_cause``).
 
-Literal-value ("scalar") facts are no longer routed by this module — the
-model tags them ``relation_type="attribute"`` at extraction time and
-``GraphMerger`` folds them onto the subject node's ``attributes`` dict
-(see ``tests/graph/test_merger_attribute_gate.py``).
+Literal-value ("scalar") facts are routed by ``relation_type="attribute"``
+tagging at extraction time; ``GraphMerger`` folds them onto the subject
+node's ``attributes`` dict rather than through this module (see
+``tests/graph/test_merger_attribute_gate.py``).
 """
 
 from __future__ import annotations

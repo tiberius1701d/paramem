@@ -12,11 +12,10 @@ Two roles, both consumed by the server lifespan:
    ``torch.cuda.memory_allocated(0)``, refuses startup (``sys.exit(1)``)
    when the measured allocation leaves less than the configured headroom.
 
-Pre-load math gates were removed: the boot path uses
-``_wait_for_gpu_drain`` (in ``app.py``) to wait for VRAM and degrade to
-cloud-only on timeout; the live-reload path uses the same drain-wait.
-``check_post_load_budget`` is the only check that can actually reject
-the configured topology.
+The boot path uses ``_wait_for_gpu_drain`` (in ``app.py``) to wait for
+VRAM and degrade to cloud-only on timeout; the live-reload path uses the
+same drain-wait. ``check_post_load_budget`` is the only check that can
+actually reject the configured topology.
 
 Working set formula (informational, used by :func:`assess_topology`)::
 
@@ -565,8 +564,7 @@ def _format_breakdown(
             (worst-case enabled-tier shape).
         interim_overflow_slack: Extra overflow slots beyond ``max_interim_count``
             reserved in the budget (mirrors ``consolidation.interim_overflow_slack``).
-            At 0 (default) the interim row matches the output before
-            overflow-slack support was added.
+            At 0 (default) no overflow annotation is added to the interim row.
 
     Returns:
         Formatted breakdown string (no trailing newline).

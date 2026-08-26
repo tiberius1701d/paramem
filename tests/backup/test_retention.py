@@ -539,9 +539,9 @@ class TestPruneRule4PreBaseSwap:
     """Rule 4 window immunity for the pre_base_swap tier.
 
     Mirrors TestPruneRule4PreMigrationWindow but exercises the pre_base_swap
-    tier path, including the acceptance-regression case: a slot within the
-    window survives even when keep=0 AND no trial.json is present (models the
-    post-rollback state where trial immunity is absent).
+    tier path, including the case where a slot within the window survives
+    even when keep=0 AND no trial.json is present (models the post-rollback
+    state where trial immunity is absent).
     """
 
     def test_pre_base_swap_within_window_preserved(self, tmp_path) -> None:
@@ -580,7 +580,7 @@ class TestPruneRule4PreBaseSwap:
         assert len(result.deleted) == 7
 
     def test_pre_base_swap_within_window_preserved_after_trial_cleared(self, tmp_path) -> None:
-        """Acceptance regression: pre_base_swap slot within window, keep=0, no trial.json.
+        """pre_base_swap slot within window, keep=0, no trial.json still survives.
 
         Models the post-rollback state: trial.json is gone (no live-TRIAL immunity)
         and keep=0 would normally remove all slots.  The 30-day window rule (rule 4)

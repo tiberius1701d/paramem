@@ -320,13 +320,12 @@ class TestRunnerFailurePaths:
     def test_runner_disk_pressure_mid_loop_preserves_written_slots_and_prunes(self, tmp_path):
         """Cap reached AFTER the first artifact writes — a mid-loop refusal.
 
-        Regression for the blocking review fix: an early ``return`` on the
-        second artifact's refusal would report ``written_slots={}`` while a
-        real slot sat on disk, and would skip pruning — exactly the operation
-        that relieves the pressure just detected.  The first write's
-        ``compute_disk_usage`` call reports comfortably under cap; the second
-        (and every later call, including the two inside ``prune()``) reports
-        over cap.
+        ``written_slots`` reflects every slot actually written to disk even
+        when a later artifact's write is refused, and pruning still runs —
+        the operation that relieves the disk pressure just detected. The
+        first write's ``compute_disk_usage`` call reports comfortably under
+        cap; the second (and every later call, including the two inside
+        ``prune()``) reports over cap.
         """
         loop = _mock_loop()
         under = DiskUsage(total_bytes=10, by_tier={}, cap_bytes=20 * 1024**3, pct_of_cap=0.0)

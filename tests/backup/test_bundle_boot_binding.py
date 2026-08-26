@@ -239,9 +239,9 @@ class TestCaptureRestoreBootBinding:
 
 
 class TestRestoringAPreUpgradeSimulateBundle:
-    """A bundle captured BEFORE the venue-uniform slot envelope landed
-    recorded a simulate tier's ``graph.json`` as a plain tier-root file (no
-    accompanying slot ``meta.json``).  Restoring it lands that file inside a
+    """A legacy bundle recording a simulate tier's ``graph.json`` as a plain
+    tier-root file (no accompanying slot ``meta.json``).  Restoring it lands
+    that file inside a
     freshly allocated slot dir (``SLOT_DURABLE_FILES`` classifies by
     filename alone) that carries no ``meta.json`` -- ``cleanup_partial_slots``
     removes it as scratch, and the tier is left with active keys but no
@@ -250,12 +250,13 @@ class TestRestoringAPreUpgradeSimulateBundle:
     """
 
     def _write_pre_upgrade_bundle(self, bundle_dir: Path, key: str) -> Path:
-        """Hand-construct a bundle.meta.json + files in the PRE-migration
-        shape: ``adapters/episodic/graph.json`` captured as a bare tier-root
-        file, no ``adapters/episodic/meta.json`` slot entry -- the exact
-        shape a bundle written before the ``SLOT_DURABLE_FILES`` change
-        would carry. ``bundle_schema_version`` (the outer bundle format) is
-        independent of the per-slot manifest schema, so it stays current."""
+        """Hand-construct a bundle.meta.json + files in the legacy shape:
+        ``adapters/episodic/graph.json`` captured as a bare tier-root
+        file, no ``adapters/episodic/meta.json`` slot entry -- the shape a
+        bundle carries when ``graph.json`` is recorded as a bare tier-root
+        file instead of as a slot member. ``bundle_schema_version`` (the
+        outer bundle format) is independent of the per-slot manifest
+        schema, so it stays current."""
         import hashlib
 
         from paramem.backup.types import BUNDLE_SCHEMA_VERSION
@@ -370,10 +371,9 @@ class TestRestoringAPreUpgradeSimulateBundle:
 
 
 class TestRestoreSweepRemovesStaleTierRootGraph:
-    """A target tree carrying a stale tier-root ``graph.json`` (pre-unification
-    debris) is swept clean by the restore's clean-slate sweep, so the tier
-    is left in the uniform shape and the next capture reports no torn
-    slot."""
+    """A target tree carrying a stale tier-root ``graph.json`` is swept clean
+    by the restore's clean-slate sweep, so the tier is left in the uniform
+    shape and the next capture reports no torn slot."""
 
     def test_restore_sweep_removes_a_stale_tier_root_graph(self, tmp_path: Path) -> None:
         # Source bundle carries a real, current-shape simulate slot for episodic.
@@ -389,9 +389,8 @@ class TestRestoreSweepRemovesStaleTierRootGraph:
             meta_fields={"tier": "manual", "label": "graph-capture"},
         )
 
-        # Target tree already carries a stale, pre-unification tier-root
-        # graph.json under episodic/ -- debris left behind before graph.json
-        # moved inside a slot.
+        # Target tree already carries a stale tier-root graph.json under
+        # episodic/, outside any slot.
         target = tmp_path / "target"
         target_episodic = target / "adapters" / "episodic"
         target_episodic.mkdir(parents=True)

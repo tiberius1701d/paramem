@@ -9,16 +9,14 @@ so a candidate that cannot boot never becomes the live config.
 A hand-rolled ``os.rename(x, live_config_path)`` in a request handler bypasses all of
 that: it renames first and discovers the config is unbootable at the next
 ``load_server_config`` — by which point the server is already dead on the next boot.
-That was the defect this guard exists to prevent recurring.
+This guard exists to prevent that failure mode.
 
 Design: default-deny, not default-allow
 ----------------------------------------
-An earlier version of this guard scanned a hardcoded list of three "promoting
-functions" for ``os.rename`` calls. Mutation-testing it (adding a fourth handler
-with a raw ``os.rename(candidate, live_config_path)``) showed the guard passed
-regardless — a new bypass anywhere else in the module was invisible to it.
+A hardcoded list of "promoting functions" scanned only for ``os.rename`` calls
+would let a new bypass anywhere else in the module go unnoticed.
 
-This version walks the **whole module** for anything rename-shaped
+This guard instead walks the **whole module** for anything rename-shaped
 (``os.rename``, a ``from os import rename`` alias, ``shutil.move``, or a
 ``Path.replace(dest)``-shaped call — one positional argument, no keywords, which
 distinguishes it from ``dataclasses.replace(obj, **changes)``) whose destination
@@ -158,7 +156,7 @@ def test_only_the_restore_handlers_rename_onto_the_live_config_path():
 
 
 def test_app_has_no_rename_config_symbol():
-    """The retired ``_rename_config`` helper is gone — promotion has one route."""
+    """There is no ``_rename_config`` helper — promotion has one route."""
     source = APP_PY.read_text(encoding="utf-8")
     assert "_rename_config" not in source, (
         "paramem/server/app.py still references _rename_config. The atomic config "

@@ -14,10 +14,10 @@ Model-free and — by construction — free of any ``paramem.graph`` import:
 every primitive here operates on plain ``dict``/``str`` fact artifacts,
 never a ``Relation`` or ``SessionGraph``. Rendering a ``Relation`` into a
 fact dict is the caller's job, in ``paramem/graph/``. One exception to
-"IO-free": :func:`build_forward_table` resolves the speaker
-placeholder prefix via :func:`~paramem.config.taxonomy.entity_type_to_prefix`,
-a cached (``lru_cache``) read of ``configs/schema.yaml`` — ``paramem.config``
-is a leaf package with no graph/server dependency of its own, so this stays
+"IO-free": :func:`build_forward_table` resolves the person-category prefix
+via :func:`~paramem.config.taxonomy.entity_type_to_prefix`, a cached
+(``lru_cache``) read of ``configs/schema.yaml`` — ``paramem.config`` is a
+leaf package with no graph/server dependency of its own, so this stays
 within the "no ``paramem.graph`` import" boundary while resolving the
 taxonomy directly rather than taking it as a caller-supplied parameter.
 
@@ -27,13 +27,13 @@ but ``paramem.cloud.anonymize_steps`` imports FROM this module
 (:data:`_MAX_MAPPING_TEXT_CHARS`, :func:`_word_boundary_ok`),
 so a runtime import here would cycle.
 
-Token shape today is BARE (``Person_1``); a braced form (``{Person_1}``)
-exists only for the in-text detection net and for the cloud's own
-brace-binding mint protocol. Nothing here hardcodes the bare shape as
-load-bearing — a future format flip only touches :func:`mint_placeholder`
-and :data:`PLACEHOLDER_SHAPE_RE`.
+The minted token shape is BARE (``Person_1``); a braced form
+(``{Person_1}``) exists only for the in-text detection net and for the
+cloud's own brace-binding mint protocol. Nothing here hardcodes the bare
+shape as load-bearing — a format change only touches
+:func:`mint_placeholder` and :data:`PLACEHOLDER_SHAPE_RE`.
 
-Load-bearing invariants preserved from the pre-refactor implementation:
+Load-bearing invariants:
 
 * ``observed is None`` in :func:`_resolution_map` means CORE UNSCOPED —
   never ``set()`` (an empty set would scope CORE to nothing and drop
@@ -45,6 +45,10 @@ Load-bearing invariants preserved from the pre-refactor implementation:
   invariant (drop, never repair) BEFORE substitution, then substitute
   subject/object, then a residual sweep over every ``_FACT_FIELDS``
   field. The two drop categories are returned already partitioned.
+* MINT-LAST: :func:`build_forward_table` prunes before it mints, so every
+  minted placeholder number is carried by at least one surviving key in
+  ``forward`` — a prefix's numbers run ``1..N`` with no holes left by a
+  containment merge or an inert-key drop.
 """
 
 from __future__ import annotations
@@ -52,10 +56,13 @@ from __future__ import annotations
 import logging
 import re
 from collections.abc import Iterable, Sequence
-from typing import TYPE_CHECKING
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, TypeVar
 
 from paramem.config.taxonomy import entity_type_to_prefix
 from paramem.utils.identity import canonical, is_speaker_id
+
+_V = TypeVar("_V")
 
 if TYPE_CHECKING:
     from paramem.cloud.anonymize_steps import ScanResult
@@ -119,11 +126,10 @@ def mint_placeholder(existing_values: Iterable[object], prefix: str) -> str:
     this function; every call site in this module passes the union of
     both sources.
 
-    THE only place a placeholder token string is built. Every mint in
-    this module — including :func:`build_forward_table`'s
-    per-prefix and speaker-name-fallback mints — goes through this one
-    function; never re-implement a local counter or scanning closure
-    at a call site.
+    THE only place a placeholder token string is built. The one call
+    site is :func:`build_forward_table`'s mint & emit pass, one call per
+    surviving non-speaker group — never re-implement a local counter or
+    scanning closure at a call site.
     """
     max_n = 0
     for v in existing_values:
@@ -134,26 +140,6 @@ def mint_placeholder(existing_values: Iterable[object], prefix: str) -> str:
             if tail.isdigit():
                 max_n = max(max_n, int(tail))
     return f"{prefix}_{max_n + 1}"
-
-
-def placeholder_prefix(token: str) -> str | None:
-    """Split a placeholder-shaped token into its prefix.
-
-    ``"Home_Address_1"`` -> ``"Home_Address"``; ``"Person_2"`` ->
-    ``"Person"``; ``None`` when *token* is not shaped per
-    :data:`PLACEHOLDER_SHAPE_RE` (the anchored full-string validator —
-    this function never partially matches an unshaped token).
-
-    THE only place a shaped token is split into prefix + numeric index.
-    Consumed by the cross-slice placeholder renumber in
-    :func:`~paramem.cloud.anonymize.anonymize` (a collision between two
-    slices' independently-minted placeholders is resolved by re-minting
-    onto the same prefix via :func:`mint_placeholder`) — never
-    re-implement the ``rsplit("_", 1)`` split at a second call site.
-    """
-    if not PLACEHOLDER_SHAPE_RE.match(token):
-        return None
-    return token.rsplit("_", 1)[0]
 
 
 def braced(token: str) -> str:
@@ -204,12 +190,13 @@ def _word_boundary_ok(text: str, key: str, pos: int) -> bool:
     edge char on that side is a word char (:func:`_is_word_char`) — see
     :func:`_substitute_whole_words`'s docstring for the full rule.
 
-    THE one boundary predicate shared by :func:`_substitute_whole_words`
-    (deciding whether a scanned candidate position is a real match, inside
-    its replace-everywhere scan) and
-    :func:`~paramem.cloud.anonymize_steps._scan_drop_reason` (the scan's
-    own whole-word verification check) — never re-implement the edge-aware
-    check at a second call site.
+    THE one boundary predicate for every whole-word decision in the
+    anonymize chain: :func:`_substitute_whole_words` (is a scanned candidate
+    position a real match), :func:`~paramem.cloud.anonymize_steps._scan_drop_reason`
+    (the scan's own whole-word verification) and the HA leg's retained-surface
+    filter in :mod:`paramem.server.egress` (does a key occur outside a
+    retained span) — never re-implement the edge-aware check at another
+    call site.
     """
     end = pos + len(key)
     if _is_word_char(key[0]) and pos > 0 and _is_word_char(text[pos - 1]):
@@ -233,10 +220,9 @@ def _substitute_whole_words_and_applied(
     side only if the KEY's edge char on that side is a word char
     (:func:`_is_word_char`).  A key whose first/last char is a
     non-word char (e.g. ``"+49 151 2345"``) needs no boundary check on
-    that side and can therefore match starting or ending mid-run —
-    fixing the historical bug where a key starting with a non-word char
-    was never attempted because matches were only tried at word-char
-    positions.  A key that IS word-char-bounded on a side (``"Bill"``)
+    that side and can therefore match starting or ending mid-run — every
+    character position is a candidate match start, not only word-char
+    starts.  A key that IS word-char-bounded on a side (``"Bill"``)
     still requires a non-word (or string-edge) neighbour there, so
     ``"Bill"`` matches standalone but never inside ``"Billing"``.
 
@@ -318,21 +304,23 @@ def _substitute_whole_words(
     return substituted
 
 
-def _applied_whole_word_keys(text: str, mapping: dict[str, str]) -> set[str]:
-    """The reporting form of :func:`_substitute_whole_words`: which keys of
-    *mapping* actually matched somewhere in *text*, without needing the
-    substituted text itself.
+def _applied_whole_word_keys(text: str, keys: Iterable[str]) -> set[str]:
+    """The reporting form of :func:`_substitute_whole_words`: which of
+    *keys* actually matches somewhere in *text*, without needing the
+    substituted text itself or a value to substitute in.
 
-    Runs the identical walk (:func:`_substitute_whole_words_and_applied`)
-    over the same ``(text, mapping)`` pair and returns only the
-    applied-keys half. A key this function does not return is INERT for
-    that ``(text, mapping)`` pair: :func:`_substitute_whole_words` would
-    substitute it nowhere. The one production caller
-    (:func:`~paramem.cloud.anonymize.anonymize`) uses this to prune a
-    forward table down to the keys that are live over one payload, before
-    deriving ``reverse``/``declared``/``anon_transcript`` from it — see
-    that function's docstring.
+    Builds ``dict.fromkeys(keys, "")`` and runs the identical walk
+    (:func:`_substitute_whole_words_and_applied`) over it, returning only
+    the applied-keys half — the values are never read, so a caller with no
+    mapping to hand (a set of candidate surfaces, not yet paired with a
+    placeholder) can still ask "which of these substitutes somewhere in
+    this text". A key this function does not return is INERT for that
+    ``(text, keys)`` pair: :func:`_substitute_whole_words` would
+    substitute it nowhere. The one production caller,
+    :func:`build_forward_table`'s prune pass, uses this to keep only the
+    forward-table keys that are live over one payload before minting.
     """
+    mapping = dict.fromkeys(keys, "")
     _substituted, applied = _substitute_whole_words_and_applied(text, mapping)
     return applied
 
@@ -346,10 +334,10 @@ def insert_placeholders(facts: list[dict], mapping: dict[str, str]) -> list[dict
     ``relation_type``, ``confidence``, ``speaker_id``, or anything else a
     caller's fact dict happens to carry) is copied through unchanged via
     ``{**f, ...}`` — the predicate is NEVER a substitution target, so a
-    placeholder cannot be glued into it at this stage (the motivating bug,
-    ``language_proficiency_Language_3``, can still occur in the cloud's
-    *returned* facts, which is why the deanon-stage predicate invariant in
-    :func:`_apply_bindings` stays).
+    placeholder cannot be glued into it at this stage. A predicate shaped
+    like ``language_proficiency_Language_3`` can still occur in the
+    cloud's *returned* facts, which is why the deanon-stage predicate
+    invariant in :func:`_apply_bindings` stays.
 
     Callers render their own artifact (a ``Relation`` list, a NetworkX
     subgraph's serialized triples, ...) into fact dicts BEFORE calling this
@@ -429,22 +417,21 @@ def _normalize_anonymization_mapping(
     (:func:`~paramem.utils.identity.is_speaker_id`) as placeholder-shaped,
     even though a speaker id never matches :data:`PLACEHOLDER_SHAPE_RE`
     (no PascalCase prefix, no underscore before the digit) — the
-    fold-onto-token carve-in, historically what let a model-authored
+    fold-onto-token carve-in, which lets a model-authored
     ``{"RealName": "speaker0"}`` entry survive normalization for the CORE
     anonymizer table. This carve-in is deliberately NOT extended to
     ``placeholder_side="key"`` — the cloud ``bindings`` table — where a
     speaker-id-shaped KEY stays genuinely ambiguous (a cloud model has no
     authority to bind new content onto the identity anchor).
 
-    Current status: the local anonymizer no longer authors a
-    ``{real: placeholder}`` mapping at all — SCAN only lists real values,
-    and :func:`build_forward_table` mints every placeholder in code,
-    including the fold-onto-``speaker{N}`` decision (from the ANCHOR call's
-    ``anchor_names``). ``placeholder_side="value"`` (and this speaker-id
-    carve-in) therefore has no production caller left; it is retained
-    here, unnarrowed, since the ``bindings`` table (``placeholder_side="key"``)
-    variant below still shares this same normalizer and its own callers
-    and tests are unaffected.
+    ``placeholder_side="value"`` has no production caller: the local
+    anonymizer never authors a ``{real: placeholder}`` mapping — SCAN only
+    lists real values, and :func:`build_forward_table` mints every
+    placeholder in code, including the fold-onto-``speaker{N}`` decision
+    (from the ANCHOR call's ``anchor_names``). This variant (and its
+    speaker-id carve-in) is retained because the ``bindings`` table
+    (``placeholder_side="key"``) variant below shares this same normalizer,
+    and that variant does have callers.
 
     Returns ``(canonical_mapping, stats)`` where ``stats`` has
     ``{inverted, dropped, dropped_entries}`` — ``inverted``/``dropped`` are
@@ -458,13 +445,12 @@ def _normalize_anonymization_mapping(
     THE only normalizer for either table.
 
     THE CORE table direction (``placeholder_side="value"``, the default)
-    has NO production caller — see the "Current status" note above. The
-    ``bindings`` table
-    variant (``placeholder_side="key"``) still has more than one caller
+    has NO production caller — see the note above. The ``bindings`` table
+    variant (``placeholder_side="key"``) has more than one caller
     (:meth:`~paramem.cloud.deanonymize.CloudScope.response`, and the
-    unrelated legacy per-session delta parser
+    unrelated per-session delta parser
     :func:`~paramem.graph.extractor._parse_enrichment_delta`) and its
-    ``stats`` is not currently surfaced to a diagnostic by either.
+    ``stats`` is not surfaced to a diagnostic by either.
     """
     if not mapping:
         return mapping, {"inverted": 0, "dropped": 0, "dropped_entries": []}
@@ -484,11 +470,10 @@ def _normalize_anonymization_mapping(
             # anonymizer LLM is authorized to emit {"RealName": "speaker0"}
             # when a coreferring real-name mention folds onto the user's
             # own token. Without this carve-in the entry has neither side
-            # placeholder-shaped and is dropped as ambiguous below, so
-            # historically the fix that let the CORE table builder actually
-            # receive the entry — see the "Post-anonymizer-split status"
-            # docstring note above (this direction has no production
-            # caller left post-split).
+            # placeholder-shaped and is dropped as ambiguous below — this
+            # carve-in is what lets the CORE table builder actually receive
+            # the entry (see the docstring note above on the ``value``
+            # direction's caller).
             # Guarded to ``placeholder_side="value"`` only: the cloud
             # ``bindings`` table (``placeholder_side="key"``) must never
             # treat a speaker id as a valid KEY placeholder — a cloud model
@@ -569,8 +554,8 @@ def _resolution_map(
     pruning check) and by :func:`_apply_bindings` (as its substitution
     map).
 
-    ``observed`` is ``None`` -> **CORE UNSCOPED** (today's behaviour;
-    every deanon call that has no cloud-observed scope to pass — e.g. a
+    ``observed`` is ``None`` -> **CORE UNSCOPED** — every deanon call
+    that has no cloud-observed scope to pass (e.g. a
     call outside the cloud-enrichment cycle, or a unit test exercising
     :func:`_apply_bindings`/:func:`_resolution_map` directly): every
     ``reverse`` entry is legal, ``cloud_bindings`` is merged in
@@ -731,9 +716,9 @@ def _declared_placeholder_tokens(
     (``language_proficiency_Language_3`` does not match
     ``\\bLanguage_3\\b``) — exactly the class of bug this
     vocabulary-based check exists to catch. Token SHAPE is irrelevant
-    here (bare today, braced after a future format flip); only
-    DECLARED-ness — membership in one of the two mapping tables —
-    matters, so this helper survives that flip unchanged.
+    here, whether bare or braced; only DECLARED-ness — membership in one
+    of the two mapping tables — matters, so this helper is independent of
+    the token shape in use.
     """
     tokens: set[str] = {k for k in reverse if isinstance(k, str) and k}
     if cloud_bindings:
@@ -807,11 +792,11 @@ def invert_forward_mapping(mapping: dict) -> dict[str, str]:
     conflict with this claim.
 
     THE single production caller for the CORE table is
-    :func:`~paramem.cloud.anonymize.anonymize`, which inverts its own
-    RECONCILED ``forward`` (:func:`build_forward_table`'s output, after
-    identity reconciliation) into ``reverse`` — :func:`build_forward_table`
-    itself no longer calls this function; see its own docstring's Returns
-    section.
+    :func:`~paramem.cloud.anonymize.anonymize`, which inverts
+    :func:`build_forward_table`'s own ``forward`` (already reconciled,
+    pruned, and minted by the time it is returned) into ``reverse`` —
+    :func:`build_forward_table` itself does not call this function; see
+    its own docstring's Returns section.
     """
     out: dict[str, str] = {}
     for k, v in mapping.items():
@@ -821,151 +806,314 @@ def invert_forward_mapping(mapping: dict) -> dict[str, str]:
     return out
 
 
+def _index_identity_domain(
+    identity_domain: Iterable[str] | None,
+) -> tuple[dict[str, str], set[str]]:
+    """Build the canonical-form -> domain-surface index for identity
+    reconciliation ONCE per :func:`build_forward_table` call.
+
+    ``identity_domain`` is the graph tier's ``chunk_nodes``, up to
+    ``max_entities_per_pass`` — typically 50 entries. Returns
+    ``(canon_to_domain, ambiguous_canon)``: a domain entry whose canonical
+    form collides with an earlier one is a genuine ambiguity, recorded in
+    ``ambiguous_canon`` rather than silently picking one.
+
+    ``identity_domain is None`` (no domain to reconcile against — the
+    session tier / chat egress / calibration) returns two empty
+    collections; :func:`build_forward_table` skips its reconcile pass
+    entirely in that case, so this function only ever produces the empty
+    pair there.
+    """
+    canon_to_domain: dict[str, str] = {}
+    ambiguous_canon: set[str] = set()
+    if identity_domain is None:
+        return canon_to_domain, ambiguous_canon
+    for d in identity_domain:
+        c = canonical(str(d))
+        if c in canon_to_domain and canon_to_domain[c] != d:
+            # Two distinct domain entries canonicalizing identically —
+            # fail closed on this entry rather than silently pick one.
+            ambiguous_canon.add(c)
+        else:
+            canon_to_domain[c] = d
+    return canon_to_domain, ambiguous_canon
+
+
+def _reconcile_to_domain(
+    mapping: dict[str, _V],
+    canon_to_domain: dict[str, str],
+    ambiguous_canon: set[str],
+) -> tuple[dict[str, _V], int]:
+    """Re-key ``mapping`` onto ``canon_to_domain``'s domain surfaces,
+    preserving each value verbatim.
+
+    Every key is folded through :func:`~paramem.utils.identity.canonical`
+    and matched against ``canon_to_domain``. A key whose canonical form is
+    ambiguous, or has no domain match, is dropped and counted. Returns
+    ``(reconciled_mapping, dropped_count)``.
+
+    Value-generic (``_V``): this function copies the value verbatim and
+    never inspects it, so :func:`build_forward_table` passes
+    ``dict[str, _Group]`` (re-keying group membership by surface, before
+    any placeholder exists) while its other callers pass ``dict[str,
+    str]`` unchanged.
+    """
+    reconciled: dict[str, _V] = {}
+    dropped = 0
+    for real, value in mapping.items():
+        c = canonical(real)
+        if c in ambiguous_canon or c not in canon_to_domain:
+            dropped += 1
+            continue
+        reconciled[canon_to_domain[c]] = value
+    return reconciled, dropped
+
+
+def _dropped_inert_entry(real: str, category: str) -> dict:
+    """Build one ``scan_dropped_entries`` record for a forward-table key
+    :func:`build_forward_table`'s prune pass drops: ``side="table"``,
+    ``reason="inert"`` — distinguishing a key dropped because it never
+    substituted anywhere in the payload from a scan-time drop
+    (``side="scan"``, built by
+    :func:`~paramem.cloud.anonymize_steps._dropped_scan_entry`).
+
+    ``category`` is the owning group's own mint prefix, passed in by the
+    caller — ``""`` for the speaker group, whose members carry no mint
+    prefix at all. The same truncation cap
+    (:data:`_MAX_MAPPING_TEXT_CHARS`) the scan path already uses for
+    ``text``.
+    """
+    return {
+        "category": category,
+        "side": "table",
+        "text": real[:_MAX_MAPPING_TEXT_CHARS],
+        "reason": "inert",
+    }
+
+
+@dataclass(frozen=True)
+class ForwardTable:
+    """The resolved real -> placeholder table :func:`build_forward_table`
+    returns, plus the two drop records the caller reports.
+
+    Attributes:
+        forward: The ``{real_name: placeholder}`` mapping that feeds
+            :func:`insert_placeholders` — already reconciled (when a
+            domain was given), pruned, and minted.
+        rekey_dropped: Count of keys dropped by identity reconciliation
+            (no domain match, or an ambiguous one) — ``0`` when
+            ``identity_domain`` was ``None``.
+        inert_entries: One :func:`_dropped_inert_entry` record per pruned
+            key — a key that substitutes nowhere in ``tag_text``. The
+            caller derives its own count from ``len(inert_entries)``: a
+            count that can disagree with the list it summarises is not a
+            field.
+    """
+
+    forward: dict[str, str]
+    rekey_dropped: int
+    inert_entries: tuple[dict, ...]
+
+
+@dataclass(eq=False)
+class _Group:
+    """One set of real surfaces sharing a single placeholder (or the
+    speaker token) — the unit of minting inside
+    :func:`build_forward_table`. Module-private, never exported.
+
+    ``eq=False`` keeps identity comparison/hashing (``is``, ``id()``): two
+    groups are the same group only by object identity, never by
+    coincidentally equal field values, so a group can be a ``set``/``dict``
+    key (the containment pass's container-group pooling) without a
+    field-value collision merging two distinct groups.
+
+    Attributes:
+        order: First-occurrence ordinal (the group's creation index) —
+            ``min()``'d onto the survivor on a containment merge, so a
+            merged group always emits at its EARLIEST member's position.
+        owner: Index into ``scans`` — the one category whose containment
+            pass may judge and re-point this group. Fixed at creation;
+            never reassigned by a merge.
+        prefix: The mint prefix — the owning category's
+            ``ScrubCategory.prefix``, or ``""`` for the speaker group
+            (which mints nothing).
+        speaker: Whether this group's target is ``speaker_id`` — closed
+            both ways (never judged, never a merge target); see
+            :func:`build_forward_table`'s docstring.
+        members: Surfaces, in first-occurrence (join) order.
+    """
+
+    order: int
+    owner: int
+    prefix: str
+    speaker: bool
+    members: list[str]
+
+
+def _is_speaker_surface(value: str, *, anchor_names: frozenset[str], enrolled: str | None) -> bool:
+    """The speaker-fold predicate: does *value* belong on the speaker
+    group?
+
+    ``enrolled is None`` (no display name to compare against — an
+    anonymous-voice speaker) — attestation alone decides: *value* folds
+    iff it is in *anchor_names*.
+
+    ``enrolled`` set — consistency is SYMMETRIC: *value* folds when it is
+    case-insensitively EQUAL to *enrolled* (no attestation needed — the
+    enrolled name is trusted on its own), or when it is ATTESTED (in
+    *anchor_names*) AND consistent with *enrolled* — either string starts
+    with the other followed by a space (``"Alex Rivera"`` under enrolled
+    ``"Alex"``, or ``"Alex"`` under enrolled ``"Alex Rivera"``). An
+    attested surface that is merely a NAMESAKE (inconsistent with
+    *enrolled*, e.g. ``"Mira"`` under enrolled ``"Alex"``) is refused — it
+    mints an ordinary placeholder instead.
+    """
+    if enrolled is None:
+        return value in anchor_names
+    low, name = value.lower(), enrolled.lower()
+    if low == name:
+        return True
+    return value in anchor_names and (low.startswith(name + " ") or name.startswith(low + " "))
+
+
+def _open_group(groups: list[_Group], owner: int, prefix: str, *, speaker: bool) -> _Group:
+    """Create, register, and return a fresh :class:`_Group` — used by
+    :func:`build_forward_table`'s resolve pass. ``order`` is the group's
+    creation index in *groups* (its first-occurrence ordinal).
+    """
+    group = _Group(order=len(groups), owner=owner, prefix=prefix, speaker=speaker, members=[])
+    groups.append(group)
+    return group
+
+
+def _join(group: _Group, value: str, group_of: dict[str, _Group]) -> None:
+    """Add *value* to *group* and register the membership in *group_of* —
+    used by :func:`build_forward_table`'s resolve pass.
+    """
+    group.members.append(value)
+    group_of[value] = group
+
+
 def build_forward_table(
     scans: "Sequence[ScanResult]",
     *,
+    tag_text: str,
     anchor_names: frozenset[str],
     speaker_id: str | None,
     speaker_name: str | None,
-) -> dict[str, str]:
+    identity_domain: Iterable[str] | None,
+) -> ForwardTable:
     """Assemble the real -> placeholder forward table from verified SCAN
-    results — code mints every placeholder now; there is no model-authored
+    results — code mints every placeholder; there is no model-authored
     mapping to normalize or invert (see the module docstring's "Model-free"
     note and :mod:`paramem.cloud.anonymize_steps`).
 
-    THE one table constructor for the local-anonymizer CORE map. This
-    function does the minting itself (:func:`mint_placeholder`) since the
-    tagger never proposes placeholder values at all — SCAN only lists real
-    values.
+    THE one table constructor for the local-anonymizer CORE map: it
+    resolves every scanned surface to a GROUP, reconciles group members
+    onto ``identity_domain`` (when given), prunes members that substitute
+    nowhere in ``tag_text``, and mints exactly one placeholder per
+    surviving non-speaker group. Five passes, always in this order:
 
-    Processing order: *scans* in the caller's given order — the resolved
-    :class:`~paramem.config.taxonomy.ScrubCategory` tuple's own order
-    (schema row order), the same order
-    :func:`~paramem.cloud.anonymize_steps.scan_values` returns one result
-    per — each category's own
-    :attr:`~paramem.cloud.anonymize_steps.ScanResult.values` in
-    first-occurrence order (already established by that function's own
-    verification). Cross-category ties (the identical or a canonically
-    equal real value scanned in two categories) resolve to the EARLIER
-    category's placeholder (first-category-wins). The tie is over which
-    placeholder PREFIX a value gets, and category order is the operator's
-    own schema-row order — a stable, config-owned precedence, not an
-    accident of "no shared offset index": every span already carries a
-    coordinate in one global payload offset space (the tagger's), so true
-    first-occurrence order across categories IS reconstructible here, and
-    is deliberately NOT what this function uses — deciding the prefix by
-    incidental payload position would let the same value mint ``Person_1``
-    in one session and ``Profile_1`` in the next, purely because a scan
-    order or a paraphrase shuffled which category's span came first.
+    0. **Gates.** The person-name category, the speaker fold TARGET, and
+       the ENROLLED display name are each resolved once, before anything
+       else. ``person_idx`` is the index into *scans* of the category
+       whose prefix is the person prefix
+       (:func:`~paramem.config.taxonomy.entity_type_to_prefix` ("person")),
+       or ``-1`` when no such category is among the active scan
+       categories — the operator narrowed ``sanitization.scrub`` away
+       from person names. ``target`` is *speaker_id* itself, but only
+       when it is truthy, well-shaped
+       (:func:`~paramem.utils.identity.is_speaker_id`), AND a person
+       category is active; otherwise ``None`` — and every later read of
+       ``enrolled`` sits inside a ``target is not None`` branch, so
+       ``target is None`` means the speaker's own name is never entered
+       and never folds, whatever the caller passed. ``enrolled`` is
+       *speaker_name* itself, but only when it is truthy, NOT itself
+       speaker-id-shaped, AND a person category is active; otherwise
+       ``None`` (an anonymous-voice speaker, or person-name scrubbing is
+       off).
+    1. **Resolve.** One sequential walk over *scans* (category order) x
+       each scan's ``values`` (first-occurrence order) assigns every
+       surface to a group: the speaker fold first
+       (:func:`_is_speaker_surface`, only ever tested when ``target is
+       not None``), else canonical-equality sharing onto an already-open
+       group (:func:`~paramem.utils.identity.canonical` — SHARING, never
+       deletion: every distinct verbatim surface still becomes its own
+       forward-table key, sharing the group's eventual placeholder), else
+       a fresh group owned by the current category (first-category-wins
+       for a value later re-scanned under a second category, since the
+       resolve walk never re-visits a value already in ``group_of``).
+       After the walk, the enrolled name itself is entered as an
+       additional forward key on the speaker group — but ONLY when
+       ``target is not None`` and ``enrolled is not None`` and it is not
+       already a member — so a name whose display form the tagger never
+       separately tagged still egresses as the speaker token.
+    2. **Containment**, per category, longest-first (see below).
+    3. **Reconcile** — only when ``identity_domain is not None``: every
+       surviving group member is re-keyed onto its domain surface via
+       :func:`_index_identity_domain` / :func:`_reconcile_to_domain`; a
+       member with no domain match, or an ambiguous one, is dropped and
+       counted into ``rekey_dropped``.
+    4. **Prune** — every member surviving reconciliation is tested against
+       *tag_text* by :func:`_applied_whole_word_keys` (the one
+       substitution walk); a member that substitutes nowhere is dropped
+       and recorded as an inert entry (:func:`_dropped_inert_entry`)
+       carrying its group's ``prefix`` as ``category`` (``""`` for the
+       speaker group).
+    5. **Mint & emit** — surviving groups are emitted in ascending
+       first-occurrence order (``_Group.order``, ``min()``'d onto the
+       survivor by every merge in pass 2, so a merged group emits at its
+       earliest member's position); each non-speaker group takes exactly
+       one :func:`mint_placeholder` call against the accumulating table —
+       so a prefix's numbers run ``1..N`` with no holes, since nothing
+       mints before pruning has removed every dead key. Within a group,
+       members are emitted longest-canonical-form-first
+       (:func:`~paramem.utils.identity.canonical` ``mode="spaces"``),
+       stable — so :func:`invert_forward_mapping`'s first-key-wins rule
+       always names the group's outermost (longest) surface, never a
+       fragment.
 
-    Canonical equality (:func:`~paramem.utils.identity.canonical`) decides
-    placeholder SHARING, never deletion: a second surface that is only
-    canonically equal to an already-minted one (``"Lena"`` after
-    ``"lena"``) still becomes its OWN forward-table key, mapped onto the
-    SAME placeholder the first canonically-equal surface minted — never a
-    dropped/discarded entry, which would egress verbatim once mint-side
-    verification stopped folding surfaces together
-    (:func:`~paramem.cloud.anonymize_steps.scan_values` keeps every
-    distinct verbatim surface the tagger returns; see that module's
-    docstring). :func:`_substitute_whole_words` stays exact and
-    case-sensitive by design — folding there would let a person named
-    ``"Bill"`` consume the common noun ``"bill"``.
-
-    **Surface containment** (applied AFTER the loop above and the
-    speaker-name seeding below, so an anchor fold onto *speaker_id* is
-    never disturbed): within one category, canonically-equal surfaces
-    (:func:`~paramem.utils.identity.canonical`, the same fold the mint
-    loop above uses to decide sharing) are ONE surface for this decision
-    too — a group minted together (``"lena"``/``"Lena"``) is judged and
-    re-pointed as a whole, never split so that one case- or
-    diacritic-differing member follows a container while its sibling is
-    left behind on the group's old placeholder. A group is judged exactly
-    once, the first time the longest-canonical-form-first sweep (below)
-    reaches any of its members: every member's own case/diacritic-
-    preserving canonical form (:func:`_whole_word_contains`, on
-    :func:`~paramem.utils.identity.canonical` ``mode="spaces"``) is
-    tested for whole-word containment against every other surface in the
-    category, and the matches are pooled across the whole group — one
-    member matching is enough for the group to find a container even
-    when a sibling's own case-differing form would not on its own
-    (``"lena"`` alone never whole-word-matches the capitalized ``"Lena
-    Marie Fischer"``, but its group-mate ``"Lena"`` does, and the pooled
-    result carries ``"lena"`` along with it). A group pooled onto
-    EXACTLY ONE other surface's PLACEHOLDER (containers that are only
-    case/diacritic variants of each other, e.g. ``"Elena Varga"`` and
-    ``"Elena VARGA"``, already share one placeholder from the mint loop
-    above and so count as one, not two) shares that container's
-    placeholder — a name fragment and the value it is part of are one
-    entity, not two (``"Varga"``/``"Elena"`` alongside ``"Elena
-    Varga"``). Every member stays its own forward-table key, so
-    substitution still replaces every one of them. A group pooled onto
-    TWO OR MORE distinct placeholders is genuinely ambiguous
-    (``"Elena"``/``"elena"`` inside both ``"Elena Varga"`` and ``"Elena
-    Fischer"``) and keeps its own freshly-minted placeholder rather than
-    guessing which one it belongs to. A value already folded onto
-    *speaker_id* by the anchor invariant below is skipped outright — this
-    rule only reassigns a group that was otherwise minted its own
-    placeholder. The rule is applied to each group exactly once, in the
-    one category that actually minted its placeholder (first-category-
-    wins, same as the mint loop) — a value merely co-listed in a second
-    category's scan (the identical surface tagged under two labels, e.g.
-    an email address tagged both ``person`` and ``email``) is never
-    re-pointed a second time onto that second category's own container.
-
-    Within a category, groups are judged LONGEST canonical form first
-    (by the length of whichever member is reached first in that sweep,
-    stable on a length tie, so an unresolved tie keeps the scan's own
-    order) rather than in scan/payload order: a group's containers must
-    already be settled — carrying their OWN final placeholder, including
-    any re-point a still-longer container gave them — before that group's
-    own ambiguity is decided, or "distinct placeholders among the
-    containers" would not actually mean "distinct entities". This makes a
+    **Containment** (pass 2), per category *idx*: that category's
+    non-empty, non-speaker-id string values are its *surfaces*; each
+    surface's case/diacritic-preserving canonical form
+    (:func:`~paramem.utils.identity.canonical` ``mode="spaces"``) is
+    ``canon_forms``. The groups this category may JUDGE are exactly the
+    groups whose ``owner == idx`` (excluding the speaker group, which is
+    never judged) — every such group has at least one member in
+    *surfaces* by construction (its founding member is what opened it
+    during this category's resolve walk). Judged groups are sorted by the
+    length of their longest member present in *surfaces*, descending,
+    stable on ties (creation order) — a group is judged exactly once, by
+    construction, never split across two containment outcomes. For each
+    judged group, in that order: pool :func:`_whole_word_contains` matches
+    across every one of the group's OWN-category members against every
+    OTHER surface of the category whose group differs, and collect the
+    distinct container GROUPS those matched surfaces belong to (a group
+    identity, not a placeholder — nothing has minted yet). A speaker-group
+    surface counts as a container for this ambiguity test exactly like any
+    other. Exactly one container group, and it is NOT the speaker group,
+    merges the judged group into it (the container keeps its identity,
+    absorbs every member, and takes ``order = min(container.order,
+    absorbed.order)``); two or more distinct containers, or a sole
+    container that IS the speaker group, leaves the judged group with its
+    own identity. Because judging runs longest-first, a container's own
+    merge is already settled by the time a shorter group is judged, so a
     transitive chain (``"Ann"`` inside ``"Ann Marie"`` inside ``"Ann Marie
-    Bell"``) collapse onto one placeholder deterministically: the longest
-    surface is judged first (it has no longer container, so it is never
-    itself re-pointed), then ``"Ann Marie"`` sees a single container and
-    shares its placeholder, then ``"Ann"`` sees that same single
-    (already-repointed) placeholder on both its containers and shares it
-    too — the SAME result regardless of the order *scan.values* happened to
-    list the three surfaces in, since judgment order is now a function of
-    canonical length, not payload position. A re-pointed group's members
-    are each DELETED then RE-INSERTED into ``forward`` rather than
-    reassigned in place, so every one of them sits AFTER its container in
-    insertion order — production recomputes ``reverse`` from ``forward``
-    via :func:`invert_forward_mapping`'s first-wins-by-insertion-order
-    rule, so without the reorder a short fragment mentioned earlier in the
-    payload could win the reverse map's tie-break over the full-length
-    surface it was folded onto. One residual: when EVERY span of a real
-    surface the tagger found is contained in a longer one (e.g. an
-    over-long address span that contains the true address), the true
-    surface never becomes its own forward-table key, and any occurrence
-    of it the tagger did not separately mark egresses verbatim — the
-    over-long key still covers the region the tagger DID mark.
+    Bell"``) collapses onto one group regardless of scan order.
 
-    Two invariants:
-
-    1. **Speaker-anchor invariants.**  ``speaker{N}`` is an anonymized
-       handle by construction (CLAUDE.md's "ONE lowercase ``speaker{N}``
-       everywhere"), never a real name to be re-mapped. A scanned value
-       that is itself speaker-id-shaped
-       (:func:`~paramem.utils.identity.is_speaker_id`) is dropped outright
-       (defensive: :func:`~paramem.cloud.anonymize_steps.scan_values`'s own
-       verification already drops it before it ever reaches here). A value
-       in *anchor_names* — the model's ANCHOR-call decision, already
-       restricted to the scanned surfaces by
-       :func:`~paramem.cloud.anonymize_steps.ask_speaker_anchor` — folds
-       onto *speaker_id* directly (the forward scrub, harmless and the only
-       thing standing between that real name and the cloud) rather than a
-       minted placeholder; such an entry is EXCLUDED from ``reverse`` (a
-       reverse entry keyed on ``speaker_id`` would restore that real name
-       onto every speaker-subject fact).
-    2. **Speaker-name seeding.**  When the runtime knows the speaker's
-       display name and it isn't already covered by a scanned/anchored
-       entry, reuse an already-built entry's placeholder when SOME scanned
-       surface names the speaker (exact or full-name match, e.g. ``"Alex"``
-       or ``"Alex Rivera"`` -> reuse its placeholder) or mint a fresh
-       placeholder via :func:`mint_placeholder`, prefixed via
-       :func:`~paramem.config.taxonomy.entity_type_to_prefix` ("person").
+    **The speaker group is CLOSED on both sides.** It is opened (once,
+    lazily, on the first surface or the enrolled-name entry that needs it)
+    with ``prefix=""`` and ``speaker=True`` — it mints nothing, and a
+    pruned member of it therefore records ``category=""`` through the
+    ordinary :func:`_dropped_inert_entry` path with no per-group carve-out.
+    It is never judged (so containment can never merge it OUT) and never
+    a merge target (so containment can never merge anything INTO it) — a
+    scanned fragment of an attested or enrolled surface (``"Rivera"``
+    under an attested ``"Alex Rivera"``) is an ordinary surface unless it
+    is ITSELF attested or equal to the enrolled name: it mints its own
+    placeholder. A surface reaches the speaker token only on evidence
+    about that surface, never by containment inside another surface that
+    had the evidence.
 
     Every other scanned value is trusted and minted unconditionally — the
     model already decided it is in scope against ``scrub``; this builder
@@ -980,6 +1128,11 @@ def build_forward_table(
     Args:
         scans: One :class:`~paramem.cloud.anonymize_steps.ScanResult` per
             configured category, in category order.
+        tag_text: The complete marker-free outbound surface (history +
+            transcript + fact lines) the prune pass (4) tests every
+            surviving key against — the same text the caller later
+            substitutes over via :func:`insert_placeholders` /
+            :func:`_substitute_whole_words`.
         anchor_names: The self-introduced subset of the scan union, from
             :func:`~paramem.cloud.anonymize_steps.ask_speaker_anchor` —
             already restricted to values that were actually scanned.
@@ -990,166 +1143,172 @@ def build_forward_table(
             ``paramem.cloud.anonymize.anonymize``'s docstring — means this
             never happens in production): such a value mints an ordinary
             placeholder instead of folding, rather than raising.
-        speaker_name: Runtime-known display name of the session's speaker.
-            When set AND not itself speaker-id-shaped, this name is
-            guaranteed to be covered. A speaker-id-shaped value here
-            (:func:`~paramem.utils.identity.is_speaker_id`) is never seeded
-            — see the reinstatement-bug comment at the seeding site.
+        speaker_name: Runtime-known display name of the session's speaker,
+            or ``None``. Consumed only when *speaker_id* is well-shaped AND
+            a person-name category is active among *scans* — see the
+            gates above (pass 0). A speaker-id-shaped value here
+            (:func:`~paramem.utils.identity.is_speaker_id`) is never
+            consumed either.
+        identity_domain: The graph tier's own node list (or ``None`` on
+            every other caller) — when given, pass 3 re-keys every
+            surviving group member onto its domain surface.
 
     Returns:
-        ``forward`` — the ``{real_name: placeholder}`` mapping that feeds
-        :func:`insert_placeholders`. This function does NOT also return a
-        ``reverse`` map: the one production caller
-        (:func:`~paramem.cloud.anonymize.anonymize`) needs ``reverse``
-        only AFTER cross-slice identity reconciliation has finished
-        mutating ``forward``, so it recomputes ``reverse`` itself, once,
-        via :func:`invert_forward_mapping` over the RECONCILED ``forward``
-        (first-wins tie-break on a many-to-one forward map, after dropping
-        any entry whose VALUE is speaker-id-shaped — invariant 1 above). A
-        caller that needs ``reverse`` from this function's own
-        pre-reconciliation ``forward`` computes it the same way:
-        ``invert_forward_mapping({k: v for k, v in forward.items() if not
-        is_speaker_id(v)})``.
+        :class:`ForwardTable` — ``forward`` (the ``{real_name:
+        placeholder}`` mapping :func:`insert_placeholders` consumes),
+        ``rekey_dropped`` and ``inert_entries`` (the two drop records the
+        caller reports; :func:`~paramem.cloud.anonymize.anonymize` derives
+        ``reverse`` from ``forward`` itself, via
+        :func:`invert_forward_mapping`, after dropping any entry whose
+        VALUE is speaker-id-shaped).
     """
-    forward: dict[str, str] = {}
-    canon_to_placeholder: dict[str, str] = {}
+    person_prefix = entity_type_to_prefix("person")
+    person_idx = next((i for i, s in enumerate(scans) if s.category.prefix == person_prefix), -1)
+    target = speaker_id if (speaker_id and is_speaker_id(speaker_id) and person_idx >= 0) else None
+    enrolled = (
+        speaker_name
+        if (speaker_name and not is_speaker_id(speaker_name) and person_idx >= 0)
+        else None
+    )
 
-    for scan in scans:
+    groups: list[_Group] = []
+    group_of: dict[str, _Group] = {}
+    canon_index: dict[str, _Group] = {}
+    speaker_group: _Group | None = None
+
+    # 1 — resolve.
+    for idx, scan in enumerate(scans):
         for value in scan.values:
             if not isinstance(value, str) or not value or is_speaker_id(value):
                 continue
-            if value in forward:
-                # Already minted for this exact surface — a scan
-                # deduplicates within its own category, but two
-                # categories can still list the identical string.
+            if value in group_of:
+                # Already assigned — a scan deduplicates within its own
+                # category, but two categories can still list the
+                # identical string (first-category-wins: it keeps the
+                # group its first occurrence opened).
                 continue
-            if speaker_id and value in anchor_names:
-                forward[value] = speaker_id
-                canon_to_placeholder.setdefault(canonical(value), speaker_id)
+            if target is not None and _is_speaker_surface(
+                value, anchor_names=anchor_names, enrolled=enrolled
+            ):
+                if speaker_group is None:
+                    # prefix="" — the speaker group mints nothing, and a
+                    # pruned member's inert record reads its category off
+                    # this field.
+                    speaker_group = _open_group(groups, idx, "", speaker=True)
+                _join(speaker_group, value, group_of)
+                canon_index.setdefault(canonical(value), speaker_group)
                 continue
-            canon = canonical(value)
-            shared = canon_to_placeholder.get(canon)
+            shared = canon_index.get(canonical(value))
             if shared is not None:
                 # Canonical SHARING, never deletion — see the docstring.
-                forward[value] = shared
+                _join(shared, value, group_of)
                 continue
-            placeholder = mint_placeholder(forward.values(), scan.category.prefix)
-            forward[value] = placeholder
-            canon_to_placeholder[canon] = placeholder
+            fresh = _open_group(groups, idx, scan.category.prefix, speaker=False)
+            _join(fresh, value, group_of)
+            canon_index[canonical(value)] = fresh
 
-    # Speaker-name seeding. ``not is_speaker_id(speaker_name)`` guards
-    # against the reinstatement bug: a display name that is itself
-    # literally speaker-id-shaped must never seed a forward-map key.
-    if speaker_name and not is_speaker_id(speaker_name) and speaker_name not in forward:
-        speaker_lower = speaker_name.lower()
-        reused: str | None = None
-        for key, placeholder in forward.items():
-            key_lower = key.lower()
-            if key_lower == speaker_lower or key_lower.startswith(speaker_lower + " "):
-                reused = placeholder
-                break
-        if reused is not None:
-            forward[speaker_name] = reused
-        else:
-            fresh = mint_placeholder(forward.values(), entity_type_to_prefix("person"))
-            forward[speaker_name] = fresh
+    # 1b — the enrolled name as an additional key on the speaker group.
+    # ``enrolled`` is None unless a person category is active, and every
+    # read of it sits under ``target is not None``, so no branch exists
+    # for a name without a well-shaped id.
+    if target is not None and enrolled is not None and enrolled not in group_of:
+        if speaker_group is None:
+            speaker_group = _open_group(groups, person_idx, "", speaker=True)
+        _join(speaker_group, enrolled, group_of)
+        canon_index.setdefault(canonical(enrolled), speaker_group)
 
-    # Surface containment — placeholder SHARING within one category, never
-    # deletion, never a second minted key. Runs LAST, after every anchor
-    # fold and the speaker-name seeding above, so a value already folded
-    # onto ``speaker_id`` is left untouched (skipped below) rather than
-    # reassigned onto some other surface's placeholder. See the docstring.
-    #
-    # ``value_mint_category`` records, for each scanned value, the index of
-    # the category that actually minted its placeholder — first-category-
-    # wins, mirroring the mint loop above (a value can appear in more than
-    # one category's ``scan.values`` when the tagger returns the identical
-    # surface under two labels, but its forward-table entry is owned by
-    # exactly one category). The sharing rule below is applied to a value
-    # ONLY in its owning category's pass — running it again in a category
-    # the value merely co-occurs in would re-point an already-settled
-    # placeholder onto that second category's own (unrelated) container.
-    value_mint_category: dict[str, int] = {}
+    # 2 — containment, per category, longest-first.
     for idx, scan in enumerate(scans):
-        for v in scan.values:
-            if isinstance(v, str) and v and not is_speaker_id(v):
-                value_mint_category.setdefault(v, idx)
+        surfaces = [v for v in scan.values if isinstance(v, str) and v and not is_speaker_id(v)]
+        surface_set = set(surfaces)
+        canon_forms = {v: canonical(v, mode="spaces") for v in surfaces}
 
-    for idx, scan in enumerate(scans):
-        category_values = [
-            v for v in scan.values if isinstance(v, str) and v and not is_speaker_id(v)
-        ]
-        canon_forms = {v: canonical(v, mode="spaces") for v in category_values}
-        # Longest-canonical-form-first, stable on ties: every container a
-        # shorter surface could fold onto has already been resolved (its
-        # own re-point, if any, already applied) by the time that shorter
-        # surface is judged — see the docstring's "Surface containment"
-        # paragraph for why payload order must not decide the outcome.
-        category_values = sorted(category_values, key=lambda v: len(canon_forms[v]), reverse=True)
-        judged_placeholders: set[str] = set()
-        for value in category_values:
-            if value_mint_category.get(value) != idx:
-                continue
-            placeholder = forward.get(value)
-            if placeholder == speaker_id:
-                continue
-            if placeholder in judged_placeholders:
-                # This value's canonical-equality group (minted together,
-                # sharing `placeholder`) was already judged via an earlier
-                # member reached by this same longest-first sweep — a
-                # group is judged exactly once so it can never be split
-                # across two containment outcomes.
-                continue
-            judged_placeholders.add(placeholder)
-            # The canonical-equality group `placeholder` already covers —
-            # every member moves together, whatever this pass decides.
-            group = [v for v in category_values if forward.get(v) == placeholder]
-            # Pool containment matches across every member's own
-            # case/diacritic-preserving form: a case-differing sibling
-            # that would not itself whole-word-match a container (`"lena"`
-            # against `"Lena Marie Fischer"`) still rides along when
-            # ANOTHER member of the same group does match (`"Lena"`).
+        judged_groups = [g for g in groups if g.owner == idx and g is not speaker_group]
+        judged_groups.sort(
+            key=lambda g: max(len(canon_forms[m]) for m in g.members if m in surface_set),
+            reverse=True,
+        )
+
+        for group in judged_groups:
+            own_members = [m for m in group.members if m in surface_set]
             containers: list[str] = []
             seen_containers: set[str] = set()
-            for member in group:
+            for member in own_members:
                 own_canon = canon_forms[member]
-                for other in category_values:
-                    if other in seen_containers or forward.get(other) == placeholder:
+                for other in surfaces:
+                    if other in seen_containers or group_of[other] is group:
                         continue
-                    if len(canon_forms[other]) > len(own_canon) and _whole_word_contains(
-                        canon_forms[other], own_canon
+                    other_canon = canon_forms[other]
+                    if len(other_canon) > len(own_canon) and _whole_word_contains(
+                        other_canon, own_canon
                     ):
                         containers.append(other)
                         seen_containers.add(other)
-            # Ambiguity is decided on DISTINCT PLACEHOLDERS, not raw
-            # surface count: ``canon_to_placeholder`` already folds
-            # case/diacritic variants of the same real value onto one
-            # placeholder in the mint loop above, so two such variants
-            # both containing the group (``"Elena Varga"`` /
-            # ``"Elena VARGA"``) are not a genuine two-way ambiguity —
-            # they name the same entity and share the same placeholder
-            # already.
-            container_placeholders = {forward[c] for c in containers}
-            if len(container_placeholders) == 1:
-                shared_placeholder = forward[containers[0]]
-                # Re-point AND re-order EVERY member of the group: delete
-                # then re-insert so each key sits AFTER its container in
-                # ``forward``'s insertion order. Production recomputes
-                # ``reverse`` from ``forward`` via
-                # :func:`invert_forward_mapping`'s first-wins-by-
-                # insertion-order rule (:func:`~paramem.cloud.anonymize.
-                # anonymize`, after cross-slice reconciliation) — without
-                # the delete+re-insert, re-assigning ``forward[member]`` in
-                # place would keep a FRAGMENT's original (earlier)
-                # insertion position, so it — not the full-length
-                # container — would win the reverse map's first-wins
-                # tie-break and become the surface that egresses on
-                # de-anonymization.
-                for member in group:
-                    del forward[member]
-                    forward[member] = shared_placeholder
+            container_groups = {group_of[c] for c in containers}
+            if len(container_groups) == 1:
+                (container,) = container_groups
+                if container is not speaker_group:
+                    container.members.extend(group.members)
+                    for m in group.members:
+                        group_of[m] = container
+                    container.order = min(container.order, group.order)
+                    group.members = []
 
-    return forward
+    # 3 — reconcile (skipped when identity_domain is None).
+    member_to_group: dict[str, _Group] = {}
+    for group in groups:
+        for m in group.members:
+            member_to_group[m] = group
+
+    rekey_dropped = 0
+    if identity_domain is not None:
+        canon_to_domain, ambiguous_canon = _index_identity_domain(identity_domain)
+        member_to_group, rekey_dropped = _reconcile_to_domain(
+            member_to_group, canon_to_domain, ambiguous_canon
+        )
+
+    # 4 — prune: every surviving key is tested against tag_text.
+    applied_keys = _applied_whole_word_keys(tag_text, member_to_group.keys())
+    inert_entries: list[dict] = []
+    surviving: dict[str, _Group] = {}
+    for key, group in member_to_group.items():
+        if key in applied_keys:
+            surviving[key] = group
+        else:
+            inert_entries.append(_dropped_inert_entry(key, group.prefix))
+
+    # 5 — mint & emit: ascending first-occurrence order, one mint per
+    # surviving non-speaker group, members longest-canonical-form-first.
+    # ``group_members`` is keyed by the ``_Group`` object itself — it is
+    # ``eq=False`` (identity hash/eq) for exactly this: no parallel
+    # ``id(group)`` bookkeeping needed to use it as a dict/set key.
+    group_members: dict[_Group, list[str]] = {}
+    for key, group in surviving.items():
+        group_members.setdefault(group, []).append(key)
+
+    ordered_groups = sorted(group_members, key=lambda g: g.order)
+
+    forward: dict[str, str] = {}
+    for group in ordered_groups:
+        keys_sorted = sorted(
+            group_members[group], key=lambda k: len(canonical(k, mode="spaces")), reverse=True
+        )
+        if group.speaker:
+            # ``target`` (not ``speaker_id``) — it is the value that
+            # actually gated this group's creation as a speaker group
+            # (the gates pass), so it is non-None by construction here, unlike
+            # ``speaker_id``'s own ``str | None`` signature type.
+            placeholder = target
+        else:
+            placeholder = mint_placeholder(forward.values(), group.prefix)
+        for key in keys_sorted:
+            forward[key] = placeholder
+
+    return ForwardTable(
+        forward=forward,
+        rekey_dropped=rekey_dropped,
+        inert_entries=tuple(inert_entries),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1242,17 +1401,17 @@ def _apply_bindings(
        Inside the full session flow
        (``paramem.graph.flows.SESSION_EXTRACT``, whose
        ``deanonymize`` stage is where this sweep actually runs), causes
-       (a) and (b) are now mostly pre-empted upstream by
+       (a) and (b) are pre-empted upstream by
        :func:`~paramem.graph.extractor._apply_enrichment_delta`, which
        drops an unresolvable ``add`` and reverts an unresolvable
        ``modify`` individually (per-triple, not a whole-delta rejection)
        BEFORE the fact ever reaches this function — so a bad mint sheds
-       only the one action that carried it.  This sweep remains the
+       only the one action that carried it.  This sweep is the
        fail-closed backstop for whatever slips past that per-triple gate
        (in particular cause (c), and any fact this function is invoked on
        directly, outside the full session flow — e.g. its own unit
-       tests). An anonymizer-stage leak is not among the live causes any
-       more: :func:`insert_placeholders` constructs the anon-stage fact
+       tests). An anonymizer-stage leak is not a live cause:
+       :func:`insert_placeholders` constructs the anon-stage fact
        array directly from the caller's relations and the mapping, so an
        orphan placeholder in a LOCAL fact is structurally impossible — the
        only source reaching this sweep is cloud's *returned* facts.
@@ -1267,19 +1426,13 @@ def _apply_bindings(
     ``residual_dropped`` holds the post-substitution copy for each fact
     step 3 removed.
 
-    Replaces the previous LLM-based deanon attempt that crashed on the
-    largest chunk's prompt with ``device not ready`` (VRAM exhaustion on
-    Mistral 7B at 8 GiB). Also replaces the regex-based binding recovery
-    (``_extract_cloud_bindings``) which produced bogus mappings under
-    multi-token replace blocks (bug 5).
-
     ``resolution`` — when the caller already holds
     :attr:`~paramem.cloud.deanonymize.CloudScope.resolution` (the ONE
     production shape, via :func:`~paramem.cloud.deanonymize.
     deanonymize_facts`), pass it here instead of letting step 2 recompute
     ``_resolution_map(reverse, cloud_bindings, observed)`` a second time
-    from the same three inputs. ``None`` (default) preserves the original
-    behaviour for direct/unit-test callers with no ``CloudScope`` to hand.
+    from the same three inputs. ``None`` (default) recomputes it for
+    direct/unit-test callers with no ``CloudScope`` to hand.
     """
     declared = _declared_placeholder_tokens(reverse, cloud_bindings)
 
@@ -1294,7 +1447,7 @@ def _apply_bindings(
             continue
         pre_filtered.append(f)
 
-    # Step 2 — substitute subject/object (unchanged semantics).
+    # Step 2 — substitute subject/object.
     resolve = (
         resolution if resolution is not None else _resolution_map(reverse, cloud_bindings, observed)
     )

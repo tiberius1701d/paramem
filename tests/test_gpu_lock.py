@@ -263,10 +263,8 @@ class TestDevicePlacement:
         _verify_device_placement(model, config)
 
 
-# TestThermalThrottle (BackgroundTrainer._thermal_throttle method) was removed
-# 2026-05-07.  After the BG trainer was refactored to delegate to
-# paramem.training.trainer.train_adapter, the throttle body lives in
-# ThermalThrottleCallback (paramem/training/thermal_throttle.py) and is
+# The thermal-throttle body lives in ThermalThrottleCallback
+# (paramem/training/thermal_throttle.py), not on BackgroundTrainer, and is
 # exercised by tests/training/test_thermal_throttle.py.
 # Quiet-hours predicate tests below remain — is_thermal_policy_active is still
 # importable from background_trainer via a re-export shim.
@@ -340,9 +338,9 @@ class TestQuietHoursPolicy:
         assert is_thermal_policy_active("auto", "12:00", "12:00", self._dt(12, 0)) is True
         assert is_thermal_policy_active("auto", "12:00", "12:00", self._dt(3, 0)) is True
 
-    # --- Throttle-with-policy integration tests removed 2026-05-07 ---
-    # The throttle body lives in ThermalThrottleCallback after the BG trainer
-    # refactor; equivalent tests are in
+    # --- Throttle-with-policy integration coverage ---
+    # The throttle body lives in ThermalThrottleCallback, not on
+    # BackgroundTrainer; coverage is in
     # tests/training/test_thermal_throttle.py::TestThermalThrottleCallbackBehaviour
     # (skips_when_window_inactive, releases_and_reacquires_when_hot,
     # shutdown_fn_breaks_wait_loop, etc.).

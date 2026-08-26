@@ -115,7 +115,7 @@ class TestEncryptCheckpointCallbackOnSave:
         being logged and swallowed.
 
         Leaving plaintext checkpoint shards on disk under Security ON is not
-        a recoverable condition — ``on_save`` no longer wraps
+        a recoverable condition — ``on_save`` does not wrap
         ``encrypt_checkpoint_dir`` in a try/except, so the failure must reach
         the caller (HF Trainer's callback dispatch) instead of being silently
         tolerated.

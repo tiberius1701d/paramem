@@ -222,9 +222,8 @@ class TestSessionBuffer:
         assert entry["text"] == "Hello"
 
     def test_append_persists_unconditionally(self, tmp_path):
-        """Pending sessions persist on disk even without debug
-        (2026-05-14 invariant — survives restarts until consolidation
-        consumes them)."""
+        """Pending sessions persist on disk even without debug — they
+        survive restarts until consolidation consumes them."""
         buffer = SessionBuffer(tmp_path / "sessions")
         buffer.append("conv1", "user", "Hello")
         session_id = buffer.get_pending()[0]["session_id"]
@@ -821,13 +820,12 @@ class TestProbeAndReasonDispatch:
         assert "Alice" not in full_prompt
 
     def test_anonymous_speaker_prefix_from_speaker_id(self, monkeypatch):
-        """Re-spec (B-form prefix from speaker_id presence): the local
-        system-prompt identity line is now gated on ``speaker_id`` alone —
-        anonymous/undisclosed speakers included.  ``speaker=None`` (the
-        display name, still absent pre-disclosure) no longer suppresses it;
-        only a ``speaker_id`` of ``None`` would.  The raw token is the
-        payload — never the display name, which stays absent from the
-        prompt regardless."""
+        """The local system-prompt identity line is gated on ``speaker_id``
+        alone — anonymous/undisclosed speakers included.  ``speaker=None``
+        (the display name, absent pre-disclosure) does not suppress it; only
+        a ``speaker_id`` of ``None`` does.  The raw token is the payload —
+        never the display name, which stays absent from the prompt
+        regardless."""
         self._stub_common(monkeypatch, fact_prefix="speaker3")
 
         captured = {}
@@ -1100,6 +1098,7 @@ class TestBaseModelAnswerSystemPrompt:
                 model=model,
                 tokenizer=tokenizer,
                 config=config,
+                diagnostics={},
                 speaker="Alice",
                 speaker_id="speaker0",
                 language="de",
@@ -1114,9 +1113,9 @@ class TestBaseModelAnswerSystemPrompt:
         assert result.text == "a plain answer"
 
     def test_anonymous_speaker_prefix_from_speaker_id(self, monkeypatch):
-        """Re-spec (B-form prefix from speaker_id presence): ``speaker=None``
-        no longer suppresses the identity token when ``speaker_id`` is set —
-        the prefix is gated on ``speaker_id`` alone, anonymous included."""
+        """``speaker=None`` does not suppress the identity token when
+        ``speaker_id`` is set — the prefix is gated on ``speaker_id`` alone,
+        anonymous included."""
         captured = {}
 
         def capture_messages(text, history, system_prompt):
@@ -1144,6 +1143,7 @@ class TestBaseModelAnswerSystemPrompt:
                 model=model,
                 tokenizer=tokenizer,
                 config=config,
+                diagnostics={},
                 speaker=None,
                 speaker_id="speaker3",
             )
@@ -1154,8 +1154,8 @@ class TestBaseModelAnswerSystemPrompt:
 
 class TestBuildMessagesAlternationDefense:
     """``_build_messages``'s same-role merge and leading-assistant strip
-    (inference.py) had ZERO behavioral coverage before this change — both
-    prompt-capture tests above patch ``_build_messages`` out entirely.
+    (inference.py) are covered here — both prompt-capture tests above patch
+    ``_build_messages`` out entirely, so they exercise neither behavior.
 
     ``_run_chat_turn``'s user/assistant append pair
     (``paramem/server/app.py``) is NOT wrapped in a ``try/except``: the
@@ -1171,12 +1171,11 @@ class TestBuildMessagesAlternationDefense:
     def test_consecutive_same_role_turns_merged(self, monkeypatch):
         from paramem.server.inference import _build_messages
 
-        # _build_messages no longer calls adapt_messages itself — that
-        # system-role-folding concern now lives in render_chat_prompt
+        # _build_messages does not call adapt_messages itself — that
+        # system-role-folding concern lives in render_chat_prompt
         # (paramem.models.loader), applied by the production call site
-        # AFTER _build_messages returns. Nothing to bypass here any more;
-        # the merge/strip logic under test is the whole of what
-        # _build_messages does.
+        # after _build_messages returns; the merge/strip logic under test
+        # is the whole of what _build_messages does.
         history = [
             {"role": "user", "text": "first"},
             {"role": "user", "text": "second"},

@@ -411,12 +411,11 @@ class TTSHandler(AsyncEventHandler):
         THIRD_PARTY_DESCRIPTOR` would silently narrate a real self-reference
         as "another speaker" IN SPEECH — worse than the honest fail-safe of
         leaving the raw token audible, which is what ``"verbatim"``
-        produces.  ``current_speaker_id`` is still omitted here — the
+        produces.  ``current_speaker_id`` is omitted here — the
         Wyoming protocol carries no notion of "the current speaker" at this
         layer, and the app-layer resolution that already ran is the one
-        call site that knows it — but it is no longer needed for the
-        self-token case: ``"verbatim"`` already leaves ANY unresolvable
-        token untouched, self-token or not.
+        call site that knows it. Nothing here needs it: ``"verbatim"``
+        already leaves ANY unresolvable token untouched, self-token or not.
 
         The speaker store is re-resolved via ``self._speaker_store_provider``
         on every call (``None`` provider resolves to no store, matching

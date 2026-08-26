@@ -106,7 +106,7 @@ def _interpolate_env_vars(value):
 
 
 # Duplicated from experiments/utils/test_harness.py to avoid modifying that file
-# while benchmarks are running. TODO: refactor into shared paramem.models.registry
+# while benchmarks are running.
 MODEL_REGISTRY = {
     "mistral": ModelConfig(
         model_id="mistralai/Mistral-7B-Instruct-v0.3",
@@ -581,6 +581,17 @@ class HAToolsConfig:
     sensitive_override: bool = False
     supported_languages: list[str] = field(default_factory=list)  # HA conversation agent langs
 
+    @property
+    def configured(self) -> bool:
+        """Whether an HA client can be built from this configuration.
+
+        The one implementation of the buildability predicate: both
+        ``_build_runtime_components`` (constructing the live HA client) and
+        the admission mapping that decides whether the span tagger loads
+        read this property rather than re-testing ``url and token``.
+        """
+        return bool(self.url and self.token)
+
 
 @dataclass
 class ToolsConfig:
@@ -592,7 +603,7 @@ class ToolsConfig:
 
 @dataclass
 class CloudConfig:
-    """Operator switches for cloud egress (rationale: ``architecture.md``, AD-21).
+    """Operator switches for cloud egress (rationale: ``ARCHITECTURE.md``).
 
     Attributes:
         enabled: The master switch for ALL cloud egress.  Necessary but
@@ -687,9 +698,11 @@ class SanitizationConfig:
       ``configs/server.yaml.example`` for the documented canonical-core
       guidance an operator edits against.
 
-    HA path is independent of ``cloud_mode`` and ``scrub``: HA
-    receives cleartext gated by intent classification.  Hardening the
-    HA hop is a planned follow-up.
+    ``cloud_mode`` governs the cloud leg only.  The HA leg is a separate
+    external-egress path: it scrubs under ``scrub`` on every turn regardless
+    of ``cloud_mode``, refuses only on its own three causes, and is never
+    closed by the personal verdict — see
+    :func:`~paramem.server.egress.answer_via_ha`.
 
     ``scrub_categories`` is derived, not operator-facing: ``__post_init__``
     resolves it from ``scrub`` via
@@ -1047,27 +1060,20 @@ class ConsolidationScheduleConfig(ConsolidationConfig):
     # pipeline minus LoRA training, publishing a queryable disk-backed store.
     mode: str = "train"
     retain_sessions: bool = True
-    # LoRA training hyperparameters (Test 17 recipe). num_epochs,
-    # gradient_accumulation_steps, and lr_decay_steps are NOT configurable
-    # here -- the training funnel unconditionally derives and overwrites
-    # all three per fold from the key-triple count via
-    # paramem.utils.config.budget_for / _BUDGET_TABLE, unclamped (no operator
-    # ceiling; a prior max_epochs clamp was retired 2026-07-26). Wall-time
-    # feedback comes from hit_cap telemetry and recall_early_stopping
-    # (below), not a config clamp. yaml fields for the derived triple were
-    # retired 2026-07-26 once that became true for every production call
-    # (train_adapter has exactly one production call site, inside the
-    # funnel).
+    # LoRA training hyperparameters. num_epochs, gradient_accumulation_steps,
+    # and lr_decay_steps are NOT configurable here -- the training funnel
+    # unconditionally derives and overwrites all three per fold from the
+    # key-triple count via paramem.utils.config.budget_for / _BUDGET_TABLE,
+    # unclamped (no operator ceiling). Wall-time feedback comes from
+    # hit_cap telemetry and recall_early_stopping (below), not a config
+    # clamp. There are no yaml fields for the derived triple, since
+    # train_adapter has exactly one production call site, inside the
+    # funnel.
     training_batch_size: int = 1
     training_max_seq_length: int = 1024
     # Absolute-step warmup count, passed straight through to TrainingConfig.
-    # warmup=0: warmup is currently disabled in production. Every fold ever
-    # trained ran at effectively zero warmup — transformers 5.5's deprecated
-    # ratio-based warmup field (deleted from this codebase; see
-    # TrainingConfig.warmup_steps) silently overwrote the previously-set
-    # `training_warmup_steps: 30` to 0 at every call, so the value that
-    # actually ran was always 0 despite the config claiming 30. Turning
-    # warmup on requires re-validating the main-tier folds.
+    # warmup=0: warmup is disabled in production. Turning warmup on
+    # requires re-validating the main-tier folds.
     training_warmup_steps: int = 0
     training_lr_scheduler_type: str = "linear"
     training_weight_decay: float = 0.1
@@ -1081,11 +1087,11 @@ class ConsolidationScheduleConfig(ConsolidationConfig):
     # control.should_training_stop after `recall_window` consecutive
     # 100%-recall probes past `early_stopping_floor` (TrainingConfig field;
     # currently 10 by default, 20 in the production fixture).
-    # Validated at multi-seed for N=100 (Test 14: 9 cells stopped cleanly
-    # e18-e26); untested at N=500+.  Flip after the first clean cycle.
+    # Validated at multi-seed for N=100; untested at N=500+.  Flip after
+    # the first clean cycle.
     recall_early_stopping: bool = False
     # Consecutive 100%-recall probes required to fire the stop signal.
-    # Test 14's validated default.  Lower (e.g. 2) for noisier
+    # Validated default.  Lower (e.g. 2) for noisier
     # convergence curves; higher for tighter stop semantics.
     recall_window: int = 3
     # Probe cadence — system-wide.  Default 3 → probe every 3 epochs;
@@ -1099,17 +1105,15 @@ class ConsolidationScheduleConfig(ConsolidationConfig):
     # stop signal.  Maps to TrainingConfig.early_stopping_floor (which
     # the experiment-side loss-based callback also uses; recall path
     # reuses the same field as ``signal_from_epoch``).  Default 20 is
-    # the conservative production posture — Test 14's multi-seed cells
-    # all stopped between e18 and e26, so 20 sits inside the empirical
-    # band without firing too early on outlier seeds.  Test 14's
-    # research default was 10; that value remains in
+    # the conservative production posture, sitting inside the empirical
+    # stop-epoch band without firing too early on outlier seeds.  A
+    # lower research default of 10 remains in
     # ``TrainingConfig.early_stopping_floor`` for direct-construction
     # contexts that don't go through the YAML.
     recall_signal_from_epoch: int = 20
     # Recall probe batch size — see TrainingConfig.recall_probe_batch_size
-    # for the empirical curve.  Default 16: ~4.75× probe wall-clock at
-    # ~346 MiB peak VRAM delta, 137/137 recall parity vs serial, multi-cycle
-    # retention parity confirmed in production conditions.
+    # for the empirical curve.  Default 16 batches the probe for
+    # throughput while preserving recall parity with serial probing.
     recall_probe_batch_size: int = 16
     # Output token budget — drives every LLM call in the extraction pipeline
     # (local extract, anonymize, cloud enrich, deanon) and every direct
@@ -1135,21 +1139,17 @@ class ConsolidationScheduleConfig(ConsolidationConfig):
     # ConsolidationLoop._current_extraction_config (graph tier).
     # This value is the operator CEILING, not a guarantee: each call
     # additionally clamps to live free VRAM (paramem.utils.vram_guard.
-    # effective_token_envelope, MIB_PER_PROMPT_TOKEN_PREFILL) — live
-    # evidence (2026-07-28) showed a packer-correct call sized exactly to
-    # this ceiling still faulting on a tighter-than-expected free-VRAM
-    # moment.
+    # effective_token_envelope, MIB_PER_PROMPT_TOKEN_PREFILL), since a
+    # packer-correct call sized exactly to this ceiling can still fault
+    # on a tighter-than-expected free-VRAM moment.
     extraction_anonymize_token_envelope: int = 8192
     # Fallback words->tokens ratio for paramem.utils.tokens.estimate_tokens
     # when no live tokenizer is available (the CLI document chunker; an
-    # in-process caller whose tokenizer raised). MEASURED ONCE with the
+    # in-process caller whose tokenizer raised). MEASURED with the
     # production tokenizer (Mistral 7B) over the three payload shapes the
-    # system ingests, shipped as their MAX so the fallback bounds rather
-    # than averages:
-    #   transcript shape (re-measured 2026-08-03, supersedes 1.44) : 1.54 tokens/word
-    #   document shape (CV) : 1534 words  / 2934 tokens = 1.91 tokens/word
-    #   fact-JSON shape (2026-07-28) : 2415 words / 8191 tokens = 3.39 tokens/word
-    #   fact-JSON shape (2026-08-03 drift re-measurement)        = 3.657 tokens/word  <- MAX
+    # system ingests — transcript, document (CV), and fact-JSON — shipped
+    # as their MAX so the fallback bounds rather than averages; the
+    # fact-JSON shape sets the value.
     #
     # NOT independently governing: no estimate_tokens() call site reads
     # this yaml value — every caller (in-process or CLI) uses the module
@@ -1703,8 +1703,8 @@ class MobilePwaConfig:
     existing deployment is unaffected until the mobile client is wired in.
 
     ``static_dir``: filesystem path to the compiled static bundle.  Empty
-    string defers resolution to the mount point (``paramem/web/static``),
-    which is not yet implemented.
+    string defers resolution to the built-in bundle at
+    ``paramem/web/static``.
 
     ``cookie_name``: name of the cookie the middleware will accept if the
     client presents one.  The server does not issue this cookie; tokens are
@@ -1725,7 +1725,7 @@ class MobilePwaConfig:
     """
 
     enabled: bool = False
-    # Empty → paramem/web/static (not yet implemented).
+    # Empty → paramem/web/static.
     static_dir: str = ""
     cookie_name: str = "paramem_token"
     push_enabled: bool = False
@@ -1795,7 +1795,7 @@ class InferenceConfig:
     max_response_tokens: int = 512
     # Kill switch for the date-group selection stage that runs before a
     # personal-history probe (paramem/server/temporal_selection.py); false
-    # skips it entirely and reproduces today's unfiltered full probe exactly
+    # skips it entirely and reproduces the unfiltered full probe exactly
     # — the operator's escape hatch and the A/B lever for measuring the
     # stage's added latency.
     temporal_selection_enabled: bool = True
@@ -1953,7 +1953,7 @@ class ServerConfig:
 
     @property
     def training_config(self) -> TrainingConfig:
-        """Training recipe from yaml (Test 17 defaults via consolidation.training_* fields).
+        """Training recipe from yaml (via consolidation.training_* fields).
 
         ``num_epochs``, ``gradient_accumulation_steps``, and
         ``lr_decay_steps`` on the returned object carry ``TrainingConfig``'s
@@ -1962,20 +1962,18 @@ class ServerConfig:
         (``ConsolidationLoop._train_tier_adapter``) unconditionally derives
         and overwrites all three from the fold's key-triple count via
         ``paramem.utils.config.budget_for`` before every fold, unclamped --
-        the bucket table governs with no operator ceiling (a prior
-        ``consolidation.max_epochs`` / ``TrainingConfig.budget_max_epochs``
-        clamp was retired 2026-07-26; ``hit_cap`` telemetry and
-        ``recall_early_stopping`` are the wall-time feedback channels, not a
-        config clamp). ``train_adapter`` (``paramem.training.trainer``) has
-        exactly one production call site, inside that funnel -- so nothing
-        ever reads this property's pre-derivation values. The corresponding
+        the bucket table governs with no operator ceiling (``hit_cap``
+        telemetry and ``recall_early_stopping`` are the wall-time feedback
+        channels, not a config clamp). ``train_adapter``
+        (``paramem.training.trainer``) has exactly one production call site,
+        inside that funnel -- so nothing ever reads this property's
+        pre-derivation values. There are no
         ``consolidation.training_gradient_accumulation_steps`` /
-        ``consolidation.training_lr_decay_steps`` yaml fields (and the prior
-        ``max_epochs``-or-30 resolution into ``num_epochs`` here) were
-        retired for the same reason (2026-07-26). ``TrainingConfig``'s own
-        fields are unchanged -- they remain the derivation's output carrier
-        and real inputs for callers that invoke ``train_adapter`` directly
-        outside this config path (experiments, archived scripts).
+        ``consolidation.training_lr_decay_steps`` yaml fields, for the same
+        reason. ``TrainingConfig``'s own fields remain the derivation's
+        output carrier and real inputs for callers that invoke
+        ``train_adapter`` directly outside this config path (experiments,
+        archived scripts).
 
         Donor resolution (``ConsolidationLoop._resolve_donor_checkpoint`` /
         ``paramem.training.donor``) is likewise unconditional at the same

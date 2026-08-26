@@ -120,8 +120,7 @@ def test_factory_threads_every_config_knob(
 
     Each scenario represents an experiment callsite's cfg mutations and
     factory kwargs. The test asserts that the factory correctly threads
-    all knobs — both the ones that were present before the migration and
-    the ones added as part of it.
+    every knob.
     """
     from paramem.server import consolidation as server_consolidation
     from paramem.server.config import load_server_config
@@ -317,7 +316,7 @@ def test_factory_simulate_mode_does_not_seed_cache(tmp_path, monkeypatch):
 class TestFactoryModelNamePassthrough:
     """Integration tests: factory passes model_name through to ConsolidationLoop.
 
-    Per-model prompt resolution now lives in the extraction component
+    Per-model prompt resolution lives in the extraction component
     (ExtractionPipeline / _load_prompt), not in the server bootstrap.
     The factory's only job is to pass config.model_name to ConsolidationLoop
     so the extraction chokepoint can do per-file resolution.
@@ -354,7 +353,7 @@ class TestFactoryModelNamePassthrough:
 
         assert captured["model_name"] == "qwen3-4b"
         # prompts_dir is the shared base (not a per-model subdir); resolution
-        # is now deferred to the extraction chokepoint.
+        # is deferred to the extraction chokepoint.
         assert captured["prompts_dir"] == cfg.prompts_dir
 
     def test_mistral_model_name_threaded(self, tmp_path, monkeypatch):

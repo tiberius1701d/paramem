@@ -290,9 +290,9 @@ class TestCrashLoopCounter:
         """Driving _fail_fast_cuda with the crash-loop guard exhausted reaches
         the full _degrade_to_cloud_only transition without booting a real
         lifespan.  This is the shared call site behind both lifespan fault
-        branches (eager-consolidation-loop and post-preload canary) that
-        previously left ``mode`` stuck at "local" after a degrade — the
-        state ``/chat`` (app.py) and ``/gpu/release`` read.
+        branches (eager-consolidation-loop and post-preload canary); it must
+        leave ``mode`` set to "cloud-only" — the state ``/chat`` (app.py) and
+        ``/gpu/release`` read.
         """
         config = _make_config(tmp_path)
         restore = _inject_config(config, model=MagicMock(), tokenizer=MagicMock())

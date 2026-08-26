@@ -300,8 +300,8 @@ class TestCliEntryPoint:
         assert str(args.daily_key_path) == "/tmp/x.age"
 
     def test_help_includes_change_passphrase(self):
-        """Regression guard — paramem --help must list the command so
-        operators discovering the CLI see it."""
+        """paramem --help must list the command so operators discovering the
+        CLI see it."""
         from paramem.cli import main as main_module
 
         parser = main_module._build_parser()

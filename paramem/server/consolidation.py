@@ -223,8 +223,8 @@ def create_consolidation_loop(
         # Key metadata (cycle counts, promotion bookkeeping) is loop-state
         # and still seeded here.  Entry payloads (subject/predicate/object/
         # speaker_id) live in the lifespan-owned MemoryStore — preload runs
-        # at lifespan boot, not here, so the loop factory no longer touches
-        # the model or reads graph.json for that purpose.  ``memory_store``
+        # at lifespan boot, not here, so the loop factory does not touch
+        # the model or read graph.json for that purpose.  ``memory_store``
         # must already have its registries AND bookkeeping loaded (the
         # ordinary boot sequence loads both before this loop is
         # constructed) so ``seed_key_metadata`` can rebuild ``promoted_keys``
@@ -268,8 +268,8 @@ def classify_pending_sessions(config: ServerConfig, buffer, store) -> PendingTri
     The arbitrator's unconditional pre-stage runs this on every dispatch
     (whichever action asked), then feeds ``drop_ids`` to
     :func:`retire_unattributable_sessions` and ``pending_count``/``named_count``
-    to the content gate — retiring what can never be attributed no longer
-    depends on whether the content gate itself runs.
+    to the content gate — retiring what can never be attributed does not
+    depend on whether the content gate itself runs.
 
     Parameters
     ----------
@@ -415,16 +415,10 @@ def session_retention_dir(loop, config) -> Path | None:
     return snap / "sessions"
 
 
-# run_consolidation was deleted when it was merged into paramem.server.app._run_extraction_phase,
-# which closes over _state instead of taking model/tokenizer/config/session_buffer as args.
-# Trial-migration callers: use _run_extraction_phase(loop, mark_sessions=False).
-# Dev scripts that imported run_consolidation directly will need updating separately.
-
-
 # --- Key-level promotion ---
 
 
-# Dedup moved onto ConsolidationLoop (see paramem/training/consolidation.py).
+# Dedup lives on ConsolidationLoop (see paramem/training/consolidation.py).
 # Re-exported as module-level aliases for existing call sites.
 _dedup_episodic = ConsolidationLoop.dedup_episodic
 _dedup_procedural = ConsolidationLoop.dedup_procedural

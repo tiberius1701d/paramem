@@ -4,17 +4,17 @@ Opt-in via a populated :class:`~paramem.server.user_tokens.UserTokenStore`
 (per-user tokens, wired by the app lifespan — see
 ``paramem.server.app._build_user_token_store``).  There is no separate
 shared-token credential: every accepted token is a ``UserTokenStore`` entry,
-attributed to a speaker or not.  ``PARAMEM_API_TOKEN`` survives only as the
-CARRIER env var infra consumers (the systemd scheduling timer, the HA custom
+attributed to a speaker or not.  ``PARAMEM_API_TOKEN`` is not a credential —
+this module does not check it against inbound requests. It is a CARRIER env
+var that infra consumers (the systemd scheduling timer, the HA custom
 component) read to source their own ``Authorization`` header value — the
 value itself must be a token minted into the store (typically an
 unattributed admin token, ``mint-user-token --unattributed --scope admin
---force-admin``).  This module does not use that env var as a credential —
-its ONE read of it, in :func:`log_startup_posture`, is a fail-open migration
-guard: a pre-migration deployment that set it as the old shared-token
-credential and never minted a per-user token would otherwise land OPEN
-silently on upgrade, with the operator's old token ignored and no signal
-that anything changed.
+--force-admin``).  This module's ONE read of the env var, in
+:func:`log_startup_posture`, guards against the case where auth is OFF (no
+store configured) and the env var is set: the operator's token is silently
+inert and every endpoint is open, with no other signal that the token no
+longer does anything.
 
 Behavior:
 - No user-token store wired (getter is ``None`` or returns ``None``) → no
@@ -268,14 +268,12 @@ def log_startup_posture(n_user_tokens: int = 0, per_user_active: bool = False) -
     active tokens stays **fail-closed** (401) until a token is minted; the
     posture is still ON.
 
-    Fail-open migration guard (this module's ONE read of
-    ``PARAMEM_API_TOKEN`` — see the module docstring): when the OFF branch
-    fires AND the env var is set, an additional LOUD warning fires.  A
-    deployment that ran under the old shared-token model has the env var
-    set, PWA off, and never minted a per-user token — on upgrade it lands
-    OPEN (the OFF branch above already logs that), with the operator's old
-    token now silently inert.  The env var's value is never read as a
-    credential here, only checked for presence.
+    This module's ONE read of ``PARAMEM_API_TOKEN`` (see the module
+    docstring): when the OFF branch fires AND the env var is set, an
+    additional LOUD warning fires, since the operator's token is silently
+    inert and every endpoint is open (the OFF branch above already logs
+    that).  The env var's value is never read as a credential here, only
+    checked for presence.
 
     Parameters
     ----------
@@ -309,12 +307,10 @@ def log_startup_posture(n_user_tokens: int = 0, per_user_active: bool = False) -
         )
         if os.environ.get("PARAMEM_API_TOKEN"):
             logger.warning(
-                "PARAMEM_API_TOKEN is set but is NO LONGER a credential — "
-                "the server does not check it. This deployment appears to be "
-                "upgrading from the old shared-token model: the token above "
-                "is silently ignored and every REST endpoint is open (see the "
-                "AUTH: OFF warning above). Run `paramem mint-user-token` to "
-                "mint a real per-user token, then set PARAMEM_API_TOKEN to "
-                "that value to protect this server again. See SECURITY.md "
-                "for the migration.",
+                "PARAMEM_API_TOKEN is set but is not used as a credential — "
+                "the server does not check it, and every REST endpoint is "
+                "open (see the AUTH: OFF warning above). Run "
+                "`paramem mint-user-token` to mint a real per-user token, "
+                "then set PARAMEM_API_TOKEN to that value to protect this "
+                "server again. See SECURITY.md for the authentication model.",
             )

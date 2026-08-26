@@ -308,16 +308,17 @@ class TestBackupItemsConfigNoneReturnsEmpty:
 
 
 # ---------------------------------------------------------------------------
-# Test 21 — regression: cap=0 + used>0 → backup_disk_pressure at failed level
+# Disk pressure with a near-zero cap and non-zero usage
 # ---------------------------------------------------------------------------
 
 
 class TestBackupItemsDiskPressureCapZeroUsedNonzero:
-    """(2026-04-22 E2E baseline): when max_total_disk_gb=0 and disk_used>0,
-    the old guard ``usage.cap_bytes > 0`` skipped the DISK PRESSURE alert entirely.
+    """When max_total_disk_gb is effectively zero and disk_used>0, the store
+    is over capacity regardless of the nominal cap.
 
-    With cap=0, any non-zero disk usage means the store is infinitely over cap.
-    The fix emits a ``backup_disk_pressure`` item at level ``"failed"``.
+    Any non-zero disk usage against a near-zero cap means the store is
+    infinitely over cap. ``_collect_backup_items`` emits a
+    ``backup_disk_pressure`` item at level ``"failed"``.
     """
 
     def test_backup_disk_pressure_emits_at_failed_level_when_cap_is_zero_and_used_nonzero(
@@ -325,9 +326,7 @@ class TestBackupItemsDiskPressureCapZeroUsedNonzero:
     ) -> None:
         """disk_cap_bytes=0, disk_used_bytes=57141 → backup_disk_pressure at failed level.
 
-        This is the exact condition observed in scenario 2 of the 2026-04-22 E2E
-        baseline test: max_total_disk_gb=0 configured, 2 backup slots on disk
-        totalling 57141 bytes.  ``max_total_disk_gb`` must be strictly positive
+        ``max_total_disk_gb`` must be strictly positive
         (``ServerBackupsConfig.__post_init__``), so this uses a sub-byte
         positive cap (``1e-12``) that still yields ``cap_bytes == 0`` —
         the same guard-covering condition as a literal ``0.0``.
@@ -347,8 +346,7 @@ class TestBackupItemsDiskPressureCapZeroUsedNonzero:
         pressure_items = [i for i in items if i.kind == "backup_disk_pressure"]
         assert len(pressure_items) == 1, (
             f"Expected 1 backup_disk_pressure item, got {len(pressure_items)}.  "
-            "cap=0 + used>0 silently skipped the disk pressure alert because "
-            "the old guard 'usage.cap_bytes > 0' was false."
+            "cap=0 + used>0 must still emit the disk pressure alert."
         )
         assert pressure_items[0].level == "failed", (
             f"Expected level='failed' for cap=0+used>0, got {pressure_items[0].level!r}.  "
@@ -363,7 +361,7 @@ class TestBackupItemsDiskPressureCapZeroUsedNonzero:
 
         cap=0 with zero usage is the empty-store case; it should not fire.
         ``1e-12`` still yields ``cap_bytes == 0`` (see the previous test);
-        ``0.0`` itself is now rejected by ``ServerBackupsConfig.__post_init__``.
+        ``0.0`` itself is rejected by ``ServerBackupsConfig.__post_init__``.
         """
         config = _make_config(tmp_path, max_total_disk_gb=1e-12)
         # No backup slots on disk → disk_used=0.

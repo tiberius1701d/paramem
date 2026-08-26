@@ -107,7 +107,7 @@ class TestSwJsNoCacheHeader:
         assert "CACHE_VERSION" in resp.text, "Expected CACHE_VERSION in sw.js body"
 
     def test_sw_js_body_contains_v7(self, monkeypatch):
-        """Response body reflects the bumped CACHE_VERSION v7."""
+        """Response body reflects CACHE_VERSION v7."""
         monkeypatch.setattr(app_module, "_state", _make_state(_make_config()))
         resp = _client_no_token().get("/app/sw.js")
         assert resp.status_code == 200
@@ -200,7 +200,7 @@ class TestSwJsRoutePrecedence:
 
 
 # ---------------------------------------------------------------------------
-# Tests: regression — other static assets still serve correctly
+# Tests: other static assets still serve correctly
 # ---------------------------------------------------------------------------
 
 

@@ -110,10 +110,7 @@ def test_operator_yaml_keys_subset_of_example():
 # Value-parity gate (CI-required)
 #
 # The structural test above guards key drift.  It does NOT guard *value*
-# drift — and that's exactly how `extraction_max_tokens` was 8192 in
-# production but 2048 in the test fixture for months without anyone
-# noticing (until the simulate-mode probe surfaced the truncation in May
-# 2026).  This second gate enforces VALUE equality on every leaf, with
+# drift, so this second gate enforces VALUE equality on every leaf, with
 # an explicit allowlist of paths where divergence is intentional.
 #
 # The allowlist is the single, reviewable decision surface for "this

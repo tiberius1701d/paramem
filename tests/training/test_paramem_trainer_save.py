@@ -273,8 +273,8 @@ class TestSaveTargetSelection:
 
     def test_lr_decay_steps_threaded_through_unconditionally(self, tmp_path):
         """``lr_decay_steps`` is always passed to ``ParamemTrainer`` (may be
-        ``None``) — the old ``trainer_cls`` / ``trainer_kwargs`` conditional
-        selection is gone."""
+        ``None``), with no conditional ``trainer_cls`` / ``trainer_kwargs``
+        selection."""
         model = _make_staging_model()
         tokenizer = _make_tokenizer()
 

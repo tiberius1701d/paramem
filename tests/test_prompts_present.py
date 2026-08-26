@@ -230,18 +230,14 @@ class TestSystemPromptFilesPresent:
 
 
 class TestSystemPromptGoldens:
-    """Byte-for-byte preservation goldens for the seven externalized files
-    that were single Python literals before being externalized.
+    """Byte-for-byte goldens for the seven externalized system-prompt files
+    that each carry a single-line literal.
 
-    Each golden string was captured programmatically from the pre-change
-    inline literal/constant (single-line literals copied verbatim from
-    source; the three former module constants captured via
-    ``repr(extractor._CLOUD_*_SYSTEM_PROMPT)`` before the constants were
-    replaced with ``_load_prompt(...)`` calls) — never hand-retyped against
-    the new ``.txt`` file, so a shared typo cannot silently pass both sides.
-    ``serving_system.txt`` and ``intent_classifier.txt`` carry no golden
-    here — they were split from multi-paragraph prose
-    (``configs/prompts/pa_voice.txt``), not a single Python literal; their
+    Each golden string is a hardcoded literal, never derived from the
+    ``.txt`` file it is checked against, so a shared typo cannot silently
+    pass both sides.  ``serving_system.txt`` and ``intent_classifier.txt``
+    carry no golden here — they hold multi-paragraph prose
+    (``configs/prompts/pa_voice.txt``), not a single-line literal; their
     content is covered by ``test_serving_prompt_contract.py`` instead.
     """
 
@@ -296,11 +292,9 @@ class TestTrainedRecallInterfacePin:
     pair every adapter in production was trained on
     (``configs/prompts/trained_recall.txt``).
 
-    The expected strings below were captured programmatically from the
-    live ``SYSTEM_PROMPT`` / ``RECALL_TEMPLATE`` Python constants before
-    they were deleted and their text moved into
-    ``configs/prompts/trained_recall.txt`` — never hand-retyped against
-    the new file, so a shared typo cannot silently pass both sides.
+    The expected strings below are hardcoded literals, never derived from
+    ``configs/prompts/trained_recall.txt``, so a shared typo cannot silently
+    pass both sides.
 
     _PIN_FAILURE_MESSAGE below is asserted on every failure: the trained
     recall interface is weight-coupled, so a text change here invalidates

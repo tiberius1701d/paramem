@@ -34,7 +34,7 @@ class TestParseSchedule:
         )
 
     def test_interval_hours_odd_becomes_heartbeat_calendar(self):
-        """Non-divisor hour cadences no longer stay monotonic — they render at
+        """Non-divisor hour cadences do not render monotonically — they render at
         the gcd(count, 24) heartbeat grid (suspend/power-off catch-up gate;
         see systemd_timer module docstring). gcd(5, 24) == gcd(7, 24) == 1,
         so both land on the hourly grid.

@@ -945,7 +945,7 @@ class GraphMerger:
         """
         # Speaker entities: node key is entity.speaker_id verbatim (lowercase).
         # Both the entity path and the relation-endpoint fallback path produce the
-        # same key because both now carry an already-lowercase speaker{N} token.
+        # same key because both carry an already-lowercase speaker{N} token.
         if entity.speaker_id is not None:
             return entity.speaker_id
 
@@ -953,7 +953,7 @@ class GraphMerger:
 
         # Tier 1: Exact match on canonical node key (non-speaker entities).
         # With node-key model A the node key IS the canonical form, so a direct
-        # lookup suffices; the old _normalize_name scan is replaced by key lookup.
+        # key lookup suffices.
         if entity_canonical in self.graph:
             return entity_canonical
 
@@ -1034,7 +1034,7 @@ class GraphMerger:
             # The node key equals entity.speaker_id (lowercase speaker{N}).
             # The ``speaker_id`` node attribute carries the same value.
             # Defensive: populate the attribute when it is missing (e.g. a node
-            # inserted before this refactor that lacks the attribute).
+            # inserted without it).
             if is_speaker and node.get("speaker_id") is None:
                 node["speaker_id"] = entity.speaker_id
         else:
@@ -1045,8 +1045,8 @@ class GraphMerger:
                 sessions=[session_id],
             )
             # Display surface, never read from entity.attributes.  The node
-            # key is now the canonical form so the node ID is no longer the
-            # display name.
+            # key is the canonical form; the node ID is not the display
+            # name.
             if entity.name and not attribute_value_is_empty(entity.name):
                 node_kwargs["display_name"] = entity.name
             if is_speaker:

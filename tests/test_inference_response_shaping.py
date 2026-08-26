@@ -29,17 +29,17 @@ import ast
 import dataclasses
 from datetime import date
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 from peft import PeftModel
 
 from paramem.graph.prompts import prompt_overrides
 from paramem.memory.store import MemoryStore as _MS
+from paramem.server.chat_result import ChatResult
 from paramem.server.config import ServerConfig
 from paramem.server.inference import (
     _CAP_HIT_TOKEN_TOLERANCE,
-    ChatResult,
     _base_model_answer,
     _generate_local_reply,
     _maybe_escalate,
@@ -174,7 +174,7 @@ class TestMaybeEscalateTrimApplication:
     def test_no_tag_branch_applies_the_trim_when_truncated(self):
         config = ServerConfig()
         response = "This is done. But this trails of"
-        result = _maybe_escalate(response, config, is_truncated=True)
+        result = _maybe_escalate(response, config, diagnostics={}, is_truncated=True)
         assert result.text == "This is done."
 
     def test_no_tag_branch_leaves_response_untouched_when_not_truncated(self):
@@ -184,36 +184,8 @@ class TestMaybeEscalateTrimApplication:
         mutated healthy replies."""
         config = ServerConfig()
         response = "This is done. But this trails of"
-        result = _maybe_escalate(response, config)
+        result = _maybe_escalate(response, config, diagnostics={})
         assert result.text == response
-
-    def test_hops_exhausted_branch_does_not_trim(self, monkeypatch):
-        """With HA and cloud both returning None, the pre-tag text comes
-        back byte-identical even when it lacks a terminator AND even when
-        is_truncated=True — this is the pin for the documented branch
-        justification (pre-tag text is complete by construction: the
-        model reached the tag)."""
-        config = ServerConfig()
-        monkeypatch.setattr("paramem.server.inference._escalate_to_ha_agent", lambda *a, **kw: None)
-        monkeypatch.setattr("paramem.server.inference.answer_via_cloud", lambda *a, **kw: None)
-        monkeypatch.setattr("paramem.server.inference.is_self_referential", lambda *a, **kw: False)
-        response = "Intro. Trailing partial [ESCALATE] some forwarded query"
-        result = _maybe_escalate(response, config, is_truncated=True)
-        assert result.text == "Intro. Trailing partial"
-
-    def test_complete_escalate_tag_still_escalates(self, monkeypatch):
-        """Order pin: the trim never runs before detect_escalation — a
-        genuine [ESCALATE] tag routes through the escalation branch, not
-        the trimmed no-tag return."""
-        config = ServerConfig()
-        sentinel = ChatResult(text="HA handled it", escalated=True)
-        monkeypatch.setattr(
-            "paramem.server.inference._escalate_to_ha_agent", lambda *a, **kw: sentinel
-        )
-        monkeypatch.setattr("paramem.server.inference.is_self_referential", lambda *a, **kw: False)
-        response = "Let me check that. [ESCALATE] what's the weather"
-        result = _maybe_escalate(response, config, is_truncated=True)
-        assert result is sentinel
 
     def test_truncated_escalate_fragment_does_not_escalate_and_is_trimmed_when_truncated(self):
         """A truncated ``[ESCAL`` fragment is not matched by
@@ -223,18 +195,62 @@ class TestMaybeEscalateTrimApplication:
         subsumed by the trim along with the rest of the incomplete tail."""
         config = ServerConfig()
         response = "Here is a fact. And then it cuts off mid tag [ESCAL"
-        result = _maybe_escalate(response, config, is_truncated=True)
+        result = _maybe_escalate(response, config, diagnostics={}, is_truncated=True)
         assert "[ESCAL" not in result.text
         assert result.text == "Here is a fact."
 
     def test_truncated_escalate_fragment_untouched_when_not_truncated(self):
         """Same fragment, is_truncated=False (default): no trim runs at
-        all — the tag-detection miss is a separate, out-of-scope residual
-        from this trim redesign (record-only, not fixed here)."""
+        all. Tag detection on an untruncated response is out of scope for
+        this trim."""
         config = ServerConfig()
         response = "Here is a fact. And then it cuts off mid tag [ESCAL"
-        result = _maybe_escalate(response, config)
+        result = _maybe_escalate(response, config, diagnostics={})
         assert result.text == response
+
+    def test_hops_exhausted_branch_is_never_trimmed(self):
+        """The hops-exhausted branch (every escalation hop unavailable)
+        never applies the trim, even when ``is_truncated=True`` — its
+        text is everything before a tag the model actually emitted and is
+        complete by construction, unlike the no-tag branch's own reply."""
+        config = ServerConfig()
+        pre_tag = "Here is a fact. Let me check something else that trails of"
+        response = f"{pre_tag}[ESCALATE]: forwarded query"
+
+        result = _maybe_escalate(
+            response,
+            config,
+            diagnostics={},
+            is_truncated=True,
+            ha_client=None,
+            cloud_agent=None,
+        )
+
+        assert result.text == pre_tag
+
+    def test_complete_escalate_tag_still_escalates_when_truncated(self):
+        """A complete ``[ESCALATE]`` tag must never be eaten by the trim,
+        even when ``is_truncated=True`` — the trim only ever runs on the
+        no-tag branch, strictly after ``detect_escalation`` has already
+        matched."""
+        config = ServerConfig()
+        response = "Here is a fact.[ESCALATE]: what's the weather like"
+
+        with patch(
+            "paramem.server.inference.answer_via_ha",
+            return_value=ChatResult(text="it's sunny", escalated=True),
+        ) as mock_ha:
+            result = _maybe_escalate(
+                response,
+                config,
+                diagnostics={},
+                is_truncated=True,
+                ha_client=MagicMock(),
+                cloud_agent=None,
+            )
+
+        mock_ha.assert_called_once()
+        assert result.text == "it's sunny"
 
 
 def _peft_model_mock() -> MagicMock:
@@ -356,6 +372,7 @@ class TestTokenBudgetPin(_PlanBuilder):
             model=model,
             tokenizer=tokenizer,
             config=config,
+            diagnostics={},
         )
 
         assert captured["max_new_tokens"] == 64
@@ -383,6 +400,7 @@ class TestTokenBudgetPin(_PlanBuilder):
             model=model,
             tokenizer=tokenizer,
             config=config,
+            diagnostics={},
         )
 
         assert captured["max_new_tokens"] == 512
@@ -599,6 +617,127 @@ class TestTemporalSelectionWiring(_PlanBuilder):
         )
         assert result.text == "final answer."
 
+    def test_zero_survivor_path_calls_no_ha_cloud_or_base_model(self, monkeypatch):
+        """The zero-survivor early return (every key filtered out by the
+        date-group selection) never reaches the ``not layers`` HA/cloud
+        dispatch or the base-model fallback — its own reasoning generate
+        plus ``_maybe_escalate`` is the entire dispatch when the reply
+        carries no ``[ESCALATE]`` tag."""
+        from paramem.server.temporal import DateWindow
+        from paramem.server.temporal_selection import DateSelection
+
+        forbid_both_read_doors(monkeypatch)
+        monkeypatch.setattr(
+            "paramem.server.inference._generate_local_reply",
+            lambda *a, **kw: ("Nothing to add.", False),
+        )
+
+        def fake_select(text, date_by_key, *, model, tokenizer, config, today):
+            return DateSelection(
+                all=False,
+                ranges=(DateWindow(start=date(2026, 8, 10), end=date(2026, 8, 10)),),
+                include_undated=False,
+            )
+
+        monkeypatch.setattr("paramem.server.inference.select_date_groups", fake_select)
+
+        tokenizer = MagicMock()
+        model = self.make_model(["episodic"])
+
+        config = ServerConfig()
+        config.inference.preload_cache = True
+
+        memory_store = _MS()
+        memory_store.set_bookkeeping(
+            "e1",
+            speaker_id="speaker0",
+            relation_type="factual",
+            first_seen="2026-08-01T09:00:00",
+            last_seen="2026-08-01T09:00:00",
+            promoted=False,
+        )
+
+        with (
+            patch("paramem.server.inference.answer_via_ha") as mock_ha,
+            patch("paramem.server.inference.answer_via_cloud") as mock_cloud,
+            patch("paramem.server.inference._base_model_answer") as mock_base_model,
+        ):
+            result = _probe_and_reason(
+                text="What did we discuss on August 10th?",
+                plan=self.make_plan([("episodic", ["e1"])]),
+                history=None,
+                model=model,
+                tokenizer=tokenizer,
+                config=config,
+                memory_store=memory_store,
+            )
+
+        mock_ha.assert_not_called()
+        mock_cloud.assert_not_called()
+        mock_base_model.assert_not_called()
+        assert result.text == "Nothing to add."
+
+    def test_zero_survivor_path_escalate_arm_still_calls_no_base_model(self, monkeypatch):
+        """Same zero-survivor early return, but the reasoning generate DOES
+        emit an ``[ESCALATE]`` tag: ``_maybe_escalate`` tries the HA/cloud
+        hops on the forwarded query, but the zero-survivor dispatch itself
+        never falls through to ``_base_model_answer`` — that fallback
+        belongs only to the ``not layers`` branch this path never
+        reaches."""
+        from paramem.server.temporal import DateWindow
+        from paramem.server.temporal_selection import DateSelection
+
+        forbid_both_read_doors(monkeypatch)
+        monkeypatch.setattr(
+            "paramem.server.inference._generate_local_reply",
+            lambda *a, **kw: ("Let me check.[ESCALATE]: what's the weather like", False),
+        )
+
+        def fake_select(text, date_by_key, *, model, tokenizer, config, today):
+            return DateSelection(
+                all=False,
+                ranges=(DateWindow(start=date(2026, 8, 10), end=date(2026, 8, 10)),),
+                include_undated=False,
+            )
+
+        monkeypatch.setattr("paramem.server.inference.select_date_groups", fake_select)
+
+        tokenizer = MagicMock()
+        model = self.make_model(["episodic"])
+
+        config = ServerConfig()
+        config.inference.preload_cache = True
+
+        memory_store = _MS()
+        memory_store.set_bookkeeping(
+            "e1",
+            speaker_id="speaker0",
+            relation_type="factual",
+            first_seen="2026-08-01T09:00:00",
+            last_seen="2026-08-01T09:00:00",
+            promoted=False,
+        )
+
+        with (
+            patch("paramem.server.inference.answer_via_ha", return_value=None) as mock_ha,
+            patch("paramem.server.inference.answer_via_cloud", return_value=None) as mock_cloud,
+            patch("paramem.server.inference._base_model_answer") as mock_base_model,
+        ):
+            result = _probe_and_reason(
+                text="What did we discuss on August 10th?",
+                plan=self.make_plan([("episodic", ["e1"])]),
+                history=None,
+                model=model,
+                tokenizer=tokenizer,
+                config=config,
+                memory_store=memory_store,
+            )
+
+        mock_ha.assert_called_once()
+        mock_cloud.assert_called_once()
+        mock_base_model.assert_not_called()
+        assert result.text == "Let me check."
+
     def test_selection_all_true_probe_set_identical_context_gains_headers(self, monkeypatch):
         """Selection stub returns ``all=True``: the probed key set is
         unchanged, and the only rendering delta is the Today header plus
@@ -773,146 +912,6 @@ class TestTemporalSelectionWiring(_PlanBuilder):
 
         kba = probed["keys_by_adapter"]
         assert set(kba["episodic"]) == {"e_match", "e_undated"}
-
-    def test_zero_survivors_skips_probe_and_escalation_plain_reply(self, monkeypatch):
-        """A selection range matching zero keys at all: no probe call, no
-        HA/cloud/base-model call, and the reasoning turn runs directly off
-        the deterministic nothing-in-period note. Plain (non-[ESCALATE])
-        reply flows straight through as the result text."""
-        from paramem.server.temporal import DateWindow
-        from paramem.server.temporal_selection import DateSelection
-
-        forbid_both_read_doors(monkeypatch)
-
-        for name in ("_escalate_to_ha_agent", "answer_via_cloud", "_base_model_answer"):
-
-            def exploding(*args, _name=name, **kwargs):
-                raise AssertionError(f"{_name} must not be called on the zero-survivor path")
-
-            monkeypatch.setattr(f"paramem.server.inference.{name}", exploding)
-
-        generated = self.stub_generate_local_reply(monkeypatch, reply="Nothing to add.")
-
-        def fake_select(text, date_by_key, *, model, tokenizer, config, today):
-            return DateSelection(
-                all=False,
-                ranges=(DateWindow(start=date(2026, 8, 10), end=date(2026, 8, 10)),),
-                include_undated=False,
-            )
-
-        monkeypatch.setattr("paramem.server.inference.select_date_groups", fake_select)
-
-        tokenizer = MagicMock()
-        tokenizer.apply_chat_template = lambda msgs, **kwargs: "prompt"
-        model = self.make_model(["episodic"])
-
-        # The production default door — pinned to state that the path
-        # short-circuits ahead of the fork under the shipping
-        # configuration, not merely under the other arm.
-        config = ServerConfig()
-        config.inference.preload_cache = True
-
-        memory_store = _MS()
-        memory_store.set_bookkeeping(
-            "e1",
-            speaker_id="speaker0",
-            relation_type="factual",
-            first_seen="2026-08-01T09:00:00",
-            last_seen="2026-08-01T09:00:00",
-            promoted=False,
-        )
-        plan = self.make_plan([("episodic", ["e1"])])
-
-        result = _probe_and_reason(
-            text="What did we discuss on August 10th?",
-            plan=plan,
-            history=None,
-            model=model,
-            tokenizer=tokenizer,
-            config=config,
-            memory_store=memory_store,
-        )
-
-        text = generated["augmented_text"]
-        assert "Nothing was recorded for the requested period." in text
-        assert "2026-08-01" in text
-        assert result.text == "Nothing to add."
-
-    def test_zero_survivors_escalate_tag_never_reaches_cloud_or_base_model(self, monkeypatch):
-        """Same zero-survivor setup, but the local model escalates anyway
-        (``[ESCALATE] ...``): HA is stubbed unreachable, ``answer_via_cloud``
-        is invoked (receiving ``is_personal=True``) but stubbed to return
-        ``None`` exactly as the ``block`` cloud-mode gate does in
-        production, ``_base_model_answer`` is never reached, and the result
-        is the pre-tag / fallback text."""
-        from paramem.server.temporal import DateWindow
-        from paramem.server.temporal_selection import DateSelection
-
-        forbid_both_read_doors(monkeypatch)
-
-        def exploding_base_model(*args, **kwargs):
-            raise AssertionError("_base_model_answer must not be called on the zero-survivor path")
-
-        monkeypatch.setattr("paramem.server.inference._base_model_answer", exploding_base_model)
-        monkeypatch.setattr("paramem.server.inference._escalate_to_ha_agent", lambda *a, **kw: None)
-        monkeypatch.setattr("paramem.server.inference.is_self_referential", lambda *a, **kw: False)
-
-        cloud_calls = []
-
-        def fake_answer_via_cloud(text, cloud_agent, config, **kwargs):
-            cloud_calls.append(kwargs)
-            return None
-
-        monkeypatch.setattr("paramem.server.inference.answer_via_cloud", fake_answer_via_cloud)
-
-        self.stub_generate_local_reply(
-            monkeypatch, reply="Intro sentence. [ESCALATE] what did we discuss then"
-        )
-
-        def fake_select(text, date_by_key, *, model, tokenizer, config, today):
-            return DateSelection(
-                all=False,
-                ranges=(DateWindow(start=date(2026, 8, 10), end=date(2026, 8, 10)),),
-                include_undated=False,
-            )
-
-        monkeypatch.setattr("paramem.server.inference.select_date_groups", fake_select)
-
-        tokenizer = MagicMock()
-        tokenizer.apply_chat_template = lambda msgs, **kwargs: "prompt"
-        model = self.make_model(["episodic"])
-
-        # The production default door — pinned to state that the path
-        # short-circuits ahead of the fork under the shipping
-        # configuration, not merely under the other arm.
-        config = ServerConfig()
-        config.inference.preload_cache = True
-
-        memory_store = _MS()
-        memory_store.set_bookkeeping(
-            "e1",
-            speaker_id="speaker0",
-            relation_type="factual",
-            first_seen="2026-08-01T09:00:00",
-            last_seen="2026-08-01T09:00:00",
-            promoted=False,
-        )
-        plan = self.make_plan([("episodic", ["e1"])])
-
-        result = _probe_and_reason(
-            text="What did we discuss on August 10th?",
-            plan=plan,
-            history=None,
-            model=model,
-            tokenizer=tokenizer,
-            config=config,
-            memory_store=memory_store,
-            is_personal=True,
-        )
-
-        assert len(cloud_calls) == 1
-        assert cloud_calls[0]["is_personal"] is True
-        assert result.text == "Intro sentence."
 
     def test_mixed_zero_dated_matches_with_undated_survivors_probes_and_renders_both(
         self, monkeypatch

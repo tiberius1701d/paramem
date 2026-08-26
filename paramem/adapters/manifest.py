@@ -155,7 +155,7 @@ class PayloadFingerprint:
     Attributes:
         kind: ``"train"`` (a LoRA weight payload,
             ``adapter_model.safetensors``) or ``"simulate"`` (a projected
-            knowledge-graph payload, ``graph.json``) — the ruled venue
+            knowledge-graph payload, ``graph.json``) — the closed venue
             vocabulary. Checked in ``__post_init__`` against
             :data:`_PAYLOAD_KINDS`, the closed vocabulary, so no writer —
             construction site or ``_dict_to_manifest``'s read boundary —
@@ -186,7 +186,7 @@ class AdapterManifest:
     """Immutable per-slot manifest written alongside every written payload.
 
     Attributes:
-        schema_version: Always ``MANIFEST_SCHEMA_VERSION`` (currently 5).
+        schema_version: Always ``MANIFEST_SCHEMA_VERSION`` (5).
         name: Adapter/tier name string (e.g. ``"episodic"``).
         trained_at: ISO-8601 UTC timestamp (``"YYYY-MM-DDTHH:MM:SSZ"``).
         payload: The slot's own content fingerprint (see
@@ -293,9 +293,7 @@ def _dict_to_manifest(d: dict) -> AdapterManifest:
     older shape. A prior-shape ``meta.json`` is migrated once, offline, by
     ``scripts/migrate/stamp_slot_manifests_v5.py`` before the first boot on
     this schema; this parser never reads that shape, and ``window_stamp``
-    is required (the v1 absent-``window_stamp`` default and the v3
-    ``keyed_pairs_sha256`` drop no longer apply — the migration is the only
-    reader of that shape).
+    is a required field.
 
     ``payload.kind == "train"`` requires ``base_model``, ``tokenizer`` and
     ``lora`` all present; any other ``payload.kind`` requires all three
@@ -525,9 +523,8 @@ def iter_slot_candidates(adapter_kind_dir: Path) -> Iterator[Path]:
     entries are skipped. This is the single shared predicate behind
     :func:`find_live_slot` (which additionally reads and validates each
     candidate's manifest) and :func:`count_slot_candidates` (which only
-    counts) — collapsed from duplicated inline predicates at both. It is
-    also the walk ``scripts/migrate/stamp_slot_manifests_v5.py`` composes
-    unchanged, so migration and boot cannot disagree about what a slot is.
+    counts). ``scripts/migrate/stamp_slot_manifests_v5.py`` composes the
+    same walk, so migration and boot cannot disagree about what a slot is.
 
     Args:
         adapter_kind_dir: Directory scoped to a single adapter kind (e.g.
@@ -599,9 +596,8 @@ def count_slot_candidates(adapter_kind_dir: Path) -> int:
 
     Delegates to :func:`iter_slot_candidates` — see its docstring for what
     counts as a candidate. This is the single implementation of the "does
-    this tier dir have any written slot at all" check that used to be
-    duplicated at multiple call sites; it is now shared by the boot mount
-    loop's one per-tier validator (``_validate_adapter_slot``, used
+    this tier dir have any written slot at all" check, shared by the boot
+    mount loop's one per-tier validator (``_validate_adapter_slot``, used
     identically for main and interim tiers), ``/speaker/forget``'s manifest
     re-stamp gate, and :func:`~paramem.server.migration.compute_shape_changes`'s
     never-trained-vs-all-corrupt distinction. It lets each caller tell "not
@@ -952,11 +948,10 @@ def build_manifest_for(
     3. **Source-safetensors mmap-hash** (cold path): resolves the base-model
        ``*.safetensors`` files from disk (local path) or the HF Hub cache
        (via ``try_to_load_from_cache``), then SHA-256s the concatenation via
-       mmap.  Much faster than the old in-memory ``state_dict`` walk (~8.5 min
-       for Mistral 7B) and survives process restarts.
+       mmap.  Survives process restarts.
 
     If all three strategies fail, ``base_hash`` is set to ``UNKNOWN`` and a
-    warning is logged.  The old ``state_dict`` walk is not used.
+    warning is logged.
 
     Args:
         model: The live ``PeftModel`` — every production caller passes a
@@ -1018,7 +1013,7 @@ def build_manifest_for(
     # Weight hash — three strategies (cheapest first):
     # 1. In-memory cache hit (amortises within one process lifetime).
     # 2. Manifest read-back: scan existing meta.json files on disk.
-    # 3. Source safetensors mmap-hash (cold path; much faster than state_dict walk).
+    # 3. Source safetensors mmap-hash (cold path).
     cache_key = id(model)
     if base_model_hash_cache is not None and cache_key in base_model_hash_cache:
         # Strategy 1: in-memory cache hit

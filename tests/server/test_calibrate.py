@@ -47,8 +47,9 @@ from paramem.server.calibrate import (
     _effective_params,
     preflight,
 )
+from paramem.server.chat_result import ChatResult
 from paramem.server.config import CloudConfig, PathsConfig, SanitizationConfig
-from paramem.server.inference import ChatResult, handle_chat
+from paramem.server.inference import handle_chat
 from paramem.utils.artifacts import calibration_run
 
 
@@ -256,9 +257,8 @@ class TestPreflight:
     def test_503_when_model_missing(self):
         """No model handle -> 503, independently of ``_state["mode"]``.
 
-        A real consolidation cycle running is no longer a preflight
-        concern: it is now the arbitrator's own guard, answering 200
-        ``deferred_already_running`` — see
+        A running consolidation cycle is the arbitrator's own guard,
+        answering 200 ``deferred_already_running`` — see
         ``TestConsolidationDispatchGuards`` in test_consolidate_dispatch.py.
         """
         state = _state_enabled()
@@ -544,20 +544,18 @@ class TestChainDispatch:
         assert state["consolidation_loop"].extraction.run.called
 
     # Artifact-scope opening (``calibration_run``) and the response.json
-    # write (``on_calibration_result``) are the executor envelope's job now
+    # write (``on_calibration_result``) are the executor envelope's job
     # (``app._run_calibration_sync``), not calibrate.py's — covered there.
 
     def test_dispatch_surfaces_focus_step_raw_output(self):
         """The inspected step's ``raw_output`` is surfaced at the response top
         level, read off the ``PhaseRecord`` object (not a dict).
 
-        Regression: the dispatch built ``record`` from ``r.to_dict()`` then read
-        ``record.raw_output`` — an ``AttributeError`` on a dict, masked because
-        the enrichment fail-closed raise short-circuited the walk before this
-        line ever ran on a completed extract.  The other dispatch mocks return a
-        graph with no attached phases (``get_phases`` empty → ``record is None``
-        → ``""``), so only a graph carrying a real focus-step record exercises
-        it.
+        The dispatch must read ``record.raw_output`` directly off the
+        ``PhaseRecord`` object.  The other dispatch mocks return a graph
+        with no attached phases (``get_phases`` empty → ``record is None``
+        → ``""``), so only a graph carrying a real focus-step record
+        exercises it.
         """
         state = _state_enabled()
 
@@ -710,18 +708,17 @@ class TestChainProductionParity:
     """The properties that make a calibration run 1:1 with production."""
 
     def test_plausibility_inspects_the_de_anonymized_judge(self):
-        """Regression guard. The standalone endpoint judged whatever fact
-        list the client posted, and the client posted ANONYMIZED facts —
-        while production feeds this judge DE-ANONYMIZED ones. Running the
-        real chain and stopping at ``deanon_plausibility`` is what closes
-        that gap; a declaration pointing anywhere else reopens it."""
+        """The plausibility judge must inspect DE-ANONYMIZED facts, never
+        the anonymized ones a client would post directly. Running the real
+        chain and stopping at ``deanon_plausibility`` guarantees this; a
+        declaration pointing anywhere else would feed the judge anonymized
+        facts."""
         assert _CHAIN["plausibility"].stop == "deanon_plausibility"
 
     def test_no_use_case_reaches_a_step_primitive(self):
-        """The handler must route through ExtractionPipeline only. A
-        dispatch calling anonymize()/judge_plausibility()/
-        request_enrichment() directly is the standalone shape this
-        unification removed."""
+        """The handler must route through ExtractionPipeline only; it must
+        never call anonymize()/judge_plausibility()/request_enrichment()
+        directly."""
         source = inspect.getsource(calibrate.dispatch_chain)
         for primitive in ("anonymize(", "judge_plausibility(", "request_enrichment("):
             assert primitive not in source
@@ -961,8 +958,8 @@ class TestCalibrateNormalize:
 
     def test_no_reimplementation_of_the_survivor_rule(self):
         """The handler must not re-derive which predicate survives — that
-        rule lives in the tier pass (highest reinforcement_count) and a
-        second copy is exactly the drift this unification removed."""
+        rule lives in the tier pass (highest reinforcement_count); a second
+        copy would drift from it."""
         import ast
 
         tree = ast.parse(inspect.getsource(calibrate.dispatch_normalize).lstrip())
@@ -1177,7 +1174,7 @@ class TestCalibrateName:
         assert "<override:name_extraction.txt>" in paths_reported
 
         # The model must have received the OVERRIDE content, not the default.
-        # captured_messages[0] is now supports_system_role's own probe call
+        # captured_messages[0] is supports_system_role's own probe call
         # (render_chat_prompt applies adapt_messages, which checks system-role
         # support via a throwaway apply_chat_template call before the real
         # render) — the actual rendered messages are always the LAST call.
@@ -1244,11 +1241,13 @@ class TestCalibrateRespond:
         assert "speaker99" in exc.value.detail
 
     def test_empty_text_400(self):
-        state = _state_respond()
-        req = CalibrateRespondRequest(text="", speaker_id="speaker0")
-        with pytest.raises(HTTPException) as exc:
-            _run_respond(state, req)
-        assert exc.value.status_code == 400
+        """A blank body is rejected at the request-schema boundary — the
+        same ``NonBlankText`` rule ``/chat`` applies — before construction
+        even succeeds, so this dispatch never sees an empty transcript."""
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError, match="empty or whitespace-only"):
+            CalibrateRespondRequest(text="", speaker_id="speaker0")
 
     @pytest.mark.parametrize(
         "component", ["speaker_store", "session_buffer", "router", "memory_store"]
@@ -1485,7 +1484,8 @@ class TestExtractNameViaLlmUserTurnFilter:
 
     These tests mock generate_answer and verify that:
     1. Assistant turns are excluded from the transcript passed to the model
-       when user_turns_only=True (fixes the salutation leak).
+       when user_turns_only=True (an assistant's own salutation must not be
+       mistaken for a user's self-introduction).
     2. Post-filters still apply (NONE sentinel, length, word-count).
     3. When user_turns_only=False, assistant turns ARE included.
     """

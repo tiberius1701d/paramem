@@ -103,27 +103,18 @@ class TestLoadPromptPerModelResolution:
 class TestLoadPromptPhaseTraceRecording:
     """``_load_prompt`` records its own resolution via
     :func:`paramem.graph.phase_trace.record_prompt` right after it resolves
-    a file (see ``paramem/graph/prompts.py``).  This is the regression pin
-    for a divergence that used to exist: a calibration run must see the
-    loader's OWN resolved path/content, never a re-implementation of the
-    search order.
+    a file (see ``paramem/graph/prompts.py``).  A calibration run must see
+    the loader's OWN resolved path/content, never a re-implementation of
+    the search order.
 
-    That re-implementation used to be live: ``paramem/server/calibrate.py``
-    carried a ``_read_prompt`` helper that resolved
-    ``path = Path(prompts_dir) / filename`` directly, skipping the
-    ``prompts_dir/<model>`` search ``_load_prompt`` performs, and fed its
-    own return value into the top-level ``prompts`` field reported by
-    several calibrate handlers — so it reported a DIFFERENT prompt than
-    production loaded whenever a per-model override existed.  Every
-    calibrate stage has since been hooked into the shared
+    Every calibrate stage is hooked into the shared
     :func:`~paramem.server.calibrate.run_stage` assembler (called by
     :func:`~paramem.server.app._run_calibration_sync` for a real dispatch),
     which reads prompt provenance from the phase trace ``_load_prompt``
     itself populates (see
-    :func:`paramem.server.calibrate._provenance_from_records`), and
-    ``_read_prompt`` has been removed.  This test class continues to pin
-    that ``_load_prompt``'s OWN chokepoint records truthfully — the
-    property every calibrate stage now depends on directly."""
+    :func:`paramem.server.calibrate._provenance_from_records`). This test
+    class pins that ``_load_prompt``'s OWN chokepoint records truthfully —
+    the property every calibrate stage depends on directly."""
 
     def test_silent_fallback_to_shipped_default_is_visible_in_record(self, tmp_path):
         """The file is ABSENT from the operator-supplied ``prompts_dir``, so
@@ -498,7 +489,7 @@ class TestExtractionPromptThirdPartySubjectContract:
         tmpl = _extraction_prompt(model)
         prose = tmpl.split("POSITIVE example")[0]
         assert re.search(r"self-reference|self-referen", prose, re.IGNORECASE), (
-            "Rule prose no longer conditions the speaker0 binding on self-reference."
+            "Rule prose does not condition the speaker0 binding on self-reference."
         )
         assert "for every fact about the speaker" not in prose, (
             "Rule prose still claims speaker0 is the subject for EVERY fact — "
@@ -666,18 +657,18 @@ class TestExtractionPromptThirdPartySubjectContract:
         tmpl = _extraction_prompt(model)
         prose = tmpl.split("POSITIVE example")[0]
         assert re.search(r"relationship edge", prose, re.IGNORECASE), (
-            "Rule prose no longer states the relationship-edge half of the "
+            "Rule prose does not state the relationship-edge half of the "
             "named-relative decomposition."
         )
         assert re.search(r"own (fact|node)", prose, re.IGNORECASE), (
-            "Rule prose no longer states the relative's-own-fact half of "
+            "Rule prose does not state the relative's-own-fact half of "
             "the named-relative decomposition."
         )
         assert re.search(r"collapse", prose, re.IGNORECASE), (
-            "Rule prose no longer forbids collapsing the two relations into one."
+            "Rule prose does not forbid collapsing the two relations into one."
         )
         assert re.search(r"drop", prose, re.IGNORECASE), (
-            "Rule prose no longer forbids dropping either relation."
+            "Rule prose does not forbid dropping either relation."
         )
 
 
@@ -821,9 +812,9 @@ class TestEnrichmentPromptContract:
         have a matching entry in `bindings`. Without this clause, cloud's
         reified entities are dropped wholesale by the residual sweep.
 
-        Updated transcript is no longer carried on the wire (delta
-        protocol — reconstructed locally from bindings + anon transcript)
-        so the contract is now solely "facts ↔ bindings".
+        The updated transcript is not carried on the wire — it is
+        reconstructed locally from bindings + the anon transcript — so the
+        contract is solely "facts ↔ bindings".
         """
         tmpl = _load_prompt("cloud_enrichment.txt")
         # Bindings is the grounding contract; the prompt must name it.
@@ -955,7 +946,7 @@ class TestEnrichmentPromptContract:
         :func:`_first_person_blocks`, not a hardcoded anchor list, so
         tuning a few-shot's wording cannot silently drop it from this
         scan) must bind the speaker to 'speaker0' — not a Person_N — in
-        the delta it actually emits.  The subject is now the RENDERED
+        the delta it actually emits.  The subject is the RENDERED
         ``{speaker_id}`` slot (per-session speaker binding), so this
         renders with ``speaker_id="speaker0"`` before checking."""
         tmpl = _load_prompt("cloud_enrichment.txt")
@@ -978,7 +969,7 @@ class TestEnrichmentPromptContract:
         Person_1 naming someone OTHER than the speaker, so the model
         cannot re-derive 'Person_1 = me' positionally even without an
         explicit rule saying so.  Checked on the RENDERED prompt
-        (``speaker_id="speaker0"``) since the subject is now the
+        (``speaker_id="speaker0"``) since the subject is the
         ``{speaker_id}`` slot; the existence assertion is its own
         non-vacuity guard."""
         tmpl = _load_prompt("cloud_enrichment.txt")
@@ -1042,18 +1033,11 @@ class TestPlausibilityPromptContract:
     def test_lists_drop_rules(self):
         """Plausibility judge relies on six numbered drop rules (R1-R6).
 
-        The prior R4 ("Unresolved placeholder in real-name input") was
-        tied to the constrained ``^(Person|City|Country|Org|Thing)_\\d+$``
-        regex that became incoherent with the open-vocabulary anonymizer
-        pivot.  It was also structurally redundant with the residual
-        sweep inside ``_apply_bindings`` at the deanon stage, before
-        plausibility.
-
-        The grounding refactor revised the remaining rules: lexical
-        token lists became illustrative parentheticals, and a new R3
-        (transcript contradiction) closes the gap that the prior
-        "no judgment calls" framing left open.  The structure of the
-        prompt and of the examples is unchanged.
+        Rule R3 (transcript contradiction) grounds the judge's verdict
+        against the transcript itself, rather than a lexical token check;
+        an unresolved-placeholder rule is out of scope for the judge since
+        the residual sweep inside ``_apply_bindings`` at the deanon stage,
+        before plausibility, already handles it.
 
         Verify each rule's identifying substring still exists so a
         prompt edit that removes a rule is caught at unit-test time.
@@ -1062,10 +1046,10 @@ class TestPlausibilityPromptContract:
         required_rules = [
             "self-loop",  # R1
             "name-swap",  # R2
-            "contradiction",  # R3 — new transcript-grounded rule
-            "conversation-role",  # R4 — was "Role leak", grounded
-            "content-free",  # R5 — was "Empty / sentinel"
-            "system identifier",  # R6 — was "System entity ID"
+            "contradiction",  # R3 — transcript-grounded rule
+            "conversation-role",  # R4
+            "content-free",  # R5
+            "system identifier",  # R6
         ]
         for rule in required_rules:
             assert rule.lower() in tmpl.lower(), f"Plausibility prompt missing rule: {rule!r}"
@@ -1129,7 +1113,7 @@ class TestPlausibilityPromptContract:
                 assert all(isinstance(i, int) for i in indices)
 
     def test_transcript_label_is_source_neutral(self):
-        """The label preceding ``{transcript}`` no longer names a
+        """The label preceding ``{transcript}`` does not name a
         conversation-specific source — the same judge also runs on
         document-sized chunks, not just conversation turns."""
         tmpl = _load_prompt("cloud_plausibility.txt")
@@ -1375,7 +1359,7 @@ class TestMergerCoexistencePrompt:
 
     def test_aggregate_keyword_absent(self):
         """``AGGREGATE`` must NOT appear in the rendered prompt — the 2-way parser
-        no longer expects or emits it; its presence would confuse the model.
+        does not expect or emit it; its presence would confuse the model.
         """
         tmpl = self._load()
         rendered = tmpl.format(predicate="speaks")
@@ -1406,11 +1390,11 @@ class TestCheckPredicateCoexistenceParser:
         ``generate_answer`` is imported locally inside
         ``check_predicate_coexistence`` (lazy import), so it is patched at
         its definition site (``paramem.evaluation.recall``), not via the
-        merger module namespace. ``check_predicate_coexistence`` no longer
-        imports ``adapt_messages`` directly — it renders through
-        ``render_chat_prompt`` (``paramem.models.loader``), which calls
-        ``adapt_messages`` as its own module-global, so that patch targets
-        ``paramem.models.loader`` too.
+        merger module namespace. ``check_predicate_coexistence`` renders
+        through ``render_chat_prompt`` (``paramem.models.loader``), which
+        calls ``adapt_messages`` as its own module-global rather than
+        ``check_predicate_coexistence`` importing it directly, so that
+        patch targets ``paramem.models.loader`` too.
         """
         from unittest.mock import MagicMock, patch
 
@@ -1463,8 +1447,8 @@ class TestSpeakerDirectiveFile:
       substituted by :func:`~paramem.server.speaker.resolve_speaker_tokens`
       at the reply boundary.
 
-    ``INFERENCE-IDENTITY`` is deleted: id-to-name resolution is not a
-    prompt injection and does not happen at the fact-render boundary
+    There is no ``INFERENCE-IDENTITY`` section: id-to-name resolution is not
+    a prompt injection and does not happen at the fact-render boundary
     either — it happens exactly once, at the reply boundary, via
     ``resolve_speaker_tokens``.  Tests verify the current section layout.
     """
@@ -1474,8 +1458,8 @@ class TestSpeakerDirectiveFile:
         path = _DEFAULT_PROMPT_DIR / "speaker_directive.txt"
         assert path.exists(), f"speaker_directive.txt not found at {path}"
 
-    def test_inference_identity_deleted_raises_key_error(self):
-        """INFERENCE-IDENTITY section is deleted; loading it must raise KeyError."""
+    def test_inference_identity_section_absent_raises_key_error(self):
+        """There is no INFERENCE-IDENTITY section; loading it must raise KeyError."""
         import pytest
 
         from paramem.graph.prompts import _load_prompt_section
@@ -1498,7 +1482,7 @@ class TestSpeakerDirectiveFile:
         assert descriptor == "another speaker"
 
     def test_extraction_directive_intact(self):
-        """EXTRACTION-DIRECTIVE section is intact and non-empty after refactor."""
+        """EXTRACTION-DIRECTIVE section is present and non-empty."""
         from paramem.graph.prompts import _load_prompt_section
 
         extraction = _load_prompt_section("speaker_directive.txt", "EXTRACTION-DIRECTIVE")
@@ -1727,23 +1711,22 @@ class TestNameExtractionPrompt:
         )
 
     def test_no_inline_name_prompt_in_app_py(self):
-        """Confirm app.py no longer contains the old inline name-extraction prompt strings.
+        """app.py must not contain inline name-extraction prompt strings.
 
-        The inline prompt was the root cause of: (a) no occupation negatives,
-        (b) no user-turn filtering.  Its removal is load-bearing — this test
-        guards the regression.
+        Every model-facing prompt string resolves through
+        ``paramem/graph/prompts.py``; an inline literal in app.py bypasses
+        occupation negatives and user-turn filtering that only the loaded
+        prompt files teach.
         """
         from pathlib import Path
 
         app_src = (
             Path(__file__).resolve().parents[1] / "paramem" / "server" / "app.py"
         ).read_text()
-        # The old system_msg verbatim fragment that's now gone.
         assert "You extract speaker names from conversation transcripts." not in app_src, (
             "Inline name-extraction system prompt detected in app.py — "
             "it must be removed and loaded from name_extraction_system.txt instead."
         )
-        # The old user_msg verbatim fragment.
         assert "Extract the speaker's self-introduced name from this transcript." not in app_src, (
             "Inline name-extraction user prompt detected in app.py — "
             "it must be removed and loaded from name_extraction.txt instead."

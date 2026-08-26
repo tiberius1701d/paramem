@@ -1622,12 +1622,12 @@ def test_arm_active_store_migration_noop_when_no_switch():
 
 
 def test_refresh_config_from_disk_arms_mode_switch():
-    """Regression: a live config refresh arms the active-store rebuild.
+    """A live config refresh arms the active-store rebuild.
 
-    Previously only the lifespan path called detect_mode_switch, so a
-    LIVE-applied mode change (migration accept / config apply) committed the new
-    mode to _state but left the on-disk store stale until the next restart. The
-    refresh path must invoke the shared arming helper with the new config.
+    The refresh path must invoke the shared arming helper (detect_mode_switch)
+    with the new config, so a LIVE-applied mode change (migration accept /
+    config apply) does not leave the on-disk store stale until the next
+    restart.
     """
     from paramem.server import app as app_module
 

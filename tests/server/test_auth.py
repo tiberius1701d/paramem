@@ -1,23 +1,18 @@
 """Tests for `paramem.server.auth` — bearer-token middleware.
 
-Re-spec (shared-token retirement, C): the middleware's ``token=`` constructor
-parameter and its constant-time shared-token comparison branch are deleted —
-every credential now lives exclusively in a
+Every credential lives exclusively in a
 :class:`~paramem.server.user_tokens.UserTokenStore`.  ``OFF``/``ON`` are
 keyed on store presence only.  These tests build the middleware with a
 ``user_token_getter`` (backed by a real ``UserTokenStore`` on ``tmp_path``,
-or ``None`` for OFF) instead of a literal shared-token string.
+or ``None`` for OFF).
 
-This file merges the former ``test_auth_middleware.py`` (extended coverage:
-cookie carrier, exempt paths/prefixes, cookie-name getter, scope-on-state,
-fail-clean, getter-None) into the one canonical suite.  Classes that tested
-the retired shared-secret constructor param (``TestLegacySharedToken``,
-``TestOnBothMode``) are replaced by :class:`TestRetiredSharedTokenSemantics`,
-one discriminating pin for the retirement.  ``TestLogStartupPosture`` is
-reconciled with the migration-guard coverage below it — the retired
-ON-shared/ON-both states and the legacy single-positional-arg call form are
-dropped, not re-specced, since neither exists in the current signature or
-behavior.
+Coverage includes the cookie carrier, exempt paths/prefixes, the
+cookie-name getter, scope stamped on request.state, fail-clean behavior,
+and a None getter.  :class:`TestSharedSecretShapedValueHasNoSpecialHandling` pins that a
+value shaped like a shared secret is just an unregistered string: rejected
+once a store is wired, and passed through with the non-admin ``"chat"``
+scope only when no store is wired at all.  ``TestLogStartupPosture`` covers
+the startup-log states (OFF / ON), keyed on store presence.
 """
 
 from __future__ import annotations
@@ -364,20 +359,16 @@ class TestCookieToken:
 
 
 # ---------------------------------------------------------------------------
-# Retired shared-token semantics (replaces TestLegacySharedToken/TestOnBothMode)
+# Shared-secret-shaped values have no special handling
 # ---------------------------------------------------------------------------
 
 
-class TestRetiredSharedTokenSemantics:
-    """Replaces the former ``TestLegacySharedToken`` and ``TestOnBothMode``
-    classes, which exercised the deleted ``token=`` shared-secret constructor
-    param and its OFF/ON-both matrix.  There is no shared-secret credential
-    anymore — every accepted token is a ``UserTokenStore`` entry.  This is the
-    one discriminating pin for the retirement: a value shaped like the old
-    shared secret is just an unregistered string now.  It is rejected once a
-    store is wired (fail-closed ON), and passes through untouched — stamped
-    with the non-admin ``"chat"`` scope — only when no store is wired at all
-    (auth OFF).
+class TestSharedSecretShapedValueHasNoSpecialHandling:
+    """There is no shared-secret credential — every accepted token is a
+    ``UserTokenStore`` entry.  A value shaped like a shared secret is just an
+    unregistered string: it is rejected once a store is wired (fail-closed
+    ON), and passes through untouched — stamped with the non-admin ``"chat"``
+    scope — only when no store is wired at all (auth OFF).
     """
 
     def test_unregistered_value_401s_when_wired_else_passes_chat_scope_off(
@@ -571,13 +562,8 @@ class TestFailClean:
 
 class TestLogStartupPosture:
     """Tests for ``log_startup_posture``'s two states (OFF / ON), keyed on
-    store presence per the current ``(n_user_tokens, per_user_active)``
-    signature.
+    store presence via the ``(n_user_tokens, per_user_active)`` signature.
 
-    Re-spec: the retired shared-token model's three/four-way ON-shared /
-    ON-per-user / ON-both matrix and its legacy single-positional-arg call
-    form (``log_startup_posture("tok")``) are gone — dropped, not
-    re-specced, since neither exists in the current signature or behavior.
     A plain OFF-state assertion is not repeated here — it is already covered
     by :class:`TestLogStartupPostureMigrationGuard` below.
     """
@@ -585,9 +571,9 @@ class TestLogStartupPosture:
     def test_on_with_zero_tokens_is_fail_closed(self, caplog):
         """Store wired, 0 active tokens → AUTH: ON fail-closed info, not OFF.
 
-        This is the bug the fix addresses: the middleware rejects every
-        request (fail-closed) when the store is wired but empty; the log
-        must say ON, not OFF, or the two would contradict runtime behavior.
+        The middleware rejects every request (fail-closed) when the store is
+        wired but empty; the log must say ON, not OFF, or the two would
+        contradict runtime behavior.
         """
         import logging
 
@@ -610,11 +596,10 @@ class TestLogStartupPosture:
 
 
 class TestLogStartupPostureMigrationGuard:
-    """Fail-open migration guard: a stale ``PARAMEM_API_TOKEN`` from the
-    retired shared-token model must not silently leave a deployment open
-    with no warning.  ``log_startup_posture`` is this module's ONE read of
-    the env var (see the module docstring) — presence-only, never used as a
-    credential.
+    """Fail-open migration guard: a stale ``PARAMEM_API_TOKEN`` env var must
+    not silently leave a deployment open with no warning.
+    ``log_startup_posture`` is this module's ONE read of the env var (see
+    the module docstring) — presence-only, never used as a credential.
     """
 
     def test_off_with_stale_token_env_var_warns_loudly(self, monkeypatch, caplog) -> None:
@@ -628,7 +613,10 @@ class TestLogStartupPostureMigrationGuard:
 
         messages = [r.message % r.args if r.args else r.message for r in caplog.records]
         assert any("AUTH: OFF" in m for m in messages)
-        assert any("PARAMEM_API_TOKEN" in m and "no longer" in m.lower() for m in messages)
+        assert any(
+            "PARAMEM_API_TOKEN" in m and "is set but is not used as a credential" in m
+            for m in messages
+        )
 
     def test_off_without_token_env_var_no_migration_warning(self, monkeypatch, caplog) -> None:
         import logging

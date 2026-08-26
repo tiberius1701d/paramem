@@ -1,15 +1,13 @@
 """THE token-estimation primitive — one estimator for every payload this
 system sizes before a local ``generate()`` call.
 
-Independent renderings of "how big is this payload" once existed at
-multiple local-generate call sites: try/except-guarded exact counts (each
-returning a ``-1`` sentinel on failure) such as
-:func:`paramem.graph.extractor.judge_plausibility` and
-:func:`paramem.server.calibrate._count_tokens`, and a tokenizer-free
-whitespace-word counter in :mod:`paramem.graph.document_chunker`.
-:func:`estimate_tokens` collapses every one of those into one function:
-exact when a tokenizer is supplied, a conservative words-based bound
-otherwise. Callers never re-implement counting locally.
+:func:`estimate_tokens` is the one call every local-generate call site
+uses to size a payload — exact when a tokenizer is supplied, a
+conservative words-based bound otherwise. Every payload-sizing call site,
+including :func:`paramem.graph.extractor.judge_plausibility`,
+:func:`paramem.server.calibrate._count_tokens`, and
+:mod:`paramem.graph.document_chunker`, routes through this one function
+rather than re-implementing its own count.
 
 Boundary — why this module and not one of the four call sites' packages:
 it cannot live in ``paramem.cloud`` (``document_chunker`` and the ingest
@@ -138,13 +136,10 @@ def encode_rendered(tokenizer, text: "RenderedPrompt | list[RenderedPrompt]", **
 # tests/fixtures/server.yaml) over the three payload shapes the system
 # actually ingests. Value is the MAX of the per-shape ratios, rounded up to 1
 # decimal: the fallback must bound, not average.
-#   transcript shape (re-measured 2026-08-03, supersedes the original
-#     188 words / 270 tokens = 1.44 tokens/word measurement, over
-#     conversational session transcript/extraction pairs) : 1.54 tokens/word
-#   document shape (CV)                    : 1534 words / 2934 tokens = 1.91 tokens/word
-#   fact-JSON shape (2026-07-28 measurement)   : 2415 words / 8191 tokens = 3.39 tokens/word
-#   fact-JSON shape (2026-08-03 drift re-measurement of the same shape,
-#     recorded beside the original since both bound it)  : 3.657 tokens/word  <- MAX
+#   transcript shape (conversational session transcript/extraction pairs)
+#                                             : 1.54 tokens/word
+#   document shape (CV)                      : 1.91 tokens/word
+#   fact-JSON shape                          : 3.657 tokens/word  <- MAX
 # PUBLIC (no leading underscore): paramem.graph.document_chunker imports
 # this cross-module to keep its own offline-derived _DOC_MAX_TOKENS
 # constant in the SAME estimator unit as this module's runtime fallback:
@@ -179,7 +174,7 @@ ANONYMIZE_ENVELOPE_TOKENS: int = 8192
 # ANCHOR prompt skeleton — the fixed system-prompt + chat-markup + call-body
 # token cost of the one remaining local anonymize call, excluding the
 # candidate values list (``{values}``) and the evidence text (``{text}``).
-# Measured 2026-08-24 via the ACTUAL runtime render path
+# Measured via the ACTUAL runtime render path
 # (``paramem.models.loader.render_chat_prompt`` over the ``ANCHOR-SYSTEM`` +
 # ``ANCHOR`` sections as
 # ``paramem.graph.anonymizer_prompts.load_anonymizer_prompts`` composes
@@ -191,10 +186,10 @@ ANONYMIZE_ENVELOPE_TOKENS: int = 8192
 ANONYMIZE_ANCHOR_PROMPT_SKELETON_TOKENS: int = 523
 
 # ---------------------------------------------------------------------------
-# ANCHOR OUTPUT reserve constants — re-measured 2026-08-24 against the
-# shipped JSON envelope shape (``{"self_introduced": [...]}``), via a direct
-# tokenizer call on the envelope text (no chat-template render — this is the
-# MODEL's own completion, not a rendered prompt). Base measurements (a
+# ANCHOR OUTPUT reserve constants — measured against the shipped JSON
+# envelope shape (``{"self_introduced": [...]}``), via a direct tokenizer
+# call on the envelope text (no chat-template render — this is the MODEL's
+# own completion, not a rendered prompt). Base measurements (a
 # markdown-code-fenced empty envelope, plus a handful of realistic person
 # names) were 5-15 tokens; each constant below adds slack over that base for
 # output-format variation (fence style, whitespace) the exact base samples
@@ -220,9 +215,8 @@ ANONYMIZE_ANCHOR_ENTRY_OVERHEAD_TOKENS: int = 6
 ANONYMIZE_ANCHOR_MAX_CANDIDATES: int = 100
 
 # Conversation-transcript prose ratio (the session-tier payload shape),
-# measured 2026-08-03 against the production tokenizer over real
-# transcript/extraction pairs (counts only — see the module docstring's
-# privacy rule; the median of 4 pairs, ~7% above the previous 1.44 estimate).
+# measured against the production tokenizer over real transcript/extraction
+# pairs (counts only — see the module docstring's privacy rule).
 TRANSCRIPT_TOKENS_PER_WORD: float = 1.54
 
 
@@ -321,10 +315,9 @@ def anonymize_payload_cap_tokens(
 
     The result is re-expressed in the estimator's own unit via
     :func:`words_to_estimator_tokens` — see that function's docstring for
-    why (ratio cancellation at every runtime comparison). Unlike the
-    retired two-shape (SCAN, APPLY) derivation this superseded, there is
-    only one call shape left to evaluate, so the identity is inlined here
-    directly rather than split into a per-shape helper with a single caller.
+    why (ratio cancellation at every runtime comparison). There is only one
+    call shape to evaluate, so the identity is inlined here directly rather
+    than split into a per-shape helper with a single caller.
 
     Args:
         envelope_tokens: Total (prompt + output) token budget for one

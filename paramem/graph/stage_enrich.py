@@ -1,12 +1,12 @@
 """``enrich`` flow stage — entity-surface correction, cloud enrichment, and
 the anon-stage plausibility judge.
 
-Carved off the tail of ``extractor._cloud_pipeline`` as the sibling of
-``paramem.graph.stage_anonymize``'s ``anonymize`` stage. Where
-``anonymize`` projects the shared :func:`~paramem.cloud.anonymize.anonymize`
-chain, this module is session-tier-specific: it drives the cloud
-enrichment round trip (coreference resolution, compound splitting, safe
-reification) and the two judges either side of it.
+The sibling of ``paramem.graph.stage_anonymize``'s ``anonymize`` stage.
+Where ``anonymize`` projects the shared
+:func:`~paramem.cloud.anonymize.anonymize` chain, this module is
+session-tier-specific: it drives the cloud enrichment round trip
+(coreference resolution, compound splitting, safe reification) and the two
+judges either side of it.
 """
 
 from __future__ import annotations
@@ -47,7 +47,7 @@ def _stage_enrich(ctx: StageContext, state: StageState) -> StageState:
     ``anon_plausibility``) records its own block via ``phase_trace``, and
     the stage still reads ``chain_stopped()`` after each one (a
     calibration caller's ``stop_at`` scope) to short-circuit mid-stage —
-    unlike ``anonymize``'s stage-boundary check (now owned by
+    unlike ``anonymize``'s stage-boundary check (owned by
     ``run_flow``), these are MID-stage checks between sub-phases the
     runner cannot see, so they stay in the body.
 
@@ -56,9 +56,7 @@ def _stage_enrich(ctx: StageContext, state: StageState) -> StageState:
     scope, the raw cloud response, and the cloud's updated anonymized
     transcript. Every early exit inside this stage hands back a state
     with an EMPTY ``facts``, which is exactly the spec's
-    ``terminal_when`` — so the siblings do not run, which is what the
-    plain ``return graph`` on those paths achieved when this stage and
-    its siblings were still one composite function.
+    ``terminal_when`` — so the siblings do not run.
 
     Gated by ``ctx.validate`` plus
     :func:`~paramem.graph.flows._session_egress_permitted` (the shared
@@ -71,10 +69,8 @@ def _stage_enrich(ctx: StageContext, state: StageState) -> StageState:
     / ``ctx.enrichment_provider_endpoint`` resolve to an ``api_key``/``endpoint``
     pair via :func:`~paramem.cloud.admission.evaluate_cloud_egress`
     — the same verdict ``enabled_when`` already computed to admit this
-    stage, so no re-gate-and-bail is needed here (unlike the pre-carve
-    ``_cloud_pipeline``, which was reachable as a bare function outside the
-    flow and re-checked defensively; ``_stage_enrich`` only runs via
-    ``run_flow``, which already gated it).
+    stage, so no re-gate-and-bail is needed here: ``_stage_enrich`` only
+    runs via ``run_flow``, which has already gated it.
 
     Every reachable path through the anon-stage judge gate records its
     state onto ``graph.diagnostics["plausibility_state_anon"]`` (the
@@ -101,13 +97,12 @@ def _stage_enrich(ctx: StageContext, state: StageState) -> StageState:
 
     # ``anon_transcript`` is the chain's output regardless of which
     # ``anonymize`` branch ran — THE speaker-value guard in
-    # ``build_forward_table`` (paramem/cloud/placeholders.py)
-    # applies on every path by construction: ``payload.reverse`` is
-    # :func:`~paramem.cloud.anonymize.anonymize`'s own inversion of the
-    # cross-slice MERGED forward table (via
-    # :func:`~paramem.cloud.placeholders.invert_forward_mapping`), never a
-    # single slice's own ``build_forward_table`` reverse (which a
-    # cross-slice placeholder re-mint can make stale).
+    # ``build_forward_table`` (paramem/cloud/placeholders.py) applies on
+    # every path by construction: ``payload.reverse`` is
+    # :func:`~paramem.cloud.anonymize.anonymize`'s own inversion of
+    # ``build_forward_table``'s ``forward`` (via
+    # :func:`~paramem.cloud.placeholders.invert_forward_mapping`), after
+    # dropping any entry whose value is speaker-id-shaped.
     anon_transcript = payload.anon_transcript
 
     # Phase — entity_correction.  Local model classifies+corrects misspelled
@@ -140,11 +135,10 @@ def _stage_enrich(ctx: StageContext, state: StageState) -> StageState:
         # correct_entity_surfaces is read-only over its inputs — it returns
         # accepted corrections as data.  ``payload`` is a frozen dataclass:
         # rebinding it to a NEW dict (never mutating ``payload.reverse`` in
-        # place) is what makes "frozen" actually hold — a prior version
-        # wrote ``reverse_mapping[key] = value`` through an alias to the
-        # SAME dict object ``payload.reverse`` still pointed at, which
-        # mutated the "immutable" contract's interior after ``declared``
-        # (frozenset(reverse.keys())) had already been snapshotted from
+        # place) is what makes "frozen" actually hold — mutating the same
+        # dict object in place through an alias would corrupt the
+        # "immutable" contract's interior after ``declared``
+        # (frozenset(reverse.keys())) has already been snapshotted from
         # it.  Corrected VALUES still reach the cloud call below (the
         # rebound ``payload`` is what ``CloudScope.response`` reads) and
         # ``graph.entities`` (feeds keyed-entry assembly).
@@ -175,14 +169,16 @@ def _stage_enrich(ctx: StageContext, state: StageState) -> StageState:
     # (subject/object substituted through ``payload.forward``; every other
     # field copied verbatim) over ``payload.facts`` — the (real-name,
     # un-substituted) fact subset :func:`~paramem.cloud.anonymize.anonymize`
-    # already cleared for egress (the input facts minus any fail-closed
-    # slice's facts; see that function's docstring).  Facts are never
+    # already cleared for egress: the full input facts verbatim on this
+    # one call's success, or empty on its own fail-closed terminal (see
+    # ``AnonymizedContract``'s docstring) — never a partial subset.  Facts
+    # are never
     # taken from the model's response — the model's job is the TRANSCRIPT
     # (``anon_transcript``, already built above); the fact array is always
     # deterministic.  A fact can therefore never be lost, reworded, or
     # dropped by the anonymizer, and a placeholder cannot be glued into a
-    # predicate at this stage (the motivating bug,
-    # ``language_proficiency_Language_3``, cannot occur here).  It can
+    # predicate at this stage — a predicate shaped like
+    # ``language_proficiency_Language_3`` cannot occur here.  It can
     # still occur in cloud's *returned* facts, which is why the
     # deanon-stage predicate invariant (:func:`_apply_bindings`) stays.
     # An orphan placeholder in a fact is likewise impossible: every
@@ -195,7 +191,8 @@ def _stage_enrich(ctx: StageContext, state: StageState) -> StageState:
     # the ``anonymize`` and ``enrich`` stages mutates ``graph.relations``,
     # so ``payload.facts`` (captured at anonymize time) stays byte-parity
     # with a fresh ``facts_from_relations(graph.relations)`` render for
-    # the session tier's single-slice ``status == "ok"`` case.
+    # the session tier's one-payload, one-scan, one-build ``status ==
+    # "ok"`` case.
     anon_facts = insert_placeholders(payload.facts, payload.forward)
 
     # Phase — cloud_enrich.  Cloud (Anthropic by default) runs the
@@ -312,8 +309,8 @@ def _stage_enrich(ctx: StageContext, state: StageState) -> StageState:
                 payload, cloud_bindings=delta.bindings, sent=(_facts_text, _transcript_text)
             )
             # Apply the delta — per-triple accept/drop/revert against
-            # ``scope.resolution``, never a whole-delta rejection (retired
-            # 2026-07-22): an unresolvable ``add`` is dropped, an
+            # ``scope.resolution``, never a whole-delta rejection: an
+            # unresolvable ``add`` is dropped, an
             # unresolvable ``modify`` is reverted to its original fact, and
             # ``drop`` is honored unconditionally. See
             # ``_apply_enrichment_delta``'s own docstring for the full
@@ -481,7 +478,7 @@ def _stage_enrich(ctx: StageContext, state: StageState) -> StageState:
 
     # Hand-over to the ``deanonymize`` sibling: de-anonymization via
     # state-machine substitution, the deanon-stage judge and the
-    # relation/entity rebuild all live in their own stages now.  ``scope``
+    # relation/entity rebuild each live in their own stage.  ``scope``
     # is the ONE anonymize/de-anonymize round-trip scope for this
     # response — the substitution and the entity-type rebuild are both
     # keyed on it.

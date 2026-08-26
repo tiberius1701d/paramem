@@ -4,7 +4,7 @@ Covers:
 - RetentionTierConfig, RetentionConfig defaults and YAML loading.
 - schedule / artifacts / max_total_disk_gb fields.
 - Invalid keep strings and invalid artifact names raise ValueError.
-- Existing orphan_sweep tests still pass alongside new fields.
+- orphan_sweep coexists with the other ServerBackupsConfig fields.
 """
 
 from __future__ import annotations
@@ -199,9 +199,9 @@ class TestSecurityArtifactsConfig:
             load_server_config(yaml_file)
 
     def test_security_artifacts_retired_registry_names_the_replacement(self, tmp_path):
-        """artifacts: [registry] -- the previous default's now-retired kind --
-        raises with targeted replacement guidance naming 'snapshot_bundle',
-        not the generic 'invalid entry' message."""
+        """artifacts: [registry] -- a retired artifact kind -- raises with
+        targeted replacement guidance naming 'snapshot_bundle', not the
+        generic 'invalid entry' message."""
         yaml_file = _write_yaml(
             tmp_path,
             """\
@@ -238,10 +238,10 @@ class TestSecurityMaxTotalDiskConfig:
 
 
 class TestSecurityOrphanSweepStillWorks:
-    """orphan_sweep coexists with new ServerBackupsConfig fields (backward-compat guard)."""
+    """orphan_sweep coexists with the other ServerBackupsConfig fields."""
 
     def test_security_orphan_sweep_still_works(self, tmp_path):
-        """orphan_sweep.max_age_hours: 48 still loads correctly alongside new retention fields."""
+        """orphan_sweep.max_age_hours: 48 loads correctly alongside the retention fields."""
         yaml_file = _write_yaml(
             tmp_path,
             """\

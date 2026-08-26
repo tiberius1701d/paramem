@@ -5,10 +5,8 @@ Boundary / why this module exists
 
 Everything here is a total function of its arguments: facts in, relations
 and entities out. There is no cloud call, no model, no tokenizer, no
-config and no prompt — the most testable unit of the extraction flow, and
-(before the split) the least tested one, because it lived buried in the
-middle of ``_cloud_pipeline`` where reaching it required standing up the
-whole anonymize → enrich → judge chain first.
+config and no prompt — the most testable unit of the extraction flow,
+reachable without standing up the anonymize → enrich → judge chain.
 
 It owns three things:
 
@@ -17,8 +15,8 @@ It owns three things:
 * ``apply_rebuild`` — the entity surface that must accompany a relation
   set (pruning, placeholder-derived typing of names the cloud minted).
   Literal-value facts (phone/email/date/certification/job title, ...) are
-  no longer routed here by object shape: the model tags them
-  ``relation_type="attribute"`` at extraction time, and
+  routed by the model's own ``relation_type="attribute"`` tag at
+  extraction time, not by object shape, and
   :class:`~paramem.graph.merger.GraphMerger` (the one merge boundary every
   path crosses) folds them onto the subject node's ``attributes`` dict as
   a provenance-bearing record (``{value, speaker_id, first_seen,
@@ -33,14 +31,13 @@ It owns three things:
   on the local model) stays with its caller: it needs the model and the
   tokenizer, which this module deliberately never sees.
 
-The ``CAUSE_*`` vocabulary (and its ``cause_kind`` classifier) used to be
-defined here on the reasoning that the gate was its only consumer; it now
-lives in :mod:`paramem.graph.empty_cause` because it describes FLOW STATE
-(the extraction flow's ``StageState.empty_cause``), not relation
-rebuilding, and has three consumers: :func:`recovery_gate` below, the flow
+The ``CAUSE_*`` vocabulary (and its ``cause_kind`` classifier) lives in
+:mod:`paramem.graph.empty_cause` because it describes FLOW STATE (the
+extraction flow's ``StageState.empty_cause``), not relation rebuilding,
+and has three consumers: :func:`recovery_gate` below, the flow
 tail stages (``paramem.graph.flows``), and the ``enrich`` stage
 (``paramem.graph.stage_enrich``). This module imports the pieces
-:func:`recovery_gate` needs back from there.
+:func:`recovery_gate` needs from there.
 """
 
 from __future__ import annotations

@@ -278,15 +278,12 @@ class TestMibPerPromptTokenPrefillConstant:
     """Pins the measured constant's value and states what it measures.
 
     ``MIB_PER_PROMPT_TOKEN_PREFILL`` models the adapter-OFF prefill
-    transient in MiB per PROMPT token (2026-08-22 direct measurement:
-    three chunks of 7032/6760/6034 prompt tokens drew 1687/1622/1449 MiB,
-    ~0.24 MiB/prompt-token, corroborated across eleven runs Aug 1-21
-    2026) — not decode, not adapter-ON, not a total-envelope token.
+    transient in MiB per PROMPT token — not decode, not adapter-ON, not a
+    total-envelope token.
     """
 
-    def test_value_is_the_measured_2026_08_22_figure(self):
-        """The constant carries the direct-measurement value (0.24), not
-        the superseded 2026-07-28 fault-inference value (0.22)."""
+    def test_value_equals_measured_prefill_ratio(self):
+        """The constant's value is 0.24 MiB per prompt token."""
         assert MIB_PER_PROMPT_TOKEN_PREFILL == pytest.approx(0.24)
 
     def test_name_states_prefill_per_prompt_token(self):
@@ -299,14 +296,14 @@ class TestMibPerPromptTokenPrefillConstant:
         assert not hasattr(vram_guard_module, "MIB_PER_TOKEN_TRANSIENT")
 
     def test_measured_chunk_fits_at_its_measured_free_vram(self):
-        """The measurement itself must be self-consistent through the
-        clamp: at 1687 MiB free (the 2026-08-22 measured transient for
-        the 7032-token chunk), the constant must admit approximately that
-        many supportable prompt tokens — pins the constant's MEANING
-        rather than re-asserting the literal against itself. The
-        constant (0.24) is a conservative rounding of the exact measured
-        ratio (0.2399), so the clamp admits very slightly fewer than the
-        measured chunk's own token count — within 1%, not exactly it."""
+        """The constant must be self-consistent through the clamp: at 1687
+        MiB free (the transient this constant models for a 7032-token
+        chunk), the constant must admit approximately that many
+        supportable prompt tokens — pins the constant's MEANING rather
+        than re-asserting the literal against itself. The constant (0.24)
+        is a conservative rounding of the exact ratio (0.2399), so the
+        clamp admits very slightly fewer than that chunk's own token
+        count — within 1%, not exactly it."""
         with (
             patch("paramem.utils.vram_guard.torch.cuda.is_available", return_value=True),
             patch("paramem.utils.vram_guard.safe_empty_cache"),
@@ -321,7 +318,7 @@ class TestMibPerPromptTokenPrefillConstant:
 
 class TestEffectiveTokenEnvelope:
     """``effective_token_envelope`` — the dynamic VRAM clamp for the
-    anonymize token envelope (owner-approved 2026-07-28).
+    anonymize token envelope.
 
     ``effective = min(configured_envelope, free_mib /
     MIB_PER_PROMPT_TOKEN_PREFILL)`` — the configured value is a CEILING,
@@ -620,10 +617,7 @@ class TestConsolidationIntegration:
 
     @staticmethod
     def _call_run_extraction_phase(loop, config, buffer):
-        """Inject config + session_buffer into _state and call _run_extraction_phase.
-
-        run_consolidation was deleted; tests call _run_extraction_phase directly.
-        """
+        """Inject config + session_buffer into _state and call _run_extraction_phase."""
         import paramem.server.app as _app
 
         prior_config = _app._state.get("config")

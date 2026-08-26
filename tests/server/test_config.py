@@ -146,10 +146,9 @@ class TestSecurityOrphanSweepConfig:
 class TestSecurityRequireEncryptionLoader:
     """``security.require_encryption`` must round-trip from YAML to the config.
 
-    Regression: the loader built ``SecurityConfig`` from the parsed
-    ``security:`` block but only passed ``backups`` — the flag was silently
-    dropped and the dataclass default (False) always won, making the
-    fail-loud opt-in a no-op through ``load_server_config``.
+    ``load_server_config`` must build ``SecurityConfig`` from every field of
+    the parsed ``security:`` block, not just ``backups`` — otherwise the
+    fail-loud opt-in silently never activates.
     """
 
     def test_true_round_trips_from_yaml(self, tmp_path):
@@ -215,9 +214,8 @@ class TestSecurityRequireEncryptionLoader:
 class TestPathsConfigNoneGuard:
     """PathsConfig properties raise ValueError when data is None.
 
-    Previously they would raise TypeError from Path(None) / str with an
-    unhelpful message.  The guard provides an explicit error that names the
-    property and the missing prerequisite.
+    The guard provides an explicit error that names the property and the
+    missing prerequisite.
     """
 
     def test_adapters_raises_when_data_is_none(self):
@@ -232,20 +230,18 @@ class TestPathsConfigNoneGuard:
 class TestBucketTableGovernsUnclamped:
     """The per-fold training-budget derivation (paramem.utils.config.budget_for
     / _BUDGET_TABLE) is unconditional and unclamped: the bucket table alone
-    governs the derived per-fold epoch count, nothing else caps it. The
-    prior ``consolidation.max_epochs`` operator ceiling / ``TrainingConfig
-    .budget_max_epochs`` field were retired 2026-07-26 (see
-    tests/server/test_config.py::TestRetiredConsolidationKeysRejected's
-    sibling stale-key test for the retired ``max_epochs`` key).
+    governs the derived per-fold epoch count, nothing else caps it.  There is
+    no operator epoch ceiling anywhere in the config surface (see
+    tests/server/test_config.py::TestRejectedConsolidationKeys's
+    stale-key test for the rejected ``max_epochs`` key).
 
     Loads the REAL config path (load_server_config on the tracked fixture)
     rather than hand-building a TrainingConfig, so this proves the tracked
     fixture yaml loads cleanly with no operator ceiling wired anywhere, not
     just paramem.utils.config.budget_for in isolation (see
     tests/test_budget_for.py for the pure-function bucket-boundary tests).
-    budget_for takes ``n_keys`` alone (its ``training_config`` parameter was
-    retired 2026-07-26 once its sole reader, the max_epochs clamp, was
-    removed) -- ``config`` is loaded here only to prove the fixture parses.
+    budget_for takes ``n_keys`` alone -- ``config`` is loaded here only to
+    prove the fixture parses.
     """
 
     FIXTURE = "tests/fixtures/server.yaml"
@@ -266,22 +262,22 @@ class TestBucketTableGovernsUnclamped:
         assert epochs == expected_epochs
 
 
-class TestRetiredConsolidationKeysRejected:
-    """Retired ``consolidation:`` keys fail loud at config load, not silently.
+class TestRejectedConsolidationKeys:
+    """Rejected ``consolidation:`` keys fail loud at config load, not silently.
 
     ``ConsolidationScheduleConfig(**consolidation_raw)`` is a plain dataclass
     constructor call (``paramem.server.config.build_server_config``); an
     unrecognized key under ``consolidation:`` is not silently ignored -- it
     raises ``TypeError`` from the dataclass constructor itself, so a stale
-    operator YAML carrying a retired key fails loud at load time. Covers, in
-    order of retirement: ``budget_derivation_enabled`` / ``donor_seeding_enabled``
-    (derived per-fold training budgets and donor seeding are now the
-    unconditional standard mechanism; validation arms passed, see
-    benchmarking.md), ``max_epochs`` (2026-07-26; the per-fold training
-    budget is unconditional and unclamped via ``paramem.utils.config.budget_for``),
-    and ``min_tier_key_floor`` / ``tier_fast_start`` (2026-07-27; the per-tier
-    key-count floor and fast-start weight-copy graduation were retired along
-    with the whole-fold accumulate guard and the ``accumulating`` terminal).
+    operator YAML carrying a rejected key fails loud at load time. Covers
+    ``budget_derivation_enabled`` / ``donor_seeding_enabled`` (derived
+    per-fold training budgets and donor seeding are the unconditional
+    standard mechanism), ``max_epochs`` (the per-fold training budget is
+    unconditional and unclamped via ``paramem.utils.config.budget_for``),
+    and ``min_tier_key_floor`` / ``tier_fast_start`` (every tier with keys
+    trains its own adapter: there is no per-tier key-count floor, no
+    fast-start weight-copy graduation, and no whole-fold accumulate guard
+    or ``accumulating`` terminal).
     """
 
     def test_stale_budget_derivation_enabled_key_raises(self, tmp_path):
@@ -309,10 +305,10 @@ class TestRetiredConsolidationKeysRejected:
             load_server_config(yaml_file)
 
     def test_stale_max_epochs_key_raises(self, tmp_path):
-        """consolidation.max_epochs was retired 2026-07-26 (the per-fold
+        """consolidation.max_epochs is a rejected key (the per-fold
         training budget is unconditional and unclamped via
         paramem.utils.config.budget_for). A stale operator YAML carrying it
-        fails loud at load time, same as the other retired keys above."""
+        fails loud at load time, same as the other rejected keys above."""
         yaml_file = _write_yaml(
             tmp_path,
             """\
@@ -349,10 +345,10 @@ class TestRetiredConsolidationKeysRejected:
             load_server_config(yaml_file)
 
 
-class TestRetiredIndexedKeyReplayKeyRejected:
-    """``consolidation.indexed_key_replay`` was retired: the memory-key
+class TestRejectedIndexedKeyReplayKey:
+    """``consolidation.indexed_key_replay`` is a rejected key: the memory-key
     lifecycle registry is unconditional, with no disabled state. Unlike the
-    plain-dataclass-strictness retirements above, this key has a dedicated
+    plain-dataclass-strictness rejections above, this key has a dedicated
     named guard in ``load_server_config`` (same convention as the
     ``training_save_strategy_bg`` / ``training_save_steps_bg`` guard
     immediately above it in ``paramem/server/config.py``) that pops the key
@@ -373,8 +369,8 @@ class TestRetiredIndexedKeyReplayKeyRejected:
             load_server_config(yaml_file)
 
 
-class TestRetiredConsolidationRetryCapKeyRejected:
-    """``consolidation.consolidation_retry_cap`` was retired: a resumed
+class TestRejectedConsolidationRetryCapKey:
+    """``consolidation.consolidation_retry_cap`` is a rejected key: a resumed
     consolidation event reads its own stage ledger rather than retrying a
     bounded number of times.  Same dedicated named-guard convention as
     ``indexed_key_replay`` immediately above it in ``paramem/server/config.py``.
@@ -536,11 +532,6 @@ class TestAdaptersFactoryDefaultMerge:
     enabled, the loader refuses to start without an explicit
     ``target_modules`` — silent fallback to the factory default would
     hide architectural choices like procedural's attn+mlp targeting.
-
-    The previous test suite asserted the silent-fallback merge was
-    correct; that behaviour is now explicitly forbidden by
-    ``load_server_config``'s loader guard, so those tests have been
-    converted to verify the guard fires.
     """
 
     def test_procedural_partial_yaml_without_target_modules_refuses(self, tmp_path):
@@ -840,17 +831,18 @@ class TestRestartConfigYamlLoader:
 
 
 class TestTrainingHyperparamsFromYaml:
-    """Regression: assembled training_config carries the Test 17 recipe from yaml.
+    """The assembled training_config carries the extended-training recipe
+    from yaml.
 
     Loads tests/fixtures/server.yaml (the stable fixture per the loader rule) and
-    asserts every Test 17 field survives assembly into the TrainingConfig returned
-    by ServerConfig.training_config.
+    asserts every extended-training field survives assembly into the
+    TrainingConfig returned by ServerConfig.training_config.
 
     ``gradient_accumulation_steps`` and ``lr_decay_steps`` are NOT covered
     here -- ``consolidation.training_gradient_accumulation_steps`` /
-    ``consolidation.training_lr_decay_steps`` were retired 2026-07-26 (dead:
-    the training funnel unconditionally derives and overwrites both per
-    fold; see ``ServerConfig.training_config``'s docstring).
+    ``consolidation.training_lr_decay_steps`` are rejected keys: the
+    training funnel unconditionally derives and overwrites both per
+    fold (see ``ServerConfig.training_config``'s docstring).
     """
 
     def test_fixture_training_config_carries_test17_recipe(self):
@@ -899,9 +891,9 @@ class TestTrainingHyperparamsFromYaml:
         assert tc.gradient_checkpointing is False
 
     def test_stale_training_gradient_accumulation_steps_key_raises(self, tmp_path):
-        """A stale operator yaml still carrying the retired
+        """A stale operator yaml still carrying the rejected
         training_gradient_accumulation_steps key fails loud (dataclass
-        strictness), exactly like the retired feature flags."""
+        strictness), exactly like the other rejected keys."""
         yaml_file = _write_yaml(
             tmp_path,
             """\
@@ -914,9 +906,9 @@ class TestTrainingHyperparamsFromYaml:
             load_server_config(yaml_file)
 
     def test_stale_training_lr_decay_steps_key_raises(self, tmp_path):
-        """A stale operator yaml still carrying the retired
+        """A stale operator yaml still carrying the rejected
         training_lr_decay_steps key fails loud (dataclass strictness),
-        exactly like the retired feature flags."""
+        exactly like the other rejected keys."""
         yaml_file = _write_yaml(
             tmp_path,
             """\
@@ -934,14 +926,14 @@ class TestDefaultServerConfigPathIsCwdIndependent:
     so config resolution does not depend on the process's working directory.
 
     ParaMem deploys from a repo checkout (editable install under systemd) with
-    ``WorkingDirectory`` = repo root today; these tests lock in that the loader
-    no longer *relies* on that cwd, closing the same landmine class as the
-    ``_trial_json_path`` fallback bug.
+    ``WorkingDirectory`` = repo root; these tests lock in that the loader
+    does not rely on that cwd.
     """
 
     def test_default_path_is_absolute_and_repo_anchored(self):
-        # The old ``Path("configs/server.yaml")`` literal was relative; the fix
-        # anchors it to the nearest ``pyproject.toml`` ancestor (the repo root).
+        # DEFAULT_SERVER_CONFIG_PATH is anchored to the nearest
+        # pyproject.toml ancestor (the repo root), never a cwd-relative
+        # literal.
         assert DEFAULT_SERVER_CONFIG_PATH.is_absolute()
         assert DEFAULT_SERVER_CONFIG_PATH.name == "server.yaml"
         assert DEFAULT_SERVER_CONFIG_PATH.parent.name == "configs"
@@ -952,8 +944,8 @@ class TestDefaultServerConfigPathIsCwdIndependent:
         from_root = load_server_config()
         # A loaded config absolutizes ``paths.data`` against the repo root; a
         # bare ``ServerConfig()`` (the "path vanished" branch) leaves it the
-        # relative ``data/ha`` default. Under the old relative default, calling
-        # from a foreign cwd hit that branch — this asserts it no longer does.
+        # relative ``data/ha`` default. Calling from a foreign cwd must not
+        # hit that branch.
         monkeypatch.chdir(tmp_path)
         from_foreign = load_server_config()
         assert from_foreign.paths.data.is_absolute()
@@ -972,9 +964,8 @@ class TestDefaultServerConfigPathIsCwdIndependent:
     def test_default_data_dir_is_absolute_and_root_anchored(self):
         # The data-root accessor used where a loaded ``config.paths.data`` is
         # unavailable (config is None / a test mock), and the base of every
-        # PathsConfig default. It replaced cwd-relative ``Path("data/ha/...")``
-        # literals scattered across the server, so it must be absolute and
-        # anchored on a root — never a bare relative name.
+        # PathsConfig default -- it must be absolute and anchored on a root,
+        # never a bare relative name.
         #
         # The anchor asserted here is NOT the repo root: conftest's
         # ``_isolate_data_root`` repoints the accessor at a tmp tree for every
@@ -990,7 +981,6 @@ class TestDefaultServerConfigPathIsCwdIndependent:
     def test_fixture_telemetry_path_is_absolute(self):
         # paths.telemetry must go through the same relative-path anchoring
         # loop as data/sessions/debug/prompts (config.py's ``for path_field
-        # in (...)`` tuple). A relative path here means the loop was missed —
-        # a regression of the cwd-independence behaviour.
+        # in (...)`` tuple). A relative path here means the loop was missed.
         cfg = load_server_config(Path("tests/fixtures/server.yaml"))
         assert cfg.paths.telemetry.is_absolute()

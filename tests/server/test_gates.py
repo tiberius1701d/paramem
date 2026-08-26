@@ -626,11 +626,9 @@ class TestGate3AdapterReloadQuad:
         must surface as GateResult(status="fail") with a read-failure
         reason — not propagate KeyRegistry.load's ValueError past the gate.
 
-        Regression for the strict-load collapse in _gate_3_reload_smoke:
-        the dead "legacy/flat registries" hand-parse fallback was deleted
-        in favor of KeyRegistry.load being the single reader, so this shape
-        must now fail at the FIRST read (all_keys), not silently produce a
-        key that later dies at the simhash load."""
+        ``KeyRegistry.load`` is the single reader for this shape: it fails
+        at the FIRST read (all_keys), rather than silently producing a key
+        that later dies at the simhash load."""
         d = tmp_path / "trial_adapter_foreign"
         d.mkdir(parents=True, exist_ok=True)
         (d / "adapter_config.json").write_text("{}")
@@ -656,8 +654,6 @@ class TestGate3AdapterReloadQuad:
         assert "failed to read indexed_key_registry.json" in g.reason
         assert "simhash" in g.reason
 
-    # test_default_qa_path_unchanged: removed with QA-format retirement.
-
 
 # ---------------------------------------------------------------------------
 # Gate 4
@@ -665,8 +661,8 @@ class TestGate3AdapterReloadQuad:
 
 
 # ---------------------------------------------------------------------------
-# KeyRegistry.load_simhashes — the shared helper and the schema-mismatch bug
-# it fixes
+# KeyRegistry.load_simhashes — the shared fingerprint-map reader and its
+# schema-mismatch guard
 # ---------------------------------------------------------------------------
 
 
@@ -675,9 +671,8 @@ class TestLoadSimhashRegistry:
     non-KeyRegistry file (e.g. key_metadata.json, accidentally pointed at)
     into a simhash map.
 
-    The reader itself now lives on the class that owns the serialization
-    (``KeyRegistry.load_simhashes``) — gates.py no longer carries its own
-    copy — but the contract these assertions pin is unchanged.
+    The reader lives on the class that owns the serialization
+    (``KeyRegistry.load_simhashes``); gates.py carries no reader of its own.
     """
 
     def test_missing_file_returns_empty(self, tmp_path):
@@ -694,10 +689,9 @@ class TestLoadSimhashRegistry:
     def test_gates_module_has_no_private_copy(self):
         """gates.py must not carry a second fingerprint-file reader.
 
-        The duplicate ``_load_simhash_registry`` leaf was collapsed into
-        ``KeyRegistry.load_simhashes``; re-adding one here would put the
-        file-shape knowledge, the encryption read and the wrong-file guard in
-        two places again.
+        Re-adding one here would put the file-shape knowledge, the
+        encryption read, and the wrong-file guard in two places instead of
+        the one, ``KeyRegistry.load_simhashes``.
         """
         import paramem.server.gates as gates_mod
 
@@ -707,10 +701,10 @@ class TestLoadSimhashRegistry:
 class TestGate3RealConfidenceVerification:
     """Gate 3 must actually verify recall content against the trial adapter's
     own SimHash fingerprint — not just parse JSON. Uses REAL
-    verify_confidence (nothing mocked) to prove the fix is not vacuous, and
-    that the extracted {key: simhash} map (not the raw KeyRegistry dict) is
-    what gets wired in — the "obvious fix" the bug report warns is wrong
-    would score every key 0.0, failing even matching content.
+    verify_confidence (nothing mocked) to prove that the extracted
+    {key: simhash} map (not the raw KeyRegistry dict) is what gets wired
+    in: passing the raw dict would score every key 0.0, failing even
+    matching content.
     """
 
     def _write_trial_registry(self, tmp_path: Path, key: str, fp: int) -> Path:
@@ -1360,8 +1354,8 @@ class TestTrialProbeMountResolvesKindSubdir:
 # ---------------------------------------------------------------------------
 # The trial-tree layout ConsolidationLoop.commit_main_tiers actually writes,
 # read back by the real gate readers (_resolve_adapter_mount_path,
-# KeyRegistry.load_simhashes) — closes the gap left by _make_trial_adapter*
-# hand-building the layout by hand.
+# KeyRegistry.load_simhashes) — rather than a hand-built fixture that mimics
+# the layout by hand.
 # ---------------------------------------------------------------------------
 
 

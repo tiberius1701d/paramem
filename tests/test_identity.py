@@ -19,8 +19,8 @@ Speaker-identity: ONE canonical lowercase form ``speaker{N}`` everywhere.
 :func:`is_speaker_id` accepts both wire casings (``Speaker0`` from legacy
 models, ``speaker0`` from the canonical store) so the ingest safety-net can
 detect and coerce either form.  The coercion OUTPUT is always lowercase.
-``canonical_speaker`` and ``speaker_ref_matches`` were deleted in the
-lowercase-uniform refactor — speaker equality is plain ``==``.
+There is no ``canonical_speaker`` or ``speaker_ref_matches`` helper —
+speaker equality is plain ``==``.
 """
 
 from paramem.utils.identity import (
@@ -256,7 +256,7 @@ class TestIsSpeakerId:
     Membership is decided on the ``canonical`` fold, so EVERY surface form is
     accepted — ``"speaker0"``, ``"Speaker0"``, ``"SPEAKER0"``.  Speaker ids
     carry no case rule of their own.  ``"speaker_0"`` is NOT one: ``_`` is a
-    blank under ``canonical``, so the index no longer follows the prefix
+    blank under ``canonical``, so the index does not follow the prefix
     directly.  This class tests the predicate; :class:`TestAsSpeakerId` covers
     the canonical form it returns.
     """

@@ -39,8 +39,9 @@ def _call_gpu_acquire() -> object:
 def test_acquire_in_defer_mode_reloads_and_switches_voice():
     """defer_model=True + cloud-only: reloads model in-process; voice restore is inside primitive.
 
-    Voice drain/restore is now owned by _live_reload_base_model (the primitive),
-    so /gpu/acquire no longer calls _set_voice_pipeline_profile("gpu") on success.
+    Voice drain/restore is owned by _live_reload_base_model (the primitive);
+    /gpu/acquire itself does not call _set_voice_pipeline_profile("gpu") on
+    success.
     Assert: _live_reload_base_model is called and mode is local after.
     """
     from paramem.server import app as app_module
@@ -580,10 +581,10 @@ def test_apply_config_live_noop_skip_when_hash_unchanged():
     (rollback case — disk restored to A, memory is A), _apply_config_live returns
     applied_live=True, skipped='no_change' without calling _live_reload_base_model.
 
-    The prior implementation used getattr(config_a, "source_path", None) which
-    always falls back to the live path when ServerConfig has no source_path
-    attribute — causing disk_hash == mem_hash on EVERY call.  The corrected
-    implementation compares disk_hash against config_drift["loaded_hash"].
+    The comparison is against ``config_drift["loaded_hash"]``, never a
+    ``getattr(config, "source_path", None)`` fallback — ServerConfig has no
+    ``source_path`` attribute, so that fallback would resolve to the live
+    path on every call and make disk_hash == mem_hash unconditionally.
     """
     from pathlib import Path
 
@@ -593,7 +594,7 @@ def test_apply_config_live_noop_skip_when_hash_unchanged():
 
     config_a = _make_config()
     # Note: do NOT set config_a.source_path — ServerConfig has no such attribute;
-    # the fix must NOT depend on it.
+    # the comparison must NOT depend on it.
 
     state_patch = {
         "mode": "cloud-only",
@@ -659,7 +660,7 @@ def test_apply_config_live_rport_stt_carve_restart_eligible():
         # Bind succeeds (no OSError).
         patch.object(socket, "socket") as mock_sock_cls,
         # return_value=None: simulate a successful reload — applied_live is
-        # now derived from the returned reason (None == success), not a
+        # derived from the returned reason (None == success), not a
         # post-call mode re-read.
         patch.object(app_module, "_live_reload_base_model", return_value=None),
         patch.object(app_module, "_set_voice_pipeline_profile"),
@@ -825,7 +826,7 @@ def test_apply_config_live_cloud_only_reason_comes_from_return_not_state():
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#  Real-hash no-op skip (hasher NOT mocked — validates the source_path fix)
+#  Real-hash no-op skip (hasher NOT mocked)
 # ════════════════════════════════════════════════════════════════════════════
 
 
@@ -837,8 +838,9 @@ def test_apply_config_live_noop_skip_real_hash_rollback():
     takes the no-op skip WITHOUT calling _live_reload_base_model (rollback case:
     disk = A, loaded = A, no real change).
 
-    This validates that the skip does not fire for ANY disk file due to both
-    sides hashing the same live_config_path (the prior source_path bug).
+    This validates that the skip compares against
+    ``config_drift["loaded_hash"]``, never both sides hashing the same
+    live_config_path.
     """
     from paramem.server import app as app_module
     from paramem.server.drift import compute_config_hash
@@ -1060,7 +1062,7 @@ def test_session_delta_sets_rebuild_session_buffer_true():
 
     assert rebuild_buf_log, "_live_reload_base_model must be called"
     assert rebuild_buf_log[0] is True, (
-        "rebuild_session_buffer must be True when retain_sessions changed (S3)"
+        "rebuild_session_buffer must be True when retain_sessions changed"
     )
 
 
@@ -1101,7 +1103,7 @@ def test_no_session_delta_keeps_rebuild_session_buffer_false():
 
     assert rebuild_buf_log, "_live_reload_base_model must be called"
     assert rebuild_buf_log[0] is False, (
-        "rebuild_session_buffer must be False when retain_sessions and debug unchanged (S3)"
+        "rebuild_session_buffer must be False when retain_sessions and debug unchanged"
     )
 
 
@@ -1141,4 +1143,4 @@ def test_debug_delta_sets_rebuild_session_buffer_true():
         app_module._apply_config_live()
 
     assert rebuild_buf_log, "_live_reload_base_model must be called"
-    assert rebuild_buf_log[0] is True, "rebuild_session_buffer must be True when debug changed (S3)"
+    assert rebuild_buf_log[0] is True, "rebuild_session_buffer must be True when debug changed"

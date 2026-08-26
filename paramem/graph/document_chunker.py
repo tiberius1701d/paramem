@@ -86,17 +86,15 @@ class ScannedPdfRejectedError(ValueError):
 # ``{transcript}`` slot), then anonymize on the extracted facts AND the
 # chunk itself (``paramem/graph/stage_anonymize.py`` threads
 # ``ctx.transcript`` — the same chunk text — into
-# ``anonymize(transcript=...)``). ``_DOC_MAX_TOKENS`` is HELD at the
-# operating-point value the shipped extraction quality was measured at,
-# rather than computed at import time from the anonymize-call token
-# envelope: the per-call-shape (SCAN, APPLY) two-shape cap door that
-# originally derived it is retired now that the anonymizer's SCAN step is
-# a span tagger with no envelope of its own — the identity that formula
-# encoded now lives only as a compile-time tripwire (below), not as this
-# constant's own derivation.
+# ``anonymize(transcript=...)``). ``_DOC_MAX_TOKENS`` is a HELD operating-
+# point literal, not a value computed at import time from the
+# anonymize-call token envelope: the anonymizer's SCAN step is a span
+# tagger with no envelope of its own, so nothing at import time can derive
+# this cap from a SCAN/APPLY call shape. Instead, the import-time tripwire
+# below validates the held value against the ANCHOR call — the one
+# envelope-bearing call the anonymize chain still issues.
 #
-# Two paragraphs of design rationale that are NOT part of the retired
-# derivation arithmetic, and must survive any future trim of this comment:
+# Two paragraphs of design rationale:
 #
 # 1. This constant is a compiled-in literal, not read from ``configs/``/yaml
 #    at import time: ``configs/prompts/`` is not packaged
@@ -115,41 +113,19 @@ class ScannedPdfRejectedError(ValueError):
 #    the held word figure below is exact regardless of which ratio produced
 #    it.
 #
-# Retired derivation and its measured inputs (2026-08-24 re-measurement
-# against the shipped sectioned home, configs/prompts/anonymization.txt —
-# see tokens.py's ANCHOR-skeleton comment for the measurement method):
-#   envelope       = paramem.utils.tokens.ANONYMIZE_ENVELOPE_TOKENS = 8192 tok
-#   scan_skeleton  = 555 tok, apply_skeleton = 253 tok (the retired SCAN/
-#                    APPLY prompt-skeleton pair)
-#   scan_reserve   = 616 tok (the retired SCAN output reserve, evaluated at
-#                    its own worst-case candidate-count ceiling)
-#   apply_reserve  = 16 tok (the retired APPLY output reserve)
-#   r_prose        = 1.9126 tokens/word (document shape — the same
-#                    measurement recorded as tokens.py's "document shape
-#                    (CV)" row) — retained below as ``_R_PROSE``, the
-#                    document-shape ratio the import-time tripwire still
-#                    uses
-#   dense_chunk_real_tokens = 1500 words * r_prose (extractor.py's
-#                ~1500-word dense-chunk reference point, COUNTS ONLY — see
-#                paramem/utils/tokens.py's module docstring for the privacy
-#                rule that measurement runs under) ~= 2869 tok
-#   f = 2200 (extractor.py's recorded dense-chunk output) / 2869 ~= 0.767
-#       (``extractor.py``'s ``_DEFAULT_FILTER_MAX_TOKENS`` comment records
-#       "Empirical worst-case observed output for a dense resume chunk was
-#       ~2200 tokens" — local EXTRACTION's raw triples-JSON output, used as
-#       the retired SCAN call's "facts" term proxy)
-# 2070 words -> 7662 estimator tokens (the retired APPLY shape was the
-# binding one: multiplicity 2.0 > SCAN's 1 + f ~= 1.767).
+# ``_R_PROSE`` (1.9126 tokens/word) is the document-shape ratio — the same
+# measurement recorded as tokens.py's "document shape (CV)" row — that the
+# import-time tripwire below uses to validate ``_DOC_MAX_TOKENS`` against
+# the ANCHOR-shape cap.
 _R_PROSE: float = 1.9126
 _DOC_MAX_TOKENS: int = 7662
 
 # Slack tripwire, not a tight bound: the ANCHOR call (the one local
-# generate() left in the anonymizer) is far cheaper than the retired
-# SCAN+APPLY pair, so this assertion passes with room to spare — it is not
-# a re-derivation of the held value above. It fires only if
-# ANONYMIZE_ENVELOPE_TOKENS is lowered, _DOC_MAX_TOKENS is raised, or the
-# ANCHOR prompt is inflated far enough that a cap-sized document chunk
-# could no longer fit the one remaining envelope-bearing call.
+# generate() left in the anonymizer) is cheap, so this assertion passes
+# with room to spare — it is not a re-derivation of the held value above.
+# It fires only if ANONYMIZE_ENVELOPE_TOKENS is lowered, _DOC_MAX_TOKENS is
+# raised, or the ANCHOR prompt is inflated far enough that a cap-sized
+# document chunk no longer fits the one remaining envelope-bearing call.
 assert _DOC_MAX_TOKENS <= anonymize_payload_cap_tokens(
     envelope_tokens=ANONYMIZE_ENVELOPE_TOKENS,
     anchor_skeleton_tokens=ANONYMIZE_ANCHOR_PROMPT_SKELETON_TOKENS,
@@ -161,9 +137,9 @@ assert _DOC_MAX_TOKENS <= anonymize_payload_cap_tokens(
 )
 
 # Context floor, not a budget (unlike _DOC_MAX_TOKENS above, this is not
-# derived from the envelope). Real threshold is unchanged from before this
-# migration (200 words — "enough context for extraction"), re-expressed in
-# the estimator's own unit via words_to_estimator_tokens.
+# derived from the envelope). The threshold is 200 words — "enough context
+# for extraction" — expressed in the estimator's own unit via
+# words_to_estimator_tokens.
 _DOC_MIN_TOKENS: int = words_to_estimator_tokens(200)  # 200 words -> 740
 
 
@@ -194,10 +170,10 @@ def _word_count(text: str) -> int:
     tokenizer — the CLI-safe fallback path (whitespace word count times the
     measured conservative ratio).  No tokenizer load required — this is
     intentionally approximate (the thresholds this feeds are heuristics,
-    not hard limits).  The name is retained (word-count semantics dominate
-    every call site's local variable naming: ``para_count``, ``page_words``)
-    even though the return value is now token-estimated, not a raw word
-    count.  ``_coalesce_to_max_tokens``' own ``s_count`` does NOT go
+    not hard limits).  The name reflects call-site variable naming
+    (``para_count``, ``page_words``) though the return value is a
+    token estimate, not a raw word count.
+    ``_coalesce_to_max_tokens``' own ``s_count`` does NOT go
     through this helper — see the comment there.
 
     Args:
@@ -445,8 +421,7 @@ def _overlap_tokens_to_words(overlap_tokens: int) -> int:
     give (``r_prose / MEASURED_TOKENS_PER_WORD`` ≈ 52% of that), i.e. this
     function is itself conservative about how much text it carries forward
     — consistent with every other conservative bound in this module.  No
-    in-repo caller passes ``overlap_tokens > 0`` today (verified by grep);
-    revisit this trade-off if one starts to.
+    in-repo caller passes ``overlap_tokens > 0``.
 
     Returns 0 for ``overlap_tokens <= 0``; otherwise at least 1 word for
     any positive ``overlap_tokens``.

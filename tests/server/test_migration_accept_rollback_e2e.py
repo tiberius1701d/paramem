@@ -307,8 +307,7 @@ class TestE2EAcceptPath:
     def test_e2e_accept_apply_failure_restart_required(self, tmp_path, monkeypatch):
         """E2E: accept with apply failure stub → restart_required=True, RESTART REQUIRED banner.
 
-        Regression coverage: the old default (restart_required=True always) now
-        only applies when the live apply fails.
+        restart_required=True applies only when the live apply fails.
         """
         fresh = _make_state(tmp_path)
         monkeypatch.setattr(app_module, "_state", fresh)
@@ -474,7 +473,7 @@ class TestE2EAcceptPath:
         )
 
     def test_e2e_accept_carve_restores_prior_mode_not_stuck_cloud_only(self, tmp_path, monkeypatch):
-        """E2E regression: an accept whose apply does NOT reload (R-PORT carve)
+        """E2E: an accept whose apply does NOT reload (R-PORT carve)
         restores the pre-guard mode instead of leaving the server stuck cloud-only.
 
         The accept handler sets mode=cloud-only as a maintenance guard, but only a
@@ -597,13 +596,12 @@ class TestE2ERollbackPath:
         assert read_trial_marker(state_dir) is None
 
     def test_e2e_rollback_restores_prior_mode_not_stuck_cloud_only(self, tmp_path, monkeypatch):
-        """E2E regression: rollback's no-op-skip apply restores the pre-guard mode
-        instead of leaving the server stuck cloud-only.
+        """E2E: rollback's no-op-skip apply restores the pre-guard mode instead
+        of leaving the server stuck cloud-only.
 
-        Rollback sets mode=cloud-only as a maintenance guard; the no-op skip (the
-        normal rollback path — disk==memory==A) returns without resetting it, and
-        step 8 did not restore it. Without the fix, every rollback degrades the
-        live server to cloud-only.
+        Rollback sets mode=cloud-only as a maintenance guard; the restore must
+        run even on the no-op-skip path (the normal rollback path —
+        disk==memory==A), which otherwise returns without resetting it.
         """
         fresh = _make_state(tmp_path)
         assert fresh["mode"] == "normal"

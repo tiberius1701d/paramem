@@ -1253,7 +1253,7 @@ def _drive_systemd_boot_from_temp_root(*, keep: bool = False) -> bool:
     MUST RUN CUDA-FREE (load-bearing). This function and its process must NEVER
     initialise CUDA (no ``torch.cuda`` calls, no model load). On this 8 GiB GPU the
     service boot needs ~6.5 of ~7 usable GiB, so a competing CUDA context in THIS
-    process tips the service boot into cloud-only (observed 2026-05-22). Because we
+    process tips the service boot into cloud-only. Because we
     hold no CUDA context, ``systemctl restart`` stops the canonical service —
     freeing its entire GPU — then starts it on the temp config, which boots into a
     fully free GPU and reaches local. There is therefore no in-process model to
@@ -1340,7 +1340,7 @@ def _run_phase_b_only() -> bool:
 
     This process must NEVER initialise CUDA (no model load, no ``torch.cuda``): on
     this 8 GiB GPU the service boot needs ~6.5 of ~7 usable GiB, so a competing
-    CUDA context here tips the boot into cloud-only (observed 2026-05-22). With no
+    CUDA context here tips the boot into cloud-only. With no
     context held, ``systemctl restart`` is a clean GPU handoff — it stops the
     canonical service (freeing its GPU) and starts the temp config into a free GPU,
     which reaches local. The live (canonical) server should be running at start;
@@ -1394,8 +1394,8 @@ def _wyoming_describe_ok(host: str, port: int, timeout_s: float = 10.0) -> bool:
 
     Uses the real ``wyoming`` client (already a dependency) — the same handshake
     Home Assistant performs on connect — so this proves a Wyoming listener is bound
-    AND speaking the protocol on ``port``. Validated against the live server before
-    landing this phase. Returns False on refusal, timeout or any protocol error.
+    AND speaking the protocol on ``port``. Returns False on refusal, timeout or any
+    protocol error.
     """
     from wyoming.client import AsyncTcpClient
     from wyoming.info import Describe, Info

@@ -167,32 +167,32 @@ def test_tts_manager_available_languages():
 
 
 def test_language_instruction_english():
-    from paramem.server.inference import _language_instruction
+    from paramem.server.prompts import language_instruction
 
-    assert _language_instruction("en") == ""
-    assert _language_instruction(None) == ""
+    assert language_instruction("en") == ""
+    assert language_instruction(None) == ""
 
 
 def test_language_instruction_non_english():
-    from paramem.server.inference import _language_instruction
+    from paramem.server.prompts import language_instruction
 
-    assert _language_instruction("de") == "Respond in German."
-    assert _language_instruction("tl") == "Respond in Tagalog."
-    assert _language_instruction("fr") == "Respond in French."
-    assert _language_instruction("es") == "Respond in Spanish."
+    assert language_instruction("de") == "Respond in German."
+    assert language_instruction("tl") == "Respond in Tagalog."
+    assert language_instruction("fr") == "Respond in French."
+    assert language_instruction("es") == "Respond in Spanish."
 
 
 def test_language_instruction_from_config():
     """Language names are derived from TTS voice config when available."""
     from paramem.server.config import ServerConfig
-    from paramem.server.inference import _language_instruction
+    from paramem.server.prompts import language_instruction
 
     config = ServerConfig()
     config.tts.voices["de"] = TTSVoiceConfig(engine="piper", model="test", language_name="Deutsch")
     # Config overrides ISO standard name
-    assert _language_instruction("de", config) == "Respond in Deutsch."
+    assert language_instruction("de", config) == "Respond in Deutsch."
     # Unconfigured language falls back to ISO
-    assert _language_instruction("fr", config) == "Respond in French."
+    assert language_instruction("fr", config) == "Respond in French."
 
 
 def test_tts_config_language_name_method():
@@ -305,10 +305,9 @@ class TestBuildSystemPrompt:
         assert "You are an assistant." in result
 
     def test_speaker_id_gates_prefix_even_with_no_display_name(self):
-        """Re-spec (B-form prefix from speaker_id presence): the display
-        name is gone as a parameter entirely — an anonymous/undisclosed
-        speaker's raw speaker_id still produces the identity line.  Only
-        ``speaker_id is None`` suppresses it now."""
+        """``_build_system_prompt`` takes no display-name parameter — an
+        anonymous/undisclosed speaker's raw speaker_id still produces the
+        identity line.  Only ``speaker_id is None`` suppresses it."""
         from paramem.graph.prompts import prompt_overrides
         from paramem.server.config import ServerConfig
         from paramem.server.inference import _build_system_prompt
@@ -1140,83 +1139,6 @@ def test_ha_supported_languages_default_empty():
     assert config.supported_languages == []
 
 
-# --- Integration test: language escalation paths ---
-
-
-def test_escalation_language_filtering_integration():
-    """Integration: unsupported language falls through HA to cloud.
-
-    Simulates the full escalation chain:
-    1. Detected language = Tagalog (tl)
-    2. HA supported_languages = [en, de, fr, es] — tl not supported
-    3. ha_client.conversation_process receives language=None (filtered)
-    4. HA responds (in its default language) — OR fails
-    5. Cloud fallback receives language="tl" (always passed)
-
-    This verifies language filtering at the HA boundary while preserving
-    language for cloud.
-    """
-    from paramem.server.config import ServerConfig
-    from paramem.server.inference import _escalate_to_ha_agent
-
-    config = ServerConfig()
-    config.tools.ha.supported_languages = ["en", "de", "fr", "es"]
-
-    # Mock HA client — capture what language it receives
-    mock_ha = MagicMock()
-    captured_kwargs = {}
-
-    def capture_call(text, agent_id=None, language=None, supported_languages=None):
-        captured_kwargs["language"] = language
-        captured_kwargs["supported_languages"] = supported_languages
-        return "HA response"
-
-    mock_ha.conversation_process = capture_call
-
-    # Escalate with Tagalog — HA should receive language=None (filtered)
-    result = _escalate_to_ha_agent(
-        text="Kumusta ang panahon?",
-        ha_client=mock_ha,
-        config=config,
-        language="tl",
-    )
-
-    # HA was called, and language was passed through to ha_client
-    # (ha_client itself filters based on supported_languages)
-    assert captured_kwargs["language"] == "tl"
-    assert captured_kwargs["supported_languages"] == ["en", "de", "fr", "es"]
-    assert result is not None
-    assert result.text == "HA response"
-
-
-def test_escalation_supported_language_preserved():
-    """Integration: supported language is preserved through HA call."""
-    from paramem.server.config import ServerConfig
-    from paramem.server.inference import _escalate_to_ha_agent
-
-    config = ServerConfig()
-    config.tools.ha.supported_languages = ["en", "de", "fr", "es"]
-
-    mock_ha = MagicMock()
-    captured = {}
-
-    def capture_call(text, agent_id=None, language=None, supported_languages=None):
-        captured["language"] = language
-        return "What's the weather?"
-
-    mock_ha.conversation_process = capture_call
-
-    result = _escalate_to_ha_agent(
-        text="What's the weather?",
-        ha_client=mock_ha,
-        config=config,
-        language="en",
-    )
-
-    assert captured["language"] == "en"
-    assert result.text == "What's the weather?"
-
-
 # --- TTSHandler streaming completion (regression: SynthesizeStopped timing) ---
 #
 # HA's streaming voice pipeline drives the TTS connection as
@@ -1385,7 +1307,7 @@ def test_oneshot_synthesize_closes_without_stopped():
 
 
 class TestCloudCarriesNoIdentity:
-    """Cloud never learns the speaker's id or name (NEW contract, 2026-08-02):
+    """Cloud never learns the speaker's id or name:
     ``_escalate_to_cloud`` — the sole cloud transport primitive — takes no
     speaker parameter at all and never calls ``_build_speaker_prefix``.  This
     replaces the OLD invariant tested here previously ("display names to
@@ -1399,7 +1321,7 @@ class TestCloudCarriesNoIdentity:
         """_escalate_to_cloud's signature carries no speaker/speaker_id param."""
         import inspect
 
-        from paramem.server.inference import _escalate_to_cloud
+        from paramem.server.egress import _escalate_to_cloud
 
         params = inspect.signature(_escalate_to_cloud).parameters
         assert "speaker" not in params
@@ -1409,7 +1331,7 @@ class TestCloudCarriesNoIdentity:
         """The prompt sent to the cloud agent carries no "You are speaking
         with" line and no speaker{N} token — cloud gets the bare
         cloud_serving_system_prompt()."""
-        from paramem.server.inference import _escalate_to_cloud
+        from paramem.server.egress import _escalate_to_cloud
         from paramem.server.prompts import cloud_serving_system_prompt
 
         cloud_agent = MagicMock()
@@ -1421,3 +1343,54 @@ class TestCloudCarriesNoIdentity:
         assert sent_prompt == cloud_serving_system_prompt()
         assert "You are speaking with" not in sent_prompt
         assert "speaker" not in sent_prompt.lower()
+
+
+class TestHaDoorThreading:
+    """``answer_via_ha`` threads the turn's resolved language and the
+    configured HA supported-languages list straight through to
+    ``ha_client.conversation_process`` — the HA conversation API's own
+    language-negotiation parameters, untouched by the scrub step above
+    them."""
+
+    def _outbound(self, *, language):
+        from paramem.server.config import ServerConfig
+        from paramem.server.egress import OutboundText
+
+        config = ServerConfig()
+        config.ha_agent_id = "conversation.test_agent"
+        # Operator opt-out: the anonymize chain short-circuits to
+        # "opted_out" without a span tagger call, so this test needs no
+        # tagger stub to exercise the door end-to-end.
+        config.sanitization.scrub_categories = ()
+        config.tools.ha.supported_languages = ["en", "de"]
+        return OutboundText(
+            "Turn on the lights",
+            config,
+            diagnostics={},
+            language=language,
+        )
+
+    def test_ha_door_threads_language(self) -> None:
+        from paramem.server.egress import answer_via_ha
+
+        ha_client = MagicMock()
+        ha_client.conversation_process.return_value = "the lights are on"
+
+        result = answer_via_ha(self._outbound(language="de"), ha_client)
+
+        assert result is not None
+        assert ha_client.conversation_process.call_args.kwargs["language"] == "de"
+
+    def test_ha_door_threads_supported_languages(self) -> None:
+        from paramem.server.egress import answer_via_ha
+
+        ha_client = MagicMock()
+        ha_client.conversation_process.return_value = "the lights are on"
+
+        result = answer_via_ha(self._outbound(language="de"), ha_client)
+
+        assert result is not None
+        assert ha_client.conversation_process.call_args.kwargs["supported_languages"] == [
+            "en",
+            "de",
+        ]

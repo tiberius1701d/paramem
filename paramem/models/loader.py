@@ -102,10 +102,9 @@ def generate_adapter_off(
     THE one adapter-off raw-generate implementation shared by every local
     structured-output call that is not a full conversational reply
     (:func:`paramem.server.intent._classify_via_llm` and
-    :func:`paramem.server.temporal_selection.select_date_groups`) — a
-    second raw copy of this block previously lived only in
-    ``_classify_via_llm``; lives here, alongside :func:`base_model_inference`
-    (the primitive it runs inside), rather than mirrored a third time.
+    :func:`paramem.server.temporal_selection.select_date_groups`) — it
+    lives here, alongside :func:`base_model_inference` (the primitive it
+    runs inside), rather than mirrored per caller.
     :func:`paramem.server.inference._generate_local_reply` is a separate,
     larger reply-shaping pipeline (system prompt assembly, cap-hit
     detection) and is not folded in.
@@ -113,7 +112,7 @@ def generate_adapter_off(
     Two-step tokenization (chat template → string → tensors) mirrors the
     production inference path: feeding ``apply_chat_template``'s tensor
     output straight into ``generate()`` crashes on transformers >= 5
-    because that call now returns a ``BatchEncoding`` (no ``.shape``
+    because that call returns a ``BatchEncoding`` (no ``.shape``
     attribute), so the template is rendered to a string first and
     tokenized as its own step.
 
@@ -167,9 +166,9 @@ class _BackupScope:
     """Handle yielded by :func:`tier_backup_scope`.
 
     The base model's object identity is fixed at load time — ``create_adapter``
-    always mutates in place and never returns a new object — so this scope no
-    longer tracks a possibly-reassigned model reference; the caller's own
-    ``model`` stays valid for the whole scope without resyncing.
+    always mutates in place and never returns a new object — so this scope
+    does not track the model reference; the caller's own ``model`` stays
+    valid for the whole scope without resyncing.
 
     ``vram`` carries the ``free_before``/``free_after``/``delta``/``total``
     mapping :func:`~paramem.utils.vram_guard.vram_measure` captured around
@@ -1023,9 +1022,8 @@ def atomic_save_adapter(
     ``None``), and promotes the slot — every caller of this function
     therefore inherits the payload digest for free.
 
-    Old ``.tmp.{pid}`` and ``.old`` paths are gone — all staging happens
-    inside ``.pending/`` which :func:`paramem.backup.backup.sweep_orphan_pending`
-    cleans on startup.
+    All staging happens inside ``.pending/`` which
+    :func:`paramem.backup.backup.sweep_orphan_pending` cleans on startup.
 
     Args:
         model: PeftModel whose adapter weights are saved.

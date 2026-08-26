@@ -308,10 +308,9 @@ class TestHasActiveTokens:
 
 
 class TestCountActive:
-    """count_active() returns only non-revoked token count (startup posture fix).
-
-    Regression: the startup log previously used ``len(store.list())`` which
-    counted revoked entries, inflating the "N active per-user token(s)" message.
+    """count_active() returns only the non-revoked token count, so the
+    startup log's "N active per-user token(s)" message never counts
+    revoked entries.
     """
 
     def test_zero_when_empty(self, tmp_path, monkeypatch, store_path):
@@ -768,10 +767,10 @@ class TestMintSpeakerIdValidation:
 
 
 class TestTokenStoreMigrationV1ToV2:
-    """v1 store raises ValueError (migration retired); v2 store loads normally."""
+    """v1 store raises ValueError (no v1->v2 auto-migration); v2 store loads normally."""
 
     def test_v1_store_raises(self, tmp_path):
-        """A v1 store raises ValueError — migration rung has been removed."""
+        """A v1 store raises ValueError — there is no v1->v2 migration path."""
         import json
 
         store_path = tmp_path / "tokens.json"

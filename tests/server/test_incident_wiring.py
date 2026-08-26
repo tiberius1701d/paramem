@@ -15,7 +15,7 @@ Covers:
 - consolidation_retry_exhausted is NOT resolved by this module's
   incident-wiring success paths (_finalize_interim's clean-success guard
   owns that conditional resolve)
-- resolve_incident idempotency fix: already-resolved returns False
+- resolve_incident idempotency: already-resolved returns False
 - Ack endpoint: acknowledged incident omitted from attention items
 - _run_stage_b_cycle's crash envelope: a raised exception's own structured
   fields (BookkeepingInvariantViolation's divergent_keys,
@@ -25,6 +25,7 @@ Covers:
 
 from __future__ import annotations
 
+import ast
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -41,6 +42,7 @@ from paramem.server.incidents import (
     resolve_incidents_by_type,
 )
 from paramem.server.run_status import read_last_runs, record_last_run
+from tests._guard_utils import enclosing_function_name, find_function, tracked_python_files
 
 # ---------------------------------------------------------------------------
 # Helpers shared with test_attention_status_e2e
@@ -616,16 +618,16 @@ class TestAutoResolve:
 
 
 # ---------------------------------------------------------------------------
-# resolve_incident idempotency fix: already-resolved returns False
+# resolve_incident idempotency: already-resolved returns False
 # ---------------------------------------------------------------------------
 
 
-class TestResolveIncidentIdempotencyFix:
+class TestResolveIncidentIdempotency:
     def test_resolve_already_resolved_returns_false(self, tmp_path):
         """resolve_incident on an already-resolved incident returns False (actual-transition gate).
 
         Gates the True return on row['status'] != 'resolved'.
-        A wired caller can now trust the boolean.
+        A wired caller can trust the boolean.
         """
         state_dir = tmp_path / "state"
         _record(state_dir)
@@ -718,6 +720,219 @@ class TestIntentClassifierUnavailableIncident:
         assert read_incidents(tmp_path / "state")[0].status == "resolved"
 
 
+#: Incident-lifecycle call names this scan follows the ``type`` argument of —
+#: matched both as a bare ``Name`` (``record_incident(...)``) and as an
+#: ``ast.Attribute`` ending in one of these names (``incidents.record_incident(...)``).
+_INCIDENT_CALL_NAMES = frozenset(
+    {"record_incident", "resolve_incident", "resolve_incidents_by_type"}
+)
+
+#: Record sites whose ``type`` argument is a run-time variable rather than a
+#: literal, a module-level constant, or a for-target over a module-level
+#: tuple — keyed ``"<repo-relative path>::<innermost enclosing function
+#: name>"``. The scan cannot see the type at these two sites, so they are
+#: named here instead; their recorded types are asserted to have a clear
+#: site exactly like every literal one. Applies to record sites only: an
+#: unresolvable resolve-side ``type`` argument is always an error, since a
+#: clear site that cannot be proven to name a type could silently fail to
+#: clear the very thing it claims to.
+#:
+#: ``_worker`` (nested inside ``_run_stage_b_cycle``, ``paramem/server/app.py``)
+#: receives its type as the ``kind`` parameter, threaded in from three call
+#: sites (``"training_crash"``, ``"consolidation_crash"``, ``"migration_error"``).
+#: ``_run_interim_training`` (nested inside ``_extract_and_start_training``,
+#: same module) receives its type as the first element of
+#: ``_overflow_incident_for``'s ``(type, severity)`` return — either
+#: ``"interim_overflow_pending"`` or ``"interim_cap_reached"``.
+RECORDED_THROUGH_A_VARIABLE: dict[str, frozenset[str]] = {
+    "paramem/server/app.py::_worker": frozenset(
+        {"training_crash", "consolidation_crash", "migration_error"}
+    ),
+    "paramem/server/app.py::_run_interim_training": frozenset(
+        {"interim_overflow_pending", "interim_cap_reached"}
+    ),
+}
+
+
+def _module_level_bindings(tree: ast.Module) -> "tuple[dict[str, str], dict[str, tuple[str, ...]]]":
+    """Return ``(str_constants, tuple_constants)`` bound at *tree*'s module scope.
+
+    ``str_constants`` maps a name to the string literal a module-level
+    ``NAME = "..."`` (``Assign``) or ``NAME: <ann> = "..."`` (``AnnAssign``)
+    binds it to. ``tuple_constants`` maps a name to the tuple of string
+    literals a module-level tuple-of-string-constants binds it to (covers
+    ``NAME: tuple[str, ...] = (...)`` incident-type registries).
+    """
+    str_constants: dict[str, str] = {}
+    tuple_constants: dict[str, tuple[str, ...]] = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target, value = node.targets[0], node.value
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            target, value = node.target, node.value
+        else:
+            continue
+        if not isinstance(target, ast.Name):
+            continue
+        if isinstance(value, ast.Constant) and isinstance(value.value, str):
+            str_constants[target.id] = value.value
+        elif (
+            isinstance(value, ast.Tuple)
+            and value.elts
+            and all(
+                isinstance(elt, ast.Constant) and isinstance(elt.value, str) for elt in value.elts
+            )
+        ):
+            tuple_constants[target.id] = tuple(elt.value for elt in value.elts)
+    return str_constants, tuple_constants
+
+
+def _incident_callee_name(func: ast.expr) -> "str | None":
+    """Return the incident-lifecycle call name *func* denotes, or ``None``.
+
+    Matches both a bare ``Name`` (``record_incident(...)``) and an
+    ``ast.Attribute`` whose final component is one of the incident call
+    names (``incidents.record_incident(...)``) — an attribute-qualified
+    call must resolve or become an offender the same as a bare one, never
+    vanish from the scan because of how the callable was imported.
+    """
+    if isinstance(func, ast.Name):
+        name = func.id
+    elif isinstance(func, ast.Attribute):
+        name = func.attr
+    else:
+        return None
+    return name if name in _INCIDENT_CALL_NAMES else None
+
+
+def _iter_incident_calls(node: ast.AST, ancestors: list):
+    """Yield ``(call, ancestors)`` for every incident-lifecycle call under *node*.
+
+    Recurses explicitly (rather than ``ast.walk``, which discards parent
+    links) so a call site's enclosing ``for`` loops and function scope are
+    recoverable at the point it is found — *ancestors* is the chain of AST
+    nodes from the module root down to and including the yielded call's
+    immediate parent.
+    """
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, ast.Call) and _incident_callee_name(child.func) is not None:
+            yield child, ancestors + [node]
+        yield from _iter_incident_calls(child, ancestors + [node])
+
+
+def _resolve_type_arg(
+    call: ast.Call,
+    callee: str,
+    ancestors: list,
+    str_constants: dict,
+    tuple_constants: dict,
+) -> "set[str] | None":
+    """Resolve *call*'s ``type`` argument to the set of type strings it denotes.
+
+    ``record_incident``'s ``type`` is keyword-only, so only a ``type=``
+    keyword is read for it. ``resolve_incident``/``resolve_incidents_by_type``
+    take it positional-or-keyword as their second parameter — the second
+    positional argument wins when present, falling back to a ``type=``
+    keyword for a caller that named it explicitly. No ``type`` argument
+    found at all resolves to ``None``, same as any other unresolvable shape.
+
+    Three resolvable shapes: a string constant; a ``Name`` bound at module
+    level to a string constant; or a ``Name`` bound as the target of the
+    nearest enclosing ``for`` loop whose iterable is a module-level tuple of
+    string constants (every element counts — the loop body cannot
+    statically narrow which one runs). Anything else — an f-string, an
+    attribute, a function-parameter Name, a Name assigned from a call
+    result — resolves to ``None``, unresolved.
+    """
+    if callee == "record_incident":
+        expr = next((kw.value for kw in call.keywords if kw.arg == "type"), None)
+    elif len(call.args) >= 2:
+        expr = call.args[1]
+    else:
+        expr = next((kw.value for kw in call.keywords if kw.arg == "type"), None)
+
+    if isinstance(expr, ast.Constant) and isinstance(expr.value, str):
+        return {expr.value}
+    if isinstance(expr, ast.Name):
+        for anc in reversed(ancestors):
+            if (
+                isinstance(anc, ast.For)
+                and isinstance(anc.target, ast.Name)
+                and anc.target.id == expr.id
+            ):
+                if isinstance(anc.iter, ast.Name) and anc.iter.id in tuple_constants:
+                    return set(tuple_constants[anc.iter.id])
+                return None
+        if expr.id in str_constants:
+            return {str_constants[expr.id]}
+    return None
+
+
+def _scan_sources(
+    sources: "list[tuple[str, str]]",
+) -> "tuple[set[str], set[str], list[tuple[str, int, str]]]":
+    """Run the incident-lifecycle type scan over in-memory ``(path, source)`` pairs.
+
+    The tree-walking half of :func:`_scan_incident_types`, split out so a
+    self-test can exercise the resolver and the offender classification
+    against small synthetic snippets without needing a git-tracked file on
+    disk. Returns ``(recorded, cleared, offenders)`` — see
+    :func:`_scan_incident_types` for what each holds.
+    """
+    recorded: set = set()
+    cleared: set = set()
+    offenders: list = []
+
+    for rel, text in sources:
+        tree = ast.parse(text)
+        lines = text.splitlines()
+        str_constants, tuple_constants = _module_level_bindings(tree)
+
+        for call, ancestors in _iter_incident_calls(tree, []):
+            callee = _incident_callee_name(call.func)
+            resolved = _resolve_type_arg(call, callee, ancestors, str_constants, tuple_constants)
+            if resolved is not None:
+                (recorded if callee == "record_incident" else cleared).update(resolved)
+                continue
+
+            fn_name = enclosing_function_name(tree, call.lineno)
+            allow_key = f"{rel}::{fn_name}" if fn_name else None
+            if (
+                callee == "record_incident"
+                and allow_key is not None
+                and allow_key in RECORDED_THROUGH_A_VARIABLE
+            ):
+                recorded.update(RECORDED_THROUGH_A_VARIABLE[allow_key])
+                continue
+
+            line = lines[call.lineno - 1] if 0 < call.lineno <= len(lines) else ""
+            offenders.append((rel, call.lineno, line.strip()))
+
+    return recorded, cleared, offenders
+
+
+def _scan_incident_types(
+    repo_root: Path,
+) -> "tuple[set[str], set[str], list[tuple[str, int, str]]]":
+    """Walk every tracked ``paramem/`` source file for the incident-lifecycle calls.
+
+    Returns ``(recorded, cleared, offenders)``: the set of incident type
+    strings ever passed to ``record_incident``, the set ever passed to
+    ``resolve_incident``/``resolve_incidents_by_type``, and
+    ``(path, line, source)`` triples for a call whose ``type`` argument
+    could not be resolved and — for a record site — is not covered by
+    :data:`RECORDED_THROUGH_A_VARIABLE`. A tracked file that fails to
+    decode or parse is a repo defect and is left to raise rather than
+    silently scanning fewer files than the guard claims to.
+    """
+    sources = [
+        (py_file.relative_to(repo_root).as_posix(), py_file.read_text())
+        for py_file in tracked_python_files(repo_root)
+        if py_file.relative_to(repo_root).as_posix().startswith("paramem/")
+    ]
+    return _scan_sources(sources)
+
+
 class TestEveryRecordedTypeHasAClearSite:
     """Every incident type recorded anywhere must also be resolved somewhere.
 
@@ -726,46 +941,130 @@ class TestEveryRecordedTypeHasAClearSite:
     caller that has to honour it.  Nothing in the module can enforce that, so
     this scan does: a type recorded with no clear site anywhere leaves a warning
     riding on ``GET /status`` forever, however healthy the system becomes.
+
+    Walks the AST of every tracked ``paramem/`` file — see
+    :func:`_scan_incident_types`.
     """
 
-    #: Types recorded through the crash-envelope helpers, which pass the type
-    #: as a ``kind=``/``_inc_type`` variable rather than a literal.  Grep cannot
-    #: see them at the record site, so they are named here; their clear sites
-    #: are asserted exactly like the literal ones.
-    INDIRECTLY_RECORDED = frozenset(
-        {
-            "training_crash",
-            "consolidation_crash",
-            "migration_error",
-            "interim_cap_reached",
-            "interim_overflow_pending",
-        }
-    )
-
-    @staticmethod
-    def _sources() -> str:
-        import pathlib
-
-        root = pathlib.Path(__file__).resolve().parents[2] / "paramem"
-        return "\n".join(p.read_text() for p in sorted(root.rglob("*.py")))
-
     def test_no_type_is_recorded_without_a_clear_site(self):
-        import re
+        """Every ``record_incident`` type resolves to a ``resolve_incident``/
+        ``resolve_incidents_by_type`` type somewhere in ``paramem/``."""
+        repo_root = Path(__file__).resolve().parents[2]
+        recorded, cleared, offenders = _scan_incident_types(repo_root)
 
-        sources = self._sources()
-        recorded = set(re.findall(r'record_incident\(\s*[^)]*?type="([a-z_]+)"', sources))
-        recorded |= self.INDIRECTLY_RECORDED
-        assert recorded, "scan found no record_incident call sites — the pattern has drifted"
+        assert not offenders, (
+            "incident-lifecycle call site(s) with an unresolvable type argument "
+            "(not a literal, a module-level constant, or a for-target over a "
+            "module-level tuple) and not covered by RECORDED_THROUGH_A_VARIABLE:\n"
+            + "\n".join(f"  {path}:{line} — {src}" for path, line, src in offenders)
+        )
 
-        cleared = set(re.findall(r'resolve_incidents_by_type\(\s*[^,]+,\s*"([a-z_]+)"', sources))
-        cleared |= set(re.findall(r'resolve_incident\(\s*[^,]+,\s*"([a-z_]+)"', sources))
-        cleared |= set(re.findall(r'resolve_incident\(\s*\n\s*[^,]+,\s*\n\s*"([a-z_]+)"', sources))
+        assert recorded, "scan found no record_incident call sites — the walk has drifted"
 
         missing = sorted(recorded - cleared)
         assert not missing, (
             "these incident types are recorded but never resolved, so they stay on "
             f"GET /status forever: {missing}"
         )
+
+
+class TestAllowlistEntriesAreLiveHits:
+    """Every ``RECORDED_THROUGH_A_VARIABLE`` entry must correspond to an
+    ACTUAL unresolvable ``record_incident`` type argument inside its named
+    function in the current tree — the function merely existing is not
+    enough: if the call site were rewritten to pass a literal type (or the
+    function were renamed or removed), the entry would silently stop
+    covering anything, and the types it names would drop out of the
+    recorded set entirely instead of failing loud for lacking a clear site.
+    """
+
+    def test_allowlist_entries_are_live_hits(self):
+        repo_root = Path(__file__).resolve().parents[2]
+        for label in RECORDED_THROUGH_A_VARIABLE:
+            rel, fn_name = label.split("::", 1)
+            tree = ast.parse((repo_root / rel).read_text())
+            assert find_function(tree, fn_name) is not None, (
+                f"RECORDED_THROUGH_A_VARIABLE names {label!r} but no such function "
+                "exists in that file — remove the stale entry."
+            )
+            str_constants, tuple_constants = _module_level_bindings(tree)
+            hits = [
+                call.lineno
+                for call, ancestors in _iter_incident_calls(tree, [])
+                if _incident_callee_name(call.func) == "record_incident"
+                and enclosing_function_name(tree, call.lineno) == fn_name
+                and _resolve_type_arg(
+                    call, "record_incident", ancestors, str_constants, tuple_constants
+                )
+                is None
+            ]
+            assert hits, (
+                f"RECORDED_THROUGH_A_VARIABLE names {label!r} but no unresolvable "
+                "record_incident type argument was found inside that function — "
+                "remove the stale entry, or its type is now a literal/constant and "
+                "no longer needs the exemption."
+            )
+
+
+class TestScanSelfTest:
+    """Self-test the scan against inline synthetic sources — proof the
+    resolver and the offender classification behave as designed, independent
+    of whatever the current tree happens to contain."""
+
+    def test_literal_type_with_no_clear_site_is_reported_missing(self):
+        recorded, cleared, offenders = _scan_sources(
+            [("mod.py", 'record_incident(sd, type="lonely_type", key="k")\n')]
+        )
+        assert offenders == []
+        assert recorded - cleared == {"lonely_type"}
+
+    def test_module_constant_type_resolves(self):
+        source = (
+            '_MY_TYPE = "my_type"\n'
+            'record_incident(sd, type=_MY_TYPE, key="k")\n'
+            'resolve_incident(sd, _MY_TYPE, "k")\n'
+        )
+        recorded, cleared, offenders = _scan_sources([("mod.py", source)])
+        assert offenders == []
+        assert recorded == {"my_type"}
+        assert cleared == {"my_type"}
+
+    def test_for_target_over_module_tuple_resolves(self):
+        source = (
+            '_TYPES = ("a_type", "b_type")\n'
+            "def clear_all():\n"
+            "    for _t in _TYPES:\n"
+            "        resolve_incidents_by_type(sd, _t)\n"
+        )
+        recorded, cleared, offenders = _scan_sources([("mod.py", source)])
+        assert offenders == []
+        assert recorded == set()
+        assert cleared == {"a_type", "b_type"}
+
+    def test_unresolvable_record_side_type_in_non_allowlisted_function_is_an_offender(self):
+        source = 'def some_function(kind):\n    record_incident(sd, type=kind, key="k")\n'
+        recorded, cleared, offenders = _scan_sources([("mod.py", source)])
+        assert recorded == set()
+        assert cleared == set()
+        assert len(offenders) == 1
+        assert offenders[0][0] == "mod.py"
+
+    def test_unresolvable_resolve_side_type_is_an_offender(self):
+        source = 'def some_function(kind):\n    resolve_incident(sd, kind, "k")\n'
+        recorded, cleared, offenders = _scan_sources([("mod.py", source)])
+        assert recorded == set()
+        assert cleared == set()
+        assert len(offenders) == 1
+
+    def test_attribute_form_call_is_seen(self):
+        """``incidents.record_incident(...)`` must resolve or become an
+        offender — never vanish silently because the callee is an
+        ``ast.Attribute`` rather than a bare ``Name``."""
+        recorded, cleared, offenders = _scan_sources(
+            [("mod.py", 'incidents.record_incident(sd, type="attr_type", key="k")\n')]
+        )
+        assert offenders == []
+        assert recorded == {"attr_type"}
 
 
 class TestSameTypeDifferentKeysStaySeparate:
@@ -1251,3 +1550,78 @@ class TestCalibrationCrashOutcome:
         _consolidation_run_done(ConsolidationAction.INTERIM, None, _FakeFuture())
 
         assert state["calibration_run"] is None
+
+
+class TestCalibrationCrashResolvedOnCleanRun:
+    """A non-staging action that completes WITHOUT an exception resolves the
+    ``calibration_crash`` incident recorded for the run's OWN route — the
+    same per-route key the crash branch above records under.  An incident
+    recorded for a DIFFERENT route is left untouched."""
+
+    def _spec(self, *, run_id: str, route_path: str):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(run_id=run_id, route_path=route_path)
+
+    def test_clean_completion_resolves_the_incident_for_its_own_route(self, state, monkeypatch):
+        from paramem.server.app import _consolidation_run_done
+        from paramem.server.consolidation_action import ConsolidationAction
+
+        state_dir = _state_dir(state)
+        record_incident(
+            state_dir,
+            type="calibration_crash",
+            key="/calibrate/extract",
+            severity="failed",
+            summary="prior crash",
+            detail={},
+        )
+
+        spec = self._spec(run_id="run-clean", route_path="/calibrate/extract")
+
+        class _FakeFuture:
+            def exception(self):
+                return None
+
+        _consolidation_run_done(ConsolidationAction.CALIBRATE, spec, _FakeFuture())
+
+        incidents = read_incidents(state_dir)
+        matching = [
+            i
+            for i in incidents
+            if i.type == "calibration_crash" and i.id == "calibration_crash:/calibrate/extract"
+        ]
+        assert len(matching) == 1
+        assert matching[0].status == "resolved"
+
+    def test_clean_completion_leaves_a_different_routes_incident_active(self, state, monkeypatch):
+        from paramem.server.app import _consolidation_run_done
+        from paramem.server.consolidation_action import ConsolidationAction
+
+        state_dir = _state_dir(state)
+        record_incident(
+            state_dir,
+            type="calibration_crash",
+            key="/calibrate/anonymize_facts",
+            severity="failed",
+            summary="prior crash on a different route",
+            detail={},
+        )
+
+        spec = self._spec(run_id="run-clean-2", route_path="/calibrate/extract")
+
+        class _FakeFuture:
+            def exception(self):
+                return None
+
+        _consolidation_run_done(ConsolidationAction.CALIBRATE, spec, _FakeFuture())
+
+        incidents = read_incidents(state_dir)
+        other = [
+            i
+            for i in incidents
+            if i.type == "calibration_crash"
+            and i.id == "calibration_crash:/calibrate/anonymize_facts"
+        ]
+        assert len(other) == 1
+        assert other[0].status == "active"

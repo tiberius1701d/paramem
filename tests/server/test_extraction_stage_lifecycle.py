@@ -3,11 +3,10 @@ and incident/attention authority around ``_extract_pending_sessions`` /
 ``_extract_and_start_training`` — the surface both a fold's interim tick and
 ``/calibrate/extract_pending`` reach through the same function.
 
-Fixture pattern mirrors the (now-superseded) ``tests/server/
-test_voice_profile_consolidation_paths.py``: a MagicMock ``ConsolidationLoop``
-whose ``extract_session`` returns empty relation lists (the no-facts fast
-path), a mocked ``SessionBuffer``, and the real ``gpu_lock_sync`` +
-``_set_voice_pipeline_profile`` spy pattern — adapted to the current design
+Fixture pattern: a MagicMock ``ConsolidationLoop`` whose ``extract_session``
+returns empty relation lists (the no-facts fast path), a mocked
+``SessionBuffer``, and the real ``gpu_lock_sync`` +
+``_set_voice_pipeline_profile`` spy pattern
 (``get_or_create_consolidation_loop``, ``take_pending_relations`` /
 ``PendingRelations``, ``arbitrate_enrichment_incidents``).
 """
@@ -379,7 +378,7 @@ class TestDispatchToExecutorEvictsVoiceBeforeEntryPoint:
 
 
 # ---------------------------------------------------------------------------
-# 44 — enrichment_degraded / vram-headroom-attention authority.
+# enrichment_degraded / vram-headroom-attention authority.
 # Structural: the extract_pending route's own dispatch closure never
 # arbitrates enrichment incidents or copies a vram-headroom warning into
 # _state, unlike the two staging callers, which both do.

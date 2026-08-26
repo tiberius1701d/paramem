@@ -1,15 +1,11 @@
-"""Regression for /status HTTP 500 when indexed_key_registry.json is encrypted.
+"""``GET /status`` reads ``indexed_key_registry.json`` through
+``read_maybe_encrypted`` so it round-trips whether the registry is
+age-encrypted (``write_infra_bytes`` encrypts when the daily identity is
+loaded) or plaintext -- a raw ``open() + json.load()`` cannot parse the age
+magic byte and raises ``UnicodeDecodeError`` on an encrypted registry.
 
-Pre-fix, ``app.py`` read the registry with raw ``open() + json.load()``. After
-the registry-encryption work flipped writes to go through ``write_infra_bytes``
-(age-encrypted when the daily identity is loaded), the read path produced
-``UnicodeDecodeError`` on the age magic byte and surfaced as HTTP 500 from
-``GET /status`` after every consolidation cycle until the operator restarted
-the server.
-
-The fix routes the read through ``read_maybe_encrypted``. This test exercises
-the exact write→read pair against an encrypted registry and asserts it
-round-trips.
+This test exercises the write->read pair against an encrypted registry and
+asserts it round-trips.
 """
 
 from __future__ import annotations
@@ -67,10 +63,10 @@ def test_encrypted_registry_round_trips_through_read_maybe_encrypted(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """When the daily identity is loaded, ``write_infra_bytes`` produces age
-    ciphertext on disk. The fixed /status read path must use
-    ``read_maybe_encrypted`` to unwrap it transparently — the prior raw
-    ``open() + json.load()`` failed with UnicodeDecodeError on the age magic
-    byte and surfaced as HTTP 500."""
+    ciphertext on disk. The ``/status`` read path must use
+    ``read_maybe_encrypted`` to unwrap it transparently — a raw
+    ``open() + json.load()`` cannot parse the age magic byte and raises
+    ``UnicodeDecodeError``."""
     _setup_daily_identity(tmp_path, monkeypatch)
 
     registry_path = tmp_path / "indexed_key_registry.json"
@@ -80,16 +76,16 @@ def test_encrypted_registry_round_trips_through_read_maybe_encrypted(
     }
     write_infra_bytes(registry_path, json.dumps(payload).encode("utf-8"))
 
-    # On-disk shape must be age-encrypted (proves the bug's preconditions).
+    # On-disk shape must be age-encrypted.
     on_disk = registry_path.read_bytes()
     assert on_disk.startswith(AGE_MAGIC), "expected age envelope, got plaintext"
 
-    # The pre-fix code path (raw open + json.load) crashes here:
+    # A raw open + json.load cannot parse the age envelope:
     with pytest.raises(UnicodeDecodeError):
         with open(registry_path) as f:
             json.load(f)
 
-    # The fixed code path (read_maybe_encrypted + json.loads) round-trips:
+    # read_maybe_encrypted + json.loads round-trips:
     parsed = json.loads(read_maybe_encrypted(registry_path).decode("utf-8"))
     assert parsed == payload
     assert parsed["active_keys"] == ["graph1", "graph2"]

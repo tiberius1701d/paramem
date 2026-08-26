@@ -3,17 +3,7 @@
 Public API: :class:`MemoryStore`.
 
 Single source of truth for the answer content, integrity fingerprints, and
-lifecycle registries of every indexed key the system holds in RAM.  Replaces
-the previous mixed-shape state on :class:`ConsolidationLoop`:
-
-* ``indexed_key_cache: dict[str, dict]`` — flat, all tiers in one bucket; tier
-  was recovered indirectly by scanning every registry.
-* ``episodic_simhash``, ``semantic_simhash``, ``procedural_simhash`` — three
-  separate flat dicts; now folded into the per-tier :class:`KeyRegistry` (each
-  registry carries ``_simhash: dict[str, int]`` — the tier's one fingerprint
-  map, active keys only; a withheld id carries no fingerprint).
-* ``indexed_key_registry: Optional[dict[str, KeyRegistry]]`` — the only
-  structure that was already per-tier; folded in here for symmetry.
+lifecycle registries of every indexed key the system holds in RAM.
 
 The unified shape is ``tier → key → value`` for all three concerns:
 
@@ -65,8 +55,8 @@ The per-key bookkeeping fields live in :attr:`MemoryStore._bookkeeping` — a fl
 ``{key → {speaker_id, relation_type, reinforcement_count, last_reinforced_cycle,
 last_seen, first_seen, promoted}}`` dict SEPARATE from ``_entries``.  Populated by
 :meth:`load_bookkeeping_from_disk` at boot (unconditionally; entry-independent),
-which merges each tier's own ``key_metadata.json`` — bookkeeping rows are a
-per-tier file now, not a single global one.  Never enters
+which merges each tier's own ``key_metadata.json`` — bookkeeping rows live in
+a per-tier file, not a single global one.  Never enters
 :meth:`KeyRegistry.save_bytes` or any hash path.
 
 **Content-only invariant:**
@@ -90,8 +80,7 @@ SimHash fingerprints live exclusively in :class:`KeyRegistry` (one per tier),
 one fingerprint map (``registry._simhash``) for the tier's active keys — a
 withheld id carries no fingerprint.  Serialised to
 ``indexed_key_registry.json`` under the ``"simhash"`` key so the on-disk file
-is the single source of truth.  The separate ``simhash_registry.json``
-sidecar has been eliminated.  Use :meth:`tier_simhashes` as the only public
+is the single source of truth.  Use :meth:`tier_simhashes` as the only public
 path to a fingerprint set.
 
 **Thread-safety concurrency contract:**
@@ -925,14 +914,12 @@ class MemoryStore:
     def discard_keys(self, keys: list[str]) -> None:
         """Soft-remove *keys*: withhold each in its owning tier's registry.
 
-        One meaning only — the former ``mode="erase"`` hard-removal branch
-        and its ``mode`` parameter are retired with their last caller (the
-        operator doors, which now narrow to a stale-mark + registry restamp;
-        see :func:`~paramem.memory.persistence.erase_keys_and_restamp_manifest`).
-        Full retirement of a key still exists — an acting site's fate
-        decision on a tier the event REBUILDS removes it outright via
-        :meth:`~paramem.training.key_registry.KeyRegistry.remove` — it is
-        just no longer reachable through this method.
+        One meaning only: stale-mark, never a hard removal.  A separate
+        mechanism handles full retirement — an acting site's fate decision
+        on a tier the event REBUILDS removes a key outright via
+        :meth:`~paramem.training.key_registry.KeyRegistry.remove` (the
+        operator doors combine a stale-mark with a registry restamp; see
+        :func:`~paramem.memory.persistence.erase_keys_and_restamp_manifest`).
 
         For each key, calls :meth:`KeyRegistry.stale` on the owning tier,
         which mints a marker holding only the id — the active fingerprint
@@ -1370,10 +1357,8 @@ class MemoryStore:
         * ``<adapter_dir>/<tier>/indexed_key_registry.json`` for each main tier
           and every ``episodic_interim_<stamp>`` slot.
 
-        The registry file now carries the tier's one fingerprint map — active
-        keys only — in the ``"simhash"`` key.  The separate
-        ``simhash_registry.json`` file is no longer read — it has been
-        eliminated.
+        The registry file carries the tier's one fingerprint map — active
+        keys only — in the ``"simhash"`` key.
 
         Entry payloads (subject/predicate/object/speaker_id) are NOT loaded
         here — that is the responsibility of the mode-specific
@@ -1396,8 +1381,8 @@ class MemoryStore:
         :func:`~paramem.memory.interim_adapter.iter_tier_roots` (main tiers,
         then interim slots) and reads ``<tier_root>/key_metadata.json`` where
         present.  Runs unconditionally at lifespan boot (after
-        ``load_registries_from_disk``) — entry-independent, so it no longer
-        requires entries to already exist.  Under
+        ``load_registries_from_disk``) — entry-independent, so it does not
+        require entries to already exist.  Under
         ``inference.preload_cache=False`` this is the ONLY write to provenance
         state at boot, and is sufficient for the router's speaker index.
 
@@ -1411,9 +1396,8 @@ class MemoryStore:
         not load-bearing.
 
         Populates ``_bookkeeping`` only (via :meth:`set_bookkeeping`).  DOES
-        NOT touch ``_entries`` — the old ``setdefault_entry`` parasitic write
-        that created payload-less stub entries has been removed.  Bookkeeping
-        presence MUST NOT manufacture a content cache hit.
+        NOT touch ``_entries`` — bookkeeping presence MUST NOT manufacture a
+        content cache hit.
 
         Each persisted record is splatted whole into :meth:`set_bookkeeping`
         (``self.set_bookkeeping(key, **key_meta)``) — a persisted row with an
@@ -1594,12 +1578,11 @@ class MemoryStore:
            rebind ``self._entries[tier]`` to the increment's entries
            (untouched for a rows-only member); install every row in
            ``increment.bookkeeping``.  Then drop each *absorbed_tiers*
-           member's own ``_registry``/``_entries`` buckets whole (the former
-           ``MemoryStore.drop_registry_and_entries`` primitive, now inlined
-           here so the ring reap converges in the SAME locked act as the
-           bundle's own install — no window in which a reader can observe a
-           key active in both the bundle's destination tier and the
-           not-yet-reaped interim tier it moved out of).
+           member's own ``_registry``/``_entries`` buckets whole, in the
+           SAME locked act as the bundle's own install — no window in which
+           a reader can observe a key active in both the bundle's
+           destination tier and the not-yet-reaped interim tier it moved
+           out of.
 
         A retired key is gone by absence: it is not in the increment's
         registry, entries, or bookkeeping, so after convergence the store

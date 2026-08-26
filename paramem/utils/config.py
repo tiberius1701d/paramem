@@ -3,9 +3,8 @@ plus a live per-fold training-budget derivation.
 
 This module is the YAML loader for the archived research scripts under
 ``archive/experiments/`` and their reference YAML at
-``archive/configs/default.yaml``. All active runtime, server, test, and
-example code was migrated off ``load_config`` during the default.yaml
-retirement arc (2026-04-28); the lint guard
+``archive/configs/default.yaml``. Active runtime, server, test, and
+example code never calls ``load_config``; the lint guard
 ``tests/test_test_config_loader_usage.py`` enforces this.
 
 The dataclasses defined below (``ParaMemConfig``, ``AdapterConfig``,
@@ -64,10 +63,10 @@ class TrainingConfig:
     num_epochs: int = 3
     # Absolute-step warmup count, passed straight to HF TrainingArguments as
     # the sole warmup knob. There is deliberately no ratio-based sibling
-    # field — that HF field is deprecated, banned by project rule, and was
-    # the mechanism that silently zeroed warmup in every fold ever trained
-    # under transformers 5.5 (see paramem.training.trainer's
-    # TrainingArguments call). 0 (default) means no warmup.
+    # field — that HF field is deprecated and banned by project rule: using
+    # it silently zeros warmup under transformers 5.5 (see
+    # paramem.training.trainer's TrainingArguments call). 0 (default) means
+    # no warmup.
     warmup_steps: int = 0
     lr_scheduler_type: str = "linear"  # HF default; use "constant" for grokking
     # When set, the LR scheduler decays over this many steps regardless of
@@ -83,10 +82,10 @@ class TrainingConfig:
     save_strategy: str = "epoch"
     save_steps: int = 0  # Steps between saves when save_strategy="steps"; 0 → HF default (500)
     save_total_limit: int = 2
-    # HF Trainer logging cadence. Default 1 matches train_adapter's prior
-    # hardcode. The BG-trainer call site overrides via dataclasses.replace
-    # to keep its historical log volume (10 steps) when delegating to
-    # train_adapter; other callers inherit the verbose default.
+    # HF Trainer logging cadence. Default 1 (verbose). The BG-trainer call
+    # site overrides via dataclasses.replace to log every 10 steps when
+    # delegating to train_adapter; other callers inherit the verbose
+    # default.
     logging_steps: int = 1
     # RAM-mode checkpointing: when > 0, train_adapter writes checkpoints to
     # /dev/shm instead of the caller's output_dir (avoids encrypted-disk IO
@@ -105,8 +104,7 @@ class TrainingConfig:
     # Probes the staged adapter at epoch boundaries and fires
     # control.should_training_stop after `recall_window` consecutive
     # 100%-recall probes past `early_stopping_floor` (reused as
-    # signal_from_epoch).  Validated at multi-seed for N=100 by Test
-    # 14; untested at N=500+; ship default-OFF.
+    # signal_from_epoch).
     recall_early_stopping: bool = False
     recall_window: int = 3
     # Probe cadence — system-wide.  3× cheaper than =1 at production
@@ -120,19 +118,11 @@ class TrainingConfig:
     # the earliest possible stop, not to "probe earlier".
     recall_probe_every_n_epochs: int = 3
     # Recall probe batch size — generate this many prompts per model.generate
-    # call when probing the staged adapter at epoch boundaries.  Default 16
-    # = validated production setting: ~4.75× faster than serial at ~346 MiB
-    # peak VRAM delta on RTX 5070 8 GB, 137/137 recall parity vs serial,
-    # multi-cycle retention parity confirmed in production conditions.
-    # Empirical curve at adapter idle:
-    #   b=1  baseline (serial),   ~125 MiB peak delta
-    #   b=8   2.91× faster,        257 MiB peak delta
-    #   b=16  4.75× faster,        346 MiB peak delta   ← production default
-    #   b=32  6.02× faster,        574 MiB peak delta
-    #   b=64  8.25× faster,       1032 MiB peak delta
-    #   b=128 10.64× faster,      2073 MiB peak delta
-    # In-training VRAM residual eats into headroom — drop to 1 only if a
-    # specific deployment's training-residual pressure forces a downgrade.
+    # call when probing the staged adapter at epoch boundaries.  16 is the
+    # production default: a favorable speed/VRAM tradeoff point that stays
+    # well clear of in-training VRAM residual eating into headroom.  Drop
+    # to 1 only if a specific deployment's training-residual pressure
+    # forces a downgrade.
     recall_probe_batch_size: int = 16
 
 
@@ -142,15 +132,12 @@ class TrainingConfig:
 # ConsolidationScheduleConfig.training_batch_size default). Epoch counts are
 # CAPS, not targets: when TrainingConfig.recall_early_stopping is on, the
 # recall gate terminates training before the cap in the common case.
-# `lr_decay_steps` defaults to None for every bucket (today's behaviour:
-# create_scheduler's no-op passthrough; see TrainingConfig.lr_decay_steps).
+# `lr_decay_steps` defaults to None for every bucket (create_scheduler's
+# no-op passthrough; see TrainingConfig.lr_decay_steps).
 #
-# See configs/server.yaml.example for the per-bucket epoch/accum values and
-# their evidence status. The largest bucket is anchored on production fold
-# telemetry. The 16-127 bucket (50 epochs) is now anchored at N=21 (4 seeds,
-# 21/21 exact-match at 50 epochs / 550 decay-pinned steps) — see
-# benchmarking.md's "Test 20: Small-N Cold-Init Recall Gate" section; the
-# rest of the 16-127 band and the <16 bucket remain extrapolated.
+# See configs/server.yaml.example for the per-bucket epoch/accum values,
+# and benchmarking.md's "Test 20: Small-N Cold-Init Recall Gate" section
+# for the supporting evidence.
 _BUDGET_TABLE: tuple[tuple[int, int, int, "int | None"], ...] = (
     # (n_keys floor, epochs, accum, lr_decay_steps)
     (128, 30, 2, None),
@@ -162,21 +149,16 @@ _BUDGET_TABLE: tuple[tuple[int, int, int, "int | None"], ...] = (
 def budget_for(n_keys: int) -> "tuple[int, int, int | None]":
     """Derive the per-fold training budget from the key-triple count.
 
-    The unconditional standard mechanism (validated via Test 20; the prior
-    ``budget_derivation_enabled`` feature flag was retired once the
-    validation arms passed -- see ``benchmarking.md``). Pure, module-level,
-    and callable independently of whether training has run (see the call
-    sites in ``paramem.training.consolidation``, which invoke this in the
-    enclosing scope BEFORE the training ``try`` block so the
-    ``finally``-path telemetry records the true budget even when training
-    raises).
+    The unconditional standard mechanism — see ``benchmarking.md``, "Test
+    20", for the supporting evidence. Pure, module-level, and callable
+    independently of whether training has run (see the call sites in
+    ``paramem.training.consolidation``, which invoke this in the enclosing
+    scope BEFORE the training ``try`` block so the ``finally``-path
+    telemetry records the true budget even when training raises).
 
-    The bucket table governs unclamped -- there is no operator ceiling. A
-    prior ``TrainingConfig.budget_max_epochs`` / ``ConsolidationScheduleConfig
-    .max_epochs`` clamp was retired 2026-07-26; wall-time feedback now comes
-    from ``hit_cap`` telemetry and recall-based early stopping, not a config
-    clamp. The clamp's removal also retired the ``training_config`` parameter
-    itself (2026-07-26) -- the derivation reads nothing off it anymore.
+    The bucket table governs unclamped -- there is no operator ceiling.
+    Wall-time feedback comes from ``hit_cap`` telemetry and recall-based
+    early stopping, not a config clamp.
 
     Args:
         n_keys: number of key-triples (entries) in the training set for this
@@ -300,8 +282,7 @@ def load_config(
 ) -> ParaMemConfig:
     """Load configuration from a YAML file, falling back to defaults.
 
-    Archived loader: ``configs/default.yaml`` was retired during the
-    default.yaml retirement arc (2026-04-28). The yaml lives at
+    Archived loader: the reference YAML lives at
     ``archive/configs/default.yaml`` alongside the archived research scripts
     that depend on it; when that file is absent this returns
     ``ParaMemConfig()`` defaults rather than raising. Active code does not

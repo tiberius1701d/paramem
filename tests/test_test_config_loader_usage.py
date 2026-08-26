@@ -49,7 +49,9 @@ EXAMPLE_VERIFY_ALLOWLIST = frozenset(
         "tests/server/test_config.py",
         # Verifies span_tagger: parses identically from both shipped YAMLs.
         "tests/test_span_tagger_config.py",
-        # Verifies the shipped example is not egress-capable.
+        # Pins the shipped example as not egress-capable (cloud disabled,
+        # no HA agent) -- reads the example's own real terms, not a
+        # calibrated-threshold fixture.
         "tests/test_scrubbing_reachable.py",
     }
 )

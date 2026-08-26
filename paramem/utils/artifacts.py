@@ -272,8 +272,8 @@ def on_fold_graph(graph: "nx.MultiDiGraph", *, label: str) -> None:
     Args:
         graph: The cumulative graph to snapshot.
         label: Purpose token.  ``"merged"`` (``stage_event``'s own merged
-            graph state) is the only label any production caller passes
-            today. The output is ``<base>/fold/graph_<label>_snapshot.json``.
+            graph state) is the only label any production caller passes.
+            The output is ``<base>/fold/graph_<label>_snapshot.json``.
     """
     payload = nx.node_link_data(graph)
     for base in _active_bases():

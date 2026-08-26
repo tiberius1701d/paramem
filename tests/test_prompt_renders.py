@@ -84,13 +84,10 @@ class TestExtractionPromptRender:
         assert leftover == [], f"Leftover placeholders after render: {leftover}"
 
     def test_example_entity_types_are_within_schema(self):
-        """Inverse of the old "every type must appear" check.
-
-        The new examples-only architecture (README → Prompt Engineering)
-        deliberately drops the ``{entity_types}`` slot — verbatim
-        taxonomy listings empirically license Mistral 7B to extend the
-        closed set with invented type names.  Schema coverage is now
-        carried by the few-shot examples.
+        """The extraction prompt carries no ``{entity_types}`` slot (README →
+        Prompt Engineering): a verbatim taxonomy listing empirically licenses
+        Mistral 7B to extend the closed set with invented type names.  Schema
+        coverage is carried by the few-shot examples instead.
 
         The remaining invariant — guarded here — is that every
         ``entity_type: "<X>"`` literal that appears in the prompt examples
@@ -116,8 +113,8 @@ class TestExtractionPromptRender:
         )
 
     def test_example_relation_types_are_within_schema(self):
-        """Inverse of the old "every relation_type must appear" check —
-        same rationale as :meth:`test_example_entity_types_are_within_schema`.
+        """Same rationale as :meth:`test_example_entity_types_are_within_schema`,
+        applied to relation types.
         """
         _, prompt = load_extraction_prompts()
         rendered = prompt.format(

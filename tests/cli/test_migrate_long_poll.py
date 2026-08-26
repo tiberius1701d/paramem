@@ -730,8 +730,8 @@ _BS_STATUS_RELOAD_DEFERRED = {
         "cloud_only_reason": "insufficient_vram",
         "restart_required_reason": None,
         # A reload was attempted and failed — the gates record's message is
-        # the CLI's sole source of deferral guidance (the renderer no longer
-        # re-derives it), so the fixture carries the real production text.
+        # the CLI's sole source of deferral guidance, so the fixture carries
+        # the real production text.
         "message": (
             "Phase A complete but base-model reload deferred "
             "(cloud_only_reason='insufficient_vram'). Phase B will run "
@@ -882,7 +882,8 @@ class TestBaseSwapLongPoll:
         (restart_required_reason set): the renderer must surface the gates
         record's own guidance (restart the service), not the generic
         /gpu/acquire text that only applies to an attempted-and-failed
-        reload — the renderer no longer re-derives instructional text.
+        reload — the gates record's message is the CLI's sole source of
+        guidance.
         """
         get_seq = [_STATUS_STAGING, _BS_STATUS_RELOAD_DEFERRED_NEVER_ATTEMPTED]
         monkeypatch.setattr(http_client, "get_json", _make_get_responses(*get_seq))

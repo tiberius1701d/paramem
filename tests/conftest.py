@@ -87,16 +87,14 @@ if not _gpu_explicitly_requested(sys.argv):
     # non-gpu run never blocks on (or even queries) the real GPU sensor.
     os.environ.setdefault("PARAMEM_COOLDOWN_DISABLED", "1")
 
-# ``BearerTokenMiddleware`` no longer reads ``PARAMEM_API_TOKEN`` at all —
-# auth enablement is driven exclusively by ``_state["user_token_store"]``
+# Auth enablement is driven exclusively by ``_state["user_token_store"]``
 # (see ``paramem.server.app._build_user_token_store``), which every test
 # controls explicitly via monkeypatch.  The env var survives only as the
 # CARRIER value other consumers (the CLI's ``http_client.py``, example
 # scripts) read directly.  Popping it here — and force-importing app.py
 # before any experiment script's module-level ``load_dotenv`` call can
-# re-seed it from ``.env`` — is defense-in-depth test isolation for THOSE
-# consumers, not a workaround for the (now-retired) middleware-token
-# capture-at-import-time behavior this comment used to describe.
+# re-seed it from ``.env`` — is defense-in-depth test isolation for those
+# consumers.
 os.environ.pop("PARAMEM_API_TOKEN", None)
 # Prevent resolve_token() from reading the real repo .env or ~/.config/paramem/
 # secrets during tests.  Auth-specific tests that need file-based resolution
@@ -292,10 +290,7 @@ def _isolate_data_root(monkeypatch, tmp_path):
     Every one of those files is age-encrypted on a deployed host, and
     ``_isolate_paramem_security_env`` above deliberately removes the daily
     passphrase — so a test that reaches the live tree either raises a decrypt
-    error (how this defect was found: three ``test_abstention.py`` cases drove
-    ``handle_chat`` with a default-constructed ``ServerConfig`` and hit
-    ``data/ha/adapters/episodic/indexed_key_registry.json``) or, worse,
-    silently reads or overwrites the household's real memory.
+    error or, worse, silently reads or overwrites the household's real memory.
 
     :func:`paramem.server.config.default_data_dir` is the ONE place that root
     is declared, and every default in :class:`~paramem.server.config.PathsConfig`
@@ -325,9 +320,9 @@ def _admin_scope_default():
     files (``test_consolidation.py``, ``test_consolidation_guard.py``,
     ``test_lang_id.py``) build ``TestClient(app_module.app)`` with no auth
     configured and call ``require_admin``-gated routes — they exist to test
-    endpoint LOGIC, not the auth boundary. A fail-closed-admin security fix
-    (unconfigured auth now stamps the non-admin ``chat`` scope instead of
-    ``admin``) made every one of those calls 403 ``admin_scope_required``.
+    endpoint LOGIC, not the auth boundary. Unconfigured auth stamps the
+    fail-closed non-admin ``chat`` scope by default, so those calls would
+    otherwise receive 403 ``admin_scope_required``.
 
     Auth behavior itself is independently covered by
     ``tests/server/test_require_admin.py`` and
@@ -473,12 +468,10 @@ def _isolate_daily_identity_cache():
     loaded identity), which means a test that mints and loads a real daily
     identity leaves the unlocked identity resident for every test that runs
     afterward in the same process — regardless of what that later test's own
-    env/monkeypatching implies. A prior full-suite run of
-    ``tests/test_consolidation.py`` demonstrated the failure mode: three
-    order-dependent tests hit ``UnicodeDecodeError`` reading an age envelope
-    where plaintext was expected, because an earlier test in the same run
-    left the cache populated and ``write_infra_json`` silently took the
-    encrypting branch.
+    env/monkeypatching implies. Without this fixture, an earlier test leaving
+    the cache populated could make a later test's ``write_infra_json`` call
+    silently take the encrypting branch, or make a read expecting plaintext
+    hit an age envelope instead.
 
     Individual test files may already clear the cache locally (e.g.
     ``tests/backup/test_encryption_primitives.py``); that is redundant but

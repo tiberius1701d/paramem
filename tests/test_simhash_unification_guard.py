@@ -5,9 +5,8 @@ key of each tier's :class:`~paramem.training.key_registry.KeyRegistry`. The
 tier's ONE fingerprint map is :attr:`KeyRegistry._simhash`, private, with a
 single private accessor :meth:`KeyRegistry._simhashes` — the only public path
 to a fingerprint set is :meth:`~paramem.memory.store.MemoryStore.tier_simhashes`
-(no ``include_stale`` keyword — that distinction was deleted along with the
-stale-record fingerprint). The separate ``simhash_registry.json`` sidecar
-file has been eliminated.
+(no ``include_stale`` keyword: there is no distinct stale-record
+fingerprint). There is no separate ``simhash_registry.json`` sidecar file.
 
 This test scans the codebase and fails if:
 1. ``KeyRegistry._simhash`` / ``KeyRegistry._simhashes`` are named (as an
@@ -16,19 +15,17 @@ This test scans the codebase and fails if:
    — the one accessor outside ``key_registry.py`` that still reads the
    private map directly.  ``MemoryStore.replace_simhashes_in_tier`` writes
    through the public :meth:`KeyRegistry.replace_simhashes` primitive
-   instead, so it is no longer on this allow-list — a regression back to a
-   direct ``reg._simhash`` write there is exactly what this guard now
-   catches. ``paramem/backup/integrity.py`` reads fingerprints through the
-   public ``KeyRegistry.load_simhashes`` leaf, not the private map, and is
-   therefore NOT on this allow-list.
+   instead, so it is not on this allow-list — a direct ``reg._simhash``
+   write there is exactly what this guard catches. ``paramem/backup/integrity.py``
+   reads fingerprints through the public ``KeyRegistry.load_simhashes`` leaf,
+   not the private map, and is therefore NOT on this allow-list.
 2. ``simhash_registry.json`` is referenced as a *write target or read path*
-   (comments and docstrings explaining its elimination are allowed).
+   (comments and docstrings explaining that there is no sidecar are allowed).
 
 Scans via ``ast`` (real ``Attribute``/string-literal nodes), not text
 matching, so a docstring or comment mentioning ``_simhash``/``_simhashes`` in
-prose never produces a false positive — the old text-scan guard this file
-replaces missed exactly that case (``paramem/memory/store.py``'s own module
-docstring names ``registry._simhash`` in prose).
+prose never produces a false positive (``paramem/memory/store.py``'s own
+module docstring names ``registry._simhash`` in prose).
 
 Mirrors the structure of ``tests/test_extraction_pipeline_guard.py``.
 """
@@ -73,7 +70,7 @@ def test_the_fingerprint_map_is_named_only_by_its_one_store_accessor():
     ``key_registry.py`` only inside ``MemoryStore.tier_simhashes``.
 
     ``MemoryStore.replace_simhashes_in_tier`` delegates to the public
-    :meth:`KeyRegistry.replace_simhashes` and no longer names either private
+    :meth:`KeyRegistry.replace_simhashes` and does not name either private
     attribute directly, so it carries no allowance here.  Any other module
     naming either — including a stray direct access from a test, a
     regression in ``replace_simhashes_in_tier``, or a resurrected read site
@@ -169,9 +166,9 @@ def test_no_simhash_sidecar_string_in_live_code():
                 offenders.append((rel, lineno, value))
 
     assert not offenders, (
-        "'simhash_registry.json' string literal found in live code. The "
-        "sidecar has been eliminated; simhashes now live in "
-        "indexed_key_registry.json. Remove the reference or add the file to "
-        "the allowlist with a comment explaining why it legitimately "
-        "references the old name:\n" + "\n".join(f"  {p}:{n} — {s!r}" for p, n, s in offenders)
+        "'simhash_registry.json' string literal found in live code. There is "
+        "no sidecar file; simhashes live in indexed_key_registry.json. "
+        "Remove the reference or add the file to the allowlist with a "
+        "comment explaining why it legitimately references that name:\n"
+        + "\n".join(f"  {p}:{n} — {s!r}" for p, n, s in offenders)
     )

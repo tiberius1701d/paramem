@@ -40,7 +40,7 @@ digits):
 * ``"Nh"`` / ``"Nm"`` / ``"every Nh"`` / ``"every Nm"`` → interval
 
 Regex usage here is one of the project's two permitted sites (the other is
-``cloud/placeholders.py``); both are recorded in ``architecture.md``.  The
+``cloud/placeholders.py``); both are recorded in ``ARCHITECTURE.md``.  The
 admissibility rule is structural, not a judgement about this module: each
 shape is declared exactly ONCE as a fragment constant and composed into the
 patterns that need it, so a grammar change is a single edit and no second
@@ -114,9 +114,7 @@ def _parse_hhmm(s: str) -> ParsedSchedule | None:
 
     THE only place a time is recognised — both the bare form and the
     ``"daily HH:MM"`` idiom land here, so the shape is matched and
-    range-checked exactly once per input.  (The idiom previously had its
-    own pattern, which matched the time, discarded the result, and left the
-    bare-form branch to match it a second time.)
+    range-checked exactly once per input.
     """
     m = _HHMM_RE.match(s)
     if not m:

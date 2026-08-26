@@ -378,8 +378,6 @@ def send_ping(subscription: dict, vapid_handle, contact: str) -> tuple[str, int 
       ``None`` in ``status_code``.  They are NOT silently swallowed — the caller
       can inspect and decide whether to retry or log.
     """
-    # SECURITY: re-validate endpoint host + drop the manual Content-Length
-    # before wiring a producer (see review)
     import httpx
 
     from paramem.server.vapid import vapid_authorization_header

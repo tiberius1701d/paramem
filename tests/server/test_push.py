@@ -787,7 +787,7 @@ class TestSendPingConstruct:
         http_version, status_code = send_ping(dummy_subscription, handle, "mailto:test@localhost")
 
         # Apple returns a 4xx for an invalid token — NOT a BadStatusLine.
-        # http_version=="HTTP/2" proves the transport fix is in place.
+        # http_version=="HTTP/2" proves the http2 transport is in use.
         assert http_version == "HTTP/2", (
             f"Expected HTTP/2 transport; got {http_version!r}. "
             "Check that h2 is installed and httpx.Client(http2=True) is used."

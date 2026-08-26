@@ -90,11 +90,12 @@ class TierIncrement:
 class TierWriteContext:
     """The collaborators the per-tier write acts need.  Derives nothing.
 
-    Replaces passing the whole live consolidation loop into ``persistence.py``
-    and ``go_live.py``: the write reads five of these fields, the publish
-    one, the go-live five, and naming them is what makes the module
-    boundary real rather than decorative.  Built once per event by the fold
-    driver, from its own state.
+    Rather than passing the whole live consolidation loop into
+    ``persistence.py`` and ``go_live.py``, this names only the
+    collaborators each act needs: the write reads five of these fields,
+    the publish one, the go-live five, and naming them is what makes the
+    module boundary real rather than decorative.  Built once per event by
+    the fold driver, from its own state.
     """
 
     model: "PeftModel"  # loop.model

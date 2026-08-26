@@ -127,8 +127,8 @@ def _make_loop(tmp_path, **kwargs) -> ConsolidationLoop:
         **defaults,
     )
     # Admit-all probe stub: the real _probe_recall runs evaluate_indexed_recall,
-    # which feeds the MagicMock model into re.sub and TypeErrors.  Admitting every key
-    # is the prior implicit behavior (no recall gate), so it is inert for these tests.
+    # which feeds the MagicMock model into re.sub and TypeErrors.  Admitting every
+    # key applies no recall gate, so it is inert for these tests.
     from paramem.training.recall_eval import RecallProbe
 
     loop._probe_recall = lambda adapter_name, entries: RecallProbe(
@@ -142,9 +142,8 @@ def _refiner_for(loop: ConsolidationLoop) -> GraphTierRefiner:
 
     Mirrors exactly what ``ConsolidationLoop.build_tier_refiner``
     constructs on every call — the enrichment and normalization surfaces
-    moved off ``ConsolidationLoop`` onto ``GraphTierRefiner`` (the deleted
-    enrichment/normalization SHIM methods that used to live directly on
-    ``ConsolidationLoop``), so tests exercise ``run_enrichment()`` /
+    live on ``GraphTierRefiner``, not on ``ConsolidationLoop``, so tests
+    exercise ``run_enrichment()`` /
     ``run_normalization()`` on a
     refiner built from the loop rather than calling a loop method directly.
     Called fresh at each use site so a test that mutates ``loop.model`` (or
@@ -381,8 +380,8 @@ class TestEnrichmentInheritsSourceWindow:
         # window is the min/max across ALL stamped works-at edges: the three
         # stamped person0/1/2 edges contribute first_seen 01/02/03 and
         # last_seen 05/06/10; the rest are unstamped ("") and ignored by
-        # min_nonempty / max. This is the fix under test — previously these
-        # fields were always "".
+        # min_nonempty / max, so the enriched edge's window derives from the
+        # stamped edges only rather than staying empty.
         assert found["first_seen"] == "2026-01-01T00:00:00"
         assert found["last_seen"] == "2026-01-10T00:00:00"
 
@@ -1196,8 +1195,8 @@ class TestCloudEgressRefusedSkipsGracefully:
 
     def test_master_switch_off_skip(self, tmp_path, monkeypatch, caplog):
         """``cloud.enabled: false`` alone blocks graph-tier cloud egress —
-        the master switch is a term of the shared verdict, so this pass can
-        no longer egress behind the operator's back."""
+        the master switch is a term of the shared verdict, so this pass
+        cannot egress behind the operator's back."""
         loop = _make_loop(tmp_path, cloud_enabled=False)
         graph = loop.merger.graph
         _populate_graph(graph, n_persons=10)
@@ -1241,11 +1240,10 @@ class TestNoModelSkipsGracefully:
 
 
 class TestDroppedRelations:
-    """Graph-tier enrichment's per-relation drop count (``dropped_relations``
-    — replaces the retired ``totality_rejected_chunks`` whole-chunk gate,
-    2026-07-22 cloud-admission redesign): a cloud response naming an
-    orphan/unresolvable token now sheds only the offending relation(s),
-    counted here (parallel to the existing ``privacy_skipped_chunks`` /
+    """Graph-tier enrichment's per-relation drop count (``dropped_relations``):
+    a cloud response naming an orphan/unresolvable token sheds only the
+    offending relation(s), counted here (parallel to the existing
+    ``privacy_skipped_chunks`` /
     ``mapping_rekey_dropped`` counters). Distinct from
     ``privacy_skipped_chunks``, which fires BEFORE any cloud call is made;
     this counter fires AFTER a real cloud response was individually
@@ -1365,7 +1363,7 @@ class TestSameAsUndeclaredOrphanShapeBackstop:
 
 
 def _payload_and_graph_for(triples: list[dict], llm_mapping: dict[str, str]):
-    """Build the ``(payload, graph)`` pair ``request_graph_enrichment`` now
+    """Build the ``(payload, graph)`` pair ``request_graph_enrichment``
     takes, from a caller-supplied ``llm_mapping`` (real_name -> placeholder)
     and the chunk's ``triples``.
 
@@ -1373,20 +1371,18 @@ def _payload_and_graph_for(triples: list[dict], llm_mapping: dict[str, str]):
     ``payload.facts`` — it has no notion of HOW a forward table was
     produced — so this helper constructs the table directly from
     *llm_mapping* rather than replaying the SCAN/MINT machinery
-    (:func:`~paramem.cloud.placeholders.build_forward_table` now mints
-    every placeholder value itself; a caller-dictated exact placeholder
-    string, as several tests below rely on, is no longer an input that
-    primitive accepts). This mirrors the pre-split helper's own scope: it
-    never modeled the model call either, only assembled a payload from a
-    given mapping.
+    (:func:`~paramem.cloud.placeholders.build_forward_table` mints every
+    placeholder value itself, so a caller-dictated exact placeholder
+    string, as several tests below rely on, is not an input that
+    primitive accepts). This helper never models the model call either,
+    only assembles a payload from a given mapping.
 
-    ``graph`` carries no relations of its own (interface narrowing,
-    2026-07-21): ``request_graph_enrichment`` derives its anonymized
-    triples directly from ``payload.facts`` via ``insert_placeholders``,
-    not from ``graph.relations`` — ``graph`` is only the diagnostics
-    sink. ``payload.facts`` is set to ``triples`` here, mirroring what
-    :func:`~paramem.cloud.anonymize.anonymize` populates it with on a
-    successful (non-fail-closed) call.
+    ``graph`` carries no relations of its own: ``request_graph_enrichment``
+    derives its anonymized triples directly from ``payload.facts`` via
+    ``insert_placeholders``, not from ``graph.relations`` — ``graph`` is
+    only the diagnostics sink. ``payload.facts`` is set to ``triples``
+    here, mirroring what :func:`~paramem.cloud.anonymize.anonymize`
+    populates it with on a successful (non-fail-closed) call.
     """
     from paramem.cloud.anonymize import AnonymizedContract
     from paramem.cloud.placeholders import invert_forward_mapping
@@ -1444,11 +1440,9 @@ class TestGraphEnrichWithCloudUnit:
         assert same_as[0] == ["Alice", "Alicia"]
 
     def test_system_prompt_overridable_and_recorded_in_provenance(self):
-        """``cloud_graph_enrichment_system.txt`` used to bind ONCE at module
-        import time (``_CLOUD_GRAPH_ENRICHMENT_SYSTEM_PROMPT``) — unreachable
-        by a calibration override and never recorded via ``record_prompt``.
-        It now loads at CALL TIME inside ``request_graph_enrichment`` itself,
-        so both become possible."""
+        """``cloud_graph_enrichment_system.txt`` loads at CALL TIME inside
+        ``request_graph_enrichment`` itself, so it is reachable by a
+        calibration override and recorded via ``record_prompt``."""
         from paramem.graph.extractor import request_graph_enrichment
         from paramem.graph.phase_trace import extraction_trace, phase_trace
         from paramem.graph.prompts import prompt_overrides
@@ -1553,8 +1547,7 @@ class TestGraphEnrichWithCloudUnit:
         """An individually-unresolvable relation (its object references a
         token never declared for this chunk) is dropped by the fail-closed
         residual sweep, and the caller's dropped-relation count (the
-        fourth tuple element) reflects it — replacing the retired
-        whole-chunk rejection this test used to pin."""
+        fourth tuple element) reflects it."""
         from paramem.graph.extractor import request_graph_enrichment
 
         triples = [
@@ -1724,12 +1717,12 @@ class TestInterimEnrichmentHook:
         enrich_mock.assert_not_called()
 
     # test_refinement_normalization_only_does_not_enrich and
-    # test_refinement_off_does_not_enrich were collapsed into the on+cloud
-    # case above (code review, 2026-07-28): the interim gate is
-    # unconditional (see this class's docstring and
+    # test_refinement_off_does_not_enrich are not present as separate cases:
+    # the interim gate is unconditional (see this class's docstring and
     # test_interim_scope_pins_enrich_false in test_consolidation.py), so the
     # on+cloud case above -- the single hardest config to satisfy -- already
-    # implies both weaker configs; testing them separately added no coverage.
+    # implies both weaker configs; testing them separately would add no
+    # coverage.
 
     def test_rollover_hook_skipped_on_ring_full(self, tmp_path):
         """Ring-full (cap_pending) short-circuit does NOT fire the enrichment hook.
@@ -1800,11 +1793,11 @@ class TestRefineOrderEnrichThenNormalize:
     # Not duplicated here at the refiner level.
 
     def test_normalization_sees_enrichment_edges(self, tmp_path, monkeypatch):
-        """Defect regression pin: a cloud paraphrase minted by
+        """A cloud paraphrase minted by
         enrichment is visible to (and collapsed by) normalization in the
-        SAME ``refine()`` call.  Before the flip, enrichment ran AFTER
-        normalization, so a cloud-coined paraphrase reached the fold's key
-        assembly un-normalized — this test fails on that ordering.
+        SAME ``refine()`` call: enrichment runs BEFORE normalization, so a
+        cloud-coined paraphrase reaches the fold's key assembly
+        normalized.
 
         The (s,o) pair already carries an established predicate ("works
         at", from ``_populate_graph``); enrichment mints a same-pair
@@ -1992,10 +1985,9 @@ class TestSurvivorRuleEstablishedOutranksEnrichment:
 
 class TestArbitrateSessionEnrichmentIncidents:
     """``ConsolidationLoop.arbitrate_enrichment_incidents`` — the session-tier
-    reconciliation extracted from ``extract_session``, now driven by the
-    per-session signal record a staging caller collects rather than the
-    ``SessionGraph`` object itself (``extract_session`` no longer writes
-    this incident directly).
+    reconciliation, driven by the per-session signal record a staging
+    caller collects rather than the ``SessionGraph`` object itself;
+    ``extract_session`` does not write this incident directly.
 
     Uses the same ``record_incident``/``resolve_incident`` surface (and the
     same ``incidents_state_dir`` fixture pattern) as
@@ -2502,12 +2494,13 @@ class TestEnrichmentRemovalLedger:
 
 
 # ---------------------------------------------------------------------------
-# Symmetric session-tier names deleted — importability guard
+# Symmetric session-tier names — importability guard
 # ---------------------------------------------------------------------------
 
 
 class TestSymmetricSessionTierNamesDeleted:
-    """SYMMETRIC_PREDICATES and _canonicalize_symmetric_predicates deleted."""
+    """SYMMETRIC_PREDICATES and _canonicalize_symmetric_predicates must not
+    be importable from extractor."""
 
     def test_symmetric_predicates_not_importable(self):
         """SYMMETRIC_PREDICATES must not be importable from extractor."""
@@ -2515,7 +2508,7 @@ class TestSymmetricSessionTierNamesDeleted:
 
         extractor = importlib.import_module("paramem.graph.extractor")
         assert not hasattr(extractor, "SYMMETRIC_PREDICATES"), (
-            "SYMMETRIC_PREDICATES must be deleted from extractor — it is no longer used"
+            "SYMMETRIC_PREDICATES must not exist in extractor"
         )
 
     def test_canonicalize_symmetric_not_importable(self):
@@ -3148,7 +3141,7 @@ class TestEnrichmentVerbatimSpeakerKeyResolution:
 
 
 class TestGraphTierAnonymizationContract:
-    """paramem.graph.extractor.request_graph_enrichment now runs the SAME
+    """paramem.graph.extractor.request_graph_enrichment runs the SAME
     anonymize -> cloud -> de-anonymize contract as session-tier extraction
     (_cloud_pipeline), via the shared primitives in paramem.graph.placeholders.
     """
@@ -3269,10 +3262,8 @@ class TestGraphTierAnonymizationContract:
 
         # "alice" is shown to cloud (declared AND observed); "Person_99" is
         # never declared anywhere — this ONE relation is dropped by
-        # ``_apply_bindings``'s fail-closed residual sweep (2026-07-22
-        # cloud-admission redesign retired the whole-delta rejection this
-        # test used to exercise); the observable outcome (no surviving
-        # relation) is unchanged.
+        # ``_apply_bindings``'s fail-closed residual sweep, so no relation
+        # survives.
         triples = [
             {
                 "subject": "alice",
@@ -3368,10 +3359,10 @@ class TestGraphTierAnonymizationContract:
         relation — ``request_graph_enrichment`` never re-mints its own
         token for a name already present in ``mapping``, regardless of
         the placeholder's shape (verified with a real anonymizer-style
-        surface, not a ``Person_N`` convenience literal).  This is the
-        regression this contract exists to prevent: re-minting instead of
-        threading through would desync the forward token from what cloud
-        is shown, or silently drop a mapping entry.
+        surface, not a ``Person_N`` convenience literal).  This is what
+        the contract prevents: re-minting instead of threading through
+        would desync the forward token from what cloud is shown, or
+        silently drop a mapping entry.
         """
         from paramem.graph.extractor import request_graph_enrichment
 
@@ -3504,8 +3495,8 @@ class TestGraphTierAnonymizationContract:
         # function, never how a real caller populates it).
         # Realistic shape otherwise: Cloud can only propose a same_as pair
         # naming placeholders it was actually SHOWN, so the chunk's
-        # ``triples`` (fed to ``request_graph_enrichment`` directly, per
-        # the interface narrowing — no separate ``anon_facts`` field)
+        # ``triples`` (fed to ``request_graph_enrichment`` directly —
+        # there is no separate ``anon_facts`` field)
         # must carry Person_1/Person_2 for them to be within the observed
         # scope.
         triples = [
@@ -3630,8 +3621,8 @@ def _populate_untyped_graph(graph: nx.MultiDiGraph, n_persons: int = 10) -> None
     for test convenience — that is NOT what the production fold graph looks
     like. These tests exist specifically to drive
     ``GraphTierRefiner.run_enrichment`` against a graph with no usable
-    type signal, proving the type source is now the local-model
-    anonymization pass, not node attributes.
+    type signal, proving the type source is the local-model anonymization
+    pass, not node attributes.
     """
     for i in range(n_persons):
         name = f"person{i}"
@@ -3680,12 +3671,12 @@ def _reconciled_contract_for_stub(
     stub's own real-name -> placeholder table (standing in for what
     ``paramem.cloud.placeholders.build_forward_table`` would have
     minted from a SCAN result — placeholder VALUES are code-minted in
-    production and no longer caller-dictated, but this test-only
-    shortcut keeps the caller-given value rather than re-minting, since
-    nothing here exercises the minting rule itself), replay the REAL
+    production, but this test-only shortcut keeps the caller-given
+    value rather than re-minting, since nothing here exercises the
+    minting rule itself), replay the REAL
     identity-reconciliation and domain-guard primitives
-    (:func:`~paramem.cloud.anonymize._index_identity_domain`,
-    :func:`~paramem.cloud.anonymize._reconcile_to_domain`,
+    (:func:`~paramem.cloud.placeholders._index_identity_domain`,
+    :func:`~paramem.cloud.placeholders._reconcile_to_domain`,
     :func:`~paramem.cloud.anonymize._domain_guard_fires`) against the
     caller's own ``identity_domain``/``facts`` — so behavioral tests of
     THAT logic (reconciliation drops, the domain-scoped fail-closed
@@ -3698,13 +3689,12 @@ def _reconciled_contract_for_stub(
     ``anonymize()`` itself returns on a successful, transcript-less
     call).
     """
-    from paramem.cloud.anonymize import (
-        AnonymizedContract,
-        _domain_guard_fires,
+    from paramem.cloud.anonymize import AnonymizedContract, _domain_guard_fires
+    from paramem.cloud.placeholders import (
         _index_identity_domain,
         _reconcile_to_domain,
+        invert_forward_mapping,
     )
-    from paramem.cloud.placeholders import invert_forward_mapping
     from paramem.utils.identity import is_speaker_id
 
     if identity_domain is not None:
@@ -3755,9 +3745,9 @@ def _stub_local_model_types(type_by_name: dict[str, str]):
     from paramem.config.taxonomy import entity_type_to_prefix
 
     def _stub(facts, model, tokenizer, *, transcript="", identity_domain=None, **kwargs):
-        # ``facts`` is a plain fact-dict list (interface narrowing,
-        # 2026-07-21) — never a ``SessionGraph`` — so names come off
-        # ``subject``/``object`` keys directly, not ``.relations``.
+        # ``facts`` is a plain fact-dict list, never a ``SessionGraph`` —
+        # so names come off ``subject``/``object`` keys directly, not
+        # ``.relations``.
         names = sorted(
             {str(f.get("subject", "")) for f in facts} | {str(f.get("object", "")) for f in facts}
         )
@@ -3826,10 +3816,10 @@ class TestGraphTierLocalModelTypeDerivation:
         decision against ``scrub``, e.g. an organization when only
         ``person name`` is configured) must appear VERBATIM in the cloud
         payload — this is what preserves ``same_as`` for non-person
-        entities. Post-redesign there is no code-side scope filter
-        downstream of the model's mapping — omission from the mapping IS
-        the exclusion mechanism, so the stub omits ``acmecorp`` directly
-        rather than typing it and relying on a downstream gate.
+        entities. There is no code-side scope filter downstream of the
+        model's mapping — omission from the mapping IS the exclusion
+        mechanism, so the stub omits ``acmecorp`` directly rather than
+        typing it and relying on a downstream gate.
 
         Mutation: mask every entity regardless of what the mapping stub
         omitted -> "acmecorp" is also tokenised -> this test fails.

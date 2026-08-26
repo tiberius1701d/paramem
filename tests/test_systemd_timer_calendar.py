@@ -111,8 +111,8 @@ class TestParseScheduleCalendarConversions:
         assert spec is not None
         assert spec.kind == "calendar"
         assert spec.on_calendar == expected_calendar
-        # TimerSpec no longer carries on_boot_sec/on_unit_active_sec fields at
-        # all (monotonic kind deleted — see systemd_timer module docstring).
+        # TimerSpec has no on_boot_sec/on_unit_active_sec fields; there is
+        # no monotonic kind (see systemd_timer module docstring).
         assert not hasattr(spec, "on_boot_sec")
         assert not hasattr(spec, "on_unit_active_sec")
 
@@ -210,9 +210,9 @@ class TestRenderTimerUnitCalendar:
         assert "Persistent=true" in text
 
     def test_every_5h_rendered_unit_has_persistent(self):
-        """'every 5h' renders as a heartbeat OnCalendar with Persistent=true
-        (catch-up gate rework) — it no longer renders as a bare monotonic
-        OnBootSec/OnUnitActiveSec timer with no catch-up.
+        """'every 5h' renders as a heartbeat OnCalendar with Persistent=true,
+        never as a bare monotonic OnBootSec/OnUnitActiveSec timer with no
+        catch-up.
         """
         spec = parse_schedule("every 5h")
         assert spec is not None
@@ -237,7 +237,8 @@ class TestRenderTimerUnitCalendar:
 
 
 class TestFloorToHeartbeatDriftRegression:
-    """The highest-value regression test in this suite for the heartbeat-floored stamp.
+    """The heartbeat-floored stamp keeps consecutive dispatches exactly
+    period-apart despite dispatch-delay jitter.
 
     Without flooring, stamping raw ``time.time()`` after a non-zero dispatch
     delay pushes every subsequent due-check one heartbeat late, silently
@@ -286,8 +287,9 @@ class TestFloorToHeartbeatDriftRegression:
         )
 
     def test_unfloored_stamp_would_drift(self):
-        """Sanity check that the regression is real: stamping raw dispatch
-        time (no flooring) does NOT stay period-apart under the same delays.
+        """Control case: stamping raw dispatch time (no flooring) does NOT
+        stay period-apart under the same delays — this is what flooring
+        fixes.
         """
         period_s = 5 * 3600
         heartbeat_fire_times = [
@@ -302,8 +304,8 @@ class TestFloorToHeartbeatDriftRegression:
         ]
         raw_gaps = [raw_stamps[i + 1] - raw_stamps[i] for i in range(len(raw_stamps) - 1)]
         assert raw_gaps != [period_s, period_s], (
-            "Expected the un-floored gaps to drift with delay — if this fails, "
-            "the regression this test guards no longer reproduces"
+            "Expected the un-floored gaps to drift with delay — flooring is "
+            "what keeps consecutive dispatches period-apart"
         )
 
     def test_floor_is_idempotent_on_an_already_floored_stamp(self):
@@ -618,7 +620,7 @@ class TestReconcileDetailString:
 
     def test_heartbeat_detail_says_with_catchup(self, tmp_path, monkeypatch):
         """'every 5h' (a heartbeat-grid, non-exact cadence) still reports
-        'with catch-up' — the 'no catch-up' detail branch no longer exists.
+        'with catch-up' — there is no 'no catch-up' detail branch.
         """
         monkeypatch.setattr(systemd_timer, "UNIT_DIR", tmp_path)
         monkeypatch.setattr(systemd_timer, "TIMER_PATH", tmp_path / "paramem-consolidate.timer")

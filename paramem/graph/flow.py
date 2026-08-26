@@ -14,11 +14,10 @@ The one exception is :func:`~paramem.graph.phase_trace.chain_stopped`,
 which is a control-flow signal (a contextvar read), not an extraction
 primitive.
 
-The first (and, at present, only) consumer is
+The only consumer is
 ``paramem.graph.flows.SESSION_EXTRACT`` — the ``local_extract`` ->
 ``second_order_extract`` -> ``anonymize`` -> ``enrich`` -> ``deanonymize``
--> ``rebuild`` flow that used to be an imperative if-cascade inside
-``extract_graph``. Stage bodies are split across
+-> ``rebuild`` flow. Stage bodies are split across
 ``paramem.graph.stage_anonymize``, ``paramem.graph.stage_enrich`` and
 ``paramem.graph.flows`` (which also owns ``SESSION_EXTRACT`` itself and
 ``extract_graph``); see those modules for the concrete stage specs — this
@@ -157,9 +156,9 @@ class StageSpec:
             that primitive opens too. ``()`` for a stage that opens none
             (a pure gate or a pure data transform). This is a
             DECLARATION, not a label: :func:`run_flow` never opens a
-            phase itself (each stage body opens its own scopes exactly
-            as it did before this runner existed), so the field's only
-            job is to be checkable — a well-formedness check
+            phase itself — each stage body opens its own scopes
+            independently — so the field's only job is to be checkable:
+            a well-formedness check
             (``tests/graph/test_flow.py``) asserts every declared name is
             a :data:`~paramem.graph.phase_trace.PHASE_NAMES` member, and
             a reader can see which phases a run can produce without

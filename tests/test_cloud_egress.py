@@ -2,9 +2,8 @@
 (``CloudScope`` observed scoping, binding-value pruning,
 ``deanonymize_facts``/``deanonymize_text``).
 
-Pure-Python. These tests pin behaviour that is unchanged by the
-anonymization single-duty call split (the split touches only how
-``AnonymizedContract`` is produced, never how it is consumed here).
+Pure-Python. These tests pin how ``AnonymizedContract`` is consumed;
+production of it is out of scope here.
 """
 
 from __future__ import annotations
@@ -42,10 +41,8 @@ class TestCloudScopeObservedScoping:
 
 
 class TestCloudScopeBindingValuePruning:
-    """``CloudScope.response`` (2026-07-22 cloud-admission redesign):
-    a binding whose own VALUE still carries an unresolvable placeholder
-    token is pruned entirely, ONE pass — replacing the fatal binding-value
-    scan that used to live in ``_check_mapping_totality``.
+    """``CloudScope.response``: a binding whose own VALUE still carries an
+    unresolvable placeholder token is pruned entirely, in ONE pass.
     """
 
     def _payload(self, reverse: dict[str, str], declared: frozenset[str]) -> AnonymizedContract:
@@ -114,11 +111,10 @@ class TestCloudScopeBindingValuePruning:
 
 
 class TestDeanonymizeFactsAlwaysSubstitutes:
-    """``deanonymize_facts`` takes NO graph and mutates nothing.  Always
-    substitutes now (2026-07-22 cloud-admission redesign retired the
-    whole-delta accept/reject ``verdict`` ``DeanonResult`` used to carry) —
-    the fail-closed residual sweep (surfaced as ``predicate_dropped`` /
-    ``residual_dropped``) is what still sheds an individual fact, and
+    """``deanonymize_facts`` takes NO graph and mutates nothing, and always
+    substitutes: there is no whole-delta accept/reject verdict.  The
+    fail-closed residual sweep (surfaced as ``predicate_dropped`` /
+    ``residual_dropped``) is what sheds an individual fact, and
     ``collisions`` is always an informational diagnostic. Diagnostics are
     the caller's business (see
     ``paramem.graph.extractor._record_binding_diagnostics``).
@@ -191,8 +187,7 @@ class TestDeanonymizeFactsAlwaysSubstitutes:
         entry — the diagnostic the caller writes to
         ``cloud_binding_collisions`` — but is otherwise INERT: CORE-LAST
         precedence resolves the fact via the CORE reverse map regardless,
-        never rejecting anything. Inverts the pre-redesign expectation
-        (used to reject the whole delta).
+        never rejecting anything.
         """
         payload = AnonymizedContract(
             status="ok",

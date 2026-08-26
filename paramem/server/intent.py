@@ -488,9 +488,7 @@ def classify_intent(
 
     PA graph match is intentionally **not** a state signal.  Speaker
     enrollment scopes keys at the router layer; intent comes from query
-    content via the encoder.  This removes the previous "speaker-in-graph
-    → PERSONAL" short-circuit that misrouted imperatives from enrolled
-    speakers.
+    content via the encoder.
 
     The function never raises — encoder/embedding errors or
     misconfiguration produce a fail-safe result rather than blocking

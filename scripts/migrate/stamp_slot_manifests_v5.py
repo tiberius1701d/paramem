@@ -541,10 +541,10 @@ def _migrate_tier(label: str, tier_root: Path, *, dry_run: bool) -> _TierResult:
         and new_registry_bytes != raw_registry_bytes
     )
 
-    # Idempotence is binding-inclusive (module docstring / the sibling
-    # plan's Q1): a tier is a no-op iff its registry already parses under
-    # the new shape AND its bound slot's manifest already carries THAT
-    # registry's digest. A bound slot can carry a stale registry_sha256
+    # Idempotence is binding-inclusive (module docstring): a tier is a
+    # no-op iff its registry already parses under the new shape AND its
+    # bound slot's manifest already carries THAT registry's digest. A
+    # bound slot can carry a stale registry_sha256
     # (still recording old_digest) even when its OWN schema_version is
     # already current -- a registry rewrite (pre-change "stale" shape ->
     # bare sorted ids) changes the tier's digest independently of any

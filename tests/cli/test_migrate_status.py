@@ -6,7 +6,7 @@ Covers:
 - state/trial.json exists → print contents.
 - state/trial.json does not exist → print "server offline; no trial marker on disk" + exit 0.
 - --json mode.
-- Correction 4: _trial_json_path returns data/ha/state/trial.json (not cwd-relative state/).
+- _trial_json_path returns <paths.data>/state/trial.json (not cwd-relative state/).
 - Marker-present: offline + real TrialMarker JSON at data/ha/state/trial.json → renders TRIAL.
 """
 
@@ -202,7 +202,7 @@ class TestTrialJsonPathCorrection:
         configs/server.yaml existing. load_server_config anchors a relative
         paths.data to the project root, so the marker path must be absolute and
         equal to <paths.data>/state/trial.json — never a cwd-relative bare
-        state/trial.json (Correction 4).
+        state/trial.json.
         """
         from paramem.server.config import load_server_config
 
@@ -214,7 +214,7 @@ class TestTrialJsonPathCorrection:
         assert path.is_absolute(), f"_trial_json_path must resolve to an absolute path: {path!r}"
         assert path == expected, (
             f"_trial_json_path returned {path!r}; expected <paths.data>/state/trial.json "
-            f"= {expected!r}. Correction 4: marker lives under paths.data/state/trial.json."
+            f"= {expected!r}. The marker lives under paths.data/state/trial.json."
         )
 
     def test_migrate_status_offline_marker_present_renders_trial_state(

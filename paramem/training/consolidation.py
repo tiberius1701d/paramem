@@ -585,9 +585,8 @@ class FoldScope:
             cloud enrichment already runs at extraction time over the
             anonymized transcript (:mod:`paramem.graph.stage_enrich`), which
             has strictly better context than a graph-only pass would at
-            interim scope; the graph-only pass's measured interim output was
-            11/15 predicate paraphrases (2026-07-28); cross-session
-            inference over the cumulative graph remains the full fold's job.
+            interim scope; cross-session inference over the cumulative
+            graph remains the full fold's job.
 
     Whether an event folds pending-session relations is not a field of
     this class at all: it is the presence of a :class:`PendingRelations`
@@ -766,12 +765,10 @@ class ConsolidationLoop:
             run_id = f"{ts}_{secrets.token_hex(3)}"
         self.run_id = run_id
         # Debug-snapshot root (paths.debug); tier/interim/cycle/run nesting
-        # is added per-write via :meth:`snapshot_dir_for` (2026-05-15
-        # hierarchy spec — paths.debug/episodic/[interim_<stamp>/]cycle_<N>/
-        # run_<run_id>/).  ``self.snapshot_dir`` (legacy attribute) preserved
-        # for the HF-Trainer checkpoint dir builder in
-        # :meth:`_training_output_dir`, which is out of scope for the
-        # debug-layout cleanup.
+        # is added per-write via :meth:`snapshot_dir_for`
+        # (paths.debug/episodic/[interim_<stamp>/]cycle_<N>/run_<run_id>/).
+        # ``self.snapshot_dir`` is preserved for the HF-Trainer checkpoint
+        # dir builder in :meth:`_training_output_dir`.
         self._debug_base: Path | None = Path(snapshot_dir) if snapshot_dir else None
         self.snapshot_dir = self._debug_base / f"run_{self.run_id}" if self._debug_base else None
         self.prompts_dir = prompts_dir
@@ -822,7 +819,7 @@ class ConsolidationLoop:
             model_name=model_name,
         )
 
-        # Graph-level cloud enrichment knobs (Task #10).
+        # Graph-level cloud enrichment knobs.
         self.graph_enrichment_neighborhood_hops = graph_enrichment_neighborhood_hops
         self.graph_enrichment_max_entities_per_pass = graph_enrichment_max_entities_per_pass
 
@@ -969,9 +966,9 @@ class ConsolidationLoop:
         :attr:`store`'s already-loaded bookkeeping — the ordinary boot
         sequence loads registries, then bookkeeping
         (:meth:`~paramem.memory.store.MemoryStore.load_bookkeeping_from_disk`),
-        then calls this — rather than from a global ``promoted_keys`` list,
-        which no longer exists.  Per-key rows are the bookkeeping loader's
-        business, not this method's.
+        then calls this — rather than from a global ``promoted_keys`` list.
+        Per-key rows are the bookkeeping loader's business, not this
+        method's.
 
         Per the wipe invariant: a tier's ``key_metadata.json`` is
         bookkeeping, not a recovery source.
@@ -1155,8 +1152,8 @@ class ConsolidationLoop:
             speaker_id: Speaker scope.
             relation_type: Model-assigned relation type from extraction
                 (e.g. ``"factual"``, ``"preference"``, ``"temporal"``,
-                ``"social"``).  Defaults to ``"factual"`` for legacy callers
-                that pre-date this field; pass explicitly at every new site.
+                ``"social"``).  Defaults to ``"factual"`` when unspecified;
+                pass explicitly at every call site that has one available.
 
         Returns:
             Dict with the canonical cache shape.
@@ -1182,9 +1179,8 @@ class ConsolidationLoop:
 
         Gradient checkpointing is disabled by ``evaluate_indexed_recall``
         itself for the duration of the probe and re-enabled here afterward
-        (when configured on), since this now runs mid-fold — before the
-        promote and before the next tier trains — rather than after training
-        has fully finished.
+        (when configured on) — this runs mid-fold, before the promote and
+        before the next tier trains.
 
         Args:
             adapter_name: Active adapter name for the probe — the staging
@@ -1317,14 +1313,14 @@ class ConsolidationLoop:
     def snapshot_dir_for(self, *, interim_stamp: str | None = None) -> Path | None:
         """Return this loop's per-cycle/per-run debug-snapshot directory.
 
-        Layout (2026-05-14 locked spec):
+        Layout:
 
             paths.debug/episodic/[interim_<stamp>/]cycle_<N>/run_<run_id>/
 
         Tier prefix is fixed to ``episodic`` since every cycle's
         graph/relation/sessions debug artifacts are anchored on the
-        episodic-primary extraction; procedural / semantic-only writers
-        (none today) can introduce their own tier roots when needed.
+        episodic-primary extraction; a procedural / semantic-only writer
+        can introduce its own tier root when needed.
 
         Returns ``None`` when debug snapshots are disabled (no
         ``snapshot_dir`` was wired into the loop).
@@ -1392,8 +1388,8 @@ class ConsolidationLoop:
                 chokepoint as ``timestamp`` so a NEW fact's edge
                 ``last_seen`` reflects when it was asserted, not when
                 extraction ran. ``None`` (default) falls back to ``now()``
-                at the extractor layer — preserves behaviour for callers
-                that don't yet have a real session-start time.
+                at the extractor layer — for callers that have no real
+                session-start time to supply.
 
         Raises:
             ExtractionFailed: A local-extraction pass (``local_extract``,
@@ -1561,8 +1557,8 @@ class ConsolidationLoop:
         # plausibility-filter peak, that retained pool can hold ~700-1500 MiB
         # which dxg counts as in-use.  Without this, multi-session cycles
         # accumulate host-side residency until ``dxgkio_make_resident`` fails
-        # with ENOMEM on the next session's first growth — the dxg crash class
-        # we measured on 2026-05-04.  Uses ``safe_empty_cache`` (not a bare
+        # with ENOMEM on the next session's first growth.  Uses
+        # ``safe_empty_cache`` (not a bare
         # ``torch.cuda.empty_cache``) so the cuBLAS workspaces the extraction
         # chain's ~4 generate calls allocate outside the PyTorch allocator
         # (~280 MiB/cycle, untouched by ``empty_cache``) are released too.  In
@@ -1616,8 +1612,8 @@ class ConsolidationLoop:
         """Reconcile the ``enrichment_degraded`` incident state for a batch
         of sessions.
 
-        THE public door for the arbitration ``extract_session`` no longer
-        performs itself (writing an incident from inside extraction would
+        THE public door for the arbitration — ``extract_session`` itself
+        never performs it (writing an incident from inside extraction would
         let a non-staging run — a calibration probe running the same chain —
         mutate production incident state).  Called once per batch, after
         extraction, by a STAGING caller only — the server layer's own
@@ -1650,7 +1646,7 @@ class ConsolidationLoop:
 
         - ``"ok"`` / ``"opted_out"`` (opted-out still reaches ``enrich``):
           resolve ``anonymize``, then arbitrate ``cloud_enrich`` by
-          ``cloud_enrichment_degraded`` as before this method existed.
+          ``cloud_enrichment_degraded``.
         - ``"failed"``: record a distinct incident keyed ``anonymize``
           (same-type-different-key, like ``graph_enrich_vram``);
           ``cloud_enrich`` is left untouched.
@@ -2125,10 +2121,9 @@ class ConsolidationLoop:
                 rejected by the config validator.
             interim_overflow_slack: Number of extra overflow slots allowed
                 beyond ``max_interim_count`` before keep-pending kicks in.
-                At 0 (default), cap_pending fires immediately when ``c >= N``
-                (identical to the original no-slack behavior).  At slack > 0,
-                the gate is:
-                    c < N           → normal mint (unchanged)
+                At 0 (default), cap_pending fires immediately when ``c >= N``.
+                At slack > 0, the gate is:
+                    c < N           → normal mint
                     N <= c < N+slack → overflow mint; result["overflow_slot"]=True
                     c >= N+slack    → cap_pending (keep sessions pending)
                 Counted against PEFT-resident adapters; the slack is proven
@@ -2814,7 +2809,7 @@ class ConsolidationLoop:
                 The simulate fold has no weight venue to train pending sessions into,
                 so it would discard the content; callers derive whether to pass
                 *pending* from ``max_interim_count == 0 and mode != "simulate"``,
-                which cannot produce that pairing today.  The guard exists so a
+                which cannot produce that pairing.  The guard exists so a
                 future caller that gets the derivation wrong fails loudly instead
                 of silently ingesting nothing.
             RuntimeError: When ``mode="train"`` is called without the GPU lock held.
@@ -2908,9 +2903,9 @@ class ConsolidationLoop:
                 relation-derived guess.  Unused (may be ``None``) otherwise.
 
         Returns:
-            A result dict carrying the fields still meaningful under this
-            design (``tiers_rebuilt``) plus the now-vestigial fields kept
-            empty for callers that read them positionally.
+            A result dict carrying the fields meaningful under this design
+            (``tiers_rebuilt``) plus fields kept for callers that read them
+            positionally.
         """
         scope = FoldScope(
             source=source,
@@ -2941,10 +2936,9 @@ class ConsolidationLoop:
         # Mark this CPU-only staging phase as "not training" so a /chat
         # arriving mid-fold gets abort_for_inference's fast no-op instead of
         # waiting out its full quiesce timeout for a training step that is
-        # not running — the same narrowing the old driver applied around its
-        # own non-training phases (BackgroundTrainer._set_is_training's own
-        # docstring).  Restored before the per-tier train/gate/write loop
-        # inside run_build_and_publish, which does touch the GPU.
+        # not running (BackgroundTrainer._set_is_training's own docstring).
+        # Restored before the per-tier train/gate/write loop inside
+        # run_build_and_publish, which does touch the GPU.
         if trainer is not None:
             trainer._set_is_training(False)
         _pending_episodic = pending.episodic if pending is not None else []
@@ -3105,11 +3099,9 @@ class ConsolidationLoop:
 
         ``output_dir/in_training`` is HF-Trainer scratch, unrelated to the
         PEFT slot lifecycle — filesystem-level debris from a crash-resume
-        attempt that never completed. Called once at construction (formerly
-        the tail of the deleted ``ensure_adapters``, which also created the
-        production tiers; tier creation now happens once, before this loop
-        is ever constructed, via ``load_base_model`` /
-        ``paramem.models.loader.ensure_resident_tiers``).
+        attempt that never completed. Called once at construction. Tier
+        creation happens once, before this loop is ever constructed, via
+        ``load_base_model`` / ``paramem.models.loader.ensure_resident_tiers``.
         """
         import shutil
 
@@ -3161,8 +3153,8 @@ class ConsolidationLoop:
             fold, and
             active_store_migration._migrate_tier_simulate_to_train, which
             is routed through this funnel rather than wiring its own
-            callback). None of those three call this helper directly any
-            more — they all reach it transitively via _train_tier_adapter.
+            callback). None of those three call this helper directly —
+            they all reach it transitively via _train_tier_adapter.
 
         A new production-reachable caller MUST call this helper; the
         AST structural test in tests/test_consolidation_recall_early_stop.py
@@ -3406,9 +3398,8 @@ class ConsolidationLoop:
         For a loop whose ``output_dir`` is a scratch tree but whose base
         model matches a real deployment's — a migration trial. Without this
         the trial resolves donors under its own empty output dir, misses,
-        and pays a full inline donor build (37-45 min measured, see
-        :mod:`paramem.training.donor`) for an artifact the deployment
-        already holds.
+        and pays a full inline donor build (see :mod:`paramem.training.donor`)
+        for an artifact the deployment already holds.
 
         Borrowing is read-only BY CONSTRUCTION, not by a second flag: a
         borrowed cache is never built into and never pruned, so a trial
@@ -4036,7 +4027,7 @@ class ConsolidationLoop:
                 candidate-owned keyed fact into its relation_type's rebuilt
                 tier instead of leaving it stranded on a tier that is never
                 built, published or restamped.  ``False`` (the default, and
-                every other caller) preserves today's drop behaviour.
+                every other caller) drops it instead.
 
         Returns:
             tier -> list of keyed rows, one list per rebuilt tier in
@@ -4492,11 +4483,11 @@ class ConsolidationLoop:
            nothing else ever revisits.
         1. Consumes the event's already-extracted material (*episodic_rels*
            / *procedural_rels* — the same :class:`Relation` objects the
-           existing extraction pipeline produces) through the same
+           extraction pipeline produces) through the same
            :class:`~paramem.graph.merger.GraphMerger` and the same
-           :meth:`build_tier_refiner` enrichment topology the old driver
-           uses.  Extraction itself (session -> relations) is unchanged and
-           stays wherever it already runs; this method never calls it.
+           :meth:`build_tier_refiner` enrichment topology.  Extraction
+           itself (session -> relations) runs wherever the caller invokes
+           it; this method never calls it.
         2. Recalls every tier in *primary_tiers* / *candidate_tiers* into a
            working copy (:meth:`_recall_working_tiers`), then, in this
            order: credits reinforcement
@@ -4673,8 +4664,7 @@ class ConsolidationLoop:
                 self._enable_gradient_checkpointing()
 
         # 3. Dedup-only/candidate-tier content, merged LAST, never
-        #    contradiction-resolved (mirrors the old driver's
-        #    dedup_target_keys ordering rationale).
+        #    contradiction-resolved.
         dedup_relations: list[Relation] = []
         for tier in candidate_tiers:
             dedup_relations.extend(self._working_registry_true_relations(working[tier]))
@@ -5143,10 +5133,9 @@ class ConsolidationLoop:
           (``increment.entries`` stays empty for a rows-only member by
           construction — see :class:`~paramem.memory.increment.TierIncrement`).
 
-        This closes the two holes an older ``increment.keyed``-only walk
-        left open: a rows-only member (``increment.keyed == []``) skipped
-        entirely, and a withheld id (which ``keyed`` never lists) never
-        checked at all.
+        Checking ``list_known()`` rather than ``increment.keyed`` covers both
+        a rows-only member (``increment.keyed == []``) and a withheld id
+        (which ``keyed`` never lists).
 
         Args:
             increment: The tier's assembled increment

@@ -228,6 +228,7 @@ def test_debug_probe_cloud_only_threads_detected_language(monkeypatch):
 
     cloud_result = MagicMock()
     cloud_result.text = "Hallo!"
+    cloud_result.diagnostics = {}
 
     with (
         patch(
@@ -259,6 +260,7 @@ def test_debug_probe_local_threads_detected_language(monkeypatch):
     chat_result = MagicMock()
     chat_result.text = "Hallo!"
     chat_result.escalated = False
+    chat_result.diagnostics = {}
 
     with (
         patch(
@@ -290,6 +292,7 @@ def test_debug_probe_disabled_detection_passes_none(monkeypatch):
 
     cloud_result = MagicMock()
     cloud_result.text = "Hello!"
+    cloud_result.diagnostics = {}
 
     with patch("paramem.server.app._relay_route", return_value=cloud_result) as mock_route:
         client = TestClient(app_module.app, raise_server_exceptions=False)

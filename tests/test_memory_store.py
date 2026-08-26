@@ -79,8 +79,8 @@ class TestQuadPayload:
     def test_bookkeeping_round_trips_speaker_id(self):
         """set_bookkeeping then bookkeeping_for_key returns the correct fields.
 
-        Replaces the deleted setdefault_entry test — bookkeeping is now the
-        canonical owner of speaker_id/relation_type/reinforcement_count/last_seen."""
+        Bookkeeping is the canonical owner of
+        speaker_id/relation_type/reinforcement_count/last_seen."""
         s = MemoryStore()
         s.set_bookkeeping(
             "graph1", speaker_id="spk-a", relation_type="factual", first_seen="", promoted=False
@@ -375,10 +375,10 @@ class TestBookkeeping:
         assert s.bookkeeping_count() == 2
 
     def test_probe_cold_disk_source_key_does_not_backfill_bookkeeping(self):
-        """A cold (previously-unbookkept) key served by a disk source on a
+        """A cold (not-yet-bookkept) key served by a disk source on a
         cache miss must NOT gain a bookkeeping record from that probe — the
-        fold publishes bookkeeping durably itself, and probe is no longer a
-        bookkeeping writer."""
+        fold publishes bookkeeping durably itself; probe never writes
+        bookkeeping."""
         from paramem.memory.entry import entry_simhash
 
         entry = {"key": "graph9", "subject": "Dana", "predicate": "lives_in", "object": "Oslo"}
@@ -983,9 +983,9 @@ class TestSetBookkeepingGuard:
     def test_cased_speaker_id_normalized_to_lowercase(self):
         """set_bookkeeping normalizes is_speaker_id values to lowercase.
 
-        Cased ``Speaker0`` is coerced to ``speaker0``; the router's
-        ``_speaker_key_index`` receives the normalized form, eliminating the
-        silent-drop regression where legacy key_metadata.json held cased ids."""
+        Cased ``Speaker0`` is coerced to ``speaker0``, so the router's
+        ``_speaker_key_index`` always receives the normalized form, even
+        when a stored key_metadata.json holds a cased id."""
         s = MemoryStore()
         s.set_bookkeeping(
             "g1", speaker_id="Speaker0", relation_type="factual", first_seen="", promoted=False
@@ -1016,10 +1016,10 @@ class TestSetBookkeepingGuard:
             )
         assert s.bookkeeping_for_key("g4") is None
 
-    def test_allow_empty_speaker_kwarg_no_longer_exists(self):
-        """The former escape hatch is deleted, not merely unused — passing
-        it raises TypeError (unexpected keyword argument), never silently
-        accepted and ignored."""
+    def test_allow_empty_speaker_kwarg_raises_type_error(self):
+        """There is no allow-empty-speaker escape hatch — passing it raises
+        TypeError (unexpected keyword argument), never silently accepted
+        and ignored."""
         s = MemoryStore()
         with pytest.raises(TypeError):
             s.set_bookkeeping(
@@ -1489,8 +1489,8 @@ class TestDiskMemorySourceMidWindowWrite:
 
 
 class TestReadSimhashRegistryFromDiskCache:
-    """``cached=True`` is opt-in: default behaviour is unchanged (always
-    disk-truth), and the cache is fresh until explicitly invalidated."""
+    """``cached=True`` is opt-in: default behaviour always reflects
+    disk-truth, and the cache is fresh until explicitly invalidated."""
 
     def test_default_uncached_reflects_disk_every_call(self, tmp_path) -> None:
         _write_episodic_registry(tmp_path, {"graph1": 111})

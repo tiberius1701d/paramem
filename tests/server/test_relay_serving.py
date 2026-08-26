@@ -1,22 +1,21 @@
-"""Cloud-egress funnel + degraded-serving contracts at the app layer.
+"""Degraded-serving and relay-fork contracts at the app layer.
 
-Split out of ``tests/test_cloud_agent.py`` (which owns provider adapters and
-``answer_via_cloud``'s policy matrix) because these are endpoint- and
-state-shaped: they pin WHICH funnel a request reaches and WHETHER the cloud
-leg is open, not what the funnel does once entered.
+These pin WHETHER the cloud leg is open under degraded serving and WHICH
+fork (``_relay_route`` vs ``handle_chat``) a turn reaches — endpoint- and
+state-shaped, not what a leg does once entered (that lives with the leg's
+own policy tests).
 
 Covered:
 
-* ``POST /chat`` with ``route="cloud"`` — forced routing selects the
-  PROVIDER; it does not buy a policy bypass.  Both local mode and
-  cloud-only mode route through ``answer_via_cloud`` — the sole
-  cloud-egress funnel; cloud-only passes ``model``/``tokenizer=None`` so
-  the funnel selects its cannot-anonymize (verbatim) branch instead of the
-  ``cloud_mode`` policy.  This endpoint path had no test coverage at all
-  before.
+* Persist-before-resolve on the cloud-only leg: the persisted assistant
+  turn keeps the raw ``speaker{N}`` token; only the returned spoken text
+  has it resolved to a display name.
 * ``cloud.allow_degraded_serving`` — the cloud leg is gated only when the
   server is cloud-only for an INVOLUNTARY reason.
 * The degradation notice fires exactly once per conversation.
+* LOCAL-mode relay fork: ``ServingPath.for_speaker(speaker_id)`` — not
+  server mode alone — decides whether a turn reaches ``_relay_route`` or
+  ``handle_chat``, and the relay leg's live model/tokenizer threading.
 
 CPU-only: no model, no GPU, no network.
 """
@@ -27,17 +26,16 @@ import asyncio
 from unittest.mock import MagicMock, patch
 
 import pytest
-from fastapi.testclient import TestClient
 from peft import PeftModel
 
 import paramem.server.app as app_module
-from paramem.server.inference import ChatResult
+from paramem.server.chat_result import ChatResult
 from paramem.server.session_buffer import SessionBuffer
 
 
 def _peft_model_mock() -> MagicMock:
     """``MagicMock(spec=PeftModel)`` -- passes the ``isinstance(model,
-    PeftModel)`` precondition ``base_model_inference`` now enforces
+    PeftModel)`` precondition ``base_model_inference`` enforces
     wherever a local-mode state's reasoning generate reaches it.
     ``is_gradient_checkpointing`` defaults False and
     ``gradient_checkpointing_disable``/``_enable`` are pre-set -- dynamic
@@ -57,10 +55,7 @@ def _make_config() -> MagicMock:
     cfg.cloud.enabled = True
     cfg.cloud.allow_degraded_serving = False
     cfg.consolidation.abort_quiesce_timeout_s = 5.0
-    # Shaped like the shipped deployment config (configs/server.yaml), so the
-    # tests below that drive the REAL funnel select the anonymize policy
-    # instead of falling into ``answer_via_cloud``'s unknown-value guard
-    # (which maps a bare MagicMock to the safest mode, "block").
+    # Shaped like the shipped deployment config (configs/server.yaml).
     cfg.sanitization.cloud_mode = "anonymize"
     cfg.sanitization.scrub = {"person name"}
     return cfg
@@ -86,239 +81,6 @@ def _make_state(tmp_path, *, mode: str = "local", cloud_only_reason=None) -> dic
         }
     )
     return state
-
-
-# ---------------------------------------------------------------------------
-# POST /chat with route="cloud"
-# ---------------------------------------------------------------------------
-
-
-def _post_chat(client, **body):
-    # Auth is OFF: _make_state's dict carries no "user_token_store" key, so
-    # BearerTokenMiddleware's getter returns None and no header is needed.
-    return client.post("/chat", json=body, headers={})
-
-
-class TestForcedCloudRouting:
-    def test_local_mode_goes_through_the_funnel(self, tmp_path, monkeypatch):
-        """``route="cloud"`` in local mode reaches ``answer_via_cloud`` with
-        a live model/tokenizer — selecting the ``cloud_mode`` policy branch,
-        not the cannot-anonymize branch.
-        """
-        monkeypatch.setattr(app_module, "_state", _make_state(tmp_path, mode="local"))
-
-        with (
-            patch.object(app_module, "_resolve_speaker", return_value=("speaker0", "Alex")),
-            patch.object(
-                app_module,
-                "answer_via_cloud",
-                return_value=ChatResult(text="cloud answer", escalated=True),
-            ) as mock_funnel,
-        ):
-            resp = _post_chat(
-                TestClient(app_module.app),
-                text="What's the population of Berlin?",
-                route="cloud",
-            )
-
-        assert resp.status_code == 200
-        assert resp.json()["text"] == "cloud answer"
-        mock_funnel.assert_called_once()
-        assert mock_funnel.call_args.args[0] == "What's the population of Berlin?"
-        assert mock_funnel.call_args.kwargs["model"] is not None
-        assert mock_funnel.call_args.kwargs["tokenizer"] is not None
-
-    def test_forced_cloud_route_holds_gpu_lock(self, tmp_path, monkeypatch):
-        """The local-mode forced-cloud dispatch reaches the live model (the
-        anonymizer's extract_graph/anonymize_turn calls generate() under
-        base_model_inference), so it needs the same GPU discipline as the
-        routed local path: abort in-flight background training, then hold
-        the shared GPU thread lock for the duration of the dispatch."""
-        from paramem.server.gpu_lock import _gpu_thread_lock
-
-        monkeypatch.setattr(app_module, "_state", _make_state(tmp_path, mode="local"))
-
-        call_order = []
-
-        def fake_abort():
-            call_order.append("abort")
-
-        def fake_funnel(*args, **kwargs):
-            call_order.append(("dispatch", _gpu_thread_lock.locked()))
-            return ChatResult(text="cloud answer", escalated=True)
-
-        with (
-            patch.object(app_module, "_resolve_speaker", return_value=("speaker0", "Alex")),
-            patch.object(
-                app_module, "_abort_background_training_for_inference", side_effect=fake_abort
-            ) as mock_abort,
-            patch.object(app_module, "answer_via_cloud", side_effect=fake_funnel),
-        ):
-            resp = _post_chat(
-                TestClient(app_module.app),
-                text="What's the population of Berlin?",
-                route="cloud",
-            )
-
-        assert resp.status_code == 200
-        mock_abort.assert_called_once()
-        assert call_order == ["abort", ("dispatch", True)], (
-            "the bg-training abort must run before the dispatch, and the "
-            "dispatch must run with the GPU thread lock held"
-        )
-        assert not _gpu_thread_lock.locked(), "the lock must be released after the dispatch"
-
-    def test_local_mode_forwards_the_personal_verdict(self, tmp_path, monkeypatch):
-        """A personal turn on the forced route carries ``is_personal=True``.
-
-        The funnel — not this branch — decides what to do with it, per
-        ``cloud_mode``.  What matters here is that the verdict is computed
-        and passed instead of being skipped.
-        """
-        monkeypatch.setattr(app_module, "_state", _make_state(tmp_path, mode="local"))
-
-        with (
-            patch.object(app_module, "_resolve_speaker", return_value=("speaker0", "Alex")),
-            patch.object(app_module, "answer_via_cloud", return_value=None) as mock_funnel,
-        ):
-            resp = _post_chat(
-                TestClient(app_module.app),
-                text="Where do I live?",
-                route="cloud",
-            )
-
-        assert resp.status_code == 200
-        assert "unavailable" in resp.json()["text"]
-        assert mock_funnel.call_args.kwargs["is_personal"] is True
-
-    def test_local_mode_non_personal_verdict_is_false(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(app_module, "_state", _make_state(tmp_path, mode="local"))
-
-        with (
-            patch.object(app_module, "_resolve_speaker", return_value=("speaker0", "Alex")),
-            patch.object(
-                app_module,
-                "answer_via_cloud",
-                return_value=ChatResult(text="ok", escalated=True),
-            ) as mock_funnel,
-        ):
-            _post_chat(
-                TestClient(app_module.app),
-                text="What is the boiling point of water?",
-                route="cloud",
-            )
-
-        assert mock_funnel.call_args.kwargs["is_personal"] is False
-
-    def test_cloud_only_mode_goes_through_the_same_funnel(self, tmp_path, monkeypatch):
-        """Cloud-only also reaches ``answer_via_cloud`` — with no local model
-        (``model``/``tokenizer=None``) so the funnel selects its
-        cannot-anonymize (verbatim) branch instead of the ``cloud_mode``
-        policy.  There is no separate bypass primitive on this path anymore.
-        """
-        monkeypatch.setattr(app_module, "_state", _make_state(tmp_path, mode="cloud-only"))
-
-        with (
-            patch.object(app_module, "_resolve_speaker", return_value=("speaker0", "Alex")),
-            patch.object(
-                app_module,
-                "answer_via_cloud",
-                return_value=ChatResult(text="cloud answer", escalated=True),
-            ) as mock_funnel,
-        ):
-            resp = _post_chat(
-                TestClient(app_module.app),
-                text="What's the population of Berlin?",
-                route="cloud",
-            )
-
-        assert resp.json()["text"] == "cloud answer"
-        mock_funnel.assert_called_once()
-        assert mock_funnel.call_args.kwargs["model"] is None
-        assert mock_funnel.call_args.kwargs["tokenizer"] is None
-        assert mock_funnel.call_args.kwargs["cloud_permitted"] is True
-
-    def test_unavailable_provider_reports_the_route(self, tmp_path, monkeypatch):
-        state = _make_state(tmp_path, mode="local")
-        state["cloud_agent"] = None
-        monkeypatch.setattr(app_module, "_state", state)
-
-        with patch.object(app_module, "_resolve_speaker", return_value=("speaker0", "Alex")):
-            resp = _post_chat(TestClient(app_module.app), text="hi", route="cloud")
-
-        assert resp.json()["text"] == "Route 'cloud' unavailable."
-        assert resp.json()["escalated"] is False
-
-    def test_forced_cloud_route_resolves_speaker_tokens_before_returning(
-        self, tmp_path, monkeypatch
-    ):
-        """The shared forced-routing exit (``if result and result.text``)
-        resolves any ``speaker{N}`` token in the funnel's answer before it
-        reaches the caller — the same reply-boundary contract as every
-        other exit."""
-        state = _make_state(tmp_path, mode="local")
-        store = MagicMock()
-        store.resolve_speaker_name.side_effect = lambda sid: {"speaker1": "Bob"}.get(sid)
-        state["speaker_store"] = store
-        monkeypatch.setattr(app_module, "_state", state)
-
-        with (
-            patch.object(app_module, "_resolve_speaker", return_value=("speaker0", "Alex")),
-            patch.object(
-                app_module,
-                "answer_via_cloud",
-                return_value=ChatResult(text="speaker1 asked that too.", escalated=True),
-            ),
-        ):
-            resp = _post_chat(TestClient(app_module.app), text="hi", route="cloud")
-
-        assert resp.json()["text"] == "Bob asked that too."
-
-    def test_forced_route_relay_speaker_gets_empty_history(self, tmp_path, monkeypatch):
-        """RELAY on the forced route (no speaker resolved at all) does not
-        buy a history-egress bypass — ``_forced_history`` is ``[]`` exactly
-        like the normal ``/chat`` fork, even though forced routing selects
-        the PROVIDER directly."""
-        state = _make_state(tmp_path, mode="local")
-        monkeypatch.setattr(app_module, "_state", state)
-        state["session_buffer"].append("conv-forced-relay", "user", "earlier turn")
-        state["session_buffer"].append("conv-forced-relay", "assistant", "earlier reply")
-
-        with (
-            patch.object(app_module, "_resolve_speaker", return_value=(None, None)),
-            patch.object(
-                app_module,
-                "answer_via_cloud",
-                return_value=ChatResult(text="cloud answer", escalated=True),
-            ) as mock_funnel,
-        ):
-            _post_chat(
-                TestClient(app_module.app),
-                text="What's the population of Berlin?",
-                route="cloud",
-                conversation_id="conv-forced-relay",
-            )
-
-        assert mock_funnel.call_args.kwargs["history"] == []
-
-    def test_forced_ha_route_resolves_speaker_tokens_before_returning(self, tmp_path, monkeypatch):
-        """Same shared exit, reached via the ``route="ha"`` branch instead
-        of ``route="cloud"`` — both funnel into the one
-        ``resolve_speaker_tokens`` call at the bottom of the forced-routing
-        block."""
-        state = _make_state(tmp_path, mode="local")
-        store = MagicMock()
-        store.resolve_speaker_name.side_effect = lambda sid: {"speaker1": "Bob"}.get(sid)
-        state["speaker_store"] = store
-        ha_client = MagicMock()
-        ha_client.conversation_process.return_value = "speaker1 asked that too."
-        state["ha_client"] = ha_client
-        monkeypatch.setattr(app_module, "_state", state)
-
-        with patch.object(app_module, "_resolve_speaker", return_value=("speaker0", "Alex")):
-            resp = _post_chat(TestClient(app_module.app), text="hi", route="ha")
-
-        assert resp.json()["text"] == "Bob asked that too."
 
 
 # ---------------------------------------------------------------------------
@@ -355,6 +117,31 @@ def test_persist_before_resolve_cloud_only_leg(tmp_path, monkeypatch):
     assistant_turns = [t for t in turns if t["role"] == "assistant"]
     assert len(assistant_turns) == 1
     assert assistant_turns[0]["text"] == "speaker0 asked about the weather."
+
+
+# ---------------------------------------------------------------------------
+# Cloud door — absent agent writes no record
+# ---------------------------------------------------------------------------
+
+
+def test_cloud_agent_none_writes_neither_cloud_key():
+    """``answer_via_cloud`` returns ``None`` immediately when ``cloud_agent``
+    is absent, before any diagnostics write — there was no cloud leg to
+    refuse, so neither ``cloud_egress`` nor ``cloud_refusal`` is stamped."""
+    from paramem.server.egress import OutboundText, answer_via_cloud
+
+    diagnostics: dict = {}
+    outbound = OutboundText(
+        "What's the population of Berlin?",
+        _make_config(),
+        diagnostics=diagnostics,
+    )
+
+    result = answer_via_cloud(outbound, None)
+
+    assert result is None
+    assert "cloud_egress" not in diagnostics
+    assert "cloud_refusal" not in diagnostics
 
 
 # ---------------------------------------------------------------------------
@@ -499,11 +286,10 @@ def test_no_notice_for_deliberate_cloud_only(tmp_path, monkeypatch):
 class TestLocalModeRelayFork:
     """``_run_chat_turn`` forks on ``ServingPath.for_speaker(speaker_id)``,
     computed internally — NOT on server mode alone.  A speakerless turn on
-    an otherwise-healthy LOCAL server must still reach the relay path.  A
-    regression that reverts the fork to a mode-only check
-    (``_state["mode"] == "cloud-only"``) would pass every pre-existing
-    cloud-only-mode test in this file while silently breaking this exact
-    case — these tests exist to catch that regression.
+    an otherwise-healthy LOCAL server must still reach the relay path, even
+    though a mode-only check (``_state["mode"] == "cloud-only"``) would pass
+    every cloud-only-mode test elsewhere in this file while missing this
+    exact case.
     """
 
     def test_local_mode_speakerless_calls_relay_route_not_handle_chat(self, tmp_path, monkeypatch):
@@ -579,7 +365,7 @@ class TestLocalModeRelayFork:
 
 
 # ---------------------------------------------------------------------------
-# Relay leg passes live model/tokenizer in LOCAL mode (owner-ruled fix)
+# Relay leg passes live model/tokenizer in LOCAL mode
 # ---------------------------------------------------------------------------
 
 
@@ -587,9 +373,9 @@ class TestRelayLegLocalModelThreading:
     """LOCAL-mode relay dispatch (a speakerless turn on an otherwise-healthy
     server) must pass the LIVE model/tokenizer into ``_relay_route`` so its
     cloud leg can sanitize via the local anonymizer instead of skipping it —
-    the owner-ruled fix for personal declaratives egressing verbatim.  A
-    server-wide cloud-only turn keeps ``model``/``tokenizer=None`` (no local
-    model exists there)."""
+    a personal declarative must not egress verbatim.  A server-wide
+    cloud-only turn keeps ``model``/``tokenizer=None`` (no local model
+    exists there)."""
 
     def test_local_mode_relay_receives_live_model_and_tokenizer(self, tmp_path, monkeypatch):
         state = _make_state(tmp_path, mode="local")

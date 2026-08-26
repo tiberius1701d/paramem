@@ -287,10 +287,9 @@ class TestApplyConfigLiveSchedulerParticipation:
     ):
         """A backup-schedule-only edit (config A off -> config B 'daily 05:00')
         is reconciled into the paramem-backup systemd timer by
-        _apply_config_live — proving _reconcile_scheduling_timers (not just
-        the consolidation-only call it replaced) is wired into the live-apply
-        path, closing the gap where a live security.backups.schedule edit
-        never reached systemd.
+        _apply_config_live via _reconcile_scheduling_timers, which reconciles
+        both the consolidation and backup timers in the live-apply path, so a
+        live security.backups.schedule edit reaches systemd.
         """
         import paramem.server.app as app_module
 
@@ -334,7 +333,7 @@ class TestApplyConfigLiveSchedulerParticipation:
     def test_cadence_change_applies_live_without_restart(self, tmp_path, monkeypatch):
         """A cadence-only edit (config A '12h' -> config B '6h') is reconciled
         into the systemd timer by _apply_config_live, with no restart
-        required — proving the scheduler is now a live-apply participant.
+        required — the scheduler is a live-apply participant.
         """
         import paramem.server.app as app_module
 

@@ -366,10 +366,9 @@ class TestTrialActive409:
 # POST /ingest-sessions/cancel — the pending-record guard
 #
 # ``active_consolidation()``'s pending-record arm (``deferred_event_pending``
-# -> ``consolidation_pending``) had zero coverage for this door before this
-# pin (verified: the only guard exercised anywhere in this file is
-# trial_active, and only for ``/ingest-sessions``, never ``/cancel``).  See
-# also ``tests/server/test_consolidate_dispatch.py::TestFiveDoorPendingRecordGuard``,
+# -> ``consolidation_pending``) gates this door exactly as it gates the
+# other mutating doors.  See also
+# ``tests/server/test_consolidate_dispatch.py::TestFiveDoorPendingRecordGuard``,
 # which pins the same arm across the other four mutating doors.
 # ---------------------------------------------------------------------------
 
@@ -378,7 +377,7 @@ class TestCancelPendingRecordGuard:
     def test_cancel_refuses_with_a_pending_record(self, client, state):
         """A pending stage ledger refuses the cancel with 409
         ``consolidation_pending`` -- distinct from ``trial_active`` and the
-        other four busy-arm verdicts, and never reached before this pin."""
+        other four busy-arm verdicts."""
         from tests.server._state_builders import _write_pending_ledger
 
         _write_pending_ledger(state["config"].paths.data, event="interim")

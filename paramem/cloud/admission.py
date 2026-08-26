@@ -1,14 +1,10 @@
 """Cloud-egress admission — the single answer to "may we call a cloud LLM?".
 
-Five sites used to answer that question with different sets of terms:
+:func:`evaluate_cloud_egress` is the one place the decision is computed —
 session-tier cloud enrichment, graph-tier enrichment, graph-tier predicate
 normalization, the ``/calibrate/enrich`` endpoint, and the conversation
-agent's own ``is_available`` predicate.  One omitted the master switch
-entirely, so an operator-triggered endpoint could egress with the switch
-off; another accepted "endpoint configured, no key" and sent an empty
-``Authorization: Bearer``.  :func:`evaluate_cloud_egress` is now the only
-place the decision is computed; every caller reads the
-:class:`EgressVerdict` it returns and decides what to DO about a refusal
+agent's own ``is_available`` predicate all read the
+:class:`EgressVerdict` it returns and decide what to DO about a refusal
 (skip silently, fall back to the local model, raise, or decline to build
 the agent) — the decision itself is not re-derived anywhere.
 
@@ -16,10 +12,10 @@ The switch it takes is the ONE master switch, ``cloud.enabled``
 (:class:`paramem.server.config.CloudConfig`).
 
 :func:`scrubbing_reachable` answers a related, narrower question — whether a
-configuration can reach a cloud LLM *with scrubbing on* — by composing
-:func:`evaluate_cloud_egress` with the chat-egress path, so a caller
-deciding whether to load a scrubbing-dependent resource has one function to
-call rather than re-deriving the composition itself.
+configuration has an external-egress path that needs scrubbing — by
+composing :func:`evaluate_cloud_egress` with the chat-egress path and the HA
+path, so a caller deciding whether to load a scrubbing-dependent resource has
+one function to call rather than re-deriving the composition itself.
 
 Leaf module by construction: stdlib only.  It must not import from
 ``paramem.graph``, ``paramem.training`` or ``paramem.server`` — the graph
@@ -200,11 +196,12 @@ def scrubbing_reachable(
     provider: str,
     model: str,
     endpoint: str | None,
+    ha_agent_id: str,
+    ha_tools_configured: bool,
 ) -> bool:
-    """Decide whether a configuration can reach a cloud LLM with scrubbing on.
+    """Decide whether a configuration has an external-egress path that needs scrubbing.
 
-    ``True`` iff *scrub_enabled* AND at least one of two cloud-reaching
-    paths holds:
+    ``True`` iff *scrub_enabled* AND at least one of three egress paths holds:
 
     1. :func:`evaluate_cloud_egress` (called with *cloud_enabled*,
        *provider*, *model*, *endpoint*) reports ``permitted`` — the exact
@@ -215,11 +212,14 @@ def scrubbing_reachable(
     2. ``cloud_enabled`` is on and *cloud_mode* is ``"anonymize"`` or
        ``"both"`` (the closed vocabulary validated by
        ``SanitizationConfig.cloud_mode``, ``paramem/server/config.py``) —
-       the chat-egress path, which reaches a cloud LLM independently of
+       the chat cloud leg, which reaches a cloud LLM independently of
        :func:`evaluate_cloud_egress`'s provider/key/endpoint terms.
+    3. *ha_agent_id* is non-empty AND *ha_tools_configured* — the HA leg,
+       which scrubs unconditionally and does not require *cloud_enabled*:
+       HA is a local recipient, reachable with the master cloud switch off.
 
     The graph tier's ``refinement_enrichment == "on"`` setting is not a
-    third term here: it is path 1 plus one extra flag, so it can never be
+    fourth term here: it is path 1 plus one extra flag, so it can never be
     true where path 1 is false — its absence from this predicate is
     derived, not forgotten.
 
@@ -245,10 +245,17 @@ def scrubbing_reachable(
             :func:`evaluate_cloud_egress`.
         endpoint: Explicit endpoint override, or ``None``, passed through
             to :func:`evaluate_cloud_egress`.
+        ha_agent_id: Configured HA conversation agent id
+            (``config.ha_agent_id``); empty means HA escalation is not
+            configured. Required, no default — a default would let a
+            caller silently close this term by omission.
+        ha_tools_configured: Whether an HA client can be built
+            (``config.tools.ha.configured``). Required, no default, for
+            the same reason as *ha_agent_id*.
 
     Returns:
-        ``True`` when scrubbing is configured and at least one egress path
-        can reach a cloud LLM.
+        ``True`` when scrubbing is configured and at least one
+        external-egress path can reach a recipient.
     """
     if not scrub_enabled:
         return False
@@ -259,4 +266,6 @@ def scrubbing_reachable(
         endpoint=endpoint,
     ).permitted:
         return True
-    return cloud_enabled and cloud_mode in {"anonymize", "both"}
+    if cloud_enabled and cloud_mode in {"anonymize", "both"}:
+        return True
+    return bool(ha_agent_id) and ha_tools_configured

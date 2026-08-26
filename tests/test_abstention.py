@@ -121,7 +121,7 @@ class TestAbstentionShortCircuit:
 
         ``intent`` defaults to PERSONAL because every abstention test in
         this class deals with personal-class queries — that is the
-        signal that drives abstention now.  Pass ``Intent.UNKNOWN`` /
+        signal that drives abstention.  Pass ``Intent.UNKNOWN`` /
         ``Intent.GENERAL`` when testing non-personal paths.
         """
         from paramem.server.router import Intent, RoutingPlan
@@ -283,7 +283,8 @@ class TestAbstentionShortCircuit:
         ``"I'm Alex. I live in Kelkham."`` instead of a conversational
         acknowledgement.
         """
-        from paramem.server.inference import ChatResult, handle_chat
+        from paramem.server.chat_result import ChatResult
+        from paramem.server.inference import handle_chat
 
         config = ServerConfig()
 
@@ -314,9 +315,10 @@ class TestAbstentionShortCircuit:
         assert result.text != config.abstention.load_response()
 
     def test_disabled_falls_through_to_base_model(self):
-        """With abstention.enabled=False, behavior matches pre-change:
-        last-resort ``_base_model_answer`` still runs."""
-        from paramem.server.inference import ChatResult, handle_chat
+        """With abstention.enabled=False, ``_base_model_answer`` still runs
+        as the last resort."""
+        from paramem.server.chat_result import ChatResult
+        from paramem.server.inference import handle_chat
 
         config = ServerConfig()
         config.abstention.enabled = False
@@ -346,209 +348,6 @@ class TestAbstentionShortCircuit:
 
         mock_base_model.assert_called_once()
         assert result.text == "base model answer"
-
-    def test_skipped_when_cloud_available(self):
-        """Non-personal query (sanitizer allowed) + no local match →
-        cloud escalation path runs; abstention does not fire."""
-        from paramem.server.inference import ChatResult, handle_chat
-        from paramem.server.router import Intent
-
-        config = ServerConfig()
-
-        with (
-            patch(
-                "paramem.server.inference.is_self_referential",
-                return_value=False,
-            ),
-            patch(
-                "paramem.server.inference._escalate_to_ha_agent",
-                return_value=ChatResult(text="cloud handled it", escalated=True),
-            ) as mock_ha,
-            patch("paramem.server.inference._base_model_answer") as mock_base_model,
-        ):
-            result = handle_chat(
-                text="What's the weather?",
-                conversation_id="test",
-                speaker="Alex",
-                history=None,
-                model=self._minimal_mock_model(),
-                tokenizer=MagicMock(),
-                config=config,
-                router=self._make_none_match_router(intent=Intent.GENERAL),
-                speaker_id="spk-abc123",
-                memory_store=_MS(),
-            )
-
-        mock_ha.assert_called_once()
-        mock_base_model.assert_not_called()
-        assert result.text == "cloud handled it"
-
-    def test_skipped_when_cloud_fails_on_non_personal_query(self):
-        """Sanitizer allowed the query (non-personal) but cloud is
-        unavailable → base model fallback, NOT abstention. The short-circuit
-        is scoped to the personal-interrogative case; cloud-outage on
-        general queries still uses base-model general knowledge."""
-        from paramem.server.inference import ChatResult, handle_chat
-        from paramem.server.router import Intent
-
-        config = ServerConfig()
-
-        with (
-            patch(
-                "paramem.server.inference.is_self_referential",
-                return_value=False,
-            ),
-            patch(
-                "paramem.server.inference._escalate_to_ha_agent",
-                return_value=None,  # HA unavailable
-            ),
-            patch(
-                "paramem.server.inference._base_model_answer",
-                return_value=ChatResult(text="base fallback"),
-            ) as mock_base_model,
-        ):
-            result = handle_chat(
-                text="What's the weather?",
-                conversation_id="test",
-                speaker="Alex",
-                history=None,
-                model=self._minimal_mock_model(),
-                tokenizer=MagicMock(),
-                config=config,
-                router=self._make_none_match_router(intent=Intent.GENERAL),
-                cloud_agent=None,  # no cloud available either
-                speaker_id="spk-abc123",
-                memory_store=_MS(),
-            )
-
-        mock_base_model.assert_called_once()
-        assert result.text == "base fallback"
-
-    def test_fires_in_probe_and_reason_when_probes_fail_and_sanitizer_blocks(self, monkeypatch):
-        """Speaker has keys (router builds plan.steps), the query routes
-        through ``_probe_and_reason``, every probe misses, sanitizer blocks
-        cloud egress.  The previous fallthrough went to ``_base_model_answer``
-        (confabulation risk on personal interrogatives — AbstentionBench
-        showed prompt-only abstention is unreliable at 7B).  The new
-        short-circuit returns the canned ``response`` instead.
-
-        This branch is structurally distinct from the no-steps abstention
-        gate at ``handle_chat``: a speaker with ANY keys in the index will
-        always route through this path for every PERSONAL query, so the
-        more facts a speaker has, the more reliably this gap fires.
-        """
-        from paramem.server.inference import handle_chat
-
-        config = live_door_config()
-        assert config.abstention.enabled is True
-
-        # A known key always carries a full bookkeeping row -- the
-        # temporal-selection stage (on by default) reads it for every key
-        # the router's plan probes, "graph0001" here.
-        memory_store = _MS()
-        memory_store.set_bookkeeping(
-            "graph0001",
-            speaker_id="spk-abc123",
-            relation_type="factual",
-            first_seen="2026-08-01T09:00:00",
-            last_seen="2026-08-01T09:00:00",
-            promoted=False,
-        )
-
-        # Make every probe miss so ``layers`` stays empty in _probe_and_reason.
-        # Sanitizer blocks (returns None) which prevents HA / cloud escalation
-        # and previously dropped through to _base_model_answer.
-        stub_live_door_probe(monkeypatch, failing_keys={"graph0001"})
-        import paramem.memory.probe as _probe_mod
-
-        mock_probe = MagicMock(wraps=_probe_mod.probe_keys_grouped_by_adapter)
-        monkeypatch.setattr("paramem.memory.probe.probe_keys_grouped_by_adapter", mock_probe)
-
-        with (
-            patch(
-                "paramem.server.inference.is_self_referential",
-                return_value=True,
-            ),
-            patch("paramem.server.inference._base_model_answer") as mock_base_model,
-        ):
-            result = handle_chat(
-                text="Where do I live?",
-                conversation_id="test",
-                speaker="Alex",
-                history=None,
-                model=self._minimal_mock_model(),
-                tokenizer=MagicMock(),
-                config=config,
-                router=self._make_router_with_steps("spk-abc123"),
-                speaker_id="spk-abc123",
-                memory_store=memory_store,
-            )
-
-        assert result.text == config.abstention.load_response()
-        # The probe really ran and missed — not "no door was ever
-        # consulted", which reaches the same fallback for another reason.
-        mock_probe.assert_called_once()
-        mock_base_model.assert_not_called()
-
-    def test_ha_tool_answer_preferred_over_abstention_in_probe_and_reason(self, monkeypatch):
-        """Inside ``_probe_and_reason``, when probes fail but HA returns a
-        tool answer (calendar, sensors, etc.), use the HA answer rather
-        than abstain.  HA tool answers are factual, not hallucinated, so
-        the no-hallucinate guarantee is preserved while still serving
-        personal queries that route through HA tools (e.g. "What's my next
-        meeting?").
-        """
-        from paramem.server.inference import ChatResult, handle_chat
-
-        config = live_door_config()
-
-        memory_store = _MS()
-        memory_store.set_bookkeeping(
-            "graph0001",
-            speaker_id="spk-abc123",
-            relation_type="factual",
-            first_seen="2026-08-01T09:00:00",
-            last_seen="2026-08-01T09:00:00",
-            promoted=False,
-        )
-
-        # Sanitizer ALLOWS the query (``stub_live_door_probe`` pins
-        # ``is_self_referential`` False) — a personal-flavored query that
-        # doesn't trip the self-referential blocker, so HA can be attempted.
-        stub_live_door_probe(monkeypatch, failing_keys={"graph0001"})
-        import paramem.memory.probe as _probe_mod
-
-        mock_probe = MagicMock(wraps=_probe_mod.probe_keys_grouped_by_adapter)
-        monkeypatch.setattr("paramem.memory.probe.probe_keys_grouped_by_adapter", mock_probe)
-
-        with (
-            patch(
-                "paramem.server.inference._escalate_to_ha_agent",
-                return_value=ChatResult(text="Your 3pm with Pat.", escalated=True),
-            ) as mock_ha,
-            patch("paramem.server.inference._base_model_answer") as mock_base_model,
-        ):
-            result = handle_chat(
-                text="What's my next meeting?",
-                conversation_id="test",
-                speaker="Alex",
-                history=None,
-                model=self._minimal_mock_model(),
-                tokenizer=MagicMock(),
-                config=config,
-                router=self._make_router_with_steps("spk-abc123"),
-                speaker_id="spk-abc123",
-                memory_store=memory_store,
-            )
-
-        # The probe really ran and missed — not "no door was ever
-        # consulted", which reaches the same fallback for another reason.
-        mock_probe.assert_called_once()
-        mock_ha.assert_called_once()
-        assert result.text == "Your 3pm with Pat."
-        # Neither abstention nor base model were used — HA answered.
-        assert result.text != config.abstention.load_response()
-        mock_base_model.assert_not_called()
 
     def test_speakerless_call_raises_value_error(self):
         """The speaker-present contract: handle_chat requires a resolved
@@ -575,11 +374,12 @@ class TestAbstentionShortCircuit:
             )
 
     def test_probe_and_reason_disabled_falls_through_to_base_model(self, monkeypatch):
-        """With abstention.enabled=False, ``_probe_and_reason`` retains the
-        old behavior: sanitizer-blocked + no probes + no HA → base model.
-        Locks the toggle as a real opt-out for both abstention sites
-        (handle_chat AND _probe_and_reason)."""
-        from paramem.server.inference import ChatResult, handle_chat
+        """With abstention.enabled=False, ``_probe_and_reason``'s
+        sanitizer-blocked + no probes + no HA path falls through to the
+        base model. Locks the toggle as a real opt-out for both abstention
+        sites (handle_chat AND _probe_and_reason)."""
+        from paramem.server.chat_result import ChatResult
+        from paramem.server.inference import handle_chat
 
         config = live_door_config()
         config.abstention.enabled = False
@@ -629,6 +429,134 @@ class TestAbstentionShortCircuit:
         mock_base_model.assert_called_once()
         assert result.text == "base model answer"
 
+    def test_ha_answer_on_general_query_suppresses_abstention(self):
+        """A GENERAL (non-personal) turn the HA door answers returns the
+        HA reply directly — ``handle_chat`` returns as soon as the door
+        answers, before the abstention gate is ever reached."""
+        from paramem.server.chat_result import ChatResult
+        from paramem.server.inference import handle_chat
+        from paramem.server.router import Intent
+
+        config = ServerConfig()
+
+        with (
+            patch("paramem.server.inference.is_self_referential", return_value=False),
+            patch(
+                "paramem.server.inference.answer_via_ha",
+                return_value=ChatResult(text="the lights are on", escalated=True),
+            ),
+            patch("paramem.server.inference._abstain_if_applicable") as mock_abstain,
+        ):
+            result = handle_chat(
+                text="Are the lights on?",
+                conversation_id="test",
+                speaker="Alex",
+                history=None,
+                model=self._minimal_mock_model(),
+                tokenizer=MagicMock(),
+                config=config,
+                router=self._make_none_match_router(intent=Intent.GENERAL),
+                cloud_agent=MagicMock(),
+                ha_client=MagicMock(),
+                speaker_id="spk-abc123",
+                memory_store=_MS(),
+            )
+
+        mock_abstain.assert_not_called()
+        assert result.text == "the lights are on"
+        assert result.text != config.abstention.load_response()
+
+    def test_general_query_cloud_outage_falls_to_base_model_not_abstention(self):
+        """A GENERAL (non-personal) query with both external legs
+        unavailable falls straight to the base model.  Abstention's gate
+        requires ``is_personal``, which a non-personal query never
+        satisfies, so the canned response never fires regardless of why
+        the external legs were unreachable."""
+        from paramem.server.chat_result import ChatResult
+        from paramem.server.inference import handle_chat
+        from paramem.server.router import Intent
+
+        config = ServerConfig()
+
+        with (
+            patch("paramem.server.inference.is_self_referential", return_value=False),
+            patch("paramem.server.inference.answer_via_ha", return_value=None),
+            patch("paramem.server.inference.answer_via_cloud", return_value=None),
+            patch(
+                "paramem.server.inference._base_model_answer",
+                return_value=ChatResult(text="base model answer"),
+            ) as mock_base_model,
+        ):
+            result = handle_chat(
+                text="What's the weather like?",
+                conversation_id="test",
+                speaker="Alex",
+                history=None,
+                model=self._minimal_mock_model(),
+                tokenizer=MagicMock(),
+                config=config,
+                router=self._make_none_match_router(intent=Intent.GENERAL),
+                cloud_agent=MagicMock(),
+                ha_client=MagicMock(),
+                speaker_id="spk-abc123",
+                memory_store=_MS(),
+            )
+
+        mock_base_model.assert_called_once()
+        assert result.text == "base model answer"
+        assert result.text != config.abstention.load_response()
+
+    def test_probe_and_reason_ha_answer_wins_over_abstention(self, monkeypatch):
+        """The ``not layers`` branch inside ``_probe_and_reason`` tries the
+        HA door before ever consulting abstention — an HA answer returns
+        immediately and the canned response is never reached."""
+        from paramem.server.chat_result import ChatResult
+        from paramem.server.inference import _probe_and_reason
+        from paramem.server.router import Intent, RoutingPlan, RoutingStep
+
+        config = live_door_config()
+        config.inference.temporal_selection_enabled = False
+
+        memory_store = _MS()
+        memory_store.set_bookkeeping(
+            "graph0001",
+            speaker_id="spk-abc123",
+            relation_type="factual",
+            first_seen="2026-08-01T09:00:00",
+            last_seen="2026-08-01T09:00:00",
+            promoted=False,
+        )
+        stub_live_door_probe(monkeypatch, failing_keys={"graph0001"})
+
+        plan = RoutingPlan(
+            strategy="direct",
+            intent=Intent.PERSONAL,
+            steps=[RoutingStep(adapter_name="episodic", keys_to_probe=["graph0001"])],
+        )
+
+        with (
+            patch(
+                "paramem.server.inference.answer_via_ha",
+                return_value=ChatResult(text="the lights are on", escalated=True),
+            ) as mock_answer_via_ha,
+            patch("paramem.server.inference._abstain_if_applicable") as mock_abstain,
+        ):
+            result = _probe_and_reason(
+                text="Where do I live?",
+                plan=plan,
+                history=None,
+                model=self._minimal_mock_model(),
+                tokenizer=MagicMock(),
+                config=config,
+                memory_store=memory_store,
+                speaker_id="spk-abc123",
+                is_personal=True,
+            )
+
+        mock_answer_via_ha.assert_called_once()
+        mock_abstain.assert_not_called()
+        assert result.text == "the lights are on"
+
 
 class TestRelayNoIdentityShortCircuit:
     """``_relay_route``'s ``identity_absent`` gate — the relay-path
@@ -636,9 +564,10 @@ class TestRelayNoIdentityShortCircuit:
     resolved speaker at all (``ServingPath.RELAY``).
 
     A personal interrogative with no identity gets the canned no-identity
-    response BEFORE the HA leg is even tried (there is no speaker for the
-    question to be about); a non-personal or declarative turn falls through
-    to the normal HA -> cloud dispatch, unaffected by ``identity_absent``.
+    response BEFORE either external leg is tried (there is no speaker for
+    the question to be about). The final fallback below that gate is the
+    local base model when one is resident, and the canned limited-mode
+    response when it is not.
     """
 
     def _config(self):
@@ -668,80 +597,44 @@ class TestRelayNoIdentityShortCircuit:
         ha_client.conversation_process.assert_not_called()
         cloud_agent.call.assert_not_called()
 
-    def test_non_personal_query_with_no_identity_reaches_ha(self):
-        from paramem.server.app import _relay_route
-
-        config = self._config()
-        ha_client = MagicMock()
-        ha_client.conversation_process.return_value = "It's sunny."
-        cloud_agent = MagicMock()
-
-        result = _relay_route(
-            text="What's the weather?",
-            history=[],
-            config=config,
-            cloud_permitted=True,
-            ha_client=ha_client,
-            cloud_agent=cloud_agent,
-            identity_absent=True,
-        )
-
-        assert result.text == "It's sunny."
-        ha_client.conversation_process.assert_called_once()
-        cloud_agent.call.assert_not_called()
-
-    def test_declarative_personal_statement_with_no_identity_reaches_ha(self):
-        """Declarative form ("I live in Kelkham.") is not interrogative, so
-        the no-identity short-circuit does not fire even though the text
-        is self-referential in content."""
-        from paramem.server.app import _relay_route
-
-        config = self._config()
-        ha_client = MagicMock()
-        ha_client.conversation_process.return_value = "Got it."
-        cloud_agent = MagicMock()
-
-        result = _relay_route(
-            text="I live in Kelkham.",
-            history=[],
-            config=config,
-            cloud_permitted=True,
-            ha_client=ha_client,
-            cloud_agent=cloud_agent,
-            identity_absent=True,
-        )
-
-        assert result.text == "Got it."
-        ha_client.conversation_process.assert_called_once()
-
     def test_identity_absent_false_never_short_circuits(self):
-        """Default (identity_absent=False) preserves the original
-        server-wide-cloud-only behavior -- no no-identity gate at all, even
-        for a personal interrogative."""
+        """A resolved-speaker personal interrogative (``identity_absent=
+        False``) must never hit the no-identity short-circuit — the gate
+        is conjuncted with ``identity_absent`` specifically so a resolved
+        speaker is never mistaken for a caller with no identity at all.
+        The turn reaches the normal HA dispatch instead."""
         from paramem.server.app import _relay_route
+        from paramem.server.chat_result import ChatResult
 
         config = self._config()
-        ha_client = MagicMock()
-        ha_client.conversation_process.return_value = "New York City."
         cloud_agent = MagicMock()
 
-        result = _relay_route(
-            text="Where do I live?",
-            history=[],
-            config=config,
-            cloud_permitted=True,
-            ha_client=ha_client,
-            cloud_agent=cloud_agent,
-        )
+        with patch(
+            "paramem.server.app.answer_via_ha",
+            return_value=ChatResult(text="ha answer", escalated=True),
+        ) as mock_ha:
+            result = _relay_route(
+                text="Where do I live?",
+                history=[],
+                config=config,
+                cloud_permitted=True,
+                ha_client=MagicMock(),
+                cloud_agent=cloud_agent,
+                speaker="Alex",
+                speaker_id="speaker0",
+                identity_absent=False,
+            )
 
-        assert result.text == "New York City."
-        ha_client.conversation_process.assert_called_once()
+        mock_ha.assert_called_once()
+        assert result.text == "ha answer"
+        assert result.text != config.abstention.load_no_identity_response()
 
     def test_no_identity_short_circuit_ignores_abstention_enabled_false(self):
         """The no-identity short-circuit is a structural impossibility (no
-        identity, no store), NOT gated on ``config.abstention.enabled`` —
-        it still fires with the toggle off, unlike every other abstention
-        gate in this module."""
+        speaker for a personal question to be about), never a feature the
+        operator can toggle off — it must fire even when
+        ``config.abstention.enabled`` is False, unlike the ordinary
+        abstention gate in ``handle_chat``."""
         from paramem.server.app import _relay_route
 
         config = self._config()

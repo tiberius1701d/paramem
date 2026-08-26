@@ -173,8 +173,8 @@ class TestBuildDateByKey:
 
     def test_preserves_input_key_order(self):
         """One dict comprehension, one pass — the returned mapping's key
-        order matches the input's, not a date-sorted order (there is no
-        sorting left to do; that was the old two-pass grouping's job)."""
+        order matches the input's, not a date-sorted order; there is no
+        sorting or grouping pass."""
         last_seen_by_key = {
             "graph_c": "2026-08-06T00:00:00",
             "graph_a": "2026-08-01T00:00:00",

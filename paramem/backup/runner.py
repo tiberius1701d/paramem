@@ -11,8 +11,8 @@ Orchestrates the full backup pipeline:
 The tier is a parameter (default ``"daily"``) selected by the caller —
 the standalone CLI runner, or ``/backup/create`` (which forwards the
 request's tier; the scheduled timer delegates with ``tier="daily"``).
-Weekly/monthly/yearly tier emission is future work; the schema accepts
-those tier names for retention budgets.
+The schema accepts weekly/monthly/yearly tier names for retention budgets;
+only daily emission runs in production.
 
 No torch, peft, or transformers imports at module level.
 """
@@ -288,7 +288,7 @@ def run_scheduled_backup(
                         if _tier_dir is not None:
                             adapter_dirs[_tier_name] = Path(_tier_dir) / _tier_name
 
-            # Resolve speaker_profiles path.  key_metadata is per-tier now —
+            # Resolve speaker_profiles path.  key_metadata is per-tier —
             # write_bundle's own per-tier capture reads it directly from
             # each adapter_dirs entry; there is no global path to resolve.
             data_dir = Path(server_config.paths.data)

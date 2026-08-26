@@ -165,7 +165,7 @@ class TestExtractJsonBlock:
 
     def test_accepts_plausibility_empty_list(self):
         """Extraction legitimately returns a bare ``[]`` when a raw fact
-        list is empty (plausibility's own output is now the rule-keyed
+        list is empty (plausibility's own output is the rule-keyed
         ``{"drop": {...}}`` map, never a bare list).  The parser must
         accept lists (even empty) as valid envelopes."""
         result = _extract_json_block("[]")

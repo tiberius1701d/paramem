@@ -18,7 +18,12 @@ time, an edit to any file here takes effect on the next request — no server
 restart required.
 """
 
+from typing import TYPE_CHECKING
+
 from paramem.graph.prompts import _load_prompt, _load_prompt_section
+
+if TYPE_CHECKING:
+    from paramem.server.config import ServerConfig
 
 _SERVING_SYSTEM_FILE = "serving_system.txt"
 _SERVING_DIRECTIVES_FILE = "serving_directives.txt"
@@ -41,7 +46,7 @@ def cloud_serving_system_prompt() -> str:
 
     Carries no identity line and no speaker token — the cloud system
     prompt is deliberately identity-free (see
-    :func:`paramem.server.inference._escalate_to_cloud`).
+    :func:`paramem.server.egress._escalate_to_cloud`).
 
     Returns:
         The contents of ``configs/prompts/cloud_serving_system.txt``.
@@ -135,7 +140,7 @@ def recorded_dates_suffix(dates: str) -> str:
         — e.g. ``" Recorded dates: 2026-01-01, 2026-01-02."``. The section
         text in ``serving_directives.txt`` cannot carry that leading space
         itself (every section is stripped on load), so it is prepended
-        here to preserve byte parity with the pre-externalization string.
+        here to produce the exact separator the caller requires.
     """
     return " " + _load_prompt_section(_SERVING_DIRECTIVES_FILE, "RECORDED-DATES-SUFFIX").format(
         dates=dates
@@ -150,3 +155,37 @@ def empty_period_note() -> str:
         ``configs/prompts/serving_directives.txt``.
     """
     return _load_prompt_section(_SERVING_DIRECTIVES_FILE, "EMPTY-PERIOD-NOTE")
+
+
+def language_instruction(language: str | None, config: "ServerConfig | None" = None) -> str:
+    """Return a language instruction string, or empty for English/unknown.
+
+    Shared by the cloud transport primitive
+    (:func:`~paramem.server.egress._escalate_to_cloud`) and the local
+    reasoning leg's speaker prefix
+    (:func:`~paramem.server.inference._build_speaker_prefix`) — one
+    implementation of the language-name derivation for both.
+
+    Derives the display name from TTS config (voice ``language_name``
+    field), falling back to ISO 639 standard names.
+
+    Args:
+        language: BCP-47 language code, or ``None``/``"en"`` for no
+            instruction.
+        config: Server config, used to derive the language display name
+            via ``config.tts.language_name``. ``None`` falls back to
+            :data:`~paramem.server.config.ISO_LANGUAGE_NAMES`.
+
+    Returns:
+        The rendered language line, or ``""`` when *language* is ``None``
+        or ``"en"``.
+    """
+    if not language or language == "en":
+        return ""
+    if config is not None:
+        name = config.tts.language_name(language)
+    else:
+        from paramem.server.config import ISO_LANGUAGE_NAMES
+
+        name = ISO_LANGUAGE_NAMES.get(language, language)
+    return language_line(name)

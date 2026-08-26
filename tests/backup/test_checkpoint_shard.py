@@ -323,7 +323,7 @@ class TestEncryptMaterializeRoundTrip:
 
 
 # ---------------------------------------------------------------------------
-# Age-envelope coverage — regression tests for the writer-flip integration.
+# Age-envelope coverage for the writer-flip integration.
 # ---------------------------------------------------------------------------
 
 

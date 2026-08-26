@@ -4,16 +4,15 @@ Procedural-typed facts route through the same interim slot as episodic
 facts, instead of training a separate per-cycle ``procedural`` MAIN adapter.
 
 Key invariants verified here:
-- A proc_graph merged into merger.graph reaches _tier_keyed["procedural"]
-  (gap-regression: the proc_graph was previously extracted but never merged).
+- A proc_graph merged into merger.graph reaches _tier_keyed["procedural"].
 - Procedural interim keys are minted into the store only after successful
   training (deferred-write atomicity mirrors the episodic path).
 - Simulate mode registers procedural interim keys immediately (mirrors episodic).
 - The unified recall gate is all-or-nothing: one failing key among a mixed
   batch rejects the whole increment and commits nothing.
-- The _run_indexed_key_procedural and _prepare_procedural_keys_for_tier
-  per-cycle helper functions no longer exist (deleted when procedural folded
-  into the unified interim slot).
+- There are no per-cycle ``_run_indexed_key_procedural`` /
+  ``_prepare_procedural_keys_for_tier`` helper functions; procedural facts
+  route through the unified interim slot.
 """
 
 from __future__ import annotations
@@ -246,10 +245,10 @@ class TestSimulateModeRegistersProceduralKeys:
 
         Simulate touches no PEFT adapter at all (no mint, no probe, no
         backup scope) — only the derive/write-to-graph.json/publish spine, so
-        this needs no GPU-collaborator fakes.  Registration is now a
-        wholesale registry rebind (``MemoryStore.adopt_increments``), not a
-        per-key ``store.put`` call — the postcondition to check is presence
-        in the tier's active-key set, not a spied write call.
+        this needs no GPU-collaborator fakes.  Registration is a wholesale
+        registry rebind (``MemoryStore.adopt_increments``), not a per-key
+        ``store.put`` call — the postcondition to check is presence in the
+        tier's active-key set, not a spied write call.
         """
         loop = _make_cycle_loop(tmp_path)
 
@@ -396,20 +395,16 @@ class TestProceduralRecallGateAllOrNothing:
 
 
 # ---------------------------------------------------------------------------
-# Test 5: regression — proc keys land in INTERIM tier, not "procedural" main
+# Interim-cycle proc keys land in the INTERIM tier, not "procedural" main
 # ---------------------------------------------------------------------------
 
 
 class TestProceduralKeyRegisteredInInterimTier:
-    """Regression: interim-cycle proc keys must be registered in the interim slot.
-
-    Before the Finding-1 fix, deferred-flush wrote proc keys to the
-    "procedural" MAIN store tier even though their weights were trained into
-    the interim adapter.  The router pairs keys with the adapter named by
-    their store tier, so the mismatch made those keys unrecallable for the
-    entire interim window.
-
-    This test FAILS on the old code (``_store_tier = "procedural"``).
+    """Interim-cycle proc keys must be registered in the interim slot, not
+    the "procedural" MAIN store tier — their weights are trained into the
+    interim adapter, and the router pairs keys with the adapter named by
+    their store tier, so a mismatch would make those keys unrecallable for
+    the entire interim window.
     """
 
     def test_train_mode_proc_key_registered_in_interim_slot(self, monkeypatch, tmp_path):
@@ -502,8 +497,9 @@ class TestProceduralKeyRegisteredInInterimTier:
     def test_interim_active_keys_includes_proc_key(self, monkeypatch, tmp_path):
         """After an interim cycle, proc key is active in the interim tier (not procedural main).
 
-        This is the router-level regression: active_keys_in_tier(interim_slot) returns
-        the proc key; active_keys_in_tier("procedural") does NOT.
+        The router pairs keys with the adapter named by their store tier, so
+        this matters at the router level: active_keys_in_tier(interim_slot)
+        returns the proc key; active_keys_in_tier("procedural") does NOT.
         """
         loop = _make_cycle_loop(tmp_path)
         _wire_cycle_fakes(loop, monkeypatch)

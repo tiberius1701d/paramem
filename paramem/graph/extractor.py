@@ -104,22 +104,20 @@ class ExtractionFailed(RuntimeError):
 # [...], ...}}`` map, one entry per rule that matched — so its output
 # volume scales with the number of rule matches, not with the
 # surviving-fact count, but the number of rule matches itself scales
-# with chunk density on a dense input. Lowering the cap independently
-# for plausibility was attempted and reverted: a 2048 cap truncated the
-# JSON array on dense chunks, the parse failed, and the caller fell back
-# to passing the unfiltered set forward. KV-cache pressure must be
-# mitigated upstream (STT/TTS eviction, gc.collect before empty_cache,
-# per-phase vram_scope wraps), not by truncating correctness-bearing
-# output.
+# with chunk density on a dense input. A cap lowered independently for
+# plausibility risks truncating the JSON array on a dense chunk: the
+# parse then fails and the caller falls back to passing the unfiltered
+# set forward. KV-cache pressure must be mitigated upstream (STT/TTS
+# eviction, gc.collect before empty_cache, per-phase vram_scope wraps),
+# not by truncating correctness-bearing output.
 _DEFAULT_FILTER_MAX_TOKENS = 8192
 # Deterministic by default; threaded to every provider call so Anthropic
 # and OpenAI-compatible filters match exactly.
 _DEFAULT_FILTER_TEMPERATURE = 0.0
 # Cloud enrichment returns the delta envelope ``{"add", "modify", "drop",
 # "bindings"}`` on virtually every call; a bare-list / malformed shape is a
-# rare per-sample deviation (2 in the whole recorded history vs. dozens of
-# clean deltas).  Re-issue the call on a parse miss rather than accept a
-# guessed-at shape — a fresh sample almost always parses.  Exhausting the
+# rare per-sample deviation.  Re-issue the call on a parse miss rather than
+# accept a guessed-at shape — a fresh sample almost always parses.  Exhausting the
 # budget hands ``None`` back to the caller, which fails OPEN (keeps the
 # pre-enrichment facts), never fatal.
 _ENRICHMENT_MAX_ATTEMPTS = 3
@@ -150,9 +148,8 @@ _DEFAULT_FILTER_TIMEOUT_SECONDS = 90.0
 _CUDA_TERMINAL_MARKERS: tuple[str, ...] = ("INTERNAL ASSERT FAILED", "CUDACachingAllocator")
 # Up to 3 attempts (1 + 2 retries). Beyond that, server restart is needed.
 _GPU_WAKE_RETRY_COUNT: int = 3
-# 5s wall-clock settle per retry. Empirically a 60s idle gap surfaced
-# "device not ready" once; 5s × 2 retries (10s total) covers the WSL2
-# driver wake-up latency observed on this host.
+# 5s wall-clock settle per retry. 5s × 2 retries (10s total) covers the
+# WSL2 driver wake-up latency on this host after a long idle gap.
 _GPU_WAKE_SETTLE_SECONDS: float = 5.0
 
 
@@ -336,8 +333,7 @@ def _wait_for_gpu_ready(*, pre_settle_seconds: float = 10.0) -> None:
 # :func:`build_document_context`) fed from ``source_type`` plus the
 # speaker fields already threaded through every local-extraction call
 # — never a prepend/append onto the slot content, and never a parallel
-# file pair.  The old DOCUMENT_*_FILENAME constants and their backing
-# files are retired (would silently drift on schema-shape rules).
+# file pair, which would silently drift on schema-shape rules.
 DEFAULT_SYSTEM_PROMPT_FILENAME = "extraction_system.txt"
 DEFAULT_USER_PROMPT_FILENAME = "extraction.txt"
 DEFAULT_PROCEDURAL_USER_PROMPT_FILENAME = "extraction_procedural.txt"
@@ -408,16 +404,15 @@ def build_document_context(
     speaker id.
 
     Returns ``""`` unless ``source_type == "document"`` and both
-    ``speaker_id`` and ``speaker_name`` are non-empty — the exact guard the
-    retired caller-layer prepend used, plus the id requirement the
-    template's ``{speaker_id}`` slot implies.  The guard runs BEFORE the
+    ``speaker_id`` and ``speaker_name`` are non-empty — the id requirement
+    the template's ``{speaker_id}`` slot implies.  The guard runs BEFORE the
     prompt load, so a non-document (or nameless) pass records no
     provenance entry for a fragment that never rendered.
 
     On the rendering path, the loaded template is ``.format()``-ed with
-    ``speaker_id``/``speaker_name`` and ``"\\n\\n"`` is appended — the
-    identical separator the retired prepend used — so the slot renders
-    immediately before ``{transcript}`` with no gap or overlap.
+    ``speaker_id``/``speaker_name`` and ``"\\n\\n"`` is appended, so the
+    slot renders immediately before ``{transcript}`` with no gap or
+    overlap.
 
     Args:
         source_type: ``"transcript"`` or ``"document"``.  Only
@@ -506,17 +501,17 @@ def extract_procedural_graph(
     primitive :func:`extract_graph` uses for its ``local_extract`` and
     ``second_order_extract`` phases — under its own
     :func:`~paramem.graph.phase_trace.extraction_trace` scope, self-tracing
-    the ``procedural_extract`` phase. Callers no longer need to open a
-    phase trace around this call; nesting inside an outer
+    the ``procedural_extract`` phase. A caller does not need to open its
+    own phase trace around this call; nesting inside an outer
     ``extraction_trace`` (e.g. the session-level trace opened by
     consolidation) is a no-op, so the phase record lands wherever the
     call happens to be nested.
 
-    Because parsing now goes through the shared primitive, this pass gets
-    the same improvements ``local_extract``/``second_order_extract``
-    already have: ``raw_output`` and prompt provenance on the phase
-    record, ``outcome="failed"`` recorded on parse error, and tolerance
-    for a bare-list model output shape.
+    Parsing goes through the shared primitive, so this pass carries the
+    same properties ``local_extract``/``second_order_extract`` have:
+    ``raw_output`` and prompt provenance on the phase record,
+    ``outcome="failed"`` recorded on parse error, and tolerance for a
+    bare-list model output shape.
 
     Args:
         timestamp: Session-start assertion time (ISO 8601), typically the
@@ -620,10 +615,10 @@ def _run_local_extraction(
     sites are — via :func:`extract_graph` or :func:`extract_procedural_graph`).
 
     On parse failure, records ``outcome="failed"`` on the phase trace and
-    returns an empty :class:`SessionGraph` for ``session_id``/``timestamp``
-    — mirrors pre-carve-out ``local_extract`` behaviour. The caller decides
-    what an empty result means (``local_extract``'s caller returns
-    immediately; ``second_order_extract``'s caller has nothing to union).
+    returns an empty :class:`SessionGraph` for ``session_id``/``timestamp``.
+    The caller decides what an empty result means (``local_extract``'s
+    caller returns immediately; ``second_order_extract``'s caller has
+    nothing to union).
     The empty graph's phase record carries the parse error as ``reason``
     and the raw output intact; ``ConsolidationLoop.extract_session`` reads
     that record via :func:`local_parse_failure` and aborts the fold, while
@@ -964,7 +959,7 @@ def _stamp_speaker_entity(
          transcripts outright).
        * **Guard B (document sources only)** — fires only when
          ``source_type == "document"``. Transcript/voice sessions keep
-         today's first-person comprehension binding untouched.
+         the first-person comprehension binding untouched.
 
        Rewriting a relation's ``object`` to the speaker id can synthesize a
        ``(speaker0, pred, speaker0)`` self-loop when the same full name was
@@ -981,7 +976,7 @@ def _stamp_speaker_entity(
        in one graph (a pre-existing speaker entity plus one renamed by the
        rewrite); those are collapsed into one, unioning ``attributes``.
 
-    2. **Existing ``is_speaker_id`` stamping loop** (unchanged in shape) sets
+    2. **The ``is_speaker_id`` stamping loop** sets
        ``entity.speaker_id`` on every entity whose (possibly just-rewritten)
        name passes :func:`~paramem.utils.identity.is_speaker_id`:
 
@@ -1094,9 +1089,9 @@ def _stamp_speaker_entity(
     return graph
 
 
-# _JSON_ENVELOPE_KEYS / _extract_json_block now live in
+# _JSON_ENVELOPE_KEYS / _extract_json_block live in
 # paramem.cloud.deanonymize (imported above) — every cloud-response
-# parser in this module still routes through the one shared parser.
+# parser in this module routes through the one shared parser.
 
 
 # Fallbacks resolved per-call via paramem.config.taxonomy.
@@ -1235,10 +1230,8 @@ def _normalize_extraction(data: dict) -> dict:
 
 
 # Two-stage cloud pipeline: enrichment first, then plausibility filtering.
-# Each stage has a single responsibility and a separate prompt — combining
-# them in one call (the previous "enrichment_provider" prompt) led to the LLM
-# expanding scope at the same time as filtering, producing inflated counts
-# and self-referential schema artifacts.
+# Each stage has a single responsibility and a separate prompt, so scope
+# expansion and filtering are never combined in one model call.
 
 # The cloud plausibility judge — a judge that only ever sees anonymized
 # data — dispatches on the SAME provider registry as enrichment
@@ -1268,7 +1261,7 @@ def _fallback_plausibility_on_raw(
     Used when anonymization fails entirely (mapping parse failure — no safe
     Cloud path), or when the full pipeline drops all relations.
 
-    Steps (originally ported from a retired standalone comparison script):
+    Steps:
     1. Serialize graph.relations to fact dicts. These are already
        real-name, un-anonymized ``graph.relations`` — no placeholder
        vocabulary exists at this point (nothing was ever anonymized on
@@ -1285,9 +1278,7 @@ def _fallback_plausibility_on_raw(
     Step 3 shares ``build_relations`` with the ``rebuild`` stage, so a
     schema-validation failure on this path lands in
     ``graph.diagnostics["pydantic_validation_dropped"]`` like anywhere
-    else. This path used to swallow those failures with a bare
-    ``except: continue``, which made a recovery-path validation failure
-    invisible.
+    else — never swallowed silently.
 
     Args:
         speaker_id: Speaker store ID stamped onto every reconstructed
@@ -1370,30 +1361,17 @@ def _record_binding_diagnostics(graph: SessionGraph, result: DeanonResult) -> No
     """Persist a :func:`~paramem.cloud.deanonymize.deanonymize_facts`
     result's collision findings onto ``graph.diagnostics``.
 
-    The gate primitive
-    (:func:`~paramem.cloud.placeholders._binding_collisions`) used to
-    write these keys itself, from inside ``deanonymize_facts``, onto a
-    ``SessionGraph`` it took purely as a diagnostics sink; a caller two
-    levels up then read the mutation back off the graph. The finding is a
-    return value now, and this is the ONE place in the extractor that
-    turns it into a diagnostic, shared by both remaining
-    ``deanonymize_facts`` call sites (the ``deanon`` substitution and
-    :func:`request_graph_enrichment`; the former ``cloud_enrich`` gate
-    call site was retired along with the whole-delta rejection it existed
-    for — see :func:`_apply_enrichment_delta`).
+    The ONE place in the extractor that turns a
+    :class:`~paramem.cloud.deanonymize.DeanonResult`'s ``collisions`` into
+    a diagnostic, shared by both ``deanonymize_facts`` call sites (the
+    ``deanon`` substitution and :func:`request_graph_enrichment`).
+    ``collisions`` is always informational — a binding for a token cloud
+    was shown is inert under CORE-LAST precedence — never a rejection
+    signal.
 
-    **``cloud_pending_orphans`` is retired (2026-07-22 cloud-admission
-    redesign).** ``DeanonResult`` no longer carries a ``verdict`` field —
-    nothing gates on a whole-delta orphan list any more, so there is
-    nothing left to write under that key. Only ``collisions`` survives:
-    always informational (a binding for a token cloud was shown is inert
-    under CORE-LAST precedence), never a rejection signal.
-
-    **Write posture (2026-08-19).** ``cloud_binding_collisions`` is now
-    written on EVERY call, empty list included — reversing the prior
-    guard, which conflated "the scan ran and found nothing" with "the
-    scan never reached this site". A present ``[]`` now means the
-    former; total absence of the key means the latter.
+    ``cloud_binding_collisions`` is written on EVERY call, empty list
+    included: a present ``[]`` means the scan ran and found nothing;
+    total absence of the key means the scan never reached this site.
 
     Args:
         graph: The graph the delta is being applied to — the session graph
@@ -1405,7 +1383,7 @@ def _record_binding_diagnostics(graph: SessionGraph, result: DeanonResult) -> No
 
 
 # The provider tables (PROVIDER_KEY_ENV, OPENAI_COMPAT_ENDPOINTS,
-# OPENAI_COMPAT_PROVIDERS) and the key resolver now live in
+# OPENAI_COMPAT_PROVIDERS) and the key resolver live in
 # paramem.cloud.admission (imported above), alongside
 # evaluate_cloud_egress — the one place the "may we reach a cloud LLM,
 # and with what credentials?" decision is computed.  They are imported
@@ -1619,9 +1597,9 @@ def request_enrichment(
     reification.
 
     Returns ``(delta, raw_response, info)``. This function only calls the
-    cloud and PARSES the response into an :class:`EnrichmentDelta` — it no
-    longer applies the delta, merges facts, or reconstructs the updated
-    transcript (2026-07-22 cloud-admission redesign). The caller applies
+    cloud and PARSES the response into an :class:`EnrichmentDelta` — it
+    does not apply the delta, merge facts, or reconstruct the updated
+    transcript. The caller applies
     the delta itself via :func:`_apply_enrichment_delta`, once it has built
     the :class:`~paramem.cloud.deanonymize.CloudScope` the delta's
     ``bindings`` need to be checked against.
@@ -1639,9 +1617,8 @@ def request_enrichment(
     brace before this dataclass is built, so ``delta.bindings`` here is
     always POST-normalize and bare, like every other internal consumer of
     the placeholder vocabulary. Cloud already knows the binding the
-    moment it mints each placeholder, so emitting it explicitly removes
-    the transcript-diff reconstruction step the previous "echo every
-    fact" protocol relied on.
+    moment it mints each placeholder, so emitting it explicitly avoids
+    any need for a transcript-diff reconstruction step.
 
     ``info`` is a dict with diagnostic flags the caller persists into
     ``graph.diagnostics``:
@@ -1666,9 +1643,9 @@ def request_enrichment(
     * ``response_chars``: length of the last raw response in characters.
 
     The action counts (``add_count`` / ``modify_count`` / ``drop_count`` /
-    ``bindings_count``) that used to live in this dict moved to
-    :func:`_apply_enrichment_delta`'s ``report`` — they depend on
-    resolvability, which this function no longer decides.
+    ``bindings_count``) live in :func:`_apply_enrichment_delta`'s
+    ``report`` — they depend on resolvability, which this function does
+    not decide.
 
     The prompt this function loads is external config — edit
     ``configs/prompts/cloud_enrichment.txt`` to tune; no code changes are
@@ -1685,8 +1662,8 @@ def request_enrichment(
     session's own speaker anchor (e.g. ``"speaker0"``, ``"speaker1"``),
     so the "Speaker identity" binding in ``cloud_enrichment.txt`` names
     the correct household member as the transcript's ``[user]`` instead
-    of hardcoding ``speaker0`` for every session (the multi-speaker
-    session binding fix). Keyword-required, no default — a silently
+    of hardcoding ``speaker0`` for every session. Keyword-required, no
+    default — a silently
     degraded prompt (a blank speaker anchor) is worse than a loud
     ``TypeError`` at the one production call site. The production caller
     (the ``enrich`` stage, :func:`~paramem.graph.stage_enrich._stage_enrich`)
@@ -1775,7 +1752,7 @@ def request_enrichment(
 
 
 # ---------------------------------------------------------------------------
-# Graph-level cloud enrichment (Task #10)
+# Graph-level cloud enrichment
 # ---------------------------------------------------------------------------
 
 
@@ -1809,22 +1786,25 @@ def request_graph_enrichment(
     guard) before calling this function; this function applies no scope
     gate of its own — it only substitutes and de-anonymizes.
 
-    ``payload.reverse`` is (A)'s own inversion of the cross-slice merged
-    forward table (:func:`~paramem.cloud.placeholders.invert_forward_mapping`,
-    called from :func:`~paramem.cloud.anonymize.anonymize` after every
-    slice's :func:`~paramem.cloud.placeholders.build_forward_table` output
-    has been merged and any placeholder collision re-minted) — the
-    speaker-value guard applies here by construction; no code path in
-    this function inverts an unfiltered forward map.
+    ``payload.reverse`` is (A)'s own inversion of
+    :func:`~paramem.cloud.placeholders.build_forward_table`'s ``forward``
+    (:func:`~paramem.cloud.placeholders.invert_forward_mapping`, called
+    from :func:`~paramem.cloud.anonymize.anonymize` after dropping any
+    entry whose value is speaker-id-shaped) — the speaker-value guard
+    applies here by construction; no code path in this function inverts
+    an unfiltered forward map.
 
     The chunk's anonymized ``subject``/``object`` fields come from
     :func:`~paramem.cloud.placeholders.insert_placeholders` applied
     DIRECTLY to ``payload.facts`` — the (real-name, un-substituted) triple
     subset :func:`~paramem.cloud.anonymize.anonymize` already cleared for
-    egress (the caller's ``triples`` minus any fail-closed slice's triples;
-    see that function's docstring) — never a ``Relation`` round trip through
+    egress: this chunk's full ``triples`` verbatim, since this chunk's own
+    call produced exactly one payload from one scan and one table build,
+    and the caller never reaches this function on that call's own
+    fail-closed terminal (see that function's docstring) — never a
+    ``Relation`` round trip through
     ``graph.relations`` — the caller's throwaway per-chunk
-    ``SessionGraph`` no longer carries relations at all; see ``graph``'s
+    ``SessionGraph`` carries no relations at all; see ``graph``'s
     own docstring entry below): every other key on each triple dict
     (``predicate``, ``relation_type``, ``speaker_id``) is copied VERBATIM
     — a speaker id can never be a mapping key (the anonymization prompt
@@ -1881,10 +1861,10 @@ def request_graph_enrichment(
     including speakers — are tokenised; org/place/thing nodes the model
     left out of ``mapping`` pass through verbatim. Accepted consequence:
     person-level ``same_as`` coreference (e.g. ``["Yang Ming", "Mr.
-    Yang"]``) can no longer be detected by the cloud judge, since both
+    Yang"]``) cannot be detected by the cloud judge, since both
     surfaces collapse to opaque, unrelated tokens before the model ever
-    sees them — the name-surface signal coreference depends on is gone for
-    people. org/place/thing ``same_as`` is unaffected (those surfaces stay
+    sees them, removing the name-surface signal coreference depends on.
+    org/place/thing ``same_as`` is unaffected (those surfaces stay
     verbatim under the default ``scrub``).
 
     Loads ``cloud_graph_enrichment.txt`` (required). The prompt uses a
@@ -1894,9 +1874,11 @@ def request_graph_enrichment(
         payload: :class:`~paramem.cloud.anonymize.AnonymizedContract` —
             the caller's already-completed (A) result for this chunk.
             ``payload.facts`` is the source of the triples this function
-            sends to cloud — no separate ``triples`` argument; a
-            fail-closed slice's triples never reach this function because
-            they never survived into ``payload.facts``.
+            sends to cloud — no separate ``triples`` argument; this
+            chunk's own fail-closed call never reaches this function at
+            all (the caller skips straight to the next chunk), so
+            ``payload.facts`` here is always this chunk's full set, never
+            a partial one.
         graph: The caller's throwaway per-chunk ``SessionGraph`` (carries
             no relations of its own — this function never reads
             ``graph.relations``) — the diagnostics sink this function
@@ -2044,8 +2026,8 @@ def _render_indexed_facts(facts: list[dict]) -> str:
     zero-based indices of facts that rule drops. Rendering each input
     with its index in square brackets is what makes that contract
     referenceable — the judge can quote ``[3]`` rather than echoing the
-    entire fact verbatim, which is what used to truncate Mistral 7B
-    mid-array on long KEEP-by-default outputs.
+    entire fact verbatim, keeping a long KEEP-by-default output well
+    clear of a mid-array truncation risk.
     """
     return "\n".join(f"[{i}] {json.dumps(f, ensure_ascii=False)}" for i, f in enumerate(facts))
 
@@ -2058,9 +2040,7 @@ def _cloud_facing_payload(facts: list[dict], anon_transcript: str | None) -> tup
     :func:`request_plausibility`'s prompt, and the ``enrich``
     stage's (:func:`~paramem.graph.stage_enrich._stage_enrich`) ``observed``
     legality-domain scan (the set of placeholder tokens cloud was actually
-    shown) cannot drift from one another — previously that invariant was
-    enforced only by a code comment next to a hand-mirrored copy of the
-    render.
+    shown) cannot drift from one another.
     """
     return _render_indexed_facts(facts), anon_transcript or "(not available)"
 
@@ -2103,7 +2083,7 @@ class DropSet:
     applied, since there is no fact at that position to drop.
     ``unattributed`` counts every drop claim the judge made that could
     not be pinned to a rule (an unknown rule key, a non-list rule value,
-    a non-int element, or an index reached through a retired non-dict
+    a non-int element, or an index reached through a non-dict
     ``"drop"`` shape) — never applied; the fact stays kept.
     """
 
@@ -2115,7 +2095,7 @@ class DropSet:
 def _count_unattributed_claims(value: object) -> int:
     """Unattributed-claim count for a drop-set value shape
     :func:`_parse_drop_set`'s rule-keyed contract does not recognize — a
-    retired non-dict ``"drop"`` value, an unknown rule key, or a
+    non-dict ``"drop"`` value, an unknown rule key, or a
     non-list rule value. A list is enumerable: every element is one claim
     the judge made without a rule — a bare index, an ``{"index": N}``
     object, anything else — so an empty list counts zero. A value that is
@@ -2158,19 +2138,18 @@ def _parse_drop_set(raw: str | None, n_facts: int) -> DropSet | None:
     index is a drop only when it sits in a list under one of the rule
     keys in :data:`PLAUSIBILITY_RULES`; everything else the judge cites —
     an unknown key's indices, non-int elements, or an index reached
-    through a retired non-dict ``"drop"`` shape — is counted in
+    through a non-dict ``"drop"`` shape — is counted in
     :attr:`DropSet.unattributed` instead, and the fact is kept.
 
     Returns ``None`` on ``raw`` being ``None``/blank, JSON parse failure,
     a non-dict top level, or a missing ``"drop"`` key — the caller
-    fail-opens (keeps all facts), matching the prior contract. A
-    ``"drop"`` value that parses but is not itself a dict (the retired
-    list/scalar forms) is NOT a parse failure: every parseable int inside
-    it is counted as unattributed (zero if it is an empty or all-non-int
-    list — there is nothing to attribute), or exactly one if the value
-    is not itself enumerable (a scalar, ``None``, a string), and zero
-    drops are applied — an old-shape verdict is counted, not turned into
-    a new fail-open trigger.
+    fail-opens (keeps all facts). A ``"drop"`` value that parses but is
+    not itself a dict (a bare list or scalar) is NOT a parse failure:
+    every parseable int inside it is counted as unattributed (zero if it
+    is an empty or all-non-int list — there is nothing to attribute), or
+    exactly one if the value is not itself enumerable (a scalar,
+    ``None``, a string), and zero drops are applied — a non-dict-shaped
+    verdict is counted, not turned into a fail-open trigger.
 
     An index outside ``[0, n_facts)`` under a valid rule key lands in
     :attr:`DropSet.out_of_range` instead of :attr:`DropSet.rules` — there
@@ -2241,9 +2220,9 @@ def _parse_drop_set(raw: str | None, n_facts: int) -> DropSet | None:
 def _apply_drop_set(facts: list[dict], raw: str | None) -> PlausibilityVerdict | None:
     """Apply the judge's drop-set output to the input facts.
 
-    Returns ``None`` on parse failure so the caller can fail-open
-    (matches the prior contract: a ``None`` return → the caller (e.g. the
-    ``enrich`` stage) keeps all input facts unchanged and logs a warning).
+    Returns ``None`` on parse failure so the caller can fail-open: a
+    ``None`` return → the caller (e.g. the ``enrich`` stage) keeps all
+    input facts unchanged and logs a warning.
     Empty drop set → ``kept == list(facts)``, ``dropped == []``.
     """
     drop_set = _parse_drop_set(raw, len(facts))
@@ -2580,9 +2559,7 @@ def _reconstruct_updated_transcript(
         return None
     if not bindings:
         return anon_transcript
-    # Single-brace `{Prefix_N}` matches the convention cloud used to echo
-    # in the previous protocol's `updated_transcript` (saved snapshots
-    # under `data/ha/debug/`) and the literal that `_apply_bindings`
+    # Single-brace `{Prefix_N}` matches the literal that `_apply_bindings`
     # already substitutes in fact subject / object.
     span_to_braced = {span: braced(placeholder) for placeholder, span in bindings.items()}
     return _substitute_whole_words(anon_transcript, span_to_braced)
@@ -2598,9 +2575,9 @@ def _apply_enrichment_delta(
     accept/drop/revert, then reconstruct the updated transcript from the
     surviving bindings.
 
-    Returns ``(facts, updated_transcript, report)``.  Unlike the retired
-    whole-delta gate, this function ALWAYS returns a fact list — there is
-    no parse-failure branch here: ``delta`` is already a parsed
+    Returns ``(facts, updated_transcript, report)``.  This function
+    ALWAYS returns a fact list — there is no parse-failure branch here:
+    ``delta`` is already a parsed
     :class:`EnrichmentDelta`, and a parse failure (``delta=None`` from
     :func:`request_enrichment`) is handled one level up, BEFORE this
     function is ever called, by the caller — the ``enrich`` stage,
@@ -2623,9 +2600,7 @@ def _apply_enrichment_delta(
     :class:`~paramem.cloud.anonymize.AnonymizedContract` to resolve
     against.
 
-    Per-action rules (owner-decided 2026-07-21/22 cloud-admission
-    redesign — replaces the whole-delta totality gate that used to live in
-    :func:`~paramem.cloud.deanonymize.deanonymize_facts`):
+    Per-action rules:
 
     1. ``add`` — a fact carrying any orphan token
        (:func:`~paramem.cloud.placeholders._fact_orphans`, scanning
@@ -2635,15 +2610,12 @@ def _apply_enrichment_delta(
        indexed input fact; if the RESULT carries any orphan, the fields
        are DISCARDED and the original input fact is kept UNCHANGED — the
        unit of rejection is cloud's CHANGE, not the fact itself.
-    3. ``drop`` — honored UNCONDITIONALLY.  The spec's alternative
-       (revert every drop in a delta that also had an add/modify
-       rejection, preferring redundancy over loss) is explicitly NOT
-       implemented here — the owner chose to measure the co-occurrence
-       first (``report["drop_with_rejection"]``) before building that
-       safety net.
+    3. ``drop`` — honored UNCONDITIONALLY.  An alternative design
+       (reverting every drop in a delta that also had an add/modify
+       rejection, preferring redundancy over loss) is not implemented;
+       ``report["drop_with_rejection"]`` records when the two co-occur.
 
-    Application order mirrors the original: ``modify``, then ``drop``,
-    then ``add``.
+    Application order: ``modify``, then ``drop``, then ``add``.
 
     ``updated_transcript`` excludes a binding ONLY when it is referenced
     EXCLUSIVELY by rejected content — an ``add``/``modify`` binding whose
@@ -2658,9 +2630,8 @@ def _apply_enrichment_delta(
     ``report`` carries:
 
     * ``add_count`` / ``modify_count`` / ``drop_count`` / ``bindings_count``
-      — the RAW counts from the parsed delta (same names
-      :func:`request_enrichment` used to report before this split — kept
-      for ``graph.diagnostics`` and ``tests/server/test_calibrate.py``
+      — the RAW counts from the parsed delta (kept for
+      ``graph.diagnostics`` and ``tests/server/test_calibrate.py``
       consumers), before any rejection.
     * ``rejected_adds`` — count of ``add`` entries dropped for carrying an
       orphan.
@@ -2669,10 +2640,7 @@ def _apply_enrichment_delta(
     * ``rejected_tokens`` — sorted list of the distinct orphan tokens
       found across every rejected ``add``/``modify``.
     * ``drop_with_rejection`` — ``True`` when this delta had a non-empty
-      ``drop`` set AND at least one ``add``/``modify`` rejection — the
-      measurement the owner asked for, to decide later whether reverting
-      every drop on any rejection (spec rule 3, not implemented) is worth
-      adding.
+      ``drop`` set AND at least one ``add``/``modify`` rejection.
     """
     resolvable: set[str] | None = set(scope.resolution) if scope is not None else None
 
@@ -2750,9 +2718,8 @@ def request_plausibility(
     The judge emits a small ``{"drop": {"R1": [<index>, ...], ...}}`` map,
     keyed by the rule that matched; this helper applies the drop-set to
     the input facts and returns the :class:`PlausibilityVerdict`. Output
-    is bounded and tiny by construction, so the truncation failure mode
-    that hit the previous "echo every fact" protocol cannot recur on long
-    inputs.
+    is bounded and tiny by construction, so truncation on long inputs
+    cannot recur.
 
     Returns `(verdict, raw_response)`. Raw response is preserved so
     callers can inspect the judge's verdict when questioning drop
@@ -2762,10 +2729,7 @@ def request_plausibility(
     short-circuits on that case rather than relying on
     :func:`_apply_drop_set`/:func:`_parse_drop_set`'s own ``raw is None``
     handling to produce the same ``None`` result implicitly, matching
-    :func:`request_enrichment`'s explicit ``raw is None`` branch (defect
-    fixed 2026-07-21: this function used to fall through to
-    ``_apply_drop_set`` unconditionally, the one asymmetry between the
-    two sibling request functions).
+    :func:`request_enrichment`'s explicit ``raw is None`` branch.
 
     The prompt is external config — edit ``configs/prompts/cloud_plausibility.txt``
     to tune; no code changes are needed.

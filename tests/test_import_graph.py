@@ -3,11 +3,11 @@ free of torch/peft/transformers at module scope.
 
 Each pin runs the import in a fresh subprocess (``sys.executable -c``) so
 imports cached by earlier tests in the same process can never mask a
-regression. A previously-heavy import chain (``paramem.backup`` eagerly
-re-exporting from ``paramem.backup.backup``, which imports
-``paramem.memory.interim_adapter`` -> PEFT -> torch/transformers at module
-scope) made every ``paramem.backup.*`` import pull in the ML stack; this
-file pins that it no longer does.
+failure to stay clean. ``paramem.memory.interim_adapter`` imports PEFT ->
+torch/transformers at module scope, so this file pins that ``paramem.backup``
+never eagerly re-exports from ``paramem.backup.backup`` in a way that would
+pull that module — and therefore the ML stack — into every ``paramem.backup.*``
+import.
 """
 
 from __future__ import annotations

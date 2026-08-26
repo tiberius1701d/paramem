@@ -52,7 +52,7 @@ class TestWriteReadMetaRoundtrip:
         assert read_meta(slot_dir).label == "pre-migration-2026-04-21"
 
     def test_meta_rejects_future_schema_version(self, tmp_path):
-        """Sidecar with schema_version > SCHEMA_VERSION raises MetaSchemaError. (NIT 2)"""
+        """Sidecar with schema_version > SCHEMA_VERSION raises MetaSchemaError."""
         meta = _make_meta()
         slot_dir = tmp_path / "future_slot"
         slot_dir.mkdir()
@@ -126,7 +126,7 @@ class TestWriteReadMetaRoundtrip:
     def test_read_meta_rejects_corrupt_json(self, tmp_path):
         """Sidecar containing invalid JSON raises MetaSchemaError("corrupt sidecar:...").
 
-        The ``__cause__`` must be a ``json.JSONDecodeError`` (Fix #2 path A).
+        The ``__cause__`` must be a ``json.JSONDecodeError``.
         """
         import json
 
@@ -152,7 +152,7 @@ class TestWriteReadMetaRoundtrip:
     def test_read_meta_rejects_binary_garbage_sidecar(self, tmp_path):
         """Sidecar containing binary garbage (non-UTF-8) raises MetaSchemaError.
 
-        The ``__cause__`` must be a ``UnicodeDecodeError`` (Fix #2 path B).
+        The ``__cause__`` must be a ``UnicodeDecodeError``.
         """
         meta = _make_meta()
         slot_dir = tmp_path / "binary_garbage_slot"

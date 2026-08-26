@@ -14,9 +14,9 @@ It also provides a timestamp helper:
       current sub-interval.
 
 Schedule-string parsing (``compute_schedule_period_seconds``) lives in
-``paramem.server.schedule_grammar`` — relocated there (2026-07) so the
-backup runner can share it without ``interim_adapter`` (a ``memory``-layer
-module) importing from ``backup``.
+``paramem.server.schedule_grammar`` so the backup runner can share it
+without ``interim_adapter`` (a ``memory``-layer module) importing from
+``backup``.
 
 This module also owns the on-disk tier-topology helpers for the adapter
 store: the whole-store tier walk (:func:`iter_tier_roots`), which reads
@@ -44,7 +44,7 @@ are present in model.peft_config.
 
 ACTIVE-ADAPTER DETERMINISM: see :func:`paramem.models.loader.detach_adapters`'s
 docstring — the switch-before-delete guard unload_interim_adapters relies on
-now lives there, not in this module.
+lives there.
 """
 
 from __future__ import annotations
@@ -66,7 +66,7 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# On-disk layout helpers (2026-05-14 hierarchy refactor)
+# On-disk layout helpers
 # ---------------------------------------------------------------------------
 #
 # PEFT adapter NAME is decoupled from on-disk DIR.  The NAME stays
@@ -307,8 +307,8 @@ def adapter_slot_root_for_name(adapter_dir: Path, name: str) -> Path:
     """Return the slot-root directory for any adapter name.
 
     Main tiers map directly to ``<adapter_dir>/<name>/``.  Interim adapters
-    map to ``<adapter_dir>/episodic/interim_<stamp>/`` per the 2026-05-14
-    hierarchy refactor.  Use this helper at every callsite that writes or
+    map to ``<adapter_dir>/episodic/interim_<stamp>/``.  Use this helper at
+    every callsite that writes or
     reads an adapter slot dir by NAME so the on-disk layout follows one
     rule.
     """

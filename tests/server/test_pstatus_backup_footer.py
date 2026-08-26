@@ -47,7 +47,7 @@ def _extract_backup_line(status_json: dict) -> str:
         capture_output=True,
         text=True,
     )
-    # Find the BACKUP line (pipe-separated since the backup-footer fix switched from \t to |).
+    # Find the BACKUP line (pipe-separated fields).
     for line in result.stdout.splitlines():
         if line.startswith("BACKUP|"):
             return line
@@ -253,7 +253,7 @@ class TestFooterNoBackupBlock:
 
 
 # ---------------------------------------------------------------------------
-# Regression — cap=0 + success=true renders clean output
+# cap=0 + success=true renders clean output
 # ---------------------------------------------------------------------------
 
 
@@ -317,8 +317,8 @@ def _render_backup_footer(backup: dict) -> str:
     bash_case_block = script_text[case_start:case_end]
 
     # Compose the full bash test fragment.
-    # NOTE: The BACKUP line uses | as separator (not \t) since the backup-footer fix.
-    # IFS=$'\t' with consecutive empty tabs collapses them (bash whitespace rule).
+    # NOTE: The BACKUP line uses | as separator, not tabs — IFS=$'\t' with
+    # consecutive empty tabs collapses them (bash whitespace rule).
     # Pass the backup_line via env var (BACKUP_LINE) so the shell sees real
     # pipe characters without any escaping artifacts from Python f-string quoting.
     bash_script = f"""#!/bin/bash
@@ -358,17 +358,15 @@ bk_next_disp=$(fmt_ts "$bk_next")
 
 
 class TestFooterCapZeroSuccessTrue:
-    """Regression: cap=0 + last_success_at set + no failures must render cleanly.
+    """cap=0 + last_success_at set + no failures must render cleanly.
 
-    Observed symptom (2026-04-22 E2E baseline): pstatus rendered
-    ``Backup:   FAILED false — 57141`` instead of a clean success or disabled line.
-    The fix adds an explicit cap=0 guard before the failure branch so no
-    false-FAILED output can be produced in this state.
+    An explicit cap=0 guard runs before the failure branch, so this state
+    can never produce false-FAILED output.
     """
 
     def test_footer_cap_zero_success_true_not_failed_branch(self):
         """cap=0 + success=true → BACKUP line does not contain 'false' or raw byte counts
-        in the rendered suffix (guards against the 'FAILED false — 57141' regression)."""
+        in the rendered suffix."""
         status = _minimal_status(
             {
                 "schedule": "daily 04:00",
@@ -406,8 +404,8 @@ class TestFooterCapZeroSuccessTrue:
     def test_footer_cap_zero_success_renders_no_failed_text(self):
         """The bash rendering of cap=0 + success=true must not say FAILED.
 
-        This is the direct guard against the symptom: pstatus showed
-        'Backup:   FAILED false — 57141' when it should show a clean line.
+        cap=0 + success=true must route to the cap=0 guard branch, showing
+        a clean line, not the failure branch.
         """
         rendered = _render_backup_footer(
             {
@@ -427,7 +425,7 @@ class TestFooterCapZeroSuccessTrue:
         assert "FAILED" not in rendered, (
             f"cap=0 + success=true rendered 'FAILED' in the footer: "
             f"{rendered!r}.  "
-            "The fix must route this state to the cap=0 guard branch, not the failure branch."
+            "This state must route to the cap=0 guard branch, not the failure branch."
         )
         # Should contain 'last ok' or 'never run', not 'FAILED'.
         assert "last ok" in rendered or "never run" in rendered or "no cap" in rendered, (

@@ -372,14 +372,10 @@ class TestSubmitSerialises:
 class TestPersistentCallableWorker:
     """Callable worker is persistent and never strands a job.
 
-    Before the fix, the worker exited as soon as the queue was empty.  A
-    concurrent submit() that observed is_alive()==True (thread in its exit
-    path but not yet terminated) would skip starting a new worker, leaving
-    the new job stranded.
-
-    The fix makes the worker persistent — it blocks on queue.get() between
-    jobs and lives for the process lifetime.  submit() starts the worker
-    exactly once on first call.
+    The worker blocks on queue.get() between jobs and lives for the process
+    lifetime, so a concurrent submit() that observes is_alive()==True never
+    skips starting a new worker while the old one is mid-exit and strands
+    the new job.  submit() starts the worker exactly once on first call.
     """
 
     @staticmethod
@@ -396,9 +392,9 @@ class TestPersistentCallableWorker:
     def test_submit_after_worker_idle_does_not_strand_job(self) -> None:
         """A job submitted after the worker has gone idle still executes.
 
-        Without the fix (get_nowait + thread exit), a job submitted while the
-        worker is in its shutdown path would be stranded.  With the persistent
-        worker (blocking get()), the second job is guaranteed to run.
+        The worker blocks on queue.get() rather than exiting when the queue
+        empties, so a job submitted while the worker is idle-but-alive is
+        guaranteed to run.
 
         Sequence:
           1. Submit job 1 and wait for it to complete.

@@ -777,7 +777,7 @@ class TestRegisterAnonymous:
         # register_anonymous should return the existing named profile via centroid match.
         anon_id = store.register_anonymous(sample_embedding)
         assert anon_id == named_id
-        # enroll() now uses _mint_anon_speaker_id() — the shared monotonic counter
+        # enroll() uses _mint_anon_speaker_id() — the shared monotonic counter
         # advances for ALL mints, named or anonymous. Alice's enroll bumped it to 1.
         assert store._next_anon_index == 1
         profiles = store.list_profiles()
@@ -932,7 +932,7 @@ class TestRegisterAnonymousTentative:
         store = self._make_tentative_store(tmp_path)
         emb_a, emb_b = self._make_tentative_pair()
 
-        # Enroll emb_a as a named speaker — now uses the shared counter, so
+        # Enroll emb_a as a named speaker — uses the shared counter, so
         # Alice gets speaker0 and the counter advances to 1.
         alice_id = store.enroll("Alice", emb_a)
         assert alice_id is not None

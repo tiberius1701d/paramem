@@ -55,9 +55,8 @@ def resolve_to_node_key(
 ) -> str:
     """Resolve a surface name to the actual node key used in the graph.
 
-    Collapses the two formerly-duplicated nested resolvers
-    (``_resolve_node_key`` / ``_resolve_name``) into one module-level
-    function so the resolution logic lives in exactly one place.
+    The one module-level resolver every caller shares — the resolution
+    logic lives in exactly one place.
 
     Resolution order:
 
@@ -75,9 +74,9 @@ def resolve_to_node_key(
        the drop→keep chain on the resolved key.  Cycle-guarded via a ``seen``
        set so a malformed coref loop does not block.
 
-    The stale rationale "verbatim-first because speaker nodes are keyed
-    VERBATIM" no longer applies: speaker node keys are now casefolded, so the
-    membership shortcut is only useful for ordinary node keys.
+    Speaker node keys are casefolded, so the membership shortcut is only
+    useful for ordinary node keys — a verbatim speaker id (e.g.
+    ``"Speaker0"``) falls through to the canonical-fallback step.
 
     Args:
         name: Surface name or node key to resolve.
@@ -209,7 +208,7 @@ def enrich_graph(
     gc_disable: "Callable[[], None] | None" = None,
     gc_enable: "Callable[[], None] | None" = None,
 ) -> dict:
-    """Post-merge graph-level cloud enrichment pass (Task #10).
+    """Post-merge graph-level cloud enrichment pass.
 
     Runs at full consolidation over the cumulative ``merger.graph`` to
     capture cross-transcript second-order relations that per-transcript
@@ -284,8 +283,8 @@ def enrich_graph(
     verdict — so that chunk's cloud call is skipped (fail-closed) and
     counted in the returned ``privacy_skipped_chunks``. This residual (an
     entity the tagger named but reconciliation could not match
-    to a node) is owner-accepted and not otherwise engineered around
-    — see ``benchmarking.md``.
+    to a node) is not otherwise engineered around — see
+    ``benchmarking.md``.
 
     The function mutates ``merger.graph`` in place: first applying
     ``same_as`` node contractions, then inserting new edges tagged with
@@ -387,13 +386,11 @@ def enrich_graph(
               individually dropped post-substitution (predicate-invariant
               plus residual-placeholder drops in
               :func:`~paramem.cloud.placeholders._apply_bindings`) —
-              summed across every chunk's cloud call.  Replaces the
-              retired ``totality_rejected_chunks`` (2026-07-22
-              cloud-admission redesign): a cloud response naming an
-              orphan/unresolvable token used to reject the WHOLE chunk
-              delta; it now sheds only the offending relation(s), counted
-              here. Distinct from ``privacy_skipped_chunks`` (which fires
-              before any cloud call is made).
+              summed across every chunk's cloud call.  A cloud response
+              naming an orphan/unresolvable token sheds only the
+              offending relation(s), counted here — it never rejects a
+              chunk's whole delta. Distinct from ``privacy_skipped_chunks``
+              (which fires before any cloud call is made).
             - ``stamped_relations`` (int): enrichment relations whose two
               endpoints resolved to exactly one speaker in the chunk's
               endpoint→speakers evidence (see the speaker-attribution
@@ -600,10 +597,9 @@ def enrich_graph(
             # for a relation endpoint that isn't already a known Entity
             # is entity_type="concept" (GraphMerger._merge_relations).
             # Node attributes are therefore NOT a usable scope source at
-            # this tier — reading them here previously masked ONLY the
-            # speaker (the sole node synthesized with entity_type=
-            # "person") and sent every other real name to the cloud
-            # verbatim.
+            # this tier: the sole node synthesized with entity_type=
+            # "person" is the speaker, so scoping off node attributes
+            # would send every other real name to the cloud verbatim.
             #
             # The local model is the SOLE scope authority instead: run
             # THE one anonymize chain (:func:`~paramem.cloud.anonymize.
@@ -611,8 +607,8 @@ def enrich_graph(
             # are already a valid ``facts: list[dict]`` (subject/
             # predicate/object/relation_type/speaker_id), so no
             # ``Relation``/``SessionGraph`` round trip is needed to reach
-            # this cloud-package call (interface narrowing, 2026-07-21:
-            # ``anonymize`` takes facts directly, never a graph carrier).
+            # this cloud-package call (``anonymize`` takes facts
+            # directly, never a graph carrier).
             # ``transcript=""`` — there is no transcript at this tier.
             # ``identity_domain=chunk_nodes`` drives (A)'s
             # identity-reconciliation step (5) — the local model's
@@ -692,12 +688,11 @@ def enrich_graph(
                 # ``payload.failure`` names which one fired — see
                 # ``AnonymizedContract``'s docstring.  Both are counted
                 # into ``privacy_skipped_chunks`` (the TOTAL count of
-                # chunks held back fail-closed), and NOT via
-                # ``payload.rekey_dropped``: that count stays ``0`` in
-                # both causes (the tagger case never reaches the
-                # reconciliation loop that increments it; the guard case
-                # is where the model's mapping was dropped entirely
-                # before reconciliation ever ran).
+                # chunks held back fail-closed).  ``payload.rekey_dropped``
+                # carries ``0`` on the tagger cause (the scan never ran, so
+                # reconciliation never ran either) and the real accumulated
+                # count on the guard cause (reconciliation ran and its
+                # drops are added to ``mapping_rekey_dropped`` below).
                 privacy_skipped_chunks += 1
                 if payload.failure == "guard":
                     # The domain-scoped fail-closed guard fired: the

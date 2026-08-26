@@ -24,7 +24,7 @@ class TestParseSlotTimestamp:
         assert result.second == 0
 
     def test_parse_slot_timestamp_rejects_18_chars(self):
-        """A string of 18 chars (the old off-by-one) is rejected — returns None."""
+        """A string of 18 chars does not match the 17-char slot format — returns None."""
         result = _parse_slot_timestamp("20260421-040000123")  # 18 chars
         assert result is None
 

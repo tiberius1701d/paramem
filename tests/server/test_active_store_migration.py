@@ -1,12 +1,11 @@
 """Unit tests for paramem.server.active_store_migration's standalone helpers.
 
-New file: the module previously had no dedicated test file, and this fix
-pass adds a new standalone function (``_delete_orphaned_simulate_slots``)
-whose logic (venue-blind manifest-kind classification, keep-slot exclusion,
-dot-dir exclusion) is directly unit-testable without a live model, GPU, or
-ConsolidationLoop -- unlike the migration functions that call it, which
-require the full fold/training surface and are exercised end-to-end via the
-scoped integration suites instead (``tests/server/test_migration_confirm.py``,
+``_delete_orphaned_simulate_slots``'s logic (venue-blind manifest-kind
+classification, keep-slot exclusion, dot-dir exclusion) is directly
+unit-testable without a live model, GPU, or ConsolidationLoop -- unlike the
+migration functions that call it, which require the full fold/training
+surface and are exercised end-to-end via the scoped integration suites
+instead (``tests/server/test_migration_confirm.py``,
 ``tests/test_consolidation.py``).
 
 No GPU required -- every slot here is written with stub payload bytes through
@@ -82,7 +81,7 @@ def _cfg(adapter_dir: Path, *, mode: str) -> MagicMock:
 
 class TestDeleteOrphanedSimulateSlots:
     def test_deletes_simulate_slots_other_than_keep(self, tmp_path: Path) -> None:
-        """A stale simulate slot left behind by an interrupted step 8 is
+        """A stale simulate slot left behind by an interrupted migration is
         removed; the freshly-committed train slot (``keep``) is untouched."""
         tier_root = tmp_path / "episodic"
         orphan = _write_simulate_slot(tier_root)
@@ -305,9 +304,8 @@ class TestMigrateTierSimulateToTrainEntryFilter:
 class TestDetectModeSwitch:
     """Behavioral pins for ``detect_mode_switch``'s manifest-bound
     classification (paramem/server/active_store_migration.py:189-254) --
-    the module's former filename-sniff-era coverage was dropped in a
-    rewrite and never re-homed; these pin the CURRENT bound-slot
-    discriminator, not the retired filename check."""
+    mode-switch detection reads the slot's bound manifest, never a
+    filename at the tier root."""
 
     def test_simulate_bound_tier_with_target_train_arms_simulate_to_train(
         self, tmp_path: Path
@@ -414,8 +412,7 @@ class TestDetectModeSwitch:
 
 class TestStateFileIO:
     """Round-trip coverage for the state-file primitives (save_state /
-    load_state / clear_state) -- dropped in the same rewrite as
-    TestDetectModeSwitch and never re-homed."""
+    load_state / clear_state)."""
 
     def test_save_then_load_round_trips_equal(self, tmp_path: Path) -> None:
         original = MigrationState.for_mode_switch(source_mode="simulate", target_mode="train")

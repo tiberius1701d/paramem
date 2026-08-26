@@ -227,14 +227,12 @@ class TestGraphTierSkipsAfterRelease:
     Both passes own a ``model is None`` early-skip, and that skip must stay
     reachable WITHOUT any read of ``self.extraction``.
 
-    Regression: the graph tier once took the extraction config as a resolved
-    constructor argument, so ``self.extraction.config`` was evaluated by the
-    caller before any guard in the tier could run — a released loop raised
-    ``AttributeError`` on ``None.config`` where it had previously skipped.
-    The config is now handed over as a deferred read
-    (``_current_extraction_config``) that only the post-guard paths invoke.
-    These tests fail with ``AttributeError`` if that read is ever hoisted back
-    above the guard.
+    The extraction config is handed over as a deferred read
+    (``_current_extraction_config``) that only the post-guard paths invoke,
+    never a resolved constructor argument evaluated before the guard runs —
+    that would read ``self.extraction.config`` and raise ``AttributeError``
+    on a released loop's ``None`` extraction. These tests fail with
+    ``AttributeError`` if that read is ever hoisted back above the guard.
     """
 
     @staticmethod

@@ -90,13 +90,10 @@ def main():
         "Use --test-audio to verify pyannote-audio works."
     )
 
-    # TODO: Implement Wyoming protocol handling:
-    # 1. Listen for Wyoming AudioStart/AudioChunk/AudioStop events
-    # 2. Accumulate audio chunks into a buffer
-    # 3. Forward audio to upstream STT for transcription
-    # 4. Compute speaker embedding from accumulated audio
-    # 5. POST to ParaMem /chat with {text: transcript, speaker_embedding: [...]}
-    # 6. Return TTS response to satellite
+    # This scaffold does not accumulate Wyoming AudioStart/AudioChunk/AudioStop
+    # events into a buffer, forward audio to the upstream STT, compute a
+    # speaker embedding from it, POST to ParaMem /chat, or return a TTS
+    # response to the satellite — only --test-audio's embedding check runs.
 
 
 if __name__ == "__main__":

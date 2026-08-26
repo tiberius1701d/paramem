@@ -16,9 +16,8 @@ logger = logging.getLogger(__name__)
 
 # Providers known to be OpenAI-compatible. Sourced from
 # ``paramem.cloud.admission`` — the ONE provider registry — rather than a
-# second, locally-maintained set: this table used to omit ``mistral``
-# while carrying it in ``COMPATIBLE_PROVIDERS`` below, so a
-# ``provider: mistral`` agent with no explicit endpoint POSTed to ``""``.
+# second, locally-maintained set, so a provider registered there is always
+# reflected here too.
 COMPATIBLE_PROVIDERS = OPENAI_COMPAT_PROVIDERS
 
 
@@ -93,8 +92,7 @@ class OpenAICompatAgent(CloudAgent):
 
         # Search models reject temperature; regular models pin to 0 for
         # structured-output determinism (CLAUDE.md invariant: temperature=0.0
-        # for JSON/QA/distillation paths).  The 0.7 default that lived here
-        # produced run-to-run variance in graph extraction.
+        # for JSON/QA/distillation paths).
         if not is_search_model:
             payload["temperature"] = 0.0
 

@@ -65,8 +65,8 @@ class GraphTierRefiner:
     construction rather than cached across folds because callers may re-wrap
     the model (``create_adapter`` / ``get_peft_model``) between folds; a
     longer-lived refiner would risk pinning a stale wrapper. See
-    :meth:`release` for the (currently unused) cleanup path that keeps the
-    class safe to hold if a future caller ever does.
+    :meth:`release` for the unused cleanup path that keeps the class safe
+    to hold if a future caller ever does.
     """
 
     def __init__(
@@ -148,10 +148,10 @@ class GraphTierRefiner:
     def release(self) -> None:
         """Null all references this refiner holds. Idempotent.
 
-        Not on any release path today — a ``GraphTierRefiner`` is constructed
-        per call and dropped by its caller on return (see the class
-        docstring) — but must exist so the class is safe to hold if a future
-        caller ever does.
+        Not called by any current caller — a ``GraphTierRefiner`` is
+        constructed per call and dropped by its caller on return (see the
+        class docstring) — but must exist so the class is safe to hold if a
+        future caller ever does.
         """
         self.model = None
         self.tokenizer = None
@@ -402,8 +402,8 @@ class GraphTierRefiner:
                 # reinforcement_count=1 (GraphMerger Case-3), and an enrichment edge
                 # inherits its chunk's MAX last_seen (graph_enrich: _chunk_last_seen),
                 # so a 1-vs-1 group would tie on `rec` and then hand the win to the
-                # cloud paraphrase.  Since the enrichment pass now runs BEFORE this
-                # one, that inversion is reachable without the `established` term.
+                # cloud paraphrase.  Since the enrichment pass runs BEFORE this one,
+                # that inversion is reachable without the `established` term.
                 def _pred_sort_key(cp: str) -> tuple:
                     edges = pred_map[cp]
                     rec = sum(e["edata"].get("reinforcement_count", 1) for e in edges)
@@ -553,25 +553,22 @@ class GraphTierRefiner:
         passes run, normalization sees the cloud-emitted predicates and
         collapses paraphrases before the fold mints keys from the graph — a
         predicate normalized after key assembly is a key minted un-normalized.
-        Two second-order effects follow from this order: normalization's
-        10-node floor (:meth:`run_normalization`) is now evaluated after
-        enrichment has added nodes, so normalization can clear a floor it
-        previously failed (strictly more normalization, never less); and
-        ``same_as`` node contractions land before normalization, so predicate
-        grouping is computed over already-coreferenced ``(subject, object)``
-        pairs — strictly better grouping than grouping first and
-        coreferencing after. Survivor selection within
-        :meth:`run_normalization` additionally never lets an
+        Normalization's 10-node floor (:meth:`run_normalization`) is evaluated
+        after enrichment has added nodes, so a graph that clears the floor
+        only with enrichment's own nodes still normalizes; and ``same_as``
+        node contractions land before normalization, so predicate grouping
+        is computed over already-coreferenced ``(subject, object)`` pairs.
+        Survivor selection within :meth:`run_normalization` never lets an
         enrichment-sourced predicate retire an established one on a recency
         tie-break (see the ``established`` term in ``_pred_sort_key``) — this
-        is what keeps the new order safe against a cloud paraphrase (which
-        inherits its chunk's maximum ``last_seen``) winning a 1-vs-1 tie
-        against an organically-extracted predicate.  What the flip gives up:
-        the cloud model that generates enrichment relations now sees the
-        graph BEFORE normalization has collapsed any synonym predicates
-        (it read an already-normalized graph under the old order) — the
-        guarantee this order relies on instead is the reorder itself plus
-        the survivor key above, not a normalized input to the cloud call.
+        is what keeps a cloud paraphrase (which inherits its chunk's maximum
+        ``last_seen``) from winning a 1-vs-1 tie against an
+        organically-extracted predicate. The cloud model that generates
+        enrichment relations sees the graph BEFORE normalization has
+        collapsed any synonym predicates — the safety guarantee for
+        enrichment-sourced predicates comes from this ordering plus the
+        survivor-key rule above, not from a normalized input to the cloud
+        call.
 
         Args:
             normalize: When ``True``, run :meth:`run_normalization`.

@@ -53,7 +53,7 @@ class TestServingSystemPromptFile:
         assert "[ESCALATE]" in prompt_text
 
     def test_prompt_states_a_numeric_word_budget(self, prompt_text: str):
-        """A word budget replaces the old "1-2 sentences" instruction.
+        """The prompt states a numeric word budget.
         Pinned by pattern, not exact prose — the numbers are
         calibration-tunable."""
         assert re.search(r"\b\d+\s+words\b", prompt_text) is not None
@@ -102,7 +102,6 @@ class TestServingSystemPromptFile:
         Today line at inference time."""
         selection = recall_selection_prompt()
         assert re.search(r"Example \(today is \w+, \d{4}-\d{2}-\d{2}\):", selection) is not None
-        # Regression guard: a prior revision anchored every example to one
-        # shared hardcoded "Today" line instead of each example stating its
-        # own date — that shape must not come back.
+        # Every example states its own date; a shared hardcoded "Today" line
+        # anchoring all examples at once must not appear.
         assert "Examples (Today is Thursday, 2026-08-06)" not in selection

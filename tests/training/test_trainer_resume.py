@@ -682,8 +682,9 @@ class TestFingerprintDatasetContentStable:
     def test_address_independence(self):
         """Two separately-constructed datasets with identical content hash equal.
 
-        This is the core regression: the old ``str(object)`` code embedded the
-        heap address, so two instances always differed.
+        Fingerprinting must not depend on object identity: hashing
+        ``str(object)`` would embed the heap address, so two instances with
+        identical content would never hash equal.
         """
         from paramem.training.trainer import _fingerprint_dataset
 
@@ -955,7 +956,7 @@ class TestStagingResumeCallbackOnSave:
 
         assert result == str(ckpt_dir), (
             f"Expected {ckpt_dir!s}, got {result!r}. "
-            "on_save fix must make _resolve_resume_checkpoint find output_dir/checkpoint-N."
+            "_resolve_resume_checkpoint must find output_dir/checkpoint-N."
         )
 
     def test_on_save_none_when_checkpoint_dir_cleaned(self, tmp_path):

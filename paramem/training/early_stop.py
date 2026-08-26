@@ -1,9 +1,8 @@
 """Recall-based early-stop policy and callback (production + experiments).
 
-Originally implemented for Test 14 in ``experiments/utils/early_stop.py``;
-lifted to ``paramem.training.early_stop`` 2026-05-06 so production
-``BackgroundTrainer`` can use the same gate.  Experiment scripts continue
-to import from ``experiments.utils.early_stop`` via a re-export shim.
+Production ``BackgroundTrainer`` imports this module directly; experiment
+scripts import from ``experiments.utils.early_stop`` via a re-export shim
+so both share the same gate.
 
 ``EarlyStopPolicy`` — dataclass encoding when probing starts, when the stop
 signal can fire, and how many consecutive perfect probes are required.
@@ -84,11 +83,10 @@ class EarlyStopPolicy:
         extra_epochs_past_first_perfect: When set, fire the stop signal at
             ``first_perfect_epoch + extra_epochs_past_first_perfect`` instead
             of waiting for ``consecutive_perfect >= window``.  Independent of
-            ``signal_from_epoch``.  None disables this alternate stop path —
-            existing callers see no change.  Used by Test 16's
-            depth-past-floor sweep where the first observation of 100% recall
-            is the anchor and an additional fixed number of epochs is trained
-            past it.
+            ``signal_from_epoch``.  ``None`` disables this alternate stop
+            path.  Supports a depth-past-floor sweep where the first
+            observation of 100% recall is the anchor and a fixed number of
+            epochs is trained past it.
 
     Raises:
         ValueError: If ``signal_from_epoch < probe_from_epoch``, or if

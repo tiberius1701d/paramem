@@ -83,10 +83,7 @@ def is_self_referential(
     short-circuit in ``paramem.server.app._relay_route``, the forwarded-query
     verdict in ``_maybe_escalate``, the history drop-gate in
     ``_sanitize_history``) imports this name directly rather than
-    re-deriving the conjunction below.  There used to be a second, private
-    ``_is_about_speaker`` wrapper with the identical body; it is retired —
-    a caller that imported it privately was re-deriving logic already
-    public here.
+    re-deriving the conjunction below.
 
     Two-tier detection, in order:
 

@@ -210,13 +210,10 @@ class TestTrainingSchedulerBehavior:
         yield
         _state["consolidating"] = saved if saved is not None else False
 
-    # test_scheduled_extract_done_callback_on_exception (generic exception on
-    # a staging action clears _state["consolidating"]) is deleted rather than
-    # retargeted: it is superseded by
-    # tests/test_vram_guard.py::TestDoneCallbackErrorSurfacing::
-    # test_generic_exception_does_not_populate_state, which drives the same
-    # assertion against the current _consolidation_run_done(action, spec,
-    # future) signature.
+    # A generic exception on a staging action clearing _state["consolidating"]
+    # is covered by tests/test_vram_guard.py::TestDoneCallbackErrorSurfacing::
+    # test_generic_exception_does_not_populate_state, which drives that
+    # assertion against _consolidation_run_done(action, spec, future).
 
     def test_consolidation_run_done_on_success_leaves_flag_alone(self):
         """On success (future.exception() is None), _consolidation_run_done
@@ -967,7 +964,7 @@ class TestVRAMBudget:
             # ── (a) math gate: pre-load math on a fresh GPU.
             # predict_base_bytes reads from HF cache; may return None if not cached.
             # Falls back to known Mistral 7B measured value for the probe.
-            _MISTRAL_7B_MEASURED = 4_308_428_800  # ~4,108 MiB NF4 (measured RTX 5070, 2026-04-19)
+            _MISTRAL_7B_MEASURED = 4_308_428_800  # ~4,108 MiB NF4 base-model footprint
             base_pred = (
                 predict_base_bytes(
                     server_cfg.model_config,
@@ -1247,7 +1244,7 @@ class TestSimulateModePromptIteration:
         )
         minted_session_id = pending_before[0]["session_id"]
 
-        # run_consolidation was deleted; use _run_extraction_phase via _state.
+        # Extraction runs through _run_extraction_phase via _state.
         # MemoryStore is lifespan-owned in production; construct it here the
         # same way the server does.
         memory_store = MemoryStore()

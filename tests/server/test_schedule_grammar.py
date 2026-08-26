@@ -355,10 +355,9 @@ class TestScheduledRunDueNonExactInterval:
         assert scheduled_run_due("every 5h", stamp, now=exactly_due) is ScheduleDueStatus.DUE
 
     def test_consecutive_dispatches_stay_exactly_period_apart(self):
-        """Same drift-regression scenario as
-        TestFloorToHeartbeatDriftRegression in test_systemd_timer_calendar.py,
-        exercised through the new scheduled_run_stamp_value API instead of
-        floor_to_heartbeat directly."""
+        """Same drift scenario as TestFloorToHeartbeatDriftRegression in
+        test_systemd_timer_calendar.py, exercised through the
+        scheduled_run_stamp_value API."""
         period_s = 5 * 3600
         base = _local(2024, 1, 15, 0, 0)
         heartbeat_fire_times = [base, base + period_s, base + 2 * period_s]

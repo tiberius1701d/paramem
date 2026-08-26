@@ -74,8 +74,6 @@ def rename_pending_to_slot(pending_dir: Path, slot_dir: Path) -> None:
         If *slot_dir* already exists.
     OSError
         On any other rename failure.
-
-    (NIT 1)
     """
     if slot_dir.exists():
         raise FileExistsError(

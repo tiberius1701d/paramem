@@ -395,7 +395,7 @@ def _delete_weight_slots(slot_root: Path) -> int:
     A weight slot is a subdirectory containing ``adapter_model.safetensors``
     or ``adapter_config.json``. A simulate-payload slot (its ``graph.json``
     lives inside its OWN timestamped subdirectory, never at *slot_root*'s
-    top level — nothing writes a tier-root ``graph.json`` any more) never
+    top level — nothing writes a tier-root ``graph.json``) never
     matches this predicate and is preserved, as is ``indexed_key_registry.json``
     at *slot_root*'s top level.
     Returns the number of slots removed.
@@ -719,7 +719,7 @@ def _migrate_tier_simulate_to_train(
     # order — see ``restore_bundle``'s registry-last rule), a torn simulate
     # write (``commit_tier_slot`` crashes between writing graph.json and the
     # registry flush that follows it), or an ordinary operator erase: the
-    # forget door no longer erases graph content at all, it stale-marks, and
+    # forget door stale-marks rather than erasing graph content, and
     # a withheld key's graph.json edge must not be hot-loaded and retrained
     # here — ``MemoryStore.put``'s ``register=True`` default would
     # re-register it as active, resurrecting the erasure. The registry is
@@ -763,7 +763,7 @@ def _migrate_tier_simulate_to_train(
         #   publish_tier_registry — the registry write never landed) —
         #   indistinguishable from a transient unmounted tier and can never
         #   prove orphanhood, so all entries are kept and a WARNING is
-        #   logged instead (unchanged from before this guard was added).
+        #   logged instead.
         registry_file = slot_root / "indexed_key_registry.json"
         if registry_file.exists():
             raise _TierSkipped(
@@ -848,11 +848,11 @@ def _migrate_tier_simulate_to_train(
 
     # Step 3: reset adapter to LoRA-zero (delete + recreate) -- the explicit
     # cold-rebuild semantics this migration is documented to use
-    # (architecture.md's base-swap migration decision). This LoRA-zero state
+    # (ARCHITECTURE.md, base-swap migration). This LoRA-zero state
     # is measured as "cold" by _train_tier_adapter below, which
     # unconditionally donor-seeds it (paramem.training.donor) before
-    # training -- migration no longer starts from a bare LoRA-zero fact-free
-    # state, it starts from the donor's task-skilled weights. On a
+    # training -- migration starts from the donor's task-skilled weights,
+    # not a bare LoRA-zero fact-free state. On a
     # base-model swap (Phase B retraining onto the new base) the donor
     # checkpoint's recorded base_model_id no longer matches, so
     # donor_checkpoint_valid rejects it and the funnel builds a fresh donor

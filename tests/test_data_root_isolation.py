@@ -83,7 +83,7 @@ def test_default_data_dir_is_redirected_away_from_the_live_store():
     assert not _is_inside(default_data_dir(), _LIVE_DATA_ROOT), (
         f"default_data_dir() resolves to {default_data_dir()}, inside the operator's "
         f"live store {_LIVE_DATA_ROOT}. conftest._isolate_data_root is not in force — "
-        "any test driving a filesystem path from config defaults now reads or writes "
+        "any test driving a filesystem path from config defaults reads or writes "
         "real personal data."
     )
 

@@ -154,9 +154,7 @@ def test_empty_stt_text_still_computes_embedding():
 
     The Wyoming/satellite path calls process_utterance with compute_embedding=True
     and relies on the embedding for speaker identification even when the audio is
-    silent or the STT produced no transcript.  The condition was previously
-    ``if compute_embedding and text`` — the ``and text`` gate was dropped so the
-    satellite path is not broken by silent audio.
+    silent or the STT produced no transcript.
 
     POST /voice passes compute_embedding=False (token auth), so that path is
     unaffected.

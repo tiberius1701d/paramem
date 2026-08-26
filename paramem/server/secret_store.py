@@ -1,8 +1,8 @@
 """Per-secret-file loader for ParaMem.
 
-Purpose: split what used to be a single ``.env`` file into one file per secret
-under ``~/.config/paramem/secrets/`` with strict permissions. Reduces blast
-radius: a single file disclosure exposes only that secret, not the full set
+Purpose: one file per secret under ``~/.config/paramem/secrets/`` with strict
+permissions, instead of a single ``.env`` file. Reduces blast radius: a
+single file disclosure exposes only that secret, not the full set
 (HA token, cloud API keys, daily passphrase, etc.).
 
 Layout:

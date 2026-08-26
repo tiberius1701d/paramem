@@ -1,17 +1,17 @@
-"""Regression tests for scripts/dev/calibrate_prompts.py.
+"""Tests for scripts/dev/calibrate_prompts.py.
 
-Specifically guards the NameError that occurred when --stages normalize was
-invoked with an empty chunk loop: params_base was assigned inside the
-for-chunk loop and therefore never bound when chunks == [].
+Pins that ``--stages normalize`` does not raise ``NameError`` on an empty
+chunk loop: ``params_base`` must be bound before the for-chunk loop runs, not
+inside it.
 
 Also covers the auth gap: _post_stage must attach the Authorization header
 and raise SystemExit with an actionable message on 401.
 
-``TestSeedFromEnrichLoading`` covers the ``--seed-from --stages enrich`` leak
-class: ``01_extract_chunk_N.json`` is written as a WRAPPER
+``TestSeedFromEnrichLoading`` covers the ``--seed-from --stages enrich``
+load: ``01_extract_chunk_N.json`` is written as a WRAPPER
 (``{"stage", "chunk_index", "candidate_runs": [...]}``), unlike ``02_``/``03_``
-which write the raw stage response directly — loading the wrapper as-is left
-``prior_extract`` with no usable ``"parsed"`` graph.
+which write the raw stage response directly, so the loader must unwrap it to
+leave ``prior_extract`` with a usable ``"parsed"`` graph.
 """
 
 from __future__ import annotations
@@ -115,8 +115,7 @@ class TestNormalizeStageNoNameError:
         BEFORE the for-chunk loop, not inside it.
 
         This is a structural assertion over the source text — it will catch any
-        future accidental regression that re-introduces the assignment inside the
-        loop.
+        edit that moves the assignment back inside the loop.
         """
         source = Path(calibrate_prompts.__file__).read_text()
         lines = source.splitlines()
@@ -145,7 +144,7 @@ class TestNormalizeStageNoNameError:
         assert params_base_line < chunk_loop_line, (
             f"params_base (line {params_base_line}) must be assigned BEFORE "
             f"'for chunk in chunks:' (line {chunk_loop_line}). "
-            "The NameError regression has been re-introduced."
+            "params_base is unbound when chunks is empty otherwise."
         )
 
 
@@ -294,8 +293,8 @@ class TestSeedFromEnrichLoading:
     The graph is the only artifact the client hands over: every stage
     past ``local_extract`` is entered server-side with that graph as its
     seed, and the chain re-derives the anonymized facts, the anonymized
-    transcript and the fail-closed decisions by running. The client no
-    longer relays any of them.
+    transcript and the fail-closed decisions by running. The client
+    relays none of them.
     """
 
     _REAL_PROMPTS_DIR = Path(__file__).resolve().parents[1] / "configs" / "prompts"
@@ -470,9 +469,8 @@ class TestRespondStage:
         index = json.loads((dump_dir / "runs.json").read_text())
         assert index["respond"] == {"0": self._canned_response()["artifact_dir"]}
 
-        # 07_respond.json is written unconditionally now, even with
-        # --baseline none where there is no comparison to report — the blob
-        # is no longer built and then discarded.
+        # 07_respond.json is written unconditionally, even with --baseline
+        # none where there is no comparison to report.
         out_blob = json.loads((dump_dir / "07_respond.json").read_text())
         assert out_blob["stage"] == "respond"
         assert out_blob["artifact_dir"] == self._canned_response()["artifact_dir"]

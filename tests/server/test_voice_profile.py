@@ -423,7 +423,7 @@ def test_stt_cpu_pair_not_stored_when_load_fails(caplog):
     try:
         # Run the exact production code path from the lifespan STT CPU block.
         # We patch WhisperSTT so the constructor returns our failing mock, then
-        # run the block that now gates on the return value of .load().
+        # run the block that gates on the return value of .load().
         async def _run():
             loop = asyncio.get_running_loop()
             stt_cpu_ok = await loop.run_in_executor(None, failing_stt.load)
@@ -434,7 +434,7 @@ def test_stt_cpu_pair_not_stored_when_load_fails(caplog):
                 app_module.logger.warning(
                     "Local STT CPU pair failed to load — voice path unavailable in cloud-only mode"
                 )
-                # Deliberately do NOT store — this is the fix being tested.
+                # Deliberately do NOT store on a load failure.
 
         app_module._state["stt_cpu"] = None  # ensure clean start
         asyncio.run(_run())
@@ -484,7 +484,7 @@ def test_tts_cpu_pair_not_stored_when_load_fails(caplog):
                 app_module.logger.warning(
                     "Local TTS CPU pair failed to load — voice path unavailable in cloud-only mode"
                 )
-                # Deliberately do NOT store — this is the fix being tested.
+                # Deliberately do NOT store on a load failure.
 
         app_module._state["tts_cpu"] = None  # ensure clean start
         asyncio.run(_run())

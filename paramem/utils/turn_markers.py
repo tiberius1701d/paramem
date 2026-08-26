@@ -1,12 +1,12 @@
 """The ``[user]`` / ``[assistant]`` transcript turn-marker vocabulary.
 
 One owner for the marker surface every extraction/anonymization few-shot
-is calibrated on. Production still mints the marker for the session
-transcript at :meth:`~paramem.server.session_buffer.SessionBuffer._format_turns`,
-which now calls :func:`format_turn` rather than formatting the marker
-itself; a second consumer (the cloud-egress payload assembler, which
-cannot import ``paramem.server``) reaches the same vocabulary through
-this leaf module. Stateless, deterministic, no I/O.
+is calibrated on. Production mints the marker for the session transcript
+at :meth:`~paramem.server.session_buffer.SessionBuffer._format_turns`,
+which calls :func:`format_turn`; a second consumer (the cloud-egress
+payload assembler, which cannot import ``paramem.server``) reaches the
+same vocabulary through this leaf module. Stateless, deterministic, no
+I/O.
 """
 
 import re
@@ -20,9 +20,9 @@ def format_turn(role: str, text: str) -> str:
     Produces ``"[<role>] <text>"`` — e.g. ``format_turn("user", "hello")``
     returns ``"[user] hello"``. ``role`` is written verbatim inside the
     brackets (no vocabulary restriction to ``user``/``assistant``); this
-    reproduces, byte-for-byte, the marker
+    matches, byte-for-byte, the marker
     :meth:`~paramem.server.session_buffer.SessionBuffer._format_turns`
-    has always produced for every role.
+    produces for every role.
     """
     return f"[{role}] {text}"
 

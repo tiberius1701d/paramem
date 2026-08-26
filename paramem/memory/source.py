@@ -357,7 +357,7 @@ def build_memory_source(
             non-``None`` in train mode — same raise treatment as *model*.
         cached_registry: Forwarded to
             :meth:`~paramem.memory.store.MemoryStore.read_simhash_registry_from_disk`
-            as its ``cached`` keyword — read for EITHER venue now, since
+            as its ``cached`` keyword — read for EITHER venue, since
             both :class:`WeightMemorySource` and :class:`DiskMemorySource`
             gate their own results against it.  Default ``False`` re-reads
             every tier registry from disk on every call — the correct

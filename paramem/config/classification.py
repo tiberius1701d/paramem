@@ -50,8 +50,9 @@ _GLYPHS: dict[Tier, str] = {
 # ---------------------------------------------------------------------------
 EXTENSION_FIELDS: frozenset[str] = frozenset(
     {
-        # Planned pipeline flag — not in the shipped server.yaml yet but
-        # documented in the consolidation block for future cloud provider routing.
+        # Reserved cloud-provider-routing key, documented in the
+        # consolidation block, absent from the shipped server.yaml — kept
+        # classified here so its addition needs no follow-up change.
         "consolidation.extraction_enrichment_provider_endpoint",
         # Optional inline overrides for the abstention messages — opt-in,
         # commented out in shipped server.yaml so the file-based default

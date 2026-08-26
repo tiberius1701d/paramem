@@ -9,9 +9,9 @@ systemd service, the GPU, or real operator key material.
 Covers the flows unit tests structurally can't:
 
 - CLI argparse dispatch reaches every subcommand under the real binary.
-- Subprocess boundary keeps module-attribute late-binding honest (the
-  default-argument / module-default pitfalls I hit multiple times during
-  the WP2b arc would have been caught here immediately).
+- Subprocess boundary keeps module-attribute late-binding honest — a
+  default-argument / module-default pitfall is caught here immediately,
+  unlike in a pure in-process unit test.
 - The env-pollution class of bug that pytest-dotenv + a live deployment
   introduced — here the subprocess env is built explicitly, not
   inherited from pytest's polluted one.
@@ -435,7 +435,7 @@ class TestRotateDailyResumeFromManifest:
 
 
 # ---------------------------------------------------------------------------
-# Regression smoke: `--dry-run` does not remove live keys
+# `--dry-run` does not remove live keys
 # ---------------------------------------------------------------------------
 
 

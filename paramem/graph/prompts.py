@@ -321,8 +321,8 @@ def _load_prompt_section(filename: str, section: str) -> str:
     """Load one named section from a sentinel-delimited prompt file.
 
     Delegates to :func:`_load_prompt_sections` for the parse (one
-    implementation of the sentinel format) and raises the same ``KeyError``
-    shape this function has always raised when *section* is absent.
+    implementation of the sentinel format) and raises ``KeyError`` when
+    *section* is absent.
 
     Args:
         filename: Basename of the sectioned prompt file (e.g.
@@ -384,11 +384,9 @@ def _load_prompt(
     model-independent by design and always call this function with
     ``model=None``.
 
-    Keyword-only after *filename* is deliberate: earlier positional
-    parameters (a hardcoded-default string, ``prompts_dir``) were deleted
-    from this signature, and a positional call site written against the
-    old signature would otherwise silently rebind into the wrong
-    parameter instead of raising ``TypeError``.
+    Keyword-only after *filename* is deliberate: a positional call site
+    would otherwise silently rebind into the wrong parameter if this
+    parameter list is ever reordered, instead of raising ``TypeError``.
 
     Two outcomes only: found → the file's stripped content; not found in
     any search directory → :exc:`FileNotFoundError` with the searched

@@ -46,8 +46,8 @@ def _make_null_gpu_lock():
 def test_auto_reclaim_calls_live_reload_on_success():
     """Hold cleared: _live_reload_base_model called; loop exits on success.
 
-    Voice drain/restore is now owned by _live_reload_base_model (the primitive),
-    so the loop itself no longer calls _set_voice_pipeline_profile("gpu") on
+    Voice drain/restore is owned by _live_reload_base_model (the primitive);
+    the loop itself does not call _set_voice_pipeline_profile("gpu") on
     success.  _restart_service must NOT be called.  last_reclaim_error cleared.
     """
     import paramem.server.app as app_module
@@ -68,8 +68,8 @@ def test_auto_reclaim_calls_live_reload_on_success():
     def _fake_reload_success(*_args, **_kwargs):
         # Faithfully simulate a successful in-process reload: the real
         # _live_reload_base_model sets mode="local" AND returns None on
-        # success — the loop now branches on the returned reason (None ==
-        # success), not a re-read of _state["mode"].  Establishing both here
+        # success — the loop branches on the returned reason (None ==
+        # success), not on _state["mode"].  Establishing both here
         # makes the test independent of any incoming _state["mode"] a prior
         # test left.
         app_module._state["mode"] = "local"
@@ -114,13 +114,13 @@ def test_auto_reclaim_calls_live_reload_on_success():
             "_auto_reclaim_loop must forward lock_held=True to _live_reload_base_model; "
             f"got call_args={mock_reload.call_args}"
         )
-        # Voice restore to "gpu" is now inside _live_reload_base_model; the loop
-        # no longer calls it on success.  Voice may still be called with "cpu" on
+        # Voice restore to "gpu" happens inside _live_reload_base_model; the loop
+        # does not call it on success.  Voice may still be called with "cpu" on
         # the decline branch; assert that "gpu" restore is NOT called by the loop.
         gpu_calls = [c for c in mock_profile.call_args_list if c.args and c.args[0] == "gpu"]
         assert not gpu_calls, (
             "auto-reclaim loop must NOT call _set_voice_pipeline_profile('gpu') — "
-            f"that is now owned by the primitive; calls={mock_profile.call_args_list}"
+            f"that is the primitive's responsibility; calls={mock_profile.call_args_list}"
         )
         mock_restart.assert_not_called()
         assert app_module._state.get("last_reclaim_error") is None
@@ -130,7 +130,7 @@ def test_auto_reclaim_exits_when_already_local():
     """If the GPU was reclaimed externally (mode=local) during the loop's sleep —
     operator /gpu/acquire, a config apply, or a base-swap reload — the loop must
     exit WITHOUT a redundant reclaim, avoiding a release+reload churn of an
-    already-loaded model (the ~10 s spurious cloud-only window seen post-swap).
+    already-loaded model.
     """
     import paramem.server.app as app_module
 
@@ -314,7 +314,7 @@ def test_auto_reclaim_defers_when_reload_stays_cloud_only():
         nonlocal reload_calls
         reload_calls += 1
         # Pre-flight declined: base model not loaded, server stays cloud-only.
-        # The loop now branches on the returned reason, not a state re-read.
+        # The loop branches on the returned reason, not on a state re-read.
         app_module._state["mode"] = "cloud-only"
         app_module._state["cloud_only_reason"] = "insufficient_vram"
         return "insufficient_vram"
@@ -359,8 +359,8 @@ def test_auto_reclaim_defers_when_reload_stays_cloud_only():
 def test_auto_reclaim_orphan_path_exits_loop_without_restart():
     """Orphan: hold_active=True, owner_alive=False → emit WARN, exit loop (no restart).
 
-    Regression guard: orphan detection (hold active, owner dead) must emit
-    WARN and exit the loop without calling _restart_service.
+    Orphan detection (hold active, owner dead) must emit WARN and exit the
+    loop without calling _restart_service.
     """
     import paramem.server.app as app_module
 

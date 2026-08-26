@@ -350,7 +350,7 @@ class TestConfirmStepFailures:
 
         After a failed confirm, the migration lock must be released so a
         second confirm attempt can proceed (or fail cleanly with a non-deadlock
-        error).  Correction 1.
+        error).
         """
         fail_count = [0]
 
@@ -372,14 +372,14 @@ class TestConfirmStepFailures:
         # Should not be 409 migration_in_progress (lock must be released).
         detail2 = resp2.json().get("detail", {})
         assert detail2.get("error") != "migration_in_progress", (
-            "Lock was not released after step-3 failure (Correction 1 violated)"
+            "Lock was not released after step-3 failure"
         )
 
     def test_confirm_releases_lock_on_step4_failure(self, client, state, tmp_path, monkeypatch):
         """Step 4 (promote_config) failure: lock is released; second confirm is not blocked.
 
-        Correction 1: the confirm handler's try/finally unconditionally releases
-        the migration lock even when step 4 raises.
+        The confirm handler's try/finally unconditionally releases the
+        migration lock even when step 4 raises.
         """
         with patch("paramem.server.migration.promote_config", side_effect=OSError("EXDEV")):
             resp1 = client.post("/migration/confirm", json={})
@@ -390,12 +390,12 @@ class TestConfirmStepFailures:
         resp2 = client.post("/migration/confirm", json={})
         detail2 = resp2.json().get("detail", {})
         assert detail2.get("error") != "migration_in_progress", (
-            "Lock was not released after step-4 failure (Correction 1 violated)"
+            "Lock was not released after step-4 failure"
         )
 
 
 # ---------------------------------------------------------------------------
-# Regression — trial_adapter_dir in marker uses state_dir, not state_dir.parent
+# trial_adapter_dir in marker uses state_dir, not state_dir.parent
 # ---------------------------------------------------------------------------
 
 
@@ -404,10 +404,9 @@ class TestConfirmTrialAdapterDirUnderStateDir:
 
     The confirm handler mints ``trial_adapter_dir`` as
     ``state_dir / "trial" / "adapters"`` — always a descendant of
-    ``state_dir``, never a sibling (``state_dir.parent / "trial_adapter"``,
-    the historical regression this class guards against: gate 3 looked for
-    quads.json at the wrong path and emitted a false FAIL on every real
-    trial).
+    ``state_dir``, never a sibling (``state_dir.parent / "trial_adapter"``):
+    gate 3 reads quads.json relative to this path, so a sibling path would
+    make gate 3 emit a false FAIL on every real trial.
     """
 
     def test_trial_adapter_dir_under_state_dir_after_confirm(self, client, state, tmp_path):
@@ -458,19 +457,20 @@ class TestConfirmTrialAdapterDirUnderStateDir:
 
 
 # ---------------------------------------------------------------------------
-# Regression — config_artifact_filename extraction uses real backup layout
+# config_artifact_filename extraction uses real backup layout
 # ---------------------------------------------------------------------------
 
 
 class TestConfirmConfigArtifactFilenameRealSlotLayout:
-    """Verify confirm extracts the artifact filename (not the sidecar) from a real
-    backup-writer slot layout (2026-04-22 E2E baseline).
+    """Verify confirm extracts the artifact filename (not the sidecar) from a
+    real backup-writer slot layout.
 
-    The backup writer names its sidecar ``<kind>-<ts>.meta.json`` (prefixed, NOT
-    the exact string ``"meta.json"``).  The old filter ``_entry.name != "meta.json"``
-    missed that sidecar, causing iterdir to return it first on some filesystems and
-    recording the sidecar filename in the marker.  At rollback time, os.rename moved
-    the sidecar JSON over the live YAML, silently corrupting configs/server.yaml.
+    The backup writer names its sidecar ``<kind>-<ts>.meta.json`` (prefixed,
+    NOT the exact string ``"meta.json"``), so the filter that identifies the
+    artifact file must exclude any name ending in ``.meta.json``, not just
+    the literal name ``"meta.json"`` -- iterdir order is not guaranteed, and
+    recording the sidecar filename in the marker would let rollback's
+    os.rename overwrite the live YAML with the sidecar JSON.
     """
 
     def test_config_artifact_filename_not_sidecar_after_confirm(
@@ -480,8 +480,7 @@ class TestConfirmConfigArtifactFilenameRealSlotLayout:
         ``.bin`` or ``.bin.enc`` (NOT ``.meta.json``).
 
         Uses the real backup.write() call path so the sidecar naming convention
-        (``config-<ts>.meta.json``) is exercised — this is the layout that caused
-        the confirm-handler bug.
+        (``config-<ts>.meta.json``) is exercised.
         """
         resp = client.post("/migration/confirm", json={})
         assert resp.status_code == 200, resp.text
@@ -500,7 +499,7 @@ class TestConfirmConfigArtifactFilenameRealSlotLayout:
         assert not filename.endswith(".meta.json"), (
             f"config_artifact_filename is a sidecar name: {filename!r}.  "
             "The iterdir filter must exclude all *.meta.json sidecars, not just "
-            "the exact string 'meta.json' (2026-04-22 E2E baseline)."
+            "the exact string 'meta.json'."
         )
 
         # The artifact must be the binary blob written by backup.write().
@@ -624,9 +623,10 @@ def _config_backup_slots(state: dict) -> list[Path]:
 class TestConfirmRejectsUnbootableCandidate:
     """A candidate that parses but cannot be constructed never reaches the live config.
 
-    Before this gate, confirm renamed first and validated at the next
-    ``load_server_config`` — leaving an unbootable server.yaml live (and, on the
-    fast mode-switch path, no backup slot to roll back to).
+    Confirm validates the candidate BEFORE renaming it live: validating only
+    at the next ``load_server_config`` would leave an unbootable
+    server.yaml live (and, on the fast mode-switch path, no backup slot to
+    roll back to).
     """
 
     @pytest.mark.parametrize(
@@ -851,7 +851,7 @@ class TestTrialMarkerBaseSwapRoundTrip:
     def test_old_marker_loads_with_defaults(self):
         """A marker dict without base-swap fields deserializes with safe defaults.
 
-        This ensures backward compatibility with markers written before base-swap fields were added.
+        This ensures backward compatibility with markers lacking base-swap fields.
         """
         old_dict = {
             "schema_version": 1,
@@ -1340,7 +1340,7 @@ class TestRunBaseSwapPhaseA:
             if migrate_call[0] == 1 and phase_a_migrate_error is not None:
                 raise phase_a_migrate_error
             if migrate_call[0] == 2:
-                # Regression guard (review CRITICAL): Phase B must load the
+                # Phase B must load the
                 # (Mistral) registries — its to-retrain tier list — into the store
                 # BEFORE migrate runs.  The base-swap preload gate leaves the live
                 # store empty; without this load migrate() would see 0 tiers and
@@ -1361,7 +1361,7 @@ class TestRunBaseSwapPhaseA:
 
             Returns the same success-dict shape the real
             ``_gpu_release_internal`` returns on success — the orchestration
-            now checks this return value (raises on anything else; see
+            checks this return value (raises on anything else; see
             ``TestFreshStartReleaseRefusalIsNotIgnored`` below) rather than
             ignoring it.
             """
@@ -1378,7 +1378,7 @@ class TestRunBaseSwapPhaseA:
             The Phase-B model-identity guard reads config.model_name to verify
             the reload completed correctly.
             Appends "apply_config_live" to call_order.  Returns the
-            shape-correct result dict — the orchestration now consumes the
+            shape-correct result dict — the orchestration consumes the
             return value instead of re-reading _state["mode"].
             """
             call_order.append("apply_config_live")
@@ -1393,7 +1393,7 @@ class TestRunBaseSwapPhaseA:
                     "skipped": None,
                 }
             state["cloud_only_reason"] = None
-            # Simulate config refresh: new model is now live.
+            # Simulate config refresh: new model is live.
             state["config"].model_name = "qwen3-4b"
             return {
                 "applied_live": True,
@@ -1554,9 +1554,10 @@ class TestRunBaseSwapPhaseA:
         hang forever) and the exception must surface as a real orchestration
         failure (``phase_a_failed``), not be silently lost.
 
-        Regression for the widened KeyRegistry.load ValueError reaching
-        migrate()'s "0 registered tiers but on-disk content exists" guard —
-        the sibling of the Phase B hang fix, same shape, same fix."""
+        This pins the same failure shape as the Phase B worker-exception
+        test: KeyRegistry.load's ValueError reaching migrate()'s "0
+        registered tiers but on-disk content exists" guard must still
+        surface through the worker's try/finally, not hang or vanish."""
         state = self._make_phase_a_state(tmp_path)
         call_order, rename_calls, gates_received, _, state_dir = self._run_phase_a(
             state,
@@ -1591,7 +1592,7 @@ class TestRunBaseSwapPhaseA:
         assert marker.base_swap_phase == "phaseA"
 
     def test_fresh_start_with_base_swap_active_does_not_409(self, tmp_path, monkeypatch):
-        """Regression: the orchestration itself sets
+        """The orchestration itself sets
         migration['base_swap_active']=True on entry (`app.py` around
         ``_run_base_swap_orchestration``'s in-flight guard). The fresh-start
         reload step must call ``_gpu_release_internal`` directly rather than
@@ -1608,12 +1609,11 @@ class TestRunBaseSwapPhaseA:
         fails because a ``phase_a_failed``-shaped gate is recorded instead of
         ``pass``. Separately asserts the real route handler DOES still 409
         when called directly with the same state, proving the guard itself
-        is intact and the fix is specifically about which callable the
+        works and the distinction is specifically about which callable the
         orchestration invokes.
         """
         # First: the route handler's own guard, exercised in isolation on a
-        # minimal state, still refuses when base_swap_active is True — the
-        # guard itself is untouched by this fix.
+        # minimal state, still refuses when base_swap_active is True.
         monkeypatch.setattr(
             app_module, "_state", {"migration": {"base_swap_active": True}, "mode": "local"}
         )
@@ -1843,9 +1843,9 @@ class TestBaseSwapSetupFailure:
         assert state["migration"]["tier_diff"] == []
 
     def test_phase_a_failure_keeps_real_trial_state(self, tmp_path, monkeypatch):
-        """Regression for the setup_failed scoping: a phaseA marker exists (the
-        Phase A submit itself failed, not the pre-marker setup), so the real
-        migration state stays TRIAL — not reset to LIVE like setup_failed.
+        """A phaseA marker exists (the Phase A submit itself failed, not the
+        pre-marker setup), so the real migration state stays TRIAL — not
+        reset to LIVE like setup_failed.
 
         Complements ``test_bundle_and_marker_preserved_on_phase_a_failure``
         above (which patches gates and checks the recorder); this asserts the
@@ -1863,14 +1863,14 @@ class TestBaseSwapSetupFailure:
         assert marker.base_swap_phase == "phaseA"
 
     def test_success_publishes_pass_gates_and_returns_live(self, tmp_path, monkeypatch):
-        """Regression: a successful swap publishes gates.status='pass' for real.
+        """A successful swap publishes gates.status='pass' for real.
 
-        Before ``_finish_base_swap`` existed, the success arm reset
-        ``_state["migration"]`` and then called ``_update_trial_gates``, which
-        is a no-op once ``trial is None`` — so ``/migration/status`` reported
-        ``gates=None`` after every successful swap and the CLI long-poll never
-        terminated.  ``patch_gates=False`` here means the real
-        ``_finish_base_swap`` runs, so this observes the fix directly.
+        ``_finish_base_swap`` must publish the gate status BEFORE resetting
+        ``_state["migration"]`` — ``_update_trial_gates`` is a no-op once
+        ``trial is None``, so a reset-then-update ordering would leave
+        ``/migration/status`` reporting ``gates=None`` after every
+        successful swap and the CLI long-poll would never terminate.
+        ``patch_gates=False`` here means the real ``_finish_base_swap`` runs.
         """
         state = self._phase_a._make_phase_a_state(tmp_path)
         self._phase_a._run_phase_a(
@@ -2207,7 +2207,7 @@ class TestBaseSwapOrchestration:
         def _fake_migrate(loop, cfg, ms):
             migrate_call[0] += 1
             if migrate_call[0] == 2:
-                # Regression guard (review CRITICAL): Phase B must load the
+                # Phase B must load the
                 # (Mistral) registries — its to-retrain tier list — into the store
                 # BEFORE migrate runs.  The base-swap preload gate leaves the live
                 # store empty; without this load migrate() would see 0 tiers and
@@ -2227,7 +2227,7 @@ class TestBaseSwapOrchestration:
 
             Returns the same success-dict shape the real
             ``_gpu_release_internal`` returns on success — the orchestration
-            now checks this return value (raises on anything else; see
+            checks this return value (raises on anything else; see
             ``TestFreshStartReleaseRefusalIsNotIgnored`` below) rather than
             ignoring it.
             """
@@ -2241,7 +2241,7 @@ class TestBaseSwapOrchestration:
             state["mode"] = _rm
             state["cloud_only_reason"] = None if _rm == "local" else "insufficient_vram"
             if _rm == "local":
-                # Simulate config refresh: new model is now live.
+                # Simulate config refresh: new model is live.
                 state["config"].model_name = "qwen3-4b"
                 return {
                     "applied_live": True,
@@ -2347,7 +2347,7 @@ class TestBaseSwapOrchestration:
             f"Expected Phase A < reload < Phase B; got order {call_order}"
         )
 
-        # Final status is 'pass' — the success arm now calls _finish_base_swap,
+        # Final status is 'pass' — the success arm calls _finish_base_swap,
         # not the patched _update_trial_gates, so this is read from the real
         # migration stash rather than the gates_received recorder.
         assert state["migration"]["trial"]["gates"]["status"] == "pass", (
@@ -2369,9 +2369,9 @@ class TestBaseSwapOrchestration:
         forever) and the exception must surface as a real orchestration
         failure (``phase_b_failed``), not be silently lost.
 
-        Regression for the widened KeyRegistry.load ValueError reaching this
-        worker via load_registries_from_disk / migrate() — both calls share
-        one frame, covered by the same finally."""
+        KeyRegistry.load's ValueError reaching this worker via
+        load_registries_from_disk / migrate() must still surface — both
+        calls share one frame, covered by the same finally."""
         state = self._make_state(tmp_path)
         call_order, gates_received, state_dir = self._run_orchestration(
             state,
@@ -2461,7 +2461,7 @@ class TestBaseSwapOrchestration:
 
             Returns the same success-dict shape the real
             ``_gpu_release_internal`` returns on success — the orchestration
-            now checks this return value (raises on anything else; see
+            checks this return value (raises on anything else; see
             ``TestFreshStartReleaseRefusalIsNotIgnored`` below) rather than
             ignoring it.
             """
@@ -2473,7 +2473,7 @@ class TestBaseSwapOrchestration:
             """Simulate _apply_config_live: load the renamed-config base model."""
             state["mode"] = "local"
             state["cloud_only_reason"] = None
-            # Simulate config refresh: new model is now live.
+            # Simulate config refresh: new model is live.
             state["config"].model_name = "qwen3-4b"
             return {
                 "applied_live": True,
@@ -2529,12 +2529,12 @@ class TestBaseSwapOrchestration:
     def test_post_phase_b_reload_runs_before_success_marker(self, tmp_path, monkeypatch):
         """Post-Phase-B in-process reload fires after Phase B and before status=pass.
 
-        Regression for the live-reload-after-final-tier gap: Phase B's
-        per-tier migrate() loop leaves the in-RAM PeftModel mounted in the
-        last tier's transient shape; without a final reload the published
-        ``adapter_available`` topology stays stale until a systemctl restart.
+        Phase B's per-tier migrate() loop leaves the in-RAM PeftModel
+        mounted in the last tier's transient shape; a final reload is
+        required so the published ``adapter_available`` topology does not
+        stay stale until a systemctl restart.
 
-        Voice drain/restore is now owned by _live_reload_base_model (the
+        Voice drain/restore is owned by _live_reload_base_model (the
         primitive), not by step 6 directly.  The step-6 ordering assertion
         is: reload fires after Phase B and before status=pass.
         """
@@ -2597,8 +2597,8 @@ class TestBaseSwapOrchestration:
         self, tmp_path, monkeypatch, caplog
     ):
         """A HANDLED reload failure (the primitive returns "reload_failed"
-        instead of raising) is logged as a WARNING naming the reason —
-        previously silent — and status=pass still fires; weights are
+        instead of raising) is logged as a WARNING naming the reason, never
+        swallowed silently, and status=pass still fires; weights are
         already durable on disk by the time Phase B returns.
         """
         import logging
@@ -2710,7 +2710,7 @@ class TestBaseSwapOrchestration:
 
         async def _fake_gpu_release():
             # Returns the success-dict shape the real _gpu_release_internal
-            # returns — the orchestration checks this now (see the module
+            # returns — the orchestration checks this (see the module
             # docstring note on _fake_gpu_release above).
             state["mode"] = "cloud-only"
             state["cloud_only_reason"] = "released"
@@ -2982,7 +2982,7 @@ class TestBaseSwapResumePhaseAware:
 
             Returns the same success-dict shape the real
             ``_gpu_release_internal`` returns on success — the orchestration
-            now checks this return value (raises on anything else; see
+            checks this return value (raises on anything else; see
             ``TestFreshStartReleaseRefusalIsNotIgnored`` below) rather than
             ignoring it.
             """
@@ -2995,7 +2995,7 @@ class TestBaseSwapResumePhaseAware:
             state["mode"] = _rm
             state["cloud_only_reason"] = None if _rm == "local" else "insufficient_vram"
             if _rm == "local":
-                # Simulate config refresh: new model is now live.
+                # Simulate config refresh: new model is live.
                 state["config"].model_name = "qwen3-4b"
                 return {
                     "applied_live": True,
@@ -3352,7 +3352,7 @@ class TestBaseSwapStep3ResumeReload:
 
             Returns the same success-dict shape the real
             ``_gpu_release_internal`` returns on success — the orchestration
-            now checks this return value (raises on anything else; see
+            checks this return value (raises on anything else; see
             ``TestFreshStartReleaseRefusalIsNotIgnored`` below) rather than
             ignoring it.
             """
@@ -3875,7 +3875,7 @@ class TestBaseSwapActiveFlag:
 
         When gpu_acquire leaves mode=cloud-only, the coroutine returns
         early (deferred).  The finally block must clear base_swap_active so
-        rollback is no longer blocked.
+        rollback is not blocked.
         """
         import asyncio as _asyncio
 
@@ -3952,7 +3952,7 @@ class TestBaseSwapActiveFlag:
 
             Returns the same success-dict shape the real
             ``_gpu_release_internal`` returns on success — the orchestration
-            now checks this return value (raises on anything else; see
+            checks this return value (raises on anything else; see
             ``TestFreshStartReleaseRefusalIsNotIgnored`` below) rather than
             ignoring it.
             """
@@ -4239,7 +4239,7 @@ class TestGpuAcquireBaseSwapResume:
             client = TestClient(_app.app, raise_server_exceptions=False)
             resp = client.post("/gpu/acquire")
 
-        # /gpu/acquire now refuses outright (409 base_swap_active) while the
+        # /gpu/acquire refuses outright (409 base_swap_active) while the
         # orchestration is actively running — it never reaches the reload
         # dispatch or the relaunch hook at all, so this is a stronger
         # guarantee than "the hook itself declines to relaunch".
@@ -4491,7 +4491,7 @@ class TestPhaseBModelIdentityGuard:
 
             Returns the same success-dict shape the real
             ``_gpu_release_internal`` returns on success — the orchestration
-            now checks this return value (raises on anything else; see
+            checks this return value (raises on anything else; see
             ``TestFreshStartReleaseRefusalIsNotIgnored`` below) rather than
             ignoring it.
             """
@@ -4672,7 +4672,7 @@ class TestPhaseBModelIdentityGuard:
     def test_guard_does_not_fire_on_correct_model(self, tmp_path, monkeypatch):
         """Phase B runs normally when mode=local and config.model_name == new_model.
 
-        This is the happy-path regression: the guard must NOT block a correctly
+        This is the happy-path control: the guard must NOT block a correctly
         reloaded server.
         """
         import asyncio as _asyncio
@@ -4737,7 +4737,7 @@ class TestPhaseBModelIdentityGuard:
 
             Returns the same success-dict shape the real
             ``_gpu_release_internal`` returns on success — the orchestration
-            now checks this return value (raises on anything else; see
+            checks this return value (raises on anything else; see
             ``TestFreshStartReleaseRefusalIsNotIgnored`` below) rather than
             ignoring it.
             """

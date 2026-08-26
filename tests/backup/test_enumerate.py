@@ -165,10 +165,10 @@ class TestInvalidSidecar:
 
 
 class TestUnknownKindSidecarSkipped:
-    """A pre-existing on-disk sidecar naming a kind this build no longer
-    recognises (e.g. a slot written under a retired artifact kind) is a
-    foreign on-disk artifact: enumeration skips it with a WARNING rather
-    than raising or deleting it — the listing-boundary posture."""
+    """A pre-existing on-disk sidecar naming a kind absent from the current
+    ``ArtifactKind`` enum is a foreign on-disk artifact: enumeration skips
+    it with a WARNING rather than raising or deleting it — the
+    listing-boundary posture."""
 
     def test_unknown_kind_sidecar_skipped_with_warning(self, tmp_path, caplog):
         import logging
@@ -178,8 +178,8 @@ class TestUnknownKindSidecarSkipped:
         # unknown-kind one is skipped.
         _write_slot(base, ArtifactKind.CONFIG, b"real")
 
-        # A foreign on-disk slot naming a kind no longer in ArtifactKind
-        # (e.g. the retired "registry" artifact kind).
+        # A foreign on-disk slot naming a kind absent from ArtifactKind
+        # (e.g. "registry").
         stray = base / "registry" / "20260101-000000"
         stray.mkdir(parents=True)
         (stray / "registry-20260101-000000.bin").write_bytes(b"legacy registry bytes")

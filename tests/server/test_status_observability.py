@@ -1,4 +1,5 @@
-"""Tests for the four observability fixes to /status.
+"""Tests for /status observability: consolidation deadline prediction, tier
+key counts, and the VRAM ledger.
 
 Covers:
 - _seconds_until_next_full_consolidation — deadline + ceil-to-tick cases

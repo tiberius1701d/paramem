@@ -183,18 +183,16 @@ class TestExtractJsonBlock:
             _extract_json_block("no json here")
 
     def test_string_value_with_closing_brace(self):
-        """Regression: string values containing `}` must not break the parser.
-        The previous brace-counting walk truncated at the first `}` it saw,
-        regardless of whether that `}` was inside a quoted string. Real local
-        Mistral output for one of the resume chunks reliably hit this and
-        produced empty graphs in two consecutive consolidation runs."""
+        """String values containing `}` must not break the parser: it tracks
+        quoted-string state so a `}` inside a quoted string is not counted
+        as a closing brace."""
         text = 'Sure, here: {"facts": [{"object": "Code: }"}]} trailing'
         result = json.loads(_extract_json_block(text))
         assert result["facts"][0]["object"] == "Code: }"
 
     def test_string_value_with_opening_brace(self):
-        """Same regression, opposite direction: `{` inside a string value
-        (e.g. anonymizer placeholder forms) must not inflate depth."""
+        """The same holds for `{` inside a string value (e.g. anonymizer
+        placeholder forms): it must not inflate the parser's brace depth."""
         text = '{"facts": [{"object": "Acme {Org_1} Berlin"}]}'
         result = json.loads(_extract_json_block(text))
         assert result["facts"][0]["object"] == "Acme {Org_1} Berlin"
@@ -222,19 +220,12 @@ class TestExtractJsonBlock:
             _extract_json_block('{"a": "unfinished')
 
     def test_truncated_envelope_does_not_fall_through_to_inner_object(self):
-        """Regression: a truncated outer envelope (e.g. cut at max_tokens
-        mid-relation) used to silently match the first inner sub-object,
-        producing an empty graph downstream. The parser must raise instead.
-
-        Reproduces the production middle-session bug where Mistral 7B
-        emitted ~6000 chars of valid JSON-prefix that opened with
-        ``{"entities": [{"name": "Alex", ...``, then got cut off
-        mid-string at ``"object": "consumer hardware`` because the chunker
-        produced a chunk too large for the old 2048-token budget. The
-        previous parser's left-to-right fall-through would have returned
-        the inner entity dict, _normalize_extraction would not find
-        ``entities``/``relations`` keys, and the SessionGraph would end up
-        empty — masking the truncation.
+        """A truncated outer envelope (e.g. cut at max_tokens mid-relation)
+        must raise rather than silently matching the first inner
+        sub-object: a left-to-right fall-through would return the inner
+        entity dict, ``_normalize_extraction`` would not find
+        ``entities``/``relations`` keys, and the ``SessionGraph`` would end
+        up empty — masking the truncation instead of surfacing it.
         """
         truncated = (
             '{"entities": [\n'
@@ -249,10 +240,10 @@ class TestExtractJsonBlock:
 
 
 class TestParseExtractionShapes:
-    """Regression: local Mistral occasionally emits unexpected JSON shapes
-    (bare list of facts instead of {"entities": ..., "relations": ...}).
-    Previous behaviour: TypeError from `data["session_id"] = ...` because
-    `data` was a list. New behaviour: rewrap as a relations payload."""
+    """Local Mistral occasionally emits unexpected JSON shapes (a bare
+    list of facts instead of {"entities": ..., "relations": ...}). Such a
+    shape is rewrapped as a relations payload rather than reaching
+    `data["session_id"] = ...`, which requires `data` to be a dict."""
 
     def test_bare_list_of_relations(self):
         from paramem.graph.extractor import _parse_extraction
@@ -340,10 +331,10 @@ class TestPlausibilityDropSetRuleKeyed:
 
     An index that does not sit in a list under one of the rule keys
     ``R1``-``R6`` is not a drop — it is counted in ``unattributed`` and the
-    fact stays kept. This is the robustness contract for the retired shapes
-    (a bare index array, the old ``{"index", "rule"}`` annotated form): a
-    parseable old-shape verdict is *counted*, not turned into a fail-open
-    trigger.
+    fact stays kept. This is the robustness contract for the other parseable
+    drop-set shapes (a bare index array, the ``{"index", "rule"}`` annotated
+    form): a parseable verdict in any of these shapes is *counted*, not
+    turned into a fail-open trigger.
     """
 
     def _facts(self, n: int) -> list[dict]:
@@ -391,12 +382,12 @@ class TestPlausibilityDropSetRuleKeyed:
         assert out.dropped == []
         assert out.unattributed == 1
 
-    def test_retired_annotated_list_shape_counts_unattributed_and_keeps_facts(self):
-        """The retired ``[{"index": N, "rule": "Rk"}]`` per-entry annotated
-        form is a successful parse with zero drops — not a new fail-open
-        trigger. Every element of the list is one claim the judge made
-        without a rule, so two entries count two unattributed claims and
-        every fact stays kept."""
+    def test_annotated_list_shape_counts_unattributed_and_keeps_facts(self):
+        """The ``[{"index": N, "rule": "Rk"}]`` per-entry annotated form is
+        a successful parse with zero drops, not a fail-open trigger. Every
+        element of the list is one claim the judge made without a rule, so
+        two entries count two unattributed claims and every fact stays
+        kept."""
         from paramem.graph.extractor import _apply_drop_set
 
         facts = self._facts(3)
@@ -406,9 +397,9 @@ class TestPlausibilityDropSetRuleKeyed:
         assert out.dropped == []
         assert out.unattributed == 2
 
-    def test_retired_bare_array_shape_counts_unattributed_and_keeps_facts(self):
-        """The retired bare-index-array ``{"drop": [1]}`` shape: the one
-        parseable int inside is one unattributed claim, zero drops applied."""
+    def test_bare_array_shape_counts_unattributed_and_keeps_facts(self):
+        """The bare-index-array ``{"drop": [1]}`` shape: the one parseable
+        int inside is one unattributed claim, zero drops applied."""
         from paramem.graph.extractor import _apply_drop_set
 
         facts = self._facts(3)
@@ -445,9 +436,9 @@ class TestPlausibilityDropSetRuleKeyed:
         assert out.unattributed == 3  # "junk", null, true
 
     def test_dropped_rule_is_always_a_string(self):
-        """The rule-keyed contract cannot produce the retired ``rule:
-        None`` shape — every drop record's rule is the non-empty rule-key
-        string it was found under."""
+        """Every drop record's rule is the non-empty rule-key string it was
+        found under — the rule-keyed contract never produces a ``rule:
+        None`` value."""
         from paramem.graph.extractor import _apply_drop_set
 
         facts = self._facts(2)
@@ -494,9 +485,8 @@ class TestPlausibilityDropSetRuleKeyed:
         assert _apply_drop_set(facts, '{"facts": []}') is None
 
     def test_top_level_list_returns_none(self):
-        """A bare top-level JSON array (the retired whole-response shape)
-        is not a dict, so it can never carry a ``"drop"`` key — parse
-        failure, caller fail-opens."""
+        """A bare top-level JSON array is not a dict, so it can never carry
+        a ``"drop"`` key — parse failure, caller fail-opens."""
         from paramem.graph.extractor import _apply_drop_set
 
         facts = self._facts(6)
@@ -613,10 +603,9 @@ class TestEnrichmentDelta:
 
     @staticmethod
     def _apply(facts, raw, anon_transcript=None):
-        """Parse ``raw`` then apply — the two steps ``request_enrichment``
-        used to fuse into one ``_apply_enrichment_delta(facts, raw, ...)``
-        call before the 2026-07-22 cloud-admission redesign split parsing
-        (``_parse_enrichment_delta``) from application."""
+        """Parse ``raw`` then apply — ``_parse_enrichment_delta`` parses the
+        raw model output into a delta, and ``_apply_enrichment_delta``
+        applies that delta to ``facts``."""
         from paramem.graph.extractor import _apply_enrichment_delta, _parse_enrichment_delta
 
         delta = _parse_enrichment_delta(raw, len(facts))
@@ -766,8 +755,8 @@ class TestEnrichmentDelta:
 
     def test_legacy_new_entity_bindings_alias(self):
         """``new_entity_bindings`` is accepted as a synonym of
-        ``bindings`` so older response shapes don't lose the binding
-        payload silently during the transition."""
+        ``bindings`` so legacy-shape responses don't lose the binding
+        payload silently."""
         anon = "Person_1 led the agile transformation initiative."
         raw = '{"new_entity_bindings": {"Event_1": "the agile transformation initiative"}}'
         _, transcript, report = self._apply([], raw, anon)
@@ -775,13 +764,12 @@ class TestEnrichmentDelta:
         assert "{Event_1}" in transcript
 
     def test_inverted_binding_is_corrected_not_passed_through(self):
-        """An inverted binding (key = real text, value = placeholder —
-        the exact shape the cloud bindings validator was previously
-        missing, per the placeholder-contract refactor) is corrected to
-        canonical ``{placeholder: real_text}`` direction rather than
-        passed straight into the substitution map. Confirmed by transcript
-        reconstruction: the real-text span is replaced by the placeholder,
-        which only happens when the binding resolves in the right direction."""
+        """An inverted binding (key = real text, value = placeholder) is
+        corrected to canonical ``{placeholder: real_text}`` direction
+        rather than passed straight into the substitution map. Confirmed by
+        transcript reconstruction: the real-text span is replaced by the
+        placeholder, which only happens when the binding resolves in the
+        right direction."""
         anon = "Person_1 works at Acme."
         raw = '{"bindings": {"Acme": "Org_9"}}'
         _, transcript, report = self._apply([], raw, anon)
@@ -794,8 +782,7 @@ class TestEnrichmentDelta:
         (e.g. a real-world name like `Person_2` or `GPT_4`) is not
         ambiguous — the caller's declared `placeholder_side="key"` breaks
         the tie, so the binding is kept as-is rather than the whole
-        delta losing the entry. Dropping here was a real regression:
-        the same case previously survived at HEAD."""
+        delta losing the entry."""
         raw = '{"bindings": {"Org_9": "Person_2"}}'
         _, _, report = self._apply([], raw, "text")
         assert report["bindings_count"] == 1
@@ -874,13 +861,12 @@ class TestEnrichmentDelta:
         assert "evidence" not in out[0]
 
     def test_prose_index_references_before_envelope_still_parse(self):
-        """Live regression (3/3 at temperature 0): reasoning prose that
-        names input facts by bracketed index (``[2]``, ``[0] and [1]``)
-        precedes the delta envelope.  Those references are valid bare-int
-        JSON arrays, so the shared envelope finder used to return ``[2]``
-        and this parser logged "enrichment delta unexpected shape: list" —
-        enrichment failed open on every attempt despite a complete,
-        well-formed envelope sitting further down the same response."""
+        """Reasoning prose that names input facts by bracketed index
+        (``[2]``, ``[0] and [1]``) may precede the delta envelope. Those
+        references are valid bare-int JSON arrays, so the shared envelope
+        finder must not mistake one for the delta — it must continue
+        scanning to the complete, well-formed envelope further down the
+        same response."""
         facts = self._facts(3)
         raw = (
             "I need to analyze the extracted facts.\n"
@@ -932,9 +918,9 @@ class TestEnrichmentDelta:
 
 
 class TestApplyEnrichmentDeltaResolvability:
-    """``_apply_enrichment_delta``'s per-triple resolvability contract
-    (2026-07-22 cloud-admission redesign) — unlike ``TestEnrichmentDelta``
-    (structural mechanics only, ``scope=None``), these tests exercise a
+    """``_apply_enrichment_delta``'s per-triple resolvability contract —
+    unlike ``TestEnrichmentDelta`` (structural mechanics only,
+    ``scope=None``), these tests exercise a
     REAL :class:`~paramem.cloud.deanonymize.CloudScope`, so an ``add``/
     ``modify`` referencing a token outside the resolvable domain is
     actually rejected/reverted.
@@ -1053,10 +1039,8 @@ class TestPipelineMaxTokensThreading:
     plausibility) instead of each stage carrying its own hardcoded budget."""
 
     def test_stage_context_carries_max_tokens_to_enrich(self):
-        """Stage 1: ``StageContext`` — the ``enrich`` stage's sole
-        parameter surface now that ``_cloud_pipeline`` no longer exists as
-        a directly-callable composite with its own ``max_tokens`` kwarg —
-        carries ``max_tokens`` through from ``extract_graph``."""
+        """``StageContext`` is the ``enrich`` stage's sole parameter
+        surface and carries ``max_tokens`` through from ``extract_graph``."""
         import dataclasses
 
         from paramem.graph.flow import StageContext
@@ -1751,11 +1735,10 @@ class TestContractCarriedFactsParity:
     def test_session_tier_opt_out_anon_facts_is_non_empty(self):
         """Session-tier counterpart: with ``scrub=set()``
         (operator opt-out), ``anonymize()``'s opt-out branch carries the
-        input facts verbatim in ``payload.facts`` (regression
-        guard: a ``facts=[]`` opt-out would silently drop every fact
-        from a payload the operator asked to egress unmasked) — so
-        ``stage_enrich``'s ``anon_facts`` derivation is non-empty, not
-        ``[]``."""
+        input facts verbatim in ``payload.facts`` — a ``facts=[]`` opt-out
+        would silently drop every fact from a payload the operator asked to
+        egress unmasked — so ``stage_enrich``'s ``anon_facts`` derivation is
+        non-empty, not ``[]``."""
         from tests._cloud_flow import run_cloud_stages
 
         graph = _make_graph(
@@ -1955,15 +1938,10 @@ class TestDeanonStagePredicateInvariantEndToEnd:
 
 
 class TestApplyBindings:
-    """Unit tests for the state-machine de-anonymization helper that replaces
-    the previous LLM-based deanon attempt and the regex-based binding
-    recovery (``_extract_cloud_bindings``).
-
-    The LLM-deanon caused VRAM exhaustion on the largest chunk's prompt
-    (mapping + 2 transcripts + facts JSON). The redesign moves binding
-    knowledge into cloud's response (``new_entity_bindings``) and reduces
-    deanon to pure dict substitution — no LLM call, no transcript
-    reconstruction, no regex."""
+    """Unit tests for the state-machine de-anonymization helper. Binding
+    knowledge arrives in cloud's response (``new_entity_bindings``); deanon
+    is pure dict substitution against that mapping — no LLM call, no
+    transcript reconstruction, no regex."""
 
     def test_substitutes_anonymizer_placeholders(self):
         """Bare anonymizer placeholders (Person_1, Org_1) substitute via
@@ -2012,8 +1990,7 @@ class TestApplyBindings:
 
     def test_substitutes_compound_objects(self):
         """Bare placeholder embedded in literal text — `Org_1 Hungary`
-        becomes `Acme Hungary` (the failure mode that bug 5 produced
-        bogus bindings for under the old regex pipeline)."""
+        becomes `Acme Hungary`."""
         from paramem.cloud.placeholders import _apply_bindings
 
         facts = [
@@ -2161,9 +2138,9 @@ class TestApplyBindings:
         assert dropped == []
         assert kept[0]["object"] == "the quarterly retro"
 
-    def test_minted_placeholder_round_trips_braced_regression(self):
-        """Braced-form minted placeholder still resolves (regression
-        guard for the union unification)."""
+    def test_minted_placeholder_round_trips_braced(self):
+        """Braced-form minted placeholder resolves via the union of
+        ``reverse`` and ``cloud_bindings``."""
         from paramem.cloud.placeholders import _apply_bindings
 
         facts = [
@@ -2360,12 +2337,11 @@ class TestApplyBindings:
 class TestResidualSweepCatchesEmbeddedPlaceholders:
     def test_residual_sweep_catches_bare_and_composite(self):
         """The residual sweep (step 3 of :func:`_apply_bindings`, the
-        SINGLE deanon exit gate — the standalone
-        ``_strip_residual_placeholders`` this test used to call directly
-        is retired) drops facts with any placeholder-shaped token, bare
-        or composite, via the fail-closed :data:`_PLACEHOLDER_TOKEN_RE`
-        backstop — even with an empty declared vocabulary (nothing in
-        ``reverse``/``cloud_bindings`` here)."""
+        SINGLE deanon exit gate) drops facts with any placeholder-shaped
+        token, bare or composite, via the fail-closed
+        :data:`_PLACEHOLDER_TOKEN_RE` backstop — even with an empty
+        declared vocabulary (nothing in ``reverse``/``cloud_bindings``
+        here)."""
         from paramem.cloud.placeholders import _apply_bindings
 
         facts = [
@@ -2420,9 +2396,9 @@ class TestPlausibilityTupleReturn:
 
 
 class TestFilterWithCloudPromptsDir:
-    """``request_enrichment`` had neither a ``prompts_dir`` parameter nor a
-    forwarded value — the ``cloud_enrichment.txt`` load never honoured a
-    calibration override at all."""
+    """``request_enrichment`` accepts a ``prompts_dir`` parameter and
+    forwards it, so the ``cloud_enrichment.txt`` load honours a calibration
+    override."""
 
     def test_prompts_dir_override_reaches_enrichment_prompt(self, tmp_path):
         from paramem.graph.extractor import request_enrichment
@@ -2479,9 +2455,9 @@ class TestFilterWithCloudPromptsDir:
 
 class TestStageEnrichSuppliesSpeakerIdToRequestEnrichment:
     """``paramem.graph.stage_enrich._stage_enrich``'s ``request_enrichment``
-    call always supplies ``ctx.speaker_id`` — now that ``speaker_id`` is
-    keyword-required with no default (a silently degraded prompt is a
-    security-relevant regression), this drives the REAL
+    call always supplies ``ctx.speaker_id``. ``speaker_id`` is
+    keyword-required with no default, so a call site cannot silently omit
+    it and degrade the prompt without failing loudly. This drives the REAL
     ``request_enrichment`` through the ``enrich`` stage (only its cloud
     transport, ``_cloud_call``, is mocked — no GPU needed since the
     ``anonymize`` stage's local model call, ``anonymize``, is also
@@ -2583,18 +2559,15 @@ class TestPlausibilityFilterWithCloudPromptsDir:
 
 class TestCloudSystemPromptCallTimeOverride:
     """``cloud_enrichment_system.txt`` / ``cloud_plausibility_system.txt``
-    used to bind ONCE at module-import time (``extractor.py`` module-level
-    constants ``_CLOUD_ENRICHMENT_SYSTEM_PROMPT`` / ``_CLOUD_PLAUSIBILITY_SYSTEM_PROMPT``)
-    — long before any :func:`~paramem.graph.phase_trace.extraction_trace`
-    scope or :func:`~paramem.graph.prompts.prompt_overrides` context could
-    exist, so a calibration override could never reach them and
-    ``record_prompt`` always no-opped for them.  They now load at CALL
-    TIME inside each consuming function.  These tests pin BOTH halves of
-    that fix: an import-time binding would make the override never reach
-    ``_cloud_call``/``generate_answer`` (first two assertions per test) AND
-    would leave ``record.prompts`` without the override entry (the
+    load at CALL TIME inside each consuming function, within whatever
+    :func:`~paramem.graph.phase_trace.extraction_trace` scope and
+    :func:`~paramem.graph.prompts.prompt_overrides` context is active, so a
+    calibration override reaches them and ``record_prompt`` records the
+    override.  These tests pin BOTH halves of that contract: the override
+    must reach ``_cloud_call``/``generate_answer`` (first two assertions
+    per test) AND ``record.prompts`` must carry the override entry (the
     provenance assertion) — a plain "does ``_load_prompt`` honour an
-    override" unit test cannot tell these apart from the old broken state.
+    override" unit test cannot tell these apart.
     """
 
     def test_cloud_enrichment_system_prompt_overridable_and_recorded(self):
@@ -2743,11 +2716,9 @@ class TestSpeakerContextInjection:
         assert "{speaker_name}" not in out
 
     def test_extraction_directive_overridable_and_recorded_in_provenance(self):
-        """``speaker_directive.txt`` used to be read via a bare
-        ``Path.read_text()`` inside its section reader — unreachable by a
-        calibration override and never recorded via ``record_prompt``.
-        It now routes through ``_load_prompt`` (via
-        ``_load_prompt_section``), so both become possible.
+        """``speaker_directive.txt`` routes through ``_load_prompt`` (via
+        ``_load_prompt_section``), so it is reachable by a calibration
+        override and recorded via ``record_prompt``.
         ``build_speaker_context`` feeds this section into the
         ``{speaker_context}`` slot of the extraction user template — it is
         part of the prompt under test."""
@@ -2774,8 +2745,7 @@ class TestSpeakerContextInjection:
 class TestDocumentContextInjection:
     """``build_document_context`` renders the document-provenance directive
     into the ``{document_context}`` slot every extraction user template
-    declares immediately before ``{transcript}`` — the externalized
-    replacement for the retired caller-layer transcript prepend."""
+    declares immediately before ``{transcript}``."""
 
     def test_document_source_with_display_name_renders_directive(self):
         """source_type='document' with both speaker_id and speaker_name
@@ -2919,9 +2889,8 @@ class TestDocumentContextInjection:
         user_content = captured["messages"][1]["content"]
         # Pin adjacency and the exact separator, not just relative ordering:
         # the rendered directive must be immediately followed by "\n\n" and
-        # then the transcript body, byte-for-byte reproducing the retired
-        # prepend's surface. Built from build_document_context itself so
-        # this stays accurate through a future content-tuning edit to
+        # then the transcript body. Built from build_document_context itself
+        # so this stays accurate through a future content-tuning edit to
         # document_directive.txt.
         from paramem.graph.extractor import build_document_context
 
@@ -2993,9 +2962,8 @@ class TestBackgroundTrainer:
 
 class TestDebugArtifacts:
     """``on_extraction_end`` / ``on_recall_probe`` — the artifact hooks, driven
-    by the ``debug_run`` scope rather than by a writer object.  All debug-write
-    semantics (plaintext, _snapshot suffix, procedural-omitted-when-empty)
-    preserved.
+    by the ``debug_run`` scope.  Debug-write semantics: plaintext,
+    ``_snapshot`` suffix, procedural omitted when empty.
     """
 
     def test_on_extraction_end_writes_plaintext(self, tmp_path):
@@ -3010,8 +2978,9 @@ class TestDebugArtifacts:
 
         assert (out_dir / "episodic_rels_snapshot.json").exists()
         assert (out_dir / "procedural_rels_snapshot.json").exists()
-        # on_extraction_end no longer writes the cumulative graph — that is now
-        # done by on_fold_graph (graph_merged_snapshot.json + graph_enriched_snapshot.json).
+        # on_extraction_end never writes the cumulative graph — that is
+        # on_fold_graph's responsibility (graph_merged_snapshot.json +
+        # graph_enriched_snapshot.json).
         assert not (out_dir / "graph_snapshot.json").exists()
 
         with open(out_dir / "episodic_rels_snapshot.json") as f:
@@ -3333,8 +3302,8 @@ class TestPlausibilityDeanon:
 
 class TestExtractionSeedSourcing:
     """Seed is sourced like its sibling sampling knobs (temperature/max_tokens):
-    the config default (``None`` today = status quo, no seeding — the value
-    production runs with), overridable by a calibration probe.  Production and
+    the config default (``None`` — no seeding, the value production runs
+    with), overridable by a calibration probe.  Production and
     calibration thread it through one identical path (``kwargs()``), so a seed
     set for a production run is the same seed a calibration run reads — the
     reproducibility calibration exists to provide.
@@ -3565,9 +3534,8 @@ class TestCloudEnrichmentFailureModes:
 class TestAllDroppedSafetyNet:
     """All-dropped safety net (the ``rebuild`` stage,
     ``paramem.graph.flows._stage_rebuild``) fires when the pipeline
-    empties out post-deanon. Original drop trigger was the grounding gate
-    (now removed); plausibility is now the final discriminator that can
-    empty the pipeline."""
+    empties out post-deanon. Plausibility is the final discriminator that
+    can empty the pipeline."""
 
     def test_all_dropped_triggers_fallback(self):
         """When plausibility drops every surviving fact, the all-dropped
@@ -3817,7 +3785,7 @@ class TestCloudMintedEntityTypeDerivation:
     entity's REAL NAME back to its placeholder via the inverted
     resolution map, not via ``reverse_mapping.get(name)`` — ``reverse_mapping``
     is keyed by placeholder, so looking it up with a real name always
-    misses (dead code prior to the fix under test).
+    misses.
     """
 
     def test_cloud_minted_entity_gets_prefix_derived_type(self):
@@ -3925,12 +3893,12 @@ class TestFallbackPlausibilityOnRawHelper:
     """
 
     def test_helper_does_not_sweep_shape_like_real_names(self):
-        """The residual-placeholder sweep this helper used to run
-        (``_strip_residual_placeholders``) is retired: this path
-        operates on real-name ``graph.relations`` where no placeholder
-        vocabulary exists, so a real name that merely happens to be
-        shaped like a placeholder (``Boeing_747``) must survive — a
-        shape-only guard here could only ever produce false positives."""
+        """This helper operates on real-name ``graph.relations`` where no
+        placeholder vocabulary exists, so it never sweeps for residual
+        placeholders (``_strip_residual_placeholders``): a real name that
+        merely happens to be shaped like a placeholder (``Boeing_747``)
+        must survive — a shape-only guard here could only ever produce
+        false positives."""
         from paramem.graph.extractor import _fallback_plausibility_on_raw
 
         graph = _make_graph(
@@ -3989,12 +3957,11 @@ class TestExtractGraphNewKwargs:
         """extract_graph forwards plausibility_judge, plausibility_stage
         into the ``StageContext`` it builds.
 
-        ``_cloud_pipeline`` no longer exists as a directly-callable
-        composite whose kwargs could be captured — ``plausibility_judge``/
-        ``plausibility_stage`` now travel exclusively via ``StageContext``,
-        built once per call and read by whichever stage needs them
-        (``enrich``). Faking ``run_flow`` itself captures exactly that
-        ctx, with no real stage body (and therefore no model) involved.
+        ``plausibility_judge``/``plausibility_stage`` travel exclusively
+        via ``StageContext``, built once per call and read by whichever
+        stage needs them (``enrich``). Faking ``run_flow`` itself captures
+        exactly that ctx, with no real stage body (and therefore no model)
+        involved.
         """
         from paramem.graph.flows import extract_graph
 
@@ -4036,11 +4003,10 @@ class TestExtractGraphNewKwargs:
 
     def test_extract_graph_default_max_tokens_matches_filter_default(self):
         """extract_graph default max_tokens matches the unified filter
-        constant (currently 8192). The single-budget invariant: the entry
-        point and downstream filter calls must default to the same value
-        so a missing config doesn't produce inconsistent budgets across
-        stages. Was 2048 historically; bumped after a resume chunk
-        truncated mid-string at the old budget."""
+        constant. The single-budget invariant: the entry point and
+        downstream filter calls must default to the same value so a
+        missing config doesn't produce inconsistent budgets across
+        stages."""
         import inspect
 
         from paramem.graph.extractor import _DEFAULT_FILTER_MAX_TOKENS
@@ -4234,12 +4200,10 @@ class TestConsolidationScheduleConfigPrivacyGuard:
 
 
 class TestBindingCollisions:
-    """Unit tests for ``_binding_collisions`` — the collision-only scan
-    that replaced ``_check_mapping_totality`` (2026-07-22 cloud-admission
-    redesign retired the per-fact orphan scan and the whole-delta verdict
-    it used to also compute alongside collisions; that per-fact predicate
-    survives as ``_fact_orphans``/``_fact_tokens``/``_placeholder_tokens``
-    — see their coverage in ``tests/test_placeholders.py``).
+    """Unit tests for ``_binding_collisions`` — the collision-only scan.
+    The per-fact orphan predicate lives separately as
+    ``_fact_orphans``/``_fact_tokens``/``_placeholder_tokens`` — see their
+    coverage in ``tests/test_placeholders.py``.
 
     ALWAYS informational: a binding for a token cloud was SHOWN is inert
     under CORE-LAST precedence (:func:`_resolution_map`), so nothing
@@ -4331,13 +4295,12 @@ class TestRecordBindingDiagnostics:
     diagnostic, and the only place in the extractor that turns a
     ``DeanonResult`` into ``graph.diagnostics`` entries.
 
-    ``DeanonResult`` no longer carries a ``verdict`` field (retired
-    2026-07-22 cloud-admission redesign — nothing gates on a whole-delta
-    orphan list any more), so ``cloud_pending_orphans`` is never written.
-    ``cloud_binding_collisions`` is written on EVERY call now (2026-08-19):
-    a present ``[]`` means the scan ran and found nothing; the key's
-    total absence would mean the scan never reached this site (a state
-    this function can no longer produce, since it always writes).
+    ``DeanonResult`` carries no ``verdict`` field — nothing gates on a
+    whole-delta orphan list — so ``cloud_pending_orphans`` is never
+    written. ``cloud_binding_collisions`` is written on EVERY call: a
+    present ``[]`` means the scan ran and found nothing; the key's total
+    absence would mean the scan never reached this site, a state this
+    function cannot produce, since it always writes.
     """
 
     @staticmethod
@@ -4352,10 +4315,10 @@ class TestRecordBindingDiagnostics:
         )
 
     def test_empty_collisions_writes_empty_list(self):
-        """Mutation: reintroduce the retired ``if`` guard -> an accepted
-        delta starts omitting the key again, and every
-        ``diagnostics["cloud_binding_collisions"] == []`` assertion in
-        the suite starts raising KeyError."""
+        """Mutation: reintroducing an ``if collisions:`` guard would make
+        an accepted delta omit the key when there are no collisions, and
+        every ``diagnostics["cloud_binding_collisions"] == []`` assertion
+        in the suite would raise KeyError."""
         from paramem.graph.extractor import _record_binding_diagnostics
 
         graph = _make_graph([])
@@ -4369,9 +4332,10 @@ class TestRecordBindingDiagnostics:
         _record_binding_diagnostics(graph, self._result(["Person_2"]))
         assert graph.diagnostics["cloud_binding_collisions"] == ["Person_2"]
 
-    def test_no_cloud_pending_orphans_key_exists_any_more(self):
-        """``cloud_pending_orphans`` is retired — a collision (or anything
-        else on ``DeanonResult``) never writes it, regardless of content."""
+    def test_no_cloud_pending_orphans_key_is_ever_written(self):
+        """``cloud_pending_orphans`` is not a valid diagnostics key — a
+        collision (or anything else on ``DeanonResult``) never writes it,
+        regardless of content."""
         from paramem.graph.extractor import _record_binding_diagnostics
 
         graph = _make_graph([])
@@ -4434,18 +4398,16 @@ class TestResolutionMap:
 
 
 class TestBindingTotalityRejection:
-    """Per-triple accept/drop/revert of an invalid cloud-enrichment delta
-    (2026-07-22 cloud-admission redesign) — replaces the retired
-    whole-delta rejection this class used to pin.  An unresolvable ``add``
-    is dropped individually; an unresolvable ``modify`` is reverted to its
-    original fact; ``drop`` is honored unconditionally (even when another
-    action in the same delta was rejected — the owner's "measure first"
-    decision, tracked via ``report["drop_with_rejection"]``, not a
+    """Per-triple accept/drop/revert of an invalid cloud-enrichment delta.
+    An unresolvable ``add`` is dropped individually; an unresolvable
+    ``modify`` is reverted to its original fact; ``drop`` is honored
+    unconditionally (even when another action in the same delta was
+    rejected — tracked via ``report["drop_with_rejection"]``, not a
     revert-all safety net). These are the pipeline-level tests the
     per-triple contract requires.
 
-    FIXTURE MECHANICS (post cloud-egress-PII redesign): ``anon_transcript``
-    is the MODEL's own rewrite — the ``anon_transcript`` argument to
+    FIXTURE MECHANICS: ``anon_transcript`` is the MODEL's own rewrite —
+    the ``anon_transcript`` argument to
     ``_anonymize_contract``/``_anonymize_stub`` (this file's mocked
     ``anonymize`` return shape) — never mechanically rebuilt from
     ``transcript`` + ``mapping``.  ``observed`` is derived from the
@@ -4470,21 +4432,20 @@ class TestBindingTotalityRejection:
         return graph, anon_facts, mapping
 
     def test_poisoned_delta_5in1_collapse_untouched_fact_survives(self, caplog):
-        """The observed 5-in-1 collapse.  Cloud DROPS the ``lives_in``
+        """A poisoned delta: Cloud DROPS the ``lives_in``
         fact (index 0) and ADDS 5 facts over bare, unbound
         Person_2/Person_3 (``bindings={}``) as its "reformation" — a
         SEPARATE, untouched local fact (``works_at``, index 1, never named
         by the delta) sits alongside it.
 
-        New end state (per-triple, not whole-delta): all 5 adds are
+        Per-triple, not whole-delta: all 5 adds are
         individually dropped (unresolvable orphans); the explicit
         ``drop`` on index 0 is honored UNCONDITIONALLY regardless of
         those rejections (deliberate: measure the co-occurrence via
         ``report["drop_with_rejection"]`` rather than reverting drops as
         a safety net) — so ``lives_in`` does NOT survive.  The untouched
         ``works_at`` fact (never named by ``add``/``modify``/``drop``)
-        survives via KEEP-by-default — that is the "local fact survives"
-        property this test pins now: survival comes from being OUTSIDE
+        survives via KEEP-by-default: survival comes from being OUTSIDE
         the delta entirely, not from a reverted drop.
         """
         import logging
@@ -4576,8 +4537,8 @@ class TestBindingTotalityRejection:
         # No residual placeholder anywhere in the surviving relation.
         assert "Person_" not in result.relations[0].subject
         assert "Person_" not in result.relations[0].object
-        # The measurement the owner asked for: this delta had a non-empty
-        # drop AND a rejection, in the same response.
+        # report["drop_with_rejection"] tracks co-occurrence: this delta had
+        # a non-empty drop AND a rejection, in the same response.
         report = result.diagnostics["cloud_enrichment_report"]
         assert report["rejected_adds"] == 5
         assert set(report["rejected_tokens"]) >= {"Person_2", "Person_3"}
@@ -4586,15 +4547,15 @@ class TestBindingTotalityRejection:
         assert phases["cloud_enrich"].outcome == "ok"
         assert any(r.levelname == "WARNING" for r in caplog.records), (
             "A per-triple rejection must be logged (WARNING, not ERROR — this "
-            "is expected traffic under the redesign, not a breach)."
+            "is expected traffic, not a breach)."
         )
 
     def test_misattribution_orphan_add_dropped_local_fact_survives(self):
-        """The misattribution regression (headline).  A placeholder
-        NOT in ``observed`` (never shown to cloud) that cloud bare-mints
-        as an ``add`` is an ORPHAN → that one add is dropped; the
-        untouched local fact survives via KEEP-by-default (a DIFFERENT
-        mechanism than the poisoned-delta test above, same end state)."""
+        """A misattribution scenario: a placeholder NOT in ``observed``
+        (never shown to cloud) that cloud bare-mints as an ``add`` is an
+        ORPHAN → that one add is dropped; the untouched local fact
+        survives via KEEP-by-default (a DIFFERENT mechanism than the
+        poisoned-delta test above, same end state)."""
         from paramem.graph.extractor import EnrichmentDelta
         from tests._cloud_flow import run_cloud_stages
 
@@ -4688,14 +4649,12 @@ class TestBindingTotalityRejection:
         assert phases["cloud_enrich"].outcome == "ok"
 
     def test_binding_key_colliding_with_observed_is_inert_fact_kept(self):
-        """Conflict is now INERT, not a rejection.  A ``bindings`` key that
+        """A ``bindings`` key that
         is itself an OBSERVED token (Person_1 — already shown as a core
         reference) is a CONFLICT recorded as a diagnostic collision, but
         CORE-LAST precedence (:func:`~paramem.cloud.placeholders._resolution_map`)
         makes it harmless: the fact is KEPT, resolved via the CORE
-        reverse map, exactly as if the bogus binding had never been sent.
-        Inverts the pre-redesign expectation (used to reject the whole
-        delta)."""
+        reverse map, exactly as if the bogus binding had never been sent."""
         from tests._cloud_flow import enrichment_side_effect, run_cloud_stages
 
         graph, anon_facts, mapping = self._graph_and_mapping()
@@ -4777,7 +4736,7 @@ class TestBindingTotalityRejection:
         subject/object-only field scan would under-include ``observed``
         and false-reject this.
 
-        Post cloud-egress-PII redesign: CORE placeholders come straight
+        CORE placeholders come straight
         from the model's own anonymizer mapping (there is no
         code-side entity walk that mints for graph entities the model
         didn't name).  So ``anonymize`` is mocked to have already
@@ -4793,8 +4752,7 @@ class TestBindingTotalityRejection:
         # extract.  `predicate` is never a substitution target, so the
         # graph relation's own predicate must already carry "City_2"
         # verbatim for it to reach the cloud-facing payload the script
-        # builds — the same text the old model-authored ``anon_facts``
-        # stub carried.
+        # builds.
         graph = _make_graph(
             [("Alex", "moved from City_2 to", "Millfield")],
             entities=[
@@ -4854,14 +4812,14 @@ class TestBindingTotalityRejection:
 
 
 class TestSpeakerAnchorPipeline:
-    """The speaker anchor through the pipeline.  The PII-fold
-    regression guard (a PII attribute on the speaker still scrubbed onto
-    the anchor, never a minted ``Person_N``) is covered directly against
+    """The speaker anchor through the pipeline.  A PII attribute on the
+    speaker is scrubbed onto the anchor, never a minted ``Person_N`` —
+    covered directly against
     :func:`~paramem.cloud.placeholders.build_forward_table` in
-    ``tests/test_placeholders.py::TestAnchorFoldReverseSkip`` — the
-    model's SCAN output is the sole scope authority post-redesign, so
-    there is no graph-entity/attribute fold left in this module to pin
-    end to end here.
+    ``tests/test_placeholders.py::TestAnchorFoldReverseSkip``.  The
+    model's SCAN output is the sole scope authority, so there is no
+    graph-entity/attribute fold left in this module to pin end to end
+    here.
     """
 
     def test_speaker0_survives_end_to_end_not_swept(self):
@@ -4871,7 +4829,7 @@ class TestSpeakerAnchorPipeline:
         placeholder pattern at all — verified structurally, not
         assumed).
 
-        Post cloud-egress-PII redesign: CORE placeholders come straight
+        CORE placeholders come straight
         from the model's own anonymizer mapping (no code-side entity
         walk), so the mock explicitly classifies ``Millfield`` ->
         ``City_1`` — the model decision this test's fixture would need
@@ -5169,8 +5127,8 @@ class TestBracedBindingKeysEndToEnd:
         assert led.object == "the agile transformation initiative"
 
     def test_bare_binding_key_still_resolves(self):
-        """Backward compatibility: the boundary still accepts the old
-        bare-key shape, no migration needed."""
+        """The boundary accepts the bare-key shape as well as the braced
+        form."""
         graph, mapping = self._graph_and_mapping()
         raw = json.dumps(
             {

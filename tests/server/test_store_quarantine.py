@@ -147,11 +147,11 @@ class TestArbitratorRejection:
 
 
 # ---------------------------------------------------------------------------
-# Resume-pending-first heals a quarantine — the reordered arbitrator's core
-# new behaviour: a pending event resumes ahead of the store-quarantine
-# verdict and the tier-unverified gate (``_dispatch_consolidation``'s
-# docstring, steps 3-5), and its own ``all_live`` completion lifts the
-# quarantine in-band, no restart or restore needed.
+# Resume-pending-first heals a quarantine: a pending event resumes ahead of
+# the store-quarantine verdict and the tier-unverified gate
+# (``_dispatch_consolidation``'s docstring, steps 3-5), and its own
+# ``all_live`` completion lifts the quarantine in-band, no restart or
+# restore needed.
 # ---------------------------------------------------------------------------
 
 
@@ -465,7 +465,7 @@ class TestQuarantinedPendingResumeHeal:
 
 
 class TestQuarantineLiftGpuLock:
-    """Blocker fix: the lift's source medium (``_build_store_contents``)
+    """The lift's source medium (``_build_store_contents``)
     follows ``config.consolidation.mode``, not ``staged_event.venue`` — a
     disk-venue ledger can still resolve to a GPU-touching
     ``WeightMemorySource`` fill. The disk venue's lift call must take

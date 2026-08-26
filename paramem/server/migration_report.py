@@ -1,12 +1,10 @@
 """Comparison report for the migration trial.
 
-The initial implementation emitted a placeholder with verbatim spec operator
-line and five "—" rows.  :func:`build_comparison_report` provides real
-evaluation with additive Optional fields only; schema_version 1 is the stable
-contract.
+:func:`build_comparison_report` renders a fixed set of rows with additive
+Optional fields only; schema_version 1 is the stable contract.
 
 Module isolation is intentional — the implementation can be replaced by
-patching a single import (forward-compat guardrail 1).
+patching a single import.
 
 No ``_state`` module-level references permitted.  All helpers accept plain
 kwargs and are unit-testable without a running server.

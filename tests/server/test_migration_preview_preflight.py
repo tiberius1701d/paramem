@@ -107,7 +107,7 @@ def _seed_backups_over_cap(backups_root: Path, size_bytes: int = 200_000) -> Non
 
 
 # ---------------------------------------------------------------------------
-# Test 6 — under-cap → preview succeeds, state=STAGING, pre_flight_fail=None
+# under-cap → preview succeeds, state=STAGING, pre_flight_fail=None
 # ---------------------------------------------------------------------------
 
 
@@ -135,7 +135,7 @@ class TestPreviewUnderCapStagesCandidate:
 
 
 # ---------------------------------------------------------------------------
-# Test 7 — over-cap → 200, pre_flight_fail="disk_pressure", state="LIVE"
+# over-cap → 200, pre_flight_fail="disk_pressure", state="LIVE"
 # ---------------------------------------------------------------------------
 
 
@@ -188,7 +188,7 @@ class TestPreviewOverCapReturnsPreFlightFail:
 
 
 # ---------------------------------------------------------------------------
-# Test 8 — second /preview call after pre-flight-fail still returns LIVE (not 409)
+# second /preview call after pre-flight-fail still returns LIVE (not 409)
 # ---------------------------------------------------------------------------
 
 
@@ -320,7 +320,7 @@ def _make_full_state(tmp_path: Path, config: MagicMock) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Test 9 — end-to-end: preview pre-flight-fail → /status emits attention item
+# end-to-end: preview pre-flight-fail → /status emits attention item
 # ---------------------------------------------------------------------------
 
 
@@ -368,7 +368,7 @@ class TestPreFlightFailSurfacesInStatusAttentionItems:
 
 
 # ---------------------------------------------------------------------------
-# Test 10 — pre-flight check raises → 200, pre_flight_fail="check_error",
+# pre-flight check raises → 200, pre_flight_fail="check_error",
 # LIVE (not STAGING), and the exception is logged.
 # ---------------------------------------------------------------------------
 
@@ -379,9 +379,10 @@ class TestPreviewPreFlightRaiseIsSurfacedNotSwallowed:
     ) -> None:
         """compute_pre_flight_check raising → pre_flight_fail='check_error', state='LIVE'.
 
-        Before the fix this was a bare ``except Exception: pre_flight = None``,
-        which rendered ``pre_flight_fail: None`` — identical to a check that
-        ran and passed.  This test fails if that swallow is restored.
+        A bare ``except Exception: pre_flight = None`` would render
+        ``pre_flight_fail: None`` — identical to a check that ran and
+        passed — so the exception must instead be surfaced as
+        ``check_error``.
         """
         config = _make_config(tmp_path, max_total_disk_gb=20.0)
         backups_root = config.paths.data / "backups"
@@ -455,7 +456,7 @@ class TestPreviewPreFlightRaiseIsSurfacedNotSwallowed:
 
 
 # ---------------------------------------------------------------------------
-# Test 11 — component read failure (encrypted, no daily identity) → check_error
+# component read failure (encrypted, no daily identity) → check_error
 # ---------------------------------------------------------------------------
 
 
@@ -490,7 +491,7 @@ class TestPreviewComponentReadFailureIsCheckError:
 
 
 # ---------------------------------------------------------------------------
-# Test 12 — config=None (production trigger) → check_error
+# config=None (production trigger) → check_error
 # ---------------------------------------------------------------------------
 
 
@@ -516,7 +517,7 @@ class TestPreviewConfigNoneIsCheckError:
 
 
 # ---------------------------------------------------------------------------
-# Test — a candidate that contradicts its OWN store is rejected before
+# a candidate that contradicts its OWN store is rejected before
 # staging (config-vs-store validation, shared by every config-promotion door
 # through paramem.server.migration.validate_candidate)
 # ---------------------------------------------------------------------------

@@ -1,11 +1,8 @@
 """Tests for the POST /gpu/release endpoint and the unified lifespan teardown.
 
 The endpoint is the canonical local→cloud-only release path used by
-external GPU consumers (gpu_guard ConfigConsumer / V1
-paramem.utils.gpu_consumer / lerobot). It replaces the old SIGUSR1 protocol,
-which the V1 ``ParamemServerConsumer.request_release`` documented as
-"switch to cloud-only" but ``app.py``'s SIGUSR1 handler implemented as
-"save snapshot and exit" — protocol mismatch surfaced under V2 testing.
+external GPU consumers (gpu_guard ConfigConsumer / paramem.utils.gpu_consumer
+/ lerobot).
 
 These tests exercise the endpoint function directly (no TestClient,
 so we avoid the heavy app lifespan). Behavior contract:
@@ -413,12 +410,12 @@ def test_release_switches_voice_to_cpu():
 
 
 def test_release_clears_intent_classifier_handle():
-    """Cloud-only VRAM-leak regression (holder 5): /gpu/release must clear the
-    intent.mode=llm classifier handle (``_ClassifierModelHandle``) — it pins
-    the base model + tokenizer, and a cloud-only server must hold ~0. The
-    surviving lifespan-frame holders (WeightMemorySource / _classifier_model
-    locals) are dropped in the lifespan and can't be unit-tested here; this
-    guards the one holder the release path itself owns.
+    """/gpu/release must clear the intent.mode=llm classifier handle
+    (``_ClassifierModelHandle``) — it pins the base model + tokenizer, and a
+    cloud-only server must hold ~0. The other lifespan-frame holders
+    (WeightMemorySource / _classifier_model locals) are dropped in the
+    lifespan and can't be unit-tested here; this guards the one holder the
+    release path itself owns.
     """
     from paramem.server import app as app_module
     from paramem.server import intent as intent_module

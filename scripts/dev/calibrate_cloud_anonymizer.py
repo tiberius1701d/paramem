@@ -3,14 +3,11 @@
 ANCHOR chain — placeholder substitution is deterministic string
 replacement, not a local model call).
 
-Owns its own fixture and threshold (2026-08-24): the prior CI contract
-test this script shared them with, ``tests/test_cloud_anonymizer_contract_gpu.py``,
-was retired by the anonymizer-split design — the fixed-threshold CI gate
-it enforced is superseded by a post-implementation GPU validation ladder
-run separately against real traffic. This script keeps its calibration
-role standalone: run it against a real GPU + model to measure the
-current baseline on the shipped fixture and eyeball the failure-mode
-distribution.
+Owns its own fixture and threshold: a fixed-threshold CI gate is out of
+scope here — a post-implementation GPU validation ladder run separately
+against real traffic covers that. This script's calibration role is
+standalone: run it against a real GPU + model to measure the current
+baseline on the shipped fixture and eyeball the failure-mode distribution.
 
 Mirrors the calibration pattern of
 ``tests/test_plausibility_contract_gpu.py`` (75% measured baseline).
@@ -58,7 +55,7 @@ Outcome classification per query:
                        in the anonymizer prompt.
 
 The script does NOT update ``_MATCH_THRESHOLD`` automatically.
-Eyeball the report — there is no longer a CI contract test to update in
+Eyeball the report — no CI contract test consumes this baseline in
 lockstep; a re-measured baseline is applied by hand once the live
 calibration gate (against ``tests/fixtures/anonymizer_gate.json``, the
 labelled fixture this script and the span-tagger SCAN step's live gate
@@ -83,17 +80,16 @@ from paramem.config.taxonomy import ScrubCategory, resolve_scrub_categories
 # ``scripts/dev/*.py`` calibration tool (e.g. ``calibrate_prompts.py``).
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
-# Reference floor only (2026-08-24) — threshold re-derived from the live
-# labelled calibration gate against the fixture below once the
-# span-tagger SCAN step is running; kept at the prior conservative value
-# until that gate measures a new one.
+# Reference floor only — a conservative value pending re-derivation from
+# the live labelled calibration gate against the fixture below, once the
+# span-tagger SCAN step is running.
 _MATCH_THRESHOLD = 0.80
 
 # Tracked, fictional calibration corpus shared with the span-tagger's own
 # live threshold-measurement gate — single-turn and multi-turn
-# transcripts, the production input shape ``answer_via_cloud``
-# (``paramem.server.inference``) passes to ``anonymize_turn`` (the
-# cloud-egress entry point anonymizes only the current-turn text;
+# transcripts, the production input shape ``answer_via_cloud`` /
+# ``answer_via_ha`` (``paramem.server.egress``) pass to ``anonymize_turn``
+# (the egress entry point anonymizes only the current-turn text;
 # conversation history flows separately through ``_sanitize_history``).
 _FIXTURE_PATH = _REPO_ROOT / "tests" / "fixtures" / "anonymizer_gate.json"
 
@@ -210,15 +206,14 @@ def _run_one(
     )
     if payload.status != "ok":
         # Covers both "failed" (fail-closed) and "opted_out"
-        # (categories=()) — neither has anything to round-trip.  Note this
-        # also fixes a latent truthiness bug the old
-        # ``if not mapping or not anon_text`` check had: a legitimate "ran,
-        # found nothing in scope" verdict (status == "ok", forward == {})
-        # is no longer misclassified as a failure — CLAUDE.md forbids
-        # truthiness checks on registries.
+        # (categories=()) — neither has anything to round-trip.  A
+        # legitimate "ran, found nothing in scope" verdict (status == "ok",
+        # forward == {}) is not a failure — CLAUDE.md forbids truthiness
+        # checks on registries, so status is checked explicitly rather
+        # than `if not mapping or not anon_text`.
         return "", dict(payload.forward), ""
     # Derived the same way production's chat-egress path derives it
-    # (``paramem.server.inference.answer_via_cloud``): whole-word
+    # (``paramem.server.egress.OutboundText.outbound_text``): whole-word
     # substitution of the bare turn text against ``payload.forward``, not
     # ``payload.anon_transcript`` — that field stays marker-bearing on
     # this call, since the marker strip lives only in the session-tier

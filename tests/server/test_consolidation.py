@@ -1,9 +1,9 @@
 """Unit tests for paramem.server.consolidation.
 
-No existing test file targets this module (``tests/test_consolidation.py``
-targets ``paramem.training.consolidation.ConsolidationLoop`` instead) --
-``load_max_tier_cycle`` is the per-tier boot-seed reader that replaced a
-single global ``key_metadata.json`` reader, with zero prior coverage.
+``tests/test_consolidation.py`` targets ``paramem.training.consolidation.ConsolidationLoop``,
+a different module -- this file covers ``paramem.server.consolidation``.
+``load_max_tier_cycle`` is the per-tier boot-seed reader that derives the
+starting cycle count from on-disk tier metadata.
 
 Covers:
 - load_max_tier_cycle: no files anywhere -> None; per-tier cycle_count

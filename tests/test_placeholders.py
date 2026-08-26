@@ -3,18 +3,14 @@ placeholder primitive kit.
 
 Most of this module's functions (``_apply_bindings``, ``_resolution_map``,
 ``build_forward_table``, ...) already have extensive coverage in
-``tests/test_extraction_pipeline.py`` (moved there unchanged when this
-module was carved out of ``paramem.graph.extractor``). This file covers
-the NEW unified primitives introduced by that carve-out: ``mint_placeholder``,
+``tests/test_extraction_pipeline.py``. This file covers the primitives
+that live only in ``paramem.cloud.placeholders``: ``mint_placeholder``,
 ``braced``, ``entity_type_to_prefix``, ``prefix_to_entity_type``, and the
 generalized (``placeholder_side``) table normalize/validate pair.
 
 ``entity_type_to_prefix``/``prefix_to_entity_type``/``placeholder_entity_type``
-moved to :mod:`paramem.config.taxonomy` (originally
-``paramem.graph.schema_config``, in the ``paramem/cloud/`` package carve of
-2026-07-21; re-homed to ``paramem.config`` when the taxonomy loader itself
-moved out of ``paramem.graph``): they derive from the graph entity-type
-taxonomy (``configs/schema.yaml``).
+live in :mod:`paramem.config.taxonomy`: they derive from the graph
+entity-type taxonomy (``configs/schema.yaml``).
 """
 
 from __future__ import annotations
@@ -36,7 +32,6 @@ from paramem.cloud.placeholders import (
     insert_placeholders,
     invert_forward_mapping,
     mint_placeholder,
-    placeholder_prefix,
     unbraced,
 )
 from paramem.config.taxonomy import (
@@ -76,27 +71,6 @@ class TestBraced:
         assert braced("{Person_1}") == "{{Person_1}}"
 
 
-class TestPlaceholderPrefix:
-    """U2 — the cross-slice placeholder renumber's one splitter."""
-
-    def test_single_segment_prefix(self):
-        assert placeholder_prefix("Person_1") == "Person"
-
-    def test_multi_segment_prefix_preserved(self):
-        assert placeholder_prefix("Home_Address_1") == "Home_Address"
-
-    def test_unshaped_token_returns_none(self):
-        assert placeholder_prefix("notshaped") is None
-
-    def test_lowercase_leading_char_returns_none(self):
-        # PLACEHOLDER_SHAPE_RE requires each prefix segment to start
-        # PascalCase — a lowercase leading char fails the anchor.
-        assert placeholder_prefix("person_1") is None
-
-    def test_no_numeric_suffix_returns_none(self):
-        assert placeholder_prefix("Person") is None
-
-
 class TestEntityTypeToPrefix:
     def test_closed_vocabulary_matches_taxonomy(self):
         assert entity_type_to_prefix("person") == "Person"
@@ -105,8 +79,8 @@ class TestEntityTypeToPrefix:
         assert entity_type_to_prefix("concept") == "Thing"
 
     def test_open_vocabulary_pascal_cases_multi_word_labels(self):
-        """Collapses the old two-implementation drift: the PascalCase
-        rule wins over the ``.capitalize()`` rule for any open type."""
+        """The PascalCase rule wins over the ``.capitalize()`` rule for
+        any open type."""
         assert entity_type_to_prefix("event") == "Event"
         assert entity_type_to_prefix("work_of_art") == "WorkOfArt"
         assert entity_type_to_prefix("self-driving") == "SelfDriving"
@@ -322,22 +296,61 @@ class TestSubstituteWholeWordsLongestFirst:
         assert out == "I visited City_1 yesterday."
 
 
+class TestPossessiveIsASubstitutionProperty:
+    """Possessive coverage is a property of ``_substitute_whole_words``
+    itself, never a forward-table entry: ``'`` is not a word character
+    (:data:`_is_word_char`), so a key matches inside its own possessive
+    without needing a dedicated ``"Alex's"`` mapping.  This is also why a
+    caller relying on this (e.g. the speaker fold in
+    ``paramem.cloud.placeholders.build_forward_table``, which enters both
+    a short and a longer surface as separate keys onto the same value)
+    must enter the LONGER surface (``"Alex Miller"``) as its own key, not
+    rely on the shorter ``"Alex"`` key alone.
+    """
+
+    def test_a_key_matches_inside_its_own_possessive_without_a_table_entry(self):
+        mapping = {"Alex": "speaker0"}
+        out = _substitute_whole_words("Alex's book is on the table.", mapping)
+        assert out == "speaker0's book is on the table."
+
+    def test_an_unrelated_word_sharing_a_prefix_is_left_alone(self):
+        mapping = {"Alex": "speaker0"}
+        out = _substitute_whole_words("Billing was Alex's job.", mapping)
+        assert out == "Billing was speaker0's job."
+        assert "Billing" in out
+
+    def test_a_shorter_key_alone_leaves_the_longer_surfaces_surname_dangling(self):
+        """The failure mode a fold covering only "Alex" would produce:
+        without a separate "Alex Miller" entry, the surname egresses
+        verbatim — exactly why the fold must re-point every matching key,
+        not just the shorter one.
+        """
+        mapping = {"Alex": "speaker0"}
+        out = _substitute_whole_words("Alex Miller called.", mapping)
+        assert out == "speaker0 Miller called."
+
+    def test_both_keys_present_fully_covers_the_longer_surface(self):
+        mapping = {"Alex": "speaker0", "Alex Miller": "speaker0"}
+        out = _substitute_whole_words("Alex Miller called.", mapping)
+        assert out == "speaker0 called."
+
+
 class TestAppliedWholeWordKeys:
     """The reporting form of :func:`_substitute_whole_words` —
     :func:`_applied_whole_word_keys` — the ONE substitution walk
     (:func:`_substitute_whole_words_and_applied`) shared by both. Used by
-    :func:`~paramem.cloud.anonymize.anonymize` to prune a forward table
-    down to keys that are actually live over one payload.
+    :func:`build_forward_table`'s prune pass to keep only the keys that
+    are actually live over one payload.
     """
 
     def test_returns_only_the_keys_that_actually_matched(self) -> None:
         mapping = {"Alex": "Person_1", "Riley": "Person_2"}
-        applied = _applied_whole_word_keys("Alex went to the store.", mapping)
+        applied = _applied_whole_word_keys("Alex went to the store.", mapping.keys())
         assert applied == {"Alex"}
 
     def test_a_key_present_nowhere_in_text_is_not_applied(self) -> None:
         mapping = {"Alex": "Person_1"}
-        assert _applied_whole_word_keys("Nothing here matches.", mapping) == set()
+        assert _applied_whole_word_keys("Nothing here matches.", mapping.keys()) == set()
 
     def test_overlapping_non_nesting_spans_only_the_first_applied_key_survives(self) -> None:
         # Longest-first substitution consumes the first key's match; the
@@ -349,7 +362,7 @@ class TestAppliedWholeWordKeys:
             "Schillerpromenade 63, 12049 Berlin": "Address_1",
             "12049 Berlin, Abteilung 3": "Address_2",
         }
-        applied = _applied_whole_word_keys(text, mapping)
+        applied = _applied_whole_word_keys(text, mapping.keys())
         assert applied == {"Schillerpromenade 63, 12049 Berlin"}
 
     def test_applied_keys_agree_with_the_str_only_forms_own_substitutions(self) -> None:
@@ -360,8 +373,8 @@ class TestAppliedWholeWordKeys:
         assert applied == {"Person_10", "Person_1"}
 
     def test_empty_text_or_mapping_yields_an_empty_applied_set(self) -> None:
-        assert _applied_whole_word_keys("", {"Alex": "Person_1"}) == set()
-        assert _applied_whole_word_keys("Alex", {}) == set()
+        assert _applied_whole_word_keys("", {"Alex": "Person_1"}.keys()) == set()
+        assert _applied_whole_word_keys("Alex", {}.keys()) == set()
 
 
 class TestInsertPlaceholders:
@@ -418,9 +431,9 @@ class TestSubstituteWholeWordsEdgeAwareBoundaries:
     """
 
     def test_non_word_leading_key_is_scrubbed(self):
-        """The confirmed live leak: a phone number key starting with
-        ``"+"`` (a non-word char) was never attempted under the old
-        "only match at a word-char position" walk."""
+        """A phone number key starting with ``"+"`` (a non-word char) must
+        still be matched and scrubbed, even though the walk only starts a
+        match search at a word-char position."""
         mapping = {"+49 151 2345": "Phone_1"}
         out = _substitute_whole_words("Call me at +49 151 2345 tomorrow.", mapping)
         assert out == "Call me at Phone_1 tomorrow."
@@ -621,8 +634,7 @@ class TestMultiSegmentPlaceholderShape:
 
 class TestPlaceholderTokens:
     """``_placeholder_tokens`` — THE ``PLACEHOLDER_TOKEN_RE.findall`` +
-    braced/bare name-extraction site (2026-07-22 cloud-admission
-    redesign de-duplication follow-up). Every other primitive that needs
+    braced/bare name-extraction site. Every other primitive that needs
     "which placeholder tokens appear in this string" (``_fact_tokens``,
     ``CloudScope.response``'s binding-value pruning) routes through this
     function — these tests pin the primitive directly.
@@ -737,7 +749,7 @@ class TestReverseMapInversionAgreement:
     :func:`build_forward_table` -> :func:`invert_forward_mapping` chain —
     :func:`invert_forward_mapping`'s first-wins tie-break on a many-to-one
     forward map is exercised directly here (the map-construction side is
-    covered by the scan/anchor/seeding tests above).
+    covered by ``tests/test_build_forward_table_sharing.py``).
     """
 
     _MANY_TO_ONE = {"Alice": "Person_1", "Bob": "Person_1"}

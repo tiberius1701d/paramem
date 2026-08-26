@@ -647,11 +647,11 @@ def compute_shape_changes(
             KEYS_WITHOUT_SLOT,
             PAYLOAD_MISMATCH,
         ):
-            # Per-verdict wording — the prior generalized "none readable/
-            # matching" text was false for KEYS_WITHOUT_SLOT (zero
-            # candidates — there is nothing to "not match") and
-            # PAYLOAD_MISMATCH (a slot DID match by hash; only its payload
-            # bytes disagree with the manifest digest).
+            # Per-verdict wording — KEYS_WITHOUT_SLOT (zero candidates —
+            # there is nothing to "not match") and PAYLOAD_MISMATCH (a slot
+            # DID match by hash; only its payload bytes disagree with the
+            # manifest digest) are not interchangeable, so each gets its own
+            # reason string.
             if binding.status == KEYS_WITHOUT_SLOT:
                 reason = "registry holds active keys but no candidate slot exists"
             elif binding.status == REGISTRY_ABSENT_WITH_SLOTS:

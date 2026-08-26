@@ -403,7 +403,7 @@ class TestSpeakerIdDedup:
         assert m.graph.nodes["speaker0"]["display_name"] == "Alex"
 
     def test_non_speaker_entities_still_dedup_by_name(self):
-        """Object entities (speaker_id=None) must still dedup by name (regression)."""
+        """Object entities (speaker_id=None) must still dedup by name."""
         m = GraphMerger(similarity_threshold=85.0)
         sg1 = SessionGraph(
             session_id="s1",
@@ -425,10 +425,11 @@ class TestSpeakerIdDedup:
 
 
 class TestUpsertEntityWritesNoAttributes:
-    """_upsert_entity no longer folds Entity.attributes onto the graph node
-    at all -- that channel is now attribute_relations' projection into the
-    merger's relation_type == "attribute" gate (test_merger_attribute_gate),
-    never a direct entity-merge write.
+    """_upsert_entity never folds Entity.attributes onto the graph node.
+
+    Attribute values reach the graph only through attribute_relations'
+    projection into the merger's relation_type == "attribute" gate
+    (test_merger_attribute_gate), never a direct entity-merge write.
     """
 
     def test_entity_with_attributes_merged_alone_leaves_node_attributes_empty(self):
@@ -1472,7 +1473,7 @@ class TestRemovalLedger:
         """Same-(s,p)/different-o REPLACE + rival has fresher last_seen:
         rival survives, incoming is NOT inserted, incoming's indexed_key is ledgered.
 
-        This is the new incoming-loses path introduced by the unified recency rule.
+        The recency rule decides in the rival's favour when the rival is newer:
         rival (Munich, 2026-01-02) vs incoming (Berlin, 2026-01-01) → Munich wins.
         """
         from unittest.mock import MagicMock, patch
@@ -1636,8 +1637,8 @@ class TestRemovalLedger:
         # Surviving surfaces record the first-seen DISPLAY surface, not the
         # canonical node key and not the incoming drifted surface — pinning
         # this against the exact stored strings (not merely "differs from
-        # incoming") catches a regression to the bare node key ("alice"),
-        # which would also differ from "ALICE" and pass a weaker check.
+        # incoming") is required: the bare node key ("alice") also differs
+        # from "ALICE" and would pass a weaker check.
         assert pre["surviving"]["subject"] == "Alice", (
             f"surviving subject must be the first-seen display surface 'Alice'; "
             f"got {pre['surviving']['subject']!r}"
@@ -1716,8 +1717,8 @@ class TestRemovalLedger:
         """record_removal with survivor_key=None (the default) omits the key
         entirely from the stored entry, so removal shapes that never carry a
         survivor (a contradiction, an enrichment same_as contraction, an
-        unkeyable-no-predicate skip) stay byte-identical to before
-        record_removal existed.
+        unkeyable-no-predicate skip) produce an entry with no survivor_key
+        field at all.
 
         Direct unit coverage of ``record_removal``'s own contract. The real
         production writer that structurally never carries a survivor_key is
@@ -1730,9 +1731,9 @@ class TestRemovalLedger:
         entry at all: whenever it records anything, the survivor edge either
         already carried its own key or adopted the best-ranked retired one
         first, so ``survivor_key`` is always set on any entry that writer
-        produces (verified empirically — a keyless-survivor group with two
-        keyed retired predicates ledgers the non-adopted one WITH the
-        adopted key as its survivor, never without).
+        produces — a keyless-survivor group with two keyed retired
+        predicates ledgers the non-adopted one WITH the adopted key as its
+        survivor, never without.
         """
         from paramem.graph.merger import GraphMerger
 
@@ -1747,11 +1748,10 @@ class TestRemovalLedger:
             f"unexpected entry shape: {entry}"
         )
 
-    def test_record_removal_rejects_the_retired_display_name_reason(self):
-        """``display_name_absorbed`` is gone from the removal vocabulary — a
-        name attribute is now an ordinary keyable fact, so nothing ever
-        absorbs it into the display surface without a trace.  Cheap
-        regression guard against re-minting the reason."""
+    def test_record_removal_rejects_display_name_absorbed_reason(self):
+        """``display_name_absorbed`` is not a valid removal reason: a name
+        attribute is an ordinary keyable fact, so nothing absorbs it into
+        the display surface without a trace."""
         from paramem.graph.merger import GraphMerger
 
         m = GraphMerger()
@@ -2563,10 +2563,10 @@ class TestMergerEdgeStamps:
         )
 
     def test_e2_symmetric_speaker_owned_sibling_not_flipped(self):
-        """Regression: a lone speaker-owned symmetric edge must NOT flip the
-        speaker out of the subject slot.  'speaker0' > 'nadia' lexicographically
-        and nadia carries no speaker_id, so the old both-speakers gate let this
-        swap through — breaking speaker-bound recall."""
+        """A lone speaker-owned symmetric edge must NOT flip the speaker out
+        of the subject slot, even though 'speaker0' > 'nadia' lexicographically
+        and nadia carries no speaker_id — a lexicographic swap here would
+        break speaker-bound recall."""
         from paramem.graph.merger import GraphMerger
         from paramem.graph.schema import Relation
 
@@ -2590,8 +2590,9 @@ class TestMergerEdgeStamps:
         )
 
     def test_e2_symmetric_speaker_owned_married_to_not_flipped(self):
-        """Same regression as sibling, for a second symmetric predicate
-        ('speaker0' > 'person_1' lexicographically)."""
+        """Speaker-owned symmetric predicate keeps the speaker as subject,
+        mirroring the sibling case, for a second predicate ('speaker0' >
+        'person_1' lexicographically)."""
         from paramem.graph.merger import GraphMerger
         from paramem.graph.schema import Relation
 
@@ -2614,9 +2615,9 @@ class TestMergerEdgeStamps:
         )
 
     def test_e2_symmetric_non_speaker_peers_still_collapse(self):
-        """Non-regression: two non-speaker peers on a symmetric relation must
-        still canonicalize to a single lexicographic-min direction so Case-1
-        reinforcement collapses both directions into one edge."""
+        """Two non-speaker peers on a symmetric relation still canonicalize
+        to a single lexicographic-min direction so Case-1 reinforcement
+        collapses both directions into one edge."""
         from paramem.graph.merger import GraphMerger
         from paramem.graph.schema import Relation
 
@@ -2694,13 +2695,13 @@ class TestMergerEdgeStamps:
 
 
 # ---------------------------------------------------------------------------
-# Casing-collision regression test (Step 2 — headline bug)
+# Speaker casing-collision resolution
 # ---------------------------------------------------------------------------
 
 
-class TestSpeakerCasingCollisionRegression:
-    """Regression: a speaker0 Entity and a speaker0 relation-endpoint that
-    arrives WITHOUT a matching Entity must resolve to exactly ONE node key.
+class TestSpeakerCasingCollision:
+    """A speaker0 Entity and a speaker0 relation-endpoint that arrives
+    WITHOUT a matching Entity must resolve to exactly ONE node key.
 
     Under lowercase-uniform identity both the entity path and the fallback
     path produce the same lowercase node key (entity.speaker_id verbatim).

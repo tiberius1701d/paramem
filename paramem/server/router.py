@@ -15,9 +15,7 @@ unresolved.  ``Intent.UNKNOWN`` is never remapped to a positive intent;
 it routes identically to ``Intent.GENERAL`` (no personal-memory access,
 escalation available).  Speaker enrollment is intentionally NOT a
 routing signal: a query from
-an enrolled speaker is classified by content, not by who said it.  This
-removes the "speaker-in-graph → PERSONAL" short-circuit that previously
-caused imperatives from enrolled speakers to misroute (HR3 bug).
+an enrolled speaker is classified by content, not by who said it.
 
 The router is stateless per query — all state lives in the registry-
 backed ``_speaker_key_index`` (preload-independent) and the optional
@@ -101,12 +99,10 @@ _PERSONAL_TIERS_PRE_INTERIM = ("procedural",)
 _PERSONAL_TIERS_POST_INTERIM = ("episodic", "semantic")
 
 
-# ``_is_interrogative`` + ``_INTERROGATIVE_*`` are NOT consumed by routing
-# any more — intent classification is the routing signal.  They remain in
-# this module solely to support the abstention gate in
-# ``paramem/server/inference.py`` (currently imports from here).  Future
-# cleanup: move to ``paramem/server/sentence_type.py`` where the encoder-
-# tier classifier already lives.
+# ``_is_interrogative`` + ``_INTERROGATIVE_*`` support the abstention gate
+# in ``paramem/server/inference.py``, which imports them from here.
+# Routing itself does not consult them — intent classification is the
+# routing signal.
 
 _INTERROGATIVE_PREFIXES = frozenset(
     {
@@ -216,9 +212,8 @@ class QueryRouter:
         boot fill is skipped so entries start empty (go-live adoption still
         installs them at the first fold, regardless of the setting — see
         :meth:`~paramem.memory.store.MemoryStore.adopt_increments`), but
-        bookkeeping is always present.  The old ``len(store) > 0`` guard
-        (which counted ``_entries`` and short-circuited on empty cache) has
-        been removed — the correct gate is ``store is not None`` only.
+        bookkeeping is always present.  The gate is ``store is not None``
+        only.
 
         Rebinds atomically: the new index is built fully, off to the side,
         then published with a single attribute-reference swap — never

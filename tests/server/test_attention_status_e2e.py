@@ -376,7 +376,7 @@ class TestKeysCountSourceOfTruth:
     """keys_count in /status must come from the authoritative MemoryStore.
 
     Branch A: live store present with main + interim tier → count includes
-    interim keys so the 202-vs-225 class of drift cannot recur.
+    interim keys, not only the main tier's.
 
     Branch B: store is None (cloud-only / pre-preload) → cold path walks
     iter_tier_roots and reads each tier's registry directly via
@@ -394,8 +394,8 @@ class TestKeysCountSourceOfTruth:
             reg_episodic.add(f"ep_key_{i}")
         live_store.load_registry("episodic", reg_episodic)
 
-        # Interim tier: 3 additional keys (simulates the slot missed by the
-        # old consolidation-loop branch that excluded interim from the count).
+        # Interim tier: 3 additional keys, which must be counted alongside
+        # the main tier's.
         reg_interim = KeyRegistry()
         for i in range(3):
             reg_interim.add(f"interim_key_{i}")
@@ -479,12 +479,12 @@ class TestKeysCountSourceOfTruth:
     ):
         """A foreign-shaped tier registry (not KeyRegistry-shaped) must not
         500 the cold /status path — the tier is excluded from the count
-        instead of raising past the endpoint.  Regression for the strict
-        KeyRegistry.load shape check (missing 'simhash') widening
-        ValueError into an unguarded cold-path read.  Tier readability is
-        NOT re-surfaced here — that is _record_unverified_tier_incidents'
-        job (the attention block); this endpoint only needs an honest
-        count."""
+        instead of raising past the endpoint.  A tier whose registry fails
+        KeyRegistry's shape check (e.g. a missing ``simhash`` key) is
+        excluded from the cold-path count rather than raising.  Tier
+        readability is NOT re-surfaced here — that is
+        _record_unverified_tier_incidents' job (the attention block); this
+        endpoint only needs an honest count."""
         adapters_dir = tmp_path / "adapters"
         # Episodic reads cleanly.
         episodic_dir = adapters_dir / "episodic"

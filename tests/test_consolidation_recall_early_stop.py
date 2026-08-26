@@ -11,8 +11,9 @@ both ``_maybe_make_recall_callback`` and ``train_adapter``:
       _migrate_tier_simulate_to_train (routed through the funnel so the
       per-fold training-budget derivation applies here too)
 
-Plus the helper itself (Class A) and the structural AST gate (Class F)
-that prevents future architectural-mismatch regressions of the v1 class.
+Plus the helper itself (Class A) and the structural AST gate (Class F),
+which asserts that every production ``train_adapter`` call site has
+``_maybe_make_recall_callback`` wired in the same function body.
 
 No GPU required.  Mocks `paramem.training.trainer.train_adapter` to capture
 the ``callbacks_extra`` kwarg.
@@ -226,14 +227,13 @@ class _Captured:
 # ---------------------------------------------------------------------------
 # Class B — TestCallSiteWiringSourcePresence
 #
-# After the _train_tier_adapter dedup (2026-06-17) and the migration-routing
-# change, the recall callback is no longer wired directly at ANY production
-# call site. It is funnelled
-# through the single shared helper _train_tier_adapter, which every
-# production path calls (run_consolidation_cycle, the full fold, and
-# active_store_migration._migrate_tier_simulate_to_train).
+# The recall callback is wired only through the single shared helper
+# _train_tier_adapter, which every production path calls
+# (run_consolidation_cycle, the full fold, and
+# active_store_migration._migrate_tier_simulate_to_train). No production
+# call site wires the callback directly.
 #
-# The invariant is now two-part:
+# The invariant is two-part:
 #   1. _train_tier_adapter calls _maybe_make_recall_callback (the funnel).
 #   2. Every production caller (run_consolidation_cycle and the full fold,
 #      both via run_build_and_publish's _train_gate_write, and
@@ -318,13 +318,13 @@ class TestCallSiteWiringSourcePresence:
         )
 
     def test_site2_unified_cycle_uses_funnel_for_interim(self) -> None:
-        """run_consolidation_cycle trains episodic+procedural via _train_tier_adapter
-        (the funnel).  _run_indexed_key_procedural was deleted when procedural
-        folded into the unified interim slot — the flat per-cycle procedural
-        train path no longer exists.
+        """run_consolidation_cycle trains episodic+procedural via
+        _train_tier_adapter (the funnel).  Procedural is trained through the
+        unified interim slot, not a flat per-cycle procedural train path;
+        there is no ``_run_indexed_key_procedural`` function.
         """
         # The funnel check is already covered by test_site1_unified_cycle_calls_funnel.
-        # This test guards that the deleted function no longer exists in the module.
+        # This test guards that _run_indexed_key_procedural does not exist in the module.
         import ast
 
         src = (PROJECT_ROOT / "paramem/training/consolidation.py").read_text()
@@ -417,8 +417,8 @@ class TestEnabledVsDisabledBranch:
 #
 # Structural AST test that scans every production-reachable module and
 # asserts the recall helper is invoked in the same FunctionDef body as
-# every train_adapter call.  This is the PR-CI gate that prevents the
-# v1 architectural-mismatch class of bug from recurring.
+# every train_adapter call.  This is the PR-CI gate that keeps a
+# train_adapter call site from training without the recall callback wired.
 # ---------------------------------------------------------------------------
 
 
@@ -699,7 +699,7 @@ class TestProbeRecall:
         self, tmp_path: Path
     ) -> None:
         """When training_config.gradient_checkpointing is True, the probe
-        re-enables it afterward (in a finally) — the probe now runs mid-fold,
+        re-enables it afterward (in a finally) — the probe runs mid-fold,
         before the promote and before the next tier trains, so the pre-probe
         state must be restored rather than left disabled.
         """

@@ -124,7 +124,6 @@ class UserTokenStore:
             raise ValueError(
                 f"Unsupported user-token store version {version!r} "
                 f"(expected >= {_STORE_VERSION}). "
-                "Migration rung for v1 has been removed. "
                 "Provide a v2 store or start fresh."
             )
         self._tokens = data.get("tokens", {})
@@ -274,9 +273,9 @@ class UserTokenStore:
         Returns the ``speaker_id`` (a string) for an attributed, active token;
         returns ``None`` for unknown, revoked, or **unattributed** tokens
         (``speaker_id=None``).  The ``None`` return for unattributed tokens is
-        intentional — :meth:`lookup` preserves its historic contract
-        (``str | None`` where ``None`` means "no speaker") and is not the auth
-        primitive for unattributed tokens.  :meth:`resolve` is used for that.
+        intentional — :meth:`lookup`'s contract is ``str | None`` where
+        ``None`` means "no speaker", and it is not the auth primitive for
+        unattributed tokens.  :meth:`resolve` is used for that.
 
         Parameters
         ----------
@@ -294,9 +293,9 @@ class UserTokenStore:
         if record is None:
             return None
         _authenticated, speaker_id, _scope = record
-        # speaker_id may be None for unattributed tokens — return None per
-        # the existing contract (callers that only care about attributed tokens
-        # see no change; the middleware switches to resolve() for unattributed).
+        # speaker_id may be None for unattributed tokens — return None.
+        # Callers that only care about attributed tokens use this method;
+        # the middleware uses resolve() for unattributed tokens.
         return speaker_id
 
     def resolve(self, token: str) -> tuple[bool, str | None, str] | None:

@@ -6,11 +6,12 @@ Covers:
 - preview render (simulate notice → shape-change block → tier diff → unified diff → Proceed?)
 - simulate notice y continues, N POSTs cancel + exits 1, EOF POSTs cancel + exits 1
 - shape-change block rendered unconditionally
-- Proceed? y prints "3b.2 not yet implemented" and exits 0
+- Proceed? y enters the long-poll flow (confirm → poll → accept/rollback/cancel)
 - Proceed? N POSTs cancel and exits 0
-- 404 fallback message lists the four 3b.1 endpoints + names confirm/accept/rollback as 3b.2-pending
+- 404 fallback message names /migration/preview, version alignment, and the
+  standalone migrate-accept/migrate-rollback subcommands
 - migrate-cancel subcommand POSTs /migration/cancel
-- --json mode bypasses prompts; simulate_mode_override at top level (Condition 8)
+- --json mode bypasses prompts; simulate_mode_override is a top-level field
 """
 
 from __future__ import annotations
@@ -105,8 +106,9 @@ class TestMigrate404Fallback:
     def test_404_message_mentions_preview_and_version_alignment(self, monkeypatch, capsys):
         """ServerUnavailable → stderr mentions /migration/preview and version alignment.
 
-        The 404 message is evergreen (no slice labels).  It must name the
-        endpoint and instruct the operator to check version alignment.
+        The 404 message is evergreen — it never references version-specific
+        labels.  It must name the endpoint and instruct the operator to
+        check version alignment.
         """
         monkeypatch.setattr(
             http_client,
@@ -152,7 +154,7 @@ class TestMigrateJsonMode:
         assert parsed["state"] == "STAGING"
 
     def test_json_mode_simulate_mode_override_at_top_level(self, monkeypatch, capsys):
-        """--json: simulate_mode_override is a top-level field (Condition 8)."""
+        """--json: simulate_mode_override is a top-level field."""
         preview = {**_BASE_PREVIEW, "simulate_mode_override": True}
         monkeypatch.setattr(http_client, "post_json", lambda *a, **kw: preview)
         rc = main(["migrate", "/abs/path.yaml", "--json"])
@@ -271,13 +273,13 @@ class TestMigrateProceedN:
 
 
 # ---------------------------------------------------------------------------
-# EOF on Proceed? prompt (Condition 4)
+# EOF on Proceed? prompt
 # ---------------------------------------------------------------------------
 
 
-class TestMigrateEOFCondition4:
+class TestMigrateEOFOnProceed:
     def test_eof_on_proceed_posts_cancel_and_exits_1(self, monkeypatch, capsys):
-        """EOF on Proceed? → POSTs /migration/cancel + exits 1 (Condition 4)."""
+        """EOF on Proceed? → POSTs /migration/cancel + exits 1."""
         cancel_called = []
 
         def _post(url, body=None, **kwargs):
@@ -290,7 +292,7 @@ class TestMigrateEOFCondition4:
         with patch("builtins.input", side_effect=EOFError):
             rc = main(["migrate", "/abs/path.yaml"])
         assert rc == 1, f"Expected exit 1 on EOF, got {rc}"
-        assert cancel_called, "cancel must be posted on EOF (Condition 4)"
+        assert cancel_called, "cancel must be posted on EOF"
 
 
 # ---------------------------------------------------------------------------
@@ -367,7 +369,7 @@ class TestSimulateNotice:
         assert cancel_called
 
     def test_simulate_notice_eof_posts_cancel_and_exits_1(self, monkeypatch):
-        """EOF on simulate notice → POSTs cancel + exits 1 (Condition 4)."""
+        """EOF on simulate notice → POSTs cancel + exits 1."""
         cancel_called = []
 
         def _post(url, body=None, **kwargs):

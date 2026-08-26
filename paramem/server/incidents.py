@@ -311,13 +311,12 @@ def record_incident(
                 if row.get("status") == "resolved":
                     new_row["status"] = "active"
                 # A bump means the row is live again regardless of the
-                # status it bumped from (reopen from resolved, or a second
-                # occurrence of an already-active/acknowledged row) — a
-                # reason a PRIOR resolve gave (e.g. "cloud egress disabled")
-                # no longer applies, so it must not linger.  Gating this on
-                # ``status == "resolved"`` alone missed the
-                # resolve-with-reason -> ack -> re-record path: an
-                # acknowledged row bumped here kept the stale reason.
+                # status it bumped from (reopen from resolved, an
+                # acknowledged row re-recorded, or a second occurrence of an
+                # already-active row) — a reason a PRIOR resolve gave (e.g.
+                # "cloud egress disabled") does not apply to a live row, so
+                # it is cleared unconditionally rather than only when
+                # ``status == "resolved"``.
                 new_row["resolved_reason"] = None
                 new_rows.append(new_row)
             else:

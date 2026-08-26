@@ -1,6 +1,6 @@
 """``build_forward_table`` — canonical-equal sharing (never deletion),
 per-prefix uniqueness, first-category-wins, the anchor fold, speaker-id
-exclusion, and speaker-name seeding.
+exclusion, and the closed speaker group.
 """
 
 from __future__ import annotations
@@ -30,10 +30,29 @@ def _scan(category: ScrubCategory, values: tuple[str, ...]):
     return ScanResult(category=category, values=values, dropped=())
 
 
+def _tag_text(scans) -> str:
+    """Every scanned surface, whole-word, space-joined — so
+    ``build_forward_table``'s prune pass finds each surface this module's
+    tests expect to survive live over the payload. ``tag_text`` is a
+    required keyword (the prune pass reads it); this is the one helper
+    every call in this module shares."""
+    return " ".join(v for scan in scans for v in scan.values if isinstance(v, str))
+
+
+def _forward(scans, **kwargs) -> dict[str, str]:
+    """Call :func:`build_forward_table` with this module's own
+    ``tag_text``/``identity_domain`` defaults and return ``.forward`` —
+    the shape every test in this module asserts against.
+    """
+    kwargs.setdefault("tag_text", _tag_text(scans))
+    kwargs.setdefault("identity_domain", None)
+    return build_forward_table(scans, **kwargs).forward
+
+
 def _derived_reverse(forward: dict[str, str]) -> dict[str, str]:
     """The exact reverse-derivation expression production uses after
     ``build_forward_table`` — copied from
-    ``paramem.cloud.anonymize.anonymize`` (~line 672).
+    ``paramem.cloud.anonymize.anonymize``.
     """
     return invert_forward_mapping({k: v for k, v in forward.items() if not is_speaker_id(v)})
 
@@ -41,8 +60,11 @@ def _derived_reverse(forward: dict[str, str]) -> dict[str, str]:
 class TestCanonicallyEqualSurfacesShareOnePlaceholder:
     def test_lena_and_lena_lowercase_map_to_the_same_placeholder_as_two_keys(self) -> None:
         scans = (_scan(PERSON, ("Lena", "lena")),)
-        forward = build_forward_table(
-            scans, anchor_names=frozenset(), speaker_id=None, speaker_name=None
+        forward = _forward(
+            scans,
+            anchor_names=frozenset(),
+            speaker_id=None,
+            speaker_name=None,
         )
         assert forward["Lena"] == forward["lena"]
         assert len(forward) == 2  # never deleted — each surface is its own key
@@ -51,8 +73,11 @@ class TestCanonicallyEqualSurfacesShareOnePlaceholder:
         from paramem.cloud.placeholders import _substitute_whole_words
 
         scans = (_scan(PERSON, ("Lena", "lena")),)
-        forward = build_forward_table(
-            scans, anchor_names=frozenset(), speaker_id=None, speaker_name=None
+        forward = _forward(
+            scans,
+            anchor_names=frozenset(),
+            speaker_id=None,
+            speaker_name=None,
         )
         text = "Lena and lena both attended."
         result = _substitute_whole_words(text, forward)
@@ -64,8 +89,11 @@ class TestCanonicallyEqualSurfacesShareOnePlaceholder:
 class TestPerPrefixUniqueness:
     def test_two_distinct_person_names_get_distinct_person_prefixed_placeholders(self) -> None:
         scans = (_scan(PERSON, ("Alex", "Sam")),)
-        forward = build_forward_table(
-            scans, anchor_names=frozenset(), speaker_id=None, speaker_name=None
+        forward = _forward(
+            scans,
+            anchor_names=frozenset(),
+            speaker_id=None,
+            speaker_name=None,
         )
         assert forward["Alex"] != forward["Sam"]
         assert forward["Alex"].startswith("Person_")
@@ -83,8 +111,11 @@ class TestFirstCategoryWinsIndependentOfPayloadPosition:
             _scan(PERSON, ("Alex",)),
             _scan(PROFILE, ("Alex",)),
         )
-        forward = build_forward_table(
-            scans, anchor_names=frozenset(), speaker_id=None, speaker_name=None
+        forward = _forward(
+            scans,
+            anchor_names=frozenset(),
+            speaker_id=None,
+            speaker_name=None,
         )
         assert forward["Alex"].startswith("Person_")
 
@@ -98,8 +129,11 @@ class TestFirstCategoryWinsIndependentOfPayloadPosition:
             _scan(PROFILE, ("Alex",)),
             _scan(PERSON, ("Alex",)),
         )
-        forward = build_forward_table(
-            scans, anchor_names=frozenset(), speaker_id=None, speaker_name=None
+        forward = _forward(
+            scans,
+            anchor_names=frozenset(),
+            speaker_id=None,
+            speaker_name=None,
         )
         assert forward["Alex"].startswith("Profile_")
 
@@ -107,8 +141,11 @@ class TestFirstCategoryWinsIndependentOfPayloadPosition:
 class TestAnchorFoldWritesForwardAndSuppressesReverse:
     def test_anchor_named_value_folds_onto_speaker_id(self) -> None:
         scans = (_scan(PERSON, ("Alex",)),)
-        forward = build_forward_table(
-            scans, anchor_names=frozenset({"Alex"}), speaker_id="speaker1", speaker_name=None
+        forward = _forward(
+            scans,
+            anchor_names=frozenset({"Alex"}),
+            speaker_id="speaker1",
+            speaker_name=None,
         )
         reverse = _derived_reverse(forward)
         assert forward["Alex"] == "speaker1"
@@ -120,47 +157,14 @@ class TestAnchorFoldWritesForwardAndSuppressesReverse:
 class TestSpeakerIdShapedKeyNeverEntersForward:
     def test_a_speaker_id_shaped_scanned_value_is_dropped(self) -> None:
         scans = (_scan(PERSON, ("speaker1", "Alex")),)
-        forward = build_forward_table(
-            scans, anchor_names=frozenset(), speaker_id=None, speaker_name=None
+        forward = _forward(
+            scans,
+            anchor_names=frozenset(),
+            speaker_id=None,
+            speaker_name=None,
         )
         assert "speaker1" not in forward
         assert "Alex" in forward
-
-
-class TestSpeakerNameSeeding:
-    def test_exact_match_reuses_the_already_minted_placeholder(self) -> None:
-        scans = (_scan(PERSON, ("Alex",)),)
-        forward = build_forward_table(
-            scans, anchor_names=frozenset(), speaker_id=None, speaker_name="Alex"
-        )
-        # "Alex" is already a key -- seeding must not overwrite or duplicate it.
-        assert forward["Alex"].startswith("Person_")
-        assert len(forward) == 1
-
-    def test_full_name_match_reuses_the_full_names_placeholder(self) -> None:
-        # A scanned surface that is a FULL name ("Alex Rivera") reuses its
-        # placeholder for the speaker's own (shorter) display name ("Alex")
-        # — the docstring's own example pairing.
-        scans = (_scan(PERSON, ("Alex Rivera",)),)
-        forward = build_forward_table(
-            scans, anchor_names=frozenset(), speaker_id=None, speaker_name="Alex"
-        )
-        assert forward["Alex"] == forward["Alex Rivera"]
-
-    def test_no_match_mints_a_fresh_placeholder_for_the_speaker_name(self) -> None:
-        scans = (_scan(PERSON, ("Sam",)),)
-        forward = build_forward_table(
-            scans, anchor_names=frozenset(), speaker_id=None, speaker_name="Alex"
-        )
-        assert "Alex" in forward
-        assert forward["Alex"] != forward["Sam"]
-
-    def test_speaker_id_shaped_speaker_name_is_never_seeded(self) -> None:
-        scans = (_scan(PERSON, ("Sam",)),)
-        forward = build_forward_table(
-            scans, anchor_names=frozenset(), speaker_id=None, speaker_name="speaker1"
-        )
-        assert "speaker1" not in forward
 
 
 class TestSurfaceContainmentSharing:
@@ -169,8 +173,11 @@ class TestSurfaceContainmentSharing:
         # convention) — its shorter fragments each occur as a whole-word
         # sub-string of exactly one longer surface, so both fold onto it.
         scans = (_scan(PERSON, ("Elena Varga", "Varga", "Elena")),)
-        forward = build_forward_table(
-            scans, anchor_names=frozenset(), speaker_id=None, speaker_name=None
+        forward = _forward(
+            scans,
+            anchor_names=frozenset(),
+            speaker_id=None,
+            speaker_name=None,
         )
         reverse = _derived_reverse(forward)
 
@@ -189,8 +196,11 @@ class TestSurfaceContainmentSharing:
         from paramem.cloud.placeholders import _substitute_whole_words
 
         scans = (_scan(PERSON, ("Elena Varga", "Varga", "Elena")),)
-        forward = build_forward_table(
-            scans, anchor_names=frozenset(), speaker_id=None, speaker_name=None
+        forward = _forward(
+            scans,
+            anchor_names=frozenset(),
+            speaker_id=None,
+            speaker_name=None,
         )
         placeholder = forward["Elena Varga"]
         text = "Elena Varga called. Varga will visit. Elena said hi."
@@ -202,8 +212,11 @@ class TestSurfaceContainmentSharing:
         # and "Elena Fischer" — genuinely ambiguous, so it keeps whatever
         # placeholder it was originally minted, never guessing.
         scans = (_scan(PERSON, ("Elena", "Elena Varga", "Elena Fischer")),)
-        forward = build_forward_table(
-            scans, anchor_names=frozenset(), speaker_id=None, speaker_name=None
+        forward = _forward(
+            scans,
+            anchor_names=frozenset(),
+            speaker_id=None,
+            speaker_name=None,
         )
         assert forward["Elena"] != forward["Elena Varga"]
         assert forward["Elena"] != forward["Elena Fischer"]
@@ -211,12 +224,16 @@ class TestSurfaceContainmentSharing:
         assert len({forward["Elena"], forward["Elena Varga"], forward["Elena Fischer"]}) == 3
 
     def test_self_introduced_short_form_stays_on_the_speaker_anchor(self) -> None:
-        # The rule runs AFTER the anchor fold and skips a value already
-        # resolved to the speaker anchor — "Priya" keeps speaker0 even
-        # though "Priya Sharma" (a longer, ordinary surface) is present.
+        # The speaker group is excluded from the judged groups entirely
+        # (it is never judged and never a merge target) — "Priya" keeps
+        # speaker0 even though "Priya Sharma" (a longer, ordinary surface)
+        # is present.
         scans = (_scan(PERSON, ("Priya", "Priya Sharma")),)
-        forward = build_forward_table(
-            scans, anchor_names=frozenset({"Priya"}), speaker_id="speaker0", speaker_name=None
+        forward = _forward(
+            scans,
+            anchor_names=frozenset({"Priya"}),
+            speaker_id="speaker0",
+            speaker_name=None,
         )
         reverse = _derived_reverse(forward)
         assert forward["Priya"] == "speaker0"
@@ -235,8 +252,11 @@ class TestSurfaceContainmentSharing:
         # inside "Bill Murray" (capital B), so the two stay separate —
         # never a guessed fold across a case difference.
         scans = (_scan(PERSON, ("bill", "Bill Murray")),)
-        forward = build_forward_table(
-            scans, anchor_names=frozenset(), speaker_id=None, speaker_name=None
+        forward = _forward(
+            scans,
+            anchor_names=frozenset(),
+            speaker_id=None,
+            speaker_name=None,
         )
         assert forward["bill"] != forward["Bill Murray"]
 
@@ -244,8 +264,11 @@ class TestSurfaceContainmentSharing:
         # "Ann" occurs inside "Annika Berg" only as a substring, not a
         # whole word (immediately followed by "ika") — no sharing.
         scans = (_scan(PERSON, ("Ann", "Annika Berg")),)
-        forward = build_forward_table(
-            scans, anchor_names=frozenset(), speaker_id=None, speaker_name=None
+        forward = _forward(
+            scans,
+            anchor_names=frozenset(),
+            speaker_id=None,
+            speaker_name=None,
         )
         assert forward["Ann"] != forward["Annika Berg"]
 
@@ -257,8 +280,11 @@ class TestSurfaceContainmentSharing:
             _scan(PERSON, ("Varga",)),
             _scan(ADDRESS, ("Varga Street 5",)),
         )
-        forward = build_forward_table(
-            scans, anchor_names=frozenset(), speaker_id=None, speaker_name=None
+        forward = _forward(
+            scans,
+            anchor_names=frozenset(),
+            speaker_id=None,
+            speaker_name=None,
         )
         assert forward["Varga"] != forward["Varga Street 5"]
         assert forward["Varga"].startswith("Person_")
@@ -284,8 +310,11 @@ class TestDerivedReverseNamesTheContainer:
         # derived reverse resolves back to the full name, never the
         # fragment that happened to appear earlier in the payload.
         scans = (_scan(PERSON, ("Elena", "Elena Varga")),)
-        forward = build_forward_table(
-            scans, anchor_names=frozenset(), speaker_id=None, speaker_name=None
+        forward = _forward(
+            scans,
+            anchor_names=frozenset(),
+            speaker_id=None,
+            speaker_name=None,
         )
         reverse = _derived_reverse(forward)
         placeholder = forward["Elena"]
@@ -301,8 +330,11 @@ class TestDerivedReverseNamesTheContainer:
         # placeholder. All three surfaces share one placeholder; the
         # derived reverse names the outermost container alone.
         scans = (_scan(PERSON, ("Ann", "Ann Marie", "Ann Marie Bell")),)
-        forward = build_forward_table(
-            scans, anchor_names=frozenset(), speaker_id=None, speaker_name=None
+        forward = _forward(
+            scans,
+            anchor_names=frozenset(),
+            speaker_id=None,
+            speaker_name=None,
         )
         reverse = _derived_reverse(forward)
         placeholder = forward["Ann Marie Bell"]
@@ -315,8 +347,11 @@ class TestDerivedReverseNamesTheContainer:
         # partition and the derived reverse are identical to the
         # ascending-order case: scan order must not change the verdict.
         scans = (_scan(PERSON, ("Ann Marie Bell", "Ann Marie", "Ann")),)
-        forward = build_forward_table(
-            scans, anchor_names=frozenset(), speaker_id=None, speaker_name=None
+        forward = _forward(
+            scans,
+            anchor_names=frozenset(),
+            speaker_id=None,
+            speaker_name=None,
         )
         reverse = _derived_reverse(forward)
         placeholder = forward["Ann Marie Bell"]
@@ -333,8 +368,11 @@ class TestDerivedReverseNamesTheContainer:
         surfaces = ("Ann", "Ann Marie", "Ann Marie Bell")
         for perm in itertools.permutations(surfaces):
             scans = (_scan(PERSON, perm),)
-            forward = build_forward_table(
-                scans, anchor_names=frozenset(), speaker_id=None, speaker_name=None
+            forward = _forward(
+                scans,
+                anchor_names=frozenset(),
+                speaker_id=None,
+                speaker_name=None,
             )
             reverse = _derived_reverse(forward)
             placeholders = {forward[s] for s in surfaces}
@@ -355,8 +393,11 @@ class TestSharingRespectsFirstCategoryOwnership:
         person = _scan(PERSON, ("alex.stone@example.de",))
         email = EMAIL
         email_scan = _scan(email, ("alex.stone@example.de", "long.alex.stone@example.de"))
-        forward = build_forward_table(
-            (person, email_scan), anchor_names=frozenset(), speaker_id=None, speaker_name=None
+        forward = _forward(
+            (person, email_scan),
+            anchor_names=frozenset(),
+            speaker_id=None,
+            speaker_name=None,
         )
         assert forward["alex.stone@example.de"].startswith("Person_")
         # The longer email has no whole-word container of its own (it is
@@ -375,8 +416,11 @@ class TestCaseAndDiacriticContainersDoNotCreateAmbiguity:
         # so when "Elena" is checked for containment, both count as ONE
         # container, not two, and folds onto it too.
         scans = (_scan(PERSON, ("Elena Varga", "Elena VARGA", "Elena")),)
-        forward = build_forward_table(
-            scans, anchor_names=frozenset(), speaker_id=None, speaker_name=None
+        forward = _forward(
+            scans,
+            anchor_names=frozenset(),
+            speaker_id=None,
+            speaker_name=None,
         )
         placeholder = forward["Elena Varga"]
         assert forward["Elena VARGA"] == placeholder
@@ -389,26 +433,28 @@ class TestCaseAndDiacriticContainersDoNotCreateAmbiguity:
         # entities (not case/diacritic variants of one another) -- "Elena"
         # is contained in both and stays on its own placeholder.
         scans = (_scan(PERSON, ("Elena Varga", "Elena Fischer", "Elena")),)
-        forward = build_forward_table(
-            scans, anchor_names=frozenset(), speaker_id=None, speaker_name=None
+        forward = _forward(
+            scans,
+            anchor_names=frozenset(),
+            speaker_id=None,
+            speaker_name=None,
         )
         assert forward["Elena"] != forward["Elena Varga"]
         assert forward["Elena"] != forward["Elena Fischer"]
         assert forward["Elena Varga"] != forward["Elena Fischer"]
 
 
-class TestAnchoredContainerFoldIsTotal:
-    def test_anchor_and_its_fragment_both_fold_onto_speaker_id_with_empty_reverse(
+class TestAnchoredContainerDoesNotCarryItsFragment:
+    def test_an_unattested_fragment_of_the_anchored_surface_keeps_its_own_placeholder(
         self,
     ) -> None:
         # The anchor call names "Elena Varga" itself (not the shorter
-        # fragment) -- the anchor fold writes it directly onto speaker_id,
-        # and the containment pass then folds "Elena" onto the anchored
-        # placeholder too, since "Elena Varga" is its sole container.
-        # Neither entry survives into the derived reverse -- an anchored
-        # fold never restores a real name onto every speaker-subject fact.
+        # fragment) -- the anchor fold writes it directly onto speaker_id.
+        # The speaker group is CLOSED: containment never merges anything
+        # into it, so "Elena" -- unattested on its own -- mints its own
+        # ordinary placeholder instead of riding the fold.
         scans = (_scan(PERSON, ("Elena Varga", "Elena")),)
-        forward = build_forward_table(
+        forward = _forward(
             scans,
             anchor_names=frozenset({"Elena Varga"}),
             speaker_id="speaker0",
@@ -416,8 +462,9 @@ class TestAnchoredContainerFoldIsTotal:
         )
         reverse = _derived_reverse(forward)
         assert forward["Elena Varga"] == "speaker0"
-        assert forward["Elena"] == "speaker0"
-        assert reverse == {}
+        assert forward["Elena"].startswith("Person_")
+        assert forward["Elena"] != "speaker0"
+        assert reverse == {"Person_1": "Elena"}
 
 
 class TestCanonicalEqualityGroupMovesTogetherOnContainmentRepoint:
@@ -443,8 +490,11 @@ class TestCanonicalEqualityGroupMovesTogetherOnContainmentRepoint:
         values = ("lena", "Marta", "Lena Marie Fischer", "Lena")
         for perm in itertools.permutations(values):
             scans = (_scan(PERSON, perm),)
-            forward = build_forward_table(
-                scans, anchor_names=frozenset(), speaker_id=None, speaker_name=None
+            forward = _forward(
+                scans,
+                anchor_names=frozenset(),
+                speaker_id=None,
+                speaker_name=None,
             )
             reverse = _derived_reverse(forward)
 
@@ -464,8 +514,11 @@ class TestCanonicalEqualityGroupMovesTogetherOnContainmentRepoint:
         # "Elena"/"elena" group onto the SAME (shared) container
         # placeholder, collapsing all four surfaces onto one placeholder.
         scans = (_scan(PERSON, ("Elena Varga", "Elena VARGA", "Elena", "elena")),)
-        forward = build_forward_table(
-            scans, anchor_names=frozenset(), speaker_id=None, speaker_name=None
+        forward = _forward(
+            scans,
+            anchor_names=frozenset(),
+            speaker_id=None,
+            speaker_name=None,
         )
         reverse = _derived_reverse(forward)
 
@@ -487,8 +540,11 @@ class TestCanonicalEqualityGroupMovesTogetherOnContainmentRepoint:
         # each other, never one splitting off onto a container while the
         # other stays isolated.
         scans = (_scan(PERSON, ("Elena Varga", "Elena Fischer", "Elena", "elena")),)
-        forward = build_forward_table(
-            scans, anchor_names=frozenset(), speaker_id=None, speaker_name=None
+        forward = _forward(
+            scans,
+            anchor_names=frozenset(),
+            speaker_id=None,
+            speaker_name=None,
         )
 
         assert forward["Elena"] == forward["elena"]
@@ -498,15 +554,17 @@ class TestCanonicalEqualityGroupMovesTogetherOnContainmentRepoint:
         assert forward["elena"] != forward["Elena Fischer"]
         assert forward["Elena Varga"] != forward["Elena Fischer"]
 
-    def test_anchored_canonical_equality_group_folds_entirely_onto_speaker_id(self) -> None:
+    def test_anchored_containers_canonical_equality_group_keeps_its_own_shared_placeholder(
+        self,
+    ) -> None:
         # The anchor call names "Lena Marie Fischer" itself -- the anchor
-        # fold writes it directly onto speaker_id, and the containment
-        # pass must then fold BOTH "Lena" and its canonical-equality
-        # sibling "lena" onto that same anchored placeholder, since
-        # "Lena Marie Fischer" is their sole container. Neither entry
-        # survives into the derived reverse.
+        # fold writes it directly onto speaker_id. The speaker group is
+        # CLOSED: containment never merges "Lena"/"lena" into it. The
+        # canonical-twin rule still binds "Lena" and "lena" to EACH OTHER
+        # (never split apart), so the two share one ordinary placeholder,
+        # distinct from speaker_id.
         scans = (_scan(PERSON, ("Lena Marie Fischer", "Lena", "lena")),)
-        forward = build_forward_table(
+        forward = _forward(
             scans,
             anchor_names=frozenset({"Lena Marie Fischer"}),
             speaker_id="speaker0",
@@ -514,6 +572,336 @@ class TestCanonicalEqualityGroupMovesTogetherOnContainmentRepoint:
         )
         reverse = _derived_reverse(forward)
         assert forward["Lena Marie Fischer"] == "speaker0"
-        assert forward["Lena"] == "speaker0"
-        assert forward["lena"] == "speaker0"
+        assert forward["Lena"] == forward["lena"]
+        assert forward["Lena"] != "speaker0"
+        assert reverse == {forward["Lena"]: "Lena"}
+
+
+class TestNumbersAreContiguousPerPrefix:
+    def test_numbers_run_from_one_with_no_holes_after_a_containment_share(self) -> None:
+        """A containment merge leaves one surviving group per prefix, so
+        the one placeholder it mints is ``Person_1`` — no ``Person_2``
+        anywhere in the table.
+        """
+        scans = (_scan(PERSON, ("Elena", "Elena Varga")),)
+        forward = _forward(
+            scans,
+            anchor_names=frozenset(),
+            speaker_id=None,
+            speaker_name=None,
+        )
+        assert forward["Elena"] == "Person_1"
+        assert forward["Elena Varga"] == "Person_1"
+        assert "Person_2" not in forward.values()
+
+    def test_numbers_run_from_one_with_no_holes_after_an_inert_prune(self) -> None:
+        """A scanned surface absent from ``tag_text`` is pruned before
+        minting, so the next surviving surface still takes ``Person_1`` —
+        no hole left where the pruned surface would have minted.
+        """
+        scans = (_scan(PERSON, ("Ghost", "Alex")),)
+        forward = _forward(
+            scans,
+            tag_text="Alex only here",
+            anchor_names=frozenset(),
+            speaker_id=None,
+            speaker_name=None,
+        )
+        assert "Ghost" not in forward
+        assert forward["Alex"] == "Person_1"
+
+    def test_first_occurrence_order_decides_the_number_within_a_prefix(self) -> None:
+        """Two independent surfaces number in first-occurrence (scan)
+        order; a group formed by a containment merge takes its earliest
+        member's ordinal, so it still numbers at the position its
+        founding member occupied, not the position its container
+        occupied.
+        """
+        scans = (_scan(PERSON, ("Sam", "Alex")),)
+        forward = _forward(
+            scans,
+            anchor_names=frozenset(),
+            speaker_id=None,
+            speaker_name=None,
+        )
+        assert forward["Sam"] == "Person_1"
+        assert forward["Alex"] == "Person_2"
+
+        # "Elena" (order 1) is absorbed into "Elena Varga" (order 2) on
+        # containment; the merged group keeps "Elena"'s earlier ordinal,
+        # so it numbers second overall (after "Bob", order 0), not third.
+        scans = (_scan(PERSON, ("Bob", "Elena", "Elena Varga")),)
+        forward = _forward(
+            scans,
+            anchor_names=frozenset(),
+            speaker_id=None,
+            speaker_name=None,
+        )
+        assert forward["Bob"] == "Person_1"
+        assert forward["Elena"] == "Person_2"
+        assert forward["Elena Varga"] == "Person_2"
+
+
+class TestNamesakeKeepsItsOwnPlaceholder:
+    def test_a_longer_unattested_surface_sharing_the_enrolled_first_name_does_not_fold(
+        self,
+    ) -> None:
+        """A scanned surface merely CONSISTENT with the enrolled name
+        (containing it as a leading word) but never attested does not
+        fold onto the speaker token — only the enrolled name itself does.
+        """
+        scans = (_scan(PERSON, ("Alex", "Alex Rivera")),)
+        forward = _forward(
+            scans,
+            anchor_names=frozenset(),
+            speaker_id="speaker1",
+            speaker_name="Alex",
+        )
+        assert forward["Alex"] == "speaker1"
+        assert forward["Alex Rivera"].startswith("Person_")
+
+
+class TestAttestationIsFilteredByEnrolledNameConsistency:
+    def test_an_attested_extension_of_the_enrolled_name_folds(self) -> None:
+        """An attested surface that extends the enrolled name (the
+        enrolled name plus a trailing word) is consistent with it and
+        folds onto the speaker token."""
+        scans = (_scan(PERSON, ("Alex Rivera",)),)
+        forward = _forward(
+            scans,
+            anchor_names=frozenset({"Alex Rivera"}),
+            speaker_id="speaker1",
+            speaker_name="Alex",
+        )
+        reverse = _derived_reverse(forward)
+        assert forward["Alex Rivera"] == "speaker1"
         assert reverse == {}
+
+    def test_an_attested_short_form_of_a_full_enrolled_name_folds(self) -> None:
+        """Consistency is symmetric: an attested surface that is a
+        LEADING fragment of a full enrolled name also folds."""
+        scans = (_scan(PERSON, ("Alex",)),)
+        forward = _forward(
+            scans,
+            anchor_names=frozenset({"Alex"}),
+            speaker_id="speaker1",
+            speaker_name="Alex Rivera",
+        )
+        assert forward["Alex"] == "speaker1"
+
+    def test_an_attested_name_that_is_not_the_enrolled_name_keeps_a_placeholder(self) -> None:
+        """An attested surface that is neither equal to nor an
+        extension/short-form of the enrolled name (a namesake) is
+        refused by the fold and mints an ordinary placeholder instead."""
+        scans = (_scan(PERSON, ("Mira",)),)
+        forward = _forward(
+            scans,
+            anchor_names=frozenset({"Mira"}),
+            speaker_id="speaker1",
+            speaker_name="Alex",
+        )
+        assert forward["Mira"].startswith("Person_")
+        assert "speaker1" not in forward.values()
+
+
+class TestAnonymousVoiceSpeakerFoldsOnAttestationAlone:
+    def test_no_enrolled_name_folds_the_attested_surface(self) -> None:
+        """With no display name to compare against (``speaker_name`` is
+        ``None``, or token-shaped and therefore treated as absent),
+        attestation alone decides the fold."""
+        for speaker_name in (None, "speaker1"):
+            scans = (_scan(PERSON, ("Mira",)),)
+            forward = _forward(
+                scans,
+                anchor_names=frozenset({"Mira"}),
+                speaker_id="speaker1",
+                speaker_name=speaker_name,
+            )
+            assert forward["Mira"] == "speaker1", f"speaker_name={speaker_name!r}: {forward}"
+
+
+class TestDeferralFoldsOnEqualityAlone:
+    def test_an_empty_anchor_set_still_folds_the_enrolled_name(self) -> None:
+        """With the ANCHOR call never issued (``anchor_names`` empty), a
+        surface equal to the enrolled name still folds — equality with
+        the enrolled name needs no attestation."""
+        scans = (_scan(PERSON, ("Alex",)),)
+        forward = _forward(
+            scans,
+            anchor_names=frozenset(),
+            speaker_id="speaker1",
+            speaker_name="Alex",
+        )
+        assert forward["Alex"] == "speaker1"
+
+
+class TestPersonScrubbingOffMakesNoSpeakerEntry:
+    def test_no_person_category_means_no_fold_and_no_enrolled_name_key(self) -> None:
+        """With no person-name category among the active scan categories,
+        the speaker's own name is never entered and never folds,
+        whatever the caller passed."""
+        scans = (_scan(ADDRESS, ()),)
+        forward = _forward(
+            scans,
+            tag_text="Alex is here",
+            anchor_names=frozenset({"Alex"}),
+            speaker_id="speaker1",
+            speaker_name="Alex",
+        )
+        assert "Alex" not in forward
+        assert "speaker1" not in forward.values()
+
+
+class TestSpeakerNameWithoutASpeakerIdIsNotConsumed:
+    def test_no_enrolled_name_key_and_no_speaker_value(self) -> None:
+        """A ``speaker_name`` without a well-shaped ``speaker_id`` is not
+        consumed at all: no enrolled-name key is entered, and no value in
+        the table is ever speaker-id-shaped."""
+        for speaker_id in (None, "not-a-token"):
+            scans = (_scan(PERSON, ()),)
+            forward = _forward(
+                scans,
+                tag_text="Alex is here",
+                anchor_names=frozenset({"Alex"}),
+                speaker_id=speaker_id,
+                speaker_name="Alex",
+            )
+            assert "Alex" not in forward, f"speaker_id={speaker_id!r}: {forward}"
+            assert not any(is_speaker_id(v) for v in forward.values()), (
+                f"speaker_id={speaker_id!r}: {forward}"
+            )
+
+
+class TestSpeakerGroupIsClosed:
+    def test_a_scanned_fragment_of_the_enrolled_name_keeps_its_own_placeholder(self) -> None:
+        """A scanned fragment of the enrolled name, itself unattested, is
+        an ordinary surface — the speaker group is closed on the
+        containment side, so nothing joins it by being a piece of the
+        enrolled name."""
+        scans = (_scan(PERSON, ("Rivera",)),)
+        forward = _forward(
+            scans,
+            anchor_names=frozenset(),
+            speaker_id="speaker1",
+            speaker_name="Alex Rivera",
+        )
+        assert forward["Rivera"].startswith("Person_")
+
+    def test_an_unattested_fragment_of_an_attested_surface_keeps_its_own_placeholder(self) -> None:
+        """An unattested fragment of an attested (folded) surface is an
+        ordinary surface — the fold decides on evidence about the
+        surface itself, never by containment inside a surface that had
+        the evidence."""
+        scans = (_scan(PERSON, ("Elena Varga", "Elena")),)
+        forward = _forward(
+            scans,
+            anchor_names=frozenset({"Elena Varga"}),
+            speaker_id="speaker1",
+            speaker_name=None,
+        )
+        reverse = _derived_reverse(forward)
+        assert forward["Elena Varga"] == "speaker1"
+        assert forward["Elena"].startswith("Person_")
+        assert reverse == {"Person_1": "Elena"}
+
+    def test_a_speaker_group_surface_still_counts_toward_containment_ambiguity(self) -> None:
+        """A surface folded onto the speaker group still counts as a
+        container for the ambiguity test on an ordinary group's
+        containment pass, exactly like any other surface."""
+        scans = (_scan(PERSON, ("Elena Varga", "Elena Fischer", "Elena")),)
+        forward = _forward(
+            scans,
+            anchor_names=frozenset({"Elena Varga"}),
+            speaker_id="speaker1",
+            speaker_name=None,
+        )
+        # "Elena" sits inside both "Elena Varga" (folded onto the speaker
+        # group) and "Elena Fischer" (an ordinary group) — two distinct
+        # containers, so it keeps its own placeholder, unchanged from the
+        # unattested/no-speaker case.
+        assert forward["Elena"].startswith("Person_")
+        assert forward["Elena"] != forward["Elena Varga"]
+        assert forward["Elena"] != forward["Elena Fischer"]
+
+
+class TestEnrolledNameIsPrunedLikeAnyKey:
+    def test_an_enrolled_name_absent_from_the_payload_is_dropped(self) -> None:
+        """An enrolled name the payload never contains is pruned like any
+        other forward-table key, and its inert record carries the
+        speaker group's own (empty) category."""
+        scans = (_scan(PERSON, ()),)
+        table = build_forward_table(
+            scans,
+            tag_text="nothing relevant here",
+            anchor_names=frozenset(),
+            speaker_id="speaker1",
+            speaker_name="Alex Morgan",
+            identity_domain=None,
+        )
+        assert "Alex Morgan" not in table.forward
+        assert len(table.inert_entries) == 1
+        assert table.inert_entries[0]["category"] == ""
+
+
+class TestFoldedCanonicalTwinFolds:
+    def test_a_case_variant_of_a_folded_surface_folds_too(self) -> None:
+        """A case/diacritic twin of a surface that folds onto the speaker
+        group is registered onto that same group by default-canonical
+        form, so it folds too."""
+        scans = (_scan(PERSON, ("Priya", "priya")),)
+        forward = _forward(
+            scans,
+            anchor_names=frozenset({"Priya"}),
+            speaker_id="speaker0",
+            speaker_name=None,
+        )
+        assert forward["Priya"] == "speaker0"
+        assert forward["priya"] == "speaker0"
+
+
+class TestReturnValueInvariant:
+    def test_every_minted_number_is_carried_by_a_key(self) -> None:
+        """For every prefix that mints at least one placeholder, the set
+        of numbers actually used is exactly ``1..N`` with no holes —
+        every minted number is carried by at least one surviving key."""
+        scans = (_scan(PERSON, ("Sam", "Alex", "Ghost")),)
+        forward = _forward(
+            scans,
+            tag_text="Sam Alex",
+            anchor_names=frozenset(),
+            speaker_id=None,
+            speaker_name=None,
+        )
+        by_prefix: dict[str, set[int]] = {}
+        for value in forward.values():
+            prefix, _, tail = value.rpartition("_")
+            by_prefix.setdefault(prefix, set()).add(int(tail))
+        for prefix, numbers in by_prefix.items():
+            assert numbers == set(range(1, len(numbers) + 1)), f"{prefix}: {numbers}"
+
+
+class TestIdentityDomainReconciliationRunsBeforePrune:
+    def test_a_domain_match_is_rekeyed_before_the_prune_and_a_miss_is_dropped_and_counted(
+        self,
+    ) -> None:
+        """Reconciliation (pass 3) runs BEFORE pruning (pass 4): "alex" is
+        re-keyed onto the identity domain's "Alex" surface first, so the
+        prune then tests THAT surface against ``tag_text`` — which is what
+        actually appears there — rather than the original scanned surface,
+        which never appears verbatim in this payload. "riley" has no
+        domain match at all, so it is dropped by reconciliation itself
+        (counted into ``rekey_dropped``) and never reaches the prune.
+        """
+        scans = (_scan(PERSON, ("alex", "riley")),)
+        table = build_forward_table(
+            scans,
+            tag_text="Alex mentioned something.",
+            anchor_names=frozenset(),
+            speaker_id=None,
+            speaker_name=None,
+            identity_domain=["Alex"],
+        )
+        assert table.forward == {"Alex": "Person_1"}
+        assert "alex" not in table.forward
+        assert "riley" not in table.forward
+        assert table.rekey_dropped == 1

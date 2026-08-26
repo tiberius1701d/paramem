@@ -116,9 +116,8 @@ class TestSingleMissingTerm:
     def test_self_hosted_provider_is_not_cloud(self):
         """Self-hosted is not cloud: it has no entry in the provider tables.
 
-        ``ollama`` used to sit in both tables while the module's own comments
-        said it was self-hosted.  Admission is only ever asked about CLOUD
-        egress, so a self-hosted host is simply not a provider here.
+        Admission is only ever asked about CLOUD egress, so a self-hosted
+        host such as ``ollama`` is simply not a provider here.
         """
         verdict = evaluate_cloud_egress(
             cloud_enabled=True, provider="ollama", model="llama3", endpoint=None
@@ -176,9 +175,9 @@ class TestOpenAICompatEndpoint:
     def test_every_openai_compat_provider_carries_a_default(self):
         """No provider in the compat set lacks a default endpoint.
 
-        Since ``ollama`` (self-hosted, no canonical URL) left the tables, the
-        two sets are identical — a provider needing an operator-supplied
-        endpoint would be a self-hosted one, which is not cloud.
+        The two sets are identical — a provider needing an operator-supplied
+        endpoint would be a self-hosted one (no canonical URL), which is not
+        cloud.
         """
         assert OPENAI_COMPAT_PROVIDERS == set(OPENAI_COMPAT_ENDPOINTS)
 
@@ -199,9 +198,9 @@ class TestUnregisteredProvider:
     @pytest.mark.parametrize("token", ["auto", "off"])
     def test_judge_tokens_never_reach_a_key_lookup(self, token, monkeypatch):
         """``"auto"`` (local judge) and ``"off"`` (no judge) are settings, not
-        providers. The old plausibility path crashed on
-        ``PROVIDER_KEY_ENV.get("auto")``; membership in the registry is what
-        prevents it, so assert both the refusal and that no env read happened."""
+        providers; membership in the registry is what keeps them from
+        reaching ``PROVIDER_KEY_ENV.get(...)``, so assert both the refusal
+        and that no env read happened."""
         reads: list[str] = []
         import paramem.cloud.admission as mod
 

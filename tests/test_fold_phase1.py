@@ -216,19 +216,16 @@ class TestStageEventEmptyOutcome:
 
 
 class TestStageEventConvergesOnAnAllUnkeyableMergedGraph:
-    """Regression pin: ``stage_event`` used to carry a SECOND early exit,
-    after the merge, on ``merger.graph.number_of_edges() == 0 and not
-    has_attributes`` -- deleted because the pre-recall exit above already
-    covers every empty-input shape except one reachable one: no new
-    material, but every active key in the working universe carries an
-    entry with an empty predicate (``unkeyable_no_predicate`` --
-    ``_working_registry_true_relations`` skips it and records the removal
-    without ever producing a graph edge or attribute). The deleted exit
-    would have returned ``None`` right there -- discarding the unkeyable
-    removal before the fate machinery ever ran, leaving the garbage key
-    active forever (a permanent no-op loop). ``stage_event`` must instead
-    flow through: the fate machinery retires the unkeyable key and the
-    event converges to a rows-only tier.
+    """``stage_event`` has exactly one early exit, before the merge; a merge
+    that produces an empty graph (``merger.graph.number_of_edges() == 0 and
+    not has_attributes``) must still flow through to the fate machinery
+    rather than returning early, because that is the only path that retires
+    an unkeyable active key: no new material, but an active key in the
+    working universe carries an entry with an empty predicate
+    (``unkeyable_no_predicate`` -- ``_working_registry_true_relations`` skips
+    it and records the removal without ever producing a graph edge or
+    attribute). ``stage_event`` flows through: the fate machinery retires the
+    unkeyable key and the event converges to a rows-only tier.
     """
 
     def test_all_unkeyable_active_keys_still_converge(self, tmp_path):
@@ -1734,9 +1731,8 @@ class TestClassifyPartialBuild:
 
 
 class TestStageEventDebugArtifactHooks:
-    """``stage_event`` must re-emit the removal-ledger and fold-assignment
-    debug artifacts it lost when the old fold driver was deleted -- the
-    design keeps richer diagnostics on the ``debug: true`` path."""
+    """``stage_event`` emits the removal-ledger and fold-assignment debug
+    artifacts on the ``debug: true`` path, for richer diagnostics."""
 
     def test_on_fold_assignments_and_on_removal_ledger_fire_with_this_events_data(
         self, tmp_path, monkeypatch

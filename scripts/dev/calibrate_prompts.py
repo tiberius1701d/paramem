@@ -691,8 +691,8 @@ def _variance_report(stage: str, runs: list[dict]) -> dict:
 
 _STAGE_FILENAME = {
     # One prompt-pair for every source type — see
-    # paramem/graph/extraction_pipeline.py.  ``source_type`` survives as
-    # a runtime gate-default flag but no longer selects prompt files.
+    # paramem/graph/extraction_pipeline.py.  ``source_type`` is a runtime
+    # gate-default flag; prompt file selection is fixed per stage below.
     "extract_user": "extraction.txt",
     "extract_system": "extraction_system.txt",
     "document_directive": "document_directive.txt",
@@ -791,9 +791,8 @@ def main(argv: list[str] | None = None) -> int:
             "submits shares the consolidation dispatch envelope with a "
             "production fold, so the server serializes them — a multi-seed "
             "campaign runs one gated call at a time, back to back, rather "
-            "than overlapping requests. That is the correct behaviour on a "
-            "thermally-bounded box, and is slower but safer than the old "
-            "inline-response contract."
+            "than overlapping requests. That is the correct, if slower, "
+            "behaviour on a thermally-bounded box."
         ),
     )
     parser.add_argument("--temperature", type=float, default=None)
