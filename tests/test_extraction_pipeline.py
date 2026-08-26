@@ -1033,6 +1033,88 @@ class TestApplyEnrichmentDeltaResolvability:
         assert report["drop_with_rejection"] is False
 
 
+class TestApplyEnrichmentDeltaObservedWholeWordScoping:
+    """``CloudScope.response``'s ``observed`` is whole-word containment
+    over ``sent`` — the per-fact orphan gate's own consumption of
+    ``observed`` (``resolvable = set(scope.resolution)``, above) tracks
+    that scoping: a declared token occurring as a real whole word in
+    ``sent`` is observed and the fact naming it resolves; the same token
+    occurring only glued to a word character in ``sent`` is not observed
+    and the fact naming it is rejected as an orphan.
+    """
+
+    @staticmethod
+    def _scope(reverse: dict[str, str], sent: str):
+        from paramem.cloud.anonymize import AnonymizedContract
+        from paramem.cloud.deanonymize import CloudScope
+
+        payload = AnonymizedContract(
+            status="ok",
+            forward={v: k for k, v in reverse.items()},
+            reverse=reverse,
+            anon_transcript=sent,
+            declared=frozenset(reverse),
+            rekey_dropped=0,
+            raw="",
+        )
+        return CloudScope.response(payload, cloud_bindings=None, sent=(sent,))
+
+    def test_whole_word_occurrence_is_observed_and_the_fact_resolves(self):
+        from paramem.graph.extractor import EnrichmentDelta, _apply_enrichment_delta
+
+        scope = self._scope({"Person_1": "Alex"}, "Person_1 lives in Berlin.")
+        assert "Person_1" in scope.observed
+        delta = EnrichmentDelta(
+            add=[
+                {
+                    "subject": "Person_1",
+                    "predicate": "likes",
+                    "object": "coffee",
+                    "relation_type": "preference",
+                    "confidence": 0.9,
+                }
+            ],
+            modify=[],
+            drop=set(),
+            bindings={},
+        )
+        out, _, report = _apply_enrichment_delta([], delta, scope, "Person_1 lives in Berlin.")
+        assert report["rejected_adds"] == 0
+        assert out == [
+            {
+                "subject": "Person_1",
+                "predicate": "likes",
+                "object": "coffee",
+                "relation_type": "preference",
+                "confidence": 0.9,
+            }
+        ]
+
+    def test_glued_occurrence_is_not_observed_and_the_fact_is_rejected(self):
+        from paramem.graph.extractor import EnrichmentDelta, _apply_enrichment_delta
+
+        scope = self._scope({"Person_1": "Alex"}, "xPerson_1 lives in Berlin.")
+        assert "Person_1" not in scope.observed
+        delta = EnrichmentDelta(
+            add=[
+                {
+                    "subject": "Person_1",
+                    "predicate": "likes",
+                    "object": "coffee",
+                    "relation_type": "preference",
+                    "confidence": 0.9,
+                }
+            ],
+            modify=[],
+            drop=set(),
+            bindings={},
+        )
+        out, _, report = _apply_enrichment_delta([], delta, scope, "xPerson_1 lives in Berlin.")
+        assert out == []
+        assert report["rejected_adds"] == 1
+        assert report["rejected_tokens"] == ["Person_1"]
+
+
 class TestPipelineMaxTokensThreading:
     """Verify the single ``extraction_max_tokens`` config flows through the
     entire LLM pipeline (local extract → anonymize → cloud enrich → deanon →
@@ -4218,12 +4300,11 @@ class TestBindingCollisions:
         assert _binding_collisions({"Person_1": "Alex"}, cloud_bindings=None) == []
         assert _binding_collisions({"Person_1": "Alex"}, cloud_bindings={}) == []
 
-    def test_unscoped_conflicting_value_is_a_collision(self, caplog):
-        """``observed=None`` (CORE unscoped): a ``cloud_bindings`` key
-        present in ``reverse_mapping`` with a DIFFERING value is a
-        collision, and is warned about — the reverse-wins tie-break in
-        :func:`_apply_bindings` would otherwise silently resolve to the
-        wrong real name."""
+    def test_key_rendering_equal_to_core_is_a_collision(self, caplog):
+        """A ``cloud_bindings`` key rendering-equal to a ``reverse_mapping``
+        key is a collision, and is warned about — the reverse-wins
+        tie-break in :func:`_apply_bindings` would otherwise silently
+        resolve to the wrong real name."""
         import logging
 
         from paramem.cloud.placeholders import _binding_collisions
@@ -4235,50 +4316,50 @@ class TestBindingCollisions:
         assert collisions == ["Org_1"]
         assert any("collision" in r.getMessage().lower() for r in caplog.records)
 
-    def test_unscoped_matching_value_is_not_a_collision(self):
-        """Same key, SAME value in both maps is not a conflict — only a
-        DIFFERING value counts."""
+    def test_exact_key_match_is_named_regardless_of_value(self):
+        """The scan names ANY key rendering-equal to a core token — an
+        exact key match with an identical value is named too: the check is
+        about declared-vocabulary distinctness, not value drift."""
         from paramem.cloud.placeholders import _binding_collisions
 
         reverse_mapping = {"Org_1": "Acme"}
         cloud_bindings = {"Org_1": "Acme"}
-        assert _binding_collisions(reverse_mapping, cloud_bindings=cloud_bindings) == []
+        assert _binding_collisions(reverse_mapping, cloud_bindings=cloud_bindings) == ["Org_1"]
 
-    def test_scoped_key_in_observed_is_a_collision(self):
-        """``observed`` given: any ``cloud_bindings`` key that is ALSO in
-        ``observed`` is a conflict, regardless of value equality — cloud
-        is rebinding something it was already shown as a core
-        reference."""
-        from paramem.cloud.placeholders import _binding_collisions
-
-        collisions = _binding_collisions(
-            {"Person_1": "Alex"},
-            cloud_bindings={"Person_1": "someone else entirely"},
-            observed={"Person_1"},
-        )
-        assert collisions == ["Person_1"]
-
-    def test_scoped_key_not_in_observed_is_not_a_collision(self):
-        """A cloud mint for a token never shown to cloud (not in
-        ``observed``) is a legitimate new entity, not a collision."""
+    def test_key_outside_core_is_not_a_collision(self):
+        """A cloud mint for a token that names no ``reverse_mapping`` key
+        (rendering-equal or otherwise) and has no sibling binding is a
+        legitimate new entity, not a collision."""
         from paramem.cloud.placeholders import _binding_collisions
 
         collisions = _binding_collisions(
             {"Person_1": "Alex"},
             cloud_bindings={"Org_9": "Acme"},
-            observed={"Person_1"},
         )
         assert collisions == []
 
     def test_multiple_collisions_sorted(self):
+        """Every ``cloud_bindings`` key rendering-equal to a
+        ``reverse_mapping`` key is named, sorted."""
+        from paramem.cloud.placeholders import _binding_collisions
+
+        collisions = _binding_collisions(
+            {"Zeta_1": "z", "Alpha_1": "a"},
+            cloud_bindings={"Zeta_1": "zz", "Alpha_1": "aa"},
+        )
+        assert collisions == ["Alpha_1", "Zeta_1"]
+
+    def test_sibling_bindings_rendering_equal_are_both_a_collision(self):
+        """Two ``cloud_bindings`` keys rendering-equal to EACH OTHER (no
+        core token involved) are both named — the sibling-collision arm of
+        the same equivalence."""
         from paramem.cloud.placeholders import _binding_collisions
 
         collisions = _binding_collisions(
             {},
-            cloud_bindings={"Zeta_1": "z", "Alpha_1": "a"},
-            observed={"Zeta_1", "Alpha_1"},
+            cloud_bindings={"Zeta_1": "z", "ZETA_1": "zz"},
         )
-        assert collisions == ["Alpha_1", "Zeta_1"]
+        assert collisions == ["ZETA_1", "Zeta_1"]
 
     def test_returns_list_not_none(self):
         """Explicit-return contract: never ``None``, always a (possibly
@@ -4914,80 +4995,6 @@ class TestSpeakerAnchorPipeline:
         assert result.relations[0].subject == "Acme"
         assert result.relations[0].object == "Millfield"
         assert result.diagnostics["cloud_enrichment_report"]["rejected_adds"] == 0
-
-
-class TestObservedDerivation:
-    """``observed`` — CORE's legality domain for a cloud cycle — is derived
-    from the DECLARED token vocabulary intersected with the payload we
-    actually rendered, not scraped out of the payload with a shape regex.
-
-    A shape scrape reads whatever token-shaped text the payload happens to
-    carry (``Boeing_747``, ``GPT_4``) and is blind to the table that
-    declares what a token IS.
-    """
-
-    def test_observed_is_declared_tokens_present_in_the_rendered_payload(self):
-        """Mutation: restore the ``PLACEHOLDER_TOKEN_RE.findall`` scrape over
-        the facts + transcript -> the shape-like real name ``Boeing_747``
-        (copied verbatim out of the transcript) enters ``observed`` as if it
-        were a declared placeholder -> this test fails.
-        """
-        from tests._cloud_flow import enrichment_side_effect, run_cloud_stages
-
-        graph = _make_graph(
-            [("Alex", "lives_in", "Millfield")],
-            entities=[
-                Entity(name="Alex", entity_type="person"),
-                Entity(name="Millfield", entity_type="place"),
-                # Declared by the builder, but named in no fact and in no
-                # transcript span -> declared but NOT observed.
-                Entity(name="Dana", entity_type="person"),
-            ],
-        )
-        anon_facts = [{"subject": "Person_1", "predicate": "lives_in", "object": "City_1"}]
-        mapping = {"Alex": "Person_1", "Millfield": "City_1"}
-
-        captured: list = []
-        from paramem.cloud import deanonymize as _cloud_deanonymize
-
-        real_collisions = _cloud_deanonymize._binding_collisions
-
-        def _spy(*args, **kwargs):
-            if "observed" in kwargs:
-                captured.append(kwargs["observed"])
-            return real_collisions(*args, **kwargs)
-
-        with (
-            patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
-            patch(
-                "paramem.graph.stage_anonymize.anonymize",
-                side_effect=_anonymize_stub(mapping, "anonymized transcript", ""),
-            ),
-            patch("paramem.cloud.deanonymize._binding_collisions", side_effect=_spy),
-            patch(
-                "paramem.graph.stage_enrich.request_enrichment",
-                side_effect=enrichment_side_effect(list(anon_facts)),
-            ),
-        ):
-            run_cloud_stages(
-                graph,
-                "Alex lives in Millfield and flew on a Boeing_747",
-                None,
-                None,
-                speaker_id="speaker0",
-                correction_entity_types=set(),
-                scrub={"person name"},
-            )
-
-        assert captured, "the deanon stage's collision scan must run with an observed scope"
-        observed = captured[-1]
-        # Declared AND in the payload.
-        assert observed == {"Person_1", "City_1"}
-        # A shape-like real name copied out of the transcript is NOT a token.
-        assert "Boeing_747" not in observed
-        # A declared token absent from the payload is not observed either
-        # (Dana's minted placeholder).
-        assert observed <= {"Person_1", "City_1"}
 
 
 class TestFilterOpenaiCompatBoundaryErrors:

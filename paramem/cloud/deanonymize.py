@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
 from paramem.cloud.placeholders import (
+    _applied_whole_word_keys,
     _apply_bindings,
     _binding_collisions,
     _contains_declared_token,
@@ -33,7 +34,7 @@ from paramem.cloud.placeholders import (
     _normalize_anonymization_mapping,
     _placeholder_tokens,
     _resolution_map,
-    _substitute_whole_words,
+    substitute_declared_renderings,
 )
 
 if TYPE_CHECKING:
@@ -361,14 +362,21 @@ class CloudScope:
         the exact strings (``sent``) the cloud provider was actually
         shown.
 
-        ``observed = {tok for tok in contract.declared if any(tok in s for
-        s in sent)}`` — substring membership over the DECLARED
-        vocabulary, never a shape scrape.  A shape scrape reads whatever
-        placeholder-shaped surface the text happens to carry, which need
-        not be the surface the table declares; any divergence between the
-        two silently scopes CORE to nothing (every token reads as an
-        orphan -> every delta rejected -> enrichment silently dead while
-        the cycle still "succeeds").
+        ``observed`` is the union, over every string in ``sent``, of
+        :func:`~paramem.cloud.placeholders._applied_whole_word_keys`
+        against the DECLARED vocabulary — whole-word containment, never a
+        shape scrape and never a raw substring test. A shape scrape reads
+        whatever placeholder-shaped surface the text happens to carry,
+        which need not be the surface the table declares; any divergence
+        between the two silently scopes CORE to nothing (every token reads
+        as an orphan -> every delta rejected -> enrichment silently dead
+        while the cycle still "succeeds"). Whole-word containment is what
+        the tolerant restore in :func:`deanonymize_text` requires: under
+        substring containment ``Person_1`` would count as shown because
+        ``Person_10`` occurred, and a reply's "person 1" would then restore
+        to a value the recipient was never shown — the exact walk consumes
+        the longest match at each position, so ``Person_1`` occurring only
+        inside ``Person_10`` is not shown.
 
         ``cloud_bindings`` is normalized here with ``placeholder_side="key"``
         — the ONE call, not one per caller — and non-``str`` pairs are
@@ -422,7 +430,9 @@ class CloudScope:
             raw_bindings, placeholder_side="key"
         )
         sent_tuple = tuple(sent)
-        observed = frozenset(tok for tok in contract.declared if any(tok in s for s in sent_tuple))
+        observed = frozenset(
+            tok for s in sent_tuple for tok in _applied_whole_word_keys(s, contract.declared)
+        )
 
         # Binding-value pruning — see docstring. A binding whose VALUE
         # still carries a placeholder token unresolvable against the
@@ -477,7 +487,7 @@ class DeanonResult:
 
     ``collisions`` is :func:`~paramem.cloud.placeholders._binding_collisions`'s
     result — cloud-binding keys that clash with the CORE reverse map or
-    with the ``observed`` scope.  ALWAYS informational: a binding for a
+    with a sibling cloud binding.  ALWAYS informational: a binding for a
     token cloud was SHOWN is inert under CORE-LAST precedence
     (:func:`~paramem.cloud.placeholders._resolution_map`), never a reason
     to drop anything.  Callers that keep diagnostics write it to their own
@@ -515,7 +525,6 @@ def deanonymize_facts(
     collisions = _binding_collisions(
         scope.reverse,
         cloud_bindings=scope.cloud_bindings,
-        observed=scope.observed,
     )
     # ``resolution=scope.resolution``: the scope already computed the
     # resolution map once (in :meth:`CloudScope.response`) — passing it
@@ -537,14 +546,20 @@ def deanonymize_text(scope: CloudScope, text: str) -> str | None:
     """De-anonymize cloud-returned free text — the single deanon exit
     gate for prose (as opposed to fact dicts; see :func:`deanonymize_facts`).
 
-    1. :func:`~paramem.cloud.placeholders._substitute_whole_words` against
-       ``scope.resolution`` — the ``observed``-scoped map, NEVER a raw
-       reverse map.  The signature makes the unsafe call unexpressible:
+    1. :func:`~paramem.cloud.placeholders.substitute_declared_renderings`
+       against ``scope.resolution`` — the ``observed``-scoped map, NEVER a
+       raw reverse map. The signature makes the unsafe call unexpressible:
        there is no way to hand this function a bare ``reverse`` dict.
+       Substitutes every rendering of a token in ``scope.resolution`` — the
+       minted form, any casing, and the final ``_`` written as one space —
+       so a placeholder the external service re-cased or re-spaced still
+       restores to the real value.
     2. :func:`~paramem.cloud.placeholders._contains_declared_token`
        against ``scope.declared`` -> returns ``None``.  Always
-       fail-closed.  Declared tokens are machine-minted (``Prefix_N``
-       from our own table), so a false positive here is not credible.
+       fail-closed.  Refuses on a declared token surviving LITERALLY
+       (standalone or glued into an identifier); declared tokens are
+       machine-minted (``Prefix_N`` from our own table), so a false
+       positive here is not credible.
 
     Returns the de-anonymized text, or ``None`` when a declared-but-
     unobserved (or otherwise unresolved) placeholder survives — the
@@ -571,7 +586,7 @@ def deanonymize_text(scope: CloudScope, text: str) -> str | None:
     omission is safe there too, for an UNRELATED reason (a downstream
     graph-membership guard, not a prose/false-positive argument).
     """
-    out = _substitute_whole_words(text, scope.resolution)
+    out = substitute_declared_renderings(text, scope.resolution)
     if _contains_declared_token(out, scope.declared):
         return None
     return out

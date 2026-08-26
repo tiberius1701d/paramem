@@ -15,8 +15,10 @@ Covered:
   fuzzy-only index match retains nothing; no entity graph retains nothing.
 * ``HAEntityGraph.retained_spans`` directly — case-insensitive literal
   matching, overlap merging, and the exact-offset invariant.
-* The reply exit gate — a declared placeholder in the reply resolves back;
-  a declared-but-unobserved token in the reply refuses the whole reply.
+* The reply exit gate — a placeholder the reply re-cases or re-spaces
+  still restores to the real value; a declared token that survives
+  literally, because it was never shown to the recipient, refuses the
+  whole reply.
 * The one anonymize-chain call per :class:`OutboundText`, including the
   forwarded query behind ``[ESCALATE]``, which is a distinct artifact and
   gets its own object.
@@ -288,35 +290,41 @@ class TestRetainedSpans:
 
 
 class TestHaReplyExitGate:
-    def test_placeholder_in_the_reply_is_restored(self, monkeypatch):
+    """``answer_via_ha``'s reply restore, through the door: a reply that
+    re-renders a sent placeholder (re-cased or re-spaced) restores to the
+    real value; a reply carrying a declared token the recipient was never
+    shown refuses the whole reply."""
+
+    def test_a_re_rendered_placeholder_in_the_reply_restores(self, monkeypatch):
         _install_tag(monkeypatch, [("Alex", "person", 0.9)])
         config = _config()
         diagnostics: dict = {}
-        outbound = _outbound("My name is Alex.", config, diagnostics=diagnostics)
-        ha_client = _ha_client("Nice to meet you, Person_1!")
+        outbound = _outbound("My name is Alex, remember that.", config, diagnostics=diagnostics)
+        ha_client = _ha_client("Hi person_1, got it!")
 
         result = answer_via_ha(outbound, ha_client)
 
         assert result is not None
-        assert result.text == "Nice to meet you, Alex!"
-        assert diagnostics == {"ha_egress": "scrubbed"}
+        assert result.text == "Hi Alex, got it!"
+        assert diagnostics.get("ha_egress") == "scrubbed"
 
-    def test_surviving_declared_token_refuses(self, monkeypatch):
-        """``Mira`` is retained (an HA-registered name) so its placeholder
-        never reaches HA; when the reply nonetheless carries that
-        placeholder token, it is declared but unobserved and the whole
-        reply is refused."""
-        _install_tag(monkeypatch, [("Alex", "person", 0.9), ("Mira", "person", 0.9)])
+    def test_a_declared_but_unshown_token_in_the_reply_refuses(self, monkeypatch):
+        """The HA retain filter never substitutes ``Alex`` inside the
+        retained ``"Alex's Lamp"`` span, so the minted ``Person_1``
+        placeholder is declared for this contract but never occurs in what
+        HA was actually sent — a reply that echoes it back literally is
+        unresolved, not restored."""
+        _install_tag(monkeypatch, [("Alex", "person", 0.9)])
         config = _config()
-        ha_graph = _ha_graph("Mira")
+        ha_graph = _ha_graph("Alex's Lamp")
         diagnostics: dict = {}
-        outbound = _outbound("My name is Alex and Mira is home.", config, diagnostics=diagnostics)
-        ha_client = _ha_client("Got it, Person_2.")
+        outbound = _outbound("Turn on Alex's lamp.", config, diagnostics=diagnostics)
+        ha_client = _ha_client("Done, Person_1.")
 
         result = answer_via_ha(outbound, ha_client, ha_graph=ha_graph)
 
         assert result is None
-        assert diagnostics == {"ha_refusal": "unresolved_placeholder"}
+        assert diagnostics.get("ha_refusal") == "unresolved_placeholder"
 
 
 # ---------------------------------------------------------------------------

@@ -200,11 +200,13 @@ def _stage_enrich(ctx: StageContext, state: StageState) -> StageState:
     # updated_anon_transcript.
     #
     # ``observed`` (computed inside ``CloudScope.response`` below) =
-    # every placeholder token cloud is actually shown — the rendered
-    # facts_json (subject/predicate/object; a placeholder in a predicate
-    # is still visible to cloud) and the anonymized transcript.  This is
-    # CORE's legality domain for this cloud cycle: only tokens cloud
-    # actually saw may be treated as legitimately bound.
+    # every placeholder token that occurs as a whole word in what cloud
+    # was shown — the rendered facts_json (subject/predicate/object) and
+    # the anonymized transcript.  A token glued inside a longer identifier
+    # (e.g. a placeholder embedded in a predicate) is visible to cloud but
+    # not observed.  This is CORE's legality domain for this cloud cycle:
+    # only tokens cloud actually saw as a whole word may be treated as
+    # legitimately bound.
     with phase_trace("cloud_enrich") as t:
         # :func:`_cloud_facing_payload` is the SAME render
         # :func:`request_enrichment` uses for its prompt, so the two cannot

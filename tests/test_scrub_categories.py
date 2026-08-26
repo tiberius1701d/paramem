@@ -1,5 +1,5 @@
 """``resolve_scrub_categories`` / ``SanitizationConfig``: the shipped
-default, the five schema-load refusals, and ``build_server_config``'s
+default, the six schema-load refusals, and ``build_server_config``'s
 ``FatalConfigError`` surface.
 """
 
@@ -64,7 +64,7 @@ class TestListInputOrderIsTheOperatorsOrder:
         assert person.hints == ("family name", "person name")
 
 
-class TestFiveRefusals:
+class TestSixRefusals:
     def test_duplicate_hint_claimed_by_two_rows_raises(self, tmp_path: Path) -> None:
         schema = _write_schema(
             tmp_path,
@@ -123,6 +123,41 @@ class TestFiveRefusals:
         )
         with pytest.raises(ValueError, match="primary_for_type"):
             resolve_scrub_categories([], path=str(schema))
+
+    def test_duplicate_prefix_under_casefold_raises(self, tmp_path: Path) -> None:
+        schema = _write_schema(
+            tmp_path,
+            [
+                "{ prefix: Org, entity_type: organization }",
+                "{ prefix: ORG, entity_type: organization }",
+            ],
+        )
+        with pytest.raises(ValueError, match="case-fold"):
+            resolve_scrub_categories([], path=str(schema))
+
+    def test_duplicate_prefix_byte_identical_raises(self, tmp_path: Path) -> None:
+        """Two rows sharing the exact same ``prefix`` string are refused
+        the same as a case-folded collision — the check compares ROWS,
+        not prefix strings, so a byte-identical pair is not exempted."""
+        schema = _write_schema(
+            tmp_path,
+            [
+                "{ prefix: Org, entity_type: organization }",
+                "{ prefix: Org, entity_type: place }",
+            ],
+        )
+        with pytest.raises(ValueError, match="case-fold"):
+            resolve_scrub_categories([], path=str(schema))
+
+    def test_distinct_prefixes_pass(self, tmp_path: Path) -> None:
+        schema = _write_schema(
+            tmp_path,
+            [
+                "{ prefix: Org, entity_type: organization }",
+                "{ prefix: Thing, entity_type: concept }",
+            ],
+        )
+        assert resolve_scrub_categories([], path=str(schema)) == ()
 
 
 class TestRaiseFiresFromSanitizationConfigItself:

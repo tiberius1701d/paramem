@@ -22,16 +22,21 @@ from paramem.cloud.placeholders import (
     PLACEHOLDER_SHAPE_RE,
     PLACEHOLDER_TOKEN_RE,
     _applied_whole_word_keys,
+    _binding_collisions,
+    _decompose_token,
     _fact_orphans,
     _fact_tokens,
     _normalize_anonymization_mapping,
     _placeholder_tokens,
+    _rendering_fold,
+    _resolution_map,
     _substitute_whole_words,
     _substitute_whole_words_and_applied,
     braced,
     insert_placeholders,
     invert_forward_mapping,
     mint_placeholder,
+    substitute_declared_renderings,
     unbraced,
 )
 from paramem.config.taxonomy import (
@@ -485,7 +490,7 @@ class TestSubstituteWholeWordsExactMatchRegression:
     — not by loosening this shared primitive's matching.
 
     Mutation: reintroduce ``canonical()`` matching in
-    ``_substitute_whole_words`` -> both tests below fail.
+    ``_substitute_whole_words`` -> the tests below fail.
     """
 
     def test_anonymize_direction_does_not_eat_common_noun_homograph(self):
@@ -504,28 +509,16 @@ class TestSubstituteWholeWordsExactMatchRegression:
         out = _substitute_whole_words(text, mapping)
         assert out == "Person_1 said the electricity bill was late."
 
-    def test_deanon_direction_does_not_substitute_literal_lowercase_text(self):
-        """DEANON direction (:func:`~paramem.cloud.deanonymize.deanonymize_text`
-        / ``_apply_bindings``): literal text a human wrote (``person 1``,
-        ``Person 1``) must NOT be substituted to the real name a
-        DIFFERENT, exact-case, machine-minted token (``Person_1``) stands
-        for — canonical matching would fold the human-written phrase onto
-        the token's identity and, in the full pipeline, consume it before
-        the fail-closed residual-token drop (b14a880) ever saw it.
-
-        Exercised directly against ``_substitute_whole_words`` — the
-        composed ``paramem.cloud.deanonymize.deanonymize_text`` is this
-        exact call plus a declared-token fail-closed check (a standalone
-        ``deanonymize_text(text, resolution)`` primitive used to wrap it,
-        but it was a pure null-guard pass-through already subsumed by
-        ``_substitute_whole_words``'s own guard, so it was retired rather
-        than kept as a second name for the same one-line body).
-        """
-        reverse = {"Person_1": "Yang Ming"}
-        assert _substitute_whole_words("person 1 in the queue", reverse) == (
-            "person 1 in the queue"
-        )
-        assert _substitute_whole_words("Person 1 of 3 slides", reverse) == "Person 1 of 3 slides"
+    def test_outbound_walk_does_not_match_a_reply_side_rendering(self):
+        """The tolerance a reply may lean on (``person_1`` for
+        ``Person_1``) is exclusive to :func:`substitute_declared_renderings`,
+        the reply-restore walk — the outbound direction never gains a
+        rendering mode. A lowercased rendering of a placeholder key is not
+        a byte-exact match and is left untouched."""
+        mapping = {"Person_1": "Alex"}
+        text = "Hi person_1, welcome."
+        out = _substitute_whole_words(text, mapping)
+        assert out == text
 
 
 class TestPlaceholderShapeRegex:
@@ -863,3 +856,174 @@ class TestNormalizeAnonymizationMappingBracedCandidates:
         log_text = caplog.text
         assert secret not in log_text
         assert "dropped" in log_text.lower()
+
+
+class TestDecomposeToken:
+    """``_decompose_token`` — the mint's own ``f"{prefix}_{n}"`` format
+    (:func:`mint_placeholder`) read backwards, not an independent spelling
+    of the shape. Composed by :func:`substitute_declared_renderings` and
+    by :func:`_rendering_fold`.
+    """
+
+    def test_accepts_a_single_segment_token(self):
+        assert _decompose_token("Person_1") == ("Person", "1")
+
+    def test_accepts_a_multi_segment_prefix(self):
+        assert _decompose_token("Home_Address_1") == ("Home_Address", "1")
+
+    def test_rejects_a_non_numeric_tail(self):
+        assert _decompose_token("Foo_Bar") is None
+
+    def test_rejects_a_zero_padded_tail(self):
+        assert _decompose_token("Person_01") is None
+
+    def test_rejects_a_separator_free_speaker_token(self):
+        """A speaker token never decomposes — the speaker family is
+        governed separately and is never a rendering-matcher candidate."""
+        assert _decompose_token("speaker1") is None
+
+    def test_rejects_a_non_decimal_unicode_digit_without_raising(self):
+        """A non-decimal Unicode digit (e.g. a superscript) passes
+        ``str.isdigit()`` but ``int()`` rejects it — ``isdecimal()`` is
+        what keeps this function total instead of raising."""
+        assert _decompose_token("Person_²") is None
+
+
+class TestSubstituteDeclaredRenderings:
+    """``substitute_declared_renderings`` — the reply-side tolerant walk
+    beside the exact ``_substitute_whole_words`` walk. The rendering
+    domain is exactly the minted form, any casing of it, and the final
+    ``_`` written as one space; the domain stops there deliberately.
+    """
+
+    def test_lowercase_rendering_restores(self):
+        out = substitute_declared_renderings("Hi person_1, welcome.", {"Person_1": "Alex"})
+        assert out == "Hi Alex, welcome."
+
+    def test_uppercase_rendering_restores(self):
+        out = substitute_declared_renderings("Hi PERSON_1, welcome.", {"Person_1": "Alex"})
+        assert out == "Hi Alex, welcome."
+
+    def test_space_separated_rendering_restores(self):
+        out = substitute_declared_renderings("Hi Person 1, welcome.", {"Person_1": "Alex"})
+        assert out == "Hi Alex, welcome."
+
+    def test_possessive_rendering_restores(self):
+        """A following non-word char (the possessive apostrophe) does not
+        block a match — the same edge-aware boundary rule the exact walk
+        uses."""
+        out = substitute_declared_renderings("Person_1's book is here.", {"Person_1": "Alex"})
+        assert out == "Alex's book is here."
+
+    def test_longest_token_wins_at_the_same_start(self):
+        """Regex alternation is leftmost-alternative; the longest-first
+        sort is what makes ``Person_10`` beat ``Person_1`` rather than
+        leaving a dangling ``0``."""
+        mapping = {"Person_1": "Alex", "Person_10": "Riley"}
+        out = substitute_declared_renderings("Person_10 called Person_1.", mapping)
+        assert out == "Riley called Alex."
+
+    def test_hyphenated_surface_is_not_a_rendering(self):
+        """``Person-1`` is outside the rendering domain, even though
+        ``Person_1`` is declared — a declared token mangled this way is
+        left in the text as written."""
+        out = substitute_declared_renderings("Hi Person-1, welcome.", {"Person_1": "Alex"})
+        assert out == "Hi Person-1, welcome."
+
+    def test_zero_padded_surface_is_not_a_rendering(self):
+        out = substitute_declared_renderings("Hi Person_01, welcome.", {"Person_1": "Alex"})
+        assert out == "Hi Person_01, welcome."
+
+    def test_unminted_token_is_not_a_rendering(self):
+        out = substitute_declared_renderings("Hi Person_9, welcome.", {"Person_1": "Alex"})
+        assert out == "Hi Person_9, welcome."
+
+    def test_a_speaker_shaped_mapping_key_contributes_no_alternative(self):
+        """No ``speaker{N}`` is ever a declared token, and the matcher
+        confirms it: a speaker-shaped key in the handed mapping never
+        decomposes, so it never becomes a rendering alternative."""
+        out = substitute_declared_renderings("SPEAKER0 said hi.", {"speaker0": "Alex"})
+        assert out == "SPEAKER0 said hi."
+
+
+class TestRenderingFoldDistinctness:
+    """The declared vocabulary is distinct under the rendering equivalence
+    :func:`_rendering_fold` defines: a cloud binding whose key is
+    rendering-equal to ANY core token — shown or not — or to another
+    cloud binding, is inert in :func:`_resolution_map` (the CORE value
+    wins, CORE-LAST, and a sibling collision class is inert on every
+    member) and is named by :func:`_binding_collisions` — the same
+    equivalence at both membership sites.
+    """
+
+    def test_case_variant_binding_is_inert_core_wins_in_resolution(self):
+        reverse = {"Person_1": "Alex"}
+        cloud_bindings = {"PERSON_1": "someone else"}
+        observed = {"Person_1"}
+        resolution = _resolution_map(reverse, cloud_bindings, observed)
+        assert resolution["Person_1"] == "Alex"
+        assert "PERSON_1" not in resolution
+
+    def test_case_variant_binding_is_named_by_binding_collisions(self):
+        collisions = _binding_collisions(
+            {"Person_1": "Alex"},
+            cloud_bindings={"PERSON_1": "someone else"},
+        )
+        assert collisions == ["PERSON_1"]
+
+    def test_exact_match_and_case_variant_fold_to_the_same_key(self):
+        assert _rendering_fold("Person_1") == _rendering_fold("PERSON_1")
+
+    def test_a_token_with_no_rendering_folds_to_itself(self):
+        """A token that does not decompose (``Foo_Bar``) has no
+        equivalence class beyond itself — its comparisons stay
+        exact-string."""
+        assert _rendering_fold("Foo_Bar") == "Foo_Bar"
+
+    def test_binding_rendering_an_unshown_core_token_is_inert_and_named(self):
+        """A cloud binding whose key renders an UNSHOWN core token is
+        inert in resolution — not merely a shown one — because a rendering
+        the external service writes back cannot itself carry the
+        shown/unshown distinction; the same binding is named by
+        :func:`_binding_collisions`."""
+        reverse = {"Person_1": "Alex"}
+        cloud_bindings = {"person_1": "the neighbour"}
+        observed: set[str] = set()
+        resolution = _resolution_map(reverse, cloud_bindings, observed)
+        assert "person_1" not in resolution
+        assert "Person_1" not in resolution
+        collisions = _binding_collisions(reverse, cloud_bindings=cloud_bindings)
+        assert collisions == ["person_1"]
+
+    def test_sibling_bindings_rendering_equal_are_both_inert_and_named(self):
+        """Two cloud bindings rendering-equal to EACH OTHER, with no core
+        token involved, are both inert in resolution and both named —
+        every member of a binding-side collision class is inert."""
+        cloud_bindings = {"Org_1": "first", "ORG_1": "second"}
+        observed = {"Person_9"}
+        resolution = _resolution_map({}, cloud_bindings, observed)
+        assert "Org_1" not in resolution
+        assert "ORG_1" not in resolution
+        collisions = _binding_collisions({}, cloud_bindings=cloud_bindings)
+        assert collisions == ["ORG_1", "Org_1"]
+
+    def test_glued_span_is_not_a_rendering_match(self):
+        """The rendering walk itself refuses a glued span on either side —
+        pinned at the walk level, independent of the composed refusal
+        gate in :func:`~paramem.cloud.deanonymize.deanonymize_text`."""
+        out = substitute_declared_renderings("xPerson_1 and Person_1x", {"Person_1": "Alex"})
+        assert out == "xPerson_1 and Person_1x"
+
+    def test_empty_mapping_returns_text_unchanged(self):
+        out = substitute_declared_renderings("Person_1 said hi.", {})
+        assert out == "Person_1 said hi."
+
+    def test_substituted_value_is_never_rescanned(self):
+        """The result is assembled in a single left-to-right pass over the
+        ORIGINAL text's match spans — a substituted real value that
+        happens to look like another declared token's rendering is never
+        fed back through the matcher."""
+        out = substitute_declared_renderings(
+            "Person_1", {"Person_1": "Person_2", "Person_2": "Riley"}
+        )
+        assert out == "Person_2"

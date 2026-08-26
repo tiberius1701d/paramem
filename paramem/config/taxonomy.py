@@ -219,7 +219,7 @@ def resolve_scrub_categories(
     row's prefix, carrying that row's ``tagger_labels`` verbatim. Category
     order is schema row order.
 
-    Five conditions are refused at this door rather than resolved
+    Six conditions are refused at this door rather than resolved
     arbitrarily or silently under-scrubbing:
 
     1. A ``scrub_categories`` hint claimed by two distinct prefix rows —
@@ -235,6 +235,12 @@ def resolve_scrub_categories(
     5. More than one prefix row setting ``primary_for_type: true`` for the
        same ``entity_type`` — the placeholder-prefix map assumes exactly
        one primary row per entity type.
+    6. Two prefix rows whose ``prefix`` values are equal under
+       ``casefold()`` — the placeholder tokens each row mints
+       (``paramem.cloud.placeholders.mint_placeholder``) would then
+       collide under the reply-side rendering equivalence
+       (``paramem.cloud.placeholders._rendering_fold``), so the declared
+       placeholder vocabulary would not be distinct.
 
     Args:
         scrub: The configured PII-vocabulary hints
@@ -248,7 +254,7 @@ def resolve_scrub_categories(
         empty ``hints`` or empty ``tagger_labels``.
 
     Raises:
-        ValueError: On any of the five conditions above.
+        ValueError: On any of the six conditions above.
     """
     cfg = load_schema_config(path)
     prefixes = cfg["anonymizer"]["prefixes"]
@@ -256,7 +262,18 @@ def resolve_scrub_categories(
     hint_owner: dict[str, str] = {}
     label_owner: dict[str, str] = {}
     primary_owner: dict[str, str] = {}
-    for row in prefixes:
+    prefix_owner: dict[str, int] = {}
+    for idx, row in enumerate(prefixes):
+        folded_prefix = str(row["prefix"]).casefold()
+        owner_idx = prefix_owner.get(folded_prefix)
+        if owner_idx is not None and owner_idx != idx:
+            raise ValueError(
+                f"Prefix {row['prefix']!r} collides under case-folding with "
+                f"prefix {prefixes[owner_idx]['prefix']!r} in schema.yaml's "
+                "anonymizer.prefixes — the declared placeholder vocabulary "
+                "must be distinct under case-folding."
+            )
+        prefix_owner[folded_prefix] = idx
         for hint in row.get("scrub_categories") or []:
             owner = hint_owner.get(hint)
             if owner is not None and owner != row["prefix"]:

@@ -30,8 +30,11 @@ so a runtime import here would cycle.
 The minted token shape is BARE (``Person_1``); a braced form
 (``{Person_1}``) exists only for the in-text detection net and for the
 cloud's own brace-binding mint protocol. Nothing here hardcodes the bare
-shape as load-bearing — a format change only touches
-:func:`mint_placeholder` and :data:`PLACEHOLDER_SHAPE_RE`.
+shape as load-bearing — the shape is declared by :func:`mint_placeholder`,
+recognised by :data:`PLACEHOLDER_SHAPE_RE`, and read backwards by
+:func:`_decompose_token` here and by
+:func:`~paramem.config.taxonomy.placeholder_entity_type` — the sites a
+format change touches.
 
 Load-bearing invariants:
 
@@ -49,6 +52,10 @@ Load-bearing invariants:
   minted placeholder number is carried by at least one surviving key in
   ``forward`` — a prefix's numbers run ``1..N`` with no holes left by a
   containment merge or an inert-key drop.
+* :func:`substitute_declared_renderings` builds its alternation from the
+  handed vocabulary's keys only, so a token never minted for the contract
+  is never matched; the declared vocabulary is distinct under the
+  rendering equivalence :func:`_rendering_fold` defines.
 """
 
 from __future__ import annotations
@@ -103,7 +110,7 @@ PLACEHOLDER_SHAPE_RE = re.compile(rf"^{_BARE_PLACEHOLDER_SHAPE}$")
 # directly for a boolean presence check (``.search``), not name
 # extraction. (The ``observed`` legality domain is computed by
 # :meth:`~paramem.cloud.deanonymize.CloudScope.response` from the
-# DECLARED vocabulary by substring containment, never by this pattern.)
+# DECLARED vocabulary by whole-word containment, never by this pattern.)
 PLACEHOLDER_TOKEN_RE = re.compile(rf"\{{(\w+_\d+)\}}|\b({_BARE_PLACEHOLDER_SHAPE})\b")
 
 
@@ -193,10 +200,13 @@ def _word_boundary_ok(text: str, key: str, pos: int) -> bool:
     THE one boundary predicate for every whole-word decision in the
     anonymize chain: :func:`_substitute_whole_words` (is a scanned candidate
     position a real match), :func:`~paramem.cloud.anonymize_steps._scan_drop_reason`
-    (the scan's own whole-word verification) and the HA leg's retained-surface
+    (the scan's own whole-word verification), the HA leg's retained-surface
     filter in :mod:`paramem.server.egress` (does a key occur outside a
-    retained span) — never re-implement the edge-aware check at another
-    call site.
+    retained span), :func:`substitute_declared_renderings` (does a
+    rendering candidate, matched on the span as written, hold at that
+    edge), and :func:`_whole_word_contains` (the containment pass in
+    :func:`build_forward_table`) — never re-implement the edge-aware check
+    at another call site.
     """
     end = pos + len(key)
     if _is_word_char(key[0]) and pos > 0 and _is_word_char(text[pos - 1]):
@@ -233,19 +243,25 @@ def _substitute_whole_words_and_applied(
     case-sensitive — every call site's mapping keys are exact-case
     entity names or placeholder tokens.
 
-    Matching is EXACT — never case-, separator-, or diacritic-folded. Keys
-    here are literal surfaces: real names in the ANONYMIZE direction and
-    machine-minted placeholder tokens in the DEANONYMIZE direction (this
-    same function is the whole of what a bare ``deanonymize_text(text,
-    resolution)`` call would do — there is no separate wrapper). Folding
-    would let a mapped person name silently consume its lowercase
-    common-noun homograph (a person named "Bill" matching the electricity
-    "bill"), and would let literal placeholder text resolve against a real
-    name, defeating the fail-closed residual-token drop before it ever
-    sees the token. Identity reconciliation — matching a mapping key
-    to the fold graph's own canonical node-key text — is a separate step
-    performed by the one caller that needs it, before this function ever
-    sees the mapping — see
+    Matching is EXACT — never case-, separator-, or diacritic-folded — for
+    both directions this walk serves. In the ANONYMIZE direction the keys
+    are literal, verbatim human surfaces (real entity names), so
+    exactness is what stops a mapped person name from silently consuming
+    its lowercase common-noun homograph (a person named "Bill" matching
+    the electricity "bill"). In the fact gate's DEANON-direction
+    substitution (:func:`_apply_bindings`) the keys are machine-minted
+    placeholder tokens, and exactness keeps a mangled or re-rendered token
+    visible as a literal substring to that gate's fail-closed residual
+    sweep — a tolerant substitution here would resolve such a token away
+    before the sweep ever saw it. The prose gate
+    (:func:`~paramem.cloud.deanonymize.deanonymize_text`) restores through
+    :func:`substitute_declared_renderings` instead — the tolerant
+    rendering walk, matched over shown tokens only, where a prose
+    coincidence ("Person 1 of 3" with ``Person_1`` shown) restoring is
+    accepted by design. Identity reconciliation — matching
+    a mapping key to the fold graph's own canonical node-key text — is a
+    separate step performed by the one caller that needs it, before this
+    function ever sees the mapping — see
     :func:`~paramem.training.graph_enrich.enrich_graph`.
 
     Returns ``(substituted_text, applied_keys)`` — ``applied_keys`` is the
@@ -316,13 +332,97 @@ def _applied_whole_word_keys(text: str, keys: Iterable[str]) -> set[str]:
     placeholder) can still ask "which of these substitutes somewhere in
     this text". A key this function does not return is INERT for that
     ``(text, keys)`` pair: :func:`_substitute_whole_words` would
-    substitute it nowhere. The one production caller,
-    :func:`build_forward_table`'s prune pass, uses this to keep only the
-    forward-table keys that are live over one payload before minting.
+    substitute it nowhere. Two production callers:
+    :func:`build_forward_table`'s prune pass uses this to keep only the
+    forward-table keys that are live over one payload before minting;
+    :meth:`~paramem.cloud.deanonymize.CloudScope.response` uses it to
+    scope ``observed`` to the declared tokens actually shown.
     """
     mapping = dict.fromkeys(keys, "")
     _substituted, applied = _substitute_whole_words_and_applied(text, mapping)
     return applied
+
+
+def _decompose_token(token: str) -> tuple[str, str] | None:
+    """Split *token* into ``(prefix, number)`` — the mint's own
+    ``f"{prefix}_{n}"`` format (:func:`mint_placeholder`) read backwards,
+    not an independent spelling of the shape.
+
+    ``prefix, sep, number = token.rpartition("_")``, accepted only when
+    *sep* is present, ``number.isdecimal()``, and re-minting
+    ``f"{prefix}_{int(number)}"`` reproduces *token* exactly — so a
+    zero-padded (``Person_01``), non-numeric (``Foo_Bar``), or
+    separator-free (``speaker1``) tail does not decompose.
+    ``isdecimal()`` (not ``isdigit()``) is what makes the following
+    ``int()`` call total: ``isdigit()`` accepts non-decimal Unicode digits
+    (e.g. a superscript ``"²"``) that ``int()`` itself rejects, which
+    would raise instead of returning ``None``. Returns ``None`` for a
+    token outside that domain.
+
+    Composed by :func:`substitute_declared_renderings` (the rendering
+    alternation) and by :func:`_rendering_fold` (the rendering
+    equivalence) — the one place the mint's format is read backwards.
+    """
+    prefix, sep, number = token.rpartition("_")
+    if not sep or not number.isdecimal():
+        return None
+    if f"{prefix}_{int(number)}" != token:
+        return None
+    return prefix, number
+
+
+def substitute_declared_renderings(text: str, mapping: dict[str, str]) -> str:
+    """Restore every rendering of a declared placeholder token in *text*
+    to *mapping*'s real value — the reply-side counterpart to
+    :func:`_substitute_whole_words`'s byte-exact outbound walk.
+
+    A rendering of a token is the minted form, any casing of it, and the
+    ``_`` between prefix and number written as one space — the domain the
+    external service may re-case or re-space when it writes a token back
+    in its reply; the domain stops there deliberately.
+
+    Builds one case-insensitive alternation from *mapping*'s keys only:
+    per key, :func:`_decompose_token` — a key that does not decompose
+    contributes no alternative; a decomposing key contributes
+    ``re.escape(prefix) + "[ _]" + number``, so only the final separator
+    is flexible and a multi-segment prefix keeps its internal underscores
+    literal. Alternatives are sorted longest-token-first (regex
+    alternation is leftmost-alternative, so the sort is what makes a
+    longer token like ``Person_10`` beat a shorter one like ``Person_1``
+    at the same starting position). Candidates come from ``finditer``,
+    left to right, non-overlapping; each is kept only when
+    :func:`_word_boundary_ok` holds on the span as written. The result is
+    assembled from the kept spans and the untouched slices between them,
+    so a substituted real value is never rescanned.
+
+    Returns *text* unchanged when *mapping* is empty or none of its keys
+    decompose.
+    """
+    alternatives: list[tuple[str, str]] = []
+    for token in mapping:
+        decomposed = _decompose_token(token)
+        if decomposed is None:
+            continue
+        prefix, number = decomposed
+        alternatives.append((token, f"{re.escape(prefix)}[ _]{number}"))
+    if not alternatives:
+        return text
+    alternatives.sort(key=lambda pair: (-len(pair[0]), pair[0]))
+    tokens_by_group = [token for token, _pattern in alternatives]
+    combined = "|".join(f"({pattern})" for _token, pattern in alternatives)
+    matcher = re.compile(combined, re.IGNORECASE)
+
+    parts: list[str] = []
+    last_end = 0
+    for m in matcher.finditer(text):
+        if not _word_boundary_ok(text, m.group(0), m.start()):
+            continue
+        token = tokens_by_group[m.lastindex - 1]
+        parts.append(text[last_end : m.start()])
+        parts.append(mapping[token])
+        last_end = m.end()
+    parts.append(text[last_end:])
+    return "".join(parts)
 
 
 def insert_placeholders(facts: list[dict], mapping: dict[str, str]) -> list[dict]:
@@ -543,6 +643,25 @@ def _normalize_anonymization_mapping(
 # ---------------------------------------------------------------------------
 
 
+def _rendering_fold(token: str) -> str:
+    """The rendering-equivalence key for *token*: two declared tokens equal
+    under this fold are one token.
+
+    ``token.casefold()`` when *token* decomposes as a placeholder
+    (:func:`_decompose_token`), *token* itself otherwise — a token with no
+    rendering has no equivalence class beyond itself, so its comparisons
+    stay exact-string.
+
+    Used at both membership sites that enforce or diagnose the declared
+    vocabulary's distinctness under the equivalence: :func:`_resolution_map`
+    (CORE-LAST enforcement — a cloud binding whose key is rendering-equal to
+    ANY core token, shown or not, or to another cloud binding, is inert)
+    and :func:`_binding_collisions` (the diagnostic that names such
+    bindings), each against a set of folds built once per call.
+    """
+    return token.casefold() if _decompose_token(token) is not None else token
+
+
 def _resolution_map(
     reverse: dict[str, str],
     cloud_bindings: dict[str, str],
@@ -564,15 +683,23 @@ def _resolution_map(
     the callers' ``observed: set[str] | None = None`` declarations.
 
     ``observed`` is a ``set`` -> **CORE SCOPED** to it: a ``reverse``
-    entry resolves only when cloud was actually shown its placeholder
-    (``key in observed`` — a token in the rendered facts cloud saw, or in
-    the anonymized transcript). Every ``cloud_bindings`` entry whose key
-    is NOT in ``observed`` is cloud's own mint and resolves too. A key
-    present in both domains is a CONFLICT — surfaced separately, purely
-    informationally, by :func:`_binding_collisions` — but never gated on
-    here: this map resolves it via CORE-LAST precedence regardless (the
-    tie-break below), so a conflict is harmless whether or not the caller
-    even runs the collision scan.
+    entry resolves only when cloud was actually shown its placeholder, or
+    a rendering of it (``key`` rendering-equal to a member of ``observed``
+    — a token in the rendered facts cloud saw, or in the anonymized
+    transcript, under :func:`_rendering_fold`'s equivalence). A
+    ``cloud_bindings`` entry is admitted only when its key is
+    rendering-equal to NO ``reverse`` key at all — shown or not — and to
+    no OTHER ``cloud_bindings`` key; every member of such a collision
+    class is inert (this is the declared-vocabulary distinctness
+    invariant, enforced here rather than merely diagnosed — a rendering
+    the external service writes back cannot itself carry the shown/unshown
+    distinction, so a mint colliding with an unshown core token is exactly
+    as unresolvable as one colliding with a shown one). A key
+    rendering-equal to a member of ``observed`` is additionally a CONFLICT
+    — surfaced separately, purely informationally, by
+    :func:`_binding_collisions`. ``observed`` and every key compared
+    against it hold exact tokens; :func:`_rendering_fold` is applied once
+    per key, against sets/maps built once per branch.
 
     **CORE PRECEDENCE (named invariant) — CORE-LAST BY CONSTRUCTION.**
     In both branches ``reverse`` entries are applied AFTER
@@ -594,15 +721,29 @@ def _resolution_map(
             if isinstance(k, str) and isinstance(v, str) and k and v
         )
     else:
+        folded_observed = {_rendering_fold(tok) for tok in observed}
+        folded_core = {_rendering_fold(k) for k in reverse if isinstance(k, str) and k}
+        binding_folds = {k: _rendering_fold(k) for k in cloud_bindings if isinstance(k, str) and k}
+        binding_fold_counts: dict[str, int] = {}
+        for fold in binding_folds.values():
+            binding_fold_counts[fold] = binding_fold_counts.get(fold, 0) + 1
         resolved.update(
             (k, v)
             for k, v in cloud_bindings.items()
-            if isinstance(k, str) and isinstance(v, str) and k and v and k not in observed
+            if isinstance(v, str)
+            and v
+            and k in binding_folds
+            and binding_fold_counts[binding_folds[k]] == 1
+            and binding_folds[k] not in folded_core
         )
         resolved.update(
             (k, v)
             for k, v in reverse.items()
-            if isinstance(k, str) and isinstance(v, str) and k and v and k in observed
+            if isinstance(k, str)
+            and isinstance(v, str)
+            and k
+            and v
+            and _rendering_fold(k) in folded_observed
         )
     return resolved
 
@@ -653,21 +794,19 @@ def _binding_collisions(
     reverse_mapping: dict,
     *,
     cloud_bindings: dict | None = None,
-    observed: set[str] | None = None,
 ) -> list[str]:
-    """Collision scan: a ``cloud_bindings`` key that clashes with the CORE
-    reverse map, or with the ``observed`` scope — ALWAYS informational,
-    never a rejection signal.  A binding for a token cloud was SHOWN is
-    inert under CORE-LAST precedence (:func:`_resolution_map` always
-    resolves such a key to the CORE value); see that function's
-    docstring for why a collision cannot corrupt resolution.
+    """Collision scan: names every ``cloud_bindings`` key that
+    :func:`_resolution_map` makes inert — the diagnostic mirror of that
+    function's admission rule, ALWAYS informational, never a rejection
+    signal. A binding for a token cloud was SHOWN is inert under
+    CORE-LAST precedence (:func:`_resolution_map` always resolves such a
+    key to the CORE value); see that function's docstring for why a
+    collision cannot corrupt resolution.
 
-    When ``cloud_bindings`` is given and ``observed`` is a set, any
-    ``cloud_bindings`` KEY that is also in ``observed`` is a CONFLICT
-    (cloud referencing/rebinding something it was already shown as a core
-    reference).  When ``observed`` is ``None`` (CORE unscoped), the scan
-    instead flags any KEY present in both ``cloud_bindings`` and
-    ``reverse_mapping`` with a DIFFERING value.
+    A ``cloud_bindings`` key is named when it is rendering-equal
+    (:func:`_rendering_fold`) to ANY ``reverse_mapping`` key — shown or
+    not — or to another ``cloud_bindings`` key (every member of such a
+    sibling collision class is named).
 
     Returns the sorted list of colliding keys, ``[]`` when the scan found
     nothing or ``cloud_bindings`` is empty/``None``.  Writes NOTHING to
@@ -677,17 +816,21 @@ def _binding_collisions(
     """
     if not cloud_bindings:
         return []
-    if observed is not None:
-        collisions = sorted(k for k in cloud_bindings if k in observed)
-    else:
-        collisions = sorted(
-            k for k, v in cloud_bindings.items() if k in reverse_mapping and reverse_mapping[k] != v
-        )
+    folded_core = {_rendering_fold(k) for k in reverse_mapping if isinstance(k, str) and k}
+    binding_folds = {k: _rendering_fold(k) for k in cloud_bindings if isinstance(k, str) and k}
+    binding_fold_counts: dict[str, int] = {}
+    for fold in binding_folds.values():
+        binding_fold_counts[fold] = binding_fold_counts.get(fold, 0) + 1
+    collisions = sorted(
+        k
+        for k, fold in binding_folds.items()
+        if fold in folded_core or binding_fold_counts[fold] > 1
+    )
     if collisions:
         logger.warning(
-            "cloud binding collision: %d placeholder(s) present in both "
-            "cloud_bindings and reverse_mapping with differing values "
-            "(reverse_mapping wins): %s.",
+            "cloud binding collision: %d placeholder(s) rendering-equal to "
+            "the core reverse map or to a sibling cloud binding, inert "
+            "under CORE-LAST precedence: %s.",
             len(collisions),
             collisions[:5],
         )

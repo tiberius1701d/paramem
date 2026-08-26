@@ -215,13 +215,16 @@ def _stage_anonymize(ctx: StageContext, state: StageState) -> StageState:
                 original_relation_count=original_count,
             )
 
-        # CORE-map diagnostic.  The CORE map is never otherwise
-        # persisted — ``anonymize.parsed.mapping`` above is the LLM HINT map,
-        # recorded before ``anonymize``'s table build runs, not CORE.
-        # Keys and COUNTS only — never the real names:
-        # ``graph_snapshot.json`` (debug dumps under ``data/ha/debug/``)
-        # serializes ``graph.diagnostics`` wholesale, and the placeholder
-        # keyset is non-identifying while the values are the PII.
+        # CORE-map diagnostic.  ``anonymize.parsed.mapping`` above is ``payload.forward``
+        # (surface -> placeholder, or the speaker id for the speaker's own surfaces),
+        # as returned by ``anonymize()``.  ``payload.reverse`` is NOT ``forward``'s
+        # inverse: it is the placeholder side of the table, with the speaker-folded
+        # surfaces excluded and one entry per distinct placeholder — the first
+        # forward key wins on a many-to-one collision (``paramem/cloud/anonymize.py``'s
+        # ``invert_forward_mapping`` call).  This block records ``payload.reverse``'s KEYS
+        # (placeholders, non-identifying) and COUNT only, never the real names its
+        # values hold, since ``graph_snapshot.json`` debug dumps serialize
+        # ``graph.diagnostics`` wholesale.
         graph.diagnostics["core_placeholders"] = {
             "keys": sorted(payload.reverse.keys()),
             "count": len(payload.reverse),
