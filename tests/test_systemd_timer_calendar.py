@@ -231,7 +231,7 @@ class TestNoRenderedUnitLacksPersistent:
     def test_backup_render_path(self, schedule):
         from paramem.backup import timer as backup_timer
 
-        spec = backup_timer.parse_schedule(schedule)
+        spec = systemd_timer.parse_schedule(schedule)
         assert spec is not None
         text = systemd_timer.render_timer_unit(
             spec, unit_name=backup_timer.TIMER_NAME, description="ParaMem scheduled backup"

@@ -2,9 +2,8 @@
 
 Mirrors ``paramem/server/systemd_timer.py`` for the ``paramem-backup`` timer,
 sharing its reconciliation core (``_reconcile_timer``) via a ``TimerTarget``
-instead of carrying a second copy of the render/reconcile logic. Reuses
-``parse_schedule`` / ``TimerSpec`` from the consolidation timer module
-(same grammar, same parser).
+instead of carrying a second copy of the render/reconcile logic; the core
+parses the schedule with the consolidation timer's own grammar.
 
 Unit files point at ``python -m paramem.backup --tier daily`` (oneshot service).
 
@@ -21,7 +20,6 @@ from pathlib import Path
 from paramem.server.systemd_timer import (
     TimerTarget,
     _reconcile_timer,  # noqa: PLC2701 – intentional private reuse
-    parse_schedule,
 )
 from paramem.utils.paths import find_project_root
 
@@ -33,11 +31,7 @@ SERVICE_PATH = UNIT_DIR / f"{TIMER_NAME}.service"
 TIMER_PATH = UNIT_DIR / f"{TIMER_NAME}.timer"
 
 
-# Re-export so tests can ``from paramem.backup.timer import parse_schedule``
-# and verify it is the same object as the server timer's parse_schedule.
-# (test_timer.py::test_reuses_parse_schedule)
 __all__ = [
-    "parse_schedule",
     "render_service_unit",
     "reconcile",
 ]
