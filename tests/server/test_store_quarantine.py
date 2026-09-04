@@ -31,6 +31,7 @@ pattern.
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -42,7 +43,6 @@ from tests._fold_fixtures import (
     _make_loop,
     _recalled_entries_from_store,
     _rel,
-    _run_pending_event_resume_and_wait,
     _wire_fakes,
 )
 from tests._fold_fixtures import _make_state as _make_resume_state
@@ -127,7 +127,7 @@ class TestArbitratorRejection:
         state = _make_arbitrator_state(tmp_path, max_interim_count=7)
         state["store_quarantine"] = dict(_CAUSE)
 
-        status, resolved, spy, _ = _dispatch(
+        status, resolved, spy = _dispatch(
             state, getattr(ConsolidationAction, action_name), monkeypatch=monkeypatch
         )
 
@@ -144,6 +144,104 @@ class TestArbitratorRejection:
 
         monkeypatch.setattr(app_module, "_state", {})
         assert app_module._store_quarantine_verdict() is None
+
+
+# ---------------------------------------------------------------------------
+# The arbitrator's resume-pending-first arm dispatches a readable pending
+# ledger AHEAD OF the store-quarantine verdict (``_dispatch_consolidation``'s
+# docstring, steps 3-5) — so a quarantined store with something pending
+# still resumes rather than refusing. The busy guards and the idle debounce
+# (steps 1-2) still run ahead of the resume itself, and a withheld main
+# tier's binding-unverified gate (step 7, below the resume) never reaches a
+# resumed dispatch either.
+# ---------------------------------------------------------------------------
+
+
+class TestQuarantinedPendingResumeDispatchesAheadOfTheGate:
+    def test_a_quarantined_store_with_a_readable_pending_ledger_resumes_while_idle(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        from paramem.server.app import ConsolidationAction
+
+        _write_pending_ledger(tmp_path, event="interim")
+        state = _make_arbitrator_state(tmp_path, max_interim_count=7)
+        state["store_quarantine"] = dict(_CAUSE)
+        assert state["last_model_use_monotonic"] is None, "fixture sanity: idle by default"
+
+        status, _resolved, spy = _dispatch(state, ConsolidationAction.AUTO, monkeypatch=monkeypatch)
+
+        assert status == "started_resume"
+        assert spy.submitted == [app_module._run_pending_event_resume]
+
+    def test_a_withheld_main_tier_does_not_block_a_quarantined_pending_resume(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """The tier-unverified gate (``adapter_manifest_status``) lives
+        BELOW the resume-pending-first arm, so a main tier flagged
+        unverified never reaches a dispatch that resumes instead."""
+        from paramem.server.app import ConsolidationAction
+
+        _write_pending_ledger(tmp_path, event="interim")
+        state = _make_arbitrator_state(tmp_path, max_interim_count=7)
+        state["store_quarantine"] = dict(_CAUSE)
+        state["adapter_manifest_status"] = {
+            "episodic": {"status": "no_matching_slot", "severity": "red"}
+        }
+
+        status, _resolved, spy = _dispatch(state, ConsolidationAction.AUTO, monkeypatch=monkeypatch)
+
+        assert status == "started_resume"
+        assert spy.submitted == [app_module._run_pending_event_resume]
+
+    @pytest.mark.parametrize(
+        "field, value, expected",
+        [
+            ("migration", {"base_swap_active": True}, "deferred_base_swap_active"),
+            ("consolidating", True, "deferred_already_running"),
+            ("mode", "cloud-only", "deferred_cloud_only"),
+            ("background_trainer", None, "deferred_bg_training"),  # replaced below
+            ("migration", {"state": "TRIAL"}, "deferred_trial_active"),
+        ],
+        ids=[
+            "base_swap_active",
+            "already_running",
+            "cloud_only",
+            "bg_training",
+            "trial_active",
+        ],
+    )
+    def test_each_busy_guard_answers_before_a_quarantined_pending_resume(
+        self, tmp_path, monkeypatch, field, value, expected
+    ) -> None:
+        from paramem.server.app import ConsolidationAction
+
+        _write_pending_ledger(tmp_path, event="interim")
+        state = _make_arbitrator_state(tmp_path, max_interim_count=7)
+        state["store_quarantine"] = dict(_CAUSE)
+        if field == "background_trainer":
+            state["background_trainer"] = MagicMock(is_training=True)
+        else:
+            state[field] = value
+
+        status, _resolved, spy = _dispatch(state, ConsolidationAction.AUTO, monkeypatch=monkeypatch)
+
+        assert status == expected
+        assert spy.submitted == []
+
+    def test_the_idle_debounce_answers_before_a_quarantined_pending_resume(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        from paramem.server.app import ConsolidationAction
+
+        _write_pending_ledger(tmp_path, event="interim")
+        state = _make_arbitrator_state(tmp_path, max_interim_count=7)
+        state["store_quarantine"] = dict(_CAUSE)
+        state["last_model_use_monotonic"] = time.monotonic() - 5  # < 30s debounce
+
+        status, _resolved, spy = _dispatch(state, ConsolidationAction.AUTO, monkeypatch=monkeypatch)
+
+        assert status == "deferred_model_in_use"
+        assert spy.submitted == []
 
 
 # ---------------------------------------------------------------------------
@@ -195,273 +293,6 @@ def _fake_lift_publishes(monkeypatch, new_store) -> list:
 
     monkeypatch.setattr(app_module, "_lift_quarantined_store", _fake_lift)
     return calls
-
-
-class TestQuarantinedPendingResumeHeal:
-    def test_quarantined_pending_dispatch_returns_started_resume(
-        self, tmp_path, monkeypatch
-    ) -> None:
-        """The arbitrator resumes instead of deferring on the quarantine
-        verdict when a pending ledger exists — executor-spy level, mirroring
-        every other pin in ``TestResumeArbitrationMatrix``
-        (``tests/server/test_consolidate_dispatch.py``): nothing the resume
-        submits is ever actually run here."""
-        from paramem.server.app import ConsolidationAction
-
-        _write_pending_ledger(tmp_path, event="interim")
-        state = _make_arbitrator_state(tmp_path, max_interim_count=7)
-        state["store_quarantine"] = dict(_CAUSE)
-
-        status, resolved, spy, _ = _dispatch(
-            state, ConsolidationAction.FULL, monkeypatch=monkeypatch
-        )
-
-        assert status == "started_resume"
-        assert resolved is ConsolidationAction.INTERIM
-        assert spy.submitted == [app_module._run_pending_event_resume]
-
-    def test_disk_venue_resume_heals_the_store(self, tmp_path, monkeypatch) -> None:
-        """A REAL, in-process disk-venue resume — the resume's own
-        ``all_live`` completion lifts the quarantine and rebinds the SAME
-        process-lifetime loop to the freshly published store, in place,
-        rather than nulling ``_state["consolidation_loop"]`` the way
-        ``POST /debug/erase-keys``/``POST /backup/restore`` do — this
-        caller's ``loop`` local is already captured by the finalizer
-        closure it is about to dispatch."""
-        from paramem.memory.store import MemoryStore
-        from paramem.training import stage_ledger as sl
-
-        loop, staged = _stage_pending_interim_event(tmp_path, venue="disk")
-        _wire_fakes(loop, monkeypatch)
-        state_dir = staged.state_dir
-
-        state = _make_resume_state(loop, tmp_path=tmp_path)
-        state["memory_store"] = None
-        state["store_quarantine"] = dict(_CAUSE)
-        monkeypatch.setattr(app_module, "_state", state)
-
-        new_store = MemoryStore()
-        lift_calls = _fake_lift_publishes(monkeypatch, new_store)
-
-        app_module._run_pending_event_resume()
-
-        assert lift_calls, "an all_live resumed event must attempt the lift"
-        assert app_module._state["memory_store"] is new_store
-        assert app_module._state["store_quarantine"] is None
-        assert loop.store is new_store, "the SAME cached loop is rebound in place"
-        assert sl.read_ledger(state_dir) is None, "the completed event's ledger is disposed"
-
-    def test_weights_venue_resume_heals_the_store(self, tmp_path, monkeypatch) -> None:
-        """Same heal, weights venue — the fake-driver seam
-        (``tests._fold_fixtures``) reaches ``_run_stage_b_cycle`` ->
-        ``BackgroundTrainer`` with no GPU touch at all: ``_train_tier_adapter``
-        and the recall gate are faked by ``_wire_fakes``, and
-        ``config.vram.cooldown_gate_threshold_c=0`` (set by
-        ``_fold_fixtures._make_state``) no-ops the thermal cooldown gate.
-        This is the in-process confirmation for the weights-venue heal path;
-        the live-hardware confirmation rides the existing U7 GPU batch."""
-        from paramem.memory.store import MemoryStore
-        from paramem.training import stage_ledger as sl
-
-        loop, staged = _stage_pending_interim_event(tmp_path, venue="weights")
-        _wire_fakes(loop, monkeypatch)
-        state_dir = staged.state_dir
-
-        state = _make_resume_state(loop, tmp_path=tmp_path)
-        state["memory_store"] = None
-        state["store_quarantine"] = dict(_CAUSE)
-        monkeypatch.setattr(app_module, "_state", state)
-
-        new_store = MemoryStore()
-        lift_calls = _fake_lift_publishes(monkeypatch, new_store)
-
-        _run_pending_event_resume_and_wait(state)
-
-        assert lift_calls, "an all_live resumed event must attempt the lift"
-        assert app_module._state["memory_store"] is new_store
-        assert app_module._state["store_quarantine"] is None
-        assert loop.store is new_store, "the SAME cached loop is rebound in place"
-        assert sl.read_ledger(state_dir) is None, "the completed event's ledger is disposed"
-
-    def test_failed_lift_leaves_quarantine_and_disposes_the_ledger(
-        self, tmp_path, monkeypatch
-    ) -> None:
-        """A ``False``-returning lift needs no retry logic of its own: the
-        completed event's ledger is disposed regardless — disposal is gated
-        on the event's own ``completed`` verdict, not on the lift outcome —
-        quarantine stays set with the fresh cause the failed lift itself
-        recorded, and the NEXT dispatch simply defers on the still-quarantined
-        store: no pending record is left for it to resume instead."""
-        from paramem.server.app import ConsolidationAction
-        from paramem.training import stage_ledger as sl
-
-        loop, staged = _stage_pending_interim_event(tmp_path, venue="disk")
-        _wire_fakes(loop, monkeypatch)
-        state_dir = staged.state_dir
-
-        state = _make_resume_state(loop, tmp_path=tmp_path)
-        state["memory_store"] = None
-        state["store_quarantine"] = dict(_CAUSE)
-        monkeypatch.setattr(app_module, "_state", state)
-        monkeypatch.setattr(app_module, "_lift_quarantined_store", lambda config: False)
-
-        app_module._run_pending_event_resume()
-
-        assert sl.read_ledger(state_dir) is None, "completion disposes the ledger regardless"
-        assert app_module._state["store_quarantine"] is not None
-        assert app_module._state["memory_store"] is None
-
-        next_state = _make_arbitrator_state(tmp_path, max_interim_count=7)
-        next_state["store_quarantine"] = dict(_CAUSE)
-        status, _resolved, spy, _ = _dispatch(
-            next_state, ConsolidationAction.FULL, monkeypatch=monkeypatch
-        )
-
-        assert status == "deferred_store_quarantined"
-        assert spy.submitted == []
-
-    @pytest.mark.parametrize(
-        "mutate,expected",
-        [
-            (lambda s: s.update(migration={"base_swap_active": True}), "deferred_base_swap_active"),
-            (lambda s: s.update(consolidating=True), "deferred_already_running"),
-            (lambda s: s.update(mode="cloud-only"), "deferred_cloud_only"),
-            (
-                lambda s: s.update(background_trainer=MagicMock(is_training=True)),
-                "deferred_bg_training",
-            ),
-            (lambda s: s.update(migration={"state": "TRIAL"}), "deferred_trial_active"),
-        ],
-        ids=[
-            "base_swap_active",
-            "already_running",
-            "cloud_only",
-            "bg_training",
-            "trial_active",
-        ],
-    )
-    def test_each_dispatch_guard_beats_a_quarantined_and_pending_dispatch(
-        self, tmp_path, monkeypatch, mutate, expected
-    ) -> None:
-        """Every one of the five ``_consolidation_dispatch_guards`` arms
-        still fires ahead of resume-pending-first — the guards are checked
-        first in the arbitrator's own order (step 1), unconditionally,
-        regardless of what a pending ledger or a quarantine below it need."""
-        from paramem.server.app import ConsolidationAction
-
-        _write_pending_ledger(tmp_path, event="interim")
-        state = _make_arbitrator_state(tmp_path, max_interim_count=7)
-        state["store_quarantine"] = dict(_CAUSE)
-        mutate(state)
-
-        status, _resolved, spy, _ = _dispatch(
-            state, ConsolidationAction.FULL, monkeypatch=monkeypatch
-        )
-
-        assert status == expected
-        assert spy.submitted == []
-
-    def test_idle_debounce_beats_a_quarantined_and_pending_dispatch(
-        self, tmp_path, monkeypatch
-    ) -> None:
-        """The idle debounce (step 2) sits ahead of BOTH resume-pending-first
-        (step 3) and the store-quarantine verdict (step 4): a recent chat
-        turn defers even when a pending ledger exists on a quarantined
-        store — nothing is submitted, and ``_run_pending_event_resume``
-        never dispatches."""
-        import time as _time
-
-        from paramem.server.app import ConsolidationAction
-
-        _write_pending_ledger(tmp_path, event="interim")
-        state = _make_arbitrator_state(tmp_path, max_interim_count=7)
-        state["store_quarantine"] = dict(_CAUSE)
-        state["last_chat_monotonic"] = _time.monotonic() - 5  # debounce is 30 s
-
-        status, _resolved, spy, _ = _dispatch(
-            state, ConsolidationAction.FULL, monkeypatch=monkeypatch
-        )
-
-        assert status == "deferred_idle"
-        assert spy.submitted == []
-        assert app_module._run_pending_event_resume not in spy.submitted
-
-    def test_raising_lift_disk_venue_still_finalizes(self, tmp_path, monkeypatch) -> None:
-        """A lift that RAISES (not merely returns ``False``) on the disk
-        venue is caught inside ``_finish_resumed_event`` — the finalizer
-        still runs, ``consolidating`` clears, and the ledger disposes: no
-        wedge. Mirrors ``test_failed_lift_leaves_quarantine_and_disposes_the_ledger``'s
-        shape for the raising case."""
-        from paramem.training import stage_ledger as sl
-
-        loop, staged = _stage_pending_interim_event(tmp_path, venue="disk")
-        _wire_fakes(loop, monkeypatch)
-        state_dir = staged.state_dir
-
-        state = _make_resume_state(loop, tmp_path=tmp_path)
-        state["memory_store"] = None
-        state["store_quarantine"] = dict(_CAUSE)
-        monkeypatch.setattr(app_module, "_state", state)
-        monkeypatch.setattr(
-            app_module,
-            "_lift_quarantined_store",
-            MagicMock(side_effect=RuntimeError("boom")),
-        )
-
-        app_module._run_pending_event_resume()
-
-        assert app_module._state["consolidating"] is False
-        assert sl.read_ledger(state_dir) is None, "completion disposes the ledger regardless"
-        assert app_module._state["store_quarantine"] is not None
-        assert app_module._state["memory_store"] is None
-
-    def test_raising_lift_weights_venue_still_finalizes(self, tmp_path, monkeypatch) -> None:
-        """Same as the disk-venue raising-lift pin above, weights venue: the
-        lift runs bare (no gpu_lock re-acquisition) inside
-        ``_run_stage_b_cycle``'s worker, raises, is caught, and the
-        finalizer still completes normally."""
-        from paramem.training import stage_ledger as sl
-
-        loop, staged = _stage_pending_interim_event(tmp_path, venue="weights")
-        _wire_fakes(loop, monkeypatch)
-        state_dir = staged.state_dir
-
-        state = _make_resume_state(loop, tmp_path=tmp_path)
-        state["memory_store"] = None
-        state["store_quarantine"] = dict(_CAUSE)
-        monkeypatch.setattr(app_module, "_state", state)
-        monkeypatch.setattr(
-            app_module,
-            "_lift_quarantined_store",
-            MagicMock(side_effect=RuntimeError("boom")),
-        )
-
-        _run_pending_event_resume_and_wait(state)
-
-        assert app_module._state["consolidating"] is False
-        assert sl.read_ledger(state_dir) is None, "completion disposes the ledger regardless"
-        assert app_module._state["store_quarantine"] is not None
-        assert app_module._state["memory_store"] is None
-
-    def test_tier_unverified_does_not_block_a_pending_resume(self, tmp_path, monkeypatch) -> None:
-        """A cold-born main tier (``registry_unverified``, one of
-        ``BINDING_ROW_STATUSES``) does not block a pending event's resume —
-        the tier-unverified gate (step 5) sits BELOW resume-pending-first
-        (step 3) now, since a resume never re-stages and so never touches
-        the merger's cross-tier identity space the gate exists to protect."""
-        from paramem.server.app import ConsolidationAction
-
-        _write_pending_ledger(tmp_path, event="interim")
-        state = _make_arbitrator_state(tmp_path, max_interim_count=7)
-        state["adapter_manifest_status"] = {"episodic": {"status": "registry_unverified"}}
-
-        status, resolved, spy, _ = _dispatch(
-            state, ConsolidationAction.FULL, monkeypatch=monkeypatch
-        )
-
-        assert status == "started_resume"
-        assert resolved is ConsolidationAction.INTERIM
-        assert spy.submitted == [app_module._run_pending_event_resume]
 
 
 class TestQuarantineLiftGpuLock:
@@ -620,6 +451,8 @@ class TestAdminDoorsServeThroughQuarantine:
         cfg.adapters.semantic.enabled = False
         cfg.adapters.procedural.enabled = False
         cfg.consolidation.refresh_cadence = ""
+        cfg.consolidation.interim_resume = "immediate"
+        cfg.consolidation.full_window = "01:00-04:00"
         cfg.consolidation.consolidation_period_string = ""
         cfg.consolidation.max_interim_count = 0
         cfg.consolidation.mode = "train"

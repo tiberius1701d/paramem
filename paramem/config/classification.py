@@ -97,6 +97,8 @@ CLASSIFICATION: Final[dict[str, Tier]] = {
     "adapters.*.target_modules": Tier.DESTRUCTIVE,
     # --- consolidation ---
     "consolidation.refresh_cadence": Tier.PIPELINE_ALTERING,
+    "consolidation.interim_resume": Tier.OPERATIONAL,
+    "consolidation.full_window": Tier.OPERATIONAL,
     "consolidation.mode": Tier.PIPELINE_ALTERING,
     "consolidation.promotion_threshold": Tier.PIPELINE_ALTERING,
     "consolidation.retain_sessions": Tier.DESTRUCTIVE,

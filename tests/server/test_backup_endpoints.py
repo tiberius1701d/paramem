@@ -536,7 +536,19 @@ class TestRestoreHappyPathConfig:
             stamp="20260101T0000",
             tiers={"episodic": {"adapter": "episodic", "pre_sha": "a", "scratch": str(scratch)}},
         )
-        sl.write_stages(state_dir, ledger, [])
+        sl.write_stages(
+            state_dir,
+            ledger,
+            [
+                sl.extraction_stage(
+                    completed_at="2026-01-01T00:00:00+00:00",
+                    sessions=[],
+                    episodic_rels=0,
+                    procedural_rels=0,
+                    artifacts=[],
+                )
+            ],
+        )
 
         resp = client.post("/backup/restore", json={"backup_id": backup_id})
 
@@ -605,7 +617,19 @@ class TestPendingConsolidationEventBundleRestoreDisposesLedger:
             stamp="20260101T0000",
             tiers={"episodic": {"adapter": "episodic", "pre_sha": "a", "scratch": str(scratch)}},
         )
-        sl.write_stages(state_dir, ledger, [])
+        sl.write_stages(
+            state_dir,
+            ledger,
+            [
+                sl.extraction_stage(
+                    completed_at="2026-01-01T00:00:00+00:00",
+                    sessions=[],
+                    episodic_rels=0,
+                    procedural_rels=0,
+                    artifacts=[],
+                )
+            ],
+        )
         record_incident(
             state_dir,
             type="consolidation_resume_blocked",

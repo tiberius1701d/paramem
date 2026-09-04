@@ -49,6 +49,7 @@ import json
 import logging
 import shutil
 from dataclasses import dataclass, field, replace
+from datetime import datetime
 from pathlib import Path
 from typing import Sequence
 
@@ -84,6 +85,35 @@ class StageLedgerVersionUnsupported(RuntimeError):
             f"stage_ledger: {path} has unsupported version {version!r} "
             f"(supported: {sorted(_SUPPORTED_VERSIONS)})"
         )
+
+
+class StageLedgerUnreadable(RuntimeError):
+    """A ledger file is present and this process cannot interpret it.
+
+    Raised by :func:`read_ledger` for each way a present file fails: a
+    payload that does not decode (``cause="undecodable"``); an age envelope
+    this process cannot open -- no daily identity loaded, or a foreign
+    envelope (``cause="unopenable"``); and a payload that decodes but is
+    not a ledger of this schema (``cause="not_a_ledger"``) -- a non-object
+    top-level payload, a missing or ill-typed head field, an unrecognised
+    ``event``, a stage entry that is not an object or is missing a
+    required field for its kind, an extraction stage whose
+    ``completed_at`` does not parse as ISO-8601, or a ledger carrying no
+    extraction stage entry at all (see :func:`_from_dict`'s own check --
+    every ledger this build writes carries one from its very first write).
+    Reporting "nothing pending" over a record this process cannot read
+    would let a fresh staging pass clear the extraction tree that record
+    still names, so none of these fold into ``read_ledger``'s ``None``
+    outcome -- ``None`` means the file is absent, never that it could not
+    be read.  :func:`dispose` deliberately bypasses this gate the same way
+    it bypasses :class:`StageLedgerVersionUnsupported`'s -- discarding a
+    record an operator cannot interpret is the intended escape hatch.
+    """
+
+    def __init__(self, *, path: Path, cause: str) -> None:
+        self.path = path
+        self.cause = cause
+        super().__init__(f"stage_ledger: {path} is present but unreadable ({cause})")
 
 
 @dataclass(frozen=True)
@@ -321,18 +351,76 @@ def _to_dict(ledger: StageLedger) -> dict:
 
 _EVENT_VOCABULARY: frozenset = frozenset({"interim", "full", "reconcile"})
 
+# The field set each stage-entry builder always writes (extraction_stage,
+# tier_written_stage, tier_live_stage) -- the one place this module's read
+# side names what its own write side promises, so a shape gate can check a
+# stage entry against the SAME contract its writer honours rather than a
+# second, independently-maintained list.  A stage entry missing one of its
+# kind's fields, or naming a "stage" outside this table at all, is not a
+# shape this module ever wrote.
+_STAGE_KIND_REQUIRED_FIELDS: "dict[str, tuple[str, ...]]" = {
+    "extraction": ("completed_at", "sessions", "episodic_rels", "procedural_rels", "artifacts"),
+    "tier_written": ("tier", "completed_at", "slot", "artifacts"),
+    "tier_live": ("tier", "completed_at", "artifacts"),
+}
+
+
+def _validate_stage_entry(entry: object) -> None:
+    """Raise ``ValueError`` when *entry* is not a stage entry this module wrote.
+
+    Every stage entry a resumed dispatch dereferences (``.get("stage")``,
+    ``.get("tier")``, and — for the extraction entry specifically —
+    ``["completed_at"]``, parsed as ISO-8601) must be checked HERE, at read
+    time, rather than at each of the several call sites that dereference
+    it: one gate that raises loud beats six call sites that each discover
+    the same corrupt shape as a different, uncaught exception.  A
+    non-``dict`` entry, an unrecognised ``"stage"`` kind, a missing
+    required field for its kind (:data:`_STAGE_KIND_REQUIRED_FIELDS`), or —
+    for an ``"extraction"`` entry — a ``completed_at`` that does not parse
+    with :meth:`datetime.datetime.fromisoformat` all raise.
+    """
+    if not isinstance(entry, dict):
+        raise ValueError(f"stage_ledger: a stage entry is not an object: {entry!r}")
+    stage_kind = entry.get("stage")
+    required = _STAGE_KIND_REQUIRED_FIELDS.get(stage_kind)
+    if required is None:
+        raise ValueError(f"stage_ledger: stage entry has unrecognised stage kind {stage_kind!r}")
+    missing = [key for key in required if key not in entry]
+    if missing:
+        raise ValueError(f"stage_ledger: {stage_kind!r} stage entry missing field(s) {missing}")
+    if stage_kind == "extraction":
+        completed_at = entry["completed_at"]
+        try:
+            datetime.fromisoformat(completed_at)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"stage_ledger: extraction stage completed_at {completed_at!r} "
+                "does not parse as ISO-8601"
+            ) from exc
+
 
 def _from_dict(data: dict) -> StageLedger:
     event = data["event"]
     if event not in _EVENT_VOCABULARY:
         raise ValueError(f"stage_ledger: event {event!r} is not one of {sorted(_EVENT_VOCABULARY)}")
+    stages_raw = data.get("stages", [])
+    for entry in stages_raw:
+        _validate_stage_entry(entry)
+    if not any(entry.get("stage") == "extraction" for entry in stages_raw):
+        # Never a legitimate on-disk shape: write_stages' only creation call
+        # site (ConsolidationLoop.stage_event) always writes the extraction
+        # entry as the ledger file's first-ever stage -- every later
+        # write_stages call appends to a ledger that already carries one.  A
+        # ledger with none is a corrupt record of the current schema, not a
+        # pre-extraction phase to tolerate.
+        raise ValueError("stage_ledger: no extraction stage entry")
     return StageLedger(
         version=data["version"],
         event=event,
         venue=data["venue"],
         stamp=data["stamp"],
         tiers=dict(data.get("tiers", {})),
-        stages=tuple(data.get("stages", [])),
+        stages=tuple(stages_raw),
         # Mandatory -- read_ledger()'s version gate only lets a payload
         # stamped CURRENT_VERSION reach here, and _to_dict always writes
         # this field for that version, so a payload missing it here is a
@@ -345,21 +433,32 @@ def _from_dict(data: dict) -> StageLedger:
 
 
 def read_ledger(state_dir: Path) -> "StageLedger | None":
-    """Read and parse the ledger at ``state_dir``, or ``None`` when it cannot answer.
+    """Read and parse the ledger at ``state_dir``.
 
-    ``None`` covers three conditions, all treated identically by every
-    caller: the file is absent; the file is unparseable; the file is an age
-    envelope this process cannot open (no daily identity loaded, or a
-    foreign envelope). An unopenable ledger is indistinguishable from no
-    ledger for every decision made here — the artifacts it would name are
-    equally unreadable, and its transcripts were never retired.
-
-    A fourth condition is NOT folded into ``None``: a payload whose
+    ``None`` means ABSENT — no file at ``state_dir``, or the file gone
+    between the existence check and the read (a race with a concurrent
+    disposer, not a corrupt record). Every present-file outcome that this
+    process cannot interpret raises rather than answering ``None``: a
+    payload that does not decode; an age envelope this process cannot open
+    (no daily identity loaded, or a foreign envelope); and a payload that
+    decodes but is not a ledger of this schema — a non-object top-level
+    payload, a missing or ill-typed head field, an unrecognised ``event``,
+    a stage entry that is not an object, one missing a required field for
+    its kind, an extraction stage whose ``completed_at`` does not parse as
+    ISO-8601, or a ledger carrying no extraction stage entry at all (every
+    ledger this build writes carries one from its very first write) — all
+    raise :class:`StageLedgerUnreadable`, naming the cause. A payload whose
     ``version`` is not in :data:`_SUPPORTED_VERSIONS` raises
-    :class:`StageLedgerVersionUnsupported` — see that class's docstring for
-    why. Every other condition never raises on content; logged at WARNING
-    with the path for the two parse-failure conditions (never logged for
-    plain absence).
+    :class:`StageLedgerVersionUnsupported` instead — see that class's
+    docstring for why it is kept distinct from the other four, and note the
+    version gate runs only once the payload is confirmed to be an object at
+    all: a top-level JSON array or string is ``StageLedgerUnreadable``, not
+    an unsupported version. Reporting "nothing pending" over a record this
+    process cannot read would let a fresh staging pass clear the extraction
+    tree that record still names — an unopenable or unparseable ledger is
+    exactly as pending as a readable one, just illegible right now. Every
+    raise — both classes — is logged at WARNING with the path first (never
+    logged for plain absence).
     """
     from paramem.backup.encryption import read_maybe_encrypted
 
@@ -373,22 +472,38 @@ def read_ledger(state_dir: Path) -> "StageLedger | None":
         return None
     except (json.JSONDecodeError, TypeError, ValueError) as exc:
         logger.warning("stage_ledger: %s is not a parseable ledger — %s", path, exc)
-        return None
+        raise StageLedgerUnreadable(path=path, cause="undecodable") from exc
     except Exception as exc:  # noqa: BLE001 — includes RuntimeError (no daily
         # identity) and pyrage.DecryptError (foreign envelope); both are
-        # equally "cannot open right now", never a raise out of this reader.
+        # equally "cannot open right now".
         logger.warning("stage_ledger: %s could not be opened — %s", path, exc)
-        return None
+        raise StageLedgerUnreadable(path=path, cause="unopenable") from exc
 
-    version = data.get("version") if isinstance(data, dict) else None
+    if not isinstance(data, dict):
+        # A top-level JSON array, string, number, or null is not a ledger of
+        # any version -- checked before the version gate so it never reads
+        # as "unsupported version None" (data.get("version") on a non-dict
+        # would itself raise AttributeError for a list/str payload).
+        logger.warning(
+            "stage_ledger: %s does not contain a ledger object — got %s", path, type(data)
+        )
+        raise StageLedgerUnreadable(path=path, cause="not_a_ledger")
+
+    version = data.get("version")
     if version not in _SUPPORTED_VERSIONS:
+        logger.warning(
+            "stage_ledger: %s has unsupported version %r (supported: %s)",
+            path,
+            version,
+            sorted(_SUPPORTED_VERSIONS),
+        )
         raise StageLedgerVersionUnsupported(path=path, version=version)
 
     try:
         return _from_dict(data)
     except (KeyError, TypeError, ValueError) as exc:
         logger.warning("stage_ledger: %s is not a parseable ledger — %s", path, exc)
-        return None
+        raise StageLedgerUnreadable(path=path, cause="not_a_ledger") from exc
 
 
 def write_stages(state_dir: Path, ledger: StageLedger, stages: "Sequence[dict]") -> None:
@@ -460,12 +575,13 @@ def dispose(state_dir: Path) -> bool:
     recomputed here.
 
     Reads the raw ledger payload directly — bypassing :func:`read_ledger`'s
-    ``version`` gate, since discarding a record this process cannot
-    interpret is precisely the escape hatch that gate exists to preserve
-    (see :class:`StageLedgerVersionUnsupported`). A payload this function
-    cannot parse at all still has its ledger file removed (the record
-    itself is gone), but nothing else can be named from it — logged at
-    WARNING rather than raised.
+    ``version`` gate and its unreadable-payload raise alike, since
+    discarding a record this process cannot interpret is precisely the
+    escape hatch both gates exist to preserve (see
+    :class:`StageLedgerVersionUnsupported` and :class:`StageLedgerUnreadable`).
+    A payload this function cannot parse at all still has its ledger file
+    removed (the record itself is gone), but nothing else can be named
+    from it — logged at WARNING rather than raised.
 
     Deletes, in order: ``ledger_path(state_dir)``; the WHOLE
     ``<state_dir>/extraction/`` tree (every event kind under it, not only

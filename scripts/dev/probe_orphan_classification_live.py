@@ -272,7 +272,7 @@ def _build_test_config() -> Path:
     cfg["consolidation"]["orphan_retirement"] = "every 1m"
     # Disable the idle debounce so the tick runs immediately after we inject
     # chats — otherwise _dispatch_consolidation returns
-    # "deferred_idle" (chat too recent) and never reaches classification.
+    # "deferred_model_in_use" (chat too recent) and never reaches classification.
     cfg["consolidation"]["training_idle_debounce_s"] = 0
 
     # Speaker: enabled so SpeakerStore loads the pre-seeded profile.

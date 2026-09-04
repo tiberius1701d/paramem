@@ -212,7 +212,7 @@ def _make_probe_state(*, mode: str = "cloud-only") -> dict:
         "memory_store": MagicMock(),
         "background_trainer": None,
         "effective_mode": None,
-        "last_chat_monotonic": 0.0,
+        "last_model_use_monotonic": 0.0,
         "user_token_store": None,
     }
 

@@ -723,3 +723,71 @@ class TestSecurityFooter:
         assert line == "  Security: -"
         assert "age daily" not in result.stdout
         assert "plaintext" not in result.stdout
+
+
+class TestScheduleWindowsAndPendingEvent:
+    """The Schedule block's ``full_window``/``interim_resume`` line, and the
+    pending consolidation event that straddles the Consol: line (kind/since)
+    and the Schedule: block's own next-resume-opportunity sub-line."""
+
+    def test_no_pending_event_renders_windows_with_no_pending_line(self):
+        """No pending-event keys on the payload → the windows line renders
+        the operator's own settings verbatim and neither the Consol: nor the
+        Schedule: pending sub-lines appear."""
+        status = dict(_BASE_STATUS)
+        status["full_window"] = "01:00-04:00"
+        status["interim_resume"] = "immediate"
+        result = _run_pstatus(status)
+        line = _line_with_prefix(result.stdout, "            full_window")
+        assert line == "            full_window 01:00-04:00 · interim_resume immediate"
+        assert "pending event resumes in" not in result.stdout
+        assert "pending interim since" not in result.stdout
+        assert "pending record unreadable" not in result.stdout
+
+    def test_pending_interim_reports_since_on_consol_and_resume_eta_once_on_schedule(self):
+        """A pending interim event: the Consol: block reports kind and
+        since-when with no ETA on that line, and the Schedule: block reports
+        the resume ETA exactly once in the whole output."""
+        status = dict(_BASE_STATUS)
+        status["pending_event_kind"] = "interim"
+        status["pending_event_since"] = "2026-09-04T10:00:00+00:00"
+        status["pending_event_next_seconds"] = 754
+        result = _run_pstatus(status)
+        stripped_lines = [_strip_ansi(line) for line in result.stdout.splitlines()]
+        pending_lines = [
+            line for line in stripped_lines if "pending interim since 2026-09-04 10:00" in line
+        ]
+        assert len(pending_lines) == 1
+        assert "resumes in" not in pending_lines[0]
+        assert sum(1 for line in stripped_lines if "pending event resumes in 12m34s" in line) == 1
+
+    def test_unreadable_pending_event_reports_no_resume_eta(self):
+        """A pending event whose ledger this build could not decode reports
+        'pending record unreadable' and no resume ETA anywhere in the
+        output."""
+        status = dict(_BASE_STATUS)
+        status["pending_event_kind"] = "unreadable"
+        result = _run_pstatus(status)
+        assert "pending record unreadable" in result.stdout
+        assert "resumes in" not in result.stdout
+
+    def test_payload_missing_all_five_schedule_keys_renders_dashes_and_exits_clean(self):
+        """A payload lacking full_window/interim_resume/pending_event_kind/
+        pending_event_since/pending_event_next_seconds entirely → the
+        windows line renders dashes and the script still exits 0."""
+        status = {
+            k: v
+            for k, v in _BASE_STATUS.items()
+            if k
+            not in (
+                "full_window",
+                "interim_resume",
+                "pending_event_kind",
+                "pending_event_since",
+                "pending_event_next_seconds",
+            )
+        }
+        result = _run_pstatus(status)
+        assert result.returncode == 0
+        line = _line_with_prefix(result.stdout, "            full_window")
+        assert line == "            full_window - · interim_resume -"

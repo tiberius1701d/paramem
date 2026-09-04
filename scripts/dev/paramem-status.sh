@@ -368,6 +368,16 @@ fields = {
     "next_run": fmt_duration(d.get("next_run_seconds")),
     "next_interim": fmt_duration(d.get("next_interim_seconds")),
     "next_full": fmt_duration(d.get("next_full_consolidation_seconds")),
+    # consolidation.full_window / consolidation.interim_resume, verbatim —
+    # the operator's own schedule settings.
+    "full_window": d.get("full_window") or "-",
+    "interim_resume": d.get("interim_resume") or "-",
+    # The pending consolidation event (kind, since, next resume opportunity),
+    # or "-" when nothing is pending. Missing keys render the same as a
+    # present-but-null value.
+    "pending_event_kind": d.get("pending_event_kind") or "-",
+    "pending_event_since": d.get("pending_event_since") or "-",
+    "pending_event_next": fmt_duration(d.get("pending_event_next_seconds")),
     "scheduler_started": d.get("scheduler_started", False),
     "orphaned": d.get("orphaned_pending", 0),
     "oldest_age": fmt_duration(d.get("oldest_pending_seconds")),
@@ -460,6 +470,8 @@ print("|".join(str(fields[k]) for k in [
     "pending_rehydration", "effective_mode",
     "migration_completed_tiers", "migration_failed_tiers",
     "next_full",
+    "full_window", "interim_resume",
+    "pending_event_kind", "pending_event_since", "pending_event_next",
     "vram_used_mib", "vram_total_mib", "vram_paramem_mib",
 ]))
 # VRAM component lines: VRAM_COMP<TAB>component<TAB>mib
@@ -554,6 +566,8 @@ IFS='|' read -r mode cloud_only_reason model model_id_short model_device \
     pending_rehydration effective_mode \
     migration_completed_tiers migration_failed_tiers \
     next_full \
+    full_window interim_resume \
+    pending_event_kind pending_event_since pending_event_next \
     vram_used_mib vram_total_mib vram_paramem_mib \
     <<< "$(echo "$parsed" | head -1)"
 speaker_lines=$(echo "$parsed" | awk '/^SPK\t/')
@@ -593,6 +607,16 @@ fmt_duration_inline() {
         echo "${m}m"
     else
         echo "${s}s"
+    fi
+}
+
+# Compact an ISO-8601 timestamp to "YYYY-MM-DD HH:MM" for display — strips
+# seconds, any fractional part, and a trailing "Z"/UTC-offset suffix. Shared
+# by every timestamp field the renderer shows (the pending event's "since",
+# the backup footer's success/failure/next times).
+fmt_ts() {
+    if [[ -z "$1" || "$1" == "-" ]]; then echo ""; else
+        echo "$1" | sed 's/T/ /; s/:[0-9][0-9]\(\.[0-9]*\)\?\(Z\|+.*\)\?$//'
     fi
 }
 
@@ -943,6 +967,20 @@ else
     echo -e "  Consol:   ${consol_line}"
 fi
 
+# Pending consolidation event: kind and since-when — present only while a
+# stage ledger is on disk waiting to resume (Consol: above reports the last
+# COMPLETED run; this is what is still outstanding). Its next resume
+# opportunity is reported once, under Schedule: below, beside the windows
+# that govern it.
+if [[ "$pending_event_kind" != "-" && -n "$pending_event_kind" ]]; then
+    if [[ "$pending_event_kind" == "unreadable" ]]; then
+        echo -e "            ${YELLOW}pending record unreadable${RESET}"
+    else
+        pending_since_disp=$(fmt_ts "$pending_event_since")
+        echo -e "            pending ${CYAN}${pending_event_kind}${RESET} since ${DIM}${pending_since_disp}${RESET}"
+    fi
+fi
+
 # Background trainer
 if [[ "$bg_trainer_active" == "True" ]]; then
     echo -e "  BG Train: ${GREEN}training${RESET} (${CYAN}${bg_trainer_adapter}${RESET})"
@@ -979,11 +1017,14 @@ if [[ "$throttle_mode" != "-" && -n "$throttle_mode" ]]; then
 fi
 
 # Scheduler — show interim cadence + derived full-cycle period.
-# Two separate "next" markers:
-#   - next interim: deterministic cadence boundary from midnight (when
-#     post_session_train rolls over to a new interim adapter stamp).
-#   - next full:    wall-clock time of the next systemd timer tick (the
-#     full-consolidation cycle = refresh_cadence × max_interim_count).
+# Three "next" markers, plus the pending event when one is waiting:
+#   - next interim: the next interim cadence mark (schedule_grammar.next_mark).
+#   - next full:    the first full_window opening at which a full fold would
+#     start, or — without a ring (max_interim_count == 0) — the next cadence
+#     mark, same as next interim.
+#   - full_window / interim_resume: the operator's own window settings.
+#   - the pending event's own next resume opportunity, when one is pending
+#     (see the Consol: line above for its kind and since-when).
 if [[ "$refresh_cadence" == "-" || -z "$refresh_cadence" ]]; then
     echo -e "  Schedule: ${DIM}manual only${RESET} (mode: ${mode_config})"
 else
@@ -1018,6 +1059,15 @@ else
         # Fallback: show legacy next_run from systemd timer tick.
         echo -e "            next full   in ${CYAN}${next_run}${RESET} ${DIM}(systemd tick)${RESET}"
     fi
+fi
+# full_window / interim_resume are independent of refresh_cadence (a ring
+# can drain at the window even with the cadence off), so this line renders
+# regardless of the manual-only branch above.
+echo -e "            full_window ${CYAN}${full_window}${RESET} · interim_resume ${CYAN}${interim_resume}${RESET}"
+# The pending event's own next resume opportunity — see the Consol: line
+# above for its kind and since-when.
+if [[ "$pending_event_kind" != "-" && -n "$pending_event_kind" && "$pending_event_next" != "-" ]]; then
+    echo -e "            pending event resumes in ${CYAN}${pending_event_next}${RESET}"
 fi
 
 # Pending enrollments
@@ -1157,12 +1207,6 @@ if [[ -n "$backup_line" ]]; then
     bk_used_gb=$(fmt_gb "${bk_used_bytes:-0}")
     bk_cap_gb=$(fmt_gb "${bk_cap_bytes:-0}")
 
-    # Compact ISO timestamps to "YYYY-MM-DD HH:MM" for display.
-    fmt_ts() {
-        if [[ -z "$1" ]]; then echo ""; else
-            echo "$1" | sed 's/T/ /; s/:[0-9][0-9]\(\.[0-9]*\)\?\(Z\|+.*\)\?$//'
-        fi
-    }
     bk_last_ok_disp=$(fmt_ts "$bk_last_ok")
     bk_last_fail_disp=$(fmt_ts "$bk_last_fail")
     bk_next_disp=$(fmt_ts "$bk_next")

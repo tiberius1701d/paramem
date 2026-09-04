@@ -1,6 +1,7 @@
 """Shared ``app._state`` builders for the endpoint-guard test family.
 
-``_write_pending_ledger`` seeds a bare pending stage ledger on disk — the
+``_write_pending_ledger`` seeds a readable pending stage ledger on disk (head plus
+its extraction entry) — the
 shape every "refuses with a pending record" pin across the guarded doors
 needs.  The per-door ``_make_*_state`` builders are each door's own minimal
 ``app._state`` dict factory, promoted here so
@@ -10,10 +11,12 @@ another test module; each door's own test file re-imports its builder back
 under its original local name.
 
 Consumers: ``tests/server/test_consolidate_dispatch.py``,
-``tests/server/test_speaker_forget.py``,
-``tests/server/test_debug_erase_keys_endpoint.py``,
+``tests/server/test_ingest_endpoint.py``,
 ``tests/server/test_interim_discard.py``,
-``tests/server/test_ingest_endpoint.py``.
+``tests/server/test_idle_watch.py``,
+``tests/server/test_pending_event_head.py``,
+``tests/server/test_status_observability.py``,
+``tests/test_app_lifespan.py``.
 """
 
 from __future__ import annotations
@@ -41,7 +44,14 @@ def _write_pending_ledger(tmp_path, *, event: str) -> None:
         stamp="20260101T0000",
         tiers={"episodic": {"adapter": "episodic", "pre_sha": ""}},
     )
-    sl.write_stages(state_dir, ledger, [])
+    extraction = sl.extraction_stage(
+        completed_at="2026-01-01T00:00:00+00:00",
+        sessions=[],
+        episodic_rels=0,
+        procedural_rels=0,
+        artifacts=[],
+    )
+    sl.write_stages(state_dir, ledger, [extraction])
 
 
 # ---------------------------------------------------------------------------

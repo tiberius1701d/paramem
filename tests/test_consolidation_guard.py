@@ -108,7 +108,7 @@ class TestEndpointGuards:
 
         state = self._make_state("LIVE")
 
-        def _fake_dispatch(action):
+        def _fake_dispatch(action, *, reason, spec=None):
             # /scheduled-tick is the schedule's door: AUTO is what carries the
             # suspend/power-off catch-up gate.
             assert action is app_module.ConsolidationAction.AUTO

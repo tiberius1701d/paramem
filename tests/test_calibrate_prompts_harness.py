@@ -740,7 +740,10 @@ class TestPostStageBackoffAndTerminalStatuses:
 
         deferred_response = MagicMock()
         deferred_response.status_code = 200
-        deferred_response.json.return_value = {"status": "deferred_idle", "action": "calibrate"}
+        deferred_response.json.return_value = {
+            "status": "deferred_model_in_use",
+            "action": "calibrate",
+        }
 
         started_response = MagicMock()
         started_response.status_code = 200

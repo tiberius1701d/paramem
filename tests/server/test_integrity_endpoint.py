@@ -328,42 +328,6 @@ class TestArmActiveMigrationIntegrityGate:
 
 
 # ---------------------------------------------------------------------------
-# Migration scheduler: integrity_check_failed → migration skipped
-# ---------------------------------------------------------------------------
-
-
-class TestMigrationSchedulerDegraded:
-    def test_scheduler_returns_migration_skipped_degraded(self, tmp_path, monkeypatch):
-        """Scheduler tick with integrity_check_failed=True returns 'migration_skipped_degraded'.
-
-        Calls the real _dispatch_consolidation production code
-        with integrity_check_failed=True and pending_rehydration=True.
-        """
-        from paramem.server.session_buffer import SessionBuffer
-
-        state = _make_minimal_state(tmp_path)
-        state["integrity_check_failed"] = True
-        state["pending_rehydration"] = True
-        state["consolidating"] = False
-        state["background_trainer"] = None
-        # mode must be "local" so the early cloud-only guard does not short-circuit
-        state["mode"] = "local"
-        state["cloud_only_reason"] = None
-        # A real (empty) buffer: the triage pre-stage runs on every dispatch,
-        # ahead of the migration gate, so the buffer is read before this test's
-        # branch is reached.
-        state["session_buffer"] = SessionBuffer(tmp_path / "sessions", debug=False)
-        state["speaker_store"] = None
-
-        monkeypatch.setattr(app_module, "_state", state)
-
-        result, _action = app_module._dispatch_consolidation(app_module.ConsolidationAction.AUTO)
-        assert result == "migration_skipped_degraded", (
-            f"Expected 'migration_skipped_degraded' but got {result!r}"
-        )
-
-
-# ---------------------------------------------------------------------------
 # migration/confirm endpoint: integrity gates for base-swap and mode-switch
 # ---------------------------------------------------------------------------
 

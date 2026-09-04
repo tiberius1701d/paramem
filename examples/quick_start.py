@@ -14,7 +14,7 @@ Two-stage flow
 - Resolve the test speaker via the before/after ``/status`` speaker-delta
   (exactly one new speaker; abort if 0 or >1).
 - Wait for the idle-debounce window, then call ``POST /consolidate/interim``;
-  handle ``deferred_idle`` retries; fail on ``noop_*`` (no sessions reached the
+  handle ``deferred_model_in_use`` retries; fail on ``noop_*`` (no sessions reached the
   buffer, or the deployment mints no interim slots).
 - Poll ``/status.consolidating`` until the background cycle finishes.
 - Assert: ``keys_count >= 6`` (extraction is non-deterministic — a floor is
@@ -78,7 +78,7 @@ Debounce wait
 After the last ``POST /chat`` the smoke sleeps ~35 s before calling
 ``POST /consolidate/interim``.  This satisfies the server's
 ``consolidation.training_idle_debounce_s`` (default 30 s).  If it returns
-``deferred_idle`` after the wait, the smoke retries up to 3 times.
+``deferred_model_in_use`` after the wait, the smoke retries up to 3 times.
 
 Usage::
 
@@ -108,10 +108,10 @@ _PROJECT_ROOT = Path(__file__).parent.parent
 
 # Debounce constant: must exceed consolidation.training_idle_debounce_s
 # (default 30 s, paramem/server/config.py).  The server returns
-# "deferred_idle" when a /chat happened less than debounce_s ago.
+# "deferred_model_in_use" when a /chat happened less than debounce_s ago.
 _DEBOUNCE_WAIT_S = 35
 
-# Maximum consolidation retry attempts after a "deferred_idle" reply.
+# Maximum consolidation retry attempts after a "deferred_model_in_use" reply.
 _CONSOLIDATE_MAX_RETRIES = 3
 
 # Generous poll timeout for the background cycle (30 min).
@@ -362,7 +362,7 @@ def _consolidate_and_wait(
 ) -> None:
     """Run debounce wait, POST /consolidate/interim, poll until the cycle finishes.
 
-    Flow: debounce sleep → POST /consolidate/interim (with ``deferred_idle``
+    Flow: debounce sleep → POST /consolidate/interim (with ``deferred_model_in_use``
     retries up to ``_CONSOLIDATE_MAX_RETRIES``) → fail on ``noop_*`` → poll
     ``/status.consolidating`` until False.
 
@@ -372,7 +372,7 @@ def _consolidate_and_wait(
     at ``0`` it answers ``noop_no_interim_tier`` and the smoke fails with that
     status rather than silently training nothing.
 
-    Exits non-zero on persistent ``deferred_idle``, on any ``noop_*`` status, or
+    Exits non-zero on persistent ``deferred_model_in_use``, on any ``noop_*`` status, or
     if the cycle does not finish within ``_POLL_TIMEOUT`` seconds.
 
     Parameters
@@ -406,9 +406,9 @@ def _consolidate_and_wait(
     time.sleep(_DEBOUNCE_WAIT_S)
 
     # ------------------------------------------------------------------
-    # POST /consolidate/interim — retry on deferred_idle.
+    # POST /consolidate/interim — retry on deferred_model_in_use.
     # ------------------------------------------------------------------
-    consolidate_status = "deferred_idle"
+    consolidate_status = "deferred_model_in_use"
     for attempt in range(1, _CONSOLIDATE_MAX_RETRIES + 1):
         if attempt > 1:
             print(
@@ -438,10 +438,10 @@ def _consolidate_and_wait(
             f"(attempt {attempt}/{_CONSOLIDATE_MAX_RETRIES})"
         )
 
-        if consolidate_status != "deferred_idle":
+        if consolidate_status != "deferred_model_in_use":
             break
 
-    if consolidate_status == "deferred_idle":
+    if consolidate_status == "deferred_model_in_use":
         print(
             f"[FAIL] {stage_label}: /consolidate/interim still returned "
             f"{consolidate_status!r} after {_CONSOLIDATE_MAX_RETRIES} attempt(s).\n"

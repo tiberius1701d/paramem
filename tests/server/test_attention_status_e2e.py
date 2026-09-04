@@ -45,6 +45,8 @@ def _base_config(tmp_path: Path) -> MagicMock:
     cfg.consolidation.refresh_cadence = ""
     cfg.consolidation.consolidation_period_string = ""
     cfg.consolidation.max_interim_count = 0
+    cfg.consolidation.interim_resume = "immediate"
+    cfg.consolidation.full_window = "01:00-04:00"
     cfg.consolidation.mode = "train"
     cfg.consolidation.quiet_hours_mode = "always_off"
     cfg.consolidation.quiet_hours_start = "00:00"

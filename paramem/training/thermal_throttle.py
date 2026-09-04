@@ -29,6 +29,8 @@ from typing import TYPE_CHECKING, Callable
 
 from transformers import TrainerCallback
 
+from paramem.server.schedule_grammar import InvalidWindow, Window
+
 if TYPE_CHECKING:
     from paramem.server.config import ConsolidationConfig
 
@@ -79,10 +81,13 @@ def is_thermal_policy_active(
 ) -> bool:
     """Pure predicate: is the thermal throttle active under this quiet-hours policy?
 
-    Re-exported by ``paramem.server.background_trainer`` so the ``/status``
-    endpoint can report policy state without a live trainer. Mode semantics in
-    ``ConsolidationScheduleConfig``. Invalid windows in ``auto`` mode fall
-    back to ``True`` (prefer-silence default).
+    Imported directly by ``paramem.server.app``'s ``/status`` endpoint so
+    policy state can be reported without a live trainer. Mode semantics in
+    ``ConsolidationScheduleConfig``. For ``"auto"``, containment is answered
+    by ``schedule_grammar.Window`` — the module's one time-of-day-window rule
+    — and a pair that names no window (out-of-range bounds, an equal pair, or
+    text that isn't ``HH:MM``) falls back to ``True`` (prefer-silence
+    default).
     """
     if mode == "always_off":
         return False
@@ -90,19 +95,10 @@ def is_thermal_policy_active(
         return True
     # mode == "auto"
     try:
-        sh, sm = (int(x) for x in start.split(":"))
-        eh, em = (int(x) for x in end.split(":"))
-    except Exception:
+        window = Window.from_hhmm(start, end)
+    except InvalidWindow:
         return True
-    t = (now or datetime.now()).time()
-    cur = t.hour * 60 + t.minute
-    s = sh * 60 + sm
-    e = eh * 60 + em
-    if s == e:
-        return True
-    if s < e:
-        return s <= cur < e
-    return cur >= s or cur < e
+    return window.contains(now)
 
 
 def _gpu_temp() -> int | None:

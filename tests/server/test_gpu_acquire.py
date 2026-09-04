@@ -495,6 +495,10 @@ def _make_config(stt_port=10300, tts_port=10301, sessions_path="/data/sessions",
     cfg = MagicMock()
     cfg.stt.port = stt_port
     cfg.tts.port = tts_port
+    cfg.consolidation.refresh_cadence = "12h"
+    cfg.consolidation.max_interim_count = 7
+    cfg.consolidation.interim_resume = "immediate"
+    cfg.consolidation.full_window = "01:00-04:00"
     cfg.paths.sessions = sessions_path
     cfg.paths.data = data_path
     cfg.source_path = None

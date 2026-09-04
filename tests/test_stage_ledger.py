@@ -75,7 +75,15 @@ class TestUnsupportedLedgerVersion:
             "venue": "weights",
             "stamp": "20260101T0000",
             "tiers": {"episodic": {"adapter": "episodic", "pre_sha": ""}},
-            "stages": [],
+            "stages": [
+                sl.extraction_stage(
+                    completed_at="2026-01-01T00:00:00+00:00",
+                    sessions=[],
+                    episodic_rels=0,
+                    procedural_rels=0,
+                    artifacts=[],
+                )
+            ],
             "absorbed_interim_tiers": [],
         }
         sl.ledger_path(state_dir).write_text(json.dumps(payload))
@@ -94,7 +102,15 @@ class TestUnsupportedLedgerVersion:
             "venue": "weights",
             "stamp": "20260101T0000",
             "tiers": {"episodic": {"adapter": "episodic", "pre_sha": ""}},
-            "stages": [],
+            "stages": [
+                sl.extraction_stage(
+                    completed_at="2026-01-01T00:00:00+00:00",
+                    sessions=[],
+                    episodic_rels=0,
+                    procedural_rels=0,
+                    artifacts=[],
+                )
+            ],
             "absorbed_interim_tiers": [],
         }
         sl.ledger_path(state_dir).write_text(json.dumps(payload))
@@ -378,7 +394,15 @@ class TestInterimScratchDirIsDisjointFromTierRoot:
             "tiers": {
                 adapter_name: {"adapter": adapter_name, "pre_sha": "", "scratch": str(scratch_dir)}
             },
-            "stages": [],
+            "stages": [
+                sl.extraction_stage(
+                    completed_at="2026-01-01T00:00:00+00:00",
+                    sessions=[],
+                    episodic_rels=0,
+                    procedural_rels=0,
+                    artifacts=[],
+                )
+            ],
             "absorbed_interim_tiers": [],
         }
         sl.ledger_path(state_dir).write_text(json.dumps(payload))
@@ -395,3 +419,222 @@ class TestInterimScratchDirIsDisjointFromTierRoot:
         assert slot_dir.exists()
         assert (slot_dir / "meta.json").exists()
         assert (slot_dir / "adapter_model.safetensors").exists()
+
+
+# ---------------------------------------------------------------------------
+# read_ledger's readability gate: absent vs. every present-but-uninterpretable
+# shape, and dispose()'s bypass of the same gate.
+# ---------------------------------------------------------------------------
+
+
+def _good_ledger_payload() -> dict:
+    """A minimal, fully valid v2 ledger payload -- the positive control every
+    malformed-shape test below is a mutation of."""
+    return {
+        "version": 2,
+        "event": "interim",
+        "venue": "weights",
+        "stamp": "20260101T0000",
+        "tiers": {},
+        "stages": [
+            sl.extraction_stage(
+                completed_at="2026-01-01T00:00:00+00:00",
+                sessions=[],
+                episodic_rels=0,
+                procedural_rels=0,
+                artifacts=[],
+            )
+        ],
+        "absorbed_interim_tiers": [],
+    }
+
+
+class TestReadLedgerAbsent:
+    def test_no_file_returns_none(self, tmp_path):
+        state_dir = tmp_path / "state"
+        state_dir.mkdir(parents=True)
+        assert sl.read_ledger(state_dir) is None
+
+
+class TestReadLedgerGoodPayloadParses:
+    def test_a_well_formed_ledger_reads_back(self, tmp_path):
+        state_dir = tmp_path / "state"
+        state_dir.mkdir(parents=True)
+        sl.ledger_path(state_dir).write_text(json.dumps(_good_ledger_payload()))
+
+        ledger = sl.read_ledger(state_dir)
+
+        assert ledger is not None
+        assert ledger.event == "interim"
+        assert ledger.stamp == "20260101T0000"
+
+
+class TestReadLedgerUndecodable:
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "not json at all {{{",
+            "",
+        ],
+    )
+    def test_unparseable_payload_raises_undecodable(self, tmp_path, raw):
+        state_dir = tmp_path / "state"
+        state_dir.mkdir(parents=True)
+        sl.ledger_path(state_dir).write_text(raw)
+
+        with pytest.raises(sl.StageLedgerUnreadable) as exc_info:
+            sl.read_ledger(state_dir)
+        assert exc_info.value.cause == "undecodable"
+
+
+class TestReadLedgerUnopenable:
+    def test_an_envelope_this_process_cannot_open_raises_unopenable(self, tmp_path, monkeypatch):
+        """A present file whose bytes decode fine at the filesystem level but
+        whose envelope this process cannot open (no daily identity loaded, a
+        foreign envelope) -- simulated by making read_maybe_encrypted itself
+        raise, exactly as it does for either real cause."""
+        state_dir = tmp_path / "state"
+        state_dir.mkdir(parents=True)
+        sl.ledger_path(state_dir).write_text(json.dumps(_good_ledger_payload()))
+
+        import paramem.backup.encryption as encryption_module
+
+        def _raise(_path):
+            raise RuntimeError("age envelope but no daily identity loaded")
+
+        monkeypatch.setattr(encryption_module, "read_maybe_encrypted", _raise)
+
+        with pytest.raises(sl.StageLedgerUnreadable) as exc_info:
+            sl.read_ledger(state_dir)
+        assert exc_info.value.cause == "unopenable"
+
+
+class TestReadLedgerNotALedger:
+    """A payload that decodes as JSON but is not a ledger of this schema --
+    every distinct way _from_dict / _validate_stage_entry refuse it."""
+
+    def test_top_level_list_raises_not_a_ledger(self, tmp_path):
+        state_dir = tmp_path / "state"
+        state_dir.mkdir(parents=True)
+        sl.ledger_path(state_dir).write_text(json.dumps([1, 2, 3]))
+
+        with pytest.raises(sl.StageLedgerUnreadable) as exc_info:
+            sl.read_ledger(state_dir)
+        assert exc_info.value.cause == "not_a_ledger"
+
+    def test_missing_head_field_raises_not_a_ledger(self, tmp_path):
+        payload = _good_ledger_payload()
+        del payload["venue"]
+        state_dir = tmp_path / "state"
+        state_dir.mkdir(parents=True)
+        sl.ledger_path(state_dir).write_text(json.dumps(payload))
+
+        with pytest.raises(sl.StageLedgerUnreadable) as exc_info:
+            sl.read_ledger(state_dir)
+        assert exc_info.value.cause == "not_a_ledger"
+
+    def test_bad_event_vocabulary_raises_not_a_ledger(self, tmp_path):
+        payload = _good_ledger_payload()
+        payload["event"] = "bogus"
+        state_dir = tmp_path / "state"
+        state_dir.mkdir(parents=True)
+        sl.ledger_path(state_dir).write_text(json.dumps(payload))
+
+        with pytest.raises(sl.StageLedgerUnreadable) as exc_info:
+            sl.read_ledger(state_dir)
+        assert exc_info.value.cause == "not_a_ledger"
+
+    def test_stage_entry_that_is_not_a_dict_raises_not_a_ledger(self, tmp_path):
+        payload = _good_ledger_payload()
+        payload["stages"].append("not a dict")
+        state_dir = tmp_path / "state"
+        state_dir.mkdir(parents=True)
+        sl.ledger_path(state_dir).write_text(json.dumps(payload))
+
+        with pytest.raises(sl.StageLedgerUnreadable) as exc_info:
+            sl.read_ledger(state_dir)
+        assert exc_info.value.cause == "not_a_ledger"
+
+    def test_extraction_entry_without_completed_at_raises_not_a_ledger(self, tmp_path):
+        payload = _good_ledger_payload()
+        del payload["stages"][0]["completed_at"]
+        state_dir = tmp_path / "state"
+        state_dir.mkdir(parents=True)
+        sl.ledger_path(state_dir).write_text(json.dumps(payload))
+
+        with pytest.raises(sl.StageLedgerUnreadable) as exc_info:
+            sl.read_ledger(state_dir)
+        assert exc_info.value.cause == "not_a_ledger"
+
+    def test_non_iso_completed_at_raises_not_a_ledger(self, tmp_path):
+        payload = _good_ledger_payload()
+        payload["stages"][0]["completed_at"] = "not a timestamp"
+        state_dir = tmp_path / "state"
+        state_dir.mkdir(parents=True)
+        sl.ledger_path(state_dir).write_text(json.dumps(payload))
+
+        with pytest.raises(sl.StageLedgerUnreadable) as exc_info:
+            sl.read_ledger(state_dir)
+        assert exc_info.value.cause == "not_a_ledger"
+
+    def test_no_extraction_entry_at_all_raises_not_a_ledger(self, tmp_path):
+        payload = _good_ledger_payload()
+        payload["stages"] = []
+        state_dir = tmp_path / "state"
+        state_dir.mkdir(parents=True)
+        sl.ledger_path(state_dir).write_text(json.dumps(payload))
+
+        with pytest.raises(sl.StageLedgerUnreadable) as exc_info:
+            sl.read_ledger(state_dir)
+        assert exc_info.value.cause == "not_a_ledger"
+
+
+class TestDisposeBypassesEveryReadabilityGate:
+    """dispose() reads the raw payload directly, bypassing read_ledger's
+    version gate and its unreadable-payload raise alike -- discarding an
+    uninterpretable record is the intended escape hatch."""
+
+    @pytest.mark.parametrize(
+        "raw_text",
+        [
+            "not json at all {{{",
+            "",
+            json.dumps([1, 2, 3]),
+            json.dumps(
+                {
+                    "version": 1,
+                    **{k: v for k, v in _good_ledger_payload().items() if k != "version"},
+                }
+            ),
+            json.dumps({**_good_ledger_payload(), "event": "bogus"}),
+        ],
+    )
+    def test_dispose_succeeds_and_removes_the_file_over_every_unreadable_shape(
+        self, tmp_path, raw_text
+    ):
+        state_dir = tmp_path / "state"
+        state_dir.mkdir(parents=True)
+        path = sl.ledger_path(state_dir)
+        path.write_text(raw_text)
+
+        disposed = sl.dispose(state_dir)
+
+        assert disposed is True
+        assert not path.exists()
+
+    def test_dispose_of_a_well_formed_ledger_also_succeeds(self, tmp_path):
+        state_dir = tmp_path / "state"
+        state_dir.mkdir(parents=True)
+        path = sl.ledger_path(state_dir)
+        path.write_text(json.dumps(_good_ledger_payload()))
+
+        disposed = sl.dispose(state_dir)
+
+        assert disposed is True
+        assert not path.exists()
+
+    def test_dispose_of_an_absent_ledger_is_a_safe_no_op(self, tmp_path):
+        state_dir = tmp_path / "state"
+        state_dir.mkdir(parents=True)
+
+        assert sl.dispose(state_dir) is False

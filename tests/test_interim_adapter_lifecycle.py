@@ -530,74 +530,34 @@ class TestComputeSchedulePeriodSeconds:
 # ---------------------------------------------------------------------------
 
 
-class TestCurrentInterimStampWithCadence:
-    """Floor-to-cadence logic for current_interim_stamp(refresh_cadence).
+class TestCurrentInterimStampCadenceFlooring:
+    """current_interim_stamp floors to the cadence's own calendar mark
+    (schedule_grammar.previous_mark) rather than to raw wall-clock -- so two
+    calls inside the same cadence window mint the same stamp. Cadences
+    previous_mark answers None for (an off-variant, a non-exact interval)
+    fall back to hourly flooring instead."""
 
-    refresh_cadence IS the sub-interval directly — no division by
-    max_interim_count. Full consolidation period is derived elsewhere
-    (ConsolidationScheduleConfig.consolidation_period_string).
-    """
+    def test_anchored_daily_hhmm_floors_to_the_anchor(self) -> None:
+        now = datetime(2026, 4, 18, 5, 30)
+        stamp = current_interim_stamp("daily 04:00", _now=now)
+        assert stamp == "20260418T0400"
 
-    def test_every_30m_floors_to_30min_boundary(self) -> None:
-        """refresh_cadence='every 30m' → boundary every 30 minutes from midnight.
+    def test_exact_interval_12h_floors_to_its_own_mark(self) -> None:
+        now = datetime(2026, 4, 18, 13, 7)
+        stamp = current_interim_stamp("every 12h", _now=now)
+        assert stamp == "20260418T1200"
 
-        At 14:47 → seconds_since_midnight = 14*3600+47*60 = 53220.
-        floored = (53220 // 1800) * 1800 = 29*1800 = 52200 = 14:30.
-        """
-        now = datetime(2026, 4, 18, 14, 47, 0)
-        stamp = current_interim_stamp("every 30m", _now=now)
-        assert stamp == "20260418T1430"
+    def test_off_variant_falls_back_to_hourly_flooring(self) -> None:
+        now = datetime(2026, 4, 18, 13, 45)
+        stamp = current_interim_stamp("off", _now=now)
+        assert stamp == "20260418T1300"
 
-    def test_every_30m_floor_at_exact_boundary(self) -> None:
-        """At exactly a 30-min boundary the stamp equals that boundary."""
-        now = datetime(2026, 4, 18, 14, 30, 0)
-        stamp = current_interim_stamp("every 30m", _now=now)
-        assert stamp == "20260418T1430"
-
-    def test_every_4h_floors_to_4h_boundary(self) -> None:
-        """refresh_cadence='every 4h' → boundary every 4h from midnight.
-
-        At 09:15 → seconds_since_midnight = 33300.
-        floored = (33300 // 14400) * 14400 = 28800 = 08:00.
-        """
-        now = datetime(2026, 4, 18, 9, 15, 0)
-        stamp = current_interim_stamp("every 4h", _now=now)
-        assert stamp == "20260418T0800"
-
-    def test_daily_hhmm_floors_to_day_boundary(self) -> None:
-        """refresh_cadence='03:00' (daily) → 86400s boundary from midnight.
-
-        At 09:15 → seconds_since_midnight = 33300.
-        floored = (33300 // 86400) * 86400 = 0 = 00:00.
-        """
-        now = datetime(2026, 4, 18, 9, 15, 0)
-        stamp = current_interim_stamp("03:00", _now=now)
-        assert stamp == "20260418T0000"
-
-    def test_off_variant_cadence_floors_to_nearest_hour(self) -> None:
-        """Explicit off-variant ("off"/"disabled"/"none") falls back to 1-h boundaries.
-
-        Callers that want to skip stamping entirely should take the
-        queue-branch earlier rather than rely on this fallback.
-        """
-        now = datetime(2026, 4, 18, 14, 47, 0)
-        for cadence in ("off", "disabled", "none"):
-            stamp = current_interim_stamp(cadence, _now=now)
-            # sub_interval=3600; seconds_since_midnight = 53220
-            # floored = (53220 // 3600) * 3600 = 50400 = 14:00
-            assert stamp == "20260418T1400", (
-                f"off-variant {cadence!r} should floor to 14:00, got {stamp}"
-            )
-
-    def test_every_2h_floors_to_2h_boundary(self) -> None:
-        """refresh_cadence='every 2h' → boundary every 2h from midnight.
-
-        At 14:47 → seconds_since_midnight = 53220.
-        floored = (53220 // 7200) * 7200 = 7*7200 = 50400 = 14:00.
-        """
-        now = datetime(2026, 4, 18, 14, 47, 0)
-        stamp = current_interim_stamp("every 2h", _now=now)
-        assert stamp == "20260418T1400"
+    def test_non_exact_interval_falls_back_to_hourly_flooring(self) -> None:
+        """'every 7h' does not divide 24 -- previous_mark has no mark for it,
+        so the stamp floors to the current hour instead."""
+        now = datetime(2026, 4, 18, 13, 45)
+        stamp = current_interim_stamp("every 7h", _now=now)
+        assert stamp == "20260418T1300"
 
 
 # ---------------------------------------------------------------------------

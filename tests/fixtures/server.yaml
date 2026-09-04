@@ -162,19 +162,35 @@ adapters:
 #     per-window buckets that absorb new facts between full consolidations
 #     so recall is possible without waiting a full cycle.
 #
-# THE ONLY SCHEDULING KNOB — refresh_cadence
-# - `refresh_cadence` is how often a NEW interim adapter is minted (the
-#   interim tick interval). Grammar: "" / "off" / "disabled" / "none"
-#   (manual only, no timer) / "weekly" / "daily" / "HH:MM" / "daily HH:MM"
-#   / "Nh" / "Nm" / "every Nh" / "every Nm".
-# - The FULL consolidation period is DERIVED, not configured:
-#       full_cycle = refresh_cadence × max_interim_count
-#   Exception: when max_interim_count=0 (full-fold-only consume-pending
-#   mode, no interim adapters) the full-cycle period equals refresh_cadence
-#   itself — not refresh_cadence × 0.
-#   Example (default): refresh_cadence="12h", max_interim_count=7
-#       → full consolidation every 84h (3.5 days), with at most 7
-#         concurrent interim adapters before the cycle fires.
+# SCHEDULING — refresh_cadence / interim_resume / full_window
+# - `refresh_cadence` is when interim ticks fire: every mark a NEW interim
+#   adapter is minted (the interim tick interval, activity-gated). Grammar:
+#   "" / "off" / "disabled" / "none" (manual only, no timer) / "weekly" /
+#   "daily" / "HH:MM" / "daily HH:MM" / "Nh" / "Nm" / "every Nh" / "every Nm".
+# - `interim_resume` says when an interim event a conversation interrupted
+#   picks back up: "immediate" (default) at the first idle moment, "tick" at
+#   the first idle moment at or after the next cadence mark (requires a
+#   cadence with wall-clock marks — an anchored cadence or an exact
+#   interval), or a daily "HH:MM-HH:MM" window at the first idle moment
+#   inside it. An interrupted FULL event always resumes at the first idle
+#   moment regardless — `interim_resume` governs interim events only.
+# - `full_window` (default "01:00-04:00") is the daily window in which a
+#   full fold may START, with a ring (max_interim_count > 0); a fold already
+#   running when the window closes keeps running. Wraps past midnight.
+#   `refresh_cadence × max_interim_count` is the age at which the oldest
+#   interim slot makes the full fold due; the fold then starts at the LAST
+#   window opening that begins at or before that deadline — a fold started inside
+#   the window runs on past its close.
+#   Example (default): refresh_cadence="12h", max_interim_count=7 → the
+#   oldest interim falls due at 84h (3.5 days) of age, and the full fold
+#   starts at the last 01:00-04:00 opening that begins at or before that deadline.
+#   Without a ring (max_interim_count=0, full-fold-only consume-pending
+#   mode) the cadence itself is the full-fold schedule, `full_window` is not
+#   read, and max_interim_count=0 requires mode: train (mode: simulate has
+#   no training venue at count 0).
+# - The default window closes before the default backup mark
+#   (security.backups.schedule, "daily 04:00"); widening the window past
+#   the backup time lets a backup and a fold overlap.
 # - At each interim tick a new adapter episodic_interim_<stamp> is created
 #   (activity-gated) and trained. No rolling eviction — adapters accumulate
 #   until the full cycle, which collapses them into the mains via replay
@@ -242,7 +258,9 @@ adapters:
 # ============================================================================
 consolidation:
   refresh_cadence: "12h"       # "" / "off" / "disabled" / "none" (manual) / "weekly" / "daily" / "HH:MM" / "daily HH:MM" / "Nh" / "Nm" / "every Nh" / "every Nm"
-                               # 12h + max_interim_count=7 → full cycle every 84h (derived).
+                               # 12h + max_interim_count=7 → oldest interim falls due at 84h; the full fold starts at the last full_window opening that begins at or before that deadline.
+  interim_resume: immediate    # "immediate" | "tick" | "HH:MM-HH:MM" — when an interim event a conversation interrupted resumes (a full event always resumes at the first idle moment regardless)
+  full_window: "01:00-04:00"   # "HH:MM-HH:MM"; daily window a full fold may START (ring only, max_interim_count > 0); wraps past midnight; not read at max_interim_count=0
   mode: train                  # "train" writes LoRA weights into the tier's slot; "simulate" writes graph.json into the tier's slot (no weight training)
                                # Closed vocabulary: any other value is rejected at config load.
                                # "simulate" + max_interim_count: 0 is also rejected (no training venue at all).
@@ -310,12 +328,16 @@ consolidation:
   # not just relation surfaces; person-name and non-entity attribute values are excluded
   # by the model's own kind classification.
   extraction_correction_entity_types: [place, organization, concept, attributes]
-  # Max concurrent interim adapters in VRAM. Together with refresh_cadence
-  # this determines the derived full-consolidation period:
-  #     full_cycle = refresh_cadence × max_interim_count
-  # Default 7 + "12h" refresh → 84h full cycle. Validated at startup —
-  # server refuses to start if base + mains + this + staging + KV exceeds
-  # the configured GPU budget. Raise only after re-running the validator.
+  # Max concurrent interim adapters in VRAM. With a ring (> 0), together with
+  # refresh_cadence this sets the age at which the oldest interim slot makes
+  # the full fold due — refresh_cadence × max_interim_count; the fold then
+  # starts at the last full_window opening that begins at or before that deadline
+  # (see the SCHEDULING block above). Validated at startup — server refuses to
+  # start if base + mains + this + staging + KV exceeds the configured GPU
+  # budget. Raise only after re-running the validator.
+  # A ring must hold at least one day of interims, since the window opens
+  # once a day: max_interim_count >= ceil(24h / refresh_cadence) is enforced
+  # at config load.
   max_interim_count: 7
   # Overflow slots beyond the max_interim_count ring before keep-pending
   # kicks in. Default 0 = sessions are kept pending immediately when the ring

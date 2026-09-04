@@ -254,6 +254,8 @@ def _make_status_compatible_config(tmp_path: Path, max_total_disk_gb: float) -> 
     cfg.adapters.procedural.enabled = False
     cfg.consolidation.max_interim_count = 0
     cfg.consolidation.refresh_cadence = ""
+    cfg.consolidation.interim_resume = "immediate"
+    cfg.consolidation.full_window = "01:00-04:00"
     cfg.consolidation.consolidation_period_string = ""
     cfg.consolidation.mode = "train"
     cfg.consolidation.quiet_hours_mode = "always_off"

@@ -93,6 +93,10 @@ def _make_isolated_state(tmp_path: Path) -> dict:
     live_yaml.write_bytes(_LIVE_CONFIG_YAML)
 
     config = MagicMock()
+    config.consolidation.refresh_cadence = "12h"
+    config.consolidation.max_interim_count = 7
+    config.consolidation.interim_resume = "immediate"
+    config.consolidation.full_window = "01:00-04:00"
     config.paths.data = tmp_path / "data" / "ha"
     config.paths.data.mkdir(parents=True, exist_ok=True)
     config.paths.sessions = tmp_path / "sessions"
@@ -448,6 +452,10 @@ class TestApplyPathIsolation:
         # config with a different paths.data so the diff detects R-PATHS.
         config_a = state["config"]
         config_b_mock = MagicMock()
+        config_b_mock.consolidation.refresh_cadence = "12h"
+        config_b_mock.consolidation.max_interim_count = 7
+        config_b_mock.consolidation.interim_resume = "immediate"
+        config_b_mock.consolidation.full_window = "01:00-04:00"
         config_b_mock.paths.data = tmp_path / "NEW_data"
         config_b_mock.paths.sessions = config_a.paths.sessions
         config_b_mock.stt = MagicMock()

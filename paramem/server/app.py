@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING, Any, Callable, Literal
 if TYPE_CHECKING:
     from paramem.adapters.registry_binding import TierBinding
     from paramem.cloud.providers.base import CloudAgent
+    from paramem.server import schedule_state
     from paramem.server.user_tokens import UserTokenStore
 
 import torch
@@ -75,6 +76,12 @@ from paramem.server.consolidation import (
     retire_unattributable_sessions,
 )
 from paramem.server.consolidation_action import ConsolidationAction, consolidation_content_gate
+from paramem.server.consolidation_choice import (
+    ConsolidationChoice,
+    DispatchReason,
+    PendingEvent,
+    choose_consolidation_run,
+)
 from paramem.server.egress import LEG_NAMES, OutboundText, answer_via_cloud, answer_via_ha
 from paramem.server.ha_graph import HAEntityGraph
 from paramem.server.incidents import (
@@ -212,6 +219,16 @@ _state = {
     # catch-up dispatch) — see _run_boot_completion_tasks. Cancelled at
     # shutdown and cleared so a repeated lifespan (TestClient) starts clean.
     "boot_completion_task": None,
+    # In-process idle-firing watch — see _watch_for_idle / _arm_idle_watch.
+    # Unlike its one-shot task siblings above, this one is armed repeatedly
+    # within a single lifespan: whenever a pending consolidation event must
+    # be finished as soon as the server goes idle. Cleared back to None by
+    # the shared _clear_state_task done-callback once the watch exits, so
+    # the next arming always starts a fresh task. Cancelled at shutdown
+    # alongside base_swap_task and boot_completion_task, and reset to None
+    # at every lifespan start for the same clean-slate guarantee those two
+    # get.
+    "idle_watch_task": None,
     "mode": "local",  # "local" or "cloud-only"
     # "explicit", "training", "gpu_conflict", "cuda_fault_persistent",
     # "insufficient_vram", "reload_failed", "apply_failed", "config_refused",
@@ -247,8 +264,12 @@ _state = {
     "wyoming_tts_server": None,
     "latest_embedding": None,
     "latest_language_detection": None,  # {language: str, probability: float}
-    "last_chat_time": None,
-    "last_chat_monotonic": None,  # time.monotonic() stamp of the most recent /chat turn
+    # time.monotonic() stamp of the last model use — a chat/voice turn, a
+    # debug probe, a raw-generation probe, or a calibrate run. Written on
+    # the event-loop thread only (cooperative scheduling, no lock needed).
+    # Read by the idle debounce, the consolidation arbitrator's
+    # seconds_until_idle, and the idle watch.
+    "last_model_use_monotonic": None,
     "pending_enrollments": set(),
     # Unknown speaker groups: temp_id → {embeddings, conversations, first_seen}.
     # Mutations happen on the asyncio event loop (cooperative scheduling).
@@ -411,9 +432,31 @@ class StatusResponse(BaseModel):
     max_interim_count: int = 0
     mode_config: str = ""  # "train" or "simulate"
     next_run_seconds: int | None = None  # seconds until next FULL consolidation
-    # Seconds until the next interim cadence boundary. None when refresh
-    # cadence is disabled.
+    # Seconds until the next interim cadence mark (schedule_grammar.next_mark).
+    # None when the cadence is off, unparseable, or a non-exact interval with
+    # no wall-clock marks.
     next_interim_seconds: int | None = None
+    # consolidation.full_window and consolidation.interim_resume, verbatim —
+    # the operator's own schedule settings, for the renderer's Schedule:
+    # block.
+    full_window: str = ""
+    interim_resume: str = ""
+    # This block describes an INTERRUPTED event waiting to resume, never a
+    # currently running one (a running fold is reported by consolidating
+    # above). The event's own kind ("interim" | "full" | "reconcile"), or
+    # "unreadable" when its stage ledger is present but this process cannot
+    # interpret it. None when nothing is waiting to resume.
+    pending_event_kind: str | None = None
+    # ISO-8601 UTC timestamp of the interrupted event's extraction stage
+    # completion — "since when" it has been waiting to resume. None when
+    # nothing is waiting to resume or the record is unreadable.
+    pending_event_since: str | None = None
+    # Seconds until the next opportunity to resume the interrupted event,
+    # from a read-only choose_consolidation_run(reason=TIMER, ...) call at
+    # the current instant: 0 when it would resume on a firing right now, the
+    # decider's own next_opportunity_seconds on a deferral. None when
+    # nothing is waiting to resume or the record is unreadable.
+    pending_event_next_seconds: int | None = None
     orphaned_pending: int = 0  # pending sessions without speaker_id
     oldest_pending_seconds: int | None = None
     speakers: list[dict] = []  # [{id, name, embeddings, pending, enroll_method}]
@@ -494,9 +537,12 @@ class StatusResponse(BaseModel):
     # are currently resident ("base", "stt", "tts").  Empty when nothing is
     # loaded or before the first load.
     vram_components: dict[str, int] = {}
-    # Seconds until the next scheduled tick on which _is_full_cycle_due would
-    # evaluate to True.  None when cadence is disabled (manual-only), when no
-    # interim dirs exist yet, or when full_period is manual-only.
+    # Seconds until the first full_window opening at which a full fold would
+    # start (_seconds_until_next_full_consolidation, derived from
+    # _full_fold_deadline and Window).  At max_interim_count == 0 this is the
+    # seconds to the next cadence mark, since the cadence is the full-fold
+    # schedule there.  None when there is no deadline (no payload-bearing
+    # interim slot, or no period) or the cadence carries no wall-clock marks.
     next_full_consolidation_seconds: int | None = None
     # Active key count per store tier.  Keys are raw tier names
     # (e.g. "episodic", "semantic", "procedural",
@@ -2798,11 +2844,13 @@ async def lifespan(app: FastAPI):
     # actually awaited by ``_run_boot_completion_tasks``, so a stale handle
     # there would raise ``CancelledError``/``RuntimeError`` outside that
     # function's own ``except Exception`` isolation; ``boot_completion_task``
-    # is unconditionally overwritten later in this same lifespan and is
-    # never awaited elsewhere, so it carries no such hazard, but is reset
-    # here too for the same clean-slate guarantee.
+    # is unconditionally overwritten later in this same lifespan and
+    # ``idle_watch_task`` is never awaited elsewhere either, so neither
+    # carries that same hazard, but both are reset here too for the same
+    # clean-slate guarantee.
     _state["base_swap_task"] = None
     _state["boot_completion_task"] = None
+    _state["idle_watch_task"] = None
     # ``mode`` is process-global and this lifespan is never guaranteed to be
     # the first one in the process (TestClient reuse, in-process restart) —
     # a prior lifespan's degrade can otherwise leave "cloud-only" resident
@@ -3316,11 +3364,11 @@ async def lifespan(app: FastAPI):
 
     # Log the configured cadence for correlation with early boot logs.  The
     # INTERIM cadence (= refresh_cadence, e.g. "12h") drives POST
-    # /scheduled-tick at every interim boundary; the tick handler decides
-    # whether a given tick is an interim train or a full fold via
-    # _is_full_cycle_due.  The full period (refresh_cadence ×
+    # /scheduled-tick at every interim boundary; the arbitrator's decider
+    # (choose_consolidation_run) resolves whether a given tick is an interim
+    # train or a full fold.  The full period (refresh_cadence ×
     # max_interim_count, e.g. 84h) is derived for logging and for the
-    # deadline backstop in _is_full_cycle_due.
+    # deadline backstop (_full_fold_deadline).
     #
     # Actual systemd timer reconciliation (both the consolidation and backup
     # timers) happens off the event loop in the boot-completion task
@@ -3560,6 +3608,8 @@ async def lifespan(app: FastAPI):
         _state["base_swap_task"].cancel()
     if _state.get("boot_completion_task"):
         _state["boot_completion_task"].cancel()
+    if _state.get("idle_watch_task"):
+        _state["idle_watch_task"].cancel()
 
     # Release the base model — single owner for base-model + bt/loop + intent-handle
     # release. Shutdown does not separately call unload_model on _state["model"];
@@ -3632,12 +3682,17 @@ async def lifespan(app: FastAPI):
 def _clear_state_task(key: str, task: "asyncio.Task") -> None:
     """``asyncio.Task`` done-callback: clear ``_state[key]`` when it still holds *task*.
 
-    Shared by every one-shot background task this module stores a handle
-    for (``base_swap_task``, ``boot_completion_task``) so a finished task's
-    slot does not keep pointing at a dead ``Task`` object forever. Guards on
-    identity (``_state.get(key) is task``) rather than unconditionally
-    clearing, so a done-callback firing after a newer task has already
-    replaced the slot never clobbers that newer task's handle.
+    Shared by every background task this module stores a handle for —
+    ``base_swap_task`` and ``boot_completion_task``, each armed once per
+    lifespan, and ``idle_watch_task`` (:func:`_watch_for_idle`, armed by
+    :func:`_arm_idle_watch`), armed repeatedly within one lifespan every
+    time a pending consolidation event needs to be finished as soon as the
+    server goes idle — so a finished task's slot does not keep pointing at
+    a dead ``Task`` object forever. Guards on identity (``_state.get(key)
+    is task``) rather than unconditionally clearing, so a done-callback
+    firing after a newer task has already replaced the slot never clobbers
+    that newer task's handle — the property ``idle_watch_task`` relies on
+    to be re-armable after each of its own exits.
     """
     if _state.get(key) is task:
         _state[key] = None
@@ -3649,9 +3704,22 @@ def _reconcile_scheduling_timers(config) -> None:
     Single call site for timer reconciliation, shared by the boot-completion
     task (:func:`_run_boot_completion_tasks`, dispatched off the event loop
     via ``asyncio.to_thread``) and a live config apply (``_apply_config_live``,
-    which already runs in an executor thread) — a schedule edit to either
-    ``consolidation.refresh_cadence`` or ``security.backups.schedule`` reaches
+    which already runs in an executor thread) — a schedule edit to
+    ``consolidation.refresh_cadence``, ``consolidation.full_window``,
+    ``consolidation.interim_resume``, or ``security.backups.schedule`` reaches
     systemd from every call site that applies config, not only server boot.
+
+    The consolidation timer is one timer carrying a set of calendar entries:
+    the cadence's own marks, plus a full-fold window start whenever a ring is
+    configured (``max_interim_count > 0``), plus an interim-resume window
+    start whenever ``interim_resume`` names a window rather than
+    ``"immediate"``/``"tick"``. ``full_window`` and a windowed
+    ``interim_resume`` are read as :class:`~paramem.server.schedule_grammar.Window`
+    via :func:`~paramem.server.schedule_grammar.parse_window`, config-validated
+    at load, so no exception handling wraps that read here — a raise would be
+    a defect at the config-validation source, not something this reconcile
+    call recovers from. The backup timer reconciles on its own schedule
+    string alone, unchanged.
 
     Each timer's reconcile is independently guarded — a failure in one (a
     malformed schedule string, a ``systemctl`` error) is logged and does not
@@ -3664,15 +3732,24 @@ def _reconcile_scheduling_timers(config) -> None:
     directly from an ``async def``.
 
     Args:
-        config: The ``ServerConfig`` to read ``consolidation.refresh_cadence``
-            and ``security.backups.schedule`` from.
+        config: The ``ServerConfig`` to read ``consolidation.refresh_cadence``,
+            ``consolidation.full_window``, ``consolidation.interim_resume``,
+            ``consolidation.max_interim_count``, and
+            ``security.backups.schedule`` from.
     """
     from paramem.backup import timer as backup_timer
     from paramem.server import systemd_timer
+    from paramem.server.schedule_grammar import parse_window
 
-    interim_cadence = config.consolidation.refresh_cadence or ""
+    cons = config.consolidation
+    interim_cadence = cons.refresh_cadence or ""
+    extras: list[str] = []
+    if cons.max_interim_count > 0:
+        extras.append(systemd_timer.window_start_calendar(parse_window(cons.full_window)))
+    if cons.interim_resume not in ("immediate", "tick"):
+        extras.append(systemd_timer.window_start_calendar(parse_window(cons.interim_resume)))
     try:
-        msg = systemd_timer.reconcile(interim_cadence)
+        msg = systemd_timer.reconcile(interim_cadence, extra_calendars=extras)
         logger.info("%s", msg)
     except Exception:
         logger.exception("Failed to reconcile consolidation timer — continuing without schedule")
@@ -3718,22 +3795,27 @@ async def _run_boot_completion_tasks() -> None:
        fold would capture the fold's own output as though it predated the
        fold.
     3. Consolidation catch-up via the identical in-process ``AUTO`` dispatch
-       ``POST /scheduled-tick`` uses, dispatched only when a read-only peek
-       at the durable cadence stamp (:func:`~paramem.server.schedule_grammar.scheduled_run_due`
-       against :func:`~paramem.server.schedule_state.read_last_scheduled_run`
-       — the identical predicate and stamp the arbitrator itself reads, not
-       a second dueness implementation) says ``DUE``. ``_dispatch_consolidation``
-       owns every dueness/guard/trial decision below that point; this task
-       duplicates none of them. A ``NO_STAMP`` peek is left for the
-       arbitrator's own seed-and-noop on the next real tick rather than
-       seeded here, so there is exactly one seeding owner. Dispatching
-       unconditionally would run the arbitrator's side-effecting pre-stages —
+       ``POST /scheduled-tick`` uses (:func:`_dispatch_consolidation` with
+       ``reason=``:attr:`~paramem.server.consolidation_choice.DispatchReason.BOOT`),
+       dispatched unconditionally — this task carries no dueness math of its
+       own. The kind of this firing is decided by the arbitrator's decider
+       (:func:`~paramem.server.consolidation_choice.choose_consolidation_run`)
+       ahead of any stamp write, the same decision a ``TIMER`` firing gets;
+       a ``BOOT`` firing whose verdict is a named noop returns that status
+       and walks none of the arbitrator's side-effecting pre-stages —
        retroactive orphan-session claim,
        :func:`~paramem.server.consolidation.retire_unattributable_sessions`
        retiring unattributable pending sessions regardless of TTL, and the
-       ``pending_rehydration`` migration branch seizing the GPU — on every
-       boot with a real cadence configured, whether or not a tick was
-       actually missed.
+       ``pending_rehydration`` migration branch seizing the GPU — so an
+       unconditional dispatch never retires a session or starts a migration
+       on a boot with nothing due. A pending event found at boot resumes
+       through the same decider call, ahead of any of that. Whatever this
+       dispatch answers — or if it raises — a ``finally`` runs
+       :func:`_arm_idle_watch` next: a ledger left pending across a restart
+       (the dispatch above deferred or noop'd rather than resuming it, or
+       never got to answer at all) is then waited on for the rest of this
+       lifespan, and arming when nothing is pending costs nothing: the
+       watch's own first pass answers ``noop_nothing_pending`` and exits.
     4. Reconcile both systemd user timers off the event loop, LAST —
        :func:`_reconcile_scheduling_timers` shells out via
        ``subprocess.run`` per timer, dispatched through ``asyncio.to_thread``
@@ -3803,35 +3885,24 @@ async def _run_boot_completion_tasks() -> None:
         logger.exception("Boot catch-up: backup step failed — continuing with remaining steps")
 
     # --- Consolidation catch-up. ---
-    # Only when refresh_cadence is a real schedule, AND only when a read-only
-    # peek at the durable cadence stamp says DUE — see the docstring's step 3.
+    # Dispatched unconditionally — the decider owns dueness, and a noop
+    # verdict walks none of the pre-stages a real boot with nothing due
+    # must not trigger (see the docstring's step 3).
     try:
-        cadence = config.consolidation.refresh_cadence or ""
-        _cadence_atom = parse_schedule_atom(cadence)
-        if _cadence_atom is not None and _cadence_atom.kind != "off":
-            from paramem.server import schedule_state as _schedule_state
-
-            _last_scheduled = _schedule_state.read_last_scheduled_run(
-                data_state_dir(config.paths.data)
-            )
-            _cadence_due = scheduled_run_due(cadence, _last_scheduled)
-            if _cadence_due is ScheduleDueStatus.DUE:
-                status, action = _dispatch_consolidation(ConsolidationAction.AUTO)
-                logger.info(
-                    "Boot catch-up: consolidation AUTO dispatch — status=%s action=%s",
-                    status,
-                    action.value,
-                )
-            else:
-                logger.info(
-                    "Boot catch-up: consolidation not due (status=%s, cadence=%r) — skipping",
-                    _cadence_due.value,
-                    cadence,
-                )
+        status, action = _dispatch_consolidation(
+            ConsolidationAction.AUTO, reason=DispatchReason.BOOT
+        )
+        logger.info(
+            "Boot catch-up: consolidation AUTO dispatch — status=%s action=%s",
+            status,
+            action.value,
+        )
     except Exception:
         logger.exception(
             "Boot catch-up: consolidation dispatch step failed — continuing with remaining steps"
         )
+    finally:
+        _arm_idle_watch()
 
     # --- Timer reconcile — LAST (see docstring step 4). ---
     try:
@@ -3980,11 +4051,6 @@ async def chat(request: ChatRequest, http_request: Request):
     (e.g. ``speaker_id`` set by BearerTokenMiddleware on authenticated
     per-user requests).  It is NOT parsed as a JSON body.
     """
-    _state["last_chat_time"] = datetime.now(timezone.utc)
-    # Monotonic stamp for debounce — immune to NTP wall-clock steps.
-    # Both writes happen on the asyncio event loop thread (cooperative
-    # scheduling), so no lock is needed.
-    _state["last_chat_monotonic"] = time.monotonic()
     buffer = _state["session_buffer"]
 
     # Authenticated speaker from an ATTRIBUTED per-user bearer token (set by
@@ -4416,8 +4482,15 @@ def _abort_background_training_for_inference() -> None:
     caller's subsequent lock acquisition succeeds without contention.
 
     Shared by every inference call site in this module that follows with
-    ``async with gpu_lock()``: the local ``handle_chat`` dispatch and the
-    relay leg (``_relay_route``) in :func:`_run_chat_turn`.
+    ``async with gpu_lock()`` — six call sites across five doors: the local
+    ``handle_chat`` dispatch and the relay leg (``_relay_route``) in
+    :func:`_run_chat_turn` (serving ``/chat`` and ``/voice``), the debug
+    probe's cloud-only and local branches, the raw-generation debug recall
+    probe, and calibrate-respond.  Also the idle watch's first arming site
+    (:func:`_arm_idle_watch`, called below, after the abort): every one of
+    those doors is about to use the model, so this is the one place common
+    to all of them where a pending consolidation event needs to start being
+    waited on again.
     """
     bg_trainer = _state.get("background_trainer")
     if bg_trainer is not None and bg_trainer.is_training:
@@ -4430,6 +4503,7 @@ def _abort_background_training_for_inference() -> None:
             )
             bg_trainer._shutdown_requested = True
             bg_trainer._is_training = False
+    _arm_idle_watch()
 
 
 async def _run_chat_turn(
@@ -4445,9 +4519,9 @@ async def _run_chat_turn(
     """Execute a single conversation turn (shared by POST /chat and POST /voice).
 
     Encapsulates the post-speaker-resolution orchestration that is identical
-    for text and voice turns: the scheduler debounce stamps, training-abort,
-    relay vs local routing, session buffer appends, scheduled-training
-    enqueue, and greeting prefix application.
+    for text and voice turns: the idle-clock stamp, training-abort, relay vs
+    local routing, session buffer appends, scheduled-training enqueue, and
+    greeting prefix application.
 
     Both ``/chat`` and ``/voice`` callers are responsible for resolving
     *greeting_prefix* before calling this function.  The relay-vs-local
@@ -4507,11 +4581,12 @@ async def _run_chat_turn(
     # buffer, so this can never include it.
     history = buffer.get_conversation_turns(conversation_id)
 
-    # Debounce stamps — monotonic for scheduler, wall-clock for /status display.
-    # Both writes run on the asyncio event-loop thread (cooperative scheduling),
-    # so no lock is needed.
-    _state["last_chat_time"] = datetime.now(timezone.utc)
-    _state["last_chat_monotonic"] = time.monotonic()
+    # Idle-clock stamp — the one record of model use every door writes,
+    # read by the idle debounce, the consolidation arbitrator, and the idle
+    # watch. Runs on the asyncio event-loop thread (cooperative scheduling),
+    # so no lock is needed. Serves both the PERSONAL and RELAY branches
+    # below: either one uses the model.
+    _state["last_model_use_monotonic"] = time.monotonic()
 
     # Relay fork: the EXISTING cloud-only chain serves two distinct
     # conditions through the one leg —
@@ -5446,25 +5521,79 @@ async def status():
         if next_epoch - time.time() < 3.15e9:  # < ~100 years ahead
             next_run_seconds = max(0, int(next_epoch - time.time()))
 
-    # Next interim bucket boundary: stamps are floored to the
-    # refresh_cadence boundary measured from midnight, so the next
-    # boundary is fully deterministic from the clock. None when cadence is
-    # disabled (manual-only mode).
-    from paramem.server.schedule_grammar import compute_schedule_period_seconds
+    # Next interim cadence mark (schedule_grammar.next_mark — the one
+    # grid-math owner). None when the cadence is off, unparseable, or a
+    # non-exact interval with no wall-clock marks.
+    from paramem.server.schedule_grammar import next_mark
 
-    next_interim_seconds: int | None = None
-    _refresh_seconds = compute_schedule_period_seconds(config.consolidation.refresh_cadence)
-    if _refresh_seconds and _refresh_seconds > 0:
-        _now = datetime.now()
-        _midnight = _now.replace(hour=0, minute=0, second=0, microsecond=0)
-        _since_mid = int((_now - _midnight).total_seconds())
-        _next_boundary = ((_since_mid // _refresh_seconds) + 1) * _refresh_seconds
-        next_interim_seconds = max(0, _next_boundary - _since_mid)
+    _now_epoch = time.time()
+    _next_mark_epoch = next_mark(config.consolidation.refresh_cadence, _now_epoch)
+    next_interim_seconds: int | None = (
+        max(0, int(_next_mark_epoch - _now_epoch)) if _next_mark_epoch is not None else None
+    )
 
     # Honest next-full prediction — gate-derived, not a raw timer tick.
     next_full_consolidation_seconds = _seconds_until_next_full_consolidation(config)
     # Oldest un-folded interim stamp for the renderer inline math.
     oldest_interim_stamp = _oldest_interim_stamp(config)
+
+    # Pending-event block: an INTERRUPTED event waiting to resume — its own
+    # kind, since-when, and next resume opportunity. A RUNNING event is
+    # already reported by consolidating (above): its stage ledger sits on
+    # disk for the whole run, so gate this block on the arbitrator's own
+    # busy signal rather than on ledger presence alone — otherwise a
+    # healthy in-progress fold would read as "resumes in 0s" beside
+    # consolidating=True. The two reads below (the ledger head, the
+    # schedule marks) are the same ones the arbitrator makes for the
+    # decider; a read-only choose_consolidation_run(reason=TIMER, ...) call
+    # at "now" cannot drift from the arbitrator's own verdict, because the
+    # decider is pure. A stamp file this process cannot interpret never 500s
+    # the route — it only narrows pending_event_next_seconds to None, since
+    # /status observes what is on disk, it does not judge it (no incident is
+    # recorded here; that is the arbitrator's own dispatch's job).
+    pending_event_kind: str | None = None
+    pending_event_since: str | None = None
+    pending_event_next_seconds: int | None = None
+    if not _state["consolidating"]:
+        _pending_head = _pending_event_head(config)
+        if _pending_head is not None:
+            if not _pending_head.readable:
+                pending_event_kind = "unreadable"
+            else:
+                pending_event_kind = _pending_head.kind
+                pending_event_since = datetime.fromtimestamp(
+                    _pending_head.since_epoch, tz=timezone.utc
+                ).isoformat()
+                from paramem.server import schedule_state as _schedule_state_mod
+
+                _schedule_state_dir = data_state_dir(config.paths.data)
+                try:
+                    _marks = _schedule_state_mod.read_marks(_schedule_state_dir)
+                except (
+                    _schedule_state_mod.ScheduleStateUnreadable,
+                    _schedule_state_mod.ScheduleStateVersionUnsupported,
+                ):
+                    pending_event_next_seconds = None
+                else:
+                    _pending_choice = choose_consolidation_run(
+                        requested=ConsolidationAction.AUTO,
+                        reason=DispatchReason.TIMER,
+                        pending=_pending_head,
+                        interim_resume=config.consolidation.interim_resume,
+                        full_window=config.consolidation.full_window,
+                        cadence=config.consolidation.refresh_cadence or "",
+                        now=_now_epoch,
+                        last_cadence_mark=_marks.last_cadence_mark_epoch,
+                        last_full_start=_marks.last_full_start_epoch,
+                        seconds_until_idle=_seconds_until_idle(config),
+                        full_fold_deadline=_full_fold_deadline(config),
+                        max_interim_count=config.consolidation.max_interim_count,
+                    )
+                    pending_event_next_seconds = (
+                        0
+                        if _pending_choice.run is not None
+                        else _pending_choice.next_opportunity_seconds
+                    )
 
     # Per-component VRAM ledger — device-wide totals from torch.cuda.mem_get_info
     # plus the component deltas measured at load time.
@@ -5825,6 +5954,11 @@ async def status():
         vram_paramem_mib=vram_paramem_mib,
         vram_components=vram_components,
         next_full_consolidation_seconds=next_full_consolidation_seconds,
+        full_window=config.consolidation.full_window,
+        interim_resume=config.consolidation.interim_resume,
+        pending_event_kind=pending_event_kind,
+        pending_event_since=pending_event_since,
+        pending_event_next_seconds=pending_event_next_seconds,
         tier_key_counts=tier_key_counts,
         oldest_interim_stamp=oldest_interim_stamp,
         store_quarantined=_state.get("store_quarantine"),
@@ -7805,7 +7939,7 @@ def _refresh_config_from_disk_into_state():
     without a subsequent model reload is correct for a pure ``consolidation.mode`` change
     because the mode affects consolidation persistence only — not the base model, adapters,
     router, or inference.  The rebuild runs later at ``/consolidate`` (pre-empted by
-    ``pending_rehydration`` in ``_dispatch_consolidation``) with its own 1.0
+    ``pending_rehydration`` in ``_arbitrate_consolidation``) with its own 1.0
     gate + source-mode fallback.
 
     Returns
@@ -10027,9 +10161,6 @@ async def debug_probe(request: DebugProbeRequest):
     :func:`_resolve_probe_route` before dispatch; this door owns the route
     field — the STT leg's ``speaker_embedding`` still has no consumer here.
     """
-    # Count as a /chat-equivalent turn for the idle-debounce gate so operator
-    # probe calls do not trigger consolidation mid-session.
-    _state["last_chat_monotonic"] = time.monotonic()
     config = _state["config"]
     if not getattr(config, "debug", False):
         return JSONResponse({"status": "forbidden_not_debug"}, status_code=403)
@@ -10087,6 +10218,10 @@ async def debug_probe(request: DebugProbeRequest):
     # running on the event loop.
     if _state["mode"] == "cloud-only":
         _abort_background_training_for_inference()
+        # Stamped where this door starts using the model, below its own
+        # refusals (forbidden_not_debug / not_ready / speaker_not_found
+        # above) — a refused probe never held a fold off.
+        _state["last_model_use_monotonic"] = time.monotonic()
 
         from paramem.server.gpu_lock import gpu_lock
 
@@ -10129,6 +10264,10 @@ async def debug_probe(request: DebugProbeRequest):
 
     # Local mode — abort BG trainer + acquire gpu_lock, mirroring /chat.
     _abort_background_training_for_inference()
+    # Stamped where this door starts using the model, below its own
+    # refusals (forbidden_not_debug / not_ready / speaker_not_found above)
+    # — a refused probe never held a fold off.
+    _state["last_model_use_monotonic"] = time.monotonic()
 
     from paramem.server.gpu_lock import gpu_lock
 
@@ -10250,6 +10389,7 @@ async def debug_recall(request: DebugRecallRequest):
         )
 
     _abort_background_training_for_inference()
+    _state["last_model_use_monotonic"] = time.monotonic()
 
     from paramem.evaluation.recall import generate_answer
     from paramem.memory.entry import parse_recalled_entry
@@ -10731,7 +10871,9 @@ def _submit_spec(
         :class:`ConsolidateResponse` — ``run_id``/``artifact_dir`` present
         exactly when ``status == "started_calibration"``.
     """
-    status, resolved_action = _dispatch_consolidation(action, spec=spec)
+    status, resolved_action = _dispatch_consolidation(
+        action, reason=DispatchReason.OPERATOR, spec=spec
+    )
     if status == "started_calibration":
         _state["calibration_run"] = {
             "run_id": spec.run_id,
@@ -10917,15 +11059,15 @@ async def calibrate_respond_route(
     """Run one production serving turn through ``handle_chat`` for calibration.
 
     Runs the training-abort sequence on the event loop, before dispatch —
-    matching every other inference entry point in this module — but does
-    NOT stamp ``_state["last_chat_monotonic"]``.  That marker exists so a
-    fold does not seize the GPU seconds after a LIVE user turn; this route
-    is a calibration probe of the serving path, not a live turn, and
-    stamping it here would make the arbitrator's own idle debounce defer
-    this call against itself (elapsed time since the stamp is always ~0s).
-    This run still holds the ``consolidating`` mutex for the whole turn,
-    network call included — the run may reach Home Assistant or place a
-    billed cloud call.
+    matching every other inference entry point in this module.  A
+    calibrate run is model use, like a conversation: it stamps the idle
+    clock (``_state["last_model_use_monotonic"]``) once its dispatch
+    actually starts — in the arbitrator's calibrate arm, after the
+    guards and the content gate, not here — so it debounces the next
+    consolidation dispatch like any other envelope run and, once running,
+    holds a fold off exactly as a conversation does.  This run still holds
+    the ``consolidating`` mutex for the whole turn, network call included —
+    the run may reach Home Assistant or place a billed cloud call.
     """
     _abort_background_training_for_inference()
     calibrate_module.preflight(_state)
@@ -11097,19 +11239,25 @@ async def require_no_trial() -> None:
 async def scheduled_tick():
     """Systemd user-timer entrypoint (paramem-consolidate.timer).
 
-    Requests ``AUTO``. The only other ``AUTO`` requester is the boot-completion
-    catch-up task (:func:`_run_boot_completion_tasks`), which dispatches
-    in-process rather than through this route — this is the only REST door
-    that does. ``AUTO`` carries the schedule's own bookkeeping: the
-    suspend/power-off catch-up gate (a tick that is not yet due against its
-    own cadence mark fires no cycle — the same universal gate applies whether
-    the request reaches here or the boot-completion task), the deadline
-    resolution (:func:`_is_full_cycle_due` picking a full fold or an interim
-    cycle), and the cadence stamp (:func:`_stamp_scheduled_run`) on dispatch.
-    ``action`` in the response reports which of the two was resolved.  The
-    content gate that follows the resolution is the same one
-    ``POST /consolidate`` and ``POST /consolidate/interim`` are subject to —
-    it is not exclusive to the timer.
+    Requests ``AUTO`` with :attr:`~paramem.server.consolidation_choice.DispatchReason.TIMER`.
+    The timer's calendar entries cover both cadence marks and, with a ring,
+    the ``full_window`` start — the arbitrator's decider
+    (:func:`~paramem.server.consolidation_choice.choose_consolidation_run`)
+    tells a cadence-mark firing from a window-start firing apart by the
+    clock, not by a flag this route passes. The other ``AUTO`` requester is
+    the boot-completion catch-up task
+    (:func:`_run_boot_completion_tasks`), with
+    :attr:`~paramem.server.consolidation_choice.DispatchReason.BOOT`,
+    dispatching in-process rather than through this route — this is the
+    only REST door that requests ``AUTO``. The decider resolves the
+    suspend/power-off catch-up gate (a tick not yet due against its own
+    cadence mark fires no cycle) and the deadline resolution (picking a
+    full fold or an interim cycle) in one pure call, ahead of the cadence
+    stamp the arbitrator writes on dispatch. ``action`` in the response
+    reports which of the two was resolved. The content gate that follows
+    the resolution is the same one ``POST /consolidate`` and
+    ``POST /consolidate/interim`` are subject to — it is not exclusive to
+    the timer.
 
     Non-blocking; HTTP 200 in every case, read ``status``.  If the GPU is
     unavailable (cloud-only, or bg training already active) the status is
@@ -11120,7 +11268,7 @@ async def scheduled_tick():
     Returns 409 ``trial_active`` when a migration TRIAL is in progress
     ("refuses new cycles" while TRIAL is active).
     """
-    status, action = _dispatch_consolidation(ConsolidationAction.AUTO)
+    status, action = _dispatch_consolidation(ConsolidationAction.AUTO, reason=DispatchReason.TIMER)
     return ConsolidateResponse(status=status, action=action.value)
 
 
@@ -11139,9 +11287,13 @@ async def consolidate():
     (:func:`~paramem.server.consolidation_action.consolidation_content_gate`'s
     CONTENT check — payload-bearing interim slots, or at ``max_interim_count: 0``
     pending NAMED sessions), minus the schedule's own deadline math
-    (:func:`_is_full_cycle_due`), which is the schedule's business alone and is
+    (the arbitrator's decider), which is the schedule's business alone and is
     never consulted on this path.  It never resolves ``AUTO`` and never falls
-    back to an interim absorb: if there is nothing to fold, it noops.
+    back to an interim absorb: if there is nothing to fold, it noops.  Requests
+    with :attr:`~paramem.server.consolidation_choice.DispatchReason.OPERATOR`
+    — operator intent, so a pending event resumes at once rather than
+    waiting for the server to go idle, still subject to the busy guards and
+    the idle debounce.
 
     A manual request drops only the TIME condition (is a full cycle due
     *right now*); the CONTENT condition (is there anything for it to
@@ -11174,7 +11326,9 @@ async def consolidate():
 
     Returns 409 ``trial_active`` when a migration TRIAL is in progress.
     """
-    status, action = _dispatch_consolidation(ConsolidationAction.FULL)
+    status, action = _dispatch_consolidation(
+        ConsolidationAction.FULL, reason=DispatchReason.OPERATOR
+    )
     return ConsolidateResponse(status=status, action=action.value)
 
 
@@ -11215,7 +11369,9 @@ async def consolidate_interim():
 
     Returns 409 ``trial_active`` when a migration TRIAL is in progress.
     """
-    status, action = _dispatch_consolidation(ConsolidationAction.INTERIM)
+    status, action = _dispatch_consolidation(
+        ConsolidationAction.INTERIM, reason=DispatchReason.OPERATOR
+    )
     return ConsolidateResponse(status=status, action=action.value)
 
 
@@ -11245,7 +11401,7 @@ async def reconsolidate():
     stage-ledger record: it never discards one, and it is not a recovery or
     abandon door.  A pending interrupted run is resumed and finished first,
     exactly like the other three consolidation endpoints — see
-    :func:`_dispatch_consolidation`'s resume-pending-first step — and this
+    :func:`_arbitrate_consolidation`'s resume-pending-first step — and this
     rebuild request waits for the next dispatch.  A record stuck in a
     deterministic resume-failure loop has exactly one in-band exit: restoring
     a healthy snapshot bundle (``POST /backup/restore``), whose wholesale
@@ -11278,10 +11434,12 @@ async def reconsolidate():
     Returns 409 ``trial_active`` when a migration TRIAL is in progress.
     """
     # Bare dispatch.  A pending interrupted run is resumed and finished
-    # first (`_dispatch_consolidation`'s resume-pending-first step) — the
+    # first (`_arbitrate_consolidation`'s resume-pending-first step) — the
     # identical contract the other three consolidation endpoints already
     # have.  This door never discards a pending event's record.
-    status, action = _dispatch_consolidation(ConsolidationAction.RECONCILE)
+    status, action = _dispatch_consolidation(
+        ConsolidationAction.RECONCILE, reason=DispatchReason.OPERATOR
+    )
     return ConsolidateResponse(status=status, action=action.value)
 
 
@@ -15881,7 +16039,7 @@ async def backup_restore(req: BackupRestoreRequest):
         # in one synchronous stretch with NO `await` in between -- the
         # arbitrator's resume-pending-first arm now treats a
         # quarantined-AND-pending dispatch as "resume it"
-        # (`_dispatch_consolidation`'s docstring, step 3), so a deliberate
+        # (`_arbitrate_consolidation`'s docstring), so a deliberate
         # quarantine that left a pending ledger observable across an await
         # boundary here could race a resume attempt against a tree this
         # restore is still mid-rewriting. Keep the whole
@@ -16546,86 +16704,6 @@ def _relay_route(
 # --- Internal ---
 
 
-def _is_full_cycle_due(config) -> bool:
-    """Oldest-interim-age deadline gate — the mechanism that fires the full fold.
-
-    Replaces the window-stamp identity gate with a content-driven signal that
-    is robust to skipped ticks, restarts, and the ≥24h stamp-collapse bug:
-
-    **The deadline:** the fold is due when the **oldest un-folded interim
-    tier's age** ≥ the full consolidation period (``N × refresh_cadence``
-    seconds, ``N = max_interim_count``).  Anchored to the oldest interim, not
-    to wall-clock since the last fold, so a skipped tick or a restart does not
-    shift it.
-
-    There is no second, count-based signal.  A slot-count gate ("due on the
-    (N+1)-th slot") is unreachable by construction: ``consolidation_period_
-    seconds`` is *derived* as ``refresh_cadence × N`` (``server/config.py``),
-    so the deadline always lands inside the very window in which the (N+1)-th
-    slot would be minted — that tick resolves FULL and drains the ring, so an
-    (N+1)-th slot never comes into existence for a count gate to observe.
-
-    **What is counted:** only interim slots that carry a written payload, in
-    either venue (``iter_interim_dirs(..., payload_only=True)`` — a slot
-    candidate is present, whether it carries ``graph.json`` or adapter
-    weights; the gate stops asking which venue it is in).  A slot directory
-    whose payload write never landed holds nothing to fold, so it must not
-    drive the gate on its own.  ``_oldest_interim_stamp``,
-    ``_full_cycle_deadline_dt`` and ``_seconds_until_next_full_consolidation``
-    filter the same way — the gate, its deadline, its incident dedup key and
-    ``/status``'s ETA must all describe one set.
-
-    Gated on ``n ≥ 1`` (un-folded interims must exist).  An empty store
-    returns ``False`` and stays on the interim path.
-
-    **N == 0 special case (full-fold-only consume-pending mode)**: when
-    ``max_interim_count == 0`` there are no interim adapter slots — the
-    interim path never mints any, so ``n`` is always 0 and the count/deadline
-    logic below does not apply.  Every scheduled tick IS a full-cycle tick at
-    ``count == 0``; there is no interim path to route to.  This function does
-    not decide whether there is anything to train on — that "no pending
-    sessions → don't dispatch" decision is the arbitrator's content gate
-    (:func:`~paramem.server.consolidation_action.consolidation_content_gate`,
-    evaluated on the resolved action after this function returns), which
-    returns ``noop_no_pending`` /
-    ``noop_no_named`` before the fold is ever entered.  At ``N == 0`` this
-    function itself returns ``True`` unconditionally.
-
-    ``N < 0`` is rejected at config load; the defensive belt below guards
-    against any future code path that bypasses the validator.
-
-    Timestamps are in LOCAL time throughout, consistent with
-    ``current_interim_stamp``'s ``datetime.now()`` basis.
-
-    ``window_stamp`` is not read here, nor anywhere else.  ``write_tier_slot``
-    still writes it on every main slot's manifest (derived via
-    ``current_full_consolidation_stamp`` and threaded through
-    ``run_build_and_publish`` / ``stage_event``'s ledger stamp), but purely
-    as provenance — no code compares stamps to decide whether a fold is due.
-    """
-    from paramem.memory.interim_adapter import iter_interim_dirs
-
-    N = config.consolidation.max_interim_count
-    # count==0 → full-fold-only consume-pending mode: every tick is a full cycle.
-    # There are no interim dirs to count or age; return True unconditionally so
-    # the dispatcher routes every tick to the full path.  The noop machinery
-    # in _run_full_cycle owns the "nothing to train" fast-path.
-    if N == 0:
-        return True
-    # Negative N is config-rejected upstream; defensive belt only.
-    if N < 0:
-        return False
-
-    if not any(iter_interim_dirs(config.adapter_dir, payload_only=True)):
-        return False
-
-    # Deadline: the oldest un-folded interim may not age past the full period.
-    deadline_dt = _full_cycle_deadline_dt(config)
-    if deadline_dt is None:
-        return False
-    return datetime.now() >= deadline_dt
-
-
 def _oldest_interim_stamp(config) -> "str | None":
     """Return the oldest un-folded interim stamp, or ``None`` when none exist.
 
@@ -16633,8 +16711,8 @@ def _oldest_interim_stamp(config) -> "str | None":
     sorted ascending (oldest first), and extracts the timestamp from the directory
     name via ``interim_stamp_from_name``.  No age gate — returns the stamp regardless
     of how old it is.  Payload-less slot dirs are skipped: this stamp is the cycle key
-    for the gate's incidents, so it must describe the same set ``_is_full_cycle_due``
-    counts.
+    for the gate's incidents, so it must describe the same set
+    :func:`_full_fold_deadline` counts.
 
     Used as the per-cycle dedup key for ``record_incident`` calls that fire
     when the ring is full (``interim_cap_reached``, ``interim_overflow_pending``)
@@ -16663,21 +16741,24 @@ def _oldest_interim_stamp(config) -> "str | None":
     return stamp
 
 
-def _full_cycle_deadline_dt(config) -> "datetime | None":
-    """Return the full-fold deadline as a ``datetime``, or ``None``.
+def _full_fold_deadline(config) -> "float | None":
+    """Return the epoch at which the full fold falls due, or ``None``.
 
-    The deadline is ``oldest_interim_dt + consolidation_period_seconds``.
-    Returns ``None`` when:
+    The deadline is the oldest payload-bearing interim slot's stamp plus
+    ``consolidation_period_seconds``. Returns ``None`` when:
 
     - No un-folded, payload-bearing interim slots exist (the scan is
-      ``payload_only=True``, venue-blind, same set as :func:`_is_full_cycle_due`).
-    - ``consolidation_period_seconds`` is ``None`` (manual-only cadence).
+      ``payload_only=True``, venue-blind).
+    - ``consolidation_period_seconds`` is ``None`` (manual-only cadence, or
+      ``max_interim_count == 0`` — there is no ring to scan).
 
     Timestamps are in LOCAL time throughout, consistent with
-    ``_is_full_cycle_due`` and ``_oldest_interim_stamp``.
+    ``_oldest_interim_stamp``.
 
-    Single source of truth for both :func:`_is_full_cycle_due` (gate) and
-    :func:`_seconds_until_next_full_consolidation` (predictor).
+    The one deadline implementation: read by the consolidation arbitrator,
+    which hands it to :func:`~paramem.server.consolidation_choice.choose_consolidation_run`,
+    and by :func:`_seconds_until_next_full_consolidation`, so the gate and
+    the prediction cannot disagree.
     """
     from paramem.memory.interim_adapter import (
         INTERIM_STAMP_FORMAT,
@@ -16696,32 +16777,43 @@ def _full_cycle_deadline_dt(config) -> "datetime | None":
     if oldest_stamp is None:
         raise ValueError(f"Corrupt interim slot name on disk: {oldest_name!r}")
     oldest_dt = datetime.strptime(oldest_stamp, INTERIM_STAMP_FORMAT)
-    return oldest_dt + timedelta(seconds=full_period_seconds)
+    return (oldest_dt + timedelta(seconds=full_period_seconds)).timestamp()
 
 
 def _seconds_until_next_full_consolidation(
     config,
     now: datetime | None = None,
 ) -> int | None:
-    """Seconds until the next scheduled tick on which :func:`_is_full_cycle_due`
-    would evaluate to ``True``.
+    """Seconds until the first opening at which a full fold would start.
 
-    Based on the same gate logic as :func:`_is_full_cycle_due`:
+    With a ring (``max_interim_count > 0``): walks daily ``full_window``
+    opening starts forward from *now* — the opening containing *now* when
+    *now* falls inside one (:meth:`~paramem.server.schedule_grammar.Window.current_start`),
+    otherwise the next opening (:meth:`~paramem.server.schedule_grammar.Window.next_start`)
+    — and answers the first opening start ``S`` for which
+    :func:`_full_fold_deadline` falls before ``S``'s own following opening
+    (``Window.next_start(S)``): the first opening at which
+    :func:`~paramem.server.consolidation_choice.choose_consolidation_run`'s
+    full-fold resolution — the deadline falls before the opening's
+    following start — would answer ``FULL`` if a firing landed there. The
+    result is clamped to ``0`` when that opening already contains *now*.
+    ``None`` when :func:`_full_fold_deadline` answers ``None`` (no
+    payload-bearing interim slot, or no period).
 
-    - ``N == 0`` (full-fold-only mode): every tick is a full fold — returns
-      seconds to the next cadence boundary (same as ``next_interim_seconds``).
-    - Cadence disabled (``refresh_cadence`` maps to ``None``): returns ``None``
-      (manual-only, no scheduled ticks).
-    - No payload-bearing interim slots exist yet: returns ``None`` (nothing to
-      fold).  The scan is ``payload_only=True`` (venue-blind) exactly as the
-      gate's is — an unfiltered predictor would contradict the gate in
-      ``/status``.
-    - Otherwise: ``deadline = oldest_interim_dt + full_period_seconds``; the
-      result is the deadline ceiled to the next tick boundary, since folds only
-      happen on ticks.
+    Without a ring (``max_interim_count == 0``): the cadence is the
+    full-fold schedule, so the answer is the seconds to the
+    next cadence mark (:func:`~paramem.server.schedule_grammar.next_mark`)
+    — identical to ``next_interim_seconds``. ``None`` for a cadence with no
+    wall-clock marks (off, unparseable, or a non-exact interval).
 
-    ``consolidation_period_seconds is None`` (cadence disabled but N > 0) also
-    returns ``None``.
+    Reads :func:`_full_fold_deadline` and
+    :class:`~paramem.server.schedule_grammar.Window`, the same two values
+    :func:`~paramem.server.consolidation_choice.choose_consolidation_run`
+    reads for the live decision. The gate additionally reads
+    ``last_full_start`` to cap a fold at one per opening — this prediction
+    does not, since it answers the first opening the deadline would fall
+    due at, not whether that opening has already been used; the once-per-
+    opening mark is the gate's own business.
 
     Parameters
     ----------
@@ -16731,52 +16823,26 @@ def _seconds_until_next_full_consolidation(
         Override for "current time" (for testing).  Defaults to
         ``datetime.now()``.
     """
-    from paramem.memory.interim_adapter import iter_interim_dirs
-    from paramem.server.schedule_grammar import compute_schedule_period_seconds
+    from paramem.server.schedule_grammar import next_mark, parse_window
 
     if now is None:
         now = datetime.now()
+    now_epoch = now.timestamp()
 
-    N = config.consolidation.max_interim_count
-    _refresh_seconds = compute_schedule_period_seconds(config.consolidation.refresh_cadence)
-    if not _refresh_seconds or _refresh_seconds <= 0:
-        return None  # manual-only — no scheduled ticks
+    if config.consolidation.max_interim_count == 0:
+        mark = next_mark(config.consolidation.refresh_cadence, now_epoch)
+        return max(0, int(mark - now_epoch)) if mark is not None else None
 
-    def _next_tick_seconds() -> int:
-        """Seconds until the next cadence boundary from midnight."""
-        midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        since_mid = int((now - midnight).total_seconds())
-        next_boundary = ((since_mid // _refresh_seconds) + 1) * _refresh_seconds
-        return max(0, next_boundary - since_mid)
+    deadline_epoch = _full_fold_deadline(config)
+    if deadline_epoch is None:
+        return None
 
-    # N == 0: every tick is a full fold.
-    if N == 0:
-        return _next_tick_seconds()
-
-    if not any(iter_interim_dirs(config.adapter_dir, payload_only=True)):
-        return None  # no interims yet — nothing to fold
-
-    deadline_dt = _full_cycle_deadline_dt(config)
-    if deadline_dt is None:
-        return None  # cadence off or no interims → no deadline
-
-    if deadline_dt <= now:
-        # Deadline already passed → due at next tick.
-        return _next_tick_seconds()
-
-    # Ceil the deadline to the next tick boundary.  Ticks fire at multiples
-    # of _refresh_seconds from midnight of the deadline's day.
-    deadline_midnight = deadline_dt.replace(hour=0, minute=0, second=0, microsecond=0)
-    deadline_since_mid = int((deadline_dt - deadline_midnight).total_seconds())
-    k = deadline_since_mid // _refresh_seconds
-    if deadline_since_mid % _refresh_seconds == 0:
-        # Deadline lands exactly on a tick boundary — use that tick.
-        tick_from_mid = k * _refresh_seconds
-    else:
-        # Ceil to the next tick.
-        tick_from_mid = (k + 1) * _refresh_seconds
-    tick_dt = deadline_midnight + timedelta(seconds=tick_from_mid)
-    return max(0, int((tick_dt - now).total_seconds()))
+    window = parse_window(config.consolidation.full_window)
+    current_start = window.current_start(now)
+    start = current_start if current_start is not None else window.next_start(now)
+    while deadline_epoch >= window.next_start(start).timestamp():
+        start = window.next_start(start)
+    return max(0, int(start.timestamp() - now_epoch))
 
 
 def _overflow_incident_for(cycle_mode: str, overflow_slot: bool) -> "tuple[str, str] | None":
@@ -16849,7 +16915,7 @@ def _record_full_consolidation_overdue(config) -> None:
 
     The one overdue check + incident, shared by the resume-pending-first arm
     (:func:`_dispatch_resume`) and the FULL dispatch arm of
-    :func:`_dispatch_consolidation` — both need the identical key, summary
+    :func:`_arbitrate_consolidation` — both need the identical key, summary
     and detail so the same stuck cycle is reported once regardless of which
     arm happens to run it.
 
@@ -16893,15 +16959,15 @@ def _store_quarantine_verdict() -> "str | None":
     The quarantine arm of :func:`refusal_for`'s closed verdict vocabulary —
     composed at the specific call sites that must refuse while the boot/lift
     store step has no publishable store (:func:`_hydrate_memory_store_in_place`):
-    the consolidation arbitrator (:func:`_dispatch_consolidation`), the
+    the consolidation arbitrator (:func:`_arbitrate_consolidation`), the
     ``/migration/confirm`` · ``/migration/accept`` trial-state-transition
     doors, ``POST /speaker/forget``, and ``POST /interim/discard`` — every
     door that reads or writes the live ``MemoryStore``.
 
     In the arbitrator specifically, refusal while quarantined is
     conditional: a PENDING event resumes ahead of this check
-    (:func:`_dispatch_consolidation`'s docstring, step 3) and — a resume
-    needing nothing from the live store — completes and, on going fully
+    (:func:`_arbitrate_consolidation`'s resume-pending-first arm) and — a
+    resume needing nothing from the live store — completes and, on going fully
     live, lifts the quarantine itself (the heal at
     :func:`_finish_resumed_event`'s tail). Every other case still defers
     here: quarantined with nothing pending, and a still-quarantined
@@ -16971,7 +17037,7 @@ def _consolidation_dispatch_guards(*, include_cloud_only: bool = True) -> "str |
     Returns:
         A non-None ``"deferred_*"`` reason string when a block is in effect,
         ``None`` when clear (caller should proceed).  The string mirrors the
-        vocabulary used by :func:`_dispatch_consolidation`.
+        vocabulary used by :func:`_arbitrate_consolidation`.
     """
     if (_state.get("migration") or {}).get("base_swap_active", False):
         return "deferred_base_swap_active"
@@ -16998,20 +17064,54 @@ def _pending_event_state_dir(config) -> Path:
     return data_state_dir(config.paths.data)
 
 
-def _pending_event_action_name(config) -> "str | None":
-    """The pending event's reported action name, or ``None`` when none is pending.
+def _pending_event_head(config) -> "PendingEvent | None":
+    """The pending event's head, or ``None`` when nothing is pending.
 
-    Reporting reads ``event`` directly off the ledger head — ``"interim"``,
-    ``"full"``, or ``"reconcile"`` — rather than deriving it: a report names
-    the door.
+    Reads the ledger straight off disk
+    (:func:`~paramem.training.stage_ledger.read_ledger`) and reports its
+    head fields. ``None`` — no ledger on disk — is the only "nothing
+    pending" answer. A present ledger this process cannot interpret
+    (:class:`~paramem.training.stage_ledger.StageLedgerUnreadable` or
+    :class:`~paramem.training.stage_ledger.StageLedgerVersionUnsupported`)
+    is caught here and reported as
+    :class:`~paramem.server.consolidation_choice.PendingEvent` with
+    ``readable=False`` — an event is still pending, just illegible right
+    now — so every caller decides its own policy rather than seeing a raise.
+
+    ``since_epoch`` is the extraction stage's own ``completed_at`` (written
+    as a UTC ISO string by
+    :meth:`~paramem.training.consolidation.ConsolidationLoop.stage_event`
+    via :func:`~paramem.training.stage_ledger.extraction_stage`), read back
+    with ``datetime.fromisoformat(...).timestamp()``; :func:`read_ledger`
+    admits no ledger without that entry, so a readable head always carries
+    one.
+
+    ``cause`` names why an unreadable head could not be read — the caught
+    exception's own :attr:`~paramem.training.stage_ledger.StageLedgerUnreadable.cause`,
+    or a rendered version string for
+    :class:`~paramem.training.stage_ledger.StageLedgerVersionUnsupported`
+    (:func:`_stage_ledger_unreadable_cause` — the one place this rendering
+    happens, shared with every other ``stage_ledger_unreadable`` incident
+    producer). The raise itself is already logged at WARNING by
+    :func:`~paramem.training.stage_ledger.read_ledger` — this function logs
+    nothing further, so a broken record does not double up the warning on
+    every poll.
     """
+    from paramem.server.consolidation_choice import PendingEvent
     from paramem.training import stage_ledger as _sl
 
     state_dir = _pending_event_state_dir(config)
-    ledger = _sl.read_ledger(state_dir)
+    try:
+        ledger = _sl.read_ledger(state_dir)
+    except (_sl.StageLedgerUnreadable, _sl.StageLedgerVersionUnsupported) as exc:
+        cause = _stage_ledger_unreadable_cause(exc)
+        return PendingEvent(kind=None, readable=False, since_epoch=None, cause=cause)
     if ledger is None:
         return None
-    return ledger.event
+
+    extraction_entry = _sl.extraction_entry(ledger)
+    since_epoch = datetime.fromisoformat(extraction_entry["completed_at"]).timestamp()
+    return PendingEvent(kind=ledger.event, readable=True, since_epoch=since_epoch)
 
 
 def active_consolidation(*, include_cloud_only: bool = True) -> "str | None":
@@ -17047,7 +17147,7 @@ def active_consolidation(*, include_cloud_only: bool = True) -> "str | None":
     if guard is not None:
         return guard
     config = _state.get("config")
-    if _pending_event_action_name(config) is not None:
+    if _pending_event_head(config) is not None:
         return "deferred_event_pending"
     return None
 
@@ -17076,7 +17176,9 @@ def refusal_for(verdict: str, *, doing: str, then: str) -> "tuple[str, str]":
         prose (``cli/backup_restore.py`` branches on ``detail["error"]``).
         The pending-record verdict is a distinct code,
         ``"consolidation_pending"``, so an operator or a script can tell
-        "wait" from "finish now".  ``"deferred_store_quarantined"``
+        "wait" from "finish now".  A present-but-unreadable ledger keeps the
+        same code but a different message, naming the record as unreadable
+        rather than the pending action's name.  ``"deferred_store_quarantined"``
         (:func:`_store_quarantine_verdict`) maps to ``"store_quarantined"``
         and names the quarantine cause in the message.
     """
@@ -17089,14 +17191,24 @@ def refusal_for(verdict: str, *, doing: str, then: str) -> "tuple[str, str]":
             f"{cause.get('message', 'unknown cause')}); wait for a repair before {doing}.",
         )
     if verdict == "deferred_event_pending":
-        action_name = _pending_event_action_name(_state.get("config")) or "a run"
+        head = _pending_event_head(_state.get("config"))
+        if head is not None and not head.readable:
+            return (
+                "consolidation_pending",
+                "A pending consolidation event's record cannot be read; waiting "
+                "will not clear it. An operator must repair the stage-ledger file "
+                "or restore a healthy backup (POST /backup/restore) "
+                f"before {doing}.",
+            )
+        action_name = (head.kind if head is not None else None) or "a run"
         return (
             "consolidation_pending",
             f"A pending consolidation event ({action_name}) is being resumed; "
-            f"wait before {doing}. It clears at the next scheduled consolidation, "
-            "or POST /consolidate to finish it now. A run that keeps failing to "
-            "resume is superseded by restoring a healthy backup "
-            "(POST /backup/restore).",
+            f"wait before {doing}. It resumes on its own as soon as the server "
+            "is idle — unconditionally for a full event, per interim_resume for "
+            "an interim one — or POST /consolidate finishes it now. A run that "
+            "keeps failing to resume is superseded by restoring a healthy "
+            "backup (POST /backup/restore).",
         )
     if verdict == "deferred_trial_active":
         return (
@@ -17124,41 +17236,74 @@ def refusal_for(verdict: str, *, doing: str, then: str) -> "tuple[str, str]":
         )
 
 
-def _stamp_scheduled_run(config) -> None:
-    """Record this dispatch's schedule mark as the last scheduled-run attempt.
+def _seconds_until_idle(config) -> int:
+    """Seconds remaining before the server is judged idle; ``0`` means idle now.
 
-    Stamps every real cadence kind — anchored (daily/weekly/HH:MM),
-    exact-divisor intervals, and non-exact intervals alike — via
-    :func:`~paramem.server.schedule_grammar.scheduled_run_stamp_value`, which
-    writes the cadence's own calendar mark (or, for a non-exact interval, its
-    heartbeat-floored stamp) rather than raw ``time.time()``: a
-    second dispatch inside the same mark's window must read
-    :attr:`~paramem.server.schedule_grammar.ScheduleDueStatus.NOT_DUE`, and an
-    un-floored stamp would silently inflate a non-exact interval's effective
-    period every cycle (see that function's docstring).
-
-    No-op when the cadence is off or unparseable — there is no cadence to
-    stamp a dispatch against, and
-    :func:`~paramem.server.schedule_grammar.scheduled_run_stamp_value` raises
-    ``ValueError`` for those inputs; this guards ahead of that call rather
-    than catching the exception.
-
-    Fires only on a SCHEDULED dispatch (the ``AUTO`` tick), on both the full and
-    the interim path.  A manual run does not reset the cadence window: the
-    scheduled tick keeps its content gate, so if the manual run already consumed
-    everything the next tick noops on its own — cheaply, and without the manual
-    run having to predict that.
+    Reads the one idle clock (``_state["last_model_use_monotonic"]``) every
+    model-using door writes, against ``session.idle_timeout_minutes``.
+    ``0`` when the clock was never stamped — a server untouched since boot
+    is idle by definition, the same reading the idle debounce takes on
+    ``None``.
     """
-    from paramem.server import schedule_state as _schedule_state
-    from paramem.server.schedule_grammar import parse_schedule_atom, scheduled_run_stamp_value
+    last_use = _state.get("last_model_use_monotonic")
+    if last_use is None:
+        return 0
+    idle_timeout_s = config.session.idle_timeout_minutes * 60
+    return max(0, int(idle_timeout_s - (time.monotonic() - last_use)))
 
-    cadence = config.consolidation.refresh_cadence or ""
-    atom = parse_schedule_atom(cadence)
-    if atom is None or atom.kind == "off":
+
+def _write_schedule_marks(
+    config,
+    *,
+    now: float,
+    cadence: str,
+    current: "schedule_state.ScheduleMarks",
+    consumes_cadence_mark: bool,
+    starts_full_fold: bool,
+) -> None:
+    """Write the cadence mark and/or the full-fold-start mark this dispatch earned.
+
+    Both fields of the pair are written together
+    (:func:`~paramem.server.schedule_state.write_marks`), even when only one
+    changes, so a verdict that both consumes a cadence mark and starts a
+    full fold never leaves a window where a crash between two separate
+    writes strands the full-start mark stale and lets a second full fold
+    start inside the same window opening. A no-op call (neither flag set)
+    touches disk not at all.
+
+    Args:
+        config: Live server config; locates the schedule state directory.
+        now: The instant this dispatch is standing on — reused as the
+            full-fold-start mark when *starts_full_fold*.
+        cadence: The interim cadence string
+            (``consolidation.refresh_cadence``) — reused to derive the
+            cadence mark itself
+            (:func:`~paramem.server.schedule_grammar.scheduled_run_stamp_value`)
+            when *consumes_cadence_mark*.
+        current: The :class:`~paramem.server.schedule_state.ScheduleMarks`
+            pair already read for this dispatch — the field not being
+            written this call is carried through unchanged.
+        consumes_cadence_mark: Whether to write the cadence mark this
+            dispatch stands on.
+        starts_full_fold: Whether to record *now* as the last full-fold
+            start.
+    """
+    if not (consumes_cadence_mark or starts_full_fold):
         return
-    _schedule_state.write_last_scheduled_run(
+
+    from paramem.server import schedule_state as _schedule_state
+    from paramem.server.schedule_grammar import scheduled_run_stamp_value as _stamp_value
+
+    _schedule_state.write_marks(
         data_state_dir(config.paths.data),
-        scheduled_run_stamp_value(cadence, time.time()),
+        _schedule_state.ScheduleMarks(
+            last_cadence_mark_epoch=(
+                _stamp_value(cadence, now)
+                if consumes_cadence_mark
+                else current.last_cadence_mark_epoch
+            ),
+            last_full_start_epoch=(now if starts_full_fold else current.last_full_start_epoch),
+        ),
     )
 
 
@@ -17272,6 +17417,55 @@ def _record_consolidation_resume_blocked_incident(exc, event: str) -> None:
         )
     except Exception:
         logger.exception("Failed to record consolidation_resume_blocked incident (non-fatal)")
+
+
+def _stage_ledger_unreadable_cause(exc: BaseException) -> str:
+    """The ``cause`` string one shared ``stage_ledger_unreadable`` incident
+    detail carries, derived the same way at every producer of it.
+
+    :class:`~paramem.training.stage_ledger.StageLedgerUnreadable` names its
+    own cause (``"undecodable"`` / ``"unopenable"`` / ``"not_a_ledger"``);
+    :class:`~paramem.training.stage_ledger.StageLedgerVersionUnsupported`
+    has no ``cause`` attribute, so its version is rendered into one here —
+    the same rendering :func:`_pending_event_head` uses for
+    :attr:`~paramem.server.consolidation_choice.PendingEvent.cause`, so the
+    string an operator reads on ``GET /status`` means the same thing
+    regardless of which site recorded it.
+    """
+    from paramem.training import stage_ledger as _sl
+
+    if isinstance(exc, _sl.StageLedgerUnreadable):
+        return exc.cause
+    return f"unsupported version {exc.version}"
+
+
+def _record_stage_ledger_unreadable_incident(*, path: Path, cause: str, summary: str) -> None:
+    """Record (or bump) the one ``stage_ledger_unreadable`` incident.
+
+    ``type="stage_ledger_unreadable", key="stage_ledger"`` — one incident
+    identity shared by every site that meets a stage ledger this process
+    cannot resume against: the arbitrator's own pending-head check
+    (:func:`_arbitrate_consolidation`), :func:`_run_pending_event_resume`'s
+    entry read, and :func:`_retire_ledger_sessions_and_dispose`'s read.
+    Recording under one key rather than one row per ledger path is
+    deliberate — there is at most one pending ledger at a time, so a second
+    producer meeting the same broken file bumps the same row instead of
+    minting a sibling an operator would have to correlate by hand.
+    *path* and *cause* land in ``detail`` so the operator sees which file
+    and why. Protected — a fault recording the incident must never mask the
+    read failure it is reporting.
+    """
+    try:
+        record_incident(
+            data_state_dir(_state["config"].paths.data),
+            type="stage_ledger_unreadable",
+            key="stage_ledger",
+            severity="failed",
+            summary=summary,
+            detail={"path": str(path), "cause": cause},
+        )
+    except Exception:
+        logger.exception("Failed to record stage_ledger_unreadable incident (non-fatal)")
 
 
 def _finish_resumed_event(loop, staged_event, *, router) -> dict:
@@ -17431,7 +17625,7 @@ def _run_pending_event_resume() -> None:
     """Executor entry point: resume a pending consolidation event straight
     from its stage ledger.
 
-    The resume-pending-first arm of :func:`_dispatch_consolidation` submits
+    The resume-pending-first arm of :func:`_arbitrate_consolidation` submits
     this exactly like any fresh dispatch (:func:`_dispatch_to_executor` has
     already set ``_state["consolidating"] = True``).  The disk venue (a
     pending simulate event) needs no GPU lock and runs inline; the weights
@@ -17449,9 +17643,29 @@ def _run_pending_event_resume() -> None:
     An active-store migration is content-preserving, not content-replacing
     — it refuses outright, record untouched, while any record is pending.
 
+    This entry point is reached only when the arbitrator already found the
+    ledger head readable — an unreadable head never dispatches here at all
+    — but the ledger read at entry still runs the same
+    :func:`~paramem.training.stage_ledger.read_ledger` a concurrent write
+    could have raced since that check. Either outcome records the shared
+    ``stage_ledger_unreadable`` incident
+    (:func:`_record_stage_ledger_unreadable_incident`) before propagating,
+    so a race lost here is operator-visible on ``GET /status`` exactly like
+    the arbitrator's own unreadable-head refusal, rather than a log line an
+    uncaught staging-action exception would otherwise leave as the only
+    trace (:func:`_consolidation_run_done`'s staging arm records no
+    incident of its own — logging there is a defensive fallback, not the
+    primary reporting path). A read that raises ``StageLedgerUnreadable``
+    or ``StageLedgerVersionUnsupported`` re-raises after recording. An
+    ABSENT ledger at this point is a different failure — the event this
+    call was dispatched to finish is not on disk — recorded under the same
+    incident (``cause="absent"``) and raised as ``RuntimeError`` naming the
+    ledger path.
+
     **Store-independent resume.** A pending event now resumes ahead of the
-    store-quarantine verdict (:func:`_dispatch_consolidation`'s docstring,
-    step 3), so this function may run with ``_state["memory_store"] is
+    store-quarantine verdict (:func:`_arbitrate_consolidation`'s
+    resume-pending-first arm), so this function may run with
+    ``_state["memory_store"] is
     None``.  In that case it constructs a throwaway, locally-scoped empty
     :class:`~paramem.memory.store.MemoryStore` and threads it into whichever
     venue's loop-construction seam applies
@@ -17477,7 +17691,36 @@ def _run_pending_event_resume() -> None:
 
     config = _state["config"]
     state_dir = data_state_dir(config.paths.data)
-    ledger = _sl.read_ledger(state_dir)
+    ledger_file = _sl.ledger_path(state_dir)
+    # An uninterpretable or absent ledger here means the event this call was
+    # dispatched to finish cannot actually be resumed -- recorded under the
+    # one shared stage_ledger_unreadable incident so the failure is
+    # operator-visible before propagating (see the docstring above for why
+    # this entry point, rather than _consolidation_run_done's staging-crash
+    # arm, is the recording site).  The exception then still propagates
+    # uncaught into that same crash handler for its existing logging /
+    # _state["consolidating"] cleanup -- recording here adds visibility, it
+    # does not replace that handling.
+    try:
+        ledger = _sl.read_ledger(state_dir)
+    except (_sl.StageLedgerUnreadable, _sl.StageLedgerVersionUnsupported) as exc:
+        cause = _stage_ledger_unreadable_cause(exc)
+        _record_stage_ledger_unreadable_incident(
+            path=ledger_file,
+            cause=cause,
+            summary=f"Pending consolidation event's stage ledger cannot be read ({cause})",
+        )
+        raise
+    if ledger is None:
+        _record_stage_ledger_unreadable_incident(
+            path=ledger_file,
+            cause="absent",
+            summary="Pending consolidation event's stage ledger is missing",
+        )
+        raise RuntimeError(
+            f"_run_pending_event_resume: no stage ledger at {ledger_file} -- "
+            "the event this resume was dispatched to finish is not on disk"
+        )
 
     staged_event = StagedEvent(
         event=ledger.event,
@@ -17530,172 +17773,192 @@ def _run_pending_event_resume() -> None:
     )
 
 
-def _dispatch_resume(config) -> "tuple[str, ConsolidationAction] | None":
-    """Resume-pending-first: dispatch a pending event's resume, or ``None``
-    when nothing is pending.
+def _dispatch_resume(
+    config, *, pending: PendingEvent, choice: ConsolidationChoice, now: float
+) -> "tuple[str, ConsolidationAction, ConsolidationChoice]":
+    """Dispatch the resume the decider granted.
 
-    Any consolidation dispatch that finds a pending ledger resumes and
-    finishes that event before any new event starts.  The reported action
-    derives from the ledger head's ``event`` field directly
-    (:func:`_pending_event_action_name`) — ``"interim"`` is ``INTERIM``,
-    ``"full"`` is ``FULL``, ``"reconcile"`` is ``RECONCILE``.  The
-    content gate is skipped deliberately: a resume's input is the ledger,
-    not new material.  The originally requested action waits for the next
-    tick.
+    The ledger head is read once per dispatch, by the arbitrator, and
+    handed in here: *choice*.run is the action to resume — the decider
+    already mapped the ledger's ``kind`` to it — and *pending*.since_epoch,
+    against *now*, is how long the event has been waiting, for the log
+    line. Reading the ledger a second time here could answer differently
+    from the head the decision was made on. The content gate is skipped
+    deliberately: a resume's input is the ledger, not new material.
+    Records the overdue incident on a ``FULL`` resume.
+    Returns *choice* unchanged as its own third element, matching
+    :func:`_arbitrate_consolidation`'s own return shape — the caller already
+    holds it, so this is a pass-through, not a new computation.
     """
-    action_name = _pending_event_action_name(config)
-    if action_name is None:
-        return None
-    resumed_action = {
-        "interim": ConsolidationAction.INTERIM,
-        "full": ConsolidationAction.FULL,
-        "reconcile": ConsolidationAction.RECONCILE,
-    }[action_name]
+    resumed_action = choice.run
     if resumed_action is ConsolidationAction.FULL:
         _record_full_consolidation_overdue(config)
     logger.info(
-        "Consolidation dispatch: resuming pending %s event ahead of any new dispatch",
-        action_name,
+        "Consolidation dispatch: resuming pending %s event ahead of any new dispatch (waiting %ds)",
+        pending.kind,
+        int(now - pending.since_epoch),
     )
     return (
         _dispatch_to_executor(_run_pending_event_resume, "started_resume", action=resumed_action),
         resumed_action,
+        choice,
     )
 
 
-def _dispatch_consolidation(
+def _arbitrate_consolidation(
     action: ConsolidationAction,
     *,
+    reason: DispatchReason,
     spec: "calibrate_module.CalibrationRunSpec | None" = None,
-) -> "tuple[str, ConsolidationAction]":
+) -> "tuple[str, ConsolidationAction, ConsolidationChoice | None]":
     """Gate + dispatch one run against the model.  The single arbitrator.
 
-    Every run that touches the model — a consolidation fold, or a
-    calibration probe — comes through here: the systemd tick, every
-    operator consolidation endpoint, and every ``/calibrate/*`` route.
-    Nothing below this function knows who asked, beyond what *action* and
-    *spec* say.
+    One arbitration, two callers: this function holds the whole decision,
+    and returns the :class:`~paramem.server.consolidation_choice.ConsolidationChoice`
+    it decided on alongside the usual status/action pair — ``None`` for the
+    three answers reached before the decider ever runs, since there is no
+    choice to report then: a busy guard (``_consolidation_dispatch_guards``),
+    the idle debounce, and ``"deferred_schedule_unreadable"`` (the schedule
+    stamp file itself cannot be read, so there is nothing to hand the
+    decider). :func:`_dispatch_consolidation`
+    is the door-facing wrapper every REST door and the boot task call,
+    discarding the choice and returning only ``(status, action)``; the idle
+    watch (:func:`_watch_for_idle`) calls this function directly instead,
+    because it needs the choice itself — specifically
+    ``choice.next_opportunity_reason``, to tell a deferral the timer will
+    clear (exit) from one only the watch itself is waiting on (keep
+    sleeping). Returning the choice is the answer to a global side channel
+    the watch would otherwise need: this function's own return value
+    already carries the same information its caller needs, with no
+    interleaving hazard to reason about.
 
-    ``AUTO`` is requested by ``/scheduled-tick`` and by the boot-completion
-    catch-up task (:func:`_run_boot_completion_tasks`, which dispatches
-    in-process rather than through a REST call) — no other caller resolves
-    it, so ``action is ConsolidationAction.AUTO`` IS "this is a scheduled or
-    boot-catch-up tick", not a separate flag threaded alongside it.
-    ``/consolidate`` requests ``FULL`` directly, ``/consolidate/interim``
-    requests ``INTERIM`` directly, ``/reconsolidate`` requests ``RECONCILE``
-    directly — none of them ever resolves ``AUTO``, so none of them consults
-    the deadline math or moves the cadence window; a manual door drops only
-    the TIME condition (is a cycle due), never the CONTENT condition (is
-    there anything to consume), which the content gate still enforces on the
-    resolved-or-direct ``FULL``/``INTERIM``/``RECONCILE`` either way — each on
-    its own input.  A ``/calibrate/*`` route requests ``CALIBRATE`` or
-    ``CALIBRATE_PENDING`` and passes its own validated *spec* — the only
+    Every run that touches the model — a consolidation fold, or a
+    calibration probe — comes through here: the systemd tick, the
+    boot-completion catch-up task, the idle watch, every operator
+    consolidation endpoint, and every ``/calibrate/*`` route. *reason*
+    names which of those is asking
+    (:class:`~paramem.server.consolidation_choice.DispatchReason`); nothing
+    below this function knows more about who asked than *action*, *reason*
+    and *spec* say.
+
+    ``AUTO`` is requested by ``/scheduled-tick`` (``reason=TIMER``), the
+    boot-completion catch-up task (:func:`_run_boot_completion_tasks`,
+    ``reason=BOOT``), and the idle watch (``reason=IDLE``) — no other caller
+    resolves it. ``/consolidate`` requests ``FULL`` directly,
+    ``/consolidate/interim`` requests ``INTERIM`` directly,
+    ``/reconsolidate`` requests ``RECONCILE`` directly — each with
+    ``reason=OPERATOR`` — so none of them ever resolves ``AUTO``, and a
+    manual door drops only the TIME condition (is a cycle due), never the
+    CONTENT condition (is there anything to consume), which the content
+    gate still enforces on the resolved-or-direct
+    ``FULL``/``INTERIM``/``RECONCILE`` either way — each on its own input.
+    A ``/calibrate/*`` route requests ``CALIBRATE`` or ``CALIBRATE_PENDING``
+    with ``reason=OPERATOR`` and passes its own validated *spec* — the only
     caller that ever passes one; every other door passes ``None``.
 
-    Order (unconditional gates first, so an explicit request cannot walk past a
-    safety property; ★ = gated on ``action.stages_event``):
+    Order:
 
     1. ``_consolidation_dispatch_guards()`` — base-swap active / already-running
        / cloud-only / bg-training / migration TRIAL active.  All actions.
-       Verified side-effect-free, so it can run before anything a pending
-       event below might need.
-    2. **Idle debounce** — all actions.  This protects a live chat turn from a
-       long GPU seizure; it is a safety property, not a schedule, so an
-       explicit request defers on it too.  MUST stay ahead of resume (step 3):
-       a weights-venue resume trains on GPU, and a chat-turn abort landing
-       mid-resume would livelock the very heal step 3 exists to run.
-    3. ★ **Resume-pending-first** (:func:`_dispatch_resume`) — a pending
-       event's ledger is resumed and finished before any new STAGING event
-       starts, the identical contract for every staging action including
-       ``RECONCILE``.  A non-staging action (a calibration probe) skips this
-       step and proceeds straight to step 4: a calibration run writes no
-       ledger, no shadow tree and no slot, and retires nothing — the resume
-       replays shadow bytes recorded at staging time, which a probe's own
-       dispatch neither depends on nor would corrupt.  A staging dispatch
-       that resumes never reaches steps 4-7 on this same call — skipping the
-       pre-stages (step 6-7) on a resuming dispatch is a deliberate, accepted
-       behavior change: retiring orphan sessions is not time-critical, and
-       the next non-resuming dispatch runs it.
-    4. :func:`_store_quarantine_verdict` — the memory store is quarantined
-       (the boot/lift store step could not publish a fresh
-       :class:`~paramem.memory.store.MemoryStore`).  All actions, including
-       ``RECONCILE`` and every calibrate action: with no store there is
-       nothing to fold into, rebuild from, or construct the process-lifetime
-       loop against.
-    5. ★ **Any MAIN tier's registry binding unverified SINCE the last store
-       step** — every STAGING action, including ``RECONCILE``.  A
-       non-staging run mints no key and rewrites no registry, so the gate
-       does not apply to it.  Distinct from step 4: this is drift a fold's
-       own post-cycle revalidation (:func:`_revalidate_adapter_manifests`)
-       observed AFTER the last successful boot/lift store step, not (yet)
-       caught by a fresh one.
-    6. **Retroactive orphan-session voice claim** (:func:`_retro_claim_orphan_sessions`)
-       — every action, including both calibrate actions: it attributes, it
-       never retires, so a probe benefits from the same attribution a fold
+    2. **Idle debounce** — all actions, reading the one idle clock
+       (``_state["last_model_use_monotonic"]``) every model-using door
+       writes.  A safety property, not a schedule, so an explicit request
+       defers on it too.
+    3. **The pending event's head and the two schedule marks are read once,
+       here** — the arbitrator does every read the decider needs and hands
+       it plain values.  A ledger present but this process cannot interpret
+       answers ``"deferred_event_unreadable"`` (incident recorded,
+       ``type="stage_ledger_unreadable"``); a schedule stamp file present
+       but this build cannot interpret answers
+       ``"deferred_schedule_unreadable"`` (incident recorded,
+       ``type="schedule_state_unreadable"``) without ever reaching the
+       decider — reading it as "never stamped" would seed the cadence mark
+       and skip a cycle in silence.
+    4. **The decider**
+       (:func:`~paramem.server.consolidation_choice.choose_consolidation_run`)
+       is called exactly once, pure, with *action* as its ``requested`` and
+       *reason* as its own — see that function's docstring for the full
+       resolution order: a non-staging action runs directly; a pending
+       event resumes or defers, ending the resolution here; an operator's
+       own staging door runs directly; otherwise the schedule's own rules
+       pick a named noop, ``FULL``, or ``INTERIM``.
+    5. **A resume verdict dispatches at once** (:func:`_dispatch_resume`) —
+       ahead of the store-quarantine and tier-unverified gates below: a
+       resume replays shadow bytes recorded at staging time, so neither
+       gate's rationale applies to it.  The cadence mark is written first
+       when the decider says this resume stands on one it had not yet
+       consumed.
+    6. **A deferral verdict is terminal here** — ``"deferred_resume_waiting"``
+       — walking no gate below: nothing runs while a ledger is pending and
+       cannot yet resume.
+    7. **The pre-stages** (store quarantine, tier-binding, retroactive
+       orphan-session voice claim, session triage and retirement, the
+       ``pending_rehydration`` migration pre-empt) run on every ``TIMER``
+       firing, whatever the decider's verdict, and on every dispatch whose
+       verdict runs something.  A ``BOOT`` or ``IDLE`` firing whose verdict
+       is a named noop returns that status here and walks none of them — a
+       restart never retires sessions or seizes the GPU for a migration on
+       its own, and neither does the server going quiet.  The migration
+       pre-empt is skipped while the ledger head read at step 3 is not
+       ``None``: the migration itself refuses over a pending event, and a
+       calibrate verdict is the one the decider resolves ahead of the
+       ledger step, so it is the one that reaches the pre-stages with an
+       event pending, and it runs as the calibrate run the operator asked
+       for.
+    8. ``noop_no_interim_tier`` — ``INTERIM`` only.
+    9. **Every action reaching this point** —
+       :func:`~paramem.server.consolidation_action.consolidation_content_gate`.
+       An empty input set is empty whether the schedule resolved into it, an
+       operator named it directly, or a calibration probe asked for the
+       pending set.  A ``noop_*`` status is not a refusal — it is the
+       answer.  ``CALIBRATE`` never noops (the operator already supplied
+       the artifact); ``CALIBRATE_PENDING`` noops exactly as ``INTERIM``
        does.
-    7. ★ **Retiring triage** — :func:`classify_pending_sessions` (pure) runs
-       unconditionally, alongside step 6, so the counts it returns are
-       available to the content gate for every action; the retirement side
-       effect (:func:`retire_unattributable_sessions`) runs only for a
-       staging action.  Reached only on a dispatch that did not resume at
-       step 3.
-    8. ``pending_rehydration`` — an incoherent active store pre-empts every
-       action, calibrate included, until the migration completes
-       (``started_migration``).  Runs after resume (step 3) for the same
-       reason it always did: the store migration is content-preserving and
-       needs a coherent, record-free tree, so a pending event always resumes
-       to completion first and the migration only ever reaches a dispatch
-       with no pending record.
-    9. **``AUTO`` only** — the suspend/power-off catch-up gate, and the
-       resolution to ``FULL`` or ``INTERIM`` via :func:`_is_full_cycle_due`
-       (its only call site).  Both belong to the schedule; every other
-       action skips straight past them.
-    10. ``noop_no_interim_tier`` — ``INTERIM`` only.
-    11. **Every action reaching this point** —
-        :func:`~paramem.server.consolidation_action.consolidation_content_gate`.
-        An empty input set is empty whether the schedule resolved into it,
-        an operator named it directly, or a calibration probe asked for the
-        pending set.  A ``noop_*`` status is not a refusal — it is the
-        answer.  ``CALIBRATE`` never noops (the operator already supplied
-        the artifact); ``CALIBRATE_PENDING`` noops exactly as ``INTERIM``
-        does.
-    12. ★ :func:`_stamp_scheduled_run` — ``AUTO`` only (``AUTO`` is a staging
-        action, so both conditions hold; the stamp is written where it is
-        today).
-    13. Dispatch table: ``FULL``/``RECONCILE`` → :func:`_run_full_consolidation_sync`;
+    10. **The two schedule marks are written together, once**
+        (:func:`_write_schedule_marks`) — the cadence mark when the decider
+        says this dispatch stands on an unconsumed one, the full-fold-start
+        mark when the decider says this dispatch starts one.  One call
+        rather than two separate writes, so a crash between them can never
+        strand the full-start mark stale and let a second full fold start
+        inside the same window opening.
+    11. Dispatch table: ``FULL``/``RECONCILE`` → :func:`_run_full_consolidation_sync`;
         ``INTERIM`` → :func:`_extract_and_start_training`; ``CALIBRATE``/
-        ``CALIBRATE_PENDING`` → :func:`_run_calibration_sync`, answering
+        ``CALIBRATE_PENDING`` → :func:`_run_calibration_sync`, stamping the
+        idle clock as the run starts and answering
         ``"started_calibration"`` — the one status that means THIS run was
         submitted.
-    14. ★ The overdue incident :func:`_record_full_consolidation_overdue`
+    12. The overdue incident :func:`_record_full_consolidation_overdue`
         stays inside the ``FULL`` arm.
 
     Args:
-        action: ``AUTO`` (the scheduled tick — let ``_is_full_cycle_due``
-            decide, ``/scheduled-tick`` only), ``FULL`` (collapse the interim
-            slots into main now — resolved from ``AUTO`` or requested
-            directly by ``/consolidate``), ``INTERIM`` (absorb pending
-            sessions into a new interim slot — resolved from ``AUTO`` or
-            requested directly by ``/consolidate/interim``), ``RECONCILE``
-            (a full consolidation whose input excludes pending sessions:
-            pending sessions stay pending; stored interim knowledge is
-            absorbed and reaped like any full fold — ``/reconsolidate``),
-            ``CALIBRATE`` (an operator-supplied calibration artifact), or
+        action: ``AUTO`` (the scheduled/boot/idle tick — let the decider
+            pick), ``FULL`` (collapse the interim slots into main now —
+            resolved from ``AUTO`` or requested directly by
+            ``/consolidate``), ``INTERIM`` (absorb pending sessions into a
+            new interim slot — resolved from ``AUTO`` or requested directly
+            by ``/consolidate/interim``), ``RECONCILE`` (a full
+            consolidation whose input excludes pending sessions: pending
+            sessions stay pending; stored interim knowledge is absorbed and
+            reaped like any full fold — ``/reconsolidate``), ``CALIBRATE``
+            (an operator-supplied calibration artifact), or
             ``CALIBRATE_PENDING`` (a calibration probe over the pending
             NAMED session set — ``POST /calibrate/extract_pending``).
+        reason: Why this dispatch is happening — see
+            :class:`~paramem.server.consolidation_choice.DispatchReason`.
         spec: The calibration run's own validated payload.  Present only on
             a ``CALIBRATE``/``CALIBRATE_PENDING`` dispatch; every other
             caller passes ``None``.
 
     Returns:
-        ``(status, action)`` — the terminal status string and the action as
-        resolved (the requested action when the dispatch never got as far as
-        resolving ``AUTO``).  ``deferred_*`` means "blocked, retry next tick";
-        ``noop_*`` means "nothing to do"; ``started*`` means the run was
-        submitted to the executor.
+        ``(status, action, choice)`` — the terminal status string, the
+        action as resolved (the requested action when the dispatch never
+        got as far as resolving ``AUTO``), and the decider's own
+        :class:`~paramem.server.consolidation_choice.ConsolidationChoice`
+        (``None`` before the decider ran).  ``deferred_*`` means "blocked,
+        retry next opportunity"; ``noop_*`` means "nothing to do";
+        ``started*`` means the run was submitted to the executor.
     """
     config = _state["config"]
-    _scheduled = action is ConsolidationAction.AUTO
 
     _guard = _consolidation_dispatch_guards()
     if _guard is not None:
@@ -17724,30 +17987,114 @@ def _dispatch_consolidation(
                 "Consolidation dispatch (%s): consolidation already running — deferred",
                 action.value,
             )
-        return _guard, action
+        return _guard, action, None
 
-    # Idle debounce — every action.  A fold seizes the GPU for minutes; firing
-    # one seconds after a chat turn would strand the next one.  Ahead of
-    # resume (below) on purpose: a weights-venue resume trains on GPU too, and
-    # this is the one property that must hold regardless of what is pending.
+    # Idle debounce — every action, reading the one idle clock every
+    # model-using door writes.  A fold seizes the GPU for minutes; firing
+    # one seconds after a turn would strand the next one.  Ahead of resume
+    # (below) on purpose: a weights-venue resume trains on GPU too, and this
+    # is the one property that must hold regardless of what is pending.
     debounce_s = config.consolidation.training_idle_debounce_s
-    last_chat = _state.get("last_chat_monotonic")
-    # Check last_chat first so MagicMock configs (tests that patch _state with
-    # a minimal mock config) short-circuit before the int comparison fires.
-    if last_chat is not None and debounce_s > 0 and (time.monotonic() - last_chat) < debounce_s:
-        elapsed = time.monotonic() - last_chat
+    last_model_use = _state.get("last_model_use_monotonic")
+    # Check last_model_use first so MagicMock configs (tests that patch
+    # _state with a minimal mock config) short-circuit before the int
+    # comparison fires.
+    if (
+        last_model_use is not None
+        and debounce_s > 0
+        and (time.monotonic() - last_model_use) < debounce_s
+    ):
+        elapsed = time.monotonic() - last_model_use
         logger.info(
-            "Consolidation dispatch (%s): chat %.1fs ago < debounce %ds — deferred",
+            "Consolidation dispatch (%s): model used %.1fs ago < debounce %ds — deferred",
             action.value,
             elapsed,
             debounce_s,
         )
-        return "deferred_idle", action
+        return "deferred_model_in_use", action, None
+
+    # The pending event's head and the two schedule marks are the two values
+    # the decider needs beyond the clock — read once, here, so the decider
+    # itself stays pure.  Each read's own refusal (a present-but-
+    # uninterpretable record) is a distinct incident from the other: the
+    # ledger head still resolves to a value (PendingEvent(readable=False)),
+    # so the decider answers "deferred_event_unreadable" at its own step and
+    # the incident is recorded below, alongside that answer; the schedule
+    # stamp file leaves no value to hand the decider at all, so its refusal
+    # is answered here, before the decider is ever called.
+    from paramem.server import schedule_state as _schedule_state
+    from paramem.training import stage_ledger as _sl
+
+    # One directory serves both reads below — the schedule stamp file and
+    # the stage ledger both live under the data root's state directory.
+    state_dir = data_state_dir(config.paths.data)
+    now = time.time()
+    cadence = config.consolidation.refresh_cadence or ""
+    head = _pending_event_head(config)
+    if head is None or head.readable:
+        # A good read resolves the incident a prior unreadable head raised
+        # — beside the schedule-marks resolve below, the two reads' own
+        # refusals each own their own incident and their own clear site.
+        resolve_incidents_by_type(state_dir, "stage_ledger_unreadable")
+
+    try:
+        marks = _schedule_state.read_marks(state_dir)
+    except (
+        _schedule_state.ScheduleStateUnreadable,
+        _schedule_state.ScheduleStateVersionUnsupported,
+    ) as exc:
+        cause = (
+            exc.cause
+            if isinstance(exc, _schedule_state.ScheduleStateUnreadable)
+            else f"version_unsupported:{exc.version!r}"
+        )
+        logger.exception(
+            "Consolidation dispatch (%s): schedule stamp file unreadable — deferred", action.value
+        )
+        record_incident(
+            state_dir,
+            type="schedule_state_unreadable",
+            key="consolidation_schedule",
+            severity="failed",
+            summary=f"Schedule stamp file cannot be read ({cause})",
+            detail={"path": str(exc.path), "cause": cause},
+        )
+        return "deferred_schedule_unreadable", action, None
+    resolve_incidents_by_type(state_dir, "schedule_state_unreadable")
+
+    choice = choose_consolidation_run(
+        requested=action,
+        reason=reason,
+        pending=head,
+        interim_resume=config.consolidation.interim_resume,
+        full_window=config.consolidation.full_window,
+        cadence=cadence,
+        now=now,
+        last_cadence_mark=marks.last_cadence_mark_epoch,
+        last_full_start=marks.last_full_start_epoch,
+        seconds_until_idle=_seconds_until_idle(config),
+        full_fold_deadline=_full_fold_deadline(config),
+        max_interim_count=config.consolidation.max_interim_count,
+    )
+
+    if choice.status == "deferred_event_unreadable":
+        ledger_file = _sl.ledger_path(_pending_event_state_dir(config))
+        logger.warning(
+            "Consolidation dispatch (%s): pending event's stage ledger unreadable (%s) — deferred",
+            action.value,
+            head.cause,
+        )
+        _record_stage_ledger_unreadable_incident(
+            path=ledger_file,
+            cause=head.cause,
+            summary=f"Pending consolidation event's stage ledger cannot be read ({head.cause})",
+        )
+        return choice.status, action, choice
 
     # Resume-pending-first: a pending event's ledger is resumed and finished
-    # before any new event starts.  Runs ahead of the store-quarantine
+    # before any new event starts.  Dispatches ahead of the store-quarantine
     # verdict and the tier-unverified gate below (see this function's own
-    # docstring, step 3): a resume replays shadow-byte increments recorded
+    # docstring): a resume replays shadow-byte increments recorded
     # at staging time rather than re-staging, so neither gate's rationale
     # applies to it, and completing it is what heals a store quarantined by
     # a crashed publish on a cold-born tier — see the lift at
@@ -17758,24 +18105,60 @@ def _dispatch_consolidation(
     # skipped deliberately — a resume's input is the ledger, not new
     # material — and so are the pre-stages below (retiring orphan sessions
     # is not time-critical; the next non-resuming dispatch runs them).
-    if action.stages_event:
-        _resume = _dispatch_resume(config)
-        if _resume is not None:
-            if _scheduled:
-                # The resumed run counts as this window's run: stamping here
-                # means a later record-free tick inside the same window reads
-                # not-due instead of starting a fresh fold. It does not throttle
-                # resume itself, which runs unconditionally while a record is
-                # pending, regardless of the stamp.
-                _stamp_scheduled_run(config)
-            return _resume
+    if choice.resume_pending:
+        if choice.consumes_cadence_mark:
+            _write_schedule_marks(
+                config,
+                now=now,
+                cadence=cadence,
+                current=marks,
+                consumes_cadence_mark=True,
+                starts_full_fold=False,
+            )
+        return _dispatch_resume(config, pending=head, choice=choice, now=now)
+
+    # A deferral verdict — "deferred_resume_waiting", the one status the
+    # decider can still answer at this point — is terminal here, walking no
+    # gate below: nothing runs while a ledger is pending and cannot yet
+    # resume. The idle watch (a direct caller of this function, not the
+    # door-facing wrapper) reads which DispatchReason owns the next
+    # opportunity straight off the returned choice — no side channel to
+    # keep in sync. Arm the watch here when this dispatch is the one that
+    # IDLE now owns — a firing that lands mid-conversation must be waited
+    # on by something, and this is the one place that knows the wait just
+    # became the watch's to own.
+    if choice.status == "deferred_resume_waiting":
+        if choice.next_opportunity_reason is DispatchReason.IDLE:
+            _arm_idle_watch()
+        return choice.status, action, choice
+
+    # The pre-stages run on every TIMER firing, whatever the verdict, and on
+    # every dispatch whose verdict runs something.  A BOOT or IDLE firing
+    # whose verdict is a named noop ends here instead — a restart never
+    # retires sessions or seizes the GPU for a migration on its own, and
+    # neither does the server going quiet.  The seed-and-noop is the one
+    # named noop that carries a mark write (priming a virgin stamp file);
+    # it writes on its way out here whichever side of this gate it fires on
+    # (a BOOT seed skips the pre-stages below, a TIMER seed runs them
+    # first, same as every other TIMER firing).
+    if choice.run is None and reason is not DispatchReason.TIMER:
+        if choice.consumes_cadence_mark:
+            _write_schedule_marks(
+                config,
+                now=now,
+                cadence=cadence,
+                current=marks,
+                consumes_cadence_mark=True,
+                starts_full_fold=False,
+            )
+        return choice.status, action, choice
 
     _quarantine_verdict = _store_quarantine_verdict()
     if _quarantine_verdict is not None:
         logger.warning(
             "Consolidation dispatch (%s): memory store is quarantined — deferred", action.value
         )
-        return _quarantine_verdict, action
+        return _quarantine_verdict, action, choice
 
     # A MAIN tier (episodic/semantic/procedural) whose registry<->manifest
     # binding could not be verified has an unknowable key set: the merger's
@@ -17801,8 +18184,9 @@ def _dispatch_consolidation(
     # separately compose _store_quarantine_verdict() at their own call
     # sites (see there) -- unlike this arm, that composition is specific to
     # those two doors, not shared via either predicate function. A pending
-    # resume (step 3 above) never reaches this gate: it is not re-staging,
-    # so an unknowable tier's identity space is not at risk from it.
+    # resume (the ledger head read, above) never reaches this gate: it is
+    # not re-staging, so an unknowable tier's identity space is not at risk
+    # from it.
     # BINDING_ROW_STATUSES (paramem/server/manifest_status.py) is the single-
     # sourced set of row statuses this arm defers on -- it includes
     # "keys_without_slot" and "payload_mismatch" alongside the pre-existing
@@ -17824,14 +18208,14 @@ def _dispatch_consolidation(
                 "is unverified — deferred",
                 action.value,
             )
-            return "deferred_tier_unverified", action
+            return "deferred_tier_unverified", action, choice
 
     # Retroactive voice-match claim: scan orphan sessions against every
     # enrolled speaker. Attributes sessions whose embeddings match an
     # existing profile at high confidence. Cheap — centroids are cached.
     # Every action, including both calibrate actions: it attributes, it
     # never retires.  Not reached on a staging dispatch that resumed above
-    # (see step 3's note).
+    # (see the ledger head read's note).
     _retro_claim_orphan_sessions()
 
     # Pending-session triage: classify_pending_sessions is pure and runs
@@ -17858,8 +18242,13 @@ def _dispatch_consolidation(
     # the same reason resume-pending-first is. Runs AFTER resume-pending-
     # first (above): the store migration is content-preserving and needs a
     # coherent, record-free tree, so a pending event always resumes to
-    # completion first and the migration runs on a later dispatch.
-    if _state.get("pending_rehydration", False):
+    # completion first and the migration runs on a later dispatch.  Skipped
+    # while the ledger head read above named an event pending: the migration
+    # itself refuses over one (active_store_migration.py), and a calibrate
+    # verdict is the one the decider resolves ahead of the ledger step, so
+    # it is the one that reaches here with an event pending — it runs as
+    # the calibrate run the operator asked for.
+    if head is None and _state.get("pending_rehydration", False):
         if _state.get("integrity_check_failed", False):
             logger.warning(
                 "Consolidation dispatch: active-store migration pending but "
@@ -17867,67 +18256,44 @@ def _dispatch_consolidation(
                 "check failed; resolve the corrupt registry file and restart the server "
                 "to retry)"
             )
-            return "migration_skipped_degraded", action
+            return "migration_skipped_degraded", action, choice
         logger.info("Consolidation dispatch: active-store migration pending — running migration")
         return (
             _dispatch_to_executor(
                 _run_active_store_migration_sync, "started_migration", action=action
             ),
             action,
+            choice,
         )
 
-    # AUTO is requested only by /scheduled-tick and the boot-completion
-    # catch-up task, so "action is AUTO" already identifies one of those two
-    # -- no separate flag alongside it (see this function's docstring).  A
-    # direct FULL/INTERIM/RECONCILE request skips this whole block: the
-    # catch-up gate and the deadline resolution are the SCHEDULE's business,
-    # never a manual door's.
-    if _scheduled:
-        # Suspend/power-off catch-up gate, universal across every real cadence
-        # kind (anchored daily/weekly/HH:MM and exact-divisor intervals, not
-        # just non-exact "heartbeat" intervals): the durable last-ATTEMPT
-        # stamp (schedule_state.py) decides whether THIS tick actually
-        # dispatches, via schedule_grammar's own dueness math
-        # (scheduled_run_due). A cadence with no real schedule (off or
-        # unparseable) has no mark to be due against and is never stamped —
-        # it falls straight through to the deadline resolution below.
-        from paramem.server import schedule_state as _schedule_state
-        from paramem.server.schedule_grammar import ScheduleDueStatus as _ScheduleDueStatus
-        from paramem.server.schedule_grammar import parse_schedule_atom as _parse_schedule_atom
-        from paramem.server.schedule_grammar import scheduled_run_due as _scheduled_run_due
-
-        cadence = config.consolidation.refresh_cadence or ""
-        _cadence_atom = _parse_schedule_atom(cadence)
-        if _cadence_atom is not None and _cadence_atom.kind != "off":
-            last_attempt = _schedule_state.read_last_scheduled_run(
-                data_state_dir(config.paths.data)
+    # The decider already resolved AUTO (if that is what was requested) —
+    # a TIMER firing that fell through to here with a named noop returns it
+    # now, after the pre-stages above have run (a seed-and-noop's mark
+    # write happens right here, on this exit, for a TIMER firing); every
+    # other dispatch reaching this point carries the action to actually run.
+    if choice.run is None:
+        if choice.consumes_cadence_mark:
+            _write_schedule_marks(
+                config,
+                now=now,
+                cadence=cadence,
+                current=marks,
+                consumes_cadence_mark=True,
+                starts_full_fold=False,
             )
-            _due_status = _scheduled_run_due(cadence, last_attempt)
-            if _due_status is _ScheduleDueStatus.NO_STAMP:
-                _stamp_scheduled_run(config)
-                logger.info(
-                    "Scheduler tick: seeding catch-up stamp for cadence %r — "
-                    "not dispatching this tick",
-                    cadence,
-                )
-                return "noop_scheduler_seeded", action
-            if _due_status is _ScheduleDueStatus.NOT_DUE:
-                return "noop_not_due", action
-
-        action = (
-            ConsolidationAction.FULL if _is_full_cycle_due(config) else ConsolidationAction.INTERIM
-        )
+        return choice.status, action, choice
+    action = choice.run
 
     # An interim tick mints an episodic_interim_* slot.  At max_interim_count==0
-    # there is no interim tier to mint into — AUTO can never resolve here
-    # (_is_full_cycle_due returns True unconditionally at N==0), and an explicit
-    # request for a tier that does not exist is meaningless, not a fold to run.
+    # there is no interim tier to mint into — the decider can never resolve
+    # INTERIM there, and an explicit request for a tier that does not exist
+    # is meaningless, not a fold to run.
     if action is ConsolidationAction.INTERIM and config.consolidation.max_interim_count == 0:
         logger.info(
             "Consolidation dispatch: interim requested but max_interim_count==0 "
             "(no interim tier exists) — noop"
         )
-        return "noop_no_interim_tier", action
+        return "noop_no_interim_tier", action, choice
 
     # The content gate applies to every action reaching this point (FULL,
     # INTERIM, RECONCILE, CALIBRATE, or CALIBRATE_PENDING — resolved from
@@ -17943,13 +18309,23 @@ def _dispatch_consolidation(
         memory_store=_state.get("memory_store"),
     )
     if _gate_status is not None:
-        return _gate_status, action
+        return _gate_status, action, choice
 
-    if _scheduled:
-        # This tick is going to dispatch, so it consumes its cadence window.  A
-        # manual run does not: the next scheduled tick keeps its own content
-        # gate and noops by itself if the manual run already took everything.
-        _stamp_scheduled_run(config)
+    # This dispatch is going to run, so the marks the decider said it stands
+    # on are written now, together, in one call — see _write_schedule_marks.
+    # A manual door drops only the TIME condition, so it consumes no mark
+    # (choice.consumes_cadence_mark / choice.starts_full_fold are both False
+    # for a direct FULL/INTERIM/RECONCILE request): the next scheduled tick
+    # keeps its own content gate and noops by itself if the manual run
+    # already took everything.
+    _write_schedule_marks(
+        config,
+        now=now,
+        cadence=cadence,
+        current=marks,
+        consumes_cadence_mark=choice.consumes_cadence_mark,
+        starts_full_fold=choice.starts_full_fold,
+    )
 
     if action in (ConsolidationAction.FULL, ConsolidationAction.RECONCILE):
         logger.info("Consolidation dispatch: running the full fold (%s)", action.value)
@@ -17979,6 +18355,7 @@ def _dispatch_consolidation(
                 action=action,
             ),
             action,
+            choice,
         )
 
     if action in (ConsolidationAction.CALIBRATE, ConsolidationAction.CALIBRATE_PENDING):
@@ -17987,6 +18364,11 @@ def _dispatch_consolidation(
             f"caller of a calibrate action must pass its own validated spec"
         )
         logger.info("Consolidation dispatch: starting calibration run (%s)", action.value)
+        # A calibrate run is model use, like a conversation: stamp the idle
+        # clock as the dispatch actually starts, so this run debounces the
+        # next consolidation dispatch like any other envelope run and, once
+        # running, holds a fold off exactly as a conversation does.
+        _state["last_model_use_monotonic"] = time.monotonic()
         return (
             _dispatch_to_executor(
                 functools.partial(_run_calibration_sync, spec),
@@ -17995,13 +18377,198 @@ def _dispatch_consolidation(
                 spec=spec,
             ),
             action,
+            choice,
         )
 
     logger.info("Consolidation dispatch: starting interim extract + train")
     return (
         _dispatch_to_executor(_extract_and_start_training, "started", action=action),
         action,
+        choice,
     )
+
+
+def _dispatch_consolidation(
+    action: ConsolidationAction,
+    *,
+    reason: DispatchReason,
+    spec: "calibrate_module.CalibrationRunSpec | None" = None,
+) -> "tuple[str, ConsolidationAction]":
+    """Gate + dispatch one run against the model — the door-facing wrapper.
+
+    One arbitration, two callers: :func:`_arbitrate_consolidation` holds the
+    whole decision and returns the
+    :class:`~paramem.server.consolidation_choice.ConsolidationChoice` it
+    decided on alongside the status/action pair; every REST door and the
+    boot-completion task call this thin wrapper instead, which discards
+    that choice and returns only ``(status, action)`` — the shape every
+    existing caller already unpacks. Only the idle watch
+    (:func:`_watch_for_idle`) needs the choice itself, so it calls
+    :func:`_arbitrate_consolidation` directly.
+
+    Args:
+        action: See :func:`_arbitrate_consolidation`.
+        reason: See :func:`_arbitrate_consolidation`.
+        spec: See :func:`_arbitrate_consolidation`.
+
+    Returns:
+        ``(status, action)`` — see :func:`_arbitrate_consolidation`'s own
+        ``Returns`` for what each value means.
+    """
+    status, resolved_action, _choice = _arbitrate_consolidation(action, reason=reason, spec=spec)
+    return status, resolved_action
+
+
+async def _watch_for_idle() -> None:
+    """Finish a pending consolidation event as soon as the server goes idle.
+
+    A module-level coroutine — reads ``_state`` fresh on every pass, holds
+    no reference to the base model, the tokenizer, or any caller's frame,
+    and is safe to leave running across a model reload or release.
+
+    Fires ``session.idle_timeout_minutes`` after the last model use
+    (``_state["last_model_use_monotonic"]``), re-read every pass — so a
+    chat turn, a probe, or a calibrate run arriving mid-wait pushes the
+    firing out through that one stamp, with no second stamp and no
+    per-turn task churn. The arming moment — a plain local taken once at
+    the top of this coroutine's own frame, never a ``_state`` field — is
+    the reference only while the clock has never been stamped (``None``).
+    That is NOT the same reading :func:`_seconds_until_idle` and the idle
+    debounce take on ``None`` — they treat an unstamped clock as idle NOW.
+    This watch instead waits one full idle timeout from its own arming on
+    an unstamped clock, because the firing that armed it while the clock
+    was still unstamped has already asked the arbitrator once, at the
+    moment it armed this watch — boot completion dispatches ``BOOT``
+    before arming, and the arbitrator's own deferral-return site only arms
+    when its own dispatch just produced the very ``deferred_resume_waiting``
+    this watch would otherwise ask about again. This watch is the backstop
+    for the answer that dispatch got, not a second immediate ask. Once the
+    clock has a stamp, the arming moment plays no further part —
+    a watch armed mid-conversation fires when THAT conversation goes idle,
+    not one full timeout after the moment it was armed.
+
+    Once idle, dispatches ``AUTO`` with
+    :attr:`~paramem.server.consolidation_choice.DispatchReason.IDLE` — the
+    same call :func:`_run_boot_completion_tasks` makes with ``BOOT`` — via
+    :func:`_arbitrate_consolidation` directly rather than the door-facing
+    :func:`_dispatch_consolidation` wrapper, because this task needs the
+    third element that function discards: the decider's own
+    :class:`~paramem.server.consolidation_choice.ConsolidationChoice`,
+    which is what tells a deferral this task should keep waiting on apart
+    from one another firing will clear. The question this task asks is
+    always "is the event I am waiting on still pending?"
+
+    One policy for every answer:
+
+    * The watch ENDS on ``started_resume`` (the event is running); on
+      ``noop_nothing_pending`` (there is no event left to wait for); on
+      ``deferred_event_unreadable`` and ``deferred_schedule_unreadable``
+      (the incident is recorded and the cure is an operator's, not a
+      wait's); and on a ``deferred_resume_waiting`` whose
+      ``choice.next_opportunity_reason`` is
+      :attr:`~paramem.server.consolidation_choice.DispatchReason.TIMER`
+      — a cadence mark under ``interim_resume: tick``, or a window start.
+      Any status this loop does not otherwise name also ends the watch: a
+      ``started_*`` other than ``started_resume``, or a ``noop_*`` other
+      than ``noop_nothing_pending``, means the pre-stages ran or a new
+      event started.
+    * The watch SLEEPS one idle timeout and asks again on every other
+      deferral — the five busy guards, ``deferred_model_in_use`` (the idle
+      debounce), and a ``deferred_resume_waiting`` whose next opportunity
+      belongs to :attr:`~paramem.server.consolidation_choice.DispatchReason.IDLE`
+      — because the event is still pending and no other firing is coming
+      for it. That sleep is never shorter than the seconds the deferral
+      named: ``next_opportunity_seconds`` is at most one idle timeout by
+      construction, so sleeping a full idle timeout satisfies it without
+      this task needing to read the value itself.
+
+    Never raises out: ``asyncio.CancelledError`` (shutdown, or a fresh
+    arming replacing this task) is a ``BaseException`` and is never caught
+    here, so it propagates untouched; anything else is logged with
+    ``logger.exception`` and the task exits, so a defect in this task never
+    takes the server down, and the next arming (:func:`_arm_idle_watch`)
+    starts a clean one.
+    """
+    armed_at = time.monotonic()
+    try:
+        while True:
+            idle_timeout_s = _state["config"].session.idle_timeout_minutes * 60
+            last_use = _state.get("last_model_use_monotonic")
+            baseline = last_use if last_use is not None else armed_at
+            remaining = baseline + idle_timeout_s - time.monotonic()
+            if remaining > 0:
+                await asyncio.sleep(remaining)
+                continue
+
+            status, _action, choice = _arbitrate_consolidation(
+                ConsolidationAction.AUTO, reason=DispatchReason.IDLE
+            )
+            logger.info("Idle watch: consolidation IDLE dispatch — status=%s", status)
+
+            if status in (
+                "started_resume",
+                "noop_nothing_pending",
+                "deferred_event_unreadable",
+                "deferred_schedule_unreadable",
+            ):
+                return
+            if status == "deferred_resume_waiting":
+                if choice.next_opportunity_reason is DispatchReason.TIMER:
+                    return
+                # Owned by IDLE — keep waiting below.
+            elif not status.startswith("deferred_"):
+                return
+
+            await asyncio.sleep(idle_timeout_s)
+    except Exception:
+        logger.exception("Idle watch task failed — exiting")
+
+
+def _arm_idle_watch() -> None:
+    """Start the idle watch task, unless one is already running.
+
+    Read off the slot rather than a separate flag: a task is started when
+    ``_state["idle_watch_task"]`` is ``None`` or the task it holds reports
+    ``done()``. Every handle created here carries the shared
+    :func:`_clear_state_task` done-callback, keyed by identity, so the slot
+    returns to ``None`` as the watch exits and the next arming — from any
+    of the three call sites (:func:`_abort_background_training_for_inference`,
+    :func:`_run_boot_completion_tasks`, and :func:`_arbitrate_consolidation`'s
+    own deferral-return site) — starts a fresh task rather than finding a
+    dead one still in the slot.
+
+    Called from every model-using door before it touches the model, from
+    boot completion, and from a dispatch whose verdict defers a resume that
+    only the idle firing will retry — the three moments something might
+    newly need the watch. Safe to call when nothing is pending: the fresh
+    task's own first pass answers ``noop_nothing_pending`` and exits, so
+    this function does no ledger read of its own before starting one.
+
+    A model-using door that arms before it stamps the idle clock still
+    reads correctly at the watch's own first pass: the new task created
+    here cannot run until this coroutine yields to the event loop, and
+    every such door writes ``_state["last_model_use_monotonic"]`` with no
+    ``await`` between the arm and the stamp — so both land in the same
+    turn, and the watch's first pass, on the next turn, always reads the
+    fresh stamp rather than the stale value that was there at arming.
+    Four call sites arm before they stamp: ``/debug/probe``'s two branches,
+    ``/debug/recall``, and ``/calibrate/respond`` (whose stamp lands later,
+    in the arbitrator's calibrate arm, once its own gates and content check
+    have passed — still on the same event-loop turn as this call).
+
+    Every call site runs on the event-loop thread — the model-using doors
+    are ``async def`` handlers calling this synchronously, the boot task is
+    itself a coroutine, and the arbitrator (``_arbitrate_consolidation``) is
+    a plain function called only from ``async def`` callers — so
+    ``asyncio.create_task`` (which requires a running loop) is always safe
+    here; no call site needs ``loop.call_soon_threadsafe``.
+    """
+    task = _state.get("idle_watch_task")
+    if task is not None and not task.done():
+        return
+    new_task = asyncio.create_task(_watch_for_idle())
+    _state["idle_watch_task"] = new_task
+    new_task.add_done_callback(functools.partial(_clear_state_task, "idle_watch_task"))
 
 
 def _retro_claim_orphan_sessions() -> int:
@@ -19029,7 +19596,26 @@ def _run_stage_b_cycle(
 _INTERIM_NON_ENCODING_OUTCOMES: frozenset[str] = frozenset({"aborted", "cap_pending"})
 
 
-def _retire_ledger_sessions_and_dispose(loop, *, disposed: bool) -> list[str]:
+@dataclass(frozen=True)
+class LedgerRetirement:
+    """The outcome of retiring a completed event's sessions and disposing its ledger.
+
+    Attributes:
+        session_ids: Session ids retired (possibly empty).
+        failure: ``None`` on a clean retire-and-dispose. ``"retirement_failed"``
+            when marking the retired sessions consolidated raised — the
+            ledger stays pending for the next resume to retry from.
+            ``"ledger_unreadable"`` when the ledger this call needed to read
+            was present but this process could not interpret it — nothing
+            retired, nothing disposed, an incident recorded naming the
+            cause.
+    """
+
+    session_ids: "tuple[str, ...]"
+    failure: "str | None" = None
+
+
+def _retire_ledger_sessions_and_dispose(loop, *, disposed: bool) -> LedgerRetirement:
     """Retire what the event's own ledger recorded, then dispose the record.
 
     Retirement reads the ledger fresh from disk — never a value captured
@@ -19054,6 +19640,23 @@ def _retire_ledger_sessions_and_dispose(loop, *, disposed: bool) -> list[str]:
     active incident of that type, which also clears any instance stranded
     on a deployed store from before this event's own failure.
 
+    A ledger this call needs to read but cannot interpret
+    (:class:`~paramem.training.stage_ledger.StageLedgerUnreadable` or
+    :class:`~paramem.training.stage_ledger.StageLedgerVersionUnsupported`)
+    is a distinct failure from a retirement failure: nothing is known about
+    which sessions this event consumed, so nothing may be retired and the
+    record must not be disposed — disposing a record this process cannot
+    read would discard the only surviving account of which sessions and
+    which shadow artifacts it names.  Recorded under the one shared
+    ``stage_ledger_unreadable`` incident
+    (:func:`_record_stage_ledger_unreadable_incident` — the same
+    ``type="stage_ledger_unreadable", key="stage_ledger"`` identity the
+    arbitrator's own pending-head check and :func:`_run_pending_event_resume`
+    record under), so a stuck unreadable record stays visible on ``GET
+    /status`` until either it becomes readable again (a later successful
+    call through this same function resolves the type below) or an
+    operator replaces the tree wholesale (a backup restore).
+
     *disposed* is the driver's own ``all_live`` verdict (every tier the
     ledger names verifies ``tier_live``).  ``False`` means this event is
     not actually complete (an abort or a partial bundle) — nothing is
@@ -19063,24 +19666,40 @@ def _retire_ledger_sessions_and_dispose(loop, *, disposed: bool) -> list[str]:
     rather than a routine branch.
 
     Returns:
-        The session ids retired (possibly empty) — folded into the
-        caller's own run-status detail.  Empty also on a retirement
-        failure: nothing is retired-and-disposed on that path, so there is
-        nothing this call can honestly report as retired.
+        :class:`LedgerRetirement` — the session ids retired (possibly
+        empty) and the failure this call met, if any.  Folded into the
+        caller's own run-status detail.
     """
     if not disposed:
-        return []
+        return LedgerRetirement(session_ids=(), failure=None)
 
     from paramem.server.consolidation import session_retention_dir
     from paramem.training import stage_ledger as _sl
 
-    ledger = _sl.read_ledger(loop._fold_state_dir)
+    incidents_dir = data_state_dir(_state["config"].paths.data)
+    ledger_path = _sl.ledger_path(loop._fold_state_dir)
+    try:
+        ledger = _sl.read_ledger(loop._fold_state_dir)
+    except (_sl.StageLedgerUnreadable, _sl.StageLedgerVersionUnsupported) as exc:
+        cause = _stage_ledger_unreadable_cause(exc)
+        logger.exception(
+            "Consolidation event: stage ledger could not be read while retiring its "
+            "sessions -- nothing retired, nothing disposed"
+        )
+        _record_stage_ledger_unreadable_incident(
+            path=ledger_path,
+            cause=cause,
+            summary=f"Stage ledger unreadable while retiring a completed event ({cause})",
+        )
+        return LedgerRetirement(session_ids=(), failure="ledger_unreadable")
+
     session_ids: list[str] = []
     if ledger is not None:
-        extraction_stage = _sl.extraction_entry(ledger) or {}
+        # read_ledger admits no ledger without an extraction entry — no
+        # fallback needed here, unlike a raw dict.get on a maybe-missing key.
+        extraction_stage = _sl.extraction_entry(ledger)
         session_ids = list(extraction_stage.get("sessions", []))
         if session_ids:
-            incidents_dir = data_state_dir(_state["config"].paths.data)
             try:
                 _state["session_buffer"].mark_consolidated(
                     session_ids,
@@ -19099,10 +19718,11 @@ def _retire_ledger_sessions_and_dispose(loop, *, disposed: bool) -> list[str]:
                     summary="Session retirement failed after a completed consolidation event",
                     detail={"session_ids": session_ids, "cause": str(exc)},
                 )
-                return []
+                return LedgerRetirement(session_ids=(), failure="retirement_failed")
             resolve_incidents_by_type(incidents_dir, "session_retirement_failed")
     _sl.dispose(loop._fold_state_dir)
-    return session_ids
+    resolve_incidents_by_type(incidents_dir, "stage_ledger_unreadable")
+    return LedgerRetirement(session_ids=tuple(session_ids), failure=None)
 
 
 def _finalize_interim(loop, result: dict, *, extraction=None) -> None:
@@ -19200,7 +19820,8 @@ def _finalize_interim(loop, result: dict, *, extraction=None) -> None:
     # Retire what the ledger recorded, then dispose the event's record.  A
     # crash between the two re-enters, finds every tier entry present,
     # retires an already-retired set (idempotent) and disposes.
-    session_ids = _retire_ledger_sessions_and_dispose(loop, disposed=bool(result.get("completed")))
+    retirement = _retire_ledger_sessions_and_dispose(loop, disposed=bool(result.get("completed")))
+    session_ids = list(retirement.session_ids)
 
     # The no-staging terminal: no ledger was ever written (stage_event's own
     # no-material early exit), so the ledger-based retirement above always
@@ -19228,6 +19849,8 @@ def _finalize_interim(loop, result: dict, *, extraction=None) -> None:
         "episodic_rels": result.get("consumed_episodic_rels", 0),
         "procedural_rels": result.get("consumed_procedural_rels", 0),
     }
+    if retirement.failure is not None:
+        _interim_detail["ledger_failure"] = retirement.failure
     try:
         record_last_run(
             data_state_dir(_state["config"].paths.data),
@@ -20081,7 +20704,7 @@ def _finalize_full(
     # c. Retire what the ledger recorded, then dispose.  A crash between the
     # two re-enters, finds every tier entry present, retires an
     # already-retired set (idempotent) and disposes.
-    _retire_ledger_sessions_and_dispose(loop, disposed=bool(result.get("completed")))
+    retirement = _retire_ledger_sessions_and_dispose(loop, disposed=bool(result.get("completed")))
     # d. Result bookkeeping.  An aborted or otherwise incomplete result
     # (reachable only from a resumed event whose bundle yielded mid-publish —
     # the fresh dispatch site routes that shape to
@@ -20107,6 +20730,8 @@ def _finalize_full(
         "tiers_rebuilt": result.get("tiers_rebuilt", []),
         "total_keys": total_keys,
     }
+    if retirement.failure is not None:
+        _full_detail["ledger_failure"] = retirement.failure
     try:
         record_last_run(
             data_state_dir(_state["config"].paths.data),
@@ -20521,7 +21146,7 @@ def _finalize_migration(loop, updated) -> None:
 def _run_active_store_migration_sync() -> None:
     """Execute the pending active-store migration on a worker thread.
 
-    Triggered by ``_dispatch_consolidation`` when
+    Triggered by ``_arbitrate_consolidation`` when
     ``_state["pending_rehydration"]`` is True — meaning startup detection
     (or an interrupted prior migration) saw a divergence between the
     operator's yaml ``consolidation.mode`` and the on-disk active store.

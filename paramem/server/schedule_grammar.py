@@ -276,18 +276,16 @@ def _is_due(
 # intervals all have real calendar marks; a non-exact interval does not (its
 # period does not evenly tile the day), so it uses heartbeat-floored-stamp
 # dueness instead (see scheduled_run_due below).
-# There is deliberately no next_mark(): no current or planned caller needs
-# "the next mark after now", only "the most recent mark at or before now".
 # ---------------------------------------------------------------------------
 
 
-def _floor_from_local_midnight(now: float, grid_seconds: int) -> float:
-    """Floor an epoch timestamp DOWN to the current local-midnight-anchored grid boundary.
+def _floor_from_local_midnight_dt(dt: datetime, grid_seconds: int) -> datetime:
+    """Floor a naive local datetime DOWN to its local-midnight-anchored grid boundary.
 
-    The one definition of "floor to a same-day grid" — used directly for
-    exact-divisor interval marks (:func:`previous_mark`) and for the
-    heartbeat-floored stamp of non-exact intervals
-    (:func:`scheduled_run_stamp_value`).
+    The one definition of "floor to a same-day grid", in naive-local-time
+    space — the shared core :func:`_floor_from_local_midnight` (the epoch
+    view) and :func:`_previous_mark_dt` (an exact-divisor interval mark)
+    both build on.
 
     Grid boundaries are computed in LOCAL time from local midnight, matching
     the LOCAL time base of rendered ``OnCalendar`` expressions — a UTC-epoch
@@ -305,33 +303,50 @@ def _floor_from_local_midnight(now: float, grid_seconds: int) -> float:
     """
     if grid_seconds <= 0:
         raise ValueError(f"grid_seconds must be positive, got {grid_seconds}")
-    dt = datetime.fromtimestamp(now)
     midnight = dt.replace(hour=0, minute=0, second=0, microsecond=0, fold=0)
     since_midnight = int((dt - midnight).total_seconds())
     floored_since_midnight = (since_midnight // grid_seconds) * grid_seconds
-    return (midnight + timedelta(seconds=floored_since_midnight)).timestamp()
+    return (midnight + timedelta(seconds=floored_since_midnight)).replace(fold=0)
 
 
-def _daily_mark(dt: datetime, hh: int, mm: int) -> float:
-    """Return the most recent daily anchor at *hh*:*mm* at or before *dt*."""
+def _floor_from_local_midnight(now: float, grid_seconds: int) -> float:
+    """Floor an epoch timestamp DOWN to the current local-midnight-anchored grid boundary.
+
+    Epoch-in/epoch-out view of :func:`_floor_from_local_midnight_dt` — used
+    directly for the heartbeat-floored stamp of non-exact intervals
+    (:func:`scheduled_run_stamp_value`).
+    """
+    return _floor_from_local_midnight_dt(datetime.fromtimestamp(now), grid_seconds).timestamp()
+
+
+def _daily_mark_dt(dt: datetime, hh: int, mm: int) -> datetime:
+    """Return the most recent daily anchor at *hh*:*mm* at or before *dt*, as naive local time."""
     anchor_today = dt.replace(hour=hh, minute=mm, second=0, microsecond=0, fold=0)
     if dt >= anchor_today:
-        return anchor_today.timestamp()
-    return (anchor_today - timedelta(days=1)).timestamp()
+        return anchor_today
+    return anchor_today - timedelta(days=1)
 
 
-def _weekly_mark(dt: datetime) -> float:
-    """Return the most recent ``WEEKLY_ANCHOR_WEEKDAY``/``HOUR``/``MINUTE`` at or before *dt*."""
+def _weekly_mark_dt(dt: datetime) -> datetime:
+    """Return the most recent weekly anchor at or before *dt*, as naive local time.
+
+    Anchor is :data:`WEEKLY_ANCHOR_WEEKDAY`/:data:`WEEKLY_ANCHOR_HOUR`/
+    :data:`WEEKLY_ANCHOR_MINUTE`.
+    """
     days_since_anchor = (dt.weekday() - WEEKLY_ANCHOR_WEEKDAY) % 7
     anchor_date = dt - timedelta(days=days_since_anchor)
-    anchor_dt = anchor_date.replace(
+    return anchor_date.replace(
         hour=WEEKLY_ANCHOR_HOUR, minute=WEEKLY_ANCHOR_MINUTE, second=0, microsecond=0, fold=0
     )
-    return anchor_dt.timestamp()
 
 
-def previous_mark(schedule: str, now: float) -> float | None:
-    """Return the most recent calendar mark at or before *now* for *schedule*.
+def _previous_mark_dt(schedule: str, dt: datetime) -> datetime | None:
+    """Return the most recent calendar-mark instant at or before *dt*, as naive local time.
+
+    The one per-kind mark placement — :func:`previous_mark` (the epoch view)
+    and :func:`next_mark` (which steps this same naive face forward by a
+    period, never by raw epoch seconds) both build on it, so the two can
+    never place a mark differently. Parses *schedule* once.
 
     Marks exist for every anchored/exact-divisor cadence:
 
@@ -349,26 +364,81 @@ def previous_mark(schedule: str, now: float) -> float | None:
     they use a different dueness strategy entirely (a heartbeat-floored
     stamp compared against a period, not a mark comparison) — see
     :func:`scheduled_run_due`.
-
-    All computation is in naive local time (matches ``OnCalendar``
-    semantics) — see the module docstring for the DST fall-back handling.
     """
     atom = parse_schedule_atom(schedule)
     if atom is None or atom.kind == "off":
         return None
-    dt = datetime.fromtimestamp(now)
     if atom.kind == "hhmm":
-        return _daily_mark(dt, atom.hh, atom.mm)
+        return _daily_mark_dt(dt, atom.hh, atom.mm)
     if atom.kind == "daily":
-        return _daily_mark(dt, DAILY_ANCHOR_HOUR, DAILY_ANCHOR_MINUTE)
+        return _daily_mark_dt(dt, DAILY_ANCHOR_HOUR, DAILY_ANCHOR_MINUTE)
     if atom.kind == "weekly":
-        return _weekly_mark(dt)
+        return _weekly_mark_dt(dt)
     if atom.kind == "interval":
         if not interval_is_exact(atom.count, atom.unit):
             return None
         grid_seconds = atom.count * 3600 if atom.unit == "h" else atom.count * 60
-        return _floor_from_local_midnight(now, grid_seconds)
+        return _floor_from_local_midnight_dt(dt, grid_seconds)
     raise ValueError(f"Unhandled schedule kind: {atom.kind!r}")
+
+
+def previous_mark(schedule: str, now: float) -> float | None:
+    """Return the most recent calendar mark at or before *now* for *schedule*.
+
+    Epoch-in/epoch-out view of :func:`_previous_mark_dt`, the module's one
+    per-kind mark placement.
+
+    All computation is in naive local time (matches ``OnCalendar``
+    semantics) — see the module docstring for the DST fall-back handling.
+    """
+    mark_dt = _previous_mark_dt(schedule, datetime.fromtimestamp(now))
+    return mark_dt.timestamp() if mark_dt is not None else None
+
+
+def next_mark(schedule: str, now: float) -> float | None:
+    """Return the next calendar mark strictly after *now* for *schedule*.
+
+    Starts from the same naive-local mark face :func:`previous_mark` places
+    (:func:`_previous_mark_dt`) and steps it forward by the cadence's period,
+    one period at a time, entirely in naive-local-time arithmetic — a
+    calendar ``timedelta`` added to a wall-clock face, never a raw
+    epoch-seconds sum, since a local day is 23 or 25 hours long across a DST
+    transition and epoch-second stepping would walk off the wall clock the
+    anchored kinds and exact-divisor intervals are defined on.
+
+    A single step can still land at or behind *now*: the naive face the
+    stepping starts from always resolves an ambiguous fall-back instant to
+    its first (``fold=0``) occurrence — the module's one fold convention —
+    so when *now* itself falls in the repeated hour's second lap, one period
+    past the mark can still be no later than *now*. The loop keeps stepping
+    until the candidate's real instant is strictly after *now*, bounded by
+    the number of marks a cadence can place inside its own repeating
+    calendar unit (a day, or a week for ``"weekly"``) — a bound no cadence's
+    genuine DST correction can exceed, so exhausting it signals a caller bug
+    rather than a real schedule.
+
+    Returns ``None`` for ``"off"``, unparseable input, and a non-exact
+    interval cadence — the same cases :func:`previous_mark` returns ``None``
+    for, since a non-exact interval has no wall-clock marks to be "next" from.
+    """
+    mark_dt = _previous_mark_dt(schedule, datetime.fromtimestamp(now))
+    if mark_dt is None:
+        return None
+    period_seconds = compute_schedule_period_seconds(schedule)
+    step = timedelta(seconds=period_seconds)
+    modulus_seconds = 604800 if period_seconds == 604800 else 86400
+    max_steps = modulus_seconds // period_seconds + 1
+    candidate = (mark_dt + step).replace(fold=0)
+    steps = 1
+    while candidate.timestamp() <= now:
+        if steps >= max_steps:
+            raise RuntimeError(
+                f"next_mark({schedule!r}, {now!r}) did not clear 'now' within "
+                f"{max_steps} steps — this signals a caller bug, not a real schedule"
+            )
+        candidate = (candidate + step).replace(fold=0)
+        steps += 1
+    return candidate.timestamp()
 
 
 class ScheduleDueStatus(str, Enum):
@@ -467,3 +537,158 @@ def scheduled_run_stamp_value(schedule: str, now: float) -> float:
         return mark
     grid_seconds = _non_exact_interval_grid_seconds(atom.count, atom.unit)
     return _floor_from_local_midnight(now, grid_seconds)
+
+
+# ---------------------------------------------------------------------------
+# Time-of-day windows.
+#
+# Window and parse_window are the single definition of a daily opening in the
+# codebase: quiet hours and any other HH:MM-bounded window both build one, so
+# there is exactly one containment/next-opening rule to get right.
+# ---------------------------------------------------------------------------
+
+
+class InvalidWindow(ValueError):
+    """The two bounds name no daily opening.
+
+    Raised for a bound outside ``0..1439`` and for ``start == end``, which
+    names no opening at all rather than an always-open or never-open one. The
+    message names both bounds and the rule they broke.
+    """
+
+
+def _window_minutes_from_hhmm(field: str, value: str) -> int:
+    """Parse one ``HH:MM`` window bound, raising :class:`InvalidWindow` on a bad shape.
+
+    Delegates shape and range checking entirely to :func:`_parse_hhmm` — the
+    module's one ``HH:MM`` recognizer — so a window bound and a cadence
+    anchor are held to the same grammar. A non-``str`` *value* (an unset
+    YAML key parsing to ``None``, an unquoted ``HH:MM`` parsing to an int)
+    is refused here rather than reaching the regex, so every config call
+    site inherits :class:`InvalidWindow` with no widened ``except``.
+    """
+    if not isinstance(value, str):
+        raise InvalidWindow(f"window {field} must be HH:MM text, got {value!r}")
+    atom = _parse_hhmm(value)
+    if atom is None:
+        raise InvalidWindow(f"window {field} must be HH:MM, got {value!r}")
+    return atom.hh * 60 + atom.mm
+
+
+@dataclass(frozen=True)
+class Window:
+    """A positive-length half-open daily time-of-day window, naive local time.
+
+    Two bounds in minutes since local midnight; wraps past midnight when
+    ``end_minute < start_minute``. ``__post_init__`` raises
+    :class:`InvalidWindow`, so no ``Window`` anywhere holds an empty opening
+    and every construction path — text via :func:`parse_window`, a config
+    pair of ``HH:MM`` fields via :meth:`from_hhmm` — is held to the one rule.
+    One meaning of the type project-wide, quiet hours included.
+    """
+
+    start_minute: int
+    end_minute: int
+
+    def __post_init__(self) -> None:
+        for field, minute in (
+            ("start_minute", self.start_minute),
+            ("end_minute", self.end_minute),
+        ):
+            if not 0 <= minute < 1440:
+                raise InvalidWindow(f"window {field} must be within 0..1439, got {minute}")
+        if self.start_minute == self.end_minute:
+            raise InvalidWindow(
+                "window start and end must differ (an equal pair names no "
+                f"opening): start_minute={self.start_minute}, end_minute={self.end_minute}"
+            )
+
+    @classmethod
+    def from_hhmm(cls, start: str, end: str) -> "Window":
+        """Build a window from two ``HH:MM`` bounds (the config-pair path, e.g. quiet hours).
+
+        Raises :class:`InvalidWindow` naming the field and the value for a
+        bound that is not ``HH:MM`` in this module's own shape (a one- or
+        two-digit hour, two-digit minutes — ``"9:5"`` is refused), and for a
+        pair that names no opening.
+        """
+        return cls(
+            _window_minutes_from_hhmm("start", start),
+            _window_minutes_from_hhmm("end", end),
+        )
+
+    def _start_on(self, now: datetime) -> datetime:
+        """Return the opening's start-of-day instant on *now*'s calendar date.
+
+        The one "today's start" arithmetic in the module — :meth:`current_start`
+        and :meth:`next_start` both place their candidate on it rather than
+        re-deriving the ``.replace(...)`` themselves.
+        """
+        return now.replace(
+            hour=self.start_minute // 60,
+            minute=self.start_minute % 60,
+            second=0,
+            microsecond=0,
+            fold=0,
+        )
+
+    def current_start(self, now: datetime | None = None) -> datetime | None:
+        """Return the start instant of the opening containing *now*, or ``None``.
+
+        The one containment arithmetic in the module — :meth:`contains` is
+        built on this. On a wrapping window inside the small hours (e.g.
+        ``23:00-02:00`` at 01:00) this is yesterday's start.
+        """
+        now = now if now is not None else datetime.now()
+        cur = now.hour * 60 + now.minute
+        start_today = self._start_on(now)
+        if self.start_minute < self.end_minute:
+            if self.start_minute <= cur < self.end_minute:
+                return start_today
+            return None
+        # Wrapping: the opening spans from start_minute through midnight to
+        # end_minute the following calendar day.
+        if cur >= self.start_minute:
+            return start_today
+        if cur < self.end_minute:
+            return start_today - timedelta(days=1)
+        return None
+
+    def contains(self, now: datetime | None = None) -> bool:
+        """Whether *now* falls inside an opening — ``current_start(now) is not None``."""
+        return self.current_start(now) is not None
+
+    def next_start(self, now: datetime | None = None) -> datetime:
+        """Return the first opening strictly after *now*.
+
+        Standing inside an opening this is the next day's, never the one
+        *now* is in.
+        """
+        now = now if now is not None else datetime.now()
+        cur = now.hour * 60 + now.minute
+        start_today = self._start_on(now)
+        if cur < self.start_minute:
+            return start_today
+        return start_today + timedelta(days=1)
+
+    @property
+    def start_hhmm(self) -> str:
+        """The start bound rendered back as ``HH:MM``."""
+        return f"{self.start_minute // 60:02d}:{self.start_minute % 60:02d}"
+
+
+def parse_window(text: str) -> Window:
+    """Build the window ``"HH:MM-HH:MM"`` names.
+
+    Raises :class:`InvalidWindow`, naming the form and the value received,
+    for a non-``str`` payload (an unset YAML key parses to ``None``), for
+    text that is not two ``HH:MM`` bounds separated by ``"-"``, and for
+    bounds that name no opening. Delegates to :meth:`Window.from_hhmm` so one
+    grammar covers cadences and windows alike.
+    """
+    if not isinstance(text, str):
+        raise InvalidWindow(f'window must be "HH:MM-HH:MM" text, got {text!r}')
+    start, sep, end = text.partition("-")
+    if not sep:
+        raise InvalidWindow(f'window must be "HH:MM-HH:MM", got {text!r}')
+    return Window.from_hhmm(start, end)

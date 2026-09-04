@@ -214,9 +214,10 @@ def create_consolidation_loop(
     # Wire the full-consolidation period string so commit_tier_slot can stamp
     # main slots with the current full-cycle window.  The stamp is manifest
     # PROVENANCE only — nothing reads it back and no gate compares stamps
-    # (_is_full_cycle_due counts payload-bearing interim slots instead).  An
-    # empty string in experiment paths (state_provider=None) therefore only
-    # means "window unknown" on those slots; it changes no scheduling decision.
+    # (the full-fold deadline counts payload-bearing interim slots instead).
+    # An empty string in experiment paths (state_provider=None) therefore
+    # only means "window unknown" on those slots; it changes no scheduling
+    # decision.
     loop.full_consolidation_period_string = config.consolidation.consolidation_period_string
 
     if seed_state_from_disk:

@@ -1,26 +1,26 @@
-"""Systemd user-timer reconciliation for the full-consolidation cycle.
+"""Systemd user-timer reconciliation for the consolidate cycle.
 
-``refresh_cadence`` (``consolidation.refresh_cadence``) is the only
-user-facing scheduling knob and the only schedule string this module ever
-sees — it is passed directly to :func:`reconcile` from the single call site in
-``app.py``'s ``lifespan``.
-This module does not receive the derived full-consolidation period
-(``refresh_cadence × max_interim_count``); that derivation lives in
-``ConsolidationScheduleConfig`` and is consumed by ``_is_full_cycle_due``,
-not by the timer renderer.
+A timer carries a set of calendar entries: the cadence's own marks
+(``consolidation.refresh_cadence``, passed to :func:`reconcile` as
+*schedule*) plus, when a caller supplies them, a full-fold window start and
+an interim-resume window start (passed as *extra_calendars*, rendered
+through :func:`window_start_calendar`). Every entry wakes the same
+endpoint, ``POST /scheduled-tick``; the arbitrator tells the entries apart
+by the wall clock and its own two durable marks, not by which entry fired,
+and decides from those what the wakeup earns — a resumed event, a full
+fold, an interim fold, or a noop.
 
 THE PRINCIPLE — the rendered ``OnCalendar`` timer decides WHEN the process
 wakes: exact-divisor cadences wake at their own period, non-exact cadences
-wake at a coarser grid (see below). WHETHER a given wakeup actually
-dispatches is decided one level up, by the arbitrator
-(``app.py::_dispatch_consolidation``), which checks a durable last-attempt
-stamp (``schedule_state.py``) against
-``schedule_grammar.scheduled_run_due`` for EVERY cadence kind, not only the
-non-exact ones. For an exact cadence the wakeup and the mark coincide, so
-the stamp check ordinarily passes straight through; it still guards against
-a duplicate/manual tick landing inside the same mark's window and against a
-missed exact-cadence tick after a suspend where systemd's own coalesced
-catch-up fires only once for however many marks were missed.
+wake at a coarser grid (see below), and a window start wakes once a day at
+its own time. WHETHER a given wakeup actually starts a fold is decided one
+level up, by the arbitrator, from the wall clock and its own durable marks
+— never from timer identity. For an exact cadence the wakeup and the mark
+it represents coincide, so the arbitrator's own check ordinarily passes
+straight through; it still guards against a duplicate/manual tick landing
+inside the same mark's window and against a missed exact-cadence tick after
+a suspend where systemd's own coalesced catch-up fires only once for
+however many marks were missed.
 
 ``systemd``'s ``Persistent=true`` only affects ``OnCalendar=`` timers —
 monotonic ``OnBootSec``/``OnUnitActiveSec`` timers run on ``CLOCK_MONOTONIC``,
@@ -43,13 +43,10 @@ no more monotonic ``TimerSpec`` kind:
   :func:`~paramem.server.schedule_grammar.non_exact_interval_grid`, imported
   from ``schedule_grammar`` rather than recomputed here — see
   :func:`_period_heartbeat_calendar`) — the timer is a wakeup source only.
-  Each heartbeat, the dispatcher (``app.py::_dispatch_consolidation``) checks
-  a durable last-attempt stamp (``schedule_state.py``) against the real
-  cadence period (via ``schedule_grammar.scheduled_run_due``) and no-ops
-  until it is actually due. This is the same answer the full fold already
-  gives for its own due-ness (``_is_full_cycle_due`` reads durable on-disk
-  state and wall clock, never timer identity) — applied one level up, to the
-  timer that drives the tick itself.
+  Each heartbeat, the arbitrator checks the real cadence period against its
+  own durable last-attempt mark and no-ops until it is actually due — the
+  same due-ness answer the full fold already gives itself, applied one
+  level up, to the timer that drives the tick.
 
 Accepted schedule strings (same parser as before, plus "off"):
     ""  / "off" / "disabled"  → no timer (manual /consolidate only)
@@ -66,11 +63,12 @@ Accepted schedule strings (same parser as before, plus "off"):
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
 from paramem.server import schedule_grammar
-from paramem.server.schedule_grammar import parse_schedule_atom
+from paramem.server.schedule_grammar import Window, parse_schedule_atom
 from paramem.utils import systemctl
 from paramem.utils.paths import find_project_root
 
@@ -89,18 +87,39 @@ DEFAULT_ENDPOINT = "http://127.0.0.1:8420/scheduled-tick"
 class TimerSpec:
     """Rendered systemd timer unit parameters for a given schedule.
 
+    A timer carries a set of calendar entries: the consolidate timer wakes
+    at every cadence mark and at each window start a caller supplies — one
+    ``OnCalendar=`` line per distinct rendered expression, in
+    first-occurrence order. ``on_calendars`` holds that set.
+
     kind values:
-      "off"      — no timer installed.
+      "off"      — no timer installed; carries no entries.
       "calendar" — OnCalendar + Persistent=true; exact grid or heartbeat
                     grid (see module docstring), always catches up missed
                     ticks on boot/resume.
       "daily"    — OnCalendar + Persistent=true; fixed daily wall-clock time.
 
     There is no monotonic kind — every non-"off" timer is OnCalendar-based.
+
+    ``__post_init__`` normalises ``on_calendars`` to a deduplicated tuple in
+    first-occurrence order, so every consumer (``render_timer_unit``,
+    ``_reconcile_timer``'s union) sees the set already reduced and never
+    dedups it a second time. It also holds the one invariant a ``TimerSpec``
+    must satisfy — ``kind == "off"`` exactly when there are no entries —
+    raising ``ValueError`` naming both when it does not.
     """
 
     kind: str  # "off" | "calendar" | "daily"
-    on_calendar: str | None = None
+    on_calendars: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        deduped = tuple(dict.fromkeys(self.on_calendars))
+        object.__setattr__(self, "on_calendars", deduped)
+        if (self.kind == "off") != (not deduped):
+            raise ValueError(
+                f"kind={self.kind!r} and on_calendars={deduped!r} disagree — "
+                '"off" must carry no entries and every other kind must carry at least one'
+            )
 
 
 def _hours_to_calendar(n: int) -> str | None:
@@ -170,6 +189,41 @@ def _period_heartbeat_calendar(count: int, unit: str) -> str:
     return cal
 
 
+def _hhmm_calendar(hh: int, mm: int) -> str:
+    """Render an hour/minute pair as the OnCalendar expression for daily at that time.
+
+    The one place this rendering is written; both :func:`parse_schedule`'s
+    ``"HH:MM"`` cadence branch and :func:`window_start_calendar` (the
+    window-start renderer offered to callers outside this module) call it,
+    so the two can never disagree on what "daily at HH:MM" looks like as an
+    OnCalendar expression.
+    """
+    return f"*-*-* {hh:02d}:{mm:02d}:00"
+
+
+def window_start_calendar(window: Window) -> str:
+    """Render a window's start as the OnCalendar expression for daily at that time.
+
+    Meant for a caller outside this module — the full-fold and
+    interim-resume window starts — that needs to add a wakeup to
+    ``extra_calendars`` on :func:`reconcile`. Its only production source is a
+    config-validated :class:`~paramem.server.schedule_grammar.Window`, so
+    there is no text to re-parse here. Uses the same rendering
+    :func:`parse_schedule` uses for a bare ``"HH:MM"`` cadence, so the entry
+    a caller hands in is byte-identical to what the timer would already
+    carry for that same time as a cadence mark, and ``_reconcile_timer``'s
+    dedup-by-rendered-expression recognises it as the same entry when the
+    two coincide.
+
+    Args:
+        window: The window whose start renders as a daily wakeup.
+
+    Returns:
+        The OnCalendar expression, e.g. ``"*-*-* 01:00:00"``.
+    """
+    return _hhmm_calendar(window.start_minute // 60, window.start_minute % 60)
+
+
 def parse_schedule(schedule: str) -> TimerSpec | None:
     """Parse a schedule string into a systemd TimerSpec.
 
@@ -187,7 +241,11 @@ def parse_schedule(schedule: str) -> TimerSpec | None:
     - ``"HH:MM"`` → daily OnCalendar timer at the given time.
 
     Every non-off kind is ``OnCalendar`` + ``Persistent=true`` (see module
-    docstring) — there is no monotonic fallback.
+    docstring) — there is no monotonic fallback. ``on_calendars`` carries
+    exactly the one expression this schedule string renders to; a caller
+    that needs to add further wakeups (a window start) does so via
+    :func:`reconcile`'s ``extra_calendars``, not by extending the tuple
+    this function returns.
 
     Returns TimerSpec(kind="off") for an explicit off setting.
     Returns None on malformed input (caller logs + falls back to off).
@@ -198,30 +256,22 @@ def parse_schedule(schedule: str) -> TimerSpec | None:
     if atom.kind == "off":
         return TimerSpec(kind="off")
     if atom.kind == "weekly":
-        return TimerSpec(
-            kind="calendar",
-            on_calendar=(
-                f"{schedule_grammar.WEEKLY_ANCHOR_LABEL} *-*-* "
-                f"{schedule_grammar.WEEKLY_ANCHOR_HOUR:02d}:"
-                f"{schedule_grammar.WEEKLY_ANCHOR_MINUTE:02d}:00"
-            ),
+        cal = (
+            f"{schedule_grammar.WEEKLY_ANCHOR_LABEL} *-*-* "
+            f"{schedule_grammar.WEEKLY_ANCHOR_HOUR:02d}:"
+            f"{schedule_grammar.WEEKLY_ANCHOR_MINUTE:02d}:00"
         )
+        return TimerSpec(kind="calendar", on_calendars=(cal,))
     if atom.kind == "daily":
-        return TimerSpec(
-            kind="daily",
-            on_calendar=(
-                f"*-*-* {schedule_grammar.DAILY_ANCHOR_HOUR:02d}:"
-                f"{schedule_grammar.DAILY_ANCHOR_MINUTE:02d}:00"
-            ),
+        cal = _hhmm_calendar(
+            schedule_grammar.DAILY_ANCHOR_HOUR, schedule_grammar.DAILY_ANCHOR_MINUTE
         )
+        return TimerSpec(kind="daily", on_calendars=(cal,))
     if atom.kind == "interval":
         cal = _period_heartbeat_calendar(atom.count, atom.unit)
-        return TimerSpec(kind="calendar", on_calendar=cal)
+        return TimerSpec(kind="calendar", on_calendars=(cal,))
     if atom.kind == "hhmm":
-        return TimerSpec(
-            kind="daily",
-            on_calendar=f"*-*-* {atom.hh:02d}:{atom.mm:02d}:00",
-        )
+        return TimerSpec(kind="daily", on_calendars=(_hhmm_calendar(atom.hh, atom.mm),))
     return None
 
 
@@ -329,10 +379,13 @@ def render_timer_unit(
 ) -> str:
     """Render the systemd .timer unit text for the given spec.
 
-    Every non-``"off"`` kind (``"calendar"``, ``"daily"``) emits
-    ``OnCalendar`` + ``Persistent=true`` so that missed ticks fire on the
-    next boot/resume — there is no monotonic kind left to special-case (see
-    module docstring).
+    Every non-``"off"`` kind (``"calendar"``, ``"daily"``) emits one
+    ``OnCalendar=`` line per entry in ``spec.on_calendars`` — already a
+    deduplicated set, in first-occurrence order, by ``TimerSpec.__post_init__``
+    — plus one ``Persistent=true``, so a missed tick fires on the next
+    boot/resume regardless of which entry it belongs to; there is no
+    monotonic kind left to special-case (see module docstring). ``systemd``
+    unions multiple ``OnCalendar=`` lines on one timer.
 
     Parameterised on ``unit_name``/``description`` so the backup timer
     (``paramem.backup.timer``) renders through this one implementation
@@ -346,7 +399,8 @@ def render_timer_unit(
         f"Unit={unit_name}.service",
     ]
     if spec.kind in ("calendar", "daily"):
-        lines.append(f"OnCalendar={spec.on_calendar}")
+        for cal in spec.on_calendars:
+            lines.append(f"OnCalendar={cal}")
         lines.append("Persistent=true")
     lines.extend(["", "[Install]", "WantedBy=timers.target", ""])
     return "\n".join(lines)
@@ -383,14 +437,26 @@ class TimerTarget:
     service_content: str
 
 
-def _reconcile_timer(target: TimerTarget, schedule: str) -> str:
+def _reconcile_timer(
+    target: TimerTarget, schedule: str, *, extra_calendars: Sequence[str] = ()
+) -> str:
     """Shared reconciliation core for both the consolidation and backup timers.
 
-    Parses *schedule*, renders/writes the unit pair, and — only when the
-    rendered unit content actually changed — (re)enables and restarts the
-    timer. Never raises on systemd errors — logs and returns a notice so the
-    caller (server startup, or ``_apply_config_live`` on a live cadence
-    change) still proceeds.
+    Parses *schedule*, builds the effective spec by constructing a
+    ``TimerSpec`` from the cadence's own entries plus *extra_calendars* —
+    ``TimerSpec.__post_init__`` does the dedup — renders/writes the unit
+    pair carrying it, and — only when the rendered unit content actually
+    changed — (re)enables and restarts the timer. Never raises on systemd
+    errors — logs and returns a notice so the caller (server startup, or
+    ``_apply_config_live`` on a live cadence change) still proceeds.
+
+    The timer is removed only when the cadence contributes no entries and
+    *extra_calendars* is empty: an off cadence carrying one or more
+    *extra_calendars* still leaves a running timer that wakes at those
+    entries, and only an off cadence with no extras removes the unit. The
+    effective kind reported and rendered is the cadence's own kind, or
+    ``"calendar"`` when the cadence itself is off and the entries are made
+    up entirely of extras.
 
     ``enable --now`` and ``restart`` are gated on ``svc_changed or
     tmr_changed`` (the same flag that gates ``daemon-reload``), not called
@@ -401,24 +467,25 @@ def _reconcile_timer(target: TimerTarget, schedule: str) -> str:
     (``_write_if_changed`` reports a change when the unit files do not yet
     exist), so a fresh machine still gets enabled.
 
-    Returns a short human-readable description of the action taken, which
-    the caller logs. The returned state ("updated" vs "already current") is
-    truthful by construction: it reports exactly ``svc_changed or
-    tmr_changed``, the same condition that gated every systemctl call in
-    this branch, so "already current" is never returned after an action was
-    actually taken.
+    Returns a short human-readable description of the action taken, naming
+    the entries installed, which the caller logs. The returned state
+    ("updated" vs "already current") is truthful by construction: it reports
+    exactly ``svc_changed or tmr_changed``, the same condition that gated
+    every systemctl call in this branch, so "already current" is never
+    returned after an action was actually taken.
     """
     spec = parse_schedule(schedule)
     if spec is None:
         logger.error(
-            "Invalid %s schedule: %r — expected '', 'off', 'HH:MM', 'every Nh', "
-            "or 'every Nm'. Timer will be disabled.",
+            "Invalid %s schedule: %r — does not match the accepted schedule grammar "
+            "(see paramem.server.schedule_grammar.parse_schedule_atom), so the cadence "
+            "contributes no timer entries; see the return line for what is actually installed.",
             target.timer_name,
             schedule,
         )
         spec = TimerSpec(kind="off")
 
-    if spec.kind == "off":
+    if not spec.on_calendars and not extra_calendars:
         changed = False
         if target.timer_path.exists():
             systemctl.run("stop", f"{target.timer_name}.timer")
@@ -429,10 +496,15 @@ def _reconcile_timer(target: TimerTarget, schedule: str) -> str:
             changed = True
         return f"{target.timer_name}: disabled" + (" (removed)" if changed else "")
 
+    effective_kind = spec.kind if spec.kind != "off" else "calendar"
+    effective_spec = TimerSpec(effective_kind, (*spec.on_calendars, *extra_calendars))
+
     svc_changed = _write_if_changed(target.service_path, target.service_content)
     tmr_changed = _write_if_changed(
         target.timer_path,
-        render_timer_unit(spec, unit_name=target.timer_name, description=target.description),
+        render_timer_unit(
+            effective_spec, unit_name=target.timer_name, description=target.description
+        ),
     )
     changed = svc_changed or tmr_changed
 
@@ -449,15 +521,16 @@ def _reconcile_timer(target: TimerTarget, schedule: str) -> str:
             return f"{target.timer_name}: enable failed ({enable.stderr.strip()[:80]})"
 
         # If unit already enabled, systemd won't restart it on daemon-reload —
-        # force a restart so the new OnCalendar takes effect.
+        # force a restart so the new OnCalendar entries take effect.
         systemctl.run("restart", f"{target.timer_name}.timer")
 
     # Every non-off kind is OnCalendar + Persistent=true — catch-up always
     # applies, whether the grid is exact or a heartbeat (see module docstring).
-    if spec.kind == "calendar":
-        detail = f"calendar {spec.on_calendar} (with catch-up)"
+    entries = ", ".join(effective_spec.on_calendars)
+    if effective_spec.kind == "calendar":
+        detail = f"calendar {entries} (with catch-up)"
     else:
-        detail = f"daily at {spec.on_calendar} (with catch-up)"
+        detail = f"daily at {entries} (with catch-up)"
     state = "updated" if changed else "already current"
     return f"{target.timer_name}: {state}, {detail}"
 
@@ -466,6 +539,8 @@ def reconcile(
     schedule: str,
     endpoint: str = DEFAULT_ENDPOINT,
     project_root: str | None = None,
+    *,
+    extra_calendars: Sequence[str] = (),
 ) -> str:
     """Reconcile the systemd user timer with the configured schedule.
 
@@ -479,8 +554,8 @@ def reconcile(
         The interim refresh cadence string (``consolidation.refresh_cadence``,
         e.g. ``"every 12h"`` / ``"12h"`` / ``"HH:MM"`` / ``"daily"``). The timer
         fires at this cadence; whether a given tick runs a full consolidation
-        is decided per-tick by ``_is_full_cycle_due`` (interim accumulation plus
-        an oldest-interim deadline), not by a separate derived-period timer.
+        is decided per-tick by the arbitrator (interim accumulation plus an
+        oldest-interim deadline), not by a separate derived-period timer.
     endpoint:
         URL the timer curls.  Defaults to
         ``http://127.0.0.1:8420/scheduled-tick``.
@@ -492,6 +567,12 @@ def reconcile(
         ``pyproject.toml``), falling back to
         ``Path(__file__).resolve().parents[2]`` when no such ancestor exists
         (e.g. an installed package under site-packages).
+    extra_calendars:
+        Further OnCalendar expressions to union with the cadence's own
+        entries, deduplicated by rendered expression — the full-fold and
+        interim-resume window starts, rendered via :func:`window_start_calendar`.
+        Empty by default, in which case the timer carries exactly the
+        cadence's own entries (or none, for an off cadence).
     """
     if project_root is None:
         _r = find_project_root(Path(__file__))
@@ -503,7 +584,7 @@ def reconcile(
         timer_path=TIMER_PATH,
         service_content=render_service_unit(endpoint, project_root),
     )
-    return _reconcile_timer(target, schedule)
+    return _reconcile_timer(target, schedule, extra_calendars=extra_calendars)
 
 
 def current_timer_state(timer_name: str = TIMER_NAME) -> dict:

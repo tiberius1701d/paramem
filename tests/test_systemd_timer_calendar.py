@@ -1,9 +1,10 @@
-"""Tests for the interval→calendar conversion in systemd_timer.
+"""Tests for systemd_timer's calendar helpers and unit rendering.
 
-Covers every common divisible cadence, a representative set of odd
-(non-divisible) cadences that now render at a coarser heartbeat grid instead
-of staying monotonic (suspend/power-off catch-up gate — see systemd_timer
-module docstring), weekly, and rendered unit text assertions.
+Covers the hour and minute grid renderers, the heartbeat floor for a
+non-divisible cadence, the rule that every rendered unit is calendar-driven
+with catch-up and never monotonic, the reconcile detail line, the anchor the
+renderer shares with the schedule grammar, the service unit's token and
+endpoint guards, project-root resolution, and the timer-state JSON parser.
 """
 
 import subprocess
@@ -12,12 +13,15 @@ from unittest.mock import patch
 
 import pytest
 
+from paramem.backup import timer as backup_timer
 from paramem.server import systemd_timer
+from paramem.server.schedule_grammar import Window
 from paramem.server.systemd_timer import (
     TimerSpec,
     _hours_to_calendar,
     _minutes_to_calendar,
     parse_schedule,
+    window_start_calendar,
 )
 from paramem.utils import systemctl
 
@@ -90,137 +94,6 @@ class TestMinutesToCalendar:
 
     def test_zero_returns_none(self):
         assert _minutes_to_calendar(0) is None
-
-
-class TestParseScheduleCalendarConversions:
-    @pytest.mark.parametrize(
-        "schedule,expected_calendar",
-        [
-            ("every 1h", _1H_CAL),
-            ("every 2h", "*-*-* 00,02,04,06,08,10,12,14,16,18,20,22:00:00"),
-            ("every 3h", "*-*-* 00,03,06,09,12,15,18,21:00:00"),
-            ("every 4h", "*-*-* 00,04,08,12,16,20:00:00"),
-            ("every 6h", "*-*-* 00,06,12,18:00:00"),
-            ("every 8h", "*-*-* 00,08,16:00:00"),
-            ("every 12h", "*-*-* 00,12:00:00"),
-            ("every 24h", "*-*-* 00:00:00"),
-        ],
-    )
-    def test_hour_cadences_become_calendar(self, schedule, expected_calendar):
-        spec = parse_schedule(schedule)
-        assert spec is not None
-        assert spec.kind == "calendar"
-        assert spec.on_calendar == expected_calendar
-        # TimerSpec has no on_boot_sec/on_unit_active_sec fields; there is
-        # no monotonic kind (see systemd_timer module docstring).
-        assert not hasattr(spec, "on_boot_sec")
-        assert not hasattr(spec, "on_unit_active_sec")
-
-    @pytest.mark.parametrize(
-        "schedule,expected_calendar",
-        [
-            ("every 5m", "*:00,05,10,15,20,25,30,35,40,45,50,55:00"),
-            ("every 15m", "*:00,15,30,45:00"),
-            ("every 30m", "*:00,30:00"),
-        ],
-    )
-    def test_minute_cadences_become_calendar(self, schedule, expected_calendar):
-        spec = parse_schedule(schedule)
-        assert spec is not None
-        assert spec.kind == "calendar"
-        assert spec.on_calendar == expected_calendar
-
-    @pytest.mark.parametrize("schedule", ["every 5h", "every 7h", "every 11h"])
-    def test_odd_hour_cadences_become_heartbeat_calendar(self, schedule):
-        """Non-divisor hour cadences render at the gcd(count, 24) heartbeat
-        grid instead of staying monotonic (suspend/power-off catch-up gate;
-        every non-off TimerSpec is now OnCalendar-based).
-        """
-        spec = parse_schedule(schedule)
-        assert spec is not None
-        assert spec.kind == "calendar"
-        assert spec.on_calendar is not None
-        assert not hasattr(spec, "on_boot_sec")
-        assert not hasattr(spec, "on_unit_active_sec")
-
-    @pytest.mark.parametrize("schedule", ["every 7m", "every 13m", "every 17m"])
-    def test_odd_minute_cadences_become_heartbeat_calendar(self, schedule):
-        """Non-divisor minute cadences render at the gcd(count, 60) heartbeat grid."""
-        spec = parse_schedule(schedule)
-        assert spec is not None
-        assert spec.kind == "calendar"
-        assert spec.on_calendar is not None
-
-    def test_weekly_becomes_calendar(self):
-        spec = parse_schedule("weekly")
-        assert spec == TimerSpec(kind="calendar", on_calendar="Mon *-*-* 00:00:00")
-
-    def test_weekly_case_variants(self):
-        for s in ("weekly", "Weekly", "WEEKLY"):
-            spec = parse_schedule(s)
-            assert spec is not None
-            assert spec.kind == "calendar"
-            assert spec.on_calendar == "Mon *-*-* 00:00:00"
-
-
-class TestRenderTimerUnitCalendar:
-    def test_calendar_kind_has_oncalendar_and_persistent(self):
-        spec = TimerSpec(kind="calendar", on_calendar="*-*-* 00,12:00:00")
-        text = systemd_timer.render_timer_unit(spec)
-        assert "OnCalendar=*-*-* 00,12:00:00" in text
-        assert "Persistent=true" in text
-        assert "OnBootSec" not in text
-        assert "OnUnitActiveSec" not in text
-
-    def test_daily_kind_has_oncalendar_and_persistent(self):
-        spec = TimerSpec(kind="daily", on_calendar="*-*-* 03:00:00")
-        text = systemd_timer.render_timer_unit(spec)
-        assert "OnCalendar=*-*-* 03:00:00" in text
-        assert "Persistent=true" in text
-
-    def test_heartbeat_calendar_kind_has_persistent_and_no_monotonic_fields(self):
-        """A heartbeat-grid TimerSpec ('every 5h' → gcd(5,24)=1 hourly grid)
-        still renders OnCalendar + Persistent=true — there is no monotonic
-        "interval" TimerSpec kind left to special-case.
-        """
-        spec = parse_schedule("every 5h")
-        assert spec is not None
-        assert spec.kind == "calendar"
-        text = systemd_timer.render_timer_unit(spec)
-        assert "OnCalendar=" in text
-        assert "Persistent=true" in text
-        assert "OnBootSec" not in text
-        assert "OnUnitActiveSec" not in text
-
-    @pytest.mark.parametrize(
-        "schedule,expected_calendar",
-        [
-            ("every 12h", "*-*-* 00,12:00:00"),
-            ("every 6h", "*-*-* 00,06,12,18:00:00"),
-            ("every 24h", "*-*-* 00:00:00"),
-            ("every 15m", "*:00,15,30,45:00"),
-            ("weekly", "Mon *-*-* 00:00:00"),
-        ],
-    )
-    def test_rendered_unit_for_common_schedules(self, schedule, expected_calendar):
-        spec = parse_schedule(schedule)
-        assert spec is not None
-        text = systemd_timer.render_timer_unit(spec)
-        assert f"OnCalendar={expected_calendar}" in text
-        assert "Persistent=true" in text
-
-    def test_every_5h_rendered_unit_has_persistent(self):
-        """'every 5h' renders as a heartbeat OnCalendar with Persistent=true,
-        never as a bare monotonic OnBootSec/OnUnitActiveSec timer with no
-        catch-up.
-        """
-        spec = parse_schedule("every 5h")
-        assert spec is not None
-        text = systemd_timer.render_timer_unit(spec)
-        assert "OnBootSec" not in text
-        assert "OnUnitActiveSec" not in text
-        assert "OnCalendar=" in text
-        assert "Persistent=true" in text
 
 
 # ---------------------------------------------------------------------------
@@ -860,14 +733,14 @@ class TestRendererAnchorMatchesGrammarMarks:
         spec = parse_schedule("daily")
         assert spec == TimerSpec(
             kind="daily",
-            on_calendar=(
+            on_calendars=(
                 f"*-*-* {schedule_grammar.DAILY_ANCHOR_HOUR:02d}:"
-                f"{schedule_grammar.DAILY_ANCHOR_MINUTE:02d}:00"
+                f"{schedule_grammar.DAILY_ANCHOR_MINUTE:02d}:00",
             ),
         )
         # Locks the current rendered value too — a silent anchor change
         # would otherwise only be caught by the (derived) assertion above.
-        assert spec.on_calendar == "*-*-* 03:00:00"
+        assert spec.on_calendars == ("*-*-* 03:00:00",)
 
         mark = schedule_grammar.previous_mark("daily", datetime(2024, 1, 15, 10, 0).timestamp())
         assert (
@@ -887,13 +760,13 @@ class TestRendererAnchorMatchesGrammarMarks:
         spec = parse_schedule("weekly")
         assert spec == TimerSpec(
             kind="calendar",
-            on_calendar=(
+            on_calendars=(
                 f"{schedule_grammar.WEEKLY_ANCHOR_LABEL} *-*-* "
                 f"{schedule_grammar.WEEKLY_ANCHOR_HOUR:02d}:"
-                f"{schedule_grammar.WEEKLY_ANCHOR_MINUTE:02d}:00"
+                f"{schedule_grammar.WEEKLY_ANCHOR_MINUTE:02d}:00",
             ),
         )
-        assert spec.on_calendar == "Mon *-*-* 00:00:00"
+        assert spec.on_calendars == ("Mon *-*-* 00:00:00",)
 
         # 2024-01-15 is the Monday matching WEEKLY_ANCHOR_WEEKDAY.
         mark = schedule_grammar.previous_mark("weekly", datetime(2024, 1, 17, 15, 0).timestamp())
@@ -907,3 +780,150 @@ class TestRendererAnchorMatchesGrammarMarks:
                 schedule_grammar.WEEKLY_ANCHOR_MINUTE,
             ).timestamp()
         )
+
+
+# ---------------------------------------------------------------------------
+# TimerSpec: a set of entries, deduplicated; kind/entries invariant.
+# ---------------------------------------------------------------------------
+
+
+class TestTimerSpecInvariant:
+    def test_off_kind_with_entries_is_refused(self):
+        with pytest.raises(ValueError):
+            TimerSpec(kind="off", on_calendars=("*-*-* 04:00:00",))
+
+    def test_non_off_kind_with_no_entries_is_refused(self):
+        with pytest.raises(ValueError):
+            TimerSpec(kind="calendar", on_calendars=())
+
+    def test_duplicate_entries_are_deduplicated(self):
+        spec = TimerSpec(
+            kind="calendar",
+            on_calendars=("*-*-* 04:00:00", "*-*-* 04:00:00", "*-*-* 12:00:00"),
+        )
+        assert spec.on_calendars == ("*-*-* 04:00:00", "*-*-* 12:00:00")
+
+
+# ---------------------------------------------------------------------------
+# window_start_calendar
+# ---------------------------------------------------------------------------
+
+
+class TestWindowStartCalendar:
+    def test_matches_the_cadence_rendering_of_the_same_hhmm(self):
+        """window_start_calendar(parse_window('01:00-04:00')) is
+        byte-identical to the cadence rendering of a bare '01:00' cadence --
+        the dedup-by-rendered-expression in reconcile() depends on this."""
+        window = Window.from_hhmm("01:00", "04:00")
+        cadence_spec = parse_schedule("01:00")
+        assert window_start_calendar(window) == cadence_spec.on_calendars[0]
+
+
+# ---------------------------------------------------------------------------
+# reconcile / extra_calendars: cadence + window starts as a unioned,
+# deduplicated set of OnCalendar= entries on one timer.
+# ---------------------------------------------------------------------------
+
+
+class TestReconcileExtraCalendars:
+    def _mock_run(self, *args, **kwargs):
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+
+    def _patch_paths(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(systemd_timer, "UNIT_DIR", tmp_path)
+        timer_path = tmp_path / "paramem-consolidate.timer"
+        service_path = tmp_path / "paramem-consolidate.service"
+        monkeypatch.setattr(systemd_timer, "TIMER_PATH", timer_path)
+        monkeypatch.setattr(systemd_timer, "SERVICE_PATH", service_path)
+        return timer_path, service_path
+
+    def test_no_extra_calendars_renders_the_cadence_entry_alone(self, tmp_path, monkeypatch):
+        """Without a ring (max_interim_count: 0) the caller passes no
+        extra_calendars at all -- the set carries the cadence's own entry
+        alone, whatever full_window would otherwise contribute."""
+        timer_path, _ = self._patch_paths(monkeypatch, tmp_path)
+        with patch.object(systemctl, "run", self._mock_run):
+            systemd_timer.reconcile("12h")
+        content = timer_path.read_text()
+        assert content.count("OnCalendar=") == 1
+        assert "OnCalendar=*-*-* 00,12:00:00" in content
+
+    def test_cadence_plus_two_window_starts_renders_three_entries(self, tmp_path, monkeypatch):
+        timer_path, _ = self._patch_paths(monkeypatch, tmp_path)
+        with patch.object(systemctl, "run", self._mock_run):
+            systemd_timer.reconcile(
+                "every 12h",
+                extra_calendars=("*-*-* 01:00:00", "*-*-* 22:00:00"),
+            )
+        content = timer_path.read_text()
+        assert content.count("OnCalendar=") == 3
+        assert "OnCalendar=*-*-* 00,12:00:00" in content
+        assert "OnCalendar=*-*-* 01:00:00" in content
+        assert "OnCalendar=*-*-* 22:00:00" in content
+        assert content.count("Persistent=true") == 1
+
+    def test_exact_duplicate_expression_is_deduplicated(self, tmp_path, monkeypatch):
+        """A window start that renders identically to a cadence mark
+        (e.g. a 01:00 window start under a plain '01:00' cadence) is not
+        double-listed."""
+        timer_path, _ = self._patch_paths(monkeypatch, tmp_path)
+        with patch.object(systemctl, "run", self._mock_run):
+            systemd_timer.reconcile("01:00", extra_calendars=("*-*-* 01:00:00",))
+        content = timer_path.read_text()
+        assert content.count("OnCalendar=") == 1
+
+    def test_off_cadence_with_a_window_start_still_installs_a_timer(self, tmp_path, monkeypatch):
+        """An operator with a ring who turns the cadence off still gets a
+        full-fold wakeup at the window start -- the window is its own entry."""
+        timer_path, _ = self._patch_paths(monkeypatch, tmp_path)
+        with patch.object(systemctl, "run", self._mock_run):
+            msg = systemd_timer.reconcile("off", extra_calendars=("*-*-* 01:00:00",))
+        assert timer_path.exists()
+        content = timer_path.read_text()
+        assert "OnCalendar=*-*-* 01:00:00" in content
+        assert "disabled" not in msg
+
+    def test_off_cadence_with_no_extras_removes_the_unit(self, tmp_path, monkeypatch):
+        timer_path, service_path = self._patch_paths(monkeypatch, tmp_path)
+        # First install something so there is a unit to remove.
+        with patch.object(systemctl, "run", self._mock_run):
+            systemd_timer.reconcile("every 12h")
+        assert timer_path.exists()
+        with patch.object(systemctl, "run", self._mock_run):
+            systemd_timer.reconcile("off")
+        assert not timer_path.exists()
+        assert not service_path.exists()
+
+    def test_non_exact_cadence_plus_window_unions_heartbeat_grid_and_window(
+        self, tmp_path, monkeypatch
+    ):
+        """'every 7h' renders at its gcd(7, 24)=1 hourly heartbeat grid; a
+        window start unions with that grid as a further, distinct entry."""
+        timer_path, _ = self._patch_paths(monkeypatch, tmp_path)
+        with patch.object(systemctl, "run", self._mock_run):
+            systemd_timer.reconcile("every 7h", extra_calendars=("*-*-* 01:00:00",))
+        content = timer_path.read_text()
+        assert content.count("OnCalendar=") == 2
+        assert _1H_CAL in content
+        assert "OnCalendar=*-*-* 01:00:00" in content
+
+
+class TestBackupTimerRendersOneEntryUnchanged:
+    def _mock_run(self, *args, **kwargs):
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+
+    def test_backup_reconcile_carries_no_extra_calendars(self, tmp_path, monkeypatch):
+        """The backup timer passes no extra_calendars to _reconcile_timer --
+        it renders exactly the one entry its own cadence contributes."""
+        timer_path = tmp_path / "paramem-backup.timer"
+        service_path = tmp_path / "paramem-backup.service"
+        monkeypatch.setattr(backup_timer, "TIMER_PATH", timer_path)
+        monkeypatch.setattr(backup_timer, "SERVICE_PATH", service_path)
+        monkeypatch.setattr(backup_timer, "UNIT_DIR", tmp_path)
+        with patch.object(systemctl, "run", self._mock_run):
+            backup_timer.reconcile(
+                "daily 04:00", python_path="/usr/bin/python", project_root="/opt/paramem"
+            )
+        content = timer_path.read_text()
+        assert content.count("OnCalendar=") == 1
+        assert "OnCalendar=*-*-* 04:00:00" in content

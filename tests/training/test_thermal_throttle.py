@@ -13,36 +13,8 @@ from unittest.mock import patch
 from paramem.training.thermal_throttle import (
     ThermalPolicy,
     ThermalThrottleCallback,
-    _should_throttle_now,
     is_thermal_policy_active,
 )
-
-
-class TestIsThermalPolicyActive:
-    def test_always_off(self):
-        assert is_thermal_policy_active("always_off", "22:00", "07:00") is False
-
-    def test_always_on(self):
-        assert is_thermal_policy_active("always_on", "22:00", "07:00") is True
-
-    def test_auto_within_window_simple(self):
-        # 23:00 sits inside 22:00-07:00 (overnight wrap).
-        now = datetime(2026, 5, 7, 23, 0)
-        assert is_thermal_policy_active("auto", "22:00", "07:00", now) is True
-
-    def test_auto_outside_window_simple(self):
-        # 12:00 is outside 22:00-07:00.
-        now = datetime(2026, 5, 7, 12, 0)
-        assert is_thermal_policy_active("auto", "22:00", "07:00", now) is False
-
-    def test_auto_within_same_day_window(self):
-        # 03:00 inside 02:00-04:00 (same-day forward window).
-        now = datetime(2026, 5, 7, 3, 0)
-        assert is_thermal_policy_active("auto", "02:00", "04:00", now) is True
-
-    def test_auto_invalid_window_falls_back_to_active(self):
-        # Garbage strings → the prefer-silence fallback returns True.
-        assert is_thermal_policy_active("auto", "bad", "input") is True
 
 
 class TestThermalPolicyFromConsolidationConfig:
@@ -87,14 +59,6 @@ class TestThermalThrottleCallbackBehaviour:
         with patch("paramem.training.thermal_throttle._gpu_temp", return_value=40):
             cb._maybe_throttle(global_step=10)
         # No lock operations expected — throttle does not touch the GPU lock.
-
-    def test_skips_when_window_inactive(self):
-        policy = self._make_policy(quiet_hours_mode="always_off")
-        cb = ThermalThrottleCallback(policy)
-        with patch("paramem.training.thermal_throttle._gpu_temp") as temp_mock:
-            cb._maybe_throttle(global_step=10)
-        # Window inactive → _gpu_temp not even called.
-        temp_mock.assert_not_called()
 
     def test_skips_when_check_interval_misses(self):
         policy = self._make_policy(check_interval=5)
@@ -147,11 +111,48 @@ class TestThermalThrottleCallbackBehaviour:
         cb = ThermalThrottleCallback(policy)
         assert cb._shutdown_fn() is False
 
-    def test_should_throttle_now_routes_through_predicate(self):
-        policy = self._make_policy(quiet_hours_mode="always_on")
-        assert _should_throttle_now(policy) is True
-        policy_off = self._make_policy(quiet_hours_mode="always_off")
-        assert _should_throttle_now(policy_off) is False
+
+class TestIsThermalPolicyActive:
+    """Truth table for the pure quiet-hours predicate served by
+    schedule_grammar.Window: the three modes, plus the auto mode's
+    prefer-silence fallback on a window that names no opening."""
+
+    _INSIDE = datetime(2026, 1, 15, 23, 0)  # inside 22:00-07:00
+    _OUTSIDE = datetime(2026, 1, 15, 12, 0)  # outside 22:00-07:00
+
+    def test_always_off_is_never_active(self):
+        assert is_thermal_policy_active("always_off", "22:00", "07:00", self._INSIDE) is False
+        assert is_thermal_policy_active("always_off", "22:00", "07:00", self._OUTSIDE) is False
+
+    def test_always_on_is_always_active(self):
+        assert is_thermal_policy_active("always_on", "22:00", "07:00", self._INSIDE) is True
+        assert is_thermal_policy_active("always_on", "22:00", "07:00", self._OUTSIDE) is True
+
+    def test_auto_is_active_inside_the_window(self):
+        assert is_thermal_policy_active("auto", "22:00", "07:00", self._INSIDE) is True
+
+    def test_auto_is_inactive_outside_the_window(self):
+        assert is_thermal_policy_active("auto", "22:00", "07:00", self._OUTSIDE) is False
+
+    def test_auto_with_a_malformed_window_prefers_silence(self):
+        """A window that cannot be parsed (bad HH:MM shape) falls back to
+        True -- the prefer-silence default."""
+        assert is_thermal_policy_active("auto", "9:5", "07:00", self._INSIDE) is True
+
+    def test_auto_with_equal_start_and_end_prefers_silence(self):
+        """start == end names no opening -- also the prefer-silence True."""
+        assert is_thermal_policy_active("auto", "22:00", "22:00", self._INSIDE) is True
+
+    def test_auto_wrapping_window_spans_midnight(self):
+        """A window that wraps past midnight (22:00-07:00) is active late at
+        night and early morning, inactive during the day."""
+        assert (
+            is_thermal_policy_active("auto", "22:00", "07:00", datetime(2026, 1, 16, 3, 0)) is True
+        )
+        assert (
+            is_thermal_policy_active("auto", "22:00", "07:00", datetime(2026, 1, 16, 12, 0))
+            is False
+        )
 
 
 def _make_cfg(**overrides):

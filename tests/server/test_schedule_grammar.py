@@ -19,6 +19,7 @@ Covers:
 
 from __future__ import annotations
 
+import time
 from datetime import datetime
 
 import pytest
@@ -29,10 +30,14 @@ from paramem.server.schedule_grammar import (
     WEEKLY_ANCHOR_HOUR,
     WEEKLY_ANCHOR_MINUTE,
     WEEKLY_ANCHOR_WEEKDAY,
+    InvalidWindow,
     ScheduleDueStatus,
+    Window,
     _is_due,
     compute_schedule_period_seconds,
+    next_mark,
     parse_schedule_atom,
+    parse_window,
     previous_mark,
     scheduled_run_due,
     scheduled_run_stamp_value,
@@ -404,3 +409,264 @@ class TestScheduledRunStampValueRaises:
     def test_off_or_unparseable_raises(self, schedule):
         with pytest.raises(ValueError):
             scheduled_run_stamp_value(schedule, _local(2024, 1, 15, 12, 0))
+
+
+# ---------------------------------------------------------------------------
+# next_mark
+# ---------------------------------------------------------------------------
+
+
+class TestNextMarkFormBoundary:
+    """next_mark's per-kind shape: a value for every kind previous_mark places
+    a mark for, None for the kinds that carry no wall-clock mark.
+    """
+
+    @pytest.mark.parametrize(
+        "schedule",
+        ["daily", "daily 04:00", "04:00", "weekly", "every 12h", "every 30m"],
+    )
+    def test_marked_kinds_return_a_value(self, schedule):
+        assert next_mark(schedule, _local(2024, 1, 15, 12, 0)) is not None
+
+    @pytest.mark.parametrize(
+        "schedule",
+        ["", "off", "disabled", "none", "every 5h", "every 90m", "bogus"],
+    )
+    def test_off_unparseable_and_non_exact_interval_return_none(self, schedule):
+        assert next_mark(schedule, _local(2024, 1, 15, 12, 0)) is None
+
+    def test_strictly_after_now_even_when_now_is_exactly_a_mark(self):
+        """Standing exactly on a mark, next_mark steps to the FOLLOWING one —
+        never returns now itself."""
+        now = _local(2024, 1, 15, 12, 0)
+        assert previous_mark("every 12h", now) == now
+        nxt = next_mark("every 12h", now)
+        assert nxt is not None
+        assert nxt > now
+        assert nxt == _local(2024, 1, 16, 0, 0)
+
+    def test_daily_hhmm_next_mark_is_tomorrows_anchor(self):
+        nxt = next_mark("daily 04:00", _local(2024, 1, 15, 10, 0))
+        assert nxt == _local(2024, 1, 16, 4, 0)
+
+    def test_weekly_next_mark_is_next_mondays_anchor(self):
+        nxt = next_mark("weekly", _local(2024, 1, 17, 15, 0))  # Wednesday
+        assert nxt == _local(2024, 1, 22, WEEKLY_ANCHOR_HOUR, WEEKLY_ANCHOR_MINUTE)
+
+
+class TestNextMarkPreviousMarkDstProperties:
+    """DST correctness properties for next_mark/previous_mark, pinned as
+    properties rather than fixed expected values: for every naive-local
+    instant across both 2026 DST transitions (Europe/Berlin spring-forward
+    2026-03-29, fall-back 2026-10-25), next_mark(s, t) is strictly after t
+    and is itself a mark (previous_mark(s, next_mark(s, t)) == next_mark(s, t)).
+
+    TZ is pinned to Europe/Berlin for the duration of this class so the
+    module's naive-local arithmetic (datetime.fromtimestamp) exercises a
+    real DST-observing zone regardless of the host's own timezone, then
+    restored.
+    """
+
+    CADENCES = ("daily 04:00", "every 6h", "weekly")
+
+    @pytest.fixture(autouse=True)
+    def _berlin_tz(self, monkeypatch):
+        monkeypatch.setenv("TZ", "Europe/Berlin")
+        time.tzset()
+        yield
+        # monkeypatch restores the TZ env var on teardown; re-apply it to the
+        # process so the C library's notion of local time is restored too.
+        time.tzset()
+
+    @staticmethod
+    def _sweep_instants(year, month, days, *, transition_day, transition_hour):
+        """Epoch instants across *days*: every minute of *transition_hour* on
+        *transition_day* (both fold occurrences, covering a fall-back repeat),
+        a 15-minute grid elsewhere — full DST-edge coverage at bounded cost.
+        """
+        instants = []
+        for day in days:
+            for hour in range(24):
+                on_transition = day == transition_day and hour == transition_hour
+                minutes = range(60) if on_transition else range(0, 60, 15)
+                folds = (0, 1) if on_transition else (0,)
+                for minute in minutes:
+                    for fold in folds:
+                        instants.append(
+                            datetime(year, month, day, hour, minute, fold=fold).timestamp()
+                        )
+        return instants
+
+    def _assert_properties_hold(self, instants):
+        for cadence in self.CADENCES:
+            for t in instants:
+                nxt = next_mark(cadence, t)
+                assert nxt is not None, f"{cadence!r} at {t!r} produced no next mark"
+                assert nxt > t, f"{cadence!r}: next_mark({t!r}) = {nxt!r} is not strictly after t"
+                assert previous_mark(cadence, nxt) == nxt, (
+                    f"{cadence!r}: next_mark({t!r}) = {nxt!r} is not itself a mark"
+                )
+
+    def test_spring_forward_transition_2026(self):
+        """2026-03-29 02:00 CET -> 03:00 CEST (the gap hour) swept fully,
+        2026-03-28..30 otherwise sampled."""
+        instants = self._sweep_instants(2026, 3, (28, 29, 30), transition_day=29, transition_hour=2)
+        self._assert_properties_hold(instants)
+
+    def test_fall_back_transition_2026(self):
+        """2026-10-25 02:00-03:00 CEST repeats as 02:00-03:00 CET (both fold
+        occurrences swept fully), 2026-10-24..26 otherwise sampled."""
+        instants = self._sweep_instants(
+            2026, 10, (24, 25, 26), transition_day=25, transition_hour=2
+        )
+        self._assert_properties_hold(instants)
+
+    def test_next_mark_from_a_mark_instant_steps_exactly_one_period_forward(self):
+        """next_mark(s, previous_mark(s, t)) round-trips on a mark instant:
+        previous_mark(s, t) is itself a mark, and asking next_mark from
+        exactly that mark returns the immediately following one — the same
+        answer next_mark(s, t) itself would give once t is a mark."""
+        for cadence in self.CADENCES:
+            t = datetime(2026, 3, 29, 10, 0).timestamp()
+            mark = previous_mark(cadence, t)
+            assert mark is not None
+            # mark is itself a mark instant: previous_mark is a no-op on it.
+            assert previous_mark(cadence, mark) == mark
+            assert next_mark(cadence, mark) == next_mark(cadence, t)
+
+    def test_spring_forward_gap_anchor_still_satisfies_the_properties(self):
+        """now=02:30 on the spring-forward day (a wall-clock time that never
+        occurred) still round-trips: the naive local face is stepped, never
+        the raw epoch, so the property holds even starting from a gap
+        instant."""
+        t = datetime(2026, 3, 29, 2, 30).timestamp()
+        for cadence in self.CADENCES:
+            nxt = next_mark(cadence, t)
+            assert nxt is not None
+            assert nxt > t
+            assert previous_mark(cadence, nxt) == nxt
+
+
+# ---------------------------------------------------------------------------
+# Window / parse_window
+# ---------------------------------------------------------------------------
+
+
+class TestWindowContainsAndCurrentStart:
+    def test_non_wrapping_contains_inside_and_excludes_outside(self):
+        window = Window.from_hhmm("01:00", "04:00")
+        assert window.contains(datetime(2026, 1, 15, 2, 0)) is True
+        assert window.contains(datetime(2026, 1, 15, 5, 0)) is False
+
+    def test_non_wrapping_half_open_end_excludes_the_end_instant(self):
+        window = Window.from_hhmm("01:00", "04:00")
+        assert window.contains(datetime(2026, 1, 15, 4, 0)) is False
+        assert window.contains(datetime(2026, 1, 15, 3, 59)) is True
+
+    def test_non_wrapping_current_start_is_todays_start(self):
+        window = Window.from_hhmm("01:00", "04:00")
+        start = window.current_start(datetime(2026, 1, 15, 2, 0))
+        assert start == datetime(2026, 1, 15, 1, 0)
+
+    def test_wrapping_past_midnight_contains_both_sides(self):
+        window = Window.from_hhmm("23:00", "02:00")
+        assert window.contains(datetime(2026, 1, 15, 23, 30)) is True
+        assert window.contains(datetime(2026, 1, 16, 1, 0)) is True
+        assert window.contains(datetime(2026, 1, 16, 10, 0)) is False
+
+    def test_wrapping_current_start_inside_small_hours_is_yesterdays_start(self):
+        """01:00 falls inside the 23:00-02:00 opening that STARTED the
+        previous calendar day."""
+        window = Window.from_hhmm("23:00", "02:00")
+        start = window.current_start(datetime(2026, 1, 16, 1, 0))
+        assert start == datetime(2026, 1, 15, 23, 0)
+
+    def test_wrapping_current_start_is_none_outside(self):
+        window = Window.from_hhmm("23:00", "02:00")
+        assert window.current_start(datetime(2026, 1, 16, 10, 0)) is None
+
+    @pytest.mark.parametrize(
+        ("start", "end"),
+        [("01:00", "04:00"), ("23:00", "02:00")],
+    )
+    def test_contains_and_current_start_never_disagree(self, start, end):
+        """contains(now) is current_start(now) is not None, over a minute
+        grid spanning a non-wrapping and a wrapping window alike."""
+        window = Window.from_hhmm(start, end)
+        for hour in range(24):
+            for minute in (0, 15, 30, 45):
+                now = datetime(2026, 1, 15, hour, minute)
+                assert window.contains(now) == (window.current_start(now) is not None)
+
+
+class TestWindowNextStart:
+    def test_next_start_is_strictly_after_now(self):
+        window = Window.from_hhmm("01:00", "04:00")
+        now = datetime(2026, 1, 15, 10, 0)
+        nxt = window.next_start(now)
+        assert nxt > now
+        assert nxt == datetime(2026, 1, 16, 1, 0)
+
+    def test_next_start_standing_inside_an_opening_is_the_next_days(self):
+        """Standing inside the opening, next_start is never the one now is
+        already in -- the full-fold deadline check depends on this."""
+        window = Window.from_hhmm("01:00", "04:00")
+        now = datetime(2026, 1, 15, 2, 0)
+        nxt = window.next_start(now)
+        assert nxt == datetime(2026, 1, 16, 1, 0)
+
+    def test_next_start_before_todays_opening_is_todays(self):
+        window = Window.from_hhmm("01:00", "04:00")
+        now = datetime(2026, 1, 15, 0, 30)
+        nxt = window.next_start(now)
+        assert nxt == datetime(2026, 1, 15, 1, 0)
+
+
+class TestWindowConstructionRefusals:
+    def test_equal_bounds_raise_invalid_window(self):
+        with pytest.raises(InvalidWindow):
+            Window(240, 240)
+
+    @pytest.mark.parametrize("minute", [-1, 1440, 1500])
+    def test_out_of_range_bound_raises_invalid_window(self, minute):
+        with pytest.raises(InvalidWindow):
+            Window(minute, 300)
+
+
+class TestParseWindow:
+    def test_builds_non_wrapping_window(self):
+        window = parse_window("01:00-04:00")
+        assert window.start_minute == 60
+        assert window.end_minute == 240
+        assert window.start_hhmm == "01:00"
+
+    def test_builds_wrapping_window(self):
+        window = parse_window("23:00-02:00")
+        assert window.start_minute == 23 * 60
+        assert window.end_minute == 2 * 60
+
+    def test_non_str_payload_raises_naming_form(self):
+        with pytest.raises(InvalidWindow, match="HH:MM-HH:MM"):
+            parse_window(None)
+
+    def test_short_hhmm_form_raises_naming_form_and_value(self):
+        with pytest.raises(InvalidWindow) as exc_info:
+            parse_window("9:5")
+        message = str(exc_info.value)
+        assert "HH:MM-HH:MM" in message
+        assert "9:5" in message
+
+    def test_equal_bounds_raise_naming_the_value(self):
+        with pytest.raises(InvalidWindow) as exc_info:
+            parse_window("04:00-04:00")
+        message = str(exc_info.value)
+        assert "240" in message
+
+    def test_out_of_range_hour_raises_naming_the_value(self):
+        with pytest.raises(InvalidWindow) as exc_info:
+            parse_window("25:00-04:00")
+        assert "25:00" in str(exc_info.value)
+
+    def test_text_without_a_separator_raises_naming_form(self):
+        with pytest.raises(InvalidWindow, match="HH:MM-HH:MM"):
+            parse_window("not a window")

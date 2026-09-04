@@ -6,21 +6,8 @@ from unittest.mock import MagicMock
 
 from paramem.backup import timer as backup_timer
 from paramem.backup.timer import reconcile, render_service_unit
-from paramem.server import systemd_timer as server_systemd_timer
 from paramem.server.schedule_grammar import compute_schedule_period_seconds
-from paramem.server.systemd_timer import TimerSpec
 from paramem.utils import systemctl
-
-# ---------------------------------------------------------------------------
-# parse_schedule reuse
-# ---------------------------------------------------------------------------
-
-
-class TestParseScheduleReuse:
-    def test_reuses_parse_schedule(self):
-        """parse_schedule imported from timer is the same object as server's."""
-        assert backup_timer.parse_schedule is server_systemd_timer.parse_schedule
-
 
 # ---------------------------------------------------------------------------
 # render_service_unit — parameterised tier
@@ -59,33 +46,6 @@ class TestRenderServiceUnit:
 # systemd_timer.render_timer_unit (see paramem/backup/timer.py module
 # docstring).
 # ---------------------------------------------------------------------------
-
-
-class TestRenderTimerUnit:
-    def test_render_timer_unit_calendar_daily(self):
-        spec = TimerSpec(kind="daily", on_calendar="*-*-* 04:00:00")
-        content = server_systemd_timer.render_timer_unit(
-            spec, unit_name=backup_timer.TIMER_NAME, description="ParaMem scheduled backup"
-        )
-        assert "OnCalendar=*-*-* 04:00:00" in content
-        assert "Persistent=true" in content
-
-    def test_render_timer_unit_heartbeat_for_non_exact_cadence(self):
-        """A non-calendar-exact backup cadence ('every 5h') renders as
-        OnCalendar + Persistent=true. The durable last-attempt stamp in
-        backup.json decides which heartbeat wakeups actually run.
-        """
-        spec = backup_timer.parse_schedule("every 5h")
-        assert spec is not None
-        assert spec.kind == "calendar"
-        content = server_systemd_timer.render_timer_unit(
-            spec, unit_name=backup_timer.TIMER_NAME, description="ParaMem scheduled backup"
-        )
-        assert "OnCalendar=" in content
-        assert "Persistent=true" in content
-        assert "OnBootSec" not in content
-        assert "OnUnitActiveSec" not in content
-
 
 # ---------------------------------------------------------------------------
 # reconcile — "off" removes units

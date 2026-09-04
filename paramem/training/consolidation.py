@@ -5412,6 +5412,17 @@ class ConsolidationLoop:
             resumed, converges here.
 
         Raises:
+            RuntimeError: No ledger is on disk at ``staged_event.state_dir``
+                for this event — ``stage_event`` must run (or resume)
+                before this call, or the post-publish re-read finds the
+                ledger gone from underneath a call already in progress.
+            StageLedgerUnreadable: The ledger is present but this process
+                cannot interpret it (propagates straight out of
+                :func:`~paramem.training.stage_ledger.read_ledger` — never
+                caught here, since there is no build/publish decision that
+                can be made over a record this process cannot read).
+            StageLedgerVersionUnsupported: The ledger's ``version`` is not
+                one this build knows how to interpret.
             ConsolidationArtifactsMissing: The ledger's extraction entry no
                 longer verifies and at least one tier is not already live
                 (raised after this event's ledger and extraction tree are
@@ -5427,6 +5438,11 @@ class ConsolidationLoop:
         from paramem.training.go_live import publish_bundle
 
         state_dir = staged_event.state_dir
+        # An uninterpretable ledger raises StageLedgerUnreadable /
+        # StageLedgerVersionUnsupported straight out of read_ledger --
+        # propagates uncaught, since there is no build/publish decision to
+        # make over a record this process cannot read.  None means the
+        # ledger is genuinely absent.
         ledger = _sl.read_ledger(state_dir)
         if ledger is None:
             raise RuntimeError(
@@ -5436,8 +5452,8 @@ class ConsolidationLoop:
 
         if not self._ledger_all_tiers_live(ledger):
             extraction_entry = _sl.extraction_entry(ledger)
-            if extraction_entry is None or not _sl.verify(extraction_entry):
-                missing = _sl.missing_artifacts(extraction_entry) if extraction_entry else []
+            if not _sl.verify(extraction_entry):
+                missing = _sl.missing_artifacts(extraction_entry)
                 _sl.dispose(state_dir)
                 raise ConsolidationArtifactsMissing(event=ledger.event, missing=missing)
 
@@ -5503,7 +5519,18 @@ class ConsolidationLoop:
                 absorbed_interim_tiers=ledger.absorbed_interim_tiers,
             )
             published_tiers.extend(inc.tier for inc in bundle)
+            # An uninterpretable ledger raises straight out of read_ledger
+            # here too.  A missing ledger is a filesystem failure, not
+            # "nothing pending" -- the publish this call just ran must be
+            # recorded as complete, and there is nothing left to record it
+            # against; _ledger_all_tiers_live has no None to walk.
             ledger = _sl.read_ledger(state_dir)
+            if ledger is None:
+                raise RuntimeError(
+                    f"run_build_and_publish: stage ledger at {state_dir} for event "
+                    f"{staged_event.event!r} disappeared after publish -- this event's "
+                    "completion cannot be recorded"
+                )
 
         all_live = self._ledger_all_tiers_live(ledger)
 

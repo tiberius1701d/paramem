@@ -339,3 +339,48 @@ class TestPreflightRefusalLeavesTheWholeTreeUnchanged:
         assert extraction_after["sessions"] == ["s1"]
         assert loop._latest_stage(post_call_ledger, "episodic", "tier_live") is None
         assert loop._latest_stage(post_call_ledger, "semantic", "tier_live") is None
+
+
+class TestPostPublishReReadFindingNoLedgerRaises:
+    """run_build_and_publish re-reads the ledger from disk immediately after
+    a bundle publishes, to record the event's completion. A missing ledger at
+    that point is a filesystem failure -- not "nothing pending" -- since the
+    publish this call just ran has nothing left to record it against."""
+
+    def test_ledger_vanishing_after_publish_raises_naming_the_state_dir(
+        self, tmp_path, monkeypatch
+    ):
+        loop = _make_loop(tmp_path, resident_tiers=["episodic"])
+        _wire_fakes(loop, monkeypatch)
+
+        staged = loop.stage_event(
+            recalled_entries=_recalled_entries_from_store(loop),
+            event="interim",
+            venue="weights",
+            stamp="stamp1",
+            primary_tiers={"episodic": "episodic"},
+            episodic_rels=[_rel("alex", "lives_in", "berlin")],
+            session_ids=["s1"],
+        )
+        assert staged is not None
+        state_dir = staged.state_dir
+
+        # run_build_and_publish calls stage_ledger.read_ledger exactly
+        # twice: once at entry (must behave normally so the build/publish
+        # proceeds for real) and once right after the bundle publishes (the
+        # call this test forces to answer "absent").
+        real_read_ledger = sl.read_ledger
+        calls = {"n": 0}
+
+        def _read_ledger_absent_on_second_call(sd):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return real_read_ledger(sd)
+            return None
+
+        monkeypatch.setattr(sl, "read_ledger", _read_ledger_absent_on_second_call)
+
+        with pytest.raises(RuntimeError, match=str(state_dir)):
+            loop.run_build_and_publish(staged, router=None)
+
+        assert calls["n"] >= 2

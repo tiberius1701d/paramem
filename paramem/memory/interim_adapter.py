@@ -13,10 +13,10 @@ It also provides a timestamp helper:
       sub-interval stamp as ``YYYYMMDDTHHMM``, floored to the boundary of the
       current sub-interval.
 
-Schedule-string parsing (``compute_schedule_period_seconds``) lives in
-``paramem.server.schedule_grammar`` so the backup runner can share it
-without ``interim_adapter`` (a ``memory``-layer module) importing from
-``backup``.
+Schedule-string parsing and calendar-mark arithmetic (``previous_mark``) live
+in ``paramem.server.schedule_grammar`` — the single owner of "where does a
+cadence land on the wall clock" — so the backup runner can share it without
+``interim_adapter`` (a ``memory``-layer module) importing from ``backup``.
 
 This module also owns the on-disk tier-topology helpers for the adapter
 store: the whole-store tier walk (:func:`iter_tier_roots`), which reads
@@ -51,14 +51,14 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterator
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 from peft import PeftModel
 
 from paramem.memory.persistence import reap_tier_artifacts
 from paramem.models.loader import create_adapter, detach_adapters
-from paramem.server.schedule_grammar import compute_schedule_period_seconds
+from paramem.server.schedule_grammar import previous_mark
 from paramem.utils.config import AdapterConfig
 from paramem.utils.tiers import MAIN_TIERS
 
@@ -91,7 +91,7 @@ INTERIM_DIR_PREFIX = "interim_"
 # THE single declaration of the interim stamp format.  Every mint
 # (:func:`current_interim_stamp`), every validation
 # (:func:`interim_stamp_from_name`) and every re-parse to a datetime
-# (``app._full_cycle_deadline_dt``) composes from this one constant — the
+# (``app._full_fold_deadline``) composes from this one constant — the
 # shape is never re-declared as a pattern or a literal length.
 INTERIM_STAMP_FORMAT = "%Y%m%dT%H%M"
 
@@ -325,38 +325,37 @@ def current_interim_stamp(
     """Return the current refresh-interval's ``YYYYMMDDTHHMM`` stamp.
 
     ``refresh_cadence`` IS the sub-interval directly — no division by
-    ``max_interim_count``. The stamp is floored to the nearest cadence
-    boundary measured from midnight of the current local day, so two calls
-    within the same cadence window return the same stamp and a single
-    interim adapter is reused for the entire window.
+    ``max_interim_count``. The stamp is the most recent calendar mark for
+    *refresh_cadence* (:func:`~paramem.server.schedule_grammar.previous_mark`
+    — the module's single owner of "where does a cadence land on the wall
+    clock"), so two calls within the same cadence window return the same
+    stamp and a single interim adapter is reused for the entire window. For
+    an anchored cadence (``"HH:MM"``/``"daily"``) the stamp floors to that
+    anchor rather than to midnight.
 
     Args:
         refresh_cadence: Interim refresh cadence (``"every 12h"``,
-            ``"every 30m"``, ``"daily"``, ``"HH:MM"``, etc.).  An off-variant
-            falls back to hourly flooring so adapter names remain sensible
-            boundaries even without a configured cadence.
+            ``"every 30m"``, ``"daily"``, ``"HH:MM"``, etc.). Anything
+            ``previous_mark`` answers ``None`` for — an off-variant, a
+            non-exact interval, or unparseable text — falls back to hourly
+            flooring so adapter names remain sensible boundaries even
+            without a cadence that has real marks.
 
     Returns:
         Timestamp string, e.g. ``"20260418T1430"`` for 2026-04-18 14:30 local.
     """
     now = _now if _now is not None else datetime.now()
+    now_epoch = now.timestamp()
 
-    sub_interval = compute_schedule_period_seconds(refresh_cadence)
-    if sub_interval is None:
-        # Off-variant (``"off"``/``"disabled"``/``"none"``): no cadence configured.
-        # Fall back to hourly flooring so stamps stay sensible. Callers that
-        # truly want to skip stamping should handle the queue-branch earlier.
-        sub_interval = 3600
-    if sub_interval <= 0:
-        sub_interval = 1  # guard against misconfiguration
+    mark = previous_mark(refresh_cadence, now_epoch)
+    if mark is None:
+        # Nothing previous_mark can place a mark for (off-variant,
+        # non-exact interval, or unparseable text): fall back to hourly
+        # flooring so stamps stay sensible. Callers that truly want to skip
+        # stamping should handle the queue-branch earlier.
+        mark = previous_mark("1h", now_epoch)
 
-    # Floor to the nearest refresh-cadence boundary measured from midnight local time.
-    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    seconds_since_midnight = int((now - midnight).total_seconds())
-    floored_seconds = (seconds_since_midnight // sub_interval) * sub_interval
-
-    floored_dt = midnight + timedelta(seconds=floored_seconds)
-    return floored_dt.strftime(INTERIM_STAMP_FORMAT)
+    return datetime.fromtimestamp(mark).strftime(INTERIM_STAMP_FORMAT)
 
 
 def current_full_consolidation_stamp(
@@ -366,13 +365,14 @@ def current_full_consolidation_stamp(
 ) -> str:
     """Return the current full-consolidation window's ``YYYYMMDDTHHMM`` stamp.
 
-    Companion to :func:`current_interim_stamp`.  Identical flooring logic
-    (anchored to local midnight) but applied to the FULL consolidation
-    period (``refresh_cadence × max_interim_count``) instead of the interim
-    cadence.  The stamp identifies which full-cycle window we are currently
-    in: two calls within the same window return the same stamp.  Its only
-    consumer is the main-slot manifest's ``window_stamp`` field, which is
-    written as provenance and read back by no gate.
+    Companion to :func:`current_interim_stamp`, sharing its implementation:
+    the period's most recent calendar mark, hourly flooring when the period
+    carries none — applied to the FULL consolidation period
+    (``refresh_cadence × max_interim_count``) instead of the interim cadence.
+    The stamp identifies which full-cycle window we are currently in: two
+    calls within the same window return the same stamp.  Its only consumer
+    is the main-slot manifest's ``window_stamp`` field, which is written as
+    provenance and read back by no gate.
 
     Args:
         consolidation_period: Full-cycle period string from

@@ -85,6 +85,8 @@ class TestOperationalSamples:
             "headless_boot",
             "sanitization.cloud_mode",
             "voice.greeting_interval_hours",
+            "consolidation.interim_resume",
+            "consolidation.full_window",
         ]
         for path in operational_paths:
             assert classify(path) == Tier.OPERATIONAL, (

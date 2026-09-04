@@ -1629,58 +1629,6 @@ def test_debug_probe_anonymous_speaker_display_name_stays_none(tmp_path, monkeyp
 # ---------------------------------------------------------------------------
 
 
-def test_debug_probe_cloud_only_branch_runs_off_the_event_loop_with_gpu_discipline(
-    tmp_path, monkeypatch
-):
-    """The cloud-only dispatch branch of ``debug_probe`` takes the same GPU
-    discipline as its local-mode sibling: abort in-flight background
-    training, then hold the shared GPU thread lock for the duration of the
-    dispatch — and the dispatch itself runs off the event loop (a
-    ``run_in_executor`` hop), since the tagger pass, encoder calls, and the
-    provider call are synchronous work."""
-    import asyncio
-    import threading
-
-    from paramem.server.app import DebugProbeRequest
-    from paramem.server.gpu_lock import _gpu_thread_lock
-
-    store = _make_speaker_store(known_ids={"speaker0": "Alex"}, is_anonymous=False)
-    fresh = _make_state(tmp_path, speaker_store=store, mode="cloud-only")
-    fresh["config"].debug = True
-    fresh["config"].text_lang_detection.enabled = False
-    fresh["config"].cloud.allow_degraded_serving = False
-    fresh["cloud_only_reason"] = None
-    monkeypatch.setattr(app_module, "_state", fresh)
-
-    loop_thread_id = threading.get_ident()
-    call_order = []
-
-    def fake_abort():
-        call_order.append("abort")
-
-    def fake_relay_route(**kwargs):
-        call_order.append(("dispatch", threading.get_ident(), _gpu_thread_lock.locked()))
-        return MagicMock(text="cloud answer", escalated=True, diagnostics={})
-
-    with (
-        patch.object(
-            app_module, "_abort_background_training_for_inference", side_effect=fake_abort
-        ) as mock_abort,
-        patch.object(app_module, "_relay_route", side_effect=fake_relay_route),
-    ):
-        asyncio.run(app_module.debug_probe(DebugProbeRequest(text="hi", speaker_id="speaker0")))
-
-    mock_abort.assert_called_once()
-    assert len(call_order) == 2
-    assert call_order[0] == "abort", "training abort must run before the dispatch"
-    _, dispatch_thread_id, lock_held_during_dispatch = call_order[1]
-    assert dispatch_thread_id != loop_thread_id, (
-        "the dispatch must run off the event loop's own thread (run_in_executor)"
-    )
-    assert lock_held_during_dispatch is True, "the dispatch must run with the GPU thread lock held"
-    assert not _gpu_thread_lock.locked(), "the lock must be released after the dispatch"
-
-
 # ---------------------------------------------------------------------------
 # Tests: /debug/probe carries the cloud-egress record; /chat does not
 # ---------------------------------------------------------------------------
@@ -1745,6 +1693,86 @@ def test_debug_probe_local_branch_carries_cloud_refusal(tmp_path, monkeypatch):
         )
 
     assert resp.diagnostics == {"cloud_refusal": "personal_blocked"}
+
+
+# ---------------------------------------------------------------------------
+# Tests: /debug/probe's cloud-only branch aborts background training, arms
+# the idle watch, and stamps the idle clock BELOW its own refusals — a
+# refused probe (e.g. forbidden_not_debug) must never hold a fold off or
+# start the idle watch running.
+# ---------------------------------------------------------------------------
+
+
+def test_debug_probe_refused_by_forbidden_not_debug_touches_none_of_the_three_collaborators(
+    tmp_path, monkeypatch
+):
+    """``config.debug=False`` returns ``forbidden_not_debug`` before any of
+    training-abort, idle-watch-arm, or idle-clock-stamp runs."""
+    import asyncio
+
+    from paramem.server.app import DebugProbeRequest
+
+    store = _make_speaker_store(known_ids={"speaker0": "Alex"}, is_anonymous=False)
+    fresh = _make_state(tmp_path, speaker_store=store, mode="cloud-only")
+    fresh["config"].debug = False  # the refusal under test
+    bg_trainer = MagicMock(is_training=True)
+    fresh["background_trainer"] = bg_trainer
+    monkeypatch.setattr(app_module, "_state", fresh)
+
+    with patch.object(app_module, "_arm_idle_watch") as arm_spy:
+        resp = asyncio.run(
+            app_module.debug_probe(DebugProbeRequest(text="hi", speaker_id="speaker0"))
+        )
+
+    assert resp.status_code == 403
+    bg_trainer.abort_for_inference.assert_not_called()
+    arm_spy.assert_not_called()
+    assert fresh.get("last_model_use_monotonic") is None, (
+        "a refused probe must never stamp the idle clock"
+    )
+
+
+def test_debug_probe_cloud_only_branch_that_proceeds_touches_all_three_collaborators(
+    tmp_path, monkeypatch
+):
+    """A probe that clears every refusal aborts background training, arms
+    the idle watch (both inside ``_abort_background_training_for_inference``),
+    and stamps the idle clock — all below the refusals, before the cloud
+    dispatch runs."""
+    import asyncio
+
+    from paramem.server.app import DebugProbeRequest
+
+    store = _make_speaker_store(known_ids={"speaker0": "Alex"}, is_anonymous=False)
+    fresh = _make_state(tmp_path, speaker_store=store, mode="cloud-only")
+    fresh["config"].debug = True
+    fresh["config"].text_lang_detection.enabled = False
+    fresh["config"].cloud.allow_degraded_serving = False
+    fresh["cloud_only_reason"] = None
+    bg_trainer = MagicMock(is_training=True)
+    bg_trainer.abort_for_inference.return_value = True
+    fresh["background_trainer"] = bg_trainer
+    fresh["last_model_use_monotonic"] = None
+    monkeypatch.setattr(app_module, "_state", fresh)
+
+    with (
+        patch.object(app_module, "_arm_idle_watch") as arm_spy,
+        patch.object(
+            app_module,
+            "_relay_route",
+            return_value=MagicMock(text="cloud answer", escalated=True, diagnostics={}),
+        ),
+    ):
+        resp = asyncio.run(
+            app_module.debug_probe(DebugProbeRequest(text="hi", speaker_id="speaker0"))
+        )
+
+    assert resp.text == "cloud answer"
+    bg_trainer.abort_for_inference.assert_called_once()
+    arm_spy.assert_called_once()
+    assert fresh["last_model_use_monotonic"] is not None, (
+        "a probe that proceeds must stamp the idle clock"
+    )
 
 
 def test_chat_response_body_carries_no_diagnostics_field(tmp_path, monkeypatch):

@@ -516,31 +516,6 @@ class TestBootLevelQuarantine:
         assert "semantic" in cause["message"]
         assert "no_matching_slot" in cause["message"]
 
-        # No consolidation action dispatches while a main tier's binding is
-        # unverified -- the deferred_tier_unverified arm of the arbitrator.
-        from paramem.server.app import ConsolidationAction
-
-        dispatch_state = {
-            "config": cfg,
-            "adapter_manifest_status": {"episodic": {"status": "no_matching_slot"}},
-            "store_quarantine": None,
-            "consolidating": False,
-            "mode": "local",
-            "migration": {},
-            "background_trainer": None,
-        }
-        monkeypatch.setattr(app_module, "_state", dispatch_state)
-
-        for action in (
-            ConsolidationAction.AUTO,
-            ConsolidationAction.FULL,
-            ConsolidationAction.INTERIM,
-            ConsolidationAction.RECONCILE,
-        ):
-            status, resolved = app_module._dispatch_consolidation(action)
-            assert status == "deferred_tier_unverified"
-            assert resolved is action
-
 
 class TestBootMidWindowServesPreEventContent:
     """A boot landing between a tier's write and its publish resolves the

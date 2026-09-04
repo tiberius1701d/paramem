@@ -232,7 +232,7 @@ def _calibrate_state(tmp_path):
         "mode": "local",
         "background_trainer": None,
         "cloud_only_reason": None,
-        "last_chat_monotonic": None,
+        "last_model_use_monotonic": None,
         "pending_rehydration": False,
         "integrity_check_failed": False,
     }

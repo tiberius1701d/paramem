@@ -300,12 +300,17 @@ def migrate(
             cleared so the migration stays pending and is surfaced on retry
             after the operator resolves the corrupt registry.
         RuntimeError: When a consolidation event's stage ledger is still
-            pending.  Raised before ``save_state`` runs, so a first-time
-            mode-switch trigger never even creates the migration state
-            file — the caller resumes the pending event (``POST
-            /consolidate`` resumes it; the schedule otherwise resumes it
-            on its own next dispatch) and this function is called again
-            once the tree is coherent.
+            pending, OR present but this process cannot interpret it
+            (:class:`~paramem.training.stage_ledger.StageLedgerUnreadable` /
+            :class:`~paramem.training.stage_ledger.StageLedgerVersionUnsupported`
+            — reading it as "nothing pending" would let this migration
+            proceed over a tree it cannot actually read).  Raised before
+            ``save_state`` runs, so a first-time mode-switch trigger never
+            even creates the migration state file — the caller resumes the
+            pending event (it resumes on its own as soon as the server is
+            idle — an interim event under ``interim_resume``, a full event
+            unconditionally — or ``POST /consolidate`` resumes it now) and
+            this function is called again once the tree is coherent.
 
     Returns the updated state.
     """
@@ -342,11 +347,27 @@ def migrate(
     from paramem.training import stage_ledger as _sl
 
     _sl_state_dir = _sl.data_state_dir(config.paths.data)
-    if _sl.read_ledger(_sl_state_dir) is not None:
+    try:
+        _pending_ledger = _sl.read_ledger(_sl_state_dir)
+    except (_sl.StageLedgerUnreadable, _sl.StageLedgerVersionUnsupported) as exc:
+        cause = (
+            exc.cause
+            if isinstance(exc, _sl.StageLedgerUnreadable)
+            else f"version_unsupported:{exc.version!r}"
+        )
+        raise RuntimeError(
+            "active-store migration: a pending consolidation event's record cannot "
+            f"be read ({cause}) — refusing to run over a tree this process cannot "
+            "verify is coherent. It resumes on its own as soon as the server is idle "
+            "(an interim event under interim_resume, a full event unconditionally), "
+            "or POST /consolidate resumes it now."
+        ) from exc
+    if _pending_ledger is not None:
         raise RuntimeError(
             "active-store migration: a pending consolidation event must complete "
-            "before the store migration can run — POST /consolidate resumes it, "
-            "or the schedule will on its own next dispatch"
+            "before the store migration can run — it resumes on its own as soon as "
+            "the server is idle (an interim event under interim_resume, a full event "
+            "unconditionally), or POST /consolidate resumes it now."
         )
 
     save_state(config.adapter_dir, state)  # ensure file exists at start

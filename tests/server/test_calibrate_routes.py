@@ -334,30 +334,6 @@ class TestStoreQuarantineRefusesCalibrate:
 
 
 # ---------------------------------------------------------------------------
-# An armed pending_rehydration pre-empts a calibrate dispatch with
-# started_migration (covered together with the identity-absent case above);
-# this class pins the migration-sync submission itself.
-# ---------------------------------------------------------------------------
-
-
-class TestArmedMigrationPreemptsCalibrate:
-    def test_pending_rehydration_submits_the_migration_sync_not_the_calibration_run(
-        self, tmp_path, monkeypatch
-    ) -> None:
-        import paramem.server.app as app_module
-
-        state = _make_calibrate_state(tmp_path, pending_rehydration=True)
-        client, submitted = _route_client(state, monkeypatch)
-
-        resp = client.post("/calibrate/extract", json=_payload_for("extract"))
-
-        assert resp.json()["status"] == "started_migration"
-        assert len(submitted) == 1
-        fn, _status = submitted[0]
-        assert fn is app_module._run_active_store_migration_sync
-
-
-# ---------------------------------------------------------------------------
 # Preflight refuses with 503 when model/tokenizer/memory_store is
 # None, independently of _state["mode"].
 # ---------------------------------------------------------------------------

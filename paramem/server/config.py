@@ -1,6 +1,7 @@
 """Server configuration — loads server.yaml into typed dataclasses."""
 
 import logging
+import math
 import os
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -10,6 +11,14 @@ import yaml
 from paramem.backup.types import FatalConfigError
 from paramem.cloud.providers.base import CloudAgentConfig
 from paramem.config.taxonomy import ScrubCategory, resolve_scrub_categories
+from paramem.server.schedule_grammar import (
+    InvalidWindow,
+    Window,
+    compute_schedule_period_seconds,
+    interval_is_exact,
+    parse_schedule_atom,
+    parse_window,
+)
 from paramem.utils.config import (
     AdapterConfig,
     ConsolidationConfig,
@@ -1047,16 +1056,33 @@ class VoiceConfig:
 
 @dataclass
 class ConsolidationScheduleConfig(ConsolidationConfig):
-    # The interim refresh cadence — the only scheduling knob the operator sets.
-    # Every refresh_cadence a new episodic_interim_<stamp> adapter is minted
-    # (subject to the activity gate). Full consolidation fires every
-    # refresh_cadence × max_interim_count (derived; see
-    # consolidation_period_seconds / consolidation_period_string properties).
-    # Grammar: "" / "off" / "disabled" / "none" (manual) / "weekly" / "daily"
-    # / "HH:MM" / "daily HH:MM" / "Nh" / "Nm" / "every Nh" / "every Nm".
+    # Three scheduling keys.
+    #
+    # refresh_cadence — when interim ticks fire. Every mark a new
+    # episodic_interim_<stamp> adapter is minted (subject to the activity
+    # gate); under interim_resume: tick the mark is also what an interim
+    # event's own resume clock is measured against. Grammar: "" / "off" /
+    # "disabled" / "none" (manual) / "weekly" / "daily" / "HH:MM" /
+    # "daily HH:MM" / "Nh" / "Nm" / "every Nh" / "every Nm".
+    #
+    # interim_resume — when an interim event a conversation interrupted picks
+    # back up: "immediate" at the first idle moment, "tick" at the first idle
+    # moment at or after the next cadence mark, or a daily "HH:MM-HH:MM"
+    # window at the first idle moment inside it.
+    #
+    # full_window — with a ring, the daily "HH:MM-HH:MM" window in which a
+    # full fold may start (start only; a fold already running at the close
+    # keeps running). Wraps past midnight. Without a ring (max_interim_count:
+    # 0) the cadence itself is the full-fold schedule and this key is not
+    # read.
     refresh_cadence: str = (
-        "12h"  # default: one new interim every 12h → 84h full consolidation at count=7
+        # default: with max_interim_count=7 the oldest interim falls due at
+        # 84h of age, and the full fold starts at the last full_window
+        # opening that begins at or before that deadline.
+        "12h"
     )
+    interim_resume: str = "immediate"  # "immediate" | "tick" | "HH:MM-HH:MM"
+    full_window: str = "01:00-04:00"  # "HH:MM-HH:MM"
     # "train" = full pipeline including LoRA training; "simulate" = full
     # pipeline minus LoRA training, publishing a queryable disk-backed store.
     mode: str = "train"
@@ -1261,10 +1287,12 @@ class ConsolidationScheduleConfig(ConsolidationConfig):
     # Set to 0 to keep only the live slot. Set high (e.g. 50) when validating
     # slot lineage and disk is cheap.
     training_keep_prior_slots: int = 3
-    # Skip new training submissions while /chat has fired within this window.
-    # A scheduled-tick arriving sooner records a "deferred_idle" status.
-    # Measured against _state["last_chat_monotonic"] via time.monotonic() so
-    # a wall-clock NTP step does not break the predicate. Set to 0 to disable.
+    # Skip new training submissions while the model was used within this
+    # window. The debounce reads the one idle clock every mechanism that
+    # interferes with training writes -- a chat or voice turn, a debug probe,
+    # a raw-generation probe, a calibrate run -- via time.monotonic() so a
+    # wall-clock NTP step does not break the predicate. A dispatch arriving
+    # sooner answers "deferred_model_in_use". Set to 0 to disable.
     training_idle_debounce_s: int = 30
     # Time /chat waits for the BG trainer to abort at the next step boundary
     # before falling back to setting _shutdown_requested directly. At step
@@ -1378,8 +1406,6 @@ class ConsolidationScheduleConfig(ConsolidationConfig):
 
         if self.max_interim_count == 0:
             try:
-                from paramem.server.schedule_grammar import compute_schedule_period_seconds
-
                 _period = compute_schedule_period_seconds(self.refresh_cadence)
             except ValueError as exc:
                 raise ValueError(
@@ -1432,8 +1458,6 @@ class ConsolidationScheduleConfig(ConsolidationConfig):
         # orphan_retirement: validate the schedule string early so the operator
         # sees a clear error at startup, not at the first tick.
         try:
-            from paramem.server.schedule_grammar import compute_schedule_period_seconds
-
             compute_schedule_period_seconds(self.orphan_retirement)
         except ValueError as exc:
             raise ValueError(
@@ -1442,6 +1466,69 @@ class ConsolidationScheduleConfig(ConsolidationConfig):
                 f"Original error: {exc}"
             ) from exc
 
+        # interim_resume: "immediate", "tick", or an "HH:MM-HH:MM" window.
+        if self.interim_resume not in ("immediate", "tick"):
+            try:
+                parse_window(self.interim_resume)
+            except InvalidWindow as exc:
+                raise ValueError(
+                    f"consolidation.interim_resume must be 'immediate', 'tick', or an "
+                    f"'HH:MM-HH:MM' window; got {self.interim_resume!r}: {exc}"
+                ) from exc
+
+        # interim_resume: "tick" needs a cadence with wall-clock marks to resume
+        # on -- an anchored cadence (weekly/daily/HH:MM/"daily HH:MM") or an
+        # exact interval. An off or unparseable cadence and a non-exact interval
+        # (e.g. "7h") alike carry no marks.
+        if self.interim_resume == "tick":
+            atom = parse_schedule_atom(self.refresh_cadence)
+            has_marks = atom is not None and (
+                atom.kind in ("weekly", "daily", "hhmm")
+                or (atom.kind == "interval" and interval_is_exact(atom.count, atom.unit))
+            )
+            if not has_marks:
+                raise ValueError(
+                    f"consolidation.interim_resume='tick' requires "
+                    f"consolidation.refresh_cadence to carry wall-clock marks (an anchored "
+                    f"cadence -- weekly/daily/'HH:MM'/'daily HH:MM' -- or an exact interval "
+                    f"such as '12h'/'15m'); got interim_resume={self.interim_resume!r} paired "
+                    f"with refresh_cadence={self.refresh_cadence!r}, which has no marks to "
+                    f"resume on."
+                )
+
+        # full_window: "HH:MM-HH:MM" only.
+        try:
+            parse_window(self.full_window)
+        except InvalidWindow as exc:
+            raise ValueError(
+                f"consolidation.full_window must be an 'HH:MM-HH:MM' window; got "
+                f"{self.full_window!r}: {exc}"
+            ) from exc
+
+        # Overflow guard: with a ring, the full-fold window opens once a day,
+        # so the ring must hold at least one day of interims -- otherwise the
+        # ring overflows between window openings even under a healthy cadence.
+        # Skipped without a ring (max_interim_count == 0, no ring to overflow)
+        # and with an off cadence (no period to measure the floor against).
+        if self.max_interim_count > 0:
+            try:
+                period_seconds = compute_schedule_period_seconds(self.refresh_cadence)
+            except ValueError as exc:
+                raise ValueError(
+                    f"consolidation.max_interim_count={self.max_interim_count} requires a "
+                    f"valid consolidation.refresh_cadence; got {self.refresh_cadence!r}: {exc}"
+                ) from exc
+            if period_seconds is not None:
+                floor = math.ceil(86400 / period_seconds)
+                if self.max_interim_count < floor:
+                    raise ValueError(
+                        f"consolidation.max_interim_count={self.max_interim_count} is below "
+                        f"the floor {floor} for consolidation.refresh_cadence="
+                        f"{self.refresh_cadence!r} (period {period_seconds}s): the full-fold "
+                        f"window opens once a day, so the ring must hold one day of interims "
+                        f"-- ceil(86400 / {period_seconds}) = {floor}."
+                    )
+
         # Quiet-hours: reject unknown modes and malformed windows early.
         mode = self.quiet_hours_mode
         if mode not in ("always_on", "always_off", "auto"):
@@ -1449,36 +1536,32 @@ class ConsolidationScheduleConfig(ConsolidationConfig):
                 f"quiet_hours_mode={mode!r} must be one of 'always_on', 'always_off', 'auto'."
             )
         if mode == "auto":
-            for fld, val in (
-                ("quiet_hours_start", self.quiet_hours_start),
-                ("quiet_hours_end", self.quiet_hours_end),
-            ):
-                try:
-                    h, m = val.split(":")
-                    hh, mm = int(h), int(m)
-                    if not (0 <= hh < 24 and 0 <= mm < 60):
-                        raise ValueError
-                except Exception:
-                    raise ValueError(
-                        f"{fld}={val!r} must be HH:MM (24h); got invalid value."
-                    ) from None
+            try:
+                Window.from_hhmm(self.quiet_hours_start, self.quiet_hours_end)
+            except InvalidWindow as exc:
+                raise ValueError(
+                    f"quiet_hours_start={self.quiet_hours_start!r} / "
+                    f"quiet_hours_end={self.quiet_hours_end!r} must form an 'HH:MM-HH:MM' "
+                    f"window: {exc}"
+                ) from exc
 
     @property
     def consolidation_period_seconds(self) -> int | None:
-        """Full consolidation period in seconds — derived, not configured.
+        """The full-fold deadline input, in seconds — derived, not configured.
 
         Returns ``refresh_cadence × max_interim_count`` seconds, or ``None``
-        when ``refresh_cadence`` is disabled (``""``/``"off"``/etc.). Used by
-        the systemd timer to schedule the full-consolidation cycle and by
-        ``pstatus`` to display the effective cadence.
+        when ``refresh_cadence`` is disabled (``""``/``"off"``/etc.). This is
+        the age at which the oldest interim slot makes a full fold due, not a
+        timer period — the timer itself carries cadence marks and
+        ``full_window`` starts, and the fold runs at the last window opening
+        that begins at or before this deadline. Also read by ``pstatus`` to display
+        the effective cadence.
 
         Special case: when ``max_interim_count == 0`` (full-fold-only
-        consume-pending mode) there are no interim adapters; the full fold
+        consume-pending mode) there is no ring and no deadline; the full fold
         runs every ``refresh_cadence`` directly, so this returns
         ``refresh_seconds`` rather than ``refresh_seconds * 0``.
         """
-        from paramem.server.schedule_grammar import compute_schedule_period_seconds
-
         refresh_seconds = compute_schedule_period_seconds(self.refresh_cadence)
         if refresh_seconds is None:
             return None
@@ -1511,8 +1594,6 @@ class ConsolidationScheduleConfig(ConsolidationConfig):
         Uses :func:`~paramem.server.schedule_grammar.compute_schedule_period_seconds`
         with the same grammar as :attr:`refresh_cadence`.
         """
-        from paramem.server.schedule_grammar import compute_schedule_period_seconds
-
         return compute_schedule_period_seconds(self.orphan_retirement)
 
 
@@ -1521,8 +1602,22 @@ class SessionConfig:
     """SessionBuffer conversation-boundary settings."""
 
     # Gap since a conversation_id's last turn after which the next append()
-    # mints a fresh session_id instead of continuing the open one.
+    # mints a fresh session_id instead of continuing the open one. The same
+    # number also defines idle: how long after the model was last used
+    # (a chat/voice turn, a debug probe, a calibrate run) the server counts
+    # as idle, which is when a consolidation event a conversation interrupted
+    # may resume.
     idle_timeout_minutes: int = 10
+
+    def __post_init__(self) -> None:
+        if self.idle_timeout_minutes <= 0:
+            raise ValueError(
+                f"session.idle_timeout_minutes must be > 0; "
+                f"got {self.idle_timeout_minutes!r}. This value also paces the "
+                f"in-process idle watch, which sleeps one idle timeout between "
+                f"passes -- 0 or a negative value turns that loop into an "
+                f"event-loop spin."
+            )
 
 
 @dataclass

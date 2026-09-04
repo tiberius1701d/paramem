@@ -570,7 +570,7 @@ class TestConfigLoadValidatorsV1ThroughV3a:
         path = _fixture_yaml_with(
             tmp_path,
             {
-                "consolidation": {"max_interim_count": 1},
+                "consolidation": {"max_interim_count": 2},
                 "adapters": {"episodic": {"enabled": False}},
             },
         )

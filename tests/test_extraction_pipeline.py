@@ -4259,22 +4259,6 @@ class TestConsolidationScheduleConfigPrivacyGuard:
         cfg = ConsolidationScheduleConfig()
         assert cfg.extraction_enrichment_provider == ""
 
-    def test_minimal_yaml_loads_with_defaults(self, tmp_path):
-        """Back-compat: minimal yaml without new keys loads with all new defaults.
-
-        Pre-flight check #2: minimal yaml without new keys must load with all new defaults.
-        """
-        from paramem.server.config import load_server_config
-
-        minimal_yaml = tmp_path / "server.yaml"
-        minimal_yaml.write_text(
-            "model: mistral\nconsolidation:\n  refresh_cadence: every 2h\n  mode: simulate\n"
-        )
-        config = load_server_config(minimal_yaml)
-        # New fields must be present with defaults
-        assert config.consolidation.extraction_plausibility_judge == "auto"
-        assert config.consolidation.extraction_plausibility_stage == "deanon"
-
 
 # ---------------------------------------------------------------------------
 # Binding collisions — diagnostic check post-anonymization

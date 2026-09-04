@@ -727,7 +727,7 @@ def _probe_state(*, mode: str = "local", cloud_providers: dict | None = None) ->
         "memory_store": MagicMock(),
         "background_trainer": None,
         "effective_mode": None,
-        "last_chat_monotonic": 0.0,
+        "last_model_use_monotonic": 0.0,
         "user_token_store": None,
         "ha_graph": None,
     }

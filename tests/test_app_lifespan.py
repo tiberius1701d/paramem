@@ -1,11 +1,11 @@
 """Integration tests for app lifespan scheduling and debounce gates.
 
 Tests cover:
-1. ConsolidationScheduleConfig.training_idle_debounce_s field validation.
-2. _dispatch_consolidation idle-debounce gate.
-3. _apply_config_live reconciling both systemd timers via
+1. ConsolidationScheduleConfig.training_idle_debounce_s and
+   .abort_quiesce_timeout_s field validation.
+2. _apply_config_live reconciling both systemd timers via
    _reconcile_scheduling_timers.
-4. _run_boot_completion_tasks — the boot-completion catch-up task (base-swap
+3. _run_boot_completion_tasks — the boot-completion catch-up task (base-swap
    await, off-loop timer reconcile, backup-before-consolidation catch-up
    dispatch ordering) and _clear_state_task, the done-callback that clears a
    completed task's _state slot.
@@ -17,12 +17,10 @@ from __future__ import annotations
 
 import asyncio
 import subprocess
-import time
 from contextlib import contextmanager
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from paramem.utils import systemctl
+import pytest
 
 # ---------------------------------------------------------------------------
 # TestIdleDebounceConfig — ConsolidationScheduleConfig.training_idle_debounce_s
@@ -91,133 +89,6 @@ class TestAbortQuiesceTimeoutConfig:
 
 
 # ---------------------------------------------------------------------------
-# TestSchedulerIdleDebounce — _dispatch_consolidation gate
-# ---------------------------------------------------------------------------
-
-
-def _make_scheduler_state(last_chat_monotonic=None, debounce_s: int = 30) -> tuple:
-    """Return (state_patch_dict, config_mock) for scheduler debounce tests.
-
-    These tests focus on the idle-debounce gate only.  ``_is_full_cycle_due``
-    is patched to ``False`` in each caller that needs to reach the pending-
-    session path — callers add that patch to their ``with`` block.
-    """
-    cfg = MagicMock()
-    cfg.consolidation.training_idle_debounce_s = debounce_s
-    # Cadence off: no real schedule to be due against, so the durable-stamp
-    # catch-up gate (schedule_grammar.scheduled_run_due) never reads/writes
-    # anything below — these tests exercise only the idle-debounce gate,
-    # which runs before it. ``config.paths`` is a bare MagicMock here (no
-    # tmp_path backing), so any cadence that DID reach the durable-stamp
-    # read would crash on ``Path(MagicMock())``.
-    cfg.consolidation.refresh_cadence = ""
-
-    buf = MagicMock()
-    buf.pending_facts.return_value = []
-
-    state_patch = {
-        "consolidating": False,
-        "mode": "local",
-        "background_trainer": None,
-        "config": cfg,
-        "session_buffer": buf,
-        "speaker_store": None,
-        "pending_rehydration": False,
-        "integrity_check_failed": False,
-        "last_chat_monotonic": last_chat_monotonic,
-    }
-    return state_patch, cfg
-
-
-class TestSchedulerIdleDebounce:
-    """_dispatch_consolidation returns 'deferred_idle' within the window."""
-
-    def test_scheduled_tick_returns_deferred_idle_within_debounce_window(self) -> None:
-        """Tick arriving 5 s after /chat with debounce=30 returns 'deferred_idle'."""
-        import paramem.server.app as app_module
-
-        state_patch, _ = _make_scheduler_state(
-            last_chat_monotonic=time.monotonic() - 5,
-            debounce_s=30,
-        )
-        with (
-            patch.dict(app_module._state, state_patch, clear=False),
-            patch("paramem.server.app._retro_claim_orphan_sessions", return_value=0),
-        ):
-            result, _action = app_module._dispatch_consolidation(
-                app_module.ConsolidationAction.AUTO
-            )
-
-        assert result == "deferred_idle", (
-            f"Expected 'deferred_idle' within debounce window but got {result!r}"
-        )
-
-    def test_scheduled_tick_proceeds_after_debounce_elapsed(self) -> None:
-        """Tick arriving 60 s after /chat with debounce=30 proceeds past the gate."""
-        import paramem.server.app as app_module
-
-        state_patch, _ = _make_scheduler_state(
-            last_chat_monotonic=time.monotonic() - 60,
-            debounce_s=30,
-        )
-        # The tick should reach the no-pending check and return noop_no_pending
-        # (session_buffer.pending_facts() returns [] from the mock).
-        # _is_full_cycle_due is patched False so this test exercises the debounce
-        # gate in isolation without triggering the full-cycle event-loop path.
-        with (
-            patch.dict(app_module._state, state_patch, clear=False),
-            patch("paramem.server.app._retro_claim_orphan_sessions", return_value=0),
-            patch("paramem.server.app._is_full_cycle_due", return_value=False),
-        ):
-            result, _action = app_module._dispatch_consolidation(
-                app_module.ConsolidationAction.AUTO
-            )
-
-        assert result != "deferred_idle", (
-            f"Expected tick to proceed past debounce gate but got {result!r}"
-        )
-
-    def test_scheduled_tick_debounce_zero_disables_gate(self) -> None:
-        """debounce_s=0 disables the gate even when chat fired right now."""
-        import paramem.server.app as app_module
-
-        state_patch, _ = _make_scheduler_state(
-            last_chat_monotonic=time.monotonic(),
-            debounce_s=0,
-        )
-        # _is_full_cycle_due is patched False so this test exercises the debounce
-        # gate in isolation without triggering the full-cycle event-loop path.
-        with (
-            patch.dict(app_module._state, state_patch, clear=False),
-            patch("paramem.server.app._retro_claim_orphan_sessions", return_value=0),
-            patch("paramem.server.app._is_full_cycle_due", return_value=False),
-        ):
-            result, _action = app_module._dispatch_consolidation(
-                app_module.ConsolidationAction.AUTO
-            )
-
-        assert result != "deferred_idle", f"debounce_s=0 must disable gate; got {result!r}"
-
-    def test_scheduled_tick_no_chat_yet_proceeds(self) -> None:
-        """last_chat_monotonic=None skips the gate (no /chat has fired yet)."""
-        import paramem.server.app as app_module
-
-        state_patch, _ = _make_scheduler_state(last_chat_monotonic=None, debounce_s=30)
-        # _is_full_cycle_due is patched False so this test exercises the debounce
-        # gate in isolation without triggering the full-cycle event-loop path.
-        with (
-            patch.dict(app_module._state, state_patch, clear=False),
-            patch("paramem.server.app._retro_claim_orphan_sessions", return_value=0),
-            patch("paramem.server.app._is_full_cycle_due", return_value=False),
-        ):
-            result, _action = app_module._dispatch_consolidation(
-                app_module.ConsolidationAction.AUTO
-            )
-
-        assert result != "deferred_idle", f"No chat yet must not defer; got {result!r}"
-
-
-# ---------------------------------------------------------------------------
 # TestApplyConfigLiveSchedulerParticipation — _apply_config_live re-reads
 # consolidation.refresh_cadence from config B and reconciles the systemd
 # timer to it, so a cadence-only edit applies live and drift clears without
@@ -266,38 +137,51 @@ def _mock_run_systemctl(*args, **kwargs):
 
 
 class TestApplyConfigLiveSchedulerParticipation:
-    def _install_timer_paths(self, tmp_path, monkeypatch):
+    """``_apply_config_live`` reconciles both systemd timers against config B
+    -- the on-disk config actually being applied -- via
+    :func:`_reconcile_scheduling_timers`. That call happens BEFORE the
+    R-PORT/R-PATHS carve classification and reads config B's schedule
+    fields unconditionally: it never diffs against config A's former
+    values, so a live apply reconciles the timer even when the schedule
+    fields did not change (see ``_apply_config_live``'s own docstring, step
+    3b). Both real timer reconciles (``systemd_timer.reconcile``,
+    ``backup_timer.reconcile``) are replaced by recorders -- no live systemd
+    session is touched."""
+
+    def _make_schedule_config(
+        self,
+        *,
+        refresh_cadence: str,
+        full_window: str = "01:00-04:00",
+        interim_resume: str = "immediate",
+        max_interim_count: int = 7,
+        backups_schedule: str = "",
+    ):
+        cfg = _make_apply_live_config(
+            refresh_cadence=refresh_cadence, backups_schedule=backups_schedule
+        )
+        cfg.consolidation.full_window = full_window
+        cfg.consolidation.interim_resume = interim_resume
+        cfg.consolidation.max_interim_count = max_interim_count
+        return cfg
+
+    def _run_apply(self, config_a, config_b):
+        from pathlib import Path
+
+        import paramem.server.app as app_module
+        from paramem.backup import timer as backup_timer
         from paramem.server import systemd_timer
 
-        monkeypatch.setattr(systemd_timer, "UNIT_DIR", tmp_path)
-        monkeypatch.setattr(systemd_timer, "TIMER_PATH", tmp_path / "paramem-consolidate.timer")
-        monkeypatch.setattr(systemd_timer, "SERVICE_PATH", tmp_path / "paramem-consolidate.service")
-        return systemd_timer
+        consolidation_calls: list[tuple[tuple, dict]] = []
+        backup_calls: list[tuple[tuple, dict]] = []
 
-    def _install_backup_timer_paths(self, tmp_path, monkeypatch):
-        from paramem.backup import timer as backup_timer
+        def _fake_systemd_reconcile(*args, **kwargs):
+            consolidation_calls.append((args, kwargs))
+            return "ok"
 
-        monkeypatch.setattr(backup_timer, "UNIT_DIR", tmp_path)
-        monkeypatch.setattr(backup_timer, "TIMER_PATH", tmp_path / "paramem-backup.timer")
-        monkeypatch.setattr(backup_timer, "SERVICE_PATH", tmp_path / "paramem-backup.service")
-        return backup_timer
-
-    def test_backup_schedule_change_applies_live_via_reconcile_scheduling_timers(
-        self, tmp_path, monkeypatch
-    ):
-        """A backup-schedule-only edit (config A off -> config B 'daily 05:00')
-        is reconciled into the paramem-backup systemd timer by
-        _apply_config_live via _reconcile_scheduling_timers, which reconciles
-        both the consolidation and backup timers in the live-apply path, so a
-        live security.backups.schedule edit reaches systemd.
-        """
-        import paramem.server.app as app_module
-
-        self._install_timer_paths(tmp_path, monkeypatch)
-        self._install_backup_timer_paths(tmp_path, monkeypatch)
-
-        config_a = _make_apply_live_config(refresh_cadence="12h", backups_schedule="off")
-        config_b = _make_apply_live_config(refresh_cadence="12h", backups_schedule="daily 05:00")
+        def _fake_backup_reconcile(*args, **kwargs):
+            backup_calls.append((args, kwargs))
+            return "ok"
 
         state_patch = {
             "mode": "cloud-only",
@@ -305,169 +189,52 @@ class TestApplyConfigLiveSchedulerParticipation:
             "config": config_a,
             "config_path": "configs/server.yaml",
             "consolidating": False,
+            "config_drift": {},
         }
 
         with (
             patch.dict(app_module._state, state_patch, clear=False),
             patch("paramem.server.gpu_lock.gpu_lock_sync", _null_gpu_lock_sync),
-            patch(
-                "paramem.server.drift.compute_config_hash",
-                side_effect=["disk_hash_b", "mem_hash_a"],
-            ),
+            patch("paramem.server.drift.compute_config_hash", return_value="disk_hash_b"),
             patch.object(Path, "exists", return_value=True),
             patch.object(app_module, "load_server_config", return_value=config_b),
-            patch.object(systemctl, "run", side_effect=_mock_run_systemctl),
-            # return_value=None: simulate a successful reload — applied_live
-            # is derived from the returned reason (None == success).
-            patch.object(app_module, "_live_reload_base_model", return_value=None),
-            patch.object(app_module, "_set_voice_pipeline_profile"),
-        ):
-            result = app_module._apply_config_live()
-
-        assert result["restart_required_reason"] is None
-        timer_text = (tmp_path / "paramem-backup.timer").read_text()
-        assert "OnCalendar=*-*-* 05:00:00" in timer_text, (
-            f"Backup timer unit was not reconciled to 'daily 05:00' in config B: {timer_text!r}"
-        )
-
-    def test_cadence_change_applies_live_without_restart(self, tmp_path, monkeypatch):
-        """A cadence-only edit (config A '12h' -> config B '6h') is reconciled
-        into the systemd timer by _apply_config_live, with no restart
-        required — the scheduler is a live-apply participant.
-        """
-        import paramem.server.app as app_module
-
-        self._install_timer_paths(tmp_path, monkeypatch)
-
-        config_a = _make_apply_live_config(refresh_cadence="12h")
-        config_b = _make_apply_live_config(refresh_cadence="6h")
-
-        state_patch = {
-            "mode": "cloud-only",
-            "cloud_only_reason": "live_reload",
-            "config": config_a,
-            "config_path": "configs/server.yaml",
-            "consolidating": False,
-        }
-
-        with (
-            patch.dict(app_module._state, state_patch, clear=False),
-            patch("paramem.server.gpu_lock.gpu_lock_sync", _null_gpu_lock_sync),
-            patch(
-                "paramem.server.drift.compute_config_hash",
-                side_effect=["disk_hash_b", "mem_hash_a"],
-            ),
-            patch.object(Path, "exists", return_value=True),
-            patch.object(app_module, "load_server_config", return_value=config_b),
-            patch.object(systemctl, "run", side_effect=_mock_run_systemctl) as mock_systemctl,
-            # return_value=None: simulate a successful reload — applied_live
-            # is derived from the returned reason (None == success).
-            patch.object(app_module, "_live_reload_base_model", return_value=None),
-            patch.object(app_module, "_set_voice_pipeline_profile"),
-        ):
-            result = app_module._apply_config_live()
-
-        assert result["restart_required_reason"] is None, (
-            f"Cadence-only change must not require a restart, got: {result}"
-        )
-        timer_text = (tmp_path / "paramem-consolidate.timer").read_text()
-        assert "OnCalendar=*-*-* 00,06,12,18:00:00" in timer_text, (
-            f"Timer unit was not reconciled to the '6h' cadence in config B: {timer_text!r}"
-        )
-        first_args = [c.args[0] for c in mock_systemctl.call_args_list]
-        assert "enable" in first_args, (
-            "systemd_timer.reconcile was not invoked from _apply_config_live "
-            f"(no enable call seen): {mock_systemctl.call_args_list}"
-        )
-
-    def test_cadence_off_disarms_timer_via_apply_config_live(self, tmp_path, monkeypatch):
-        """refresh_cadence='' in config B fully disarms the timer when applied
-        live — the off path stays absolute after wiring in the reconcile call.
-        """
-        import paramem.server.app as app_module
-
-        systemd_timer = self._install_timer_paths(tmp_path, monkeypatch)
-
-        # Pre-install an active timer (as if a prior '12h' cadence was live).
-        with patch.object(systemctl, "run", side_effect=_mock_run_systemctl):
-            systemd_timer.reconcile("every 12h")
-        assert (tmp_path / "paramem-consolidate.timer").exists()
-
-        config_a = _make_apply_live_config(refresh_cadence="12h")
-        config_b = _make_apply_live_config(refresh_cadence="")
-
-        state_patch = {
-            "mode": "cloud-only",
-            "cloud_only_reason": "live_reload",
-            "config": config_a,
-            "config_path": "configs/server.yaml",
-            "consolidating": False,
-        }
-
-        with (
-            patch.dict(app_module._state, state_patch, clear=False),
-            patch("paramem.server.gpu_lock.gpu_lock_sync", _null_gpu_lock_sync),
-            patch(
-                "paramem.server.drift.compute_config_hash",
-                side_effect=["disk_hash_b", "mem_hash_a"],
-            ),
-            patch.object(Path, "exists", return_value=True),
-            patch.object(app_module, "load_server_config", return_value=config_b),
-            patch.object(systemctl, "run", side_effect=_mock_run_systemctl),
-            # return_value=None: simulate a successful reload — applied_live
-            # is derived from the returned reason (None == success).
+            patch.object(systemd_timer, "reconcile", _fake_systemd_reconcile),
+            patch.object(backup_timer, "reconcile", _fake_backup_reconcile),
             patch.object(app_module, "_live_reload_base_model", return_value=None),
             patch.object(app_module, "_set_voice_pipeline_profile"),
         ):
             app_module._apply_config_live()
 
-        assert not (tmp_path / "paramem-consolidate.timer").exists(), (
-            "refresh_cadence='' must disarm (remove) the timer unit via _apply_config_live"
-        )
-        assert not (tmp_path / "paramem-consolidate.service").exists()
+        return consolidation_calls, backup_calls
 
-    def test_no_config_b_skips_scheduler_reconcile(self, tmp_path, monkeypatch):
-        """When config B fails to load, the scheduler reconcile is skipped
-        (nothing to read) rather than acting on a stale/absent config."""
-        import paramem.server.app as app_module
+    def test_reconcile_reads_config_bs_new_cadence_and_extra_calendars(self) -> None:
+        """The reconcile call's cadence argument and computed
+        ``extra_calendars`` (a ring's own ``full_window`` start) both come
+        from config B -- the incoming config -- never config A's former
+        cadence."""
+        config_a = self._make_schedule_config(refresh_cadence="6h")
+        config_b = self._make_schedule_config(refresh_cadence="12h")
 
-        self._install_timer_paths(tmp_path, monkeypatch)
+        consolidation_calls, _backup_calls = self._run_apply(config_a, config_b)
 
-        config_a = _make_apply_live_config(refresh_cadence="12h")
+        assert len(consolidation_calls) == 1
+        args, kwargs = consolidation_calls[0]
+        assert args == ("12h",)
+        assert kwargs["extra_calendars"] == ["*-*-* 01:00:00"]
 
-        state_patch = {
-            "mode": "cloud-only",
-            "cloud_only_reason": "live_reload",
-            "config": config_a,
-            "config_path": "configs/server.yaml",
-            "consolidating": False,
-        }
+    def test_reconcile_runs_even_when_the_schedule_fields_are_unchanged(self) -> None:
+        """``_apply_config_live`` re-reads config B's PRESENT schedule
+        fields unconditionally -- it never diffs against config A's former
+        values -- so the reconcile still fires on an apply that changes
+        nothing about the schedule."""
+        config_a = self._make_schedule_config(refresh_cadence="12h")
+        config_b = self._make_schedule_config(refresh_cadence="12h")
 
-        def _failing_load(path, **kw):
-            raise ValueError("simulated parse failure")
+        consolidation_calls, _backup_calls = self._run_apply(config_a, config_b)
 
-        with (
-            patch.dict(app_module._state, state_patch, clear=False),
-            patch("paramem.server.gpu_lock.gpu_lock_sync", _null_gpu_lock_sync),
-            patch(
-                "paramem.server.drift.compute_config_hash",
-                side_effect=["disk_hash_b", "mem_hash_a"],
-            ),
-            patch.object(Path, "exists", return_value=True),
-            patch.object(app_module, "load_server_config", _failing_load),
-            patch.object(systemctl, "run", side_effect=_mock_run_systemctl) as mock_systemctl,
-            # return_value=None: simulate a successful reload — applied_live
-            # is derived from the returned reason (None == success).
-            patch.object(app_module, "_live_reload_base_model", return_value=None),
-            patch.object(app_module, "_set_voice_pipeline_profile"),
-        ):
-            app_module._apply_config_live()
-
-        assert mock_systemctl.call_args_list == [], (
-            "Scheduler reconcile must not run when config B failed to load: "
-            f"{mock_systemctl.call_args_list}"
-        )
-        assert not (tmp_path / "paramem-consolidate.timer").exists()
+        assert len(consolidation_calls) == 1
+        args, _kwargs = consolidation_calls[0]
+        assert args == ("12h",)
 
 
 # ---------------------------------------------------------------------------
@@ -520,6 +287,89 @@ class TestClearStateTask:
             assert app_module._state.get("_test_task_slot") is not None
         finally:
             app_module._state.pop("_test_task_slot", None)
+
+
+# ---------------------------------------------------------------------------
+# TestReconcileSchedulingTimers — _reconcile_scheduling_timers: the
+# consolidation timer carries the cadence entry plus a window-start entry
+# per configured window; the backup timer reconciles on its own schedule
+# alone, with no extra_calendars.
+# ---------------------------------------------------------------------------
+
+
+class TestReconcileSchedulingTimers:
+    def _reconcile(self, config):
+        """Call ``_reconcile_scheduling_timers`` with both timer reconciles
+        replaced by recorders. Returns (consolidation_calls, backup_calls),
+        each a list of ``(args, kwargs)``."""
+        import paramem.server.app as app_module
+        from paramem.backup import timer as backup_timer
+        from paramem.server import systemd_timer
+
+        consolidation_calls: list[tuple[tuple, dict]] = []
+        backup_calls: list[tuple[tuple, dict]] = []
+
+        def _fake_systemd_reconcile(*args, **kwargs):
+            consolidation_calls.append((args, kwargs))
+            return "ok"
+
+        def _fake_backup_reconcile(*args, **kwargs):
+            backup_calls.append((args, kwargs))
+            return "ok"
+
+        with (
+            patch.object(systemd_timer, "reconcile", _fake_systemd_reconcile),
+            patch.object(backup_timer, "reconcile", _fake_backup_reconcile),
+        ):
+            app_module._reconcile_scheduling_timers(config)
+
+        return consolidation_calls, backup_calls
+
+    def test_default_fixture_config_adds_the_full_window_start_only(self) -> None:
+        """Fixture defaults: refresh_cadence=12h, max_interim_count=7 (a
+        ring), interim_resume=immediate (not a window) -> one extra entry,
+        the full_window start."""
+        from paramem.server.config import load_server_config
+
+        config = load_server_config("tests/fixtures/server.yaml")
+
+        consolidation_calls, backup_calls = self._reconcile(config)
+
+        assert len(consolidation_calls) == 1
+        args, kwargs = consolidation_calls[0]
+        assert args == (config.consolidation.refresh_cadence,)
+        assert kwargs["extra_calendars"] == ["*-*-* 01:00:00"]
+
+        assert len(backup_calls) == 1
+        _backup_args, backup_kwargs = backup_calls[0]
+        assert "extra_calendars" not in backup_kwargs
+
+    def test_no_ring_adds_no_window_start(self) -> None:
+        """max_interim_count=0: no ring, so full_window is never read and no
+        extra entry is added."""
+        from paramem.server.config import load_server_config
+
+        config = load_server_config("tests/fixtures/server.yaml")
+        config.consolidation.max_interim_count = 0
+
+        consolidation_calls, _backup_calls = self._reconcile(config)
+
+        assert consolidation_calls[0][1]["extra_calendars"] == []
+
+    def test_windowed_interim_resume_adds_a_second_entry_in_order(self) -> None:
+        """A ring (full_window start) plus a windowed interim_resume (its
+        own start) -> two entries, full_window first, interim_resume second."""
+        from paramem.server.config import load_server_config
+
+        config = load_server_config("tests/fixtures/server.yaml")
+        config.consolidation.interim_resume = "22:00-23:00"
+
+        consolidation_calls, _backup_calls = self._reconcile(config)
+
+        assert consolidation_calls[0][1]["extra_calendars"] == [
+            "*-*-* 01:00:00",
+            "*-*-* 22:00:00",
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -580,58 +430,6 @@ class TestBootCompletionTaskCatchUp:
         asyncio.run(_go())
         return mocks
 
-    def test_both_schedules_off_no_dispatch(self, tmp_path):
-        """Both schedules off -> timers reconciled, but no backup and no
-        consolidation dispatch."""
-        config = _make_boot_config(tmp_path, refresh_cadence="", backup_schedule="off")
-        mocks = self._run_boot_task(config)
-
-        mocks["_reconcile_scheduling_timers"].assert_called_once_with(config)
-        mocks["_create_backup"].assert_not_called()
-        mocks["_dispatch_consolidation"].assert_not_called()
-
-    def test_backup_no_stamp_runs_before_consolidation_dispatch(self, tmp_path):
-        """No backup.json yet (NO_STAMP) -> _create_backup runs with tier
-        'daily' strictly BEFORE the consolidation AUTO dispatch — the fold
-        rewrites adapter dirs the snapshot bundle reads, so backup must not
-        run after it.
-
-        The consolidation cadence's own catch-up stamp is pre-seeded stale
-        (DUE) so the due-peek in front of the AUTO dispatch lets this
-        ordering test reach the dispatch at all — see
-        ``test_consolidation_stale_stamp_dispatches`` /
-        ``test_consolidation_no_stamp_does_not_dispatch`` for the peek itself.
-        """
-        import paramem.server.app as app_module
-        from paramem.server.schedule_state import write_last_scheduled_run
-
-        config = _make_boot_config(
-            tmp_path,
-            refresh_cadence="every 12h",
-            backup_schedule="daily 04:00",
-            artifacts=["snapshot_bundle"],
-        )
-        write_last_scheduled_run(tmp_path / "state", time.time() - 86400)
-
-        call_order: list = []
-
-        def _fake_backup(kinds, tier, label):
-            call_order.append(("backup", list(kinds), tier, label))
-
-        def _fake_dispatch(action):
-            call_order.append(("consolidate", action))
-            return "started_full", action
-
-        self._run_boot_task(
-            config,
-            _create_backup=_fake_backup,
-            _dispatch_consolidation=_fake_dispatch,
-        )
-
-        assert [c[0] for c in call_order] == ["backup", "consolidate"], call_order
-        assert call_order[0] == ("backup", ["snapshot_bundle"], "daily", None)
-        assert call_order[1][1] is app_module.ConsolidationAction.AUTO
-
     def test_backup_not_due_within_window_skips(self, tmp_path):
         """A recent backup.json completed_at inside the current mark's window
         -> NOT_DUE -> _create_backup is never invoked."""
@@ -659,56 +457,6 @@ class TestBootCompletionTaskCatchUp:
         mocks = self._run_boot_task(config)
 
         mocks["_create_backup"].assert_not_called()
-
-    def test_consolidation_cadence_off_never_dispatches(self, tmp_path):
-        """refresh_cadence='' -> AUTO is never dispatched, even though the
-        arbitrator itself would otherwise fall through to the content gates
-        on every boot."""
-        config = _make_boot_config(tmp_path, refresh_cadence="", backup_schedule="off")
-        mocks = self._run_boot_task(config)
-
-        mocks["_dispatch_consolidation"].assert_not_called()
-
-    def test_consolidation_stale_stamp_dispatches_auto(self, tmp_path):
-        """A real refresh_cadence with a stale (DUE) catch-up stamp ->
-        _dispatch_consolidation invoked with AUTO."""
-        import paramem.server.app as app_module
-        from paramem.server.schedule_state import write_last_scheduled_run
-
-        config = _make_boot_config(tmp_path, refresh_cadence="every 12h", backup_schedule="off")
-        write_last_scheduled_run(tmp_path / "state", time.time() - 86400)
-        mocks = self._run_boot_task(config)
-
-        mocks["_dispatch_consolidation"].assert_called_once_with(
-            app_module.ConsolidationAction.AUTO
-        )
-
-    def test_consolidation_no_stamp_does_not_dispatch(self, tmp_path):
-        """A real refresh_cadence with NO catch-up stamp on disk yet ->
-        the due-peek reads NO_STAMP -> _dispatch_consolidation is NOT
-        invoked. Seeding the stamp stays the arbitrator's own job on the
-        next real tick (one seeding owner) — the boot task never seeds it.
-        """
-        config = _make_boot_config(tmp_path, refresh_cadence="every 12h", backup_schedule="off")
-        mocks = self._run_boot_task(config)
-
-        mocks["_dispatch_consolidation"].assert_not_called()
-
-    def test_consolidation_fresh_stamp_does_not_dispatch(self, tmp_path):
-        """A real refresh_cadence with a catch-up stamp already inside the
-        current mark's window -> the due-peek reads NOT_DUE ->
-        _dispatch_consolidation is NOT invoked."""
-        from paramem.server.schedule_grammar import previous_mark
-        from paramem.server.schedule_state import write_last_scheduled_run
-
-        config = _make_boot_config(tmp_path, refresh_cadence="every 12h", backup_schedule="off")
-        # Stamp the current mark itself (mirrors scheduled_run_stamp_value's
-        # "stamp the mark, not raw now") so the peek reads NOT_DUE.
-        mark = previous_mark("every 12h", time.time())
-        write_last_scheduled_run(tmp_path / "state", mark)
-        mocks = self._run_boot_task(config)
-
-        mocks["_dispatch_consolidation"].assert_not_called()
 
     def test_backup_due_with_stale_stamp_runs(self, tmp_path):
         """A backup schedule with a stale (DUE, not just absent) completed_at
@@ -753,26 +501,6 @@ class TestBootCompletionTaskCatchUp:
 
         mocks["_create_backup"].assert_called_once()
 
-    def test_backup_step_failure_does_not_block_consolidation_dispatch(self, tmp_path):
-        """The backup step raising must not prevent the consolidation
-        catch-up step from still running — the two are isolated."""
-        import paramem.server.app as app_module
-        from paramem.server.schedule_state import write_last_scheduled_run
-
-        config = _make_boot_config(
-            tmp_path, refresh_cadence="every 12h", backup_schedule="every 5h"
-        )
-        write_last_scheduled_run(tmp_path / "state", time.time() - 86400)
-
-        def _boom(*a, **k):
-            raise RuntimeError("backup step exploded")
-
-        mocks = self._run_boot_task(config, _create_backup=_boom)
-
-        mocks["_dispatch_consolidation"].assert_called_once_with(
-            app_module.ConsolidationAction.AUTO
-        )
-
     def test_base_swap_task_awaited_before_catch_up(self, tmp_path):
         """A pending base_swap_task is awaited to completion before the
         timer reconcile (or any catch-up work) runs."""
@@ -805,69 +533,74 @@ class TestBootCompletionTaskCatchUp:
         asyncio.run(_go())
         assert call_order == ["base_swap_done", "reconcile"], call_order
 
-    def test_base_swap_task_raises_does_not_block_remaining_steps(self, tmp_path):
-        """A base_swap_task that raises is isolated in its own try/except —
-        the backup, consolidation, and reconcile steps that follow it still
-        run (docstring step 1: 'a failure in one never prevents the
-        remaining, independent steps from running')."""
+    def test_backup_catch_up_runs_before_the_consolidation_dispatch(self, tmp_path):
+        """The backup step (when due) completes BEFORE the consolidation
+        catch-up dispatches — a fold rewrites the tier adapter directories
+        the backup snapshot reads, so running the backup after a fold would
+        capture the fold's own output as though it predated the fold."""
         import paramem.server.app as app_module
-        from paramem.server.schedule_state import write_last_scheduled_run
 
-        config = _make_boot_config(
-            tmp_path, refresh_cadence="every 12h", backup_schedule="every 5h"
-        )
-        write_last_scheduled_run(tmp_path / "state", time.time() - 86400)
+        config = _make_boot_config(tmp_path, refresh_cadence="", backup_schedule="every 5h")
+        call_order: list = []
 
-        async def _base_swap():
-            raise RuntimeError("base swap exploded")
+        def _fake_create_backup(*args, **kwargs):
+            call_order.append("backup")
+
+        def _fake_dispatch(*args, **kwargs):
+            call_order.append("dispatch")
+            return "started_full", app_module.ConsolidationAction.FULL
 
         async def _go():
-            task = asyncio.create_task(_base_swap())
             with (
                 patch.dict(
                     app_module._state,
-                    {"config": config, "base_swap_task": task},
+                    {"config": config, "base_swap_task": None},
                     clear=False,
                 ),
-                patch.object(app_module, "_reconcile_scheduling_timers") as mock_reconcile,
-                patch.object(app_module, "_create_backup") as mock_backup,
-                patch.object(
-                    app_module,
-                    "_dispatch_consolidation",
-                    MagicMock(return_value=("started_full", app_module.ConsolidationAction.FULL)),
-                ) as mock_dispatch,
+                patch.object(app_module, "_reconcile_scheduling_timers"),
+                patch.object(app_module, "_create_backup", _fake_create_backup),
+                patch.object(app_module, "_dispatch_consolidation", _fake_dispatch),
             ):
                 await app_module._run_boot_completion_tasks()
-            return mock_reconcile, mock_backup, mock_dispatch
 
-        mock_reconcile, mock_backup, mock_dispatch = asyncio.run(_go())
+        asyncio.run(_go())
+        assert call_order == ["backup", "dispatch"], call_order
 
-        mock_backup.assert_called_once()
-        mock_dispatch.assert_called_once_with(app_module.ConsolidationAction.AUTO)
-        mock_reconcile.assert_called_once_with(config)
-
-    def test_reconcile_runs_last_with_active_schedules(self, tmp_path):
-        """With both a real backup schedule and a real consolidation cadence
-        DUE, the timer reconcile still runs strictly LAST, after both
-        catch-ups have completed (docstring step 4) — the ordering test
-        above only exercises this with both schedules off, so it never
-        observes reconcile relative to the catch-ups themselves."""
+    @pytest.mark.parametrize("refresh_cadence", ["", "12h"])
+    def test_consolidation_dispatch_requests_auto_with_boot_reason_regardless_of_cadence(
+        self, tmp_path, refresh_cadence
+    ):
+        """The boot task's own consolidation catch-up always requests
+        ``AUTO`` with ``reason=BOOT`` — the decider owns dueness, so the
+        request is unconditional whether the cadence is off (manual-only)
+        or a real cadence."""
         import paramem.server.app as app_module
-        from paramem.server.schedule_state import write_last_scheduled_run
+        from paramem.server.consolidation_choice import DispatchReason
 
-        config = _make_boot_config(
-            tmp_path, refresh_cadence="every 12h", backup_schedule="every 5h"
+        config = _make_boot_config(tmp_path, refresh_cadence=refresh_cadence, backup_schedule="off")
+        mocks = self._run_boot_task(config)
+
+        mocks["_dispatch_consolidation"].assert_called_once_with(
+            app_module.ConsolidationAction.AUTO, reason=DispatchReason.BOOT
         )
-        write_last_scheduled_run(tmp_path / "state", time.time() - 86400)
 
+    def test_timer_reconcile_runs_last(self, tmp_path):
+        """The timer reconcile is dispatched after both the backup catch-up
+        and the consolidation catch-up have already run/stamped — so a
+        ``Persistent=true`` tick the reconcile's own ``enable`` might fire
+        curls a server that already answers not-due, rather than racing the
+        boot task's own catch-up work into a double run."""
+        import paramem.server.app as app_module
+
+        config = _make_boot_config(tmp_path, refresh_cadence="", backup_schedule="every 5h")
         call_order: list = []
 
-        def _fake_backup(kinds, tier, label):
+        def _fake_create_backup(*args, **kwargs):
             call_order.append("backup")
 
-        def _fake_dispatch(action):
-            call_order.append("consolidate")
-            return "started_full", action
+        def _fake_dispatch(*args, **kwargs):
+            call_order.append("dispatch")
+            return "started_full", app_module.ConsolidationAction.FULL
 
         def _fake_reconcile(cfg):
             call_order.append("reconcile")
@@ -880,31 +613,105 @@ class TestBootCompletionTaskCatchUp:
                     clear=False,
                 ),
                 patch.object(app_module, "_reconcile_scheduling_timers", _fake_reconcile),
-                patch.object(app_module, "_create_backup", _fake_backup),
+                patch.object(app_module, "_create_backup", _fake_create_backup),
                 patch.object(app_module, "_dispatch_consolidation", _fake_dispatch),
             ):
                 await app_module._run_boot_completion_tasks()
 
         asyncio.run(_go())
+        assert call_order == ["backup", "dispatch", "reconcile"], call_order
 
-        assert call_order == ["backup", "consolidate", "reconcile"], call_order
+    def test_a_raising_backup_step_does_not_block_the_dispatch(self, tmp_path):
+        """Each catch-up step is isolated in its own try/except — a raise in
+        the backup step is logged and swallowed, and the consolidation
+        catch-up still runs."""
+        config = _make_boot_config(tmp_path, refresh_cadence="", backup_schedule="every 5h")
+        mocks = self._run_boot_task(
+            config, _create_backup=MagicMock(side_effect=RuntimeError("backup boom"))
+        )
 
-    def test_config_none_returns_without_error(self):
-        """_state['config'] is None -> returns quietly, no reconcile/backup/
-        consolidate work attempted."""
+        mocks["_dispatch_consolidation"].assert_called_once()
+
+    def test_a_raising_base_swap_task_does_not_block_remaining_steps(self, tmp_path):
+        """A ``base_swap_task`` that raises is caught (logged) at step 1 —
+        the backup, consolidation-dispatch, and timer-reconcile steps still
+        run to completion afterward."""
         import paramem.server.app as app_module
 
-        with (
-            patch.dict(app_module._state, {"config": None, "base_swap_task": None}, clear=False),
-            patch.object(app_module, "_reconcile_scheduling_timers") as mock_reconcile,
-            patch.object(app_module, "_create_backup") as mock_backup,
-            patch.object(app_module, "_dispatch_consolidation") as mock_dispatch,
-        ):
-            asyncio.run(app_module._run_boot_completion_tasks())
+        config = _make_boot_config(tmp_path, refresh_cadence="", backup_schedule="every 5h")
 
-        mock_reconcile.assert_not_called()
-        mock_backup.assert_not_called()
-        mock_dispatch.assert_not_called()
+        async def _failing_base_swap():
+            await asyncio.sleep(0)
+            raise RuntimeError("base-swap boom")
+
+        mocks = {
+            "_reconcile_scheduling_timers": MagicMock(),
+            "_create_backup": MagicMock(),
+            "_dispatch_consolidation": MagicMock(
+                return_value=("started_full", app_module.ConsolidationAction.FULL)
+            ),
+        }
+
+        async def _go():
+            task = asyncio.create_task(_failing_base_swap())
+            with (
+                patch.dict(
+                    app_module._state,
+                    {"config": config, "base_swap_task": task},
+                    clear=False,
+                ),
+                patch.object(
+                    app_module,
+                    "_reconcile_scheduling_timers",
+                    mocks["_reconcile_scheduling_timers"],
+                ),
+                patch.object(app_module, "_create_backup", mocks["_create_backup"]),
+                patch.object(
+                    app_module, "_dispatch_consolidation", mocks["_dispatch_consolidation"]
+                ),
+            ):
+                await app_module._run_boot_completion_tasks()
+
+        asyncio.run(_go())
+        mocks["_create_backup"].assert_called_once()
+        mocks["_dispatch_consolidation"].assert_called_once()
+        mocks["_reconcile_scheduling_timers"].assert_called_once()
+
+    def test_config_none_returns_without_error(self):
+        """``_state["config"] is None`` (never booted, or a config load
+        failure) returns immediately — no backup, dispatch, or reconcile
+        step runs, and nothing raises."""
+        import paramem.server.app as app_module
+
+        mocks = {
+            "_reconcile_scheduling_timers": MagicMock(),
+            "_create_backup": MagicMock(),
+            "_dispatch_consolidation": MagicMock(),
+        }
+
+        async def _go():
+            with (
+                patch.dict(
+                    app_module._state,
+                    {"config": None, "base_swap_task": None},
+                    clear=False,
+                ),
+                patch.object(
+                    app_module,
+                    "_reconcile_scheduling_timers",
+                    mocks["_reconcile_scheduling_timers"],
+                ),
+                patch.object(app_module, "_create_backup", mocks["_create_backup"]),
+                patch.object(
+                    app_module, "_dispatch_consolidation", mocks["_dispatch_consolidation"]
+                ),
+            ):
+                await app_module._run_boot_completion_tasks()
+
+        asyncio.run(_go())
+        mocks["_create_backup"].assert_not_called()
+        mocks["_dispatch_consolidation"].assert_not_called()
+        mocks["_reconcile_scheduling_timers"].assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -1744,3 +1551,59 @@ class TestShutdownGpuLockRelease:
             if r.levelno >= logging.ERROR and "could not acquire GPU lock" in r.message
         ]
         assert error_records, "expected an ERROR log naming the lock-acquire timeout"
+
+
+# ---------------------------------------------------------------------------
+# TestIdleFiringResumesPendingEventAtNoCadenceCost — the abort-then-resume
+# arc at the dispatch boundary: a pending interim event, found by an idle
+# firing while the server is idle, resumes without consuming a cadence
+# mark. No training runs — the executor hop is a spy, matching
+# tests/server/test_consolidate_dispatch.py's own arbitrator harness.
+# ---------------------------------------------------------------------------
+
+
+class TestIdleFiringResumesPendingEventAtNoCadenceCost:
+    def test_idle_dispatch_resumes_a_pending_interim_event_without_a_cadence_write(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """A pending interim event, found on disk by an IDLE-reasoned
+        dispatch while the server has never used the model, is resumed
+        through the real arbitrator (``started_resume``, one submission to
+        the executor spy) and the schedule stamp file's cadence mark is
+        byte-for-byte unchanged — the idle watch's own resume earns no
+        cadence credit, only a cadence-firing resume does.
+        """
+        import time
+
+        import paramem.server.app as app_module
+        from paramem.server.consolidation_choice import DispatchReason
+        from paramem.server.schedule_state import ScheduleMarks, read_marks, write_marks
+        from tests.server._state_builders import _write_pending_ledger
+        from tests.server.test_consolidate_dispatch import _ExecutorSpy, _make_arbitrator_state
+
+        state = _make_arbitrator_state(tmp_path, max_interim_count=7)
+        _write_pending_ledger(tmp_path, event="interim")
+        # Idle since boot: the clock has never been stamped.
+        state["last_model_use_monotonic"] = None
+
+        state_dir = tmp_path / "state"
+        seeded = ScheduleMarks(
+            last_cadence_mark_epoch=time.time() - 3600, last_full_start_epoch=None
+        )
+        write_marks(state_dir, seeded)
+        before = read_marks(state_dir)
+
+        spy = _ExecutorSpy()
+        state["event_loop"] = spy.loop
+        monkeypatch.setattr(app_module, "_state", state)
+        monkeypatch.setattr(app_module, "_retro_claim_orphan_sessions", lambda: 0)
+
+        status, _action, _choice = app_module._arbitrate_consolidation(
+            app_module.ConsolidationAction.AUTO, reason=DispatchReason.IDLE
+        )
+
+        assert status == "started_resume"
+        assert spy.call_count == 1
+
+        after = read_marks(state_dir)
+        assert after.last_cadence_mark_epoch == before.last_cadence_mark_epoch
