@@ -683,6 +683,108 @@ class TestRespondStage:
         assert "WARNING" not in captured.out
 
 
+class TestAnonymizeFactsStage:
+    """``anonymize_facts`` composes the same sectioned prompt home as the
+    chunk-level ``anonymize`` stage (``configs/prompts/anonymization.txt``)
+    and carries the operator's ``prompt_variants`` in its request body, the
+    way every other calibration stage does."""
+
+    _REAL_PROMPTS_DIR = Path(__file__).resolve().parents[1] / "configs" / "prompts"
+
+    @staticmethod
+    def _canned_response() -> dict:
+        return {
+            "stage": "anonymize_facts",
+            "raw_output": "{}",
+            "parsed": {"status": "ok", "mapping": {}},
+            "parse_error": None,
+            "artifact_dir": "/tmp/paramem-calibration/anonymize_facts_1",
+            "phases": [],
+        }
+
+    def test_anonymize_facts_shares_the_anonymize_prompt_entry(self):
+        """The one prompt this stage exercises is ``anonymize``'s own
+        entry — ``anonymization.txt`` — never a separate facts-only prompt
+        file."""
+        assert calibrate_prompts._STAGE_PROMPTS["anonymize_facts"] == ("anonymize",)
+
+    def test_anonymize_facts_posts_prompt_variants_in_its_request_body(self, tmp_path: Path):
+        dump_dir = tmp_path / "dump"
+        dump_dir.mkdir()
+        snapshot = tmp_path / "graph_merged_snapshot.json"
+        snapshot.write_text(
+            json.dumps(
+                {"directed": False, "multigraph": False, "graph": {}, "nodes": [], "links": []}
+            )
+        )
+        fake_post_stage = MagicMock(return_value=self._canned_response())
+
+        argv = [
+            "--stages",
+            "anonymize_facts",
+            "--snapshot",
+            str(snapshot),
+            "--dump-dir",
+            str(dump_dir),
+            "--prompts-dir",
+            str(self._REAL_PROMPTS_DIR),
+            "--baseline",
+            "none",
+        ]
+        with patch.object(calibrate_prompts, "_post_stage", fake_post_stage):
+            rc = calibrate_prompts.main(argv)
+
+        assert rc == 0
+        fake_post_stage.assert_called_once()
+        args, _kwargs = fake_post_stage.call_args
+        assert args[1] == "anonymize_facts"
+        payload = args[2]
+        assert set(payload) == {"snapshot_path", "prompt_variants", "params"}
+        assert payload["snapshot_path"] == str(snapshot)
+        assert isinstance(payload["prompt_variants"], dict)
+
+    def test_anonymize_facts_variant_of_anonymization_txt_is_included_when_present(
+        self, tmp_path: Path
+    ):
+        """A ``--prompt-prefix``-named variant of ``anonymization.txt`` in
+        the prompts directory is picked up into the posted
+        ``prompt_variants`` — the same mechanism the chunk-level
+        ``anonymize`` stage uses."""
+        dump_dir = tmp_path / "dump"
+        dump_dir.mkdir()
+        prompts_dir = tmp_path / "prompts"
+        prompts_dir.mkdir()
+        (prompts_dir / "myvariant_anonymization.txt").write_text("variant body")
+        snapshot = tmp_path / "graph_merged_snapshot.json"
+        snapshot.write_text(
+            json.dumps(
+                {"directed": False, "multigraph": False, "graph": {}, "nodes": [], "links": []}
+            )
+        )
+        fake_post_stage = MagicMock(return_value=self._canned_response())
+
+        argv = [
+            "--stages",
+            "anonymize_facts",
+            "--snapshot",
+            str(snapshot),
+            "--dump-dir",
+            str(dump_dir),
+            "--prompts-dir",
+            str(prompts_dir),
+            "--prompt-prefix",
+            "myvariant_",
+            "--baseline",
+            "none",
+        ]
+        with patch.object(calibrate_prompts, "_post_stage", fake_post_stage):
+            rc = calibrate_prompts.main(argv)
+
+        assert rc == 0
+        payload = fake_post_stage.call_args[0][2]
+        assert payload["prompt_variants"] == {"anonymization.txt": "myvariant_anonymization.txt"}
+
+
 class TestReplyOverlap:
     """``_reply_overlap`` — a minimal, deterministic content-drift signal
     between a baseline and a candidate serving reply."""

@@ -39,6 +39,7 @@ from paramem.graph.schema import SessionGraph
 from paramem.server import calibrate
 from paramem.server.calibrate import (
     _CHAIN,
+    CalibrateAnonymizeFactsRequest,
     CalibrateChainRequest,
     CalibrateNameRequest,
     CalibrateNormalizeRequest,
@@ -146,6 +147,12 @@ def _run_normalize(
     state: dict, req: CalibrateNormalizeRequest, *, artifact_dir: Path | None = None
 ) -> dict:
     return _run_stage(state, "normalize", req, artifact_dir=artifact_dir)
+
+
+def _run_anonymize_facts(
+    state: dict, req: CalibrateAnonymizeFactsRequest, *, artifact_dir: Path | None = None
+) -> dict:
+    return _run_stage(state, "anonymize_facts", req, artifact_dir=artifact_dir)
 
 
 def _run_name(state: dict, req: CalibrateNameRequest, *, artifact_dir: Path | None = None) -> dict:
@@ -972,6 +979,61 @@ class TestCalibrateNormalize:
         }
         assert "normalize_predicates" not in names
         assert "reinforcement_count" not in names
+
+
+class TestCalibrateAnonymizeFactsPromptVariants:
+    """``CalibrateAnonymizeFactsRequest`` carries ``prompt_variants`` the
+    same way every other calibration door does — resolved by
+    ``validate_anonymize_facts`` through ``resolve_prompt_variants``,
+    before any model call, exactly like the sibling chain/normalize
+    validators.
+    """
+
+    def test_prompt_variants_defaults_to_an_empty_dict(self):
+        req = CalibrateAnonymizeFactsRequest(
+            facts=[{"subject": "alex", "predicate": "lives in", "object": "berlin"}]
+        )
+        assert req.prompt_variants == {}
+
+    def test_an_unknown_variant_is_refused_before_any_model_call(self, tmp_path):
+        """A named variant absent from the calibration prompt directory is
+        HTTP 400 — the door never falls back to the shipped prompt."""
+        state = _state_enabled()
+        state["config"].paths = PathsConfig(calibration=tmp_path)
+        req = CalibrateAnonymizeFactsRequest(
+            facts=[{"subject": "alex", "predicate": "lives in", "object": "berlin"}],
+            prompt_variants={"anonymization.txt": "typo_variant.txt"},
+        )
+
+        with pytest.raises(HTTPException) as exc:
+            _run_anonymize_facts(state, req)
+
+        assert exc.value.status_code == 400
+        assert "variant not found" in exc.value.detail.lower()
+
+    def test_a_resolved_variant_reaches_the_run_specs_overrides(self, tmp_path):
+        """A prompt variant named in the request reaches the run spec's own
+        ``overrides`` — the dict ``run_stage`` installs via
+        ``prompt_overrides`` before dispatch — via the real
+        ``build_spec`` -> ``validate_anonymize_facts`` ->
+        ``resolve_prompt_variants`` path, not a call to
+        ``resolve_prompt_variants`` alone."""
+        (tmp_path / "prompts").mkdir()
+        (tmp_path / "prompts" / "my_anonymization.txt").write_text(
+            "VARIANT ANONYMIZATION BODY", encoding="utf-8"
+        )
+        state = _state_enabled()
+        state["config"].paths = PathsConfig(calibration=tmp_path)
+        req = CalibrateAnonymizeFactsRequest(
+            facts=[{"subject": "alex", "predicate": "lives in", "object": "berlin"}],
+            prompt_variants={"anonymization.txt": "my_anonymization.txt"},
+        )
+
+        spec = calibrate.build_spec(
+            "anonymize_facts", state, req, run_id="test-run", artifact_dir=tmp_path / "run"
+        )
+
+        assert spec.overrides == {"anonymization.txt": "VARIANT ANONYMIZATION BODY"}
 
 
 class TestEffectiveParamsSeed:

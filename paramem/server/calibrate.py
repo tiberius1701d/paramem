@@ -231,16 +231,20 @@ class CalibrateAnonymizeFactsRequest(BaseModel):
     override), so this calibrates against the operator's actual
     configuration, not a synthetic one.
 
-    Carries no ``prompt_variants``: this door's only anonymizer prompt,
-    ``anonymization.txt``, is anchor-only, and a facts-only call
-    (``transcript=""``) never reaches the ANCHOR gate, so a variant of
-    that prompt would never be exercised — see
-    ``/calibrate/anonymize`` for the transcript-bearing door, which does
-    carry variants.
+    This door runs the production anonymize step on the resolved facts,
+    which issues the SCAN model call over the rendered fact lines — the
+    ANCHOR call needs a transcript and does not run on this transcript-free
+    door.  ``prompt_variants`` carries the operator's prompt variants,
+    resolved the same way every other calibration use case resolves them
+    (see :func:`resolve_prompt_variants`): a variant of ``anonymization.txt``
+    supplied here is exercised on its SCAN sections — see
+    ``/calibrate/anonymize`` for the transcript-bearing door, whose
+    variants can additionally reach the ANCHOR sections.
     """
 
     facts: list[dict] | None = None
     snapshot_path: str | None = None
+    prompt_variants: dict[str, str] = Field(default_factory=dict)
     params: CalibrateParams = Field(default_factory=CalibrateParams)
 
 
@@ -1146,6 +1150,10 @@ def validate_anonymize_facts(state: dict, req: CalibrateAnonymizeFactsRequest) -
     """Resolve the fact list and prompt overrides for
     :func:`dispatch_anonymize_facts` — paired with it as the
     ``anonymize_facts`` stage's validate/dispatch split.
+
+    Resolves the operator's prompt variants the same way every other
+    calibration use case resolves them (see :func:`resolve_prompt_variants`)
+    — before any model call, zero inference cost on a bad variant name.
     """
     has_facts = req.facts is not None
     has_snapshot = req.snapshot_path is not None
@@ -1163,7 +1171,7 @@ def validate_anonymize_facts(state: dict, req: CalibrateAnonymizeFactsRequest) -
             status_code=400,
             detail="No facts to anonymize (empty facts list, or snapshot has no edges).",
         )
-    return {"facts": facts, "overrides": {}}
+    return {"facts": facts, "overrides": resolve_prompt_variants(state, req.prompt_variants)}
 
 
 def dispatch_anonymize_facts(

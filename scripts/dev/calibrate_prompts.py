@@ -12,14 +12,15 @@ Stages: the live, authoritative list of stage names carrying prompt variants
 is the ``_STAGE_PROMPTS`` mapping below — each key is a stage and maps 1:1
 onto ``POST /calibrate/<stage>``.  Most stages (``extract``, ``anonymize``,
 ``enrich``, ``plausibility``) run a chunk through the extraction pipeline;
-``normalize`` runs against a stored graph snapshot (``--snapshot``); ``name``
-runs against a turn transcript (``--turns-jsonl``); ``respond`` runs one live
-serving turn against a bare utterance (``--utterance``).  See each stage's
-guard code in ``main()`` for its required input flag.  ``anonymize_facts`` is
-a stage outside this mapping: it runs against a stored graph snapshot
-(``--snapshot``) like ``normalize``, but the only prompt it composes
-(``anonymization.txt``) never issues a model call on this facts-only,
-transcript-free door, so it carries no prompt variants.
+``normalize`` and ``anonymize_facts`` run against a stored graph snapshot
+(``--snapshot``); ``name`` runs against a turn transcript (``--turns-jsonl``);
+``respond`` runs one live serving turn against a bare utterance
+(``--utterance``).  See each stage's guard code in ``main()`` for its
+required input flag.  ``anonymize_facts`` composes the same prompt home as
+the transcript-bearing ``anonymize`` stage (``anonymization.txt``): it
+issues the SCAN model call over the rendered fact lines (the ANCHOR call
+needs a transcript and does not run on this transcript-free door), so it
+carries prompt variants the same way ``anonymize`` does.
 
 Usage::
 
@@ -141,6 +142,7 @@ _STAGE_PROMPTS: dict[str, tuple[str, ...]] = {
     "enrich": ("enrich",),
     "plausibility": ("plausibility",),
     "normalize": ("normalize_filter",),
+    "anonymize_facts": ("anonymize",),
     "name": ("name_user", "name_system"),
     "respond": (
         "serving_system",
@@ -1137,8 +1139,11 @@ def main(argv: list[str] | None = None) -> int:
     # The facts-only anonymize use case graph-tier enrichment uses —
     # composes the SAME sectioned home (configs/prompts/anonymization.txt)
     # as the session-tier "anonymize" chunk stage above, just with no
-    # transcript. Reads the same --snapshot artifact "normalize" reads;
-    # the server derives facts + identity_domain from it
+    # transcript: the SCAN model call still runs over the rendered fact
+    # lines, so a variant of anonymization.txt is exercised on its SCAN
+    # sections the same way it is for "anonymize" (the ANCHOR call needs a
+    # transcript and never runs here). Reads the same --snapshot artifact
+    # "normalize" reads; the server derives facts + identity_domain from it
     # (paramem.server.calibrate.dispatch_anonymize_facts).
     if "anonymize_facts" in stages:
         anonymize_facts_runs: list[dict] = []
@@ -1150,6 +1155,9 @@ def main(argv: list[str] | None = None) -> int:
                 "anonymize_facts",
                 {
                     "snapshot_path": args.snapshot,
+                    "prompt_variants": _variants(
+                        prompts_dir, args.prompt_prefix, "anonymize_facts"
+                    ),
                     "params": {k: v for k, v in params.items() if v is not None},
                 },
             )
