@@ -156,11 +156,12 @@ MEASURED_TOKENS_PER_WORD: float = 3.7
 # "envelope - skeleton - reserve" (payload carried once) plus the
 # ratio-cancellation unit rule, shared by every caller that must fit a
 # payload (a document chunk, a conversation transcript) inside one
-# anonymize-call token envelope. The anonymizer's SCAN step is a span
-# tagger — no envelope, no local ``generate()`` — so there is exactly ONE
-# local-call shape left to size a payload against: the ANCHOR
-# self-introduction question, which carries the payload once. See
-# :func:`anonymize_payload_cap_tokens`'s docstring for the identity itself.
+# anonymize-call token envelope. One ``anonymize()`` call issues up to two
+# local ``generate()`` calls that each carry the payload once: SCAN (every
+# call, when a model is resident) and ANCHOR (only when a kept person
+# value is a candidate). A compile-time payload cap must fit BOTH call
+# shapes, so :func:`anonymize_payload_cap_tokens` takes the tighter of the
+# two constraints. See that function's docstring for the identity itself.
 # ---------------------------------------------------------------------------
 
 # Total tokens (prompt + output) one local anonymize() call may occupy.
@@ -184,6 +185,91 @@ ANONYMIZE_ENVELOPE_TOKENS: int = 8192
 # ``mistralai/Mistral-7B-Instruct-v0.3``), CPU-only (tokenizer load, no
 # model, no GPU).
 ANONYMIZE_ANCHOR_PROMPT_SKELETON_TOKENS: int = 523
+
+# SCAN prompt skeleton — the fixed system-prompt + chat-markup + call-body
+# token cost of the SCAN call, excluding the payload text (``{text}``) but
+# INCLUDING the rendered keyword table (``{keywords}`` — every row of the
+# shipped ``configs/schema.yaml`` ``anonymizer.prefixes`` table, since the
+# skeleton must reflect what a real call actually carries). Measured via
+# the ACTUAL runtime render path (``paramem.models.loader.render_chat_prompt``
+# over the ``SCAN-SYSTEM`` + ``SCAN`` sections as
+# ``paramem.graph.anonymizer_prompts.load_anonymizer_prompts`` composes
+# them, ``{keywords}`` rendered from
+# ``paramem.config.taxonomy.prefix_descriptions()``, ``{text}`` empty,
+# ``add_generation_prompt=True``), counted with the production tokenizer
+# (Mistral 7B, ``mistralai/Mistral-7B-Instruct-v0.3``), CPU-only (tokenizer
+# load, no model, no GPU). Re-measure whenever the shipped table gains or
+# loses a row.
+ANONYMIZE_SCAN_PROMPT_SKELETON_TOKENS: int = 768
+
+# ---------------------------------------------------------------------------
+# SCAN OUTPUT reserve constants — the SCAN reply's size is bounded by how
+# many values it names, not by the payload's own size, but that count is
+# unknown before the call, so the reserve is a function of the payload's
+# own token count with a plateau (see :func:`scan_output_reserve_tokens`).
+# ---------------------------------------------------------------------------
+
+# Reply tokens per payload token for a perfect mapping, measured with the
+# production tokenizer: total reply tokens over total payload tokens,
+# ``add_special_tokens=False`` (the same call :func:`estimate_tokens` makes
+# with a tokenizer). The per-entry maximum ran higher on short single-word
+# turns, where a fixed JSON overhead dominates a tiny payload, and is
+# bounded instead by the plateau below, never by scaling this ratio to a
+# larger payload — see :data:`ANONYMIZE_SCAN_MAX_OUTPUT_TOKENS`.
+# Re-measure at any model swap.
+ANONYMIZE_SCAN_REPLY_RATIO: float = 2.15
+
+# The plateau: SCAN output reserve never exceeds this regardless of
+# payload size. Bounded above by what leaves the ANCHOR-shape and
+# SCAN-shape compile-time caps (:func:`anonymize_payload_cap_tokens`)
+# still admitting the held document-ingest and transcript operating
+# points (``paramem.graph.document_chunker._DOC_MAX_TOKENS``,
+# ``paramem.server.session_buffer._TRANSCRIPT_MAX_TOKENS``) — scaling
+# :data:`ANONYMIZE_SCAN_REPLY_RATIO` to either operating point's own
+# real-token payload size would overshoot that ceiling, which is the
+# short-turn measurement's fixed-JSON-overhead bias (see that constant's
+# own comment), not evidence of a real per-token reply cost at that
+# scale. A value-dense payload whose true reply would exceed this
+# plateau truncates, fails to parse, and fails closed — the accepted
+# direction, the same the ANCHOR reserve states.
+ANONYMIZE_SCAN_MAX_OUTPUT_TOKENS: int = 3400
+
+# The empty reply (`{"mapping": {}}`, 5 tokens measured directly with the
+# production tokenizer, no chat-template render) plus margin for
+# output-format variation (fence style, whitespace) — mirrors
+# :data:`ANONYMIZE_MIN_ANCHOR_OUTPUT_TOKENS`'s margin over its own
+# measured base.
+ANONYMIZE_MIN_SCAN_OUTPUT_TOKENS: int = 24
+
+
+def scan_output_reserve_tokens(payload_tokens: int) -> int:
+    """THE one SCAN-call output-reserve formula: a function of the
+    payload's own token count, plateaued — the SCAN reply's true size
+    depends on how many values it names, which is unknown before the
+    call, so this bounds it from the one thing that IS known beforehand.
+
+    ``min(max(ANONYMIZE_MIN_SCAN_OUTPUT_TOKENS, ceil(payload_tokens *
+    ANONYMIZE_SCAN_REPLY_RATIO)), ANONYMIZE_SCAN_MAX_OUTPUT_TOKENS)`` —
+    *payload_tokens* clamped at 0 before scaling; the plateau caps the
+    reserve at a constant well under the envelope regardless of how large
+    *payload_tokens* is, exactly as :func:`anchor_output_reserve_tokens`
+    plateaus at its own candidate-count ceiling.
+
+    Args:
+        payload_tokens: The SCAN call's own payload token count
+            (:func:`estimate_tokens` over the payload text) — NOT the
+            rendered prompt's token count, which also carries the fixed
+            keyword-table skeleton.
+
+    Returns:
+        The output-token reserve for one SCAN call.
+    """
+    bounded = max(0, payload_tokens)
+    return min(
+        max(ANONYMIZE_MIN_SCAN_OUTPUT_TOKENS, math.ceil(bounded * ANONYMIZE_SCAN_REPLY_RATIO)),
+        ANONYMIZE_SCAN_MAX_OUTPUT_TOKENS,
+    )
+
 
 # ---------------------------------------------------------------------------
 # ANCHOR OUTPUT reserve constants — measured against the shipped JSON
@@ -298,26 +384,27 @@ def anonymize_payload_cap_tokens(
     envelope_tokens: int,
     anchor_skeleton_tokens: int,
     anchor_reserve_tokens: int,
+    scan_skeleton_tokens: int,
+    scan_reserve_tokens: int,
     payload_tokens_per_word: float,
     tokens_per_word: float = MEASURED_TOKENS_PER_WORD,
 ) -> int:
     """THE one door every anonymize-payload cap consumer calls — the payload
-    size ceiling that fits the one remaining local ``generate()`` call
-    shape (ANCHOR).
+    size ceiling that fits BOTH local ``generate()`` call shapes one
+    ``anonymize()`` call may issue (SCAN, ANCHOR): the tighter of the two.
 
-    A payload of ``P`` real tokens is carried once by the ANCHOR call,
-    alongside its fixed prompt skeleton and its candidate-bounded output
-    reserve, against a single envelope::
+    A payload of ``P`` real tokens is carried once by each call, alongside
+    that call's own fixed prompt skeleton and its own output reserve,
+    against the SAME envelope::
 
-        envelope  >=  skeleton + P + reserve
+        envelope  >=  skeleton + P + reserve   (per call shape)
         P         <=  envelope - skeleton - reserve
-        cap_words  =  floor(P / payload_tokens_per_word)
+        P_max     =  min(P_anchor, P_scan)
+        cap_words  =  floor(P_max / payload_tokens_per_word)
 
     The result is re-expressed in the estimator's own unit via
     :func:`words_to_estimator_tokens` — see that function's docstring for
-    why (ratio cancellation at every runtime comparison). There is only one
-    call shape to evaluate, so the identity is inlined here directly rather
-    than split into a per-shape helper with a single caller.
+    why (ratio cancellation at every runtime comparison).
 
     Args:
         envelope_tokens: Total (prompt + output) token budget for one
@@ -334,6 +421,14 @@ def anonymize_payload_cap_tokens(
             evaluated at its own structural candidate-count ceiling (a
             compile-time cap cannot know a real payload's candidate count
             in advance).
+        scan_skeleton_tokens: The SCAN call's fixed prompt-template token
+            cost, including the rendered keyword table (see
+            :data:`ANONYMIZE_SCAN_PROMPT_SKELETON_TOKENS`).
+        scan_reserve_tokens: The SCAN call's output-side reserve — callers
+            pass :data:`ANONYMIZE_SCAN_MAX_OUTPUT_TOKENS` itself, the
+            plateau :func:`scan_output_reserve_tokens` cannot exceed,
+            since a compile-time cap cannot know a real payload's true
+            reply size in advance.
         payload_tokens_per_word: The payload shape's own prose ratio (real
             tokens per word), used only to convert the real-token payload
             budget into a word count.
@@ -345,19 +440,29 @@ def anonymize_payload_cap_tokens(
         output), never real tokens.
 
     Raises:
-        ValueError: When ``envelope_tokens - anchor_skeleton_tokens -
-            anchor_reserve_tokens <= 0`` — a mis-measured skeleton or a
-            shrunken envelope leaves no payload budget at all, which is a
-            configuration error, not a legitimate zero-word cap.
+        ValueError: When either call shape's own
+            ``envelope_tokens - skeleton_tokens - reserve_tokens <= 0`` —
+            a mis-measured skeleton or a shrunken envelope leaves that
+            call no payload budget at all, which is a configuration
+            error, not a legitimate zero-word cap.
     """
-    available = envelope_tokens - anchor_skeleton_tokens - anchor_reserve_tokens
-    if available <= 0:
+    anchor_available = envelope_tokens - anchor_skeleton_tokens - anchor_reserve_tokens
+    if anchor_available <= 0:
         raise ValueError(
-            f"anonymize_payload_cap_tokens: no payload budget left — "
+            f"anonymize_payload_cap_tokens: no ANCHOR payload budget left — "
             f"envelope_tokens ({envelope_tokens!r}) - anchor_skeleton_tokens "
             f"({anchor_skeleton_tokens!r}) - anchor_reserve_tokens "
-            f"({anchor_reserve_tokens!r}) = {available!r}, must be > 0"
+            f"({anchor_reserve_tokens!r}) = {anchor_available!r}, must be > 0"
         )
+    scan_available = envelope_tokens - scan_skeleton_tokens - scan_reserve_tokens
+    if scan_available <= 0:
+        raise ValueError(
+            f"anonymize_payload_cap_tokens: no SCAN payload budget left — "
+            f"envelope_tokens ({envelope_tokens!r}) - scan_skeleton_tokens "
+            f"({scan_skeleton_tokens!r}) - scan_reserve_tokens "
+            f"({scan_reserve_tokens!r}) = {scan_available!r}, must be > 0"
+        )
+    available = min(anchor_available, scan_available)
     cap_words = math.floor(available / payload_tokens_per_word)
     return words_to_estimator_tokens(cap_words, tokens_per_word=tokens_per_word)
 

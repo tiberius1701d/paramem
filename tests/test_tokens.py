@@ -19,11 +19,22 @@ import pytest
 from paramem.utils.tokens import (
     _DRIFT_SAMPLE_DOCUMENT,
     _DRIFT_SAMPLES,
+    ANONYMIZE_ANCHOR_MAX_CANDIDATES,
+    ANONYMIZE_ANCHOR_PROMPT_SKELETON_TOKENS,
+    ANONYMIZE_ENVELOPE_TOKENS,
+    ANONYMIZE_MIN_SCAN_OUTPUT_TOKENS,
+    ANONYMIZE_SCAN_MAX_OUTPUT_TOKENS,
+    ANONYMIZE_SCAN_PROMPT_SKELETON_TOKENS,
+    ANONYMIZE_SCAN_REPLY_RATIO,
     MEASURED_TOKENS_PER_WORD,
+    TRANSCRIPT_TOKENS_PER_WORD,
     RenderedPrompt,
+    anchor_output_reserve_tokens,
+    anonymize_payload_cap_tokens,
     check_ratio_drift,
     encode_rendered,
     estimate_tokens,
+    scan_output_reserve_tokens,
     words_to_estimator_tokens,
 )
 
@@ -364,3 +375,154 @@ class TestEncodeCountIdentity:
         encoded_len = len(encode_rendered(tok, prompt)["input_ids"])
         with_special = len(tok(prompt, add_special_tokens=True)["input_ids"])
         assert with_special != encoded_len
+
+
+# ---------------------------------------------------------------------------
+# scan_output_reserve_tokens — the plateau shape.
+# ---------------------------------------------------------------------------
+
+
+class TestScanOutputReserveTokensPlateauShape:
+    def test_a_zero_or_tiny_payload_floors_at_the_minimum(self):
+        assert scan_output_reserve_tokens(0) == ANONYMIZE_MIN_SCAN_OUTPUT_TOKENS
+        assert scan_output_reserve_tokens(1) == ANONYMIZE_MIN_SCAN_OUTPUT_TOKENS
+
+    def test_the_ratio_region_scales_with_payload_tokens(self):
+        payload_tokens = 100
+        expected = max(
+            ANONYMIZE_MIN_SCAN_OUTPUT_TOKENS,
+            math.ceil(payload_tokens * ANONYMIZE_SCAN_REPLY_RATIO),
+        )
+        assert expected < ANONYMIZE_SCAN_MAX_OUTPUT_TOKENS  # this payload is in the ratio region
+        assert scan_output_reserve_tokens(payload_tokens) == expected
+
+    def test_a_large_payload_plateaus_at_the_maximum(self):
+        huge = 100_000
+        assert scan_output_reserve_tokens(huge) == ANONYMIZE_SCAN_MAX_OUTPUT_TOKENS
+
+    def test_a_negative_payload_is_clamped_to_zero_before_scaling(self):
+        assert scan_output_reserve_tokens(-5) == ANONYMIZE_MIN_SCAN_OUTPUT_TOKENS
+
+
+# ---------------------------------------------------------------------------
+# anonymize_payload_cap_tokens — the tighter of SCAN and ANCHOR.
+# ---------------------------------------------------------------------------
+
+
+class TestAnonymizePayloadCapTokensIsTheTighterConstraint:
+    def test_a_larger_scan_skeleton_makes_the_scan_side_the_binding_constraint(self):
+        # ANCHOR side: envelope(1000) - skeleton(100) - reserve(100) = 800 available.
+        # SCAN side:   envelope(1000) - skeleton(700) - reserve(100) = 200 available.
+        # SCAN is tighter -> the cap must reflect 200, not 800.
+        cap = anonymize_payload_cap_tokens(
+            envelope_tokens=1000,
+            anchor_skeleton_tokens=100,
+            anchor_reserve_tokens=100,
+            scan_skeleton_tokens=700,
+            scan_reserve_tokens=100,
+            payload_tokens_per_word=1.0,
+            tokens_per_word=1.0,
+        )
+        assert cap == 200
+
+    def test_a_larger_anchor_skeleton_makes_the_anchor_side_the_binding_constraint(self):
+        # ANCHOR side: 1000 - 700 - 100 = 200 available.
+        # SCAN side:   1000 - 100 - 100 = 800 available.
+        # ANCHOR is tighter this time.
+        cap = anonymize_payload_cap_tokens(
+            envelope_tokens=1000,
+            anchor_skeleton_tokens=700,
+            anchor_reserve_tokens=100,
+            scan_skeleton_tokens=100,
+            scan_reserve_tokens=100,
+            payload_tokens_per_word=1.0,
+            tokens_per_word=1.0,
+        )
+        assert cap == 200
+
+    def test_a_zero_or_negative_scan_budget_raises(self):
+        with pytest.raises(ValueError, match="SCAN"):
+            anonymize_payload_cap_tokens(
+                envelope_tokens=100,
+                anchor_skeleton_tokens=10,
+                anchor_reserve_tokens=10,
+                scan_skeleton_tokens=90,
+                scan_reserve_tokens=90,
+                payload_tokens_per_word=1.0,
+            )
+
+    def test_a_zero_or_negative_anchor_budget_raises(self):
+        with pytest.raises(ValueError, match="ANCHOR"):
+            anonymize_payload_cap_tokens(
+                envelope_tokens=100,
+                anchor_skeleton_tokens=90,
+                anchor_reserve_tokens=90,
+                scan_skeleton_tokens=10,
+                scan_reserve_tokens=10,
+                payload_tokens_per_word=1.0,
+            )
+
+
+# ---------------------------------------------------------------------------
+# The shipped constants and the two import-time tripwires.
+# ---------------------------------------------------------------------------
+
+
+class TestShippedScanConstants:
+    def test_every_scan_and_anchor_constant_is_positive(self):
+        assert ANONYMIZE_ENVELOPE_TOKENS > 0
+        assert ANONYMIZE_SCAN_PROMPT_SKELETON_TOKENS > 0
+        assert ANONYMIZE_ANCHOR_PROMPT_SKELETON_TOKENS > 0
+        assert ANONYMIZE_SCAN_REPLY_RATIO > 0
+        assert ANONYMIZE_SCAN_MAX_OUTPUT_TOKENS > 0
+        assert ANONYMIZE_MIN_SCAN_OUTPUT_TOKENS > 0
+
+    def test_the_plateau_leaves_a_positive_payload_budget_under_the_envelope(self):
+        assert ANONYMIZE_SCAN_MAX_OUTPUT_TOKENS < (
+            ANONYMIZE_ENVELOPE_TOKENS - ANONYMIZE_SCAN_PROMPT_SKELETON_TOKENS
+        )
+
+    def test_anchor_reserve_at_its_own_structural_ceiling_is_a_real_function_call(self):
+        # Exercises the exact call anonymize_payload_cap_tokens's callers make
+        # for the ANCHOR side's compile-time reserve.
+        reserve = anchor_output_reserve_tokens(ANONYMIZE_ANCHOR_MAX_CANDIDATES)
+        assert reserve > 0
+
+
+class TestImportTimeTripwiresHoldWithTheShippedConstants:
+    """The two compile-time-capped modules
+    (``paramem.graph.document_chunker``, ``paramem.server.session_buffer``)
+    each hold a document-chunk / transcript-rotation token cap against
+    ``anonymize_payload_cap_tokens`` computed from the shipped SCAN/ANCHOR
+    constants and the module's OWN words-per-token ratio
+    (``document_chunker._R_PROSE`` / ``TRANSCRIPT_TOKENS_PER_WORD``).
+    Reproduced here as a direct call and assertion — not merely a
+    successful import — so a drift is reported as a normal assertion
+    failure naming the held cap and the computed one, not an import-time
+    ``AssertionError`` with no test context."""
+
+    def test_document_chunk_cap_fits_under_the_shipped_scan_anchor_cap(self):
+        from paramem.graph.document_chunker import _DOC_MAX_TOKENS, _R_PROSE
+
+        cap = anonymize_payload_cap_tokens(
+            envelope_tokens=ANONYMIZE_ENVELOPE_TOKENS,
+            anchor_skeleton_tokens=ANONYMIZE_ANCHOR_PROMPT_SKELETON_TOKENS,
+            anchor_reserve_tokens=anchor_output_reserve_tokens(ANONYMIZE_ANCHOR_MAX_CANDIDATES),
+            scan_skeleton_tokens=ANONYMIZE_SCAN_PROMPT_SKELETON_TOKENS,
+            scan_reserve_tokens=ANONYMIZE_SCAN_MAX_OUTPUT_TOKENS,
+            payload_tokens_per_word=_R_PROSE,
+        )
+        assert _DOC_MAX_TOKENS <= cap
+
+    def test_transcript_rotation_cap_fits_under_the_shipped_scan_anchor_cap(self):
+        from paramem.server.session_buffer import _TRANSCRIPT_MAX_TOKENS
+
+        cap = anonymize_payload_cap_tokens(
+            envelope_tokens=ANONYMIZE_ENVELOPE_TOKENS,
+            anchor_skeleton_tokens=ANONYMIZE_ANCHOR_PROMPT_SKELETON_TOKENS,
+            anchor_reserve_tokens=anchor_output_reserve_tokens(ANONYMIZE_ANCHOR_MAX_CANDIDATES),
+            scan_skeleton_tokens=ANONYMIZE_SCAN_PROMPT_SKELETON_TOKENS,
+            scan_reserve_tokens=ANONYMIZE_SCAN_MAX_OUTPUT_TOKENS,
+            payload_tokens_per_word=TRANSCRIPT_TOKENS_PER_WORD,
+        )
+        assert _TRANSCRIPT_MAX_TOKENS <= cap

@@ -1,31 +1,35 @@
 """External egress — the one primitive both answering legs (HA and cloud)
 send outbound text through.
 
-Two external legs share one scrub primitive and one exit gate, with
-different policies:
+The two external legs carry different policies, because they cross
+different trust boundaries:
 
-* **Cloud leg** (:func:`answer_via_cloud`) — governed by
-  ``sanitization.cloud_mode`` exactly as configured (``block`` /
-  ``anonymize`` / ``both``).
-* **HA leg** (:func:`answer_via_ha`) — scrubs always, refuses only on its
-  own three causes (``tagger_unavailable``, ``guard``,
-  ``unresolved_placeholder``), and is never closed by a personal verdict.
+* **Cloud leg** (:func:`answer_via_cloud`) — a third party's servers.
+  Governed by ``sanitization.cloud_mode`` exactly as configured
+  (``block`` / ``anonymize`` / ``both``): personal-value substitution
+  through the anonymize chain, a policy-gated personal-query refusal, and
+  a restore of the reply against the same contract.
+* **HA leg** (:func:`answer_via_ha`) — the configured Home Assistant
+  conversation agent. The turn goes out and the reply comes back exactly
+  as they are: no anonymize contract is built, no substitution runs, no
+  restore runs, and the leg is never closed by a personal verdict. Which
+  agent handles the turn, local or hosted, is the operator's choice; the
+  security documentation carries the recommendation.
 
 :class:`OutboundText` holds one outbound text, the inputs the anonymize
 chain needs, and the single :class:`~paramem.cloud.anonymize.AnonymizedContract`
 built for it — memoised, so the anonymize chain runs at most once per
-object even when both legs (or a leg followed by a caller-side fallback)
-read from it. Both doors take an :class:`OutboundText`; ``cloud_agent`` /
-``cloud_permitted`` / ``ha_client`` / ``ha_graph`` are the doors' own
-parameters, never fields of the shared object.
+object even when the cloud leg is read from it more than once (a leg
+followed by a caller-side fallback). ``cloud_agent`` / ``cloud_permitted``
+/ ``ha_client`` are the doors' own parameters, never fields of the shared
+object.
 
 This module owns everything that decides what leaves the house:
 :class:`OutboundText`, :func:`answer_via_ha`, :func:`answer_via_cloud`,
 :func:`_escalate_to_cloud` (the cloud transport primitive, one caller),
 :func:`_sanitize_history`, :func:`_stamp_leg`, :func:`_refuse_failed_contract`,
-:func:`_record_tagger_incident`, :func:`_ha_substitution_table`, and the
-per-leg record vocabularies (:data:`LEG_NAMES` / :data:`_EGRESS_VALUES` /
-:data:`_REFUSAL_VALUES`). ``MAX_HISTORY_TURNS`` belongs to
+and the per-leg record vocabularies (:data:`LEG_NAMES` / :data:`_EGRESS_VALUES`
+/ :data:`_REFUSAL_VALUES`). ``MAX_HISTORY_TURNS`` belongs to
 :mod:`paramem.server.session_buffer` instead — the property it bounds is
 the read of that buffer's own history, not an egress concern — and this
 module imports it from there.
@@ -44,7 +48,6 @@ from typing import TYPE_CHECKING, Any
 from paramem.cloud.providers.base import CloudAgent
 from paramem.server.chat_result import ChatResult
 from paramem.server.config import ServerConfig
-from paramem.server.ha_graph import HAEntityGraph
 from paramem.server.prompts import cloud_serving_system_prompt, language_instruction
 from paramem.server.sanitizer import is_self_referential
 from paramem.server.session_buffer import MAX_HISTORY_TURNS
@@ -65,8 +68,9 @@ _EGRESS_VALUES = ("scrubbed", "verbatim")
 _REFUSAL_VALUES = (
     "not_permitted",
     "personal_blocked",
-    "tagger_unavailable",
     "guard",
+    "model_unavailable",
+    "scan_failed",
     "unresolved_placeholder",
 )
 
@@ -103,61 +107,6 @@ def _sanitize_history(history: list[dict] | None) -> list[dict]:
     return sanitized
 
 
-def _ha_substitution_table(
-    text: str,
-    forward: dict[str, str],
-    ha_graph: HAEntityGraph | None,
-) -> dict[str, str]:
-    """The forward table the HA door actually substitutes over: *forward*
-    minus the keys the HA retain filter removes.
-
-    An HA-registered entity or area name occurring in *text* is retained
-    (left out of substitution) — sending HA a name it gave us discloses
-    nothing, and scrubbing it would break device control for person-named
-    entities.  Privacy wins whenever a key ALSO occurs outside a retained
-    span: such a key stays in the table and is substituted everywhere.
-
-    Args:
-        text: The outbound text the table will be substituted over.
-        forward: The contract's forward table (real value → placeholder).
-        ha_graph: The HA entity graph to retain against, or ``None`` when
-            no HA entity graph exists (HA not configured, or its build
-            failed) — every key stays in the table in that case.
-
-    Returns:
-        *forward* unchanged, or with every key whose every occurrence in
-        *text* lies inside a retained span removed.
-    """
-    if ha_graph is None:
-        return forward
-    spans = ha_graph.retained_spans(text)
-    if not spans:
-        return forward
-
-    from paramem.cloud.placeholders import _word_boundary_ok
-
-    def _inside_any_span(start: int, end: int) -> bool:
-        return any(span_start <= start and end <= span_end for span_start, span_end in spans)
-
-    table = dict(forward)
-    for key in forward:
-        if not key:
-            continue
-        occurrences: list[tuple[int, int]] = []
-        pos = 0
-        while True:
-            idx = text.find(key, pos)
-            if idx == -1:
-                break
-            end = idx + len(key)
-            if _word_boundary_ok(text, key, idx):
-                occurrences.append((idx, end))
-            pos = idx + 1
-        if occurrences and all(_inside_any_span(start, end) for start, end in occurrences):
-            del table[key]
-    return table
-
-
 @dataclass
 class OutboundText:
     """One outbound text and the scrub state every external leg shares for it.
@@ -165,12 +114,13 @@ class OutboundText:
     Built once per text a leg may send: the turn (with its history) on the
     routed legs, or the model-authored forwarded query behind
     ``[ESCALATE]``, which is a different artifact and gets its own object.
-    The anonymize chain runs at most once per object; both doors read the
-    same contract, so an HA-miss -> cloud-fallback turn is scrubbed once.
+    The anonymize chain runs at most once per object, lazily — the HA leg
+    never calls :meth:`contract`, so an HA-miss -> cloud-fallback turn
+    builds the contract at most once, on the cloud leg's own first read.
 
     ``reverse`` lives on the held contract and never leaves this object:
-    the doors expose only the substituted outbound surfaces and the
-    restored reply.
+    the cloud leg exposes only the substituted outbound surfaces and the
+    restored reply; the HA leg exposes ``self.text`` unchanged.
 
     Attributes:
         text: The text this object may send — a turn or a forwarded query.
@@ -238,23 +188,20 @@ class OutboundText:
             )
         return self._contract
 
-    def outbound_text(self, *, retain: HAEntityGraph | None = None) -> str:
+    def outbound_text(self) -> str:
         """The current turn's text, substituted over this object's forward table.
 
-        Args:
-            retain: The HA entity graph to retain registered names against,
-                or ``None`` — the cloud door, and the HA door with no
-                entity graph, both mean "substitute the full table".
+        Cloud only — the HA leg sends ``self.text`` unchanged and never
+        calls this method.
 
         Returns:
             *self.text* with every scrubbed value replaced by its
-            placeholder (minus any HA-retained occurrence).
+            placeholder.
         """
         from paramem.cloud.placeholders import _substitute_whole_words
 
         contract = self.contract()
-        table = _ha_substitution_table(self.text, contract.forward, retain)
-        return _substitute_whole_words(self.text, table)
+        return _substitute_whole_words(self.text, contract.forward)
 
     def outbound_history(self) -> list[dict]:
         """The drop-gated history turns, substituted over this object's forward table.
@@ -340,111 +287,63 @@ def _stamp_leg(
         diagnostics[f"{leg}_refusal"] = refusal
 
 
-def _record_tagger_incident(config: ServerConfig, leg: str) -> None:
-    """Record the non-fatal ``span_tagger_unavailable`` control-plane incident.
-
-    Best-effort observability, not a serving-path precondition: the
-    refusal that triggered this call is already authoritative (privacy
-    must win regardless of whether this write lands), so an incident-store
-    failure here must not turn a fail-closed refusal into a 500 for the
-    turn.
-
-    Args:
-        config: The live server config.
-        leg: The leg that refused (``"cloud"`` or ``"ha"``) — keys the
-            incident, so each closed leg gets its own row;
-            ``_load_span_tagger`` resolves by incident type, so the clear
-            site is unaffected.
-    """
-    from paramem.server.incidents import record_incident
-    from paramem.training.stage_ledger import data_state_dir
-
-    # Per-leg summary/detail: the cloud leg's scrub is conditional on
-    # ``cloud_mode``, so its record names the mode that was in effect; the
-    # HA leg scrubs unconditionally and has no mode to name.
-    if leg == "cloud":
-        summary = (
-            f"Span tagger unavailable — cloud egress refused under "
-            f"cloud_mode={config.sanitization.cloud_mode!r}"
-        )
-        detail = {"leg": leg, "cloud_mode": config.sanitization.cloud_mode}
-    else:
-        summary = "Span tagger unavailable — HA egress refused (the HA leg scrubs unconditionally)"
-        detail = {"leg": leg}
-
-    try:
-        record_incident(
-            data_state_dir(config.paths.data),
-            type="span_tagger_unavailable",
-            key=leg,
-            severity="warning",
-            summary=summary,
-            detail=detail,
-        )
-    except Exception:
-        logger.exception("Failed to record span_tagger_unavailable incident (non-fatal)")
-
-
 def _refuse_failed_contract(outbound: OutboundText, leg: str) -> None:
-    """Stamp *leg*'s refusal from a ``status="failed"`` contract, and record
-    the tagger incident when that is the cause.
+    """Stamp *leg*'s refusal from a ``status="failed"`` contract.
+
+    Maps the contract's three ``failure`` values one to one onto the
+    cloud leg's refusal vocabulary — the HA leg never builds a contract
+    and never calls this function.
 
     Args:
         outbound: The object whose ``contract().failure`` names the cause.
-        leg: The leg refusing (``"cloud"`` or ``"ha"``).
+        leg: The leg refusing (``"cloud"`` in production).
 
     Raises:
-        RuntimeError: If ``outbound.contract().failure`` is neither
-            ``"tagger"`` nor ``"guard"`` — an invariant violation, not a
-            cause to launder into an existing bucket.
+        RuntimeError: If ``outbound.contract().failure`` is none of
+            ``"guard"``, ``"model_unavailable"``, ``"scan_failed"`` — an
+            invariant violation, not a cause to launder into an existing
+            bucket.
     """
     failure = outbound.contract().failure
-    if failure == "tagger":
-        _stamp_leg(outbound.diagnostics, leg, refusal="tagger_unavailable")
-        _record_tagger_incident(outbound.config, leg)
-    elif failure == "guard":
-        _stamp_leg(outbound.diagnostics, leg, refusal="guard")
+    if failure in ("guard", "model_unavailable", "scan_failed"):
+        _stamp_leg(outbound.diagnostics, leg, refusal=failure)
     else:
         raise RuntimeError(
             f"_refuse_failed_contract: unrecognised failure value {failure!r} for leg "
-            f"{leg!r} — expected 'tagger' or 'guard'"
+            f"{leg!r} — expected 'guard', 'model_unavailable' or 'scan_failed'"
         )
 
 
 def answer_via_ha(
     outbound: OutboundText,
     ha_client: HAClient | None,
-    *,
-    ha_graph: HAEntityGraph | None = None,
 ) -> ChatResult | None:
     """Send *outbound* to the HA conversation agent — the HA egress door.
 
-    Scrubs always (subject to the operator's ``sanitization.scrub``
-    opt-out), and is never closed by a personal verdict: HA reachability
-    does not depend on ``outbound.is_personal`` at all.
+    The HA leg carries the turn verbatim on every path: no anonymize
+    contract is built, no substitution runs, and no restore runs on the
+    reply. It sends the turn to whichever HA conversation agent the
+    operator has configured; the choice of that agent, local or hosted,
+    is the operator's, and the security documentation carries the
+    recommendation. This leg is never closed by a personal verdict
+    either: HA reachability does not depend on ``outbound.is_personal``
+    at all.
 
     Sequence:
 
     1. ``ha_client is None`` or no ``ha_agent_id`` configured -> ``None``,
-       no record written, no anonymize call run.
-    2. ``outbound.contract()`` — a ``"failed"`` status refuses via
-       :func:`_refuse_failed_contract` and returns ``None``.
-    3. ``outbound.outbound_text(retain=ha_graph)`` — the HA-bound payload,
-       with any HA-registered entity/area name retained.
-    4. Stamp the leg's egress at the send boundary (describes the payload
-       that left, not the outcome).
-    5. Call the HA client's ``conversation_process``.
-    6. ``None`` reply -> return ``None`` (the egress record stands; the
-       caller owns the fall-through to the next mechanism in its chain).
-    7. Restore the reply; a surviving declared placeholder stamps
-       ``unresolved_placeholder`` and returns ``None``.
-    8. Return the restored :class:`~paramem.server.chat_result.ChatResult`.
+       nothing sent, nothing stamped.
+    2. Stamp the leg's egress at the send boundary — always ``"verbatim"``.
+    3. Call the HA client's ``conversation_process`` with ``outbound.text``
+       unchanged.
+    4. ``None`` reply -> return ``None`` (the caller owns the fall-through
+       to the next mechanism in its chain).
+    5. Return the reply exactly as it came, wrapped in a
+       :class:`~paramem.server.chat_result.ChatResult`.
 
     Args:
         outbound: The text to send.
         ha_client: The HA client, or ``None`` when HA is not configured.
-        ha_graph: The HA entity graph to retain registered names against,
-            or ``None`` when none exists.
 
     Returns:
         The HA reply as a :class:`~paramem.server.chat_result.ChatResult`,
@@ -453,16 +352,10 @@ def answer_via_ha(
     if ha_client is None or not outbound.config.ha_agent_id:
         return None
 
-    contract = outbound.contract()
-    if contract.status == "failed":
-        _refuse_failed_contract(outbound, "ha")
-        return None
-
-    ha_text = outbound.outbound_text(retain=ha_graph)
-    _stamp_leg(outbound.diagnostics, "ha", egress="scrubbed" if contract.forward else "verbatim")
+    _stamp_leg(outbound.diagnostics, "ha", egress="verbatim")
 
     reply = ha_client.conversation_process(
-        ha_text,
+        outbound.text,
         agent_id=outbound.config.ha_agent_id,
         language=outbound.language,
         supported_languages=outbound.config.tools.ha.supported_languages,
@@ -470,13 +363,7 @@ def answer_via_ha(
     if reply is None:
         return None
 
-    restored = outbound.restore(reply, sent=(ha_text,))
-    if restored is None:
-        logger.warning("HA response carried an unresolved placeholder — blocking")
-        _stamp_leg(outbound.diagnostics, "ha", refusal="unresolved_placeholder")
-        return None
-
-    return ChatResult(text=restored, escalated=True)
+    return ChatResult(text=reply, escalated=True)
 
 
 def answer_via_cloud(
@@ -503,9 +390,10 @@ def answer_via_cloud(
     +-------------+----------------------+----------------------+
 
     Per-query safety: when an anonymizing path is selected and the local
-    anonymizer fails to produce a mapping (span tagger unavailable, or the
-    domain-scoped fail-closed guard fired), this call returns ``None`` so
-    the caller falls back without sending anything to the cloud.
+    anonymizer fails to produce a mapping (the base model was not resident,
+    the scan call failed, or the domain-scoped fail-closed guard fired),
+    this call returns ``None`` so the caller falls back without sending
+    anything to the cloud.
 
     ``cloud_permitted`` defaults to ``True``: on the local-mode path, cloud
     egress is already gated upstream by ``cloud_agent`` presence, so local
@@ -517,8 +405,6 @@ def answer_via_cloud(
     and every ``None`` this function returns while ``cloud_agent`` was
     present is stamped into ``outbound.diagnostics`` via :func:`_stamp_leg`
     — see that function's docstring for the key-presence contract.
-    ``tagger_unavailable`` also records a ``span_tagger_unavailable``
-    incident (deduped on repeat).
 
     Args:
         outbound: The text to send.

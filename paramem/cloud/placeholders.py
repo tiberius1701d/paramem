@@ -10,21 +10,19 @@ caller) or WHAT happens to the result (cloud prompt construction,
 plausibility filtering, ``Relation`` construction) — those are
 extraction-pipeline concerns that live in ``paramem.graph``.
 
-Model-free and — by construction — free of any ``paramem.graph`` import:
-every primitive here operates on plain ``dict``/``str`` fact artifacts,
-never a ``Relation`` or ``SessionGraph``. Rendering a ``Relation`` into a
-fact dict is the caller's job, in ``paramem/graph/``. One exception to
-"IO-free": :func:`build_forward_table` resolves the person-category prefix
-via :func:`~paramem.config.taxonomy.entity_type_to_prefix`, a cached
-(``lru_cache``) read of ``configs/schema.yaml`` — ``paramem.config`` is a
-leaf package with no graph/server dependency of its own, so this stays
-within the "no ``paramem.graph`` import" boundary while resolving the
-taxonomy directly rather than taking it as a caller-supplied parameter.
+Model-free and IO-free — by construction — and free of any ``paramem.graph``
+import: every primitive here operates on plain ``dict``/``str`` fact
+artifacts, never a ``Relation`` or ``SessionGraph``. Rendering a
+``Relation`` into a fact dict is the caller's job, in ``paramem/graph/``.
+:func:`build_forward_table` takes the person-category prefix as a caller
+argument rather than resolving it itself — the caller
+(:func:`~paramem.cloud.anonymize.anonymize`) resolves it once via
+:func:`~paramem.config.taxonomy.entity_type_to_prefix`.
 
 :class:`~paramem.cloud.anonymize_steps.ScanResult` is imported only under
 ``TYPE_CHECKING`` below — :func:`build_forward_table`'s type hint names it,
 but ``paramem.cloud.anonymize_steps`` imports FROM this module
-(:data:`_MAX_MAPPING_TEXT_CHARS`, :func:`_word_boundary_ok`),
+(:data:`_MAX_MAPPING_TEXT_CHARS`, :func:`_first_occurrence`),
 so a runtime import here would cycle.
 
 The minted token shape is BARE (``Person_1``); a braced form
@@ -66,7 +64,6 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, TypeVar
 
-from paramem.config.taxonomy import entity_type_to_prefix
 from paramem.utils.identity import canonical, is_speaker_id
 
 _V = TypeVar("_V")
@@ -191,7 +188,7 @@ def _is_word_char(c: str) -> bool:
     return c.isalnum() or c == "_"
 
 
-def _word_boundary_ok(text: str, key: str, pos: int) -> bool:
+def word_boundary_ok(text: str, key: str, pos: int) -> bool:
     """Edge-aware whole-word boundary test for a candidate match of *key*
     at *pos* in *text*: a side needs a boundary check only when the KEY's
     edge char on that side is a word char (:func:`_is_word_char`) — see
@@ -199,14 +196,14 @@ def _word_boundary_ok(text: str, key: str, pos: int) -> bool:
 
     THE one boundary predicate for every whole-word decision in the
     anonymize chain: :func:`_substitute_whole_words` (is a scanned candidate
-    position a real match), :func:`~paramem.cloud.anonymize_steps._scan_drop_reason`
-    (the scan's own whole-word verification), the HA leg's retained-surface
-    filter in :mod:`paramem.server.egress` (does a key occur outside a
-    retained span), :func:`substitute_declared_renderings` (does a
+    position a real match), :func:`_first_occurrence` (where a value first
+    occurs, for ordering), :func:`substitute_declared_renderings` (does a
     rendering candidate, matched on the span as written, hold at that
     edge), and :func:`_whole_word_contains` (the containment pass in
     :func:`build_forward_table`) — never re-implement the edge-aware check
-    at another call site.
+    at another call site. Exported under a public name because
+    ``scripts/dev/anonymizer_gate.py`` imports it directly, to check its own
+    scoring walk against production rather than restate the rule.
     """
     end = pos + len(key)
     if _is_word_char(key[0]) and pos > 0 and _is_word_char(text[pos - 1]):
@@ -222,7 +219,7 @@ def _substitute_whole_words_and_applied(
 ) -> tuple[str, set[str]]:
     """The ONE longest-first, edge-aware-boundary replace-everywhere walk —
     shared by :func:`_substitute_whole_words` (its ``str``-only public
-    form) and :func:`_applied_whole_word_keys` (its key-reporting form),
+    form) and :func:`applied_whole_word_keys` (its key-reporting form),
     each reading one half of this function's return rather than
     re-implementing the walk.
 
@@ -288,7 +285,7 @@ def _substitute_whole_words_and_applied(
                 continue
             if text[pos:end] != key:
                 continue
-            if not _word_boundary_ok(text, key, pos):
+            if not word_boundary_ok(text, key, pos):
                 continue
             replacement = normalized[key]
             if not isinstance(replacement, str):
@@ -320,7 +317,7 @@ def _substitute_whole_words(
     return substituted
 
 
-def _applied_whole_word_keys(text: str, keys: Iterable[str]) -> set[str]:
+def applied_whole_word_keys(text: str, keys: Iterable[str]) -> set[str]:
     """The reporting form of :func:`_substitute_whole_words`: which of
     *keys* actually matches somewhere in *text*, without needing the
     substituted text itself or a value to substitute in.
@@ -332,11 +329,14 @@ def _applied_whole_word_keys(text: str, keys: Iterable[str]) -> set[str]:
     placeholder) can still ask "which of these substitutes somewhere in
     this text". A key this function does not return is INERT for that
     ``(text, keys)`` pair: :func:`_substitute_whole_words` would
-    substitute it nowhere. Two production callers:
+    substitute it nowhere. Three production callers:
     :func:`build_forward_table`'s prune pass uses this to keep only the
     forward-table keys that are live over one payload before minting;
     :meth:`~paramem.cloud.deanonymize.CloudScope.response` uses it to
-    scope ``observed`` to the declared tokens actually shown.
+    scope ``observed`` to the declared tokens actually shown;
+    :func:`~paramem.cloud.anonymize._anchor_candidates` uses it to scope
+    the kept person values to the ones that substitute inside the
+    transcript region.
     """
     mapping = dict.fromkeys(keys, "")
     _substituted, applied = _substitute_whole_words_and_applied(text, mapping)
@@ -391,7 +391,7 @@ def substitute_declared_renderings(text: str, mapping: dict[str, str]) -> str:
     longer token like ``Person_10`` beat a shorter one like ``Person_1``
     at the same starting position). Candidates come from ``finditer``,
     left to right, non-overlapping; each is kept only when
-    :func:`_word_boundary_ok` holds on the span as written. The result is
+    :func:`word_boundary_ok` holds on the span as written. The result is
     assembled from the kept spans and the untouched slices between them,
     so a substituted real value is never rescanned.
 
@@ -415,7 +415,7 @@ def substitute_declared_renderings(text: str, mapping: dict[str, str]) -> str:
     parts: list[str] = []
     last_end = 0
     for m in matcher.finditer(text):
-        if not _word_boundary_ok(text, m.group(0), m.start()):
+        if not word_boundary_ok(text, m.group(0), m.start()):
             continue
         token = tokens_by_group[m.lastindex - 1]
         parts.append(text[last_end : m.start()])
@@ -884,11 +884,40 @@ def _contains_declared_token(text: str, declared: set[str]) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _first_occurrence(haystack: str, needle: str) -> int:
+    """First whole-word occurrence offset of *needle* in *haystack* — the
+    same edge-aware boundary rule :func:`word_boundary_ok` applies at
+    substitution time.
+
+    Returns ``len(haystack)`` (a sentinel past every real position, never
+    ``-1``) when *needle* is empty or occurs nowhere at a word boundary —
+    so a caller sorting several candidates by this function's result puts
+    a non-occurring one last rather than raising or needing a separate
+    "not found" branch.
+
+    Two production callers: :func:`_whole_word_contains` below (does
+    *needle* occur at all) and
+    :func:`~paramem.cloud.anonymize_steps.scan_values` /
+    :func:`~paramem.cloud.anonymize._anchor_candidates` (order several
+    surviving values by where each first appears in the payload — the SCAN
+    reply carries no offsets of its own).
+    """
+    if not needle:
+        return len(haystack)
+    start = 0
+    while True:
+        pos = haystack.find(needle, start)
+        if pos == -1:
+            return len(haystack)
+        if word_boundary_ok(haystack, needle, pos):
+            return pos
+        start = pos + 1
+
+
 def _whole_word_contains(haystack: str, needle: str) -> bool:
     """True when *needle* occurs as a whole-word substring of *haystack*,
-    at any position — the same edge-aware boundary rule
-    :func:`_word_boundary_ok` applies at substitution time, reused here so
-    "does this surface occur as a real sub-phrase of that one" and "would
+    at any position — built on :func:`_first_occurrence` so "does this
+    surface occur as a real sub-phrase of that one" and "would
     substitution actually match it" are the same question ON THE SAME
     INPUT SHAPE :func:`_substitute_whole_words` sees. The ONE caller
     (:func:`build_forward_table`'s surface-containment pass) always passes
@@ -905,14 +934,7 @@ def _whole_word_contains(haystack: str, needle: str) -> bool:
     """
     if not needle or needle == haystack:
         return False
-    start = 0
-    while True:
-        pos = haystack.find(needle, start)
-        if pos == -1:
-            return False
-        if _word_boundary_ok(haystack, needle, pos):
-            return True
-        start = pos + 1
+    return _first_occurrence(haystack, needle) < len(haystack)
 
 
 def invert_forward_mapping(mapping: dict) -> dict[str, str]:
@@ -1145,6 +1167,7 @@ def build_forward_table(
     speaker_id: str | None,
     speaker_name: str | None,
     identity_domain: Iterable[str] | None,
+    person_prefix: str,
 ) -> ForwardTable:
     """Assemble the real -> placeholder forward table from verified SCAN
     results — code mints every placeholder; there is no model-authored
@@ -1160,8 +1183,9 @@ def build_forward_table(
     0. **Gates.** The person-name category, the speaker fold TARGET, and
        the ENROLLED display name are each resolved once, before anything
        else. ``person_idx`` is the index into *scans* of the category
-       whose prefix is the person prefix
-       (:func:`~paramem.config.taxonomy.entity_type_to_prefix` ("person")),
+       whose prefix is *person_prefix* (resolved once by the caller,
+       :func:`~paramem.cloud.anonymize.anonymize`, via
+       :func:`~paramem.config.taxonomy.entity_type_to_prefix` ("person")),
        or ``-1`` when no such category is among the active scan
        categories — the operator narrowed ``sanitization.scrub`` away
        from person names. ``target`` is *speaker_id* itself, but only
@@ -1189,8 +1213,8 @@ def build_forward_table(
        After the walk, the enrolled name itself is entered as an
        additional forward key on the speaker group — but ONLY when
        ``target is not None`` and ``enrolled is not None`` and it is not
-       already a member — so a name whose display form the tagger never
-       separately tagged still egresses as the speaker token.
+       already a member — so a name whose display form the SCAN call never
+       separately named still egresses as the speaker token.
     2. **Containment**, per category, longest-first (see below).
     3. **Reconcile** — only when ``identity_domain is not None``: every
        surviving group member is re-keyed onto its domain surface via
@@ -1198,7 +1222,7 @@ def build_forward_table(
        member with no domain match, or an ambiguous one, is dropped and
        counted into ``rekey_dropped``.
     4. **Prune** — every member surviving reconciliation is tested against
-       *tag_text* by :func:`_applied_whole_word_keys` (the one
+       *tag_text* by :func:`applied_whole_word_keys` (the one
        substitution walk); a member that substitutes nowhere is dropped
        and recorded as an inert entry (:func:`_dropped_inert_entry`)
        carrying its group's ``prefix`` as ``category`` (``""`` for the
@@ -1295,6 +1319,10 @@ def build_forward_table(
         identity_domain: The graph tier's own node list (or ``None`` on
             every other caller) — when given, pass 3 re-keys every
             surviving group member onto its domain surface.
+        person_prefix: The person-category placeholder prefix, resolved
+            ONCE by the caller (:func:`~paramem.cloud.anonymize.anonymize`)
+            via :func:`~paramem.config.taxonomy.entity_type_to_prefix`
+            ("person") — this function never resolves it a second time.
 
     Returns:
         :class:`ForwardTable` — ``forward`` (the ``{real_name:
@@ -1305,7 +1333,6 @@ def build_forward_table(
         :func:`invert_forward_mapping`, after dropping any entry whose
         VALUE is speaker-id-shaped).
     """
-    person_prefix = entity_type_to_prefix("person")
     person_idx = next((i for i, s in enumerate(scans) if s.category.prefix == person_prefix), -1)
     target = speaker_id if (speaker_id and is_speaker_id(speaker_id) and person_idx >= 0) else None
     enrolled = (
@@ -1411,7 +1438,7 @@ def build_forward_table(
         )
 
     # 4 — prune: every surviving key is tested against tag_text.
-    applied_keys = _applied_whole_word_keys(tag_text, member_to_group.keys())
+    applied_keys = applied_whole_word_keys(tag_text, member_to_group.keys())
     inert_entries: list[dict] = []
     surviving: dict[str, _Group] = {}
     for key, group in member_to_group.items():

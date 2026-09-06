@@ -33,7 +33,7 @@ component every cloud-egress path composes through — so
 ``anonymize_turn``, the conversation-egress composition of that shared
 component, belongs at the flow layer rather than with the primitives.
 Its callers are ``paramem/server/egress.py`` and
-``scripts/dev/calibrate_cloud_anonymizer.py``.
+``scripts/dev/anonymizer_gate.py``.
 """
 
 from __future__ import annotations
@@ -50,7 +50,6 @@ from paramem.cloud.anonymize import (
     _DEFAULT_ANONYMIZER_TOKEN_ENVELOPE,
     AnonymizedContract,
     anonymize,
-    failed_contract,
 )
 from paramem.cloud.deanonymize import deanonymize_facts
 from paramem.config.taxonomy import ScrubCategory
@@ -753,8 +752,8 @@ def extract_graph(
             default; ignored for native-SDK providers.
         scrub_categories: Resolved scrub categories
             (``SanitizationConfig.scrub_categories``) forwarded to the
-            anonymize stage's local anonymizer call, whose configured
-            tagger labels are the sole scope authority (see
+            anonymize stage's local anonymizer call, whose activated
+            categories are the sole scope authority (see
             :func:`~paramem.cloud.anonymize.anonymize`). Required — no
             implicit default; an empty tuple is the operator opt-out.
         correction_entity_types: Scope-and-enable knob for the local
@@ -907,35 +906,35 @@ def anonymize_turn(
     ``[<role>] <text>`` surface every anonymization few-shot is
     calibrated on, then handed to :func:`~paramem.cloud.anonymize.anonymize`
     as its ``transcript`` and ``history`` arguments respectively - the
-    same tagger pass that scans the current turn also scans the
-    drop-gated history, and both surfaces build ONE forward table, so a
-    value named only in an earlier turn is placeholdered exactly like one
-    named in the current turn. ``history`` is already the drop-gated,
+    same SCAN call that names values in the current turn also names them
+    in the drop-gated history, and both surfaces build ONE forward table,
+    so a value named only in an earlier turn is placeholdered exactly like
+    one named in the current turn. ``history`` is already the drop-gated,
     ``{role, text}``-shaped turn list the caller resolved (``()`` for a
     text-only ``/chat`` request with no prior turns).
 
     This path passes no facts - ``facts=[]`` - the anonymize chain's
     documented shape for "transcript but no facts" (chat egress). No
-    local extraction runs here: the span tagger anchors the anonymizer's
-    self-introduction question with entity spans directly against the
-    tagged payload.
+    local extraction runs here: the SCAN call's kept person values anchor
+    the anonymizer's self-introduction question directly against the
+    payload.
 
     ``model`` / ``tokenizer`` may be ``None`` - a cloud-only deferral
-    (base model not resident), never a configuration. ``None`` selects
-    only the anonymize chain's own ANCHOR gate
-    (:func:`~paramem.cloud.anonymize.anonymize`) - the tagger scan and
-    the rest of the chain run identically either way. The adapter-off
-    scope below is entered only when a model is present, since it is a
-    property of the resident PEFT model.
+    (base model not resident), never a configuration. ``None`` fails the
+    whole call closed (``status="failed"``, ``failure="model_unavailable"``)
+    - the SCAN call needs a resident model and cannot be deferred the way
+    the ANCHOR call can. The adapter-off scope below is entered only when
+    a model is present, since it is a property of the resident PEFT model.
 
     ``categories`` is the resolved scrub-category tuple
-    (``SanitizationConfig.scrub_categories``) - the tagger's configured
-    labels are the sole scope authority; there is no code-side
-    entity-type gate. Required - an omitted value would silently
-    anonymize against a hidden default on a security-critical egress
-    path. An empty tuple is the operator opt-out, handled entirely inside
-    :func:`~paramem.cloud.anonymize.anonymize`'s own ``categories``-empty
-    door - this helper has no door of its own to duplicate it.
+    (``SanitizationConfig.scrub_categories``) - the operator's ``scrub``
+    selection decides which SCAN keyword's values are kept; there is no
+    model-side judgement of scope. Required - an omitted value would
+    silently anonymize against a hidden default on a security-critical
+    egress path. An empty tuple is the operator opt-out, handled entirely
+    inside :func:`~paramem.cloud.anonymize.anonymize`'s own
+    ``categories``-empty door - this helper has no door of its own to
+    duplicate it.
 
     ``token_envelope`` is the total (prompt + output) token budget the
     ``anonymize`` call below may occupy - forwarded verbatim as its own
@@ -944,8 +943,9 @@ def anonymize_turn(
     standard as ``categories`` above, and an unbudgeted anonymize call is
     a defect to trace, not a value to fall back on silently. Production's
     only caller, :meth:`~paramem.server.egress.OutboundText.contract`
-    (read by both :func:`~paramem.server.egress.answer_via_ha` and
-    :func:`~paramem.server.egress.answer_via_cloud`), sources it from
+    (read by :func:`~paramem.server.egress.answer_via_cloud`; the HA door,
+    :func:`~paramem.server.egress.answer_via_ha`, sends the turn verbatim
+    and never builds a contract), sources it from
     ``config.consolidation.extraction_anonymize_token_envelope``
     - the one operator envelope value that also sizes session-tier
     extraction and graph-tier enrichment (:data:`_DEFAULT_ANONYMIZER_TOKEN_ENVELOPE`
@@ -978,11 +978,15 @@ def anonymize_turn(
       returns.
     * ``"opted_out"`` - operator opted out (``categories`` empty).
     * ``"failed"`` - block, with ``failure`` naming the cause
-      (``"guard"`` or ``"tagger"``) - see
-      :class:`~paramem.cloud.anonymize.AnonymizedContract`. Also covers
-      this helper's own precondition: empty/whitespace-only ``transcript``.
-      Callers must NEVER fall back to the original real-name transcript
-      on this status.
+      (``"guard"``, ``"model_unavailable"`` or ``"scan_failed"``) - see
+      :class:`~paramem.cloud.anonymize.AnonymizedContract`. Callers must
+      NEVER fall back to the original real-name transcript on this status.
+
+    An empty or whitespace-only ``transcript`` is a caller precondition,
+    not a status this function can return: :exc:`ValueError` is raised
+    immediately, before :func:`~paramem.cloud.anonymize.anonymize` is
+    ever reached - every caller of this function already checks for
+    non-empty text before escalating.
 
     A raise out of :func:`~paramem.cloud.anonymize.anonymize` is a
     defect and propagates unchanged - this helper installs no handler
@@ -992,9 +996,12 @@ def anonymize_turn(
 
     The companion :func:`~paramem.cloud.deanonymize.deanonymize_text`
     is the caller's exit gate for the cloud's response text.
+
+    Raises:
+        ValueError: *transcript* is empty or whitespace-only.
     """
     if not transcript or not transcript.strip():
-        return failed_contract()
+        raise ValueError("anonymize_turn: transcript must be non-empty")
 
     anon_prompts = load_anonymizer_prompts(prompts_dir=prompts_dir)
     # The anonymizer's speaker-anchor slot may only carry a value that

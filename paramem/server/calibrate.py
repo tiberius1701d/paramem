@@ -216,7 +216,7 @@ class CalibrateAnonymizeFactsRequest(BaseModel):
       produces), supplied directly by the caller.
     * ``snapshot_path`` — path to a NetworkX node-link
       ``graph_merged_snapshot.json`` on the server filesystem, read via
-      the same :func:`_relations_from_snapshot` reader
+      the same :func:`relations_from_snapshot` reader
       :class:`CalibrateNormalizeRequest` uses.
 
     Exactly one of ``facts`` or ``snapshot_path`` must be provided;
@@ -408,7 +408,7 @@ def resolve_prompt_variants(state: dict, variants: dict[str, str]) -> dict[str, 
     return resolved
 
 
-def _relations_from_snapshot(snapshot_path: str) -> list[dict]:
+def relations_from_snapshot(snapshot_path: str) -> list[dict]:
     """Load a NetworkX node-link ``graph_merged_snapshot.json`` into flat
     ``{subject, predicate, object, relation_type}`` dicts, plus
     ``speaker_id`` only when the edge carries one.
@@ -1069,7 +1069,7 @@ def validate_normalize(state: dict, req: CalibrateNormalizeRequest) -> dict[str,
         )
     resolved: dict[str, Any] = {"overrides": resolve_prompt_variants(state, req.prompt_variants)}
     resolved["relations"] = (
-        req.relations if has_relations else _relations_from_snapshot(req.snapshot_path)  # type: ignore[arg-type]
+        req.relations if has_relations else relations_from_snapshot(req.snapshot_path)  # type: ignore[arg-type]
     )
     return resolved
 
@@ -1157,7 +1157,7 @@ def validate_anonymize_facts(state: dict, req: CalibrateAnonymizeFactsRequest) -
                 "not both and not neither."
             ),
         )
-    facts = req.facts if has_facts else _relations_from_snapshot(req.snapshot_path)  # type: ignore[arg-type]
+    facts = req.facts if has_facts else relations_from_snapshot(req.snapshot_path)  # type: ignore[arg-type]
     if not facts:
         raise HTTPException(
             status_code=400,
@@ -1214,11 +1214,12 @@ def dispatch_anonymize_facts(
             prompts=anon_prompts,
         )
         # ``t.set_raw`` carries ``_render_scan_raw``'s output verbatim — the
-        # tagged span list plus the anchor's raw text, and on a
-        # ``failure="tagger"`` terminal the tagger's own refusal message —
-        # into the phase record only, never ``graph.diagnostics`` (counts
-        # only).  On this facts-only door it includes no history surfaces
-        # (``history=()`` here), unlike the session-tier door.
+        # SCAN call's own raw reply plus the anchor's raw text, and on a
+        # ``failure="scan_failed"`` terminal the SCAN call's own reply or
+        # refusal message instead — into the phase record only, never
+        # ``graph.diagnostics`` (counts only).  On this facts-only door it
+        # includes no history surfaces (``history=()`` here), unlike the
+        # session-tier door.
         t.set_raw(payload.raw)
         t.set_parsed(
             {
@@ -1226,7 +1227,6 @@ def dispatch_anonymize_facts(
                 "mapping_size": len(payload.forward),
                 "status": payload.status,
                 "failure": payload.failure,
-                "tagger_windows": payload.tagger_windows,
                 "model_calls": payload.model_calls,
                 "scan_dropped": payload.scan_dropped,
                 "call_tokens": list(payload.call_tokens),
@@ -1236,7 +1236,6 @@ def dispatch_anonymize_facts(
         "status": payload.status,
         "failure": payload.failure,
         "mapping": dict(payload.forward),
-        "tagger_windows": payload.tagger_windows,
         "model_calls": payload.model_calls,
         "scan_dropped": payload.scan_dropped,
         "inert_dropped": payload.inert_dropped,
@@ -1434,7 +1433,6 @@ def dispatch_respond(
             language=language,
             effective_mode=state.get("effective_mode"),
             memory_store=state["memory_store"],
-            ha_graph=state.get("ha_graph"),
             # Always the routed turn — this door never forces a leg.
             forced_leg=None,
         )

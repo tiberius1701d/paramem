@@ -24,39 +24,6 @@ FUZZY_THRESHOLD = 80
 # Service name fragments to skip (not user-facing actions)
 _SKIP_SERVICES = {"reload", "update", "refresh", "homeassistant"}
 
-# Sentinel emitted by :func:`_length_preserving_lower` in place of a
-# character whose ``str.lower()`` fold is not exactly one code point.  No HA
-# entity or area name contains this character, so substituting it in never
-# creates a spurious match; it exists only to keep the folded string exactly
-# as long as the raw one.
-_FOLD_SENTINEL = "�"
-
-
-def _length_preserving_lower(text: str) -> str:
-    """Fold *text* to lowercase one character at a time, preserving length.
-
-    :meth:`HAEntityGraph.retained_spans`'s offset invariant depends on the
-    folded string being exactly as long as *text*: a character whose
-    ``str.lower()`` expands to more than one code point (a handful of
-    code points do this) is replaced by :data:`_FOLD_SENTINEL` instead of
-    its expansion, rather than shifting every later offset. This costs at
-    most one retained occurrence for such a character — never a mis-mapped
-    offset, which is the failure that matters here.
-
-    Args:
-        text: Raw text to fold.
-
-    Returns:
-        A string of the same length as *text*, each character replaced by
-        its single-code-point lowercase fold, or :data:`_FOLD_SENTINEL`
-        when the fold is not exactly one code point.
-    """
-    out = []
-    for ch in text:
-        folded = ch.lower()
-        out.append(folded if len(folded) == 1 else _FOLD_SENTINEL)
-    return "".join(out)
-
 
 @dataclass
 class HAEntityNode:
@@ -277,53 +244,6 @@ class HAEntityGraph:
             matched_verbs=sorted(matched_verbs),
             domains=all_domains,
         )
-
-    def retained_spans(self, text: str) -> tuple[tuple[int, int], ...]:
-        """Character spans of *text* where an indexed entity or area name
-        occurs literally, case-insensitively.  Overlapping occurrences are
-        merged.  Only literal occurrences count — a fuzzy index match has
-        no occurrence to retain.
-
-        Used by the HA egress door to keep an HA-registered name readable
-        in the text sent to HA, even while every other detected span is
-        scrubbed.
-
-        The fold is length-preserving (:func:`_length_preserving_lower`),
-        so a folded offset IS the raw offset — no index map is needed and
-        none can go stale.
-
-        Args:
-            text: The outbound text to scan.
-
-        Returns:
-            A tuple of ``(start, end)`` spans, sorted and merged, or ``()``
-            when the entity index is empty or nothing matched.
-        """
-        if not self._entity_list:
-            return ()
-        folded = _length_preserving_lower(text)
-        spans: list[tuple[int, int]] = []
-        for name in self._entity_list:
-            if not name:
-                continue
-            pos = 0
-            while True:
-                idx = folded.find(name, pos)
-                if idx == -1:
-                    break
-                spans.append((idx, idx + len(name)))
-                pos = idx + 1
-        if not spans:
-            return ()
-        spans.sort()
-        merged: list[tuple[int, int]] = [spans[0]]
-        for start, end in spans[1:]:
-            last_start, last_end = merged[-1]
-            if start <= last_end:
-                merged[-1] = (last_start, max(last_end, end))
-            else:
-                merged.append((start, end))
-        return tuple(merged)
 
     @property
     def entity_count(self) -> int:

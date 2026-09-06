@@ -26,7 +26,6 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
 from paramem.cloud.placeholders import (
-    _applied_whole_word_keys,
     _apply_bindings,
     _binding_collisions,
     _contains_declared_token,
@@ -34,6 +33,7 @@ from paramem.cloud.placeholders import (
     _normalize_anonymization_mapping,
     _placeholder_tokens,
     _resolution_map,
+    applied_whole_word_keys,
     substitute_declared_renderings,
 )
 
@@ -56,8 +56,6 @@ _JSON_ENVELOPE_KEYS = frozenset(
         "relations",
         "new_entity_bindings",
         "summary",
-        # Anonymizer envelope — `{"mapping": {...}}`
-        "mapping",
         # Plausibility drop-set envelope — `{"drop": {"R1": [<idx>...],
         # ...}}`, a map from rule id to the indices that rule drops.
         # Shared with the enrichment delta's own `drop` key below (a bare
@@ -363,7 +361,7 @@ class CloudScope:
         shown.
 
         ``observed`` is the union, over every string in ``sent``, of
-        :func:`~paramem.cloud.placeholders._applied_whole_word_keys`
+        :func:`~paramem.cloud.placeholders.applied_whole_word_keys`
         against the DECLARED vocabulary — whole-word containment, never a
         shape scrape and never a raw substring test. A shape scrape reads
         whatever placeholder-shaped surface the text happens to carry,
@@ -431,7 +429,7 @@ class CloudScope:
         )
         sent_tuple = tuple(sent)
         observed = frozenset(
-            tok for s in sent_tuple for tok in _applied_whole_word_keys(s, contract.declared)
+            tok for s in sent_tuple for tok in applied_whole_word_keys(s, contract.declared)
         )
 
         # Binding-value pruning — see docstring. A binding whose VALUE

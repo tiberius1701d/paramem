@@ -20,7 +20,10 @@ import pytest
 
 from paramem.server.config import (
     DEFAULT_SERVER_CONFIG_PATH,
+    CpuConfig,
     PathsConfig,
+    SanitizationConfig,
+    ServerConfig,
     default_data_dir,
     load_server_config,
 )
@@ -1014,3 +1017,34 @@ class TestDefaultServerConfigPathIsCwdIndependent:
         # in (...)`` tuple). A relative path here means the loop was missed.
         cfg = load_server_config(Path("tests/fixtures/server.yaml"))
         assert cfg.paths.telemetry.is_absolute()
+
+
+class TestCpuConfig:
+    """The process-wide torch thread count — default 8, refused below 1."""
+
+    def test_default_is_eight(self):
+        assert CpuConfig().threads == 8
+
+    def test_an_explicit_value_is_kept(self):
+        assert CpuConfig(threads=4).threads == 4
+
+    def test_a_value_below_one_raises(self):
+        with pytest.raises(ValueError, match="cpu.threads"):
+            CpuConfig(threads=0)
+        with pytest.raises(ValueError, match="cpu.threads"):
+            CpuConfig(threads=-1)
+
+    def test_server_config_carries_a_cpu_field(self):
+        assert isinstance(ServerConfig().cpu, CpuConfig)
+
+
+class TestSanitizationConfigDefaultScrubResolvesToTheShippedFive:
+    def test_default_scrub_categories_are_the_five_shipped_categories(self):
+        categories = SanitizationConfig().scrub_categories
+        assert [c.prefix for c in categories] == [
+            "Person",
+            "Phone",
+            "Email",
+            "Address",
+            "Profile",
+        ]

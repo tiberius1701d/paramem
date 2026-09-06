@@ -17,40 +17,53 @@ fallback_relation_type: factual
 
 # Anonymizer vocabulary — single source of truth for placeholder-prefix
 # <-> entity-type resolution on the de-anonymization / repair path
-# (paramem.config.taxonomy.entity_type_to_prefix /
-# prefix_to_entity_type, via that module's anonymizer_type_to_prefix /
-# anonymizer_prefix_to_type), AND — via `scrub_categories` / `tagger_labels`
-# — for grouping `sanitization.scrub` hints into the local anonymizer's
-# per-category span-tagger calls
+# (paramem.config.taxonomy.entity_type_to_prefix / prefix_to_entity_type,
+# via that module's anonymizer_type_to_prefix / anonymizer_prefix_to_type),
+# AND — via `scrub_categories` — for grouping `sanitization.scrub` hints
+# into the local anonymizer's SCAN categories
 # (paramem.config.taxonomy.resolve_scrub_categories).
 #
-# prefix           — the literal token ("Person", "City", etc.)
+# Every row is also a keyword the anonymizer's SCAN call may answer with:
+# the resident base model is shown every row's `prefix`/`description` pair
+# (paramem.config.taxonomy.prefix_descriptions, in table order, whether
+# the row is scrubbed or not) and returns each value it finds mapped to
+# one of these keywords. Code then folds the returned keyword through
+# canonical() and matches it exactly against a row's folded prefix: a
+# value whose keyword names a row the operator's `scrub` activates is
+# kept, every other value reverts.
+#
+# prefix           — the literal token ("Person", "City", etc.) and the
+#                    keyword the SCAN call answers with. One word of
+#                    letters, starting with a capital (PascalCase, no
+#                    digits, no underscore) — this is also the mint's
+#                    placeholder shape (`Prefix_N`) and the fold the
+#                    keyword resolution matches against, so a looser
+#                    shape would make either ambiguous. Config load
+#                    refuses a row whose prefix does not match, and
+#                    refuses two rows whose prefixes collide under either
+#                    `casefold()` (the mint's rendering equivalence) or
+#                    `canonical()` (the keyword resolution).
 # entity_type      — the graph type that this prefix represents. Must be one
-#                    of entity_types above. Multiple prefixes may map to the
-#                    same entity_type (City → place, Country → place).
-# description      — human-readable label for this file's readers only.
+#                    of entity_types above — an undeclared entity_type fails
+#                    config load. Multiple prefixes may map to the same
+#                    entity_type (City → place, Country → place).
+# description      — the keyword's one-line definition, in the model's own
+#                    words — this file's readers and the SCAN call both
+#                    read it verbatim; it is vocabulary, not instruction.
 # primary_for_type — only one prefix per entity_type may set this. Used by
 #                    the repair path to pick a canonical prefix when
 #                    re-anonymizing a leaked real name; a second row
 #                    setting it for the same entity_type fails config load.
 # scrub_categories — optional list of `sanitization.scrub` hints this row
-#                    serves. A configured hint claimed by this row groups
-#                    into ONE scan category named after this row's prefix.
-#                    A hint claimed by two rows, or a configured hint no
-#                    row claims, fails config load.
-# tagger_labels    — the span tagger's OWN label vocabulary for this row:
-#                    the strings handed to the GLiNER model, distinct from
-#                    the operator-facing `scrub_categories` hints. Every
-#                    row that declares `scrub_categories` AND is activated
-#                    by the operator's `sanitization.scrub` (at least one
-#                    of its hints configured) must declare at least one
-#                    tagger label — an activated row with none is refused
-#                    at config load rather than silently scrubbing
-#                    nothing. These strings are pinned to the checkpoint
-#                    configured at `span_tagger.checkpoint` (server.yaml)
-#                    — they are the measured labels that checkpoint scores
-#                    well against, not free prose — and must be
-#                    re-measured whenever that checkpoint changes.
+#                    serves. A configured hint claimed by this row activates
+#                    this row: the operator's `sanitization.scrub` selection
+#                    decides which rows the SCAN keep-or-revert step keeps. A
+#                    hint claimed by two rows, an uncovered configured hint,
+#                    or a hint whose `canonical()` form equals another row's
+#                    folded prefix all fail config load. A row without
+#                    `scrub_categories` can never be activated — its values
+#                    always revert. An active row always carries at least
+#                    the hint that activated it.
 #
 # This file is the ONE declaration of both vocabularies — every reader
 # (relation types, entity types, the placeholder-prefix map, and
@@ -70,23 +83,33 @@ fallback_relation_type: factual
 # identifier of a person — it is a legitimately correctable entity class
 # (`place` IS a member of `_CORRECTABLE`), so world-knowledge entity
 # correction is exactly the repair pass a restored place name should be
-# eligible for. Place carries no `scrub_categories` below — its hints have
-# no measured tagger label yet, and declaring them without one would
-# refuse config load the moment an operator activated them.
+# eligible for. Place carries no `scrub_categories` below — declaring one
+# without a measured need would refuse config load the moment an operator
+# activated it.
+#
+# Product / Room / Profession / Work carry `entity_type` values that ARE
+# correctable (`concept` / `place` / `concept` / `concept`); Artist / Date /
+# Other do not (`person` / `event` / `person`) — a musician or author name,
+# a calendar date, and the catch-all (which may hold a private name) are
+# the kinds this design keeps outside the entity-correction rewrite path.
+# None of the seven set `primary_for_type` — the four primaries above
+# already cover their entity types.
 anonymizer:
   prefixes:
-    - { prefix: Person,  entity_type: person,       description: "Person names",                                      primary_for_type: true, scrub_categories: [person name, full name, given name, family name], tagger_labels: [person] }
-    - { prefix: Phone,   entity_type: person,       description: "Phone numbers",                                     scrub_categories: [phone number, mobile number, landline number], tagger_labels: [phone number] }
-    - { prefix: Email,   entity_type: person,       description: "Email addresses",                                   scrub_categories: [email address], tagger_labels: [email] }
-    # tagger_labels measured 2026-08-25 against checkpoint revision 1fcf13e8... (urchade/gliner_multi_pii-v1):
-    # `address` @ threshold 0.5 reaches dense-contact-list recall 10/10 on both measured dense shapes vs 2/10 and 1/10
-    # for `full address` on the same two shapes, with no loss on prose (4/4 addresses, 23/24 non-addresses) and no new
-    # false positives; measured cost is one over-long span on the multi-window dense list that contains the true
-    # address (over-scrub direction, never under-scrub).
-    - { prefix: Address, entity_type: person,       description: "Postal/street addresses",                           scrub_categories: [street address, postal address], tagger_labels: [address] }
-    - { prefix: Profile, entity_type: person,       description: "Profile URLs / social media handles",               scrub_categories: [profile URL, social media handle], tagger_labels: [social media handle, username] }
-    - { prefix: City,    entity_type: place,        description: "City/town names",                                   primary_for_type: true }
-    - { prefix: Country, entity_type: place,        description: "Country names" }
-    - { prefix: Place,   entity_type: place,        description: "Generic place/location names" }
-    - { prefix: Org,     entity_type: organization,  description: "Organization names",                                primary_for_type: true }
-    - { prefix: Thing,   entity_type: concept,       description: "Other identifying things (apps, products, brands)", primary_for_type: true }
+    - { prefix: Person,     entity_type: person,       description: "a person's given name, family name or full name (not a job title)", primary_for_type: true, scrub_categories: [person name, full name, given name, family name] }
+    - { prefix: Phone,      entity_type: person,       description: "a telephone number",                               scrub_categories: [phone number, mobile number, landline number] }
+    - { prefix: Email,      entity_type: person,       description: "an email address",                                 scrub_categories: [email address] }
+    - { prefix: Address,    entity_type: person,       description: "a street address (street plus number, optionally postal code)", scrub_categories: [street address, postal address] }
+    - { prefix: Profile,    entity_type: person,       description: "a profile URL or social-media handle",            scrub_categories: [profile URL, social media handle] }
+    - { prefix: City,       entity_type: place,        description: "a city, town or village name",                     primary_for_type: true }
+    - { prefix: Country,    entity_type: place,        description: "a country name" }
+    - { prefix: Place,      entity_type: place,        description: "a named place that is not a street address, city or country (a landmark, a region, a venue)" }
+    - { prefix: Org,        entity_type: organization,  description: "a company, institution, club or organisation name", primary_for_type: true }
+    - { prefix: Thing,      entity_type: concept,       description: "an identifying thing that is not a product, brand, device, app or service (a project name, an internal code name)", primary_for_type: true }
+    - { prefix: Product,    entity_type: concept,       description: "a product, brand, device, app or service name, including a named smart-home device" }
+    - { prefix: Room,       entity_type: place,        description: "a room or area of a home" }
+    - { prefix: Profession, entity_type: concept,       description: "a job title or profession" }
+    - { prefix: Artist,     entity_type: person,       description: "a musician, band, author or performer name" }
+    - { prefix: Work,       entity_type: concept,       description: "a song, album, film, book or show title" }
+    - { prefix: Date,       entity_type: event,        description: "a calendar date, a weekday or month name, or a date of birth" }
+    - { prefix: Other,      entity_type: person,       description: "any other proper noun or identifier that fits no listed kind" }

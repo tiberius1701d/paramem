@@ -594,10 +594,9 @@ class HAToolsConfig:
     def configured(self) -> bool:
         """Whether an HA client can be built from this configuration.
 
-        The one implementation of the buildability predicate: both
-        ``_build_runtime_components`` (constructing the live HA client) and
-        the admission mapping that decides whether the span tagger loads
-        read this property rather than re-testing ``url and token``.
+        The one implementation of the buildability predicate:
+        ``_build_runtime_components`` (constructing the live HA client)
+        reads this property rather than re-testing ``url and token``.
         """
         return bool(self.url and self.token)
 
@@ -681,36 +680,38 @@ class SanitizationConfig:
 
     * ``scrub`` — a flat list of PII-vocabulary HINTS (e.g. ``"person
       name"``, ``"phone number"``) anonymized when ``cloud_mode`` selects
-      an anonymizing mode.  **The prompt is the sole scope authority** —
-      the local LLM is given this list verbatim and decides, per value,
-      whether it is an instance of one of the listed categories; a value
-      it judges in-scope gets a placeholder minted and is substituted out
-      of the payload, regardless of the entity/attribute it happens to
-      live on.  There is no code-side entity-type gate downstream of this
-      config.  Defaults to a load-bearing set of name / phone / address /
-      online-identity sub-terms (e.g. ``"given name"``, ``"mobile
-      number"``, ``"street address"``, ``"social media handle"``):
-      direct contact identifiers are scrubbed while city, organization,
-      product, etc. are omitted so the cloud can still reason about
-      places and things sensibly (e.g. "What's a good restaurant in
-      Berlin?").  An empty list (``[]``) disables the
-      anonymization branch entirely under ``cloud_mode=anonymize|both``
-      — cloud sees the original text unchanged; this is the operator
-      opt-out.  Operator owns the privacy/utility tradeoff.  The
-      vocabulary is free-form — no closed set enforced or checked in
-      code, and NO semantic warn either: ``__post_init__`` below REJECTS
-      only on STRUCTURE (a list of non-empty strings) and never inspects
-      content.  A code-side "canonical vocabulary" to validate — or warn
-      — against would be the same closed list this design deletes
-      everywhere else, and it cannot discriminate a legitimate novel
-      category from a typo of a common one, so it isn't attempted.  See
-      ``configs/server.yaml.example`` for the documented canonical-core
-      guidance an operator edits against.
+      an anonymizing mode. Each hint resolves, via
+      :func:`~paramem.config.taxonomy.resolve_scrub_categories`, to a row
+      of ``configs/schema.yaml``'s ``anonymizer.prefixes`` table — the
+      row's ``prefix`` becomes an ACTIVE keyword. The anonymizer's SCAN
+      call is shown every row's keyword and description, active or not
+      (so the model never learns which kinds are scrubbed), names every
+      value it finds with one keyword, and mints nothing; CODE then folds
+      the returned keyword through ``canonical()`` and keeps a value only
+      when its keyword names an active row — every other value reverts
+      (left verbatim), whatever entity/attribute it lives on. Defaults to
+      a load-bearing set of name / phone / address / online-identity
+      sub-terms (e.g. ``"given name"``, ``"mobile number"``, ``"street
+      address"``, ``"social media handle"``): direct contact identifiers
+      are scrubbed while city, organization, product, etc. are omitted so
+      the cloud can still reason about places and things sensibly (e.g.
+      "What's a good restaurant in Berlin?").  An empty list (``[]``)
+      disables the anonymization branch entirely under
+      ``cloud_mode=anonymize|both`` — cloud sees the original text
+      unchanged; this is the operator opt-out.  Operator owns the
+      privacy/utility tradeoff.  The vocabulary is free-form — no closed
+      set enforced or checked in code, and NO semantic warn either:
+      ``__post_init__`` below REJECTS only on STRUCTURE (a list of
+      non-empty strings) and never inspects content.  A code-side
+      "canonical vocabulary" to validate — or warn — against would be the
+      same closed list this design deletes everywhere else, and it cannot
+      discriminate a legitimate novel category from a typo of a common
+      one, so it isn't attempted.  See ``configs/server.yaml.example`` for
+      the documented canonical-core guidance an operator edits against.
 
-    ``cloud_mode`` governs the cloud leg only.  The HA leg is a separate
-    external-egress path: it scrubs under ``scrub`` on every turn regardless
-    of ``cloud_mode``, refuses only on its own three causes, and is never
-    closed by the personal verdict — see
+    ``cloud_mode`` and ``scrub`` govern the cloud leg only.  The HA leg is a
+    separate external-egress path: it carries the turn text verbatim on
+    every path, regardless of ``cloud_mode`` — see
     :func:`~paramem.server.egress.answer_via_ha`.
 
     ``scrub_categories`` is derived, not operator-facing: ``__post_init__``
@@ -719,9 +720,8 @@ class SanitizationConfig:
     construction, so the pair can never disagree regardless of which
     construction site (YAML load via :func:`build_server_config`, or a
     dev script's direct ``SanitizationConfig()``) built this object. Each
-    category pairs a ``configs/schema.yaml`` ``anonymizer.prefixes`` row's
-    configured ``scrub`` hints with that row's span-tagger label
-    vocabulary (``tagger_labels``).
+    resolved category is one ``configs/schema.yaml`` ``anonymizer.prefixes``
+    row the configured ``scrub`` hints activate.
     """
 
     cloud_mode: str = "block"  # block, anonymize, both
@@ -751,49 +751,26 @@ class SanitizationConfig:
 
 
 @dataclass
-class SpanTaggerConfig:
-    """The local anonymizer's SCAN step: a CPU-resident GLiNER span-tagging
-    model, loaded once per process the way the base model is loaded —
-    eager ``from_pretrained`` against a Hugging Face cache checkpoint, no
-    build step of our own.
+class CpuConfig:
+    """Process-wide CPU settings.
 
-    ``checkpoint`` / ``revision`` / ``score_threshold`` / ``threads`` are
-    the ONLY model settings this design hardcodes anywhere — every other
-    tagger parameter (``max_len``, ``max_width``, window size, overlap,
-    the label vocabulary) is read off the loaded model or off
-    ``configs/schema.yaml`` at runtime, never typed twice.
+    * ``threads`` — the process-wide ``torch.set_num_threads`` value,
+      applied as the first statement of
+      :func:`~paramem.server.app._build_runtime_components`, before every
+      CPU-resident torch model the server loads (the speaker-embedding
+      model, CPU Kokoro TTS, and — when its own residency falls back to
+      CPU — the sentence encoder). Host-dependent: too many threads
+      oversubscribes the machine and gets dramatically SLOWER, not faster.
 
-    * ``checkpoint`` — Hugging Face model id of the detection model.
-    * ``revision`` — exact commit of that model, pinned so an upstream
-      change cannot silently alter what a deployment scrubs.
-    * ``score_threshold`` — minimum confidence for a tagged span to be
-      treated as in scope. Lower marks more (over-scrubbing costs cloud
-      utility); higher marks less (under-scrubbing sends real data).
-      Re-measure against a labelled sample after any checkpoint change.
-    * ``threads`` — CPU threads the detector may use. Host-dependent:
-      too many oversubscribes the machine and gets dramatically SLOWER,
-      not faster. Process-wide.
-
-    An absent ``span_tagger:`` block in ``server.yaml`` yields these
-    defaults unchanged — this class, not the YAML, is the default source.
+    An absent ``cpu:`` block in ``server.yaml`` yields this default
+    unchanged — this class, not the YAML, is the default source.
     """
 
-    checkpoint: str = "urchade/gliner_multi_pii-v1"
-    revision: str = "1fcf13e85f4eef5394e1fcd406cf2ca9ea82351d"
-    score_threshold: float = 0.4
     threads: int = 8
 
     def __post_init__(self) -> None:
-        if not self.checkpoint:
-            raise ValueError(f"span_tagger.checkpoint must be non-empty; got {self.checkpoint!r}")
-        if not self.revision:
-            raise ValueError(f"span_tagger.revision must be non-empty; got {self.revision!r}")
-        if not (0.0 < self.score_threshold <= 1.0):
-            raise ValueError(
-                f"span_tagger.score_threshold must be in (0, 1]; got {self.score_threshold!r}"
-            )
         if self.threads < 1:
-            raise ValueError(f"span_tagger.threads must be >= 1; got {self.threads!r}")
+            raise ValueError(f"cpu.threads must be >= 1; got {self.threads!r}")
 
 
 _ABSTENTION_RESPONSE_FALLBACK = "I don't have that information stored yet."
@@ -1959,7 +1936,7 @@ class ServerConfig:
     ha_agent_id: str = ""  # HA conversation agent for escalation; empty disables HA escalation
     tools: ToolsConfig = field(default_factory=ToolsConfig)
     sanitization: SanitizationConfig = field(default_factory=SanitizationConfig)
-    span_tagger: SpanTaggerConfig = field(default_factory=SpanTaggerConfig)
+    cpu: CpuConfig = field(default_factory=CpuConfig)
     abstention: AbstentionConfig = field(default_factory=AbstentionConfig)
     intent: IntentConfig = field(default_factory=IntentConfig)
     sentence_type: SentenceTypeConfig = field(default_factory=SentenceTypeConfig)
@@ -2459,9 +2436,9 @@ def build_server_config(raw: dict, *, source_path: str | Path) -> ServerConfig:
     if text_lang_raw:
         config.text_lang_detection = TextLangDetectionConfig(**text_lang_raw)
 
-    span_tagger_raw = raw.get("span_tagger", {})
-    if span_tagger_raw:
-        config.span_tagger = SpanTaggerConfig(**span_tagger_raw)
+    cpu_raw = raw.get("cpu", {})
+    if cpu_raw:
+        config.cpu = CpuConfig(**cpu_raw)
 
     mobile_pwa_raw = raw.get("mobile_pwa", {})
     if mobile_pwa_raw:

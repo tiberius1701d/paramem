@@ -53,6 +53,8 @@ from paramem.utils.tokens import (
     ANONYMIZE_ANCHOR_MAX_CANDIDATES,
     ANONYMIZE_ANCHOR_PROMPT_SKELETON_TOKENS,
     ANONYMIZE_ENVELOPE_TOKENS,
+    ANONYMIZE_SCAN_MAX_OUTPUT_TOKENS,
+    ANONYMIZE_SCAN_PROMPT_SKELETON_TOKENS,
     MEASURED_TOKENS_PER_WORD,
     anchor_output_reserve_tokens,
     anonymize_payload_cap_tokens,
@@ -88,11 +90,10 @@ class ScannedPdfRejectedError(ValueError):
 # ``ctx.transcript`` — the same chunk text — into
 # ``anonymize(transcript=...)``). ``_DOC_MAX_TOKENS`` is a HELD operating-
 # point literal, not a value computed at import time from the
-# anonymize-call token envelope: the anonymizer's SCAN step is a span
-# tagger with no envelope of its own, so nothing at import time can derive
-# this cap from a SCAN/APPLY call shape. Instead, the import-time tripwire
-# below validates the held value against the ANCHOR call — the one
-# envelope-bearing call the anonymize chain still issues.
+# anonymize-call token envelope. Instead, the import-time tripwire below
+# validates the held value against BOTH local calls the anonymize chain
+# may issue on a chunk-sized payload — SCAN (every call) and ANCHOR (when
+# a kept person value is a candidate).
 #
 # Two paragraphs of design rationale:
 #
@@ -120,20 +121,21 @@ class ScannedPdfRejectedError(ValueError):
 _R_PROSE: float = 1.9126
 _DOC_MAX_TOKENS: int = 7662
 
-# Slack tripwire, not a tight bound: the ANCHOR call (the one local
-# generate() left in the anonymizer) is cheap, so this assertion passes
-# with room to spare — it is not a re-derivation of the held value above.
-# It fires only if ANONYMIZE_ENVELOPE_TOKENS is lowered, _DOC_MAX_TOKENS is
-# raised, or the ANCHOR prompt is inflated far enough that a cap-sized
-# document chunk no longer fits the one remaining envelope-bearing call.
+# Slack tripwire, not a tight bound: this assertion passes with room to
+# spare — it is not a re-derivation of the held value above. It fires only
+# if ANONYMIZE_ENVELOPE_TOKENS is lowered, _DOC_MAX_TOKENS is raised, or
+# either local call's own skeleton/reserve is inflated far enough that a
+# cap-sized document chunk no longer fits both call shapes.
 assert _DOC_MAX_TOKENS <= anonymize_payload_cap_tokens(
     envelope_tokens=ANONYMIZE_ENVELOPE_TOKENS,
     anchor_skeleton_tokens=ANONYMIZE_ANCHOR_PROMPT_SKELETON_TOKENS,
     anchor_reserve_tokens=anchor_output_reserve_tokens(ANONYMIZE_ANCHOR_MAX_CANDIDATES),
+    scan_skeleton_tokens=ANONYMIZE_SCAN_PROMPT_SKELETON_TOKENS,
+    scan_reserve_tokens=ANONYMIZE_SCAN_MAX_OUTPUT_TOKENS,
     payload_tokens_per_word=_R_PROSE,
 ), (
-    "_DOC_MAX_TOKENS exceeds the anchor-shape cap — the envelope, the "
-    "held cap, or the ANCHOR prompt moved; re-measure jointly."
+    "_DOC_MAX_TOKENS exceeds the SCAN/ANCHOR-shape cap — the envelope, the "
+    "held cap, or a call's own skeleton/reserve moved; re-measure jointly."
 )
 
 # Context floor, not a budget (unlike _DOC_MAX_TOKENS above, this is not

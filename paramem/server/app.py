@@ -2819,6 +2819,62 @@ def _check_token_ratio_drift(config) -> None:
     }
 
 
+def _check_scan_skeleton_drift(config, tokenizer) -> None:
+    """Refuse a model load whose live prefix table renders a SCAN skeleton
+    over the pinned token budget.
+
+    The anonymizer's SCAN prompt renders its ``{keywords}`` slot from the
+    operator-editable ``configs/schema.yaml`` ``anonymizer.prefixes``
+    table (:func:`paramem.cloud.anonymize_steps.render_scan_section`), so
+    an edited table can grow the rendered skeleton past
+    :data:`~paramem.utils.tokens.ANONYMIZE_SCAN_PROMPT_SKELETON_TOKENS` —
+    the constant the anonymizer's token budget was measured and pinned
+    against. This re-renders the SCAN section with an empty payload over
+    the live table, wraps it with the ``SCAN-SYSTEM`` section through
+    :func:`~paramem.models.loader.render_chat_prompt` — the same two-message
+    render :func:`paramem.cloud.anonymize_steps._generate` issues for the
+    real call — and counts the rendered text with *tokenizer* through
+    :func:`~paramem.utils.tokens.estimate_tokens`, the same measurement
+    the constant itself was pinned with, mirroring
+    :func:`paramem.utils.tokens.check_ratio_drift`'s re-measure-at-load
+    shape.
+
+    Called from :func:`_load_model_into_state`, the one site every model
+    load — boot and live reload alike — passes through, so a table edit is
+    caught before the anonymizer ever runs against it.
+
+    Args:
+        config: The just-loaded :class:`~paramem.server.config.ServerConfig`.
+        tokenizer: The tokenizer paired with the just-loaded base model.
+
+    Raises:
+        RuntimeError: When the live-table render exceeds
+            :data:`~paramem.utils.tokens.ANONYMIZE_SCAN_PROMPT_SKELETON_TOKENS`
+            — names the constant and the measured size.
+    """
+    from paramem.cloud.anonymize_steps import render_scan_section
+    from paramem.graph.anonymizer_prompts import load_anonymizer_prompts
+    from paramem.models.loader import render_chat_prompt
+    from paramem.utils.tokens import ANONYMIZE_SCAN_PROMPT_SKELETON_TOKENS, estimate_tokens
+
+    prompts = load_anonymizer_prompts(prompts_dir=config.prompts_dir)
+    messages = [
+        {"role": "system", "content": prompts.scan_system},
+        {"role": "user", "content": render_scan_section(prompts.scan, "")},
+    ]
+    rendered = render_chat_prompt(messages, tokenizer, add_generation_prompt=True)
+    measured = estimate_tokens(rendered, tokenizer)
+    if measured > ANONYMIZE_SCAN_PROMPT_SKELETON_TOKENS:
+        raise RuntimeError(
+            "SCAN prompt skeleton drift: the live configs/schema.yaml "
+            f"anonymizer.prefixes table renders to {measured} tokens, exceeding "
+            f"the pinned ANONYMIZE_SCAN_PROMPT_SKELETON_TOKENS "
+            f"({ANONYMIZE_SCAN_PROMPT_SKELETON_TOKENS}). Re-measure the constant "
+            "against the edited table (paramem/utils/tokens.py), or revert the "
+            "table edit."
+        )
+
+
 # GPU-lock timeout for lifespan shutdown's base-model release: long enough for
 # a background-trainer worker mid-fold to reach its next epoch boundary and
 # release (the shutdown flag set earlier in this same teardown only stops
@@ -4655,7 +4711,6 @@ async def _run_chat_turn(
                     # Genuinely None in server-wide cloud-only mode.
                     model=_state.get("model"),
                     tokenizer=_state.get("tokenizer"),
-                    ha_graph=_state.get("ha_graph"),
                 ),
             )
         buffer.append(
@@ -7324,83 +7379,6 @@ def _report_intent_classifier_health(config, encoder_handle, exemplar_bank) -> N
     )
 
 
-def _load_span_tagger(config) -> None:
-    """Load the span tagger when this configuration has an external-egress
-    path that needs scrubbing.
-
-    The ONLY site that maps ``ServerConfig`` onto
-    :func:`~paramem.cloud.admission.scrubbing_reachable`'s terms:
-    ``scrub_enabled=bool(config.sanitization.scrub_categories)``, the same
-    cloud-egress terms (``cloud_enabled``, ``provider``, ``model``,
-    ``endpoint``) that ``_session_egress_permitted``
-    (``paramem/graph/flows.py``) already gates session-tier cloud
-    enrichment on, the chat-egress ``cloud_mode`` term, and the HA term
-    (``config.ha_agent_id``, ``config.tools.ha.configured``). When the
-    configuration has no external-egress path needing scrubbing, this logs
-    at INFO and returns — no model download is attempted, and the tagger
-    stays unloaded (every ``anonymize()`` call then fails closed via its
-    ``"tagger"`` contract member). When it can, delegates to
-    :func:`~paramem.cloud.span_tagger.load_at_startup`, which is
-    idempotent on an unchanged ``(checkpoint, revision)`` pair and raises
-    ``RuntimeError`` naming the checkpoint and revision on a resolution
-    failure — deliberately left to propagate to this function's caller.
-
-    This is the clear site for the ``span_tagger_unavailable`` incident
-    (recorded by :func:`~paramem.server.egress._refuse_failed_contract` when
-    a cloud or HA egress turn hits a ``"tagger"`` failure): a successful
-    ``load_at_startup`` here resolves every open incident of that type, the
-    same record-and-resolve-in-one-function shape as
-    :func:`_report_intent_classifier_health`. The unreachable branch above
-    resolves it too, with a ``reason`` — a standing incident recorded while
-    the tagger was needed must not survive an operator reconfiguring away
-    from it (e.g. to ``cloud_mode: block`` with no HA agent configured),
-    since this function is the incident's only clear site and that path
-    never reaches ``load_at_startup``.
-
-    Parameters
-    ----------
-    config:
-        The live ``ServerConfig``.
-    """
-    from paramem.cloud import span_tagger
-    from paramem.cloud.admission import scrubbing_reachable
-
-    reachable = scrubbing_reachable(
-        scrub_enabled=bool(config.sanitization.scrub_categories),
-        cloud_enabled=config.cloud.enabled,
-        cloud_mode=config.sanitization.cloud_mode,
-        provider=config.consolidation.extraction_enrichment_provider,
-        model=config.consolidation.extraction_enrichment_provider_model,
-        endpoint=config.consolidation.extraction_enrichment_provider_endpoint,
-        ha_agent_id=config.ha_agent_id,
-        ha_tools_configured=config.tools.ha.configured,
-    )
-    if not reachable:
-        logger.info(
-            "span_tagger: not loaded — this configuration has no external-egress "
-            "path needing the span tagger"
-        )
-        # This configuration has no external-egress path that needs
-        # scrubbing, so an existing span_tagger_unavailable incident
-        # (raised by an earlier boot, or a still-active previous config)
-        # does not apply — resolve it here too, or an operator who moves
-        # to cloud_mode: block with no HA agent configured after a tagger
-        # failure is stuck with a standing incident the tagger can never
-        # clear (this function is its only clear site, and this branch
-        # never reaches the load_at_startup call below).
-        resolve_incidents_by_type(
-            data_state_dir(config.paths.data),
-            "span_tagger_unavailable",
-            reason=(
-                "configuration has no external-egress path needing the span tagger "
-                "(scrubbing unreachable)"
-            ),
-        )
-        return
-    span_tagger.load_at_startup(config.span_tagger)
-    resolve_incidents_by_type(data_state_dir(config.paths.data), "span_tagger_unavailable")
-
-
 def _build_runtime_components(
     config,
     *,
@@ -7428,6 +7406,12 @@ def _build_runtime_components(
     The apply path must not call ``start_wyoming_server`` /
     ``start_wyoming_tts_server`` again.
 
+    The process-wide CPU thread count (``config.cpu.threads``) is applied
+    as this function's first statement, unconditionally (every call, not
+    gated on ``full_rebuild``) — before every CPU-resident torch model any
+    of the steps below may load (speaker embedding, CPU Kokoro TTS, and,
+    on its own residency fallback, the sentence encoder).
+
     Construction ordering:
 
     1. session_buffer (snapshot old → construct → rehydrate → load_snapshot)
@@ -7444,7 +7428,7 @@ def _build_runtime_components(
     8. exemplar banks + ``set_classifier_model``
        — ``full_rebuild=True`` only for exemplar banks; ``set_classifier_model``
        runs on both paths so the freshly loaded model is registered.
-    9. language_tracker + lang_id + span_tagger  — ``full_rebuild=True`` only.
+    9. language_tracker + lang_id  — ``full_rebuild=True`` only.
 
     Parameters
     ----------
@@ -7473,6 +7457,8 @@ def _build_runtime_components(
         ``load_entity_map()`` / ``get_services()`` network calls on every
         plain warm reclaim (config did not change — skip network reconnect).
     """
+    torch.set_num_threads(config.cpu.threads)
+
     # ── 1. session_buffer ────────────────────────────────────────────────────
     # Only on full_rebuild paths (boot + apply); plain reclaim keeps the live
     # buffer to avoid losing in-flight state.
@@ -7776,7 +7762,7 @@ def _build_runtime_components(
 
             load_personal_referent_exemplars(config.personal_referent)
 
-    # ── 9. language_tracker + lang_id + span_tagger ──────────────────────────
+    # ── 9. language_tracker + lang_id ─────────────────────────────────────────
     # Only on full_rebuild: plain reclaim keeps the existing tracker (same config).
     if full_rebuild:
         from paramem.server.language_tracker import LanguageTracker
@@ -7790,16 +7776,6 @@ def _build_runtime_components(
             from paramem.server import lang_id
 
             lang_id.load_at_startup(config.text_lang_detection.model_path)
-
-        # Span tagger fails CLOSED at load (a failure propagates out of
-        # this function and is handled by each caller — see
-        # ``_load_span_tagger``'s docstring), where lang_id above fails
-        # open. It holds a CPU-resident model only, never
-        # ``_state["model"]``: not a base-model holder (no
-        # ``# BASE-MODEL HOLDER`` tag), invisible to
-        # ``_release_base_model_in_process``, and left resident by both
-        # ``POST /gpu/release`` and ``POST /gpu/acquire``.
-        _load_span_tagger(config)
 
 
 def _remount_adapters_from_disk(config) -> None:
@@ -7893,6 +7869,9 @@ def _load_model_into_state(config) -> None:
     Refuses (``ConfigStoreMismatch``) on a config that contradicts the
     tier store already on disk — see
     :func:`~paramem.server.config_store_validator.check_config_against_store`.
+    Refuses (``RuntimeError``) when the live anonymizer prefix table
+    renders a SCAN prompt skeleton over the pinned token budget — see
+    :func:`_check_scan_skeleton_drift`.
     """
     apply_process_cap(fraction=config.vram.process_cap_fraction)
     logger.info("Loading model: %s (%s)", config.model_name, config.model_config.model_id)
@@ -7911,6 +7890,11 @@ def _load_model_into_state(config) -> None:
     # Store the measured delta in the per-component VRAM ledger (bytes).
     # vram_measure stores an INT — no BASE-MODEL HOLDER created here.
     _state["vram_components"]["base"] = _base_vm["delta"]
+
+    # Live prefix table can grow the SCAN skeleton past its pinned token
+    # budget; catch it here, before the model is committed into _state, on
+    # every load (boot and live reload alike).
+    _check_scan_skeleton_drift(config, tokenizer)
 
     # Manifest caches are model-specific; re-init on every load.
     _state["adapter_manifest_status"] = {}
@@ -10212,7 +10196,7 @@ async def debug_probe(request: DebugProbeRequest):
     # verdict is a module singleton that survives /gpu/release and runs
     # on CUDA in this deployment, so a deferral's local work here is not
     # CPU-only, and the lock is cheap with nothing behind it when there
-    # is no local model.  The relay leg's tagger pass, encoder calls and
+    # is no local model.  The relay leg's SCAN call, encoder calls and
     # provider call are synchronous work, same as the local branch below,
     # so this dispatch takes the same run_in_executor hop rather than
     # running on the event loop.
@@ -10244,7 +10228,6 @@ async def debug_probe(request: DebugProbeRequest):
                     speaker_id=request.speaker_id,
                     model=_state.get("model"),
                     tokenizer=_state.get("tokenizer"),
-                    ha_graph=_state.get("ha_graph"),
                     forced_leg=forced_leg,
                 ),
             )
@@ -10290,7 +10273,6 @@ async def debug_probe(request: DebugProbeRequest):
                 language=detected_language,
                 effective_mode=_state.get("effective_mode"),
                 memory_store=_state["memory_store"],
-                ha_graph=_state.get("ha_graph"),
                 forced_leg=forced_leg,
             ),
         )
@@ -16502,7 +16484,6 @@ def _relay_route(
     identity_absent: bool = False,
     model=None,
     tokenizer=None,
-    ha_graph: HAEntityGraph | None = None,
     forced_leg: str | None = None,
 ) -> ChatResult:
     """Route queries served by the relay path: HA / cloud / local base model, no PA memory.
@@ -16604,9 +16585,6 @@ def _relay_route(
             branch + base-model fallback), or ``None`` in server-wide
             cloud-only mode (no local model exists).
         tokenizer: Paired with *model*; ``None`` under the same condition.
-        ha_graph: The live HA entity graph (``_state["ha_graph"]``), or
-            ``None`` when HA is not configured or its build failed at
-            boot — retains nothing in that case.
         forced_leg: The probe door's resolved route (``None`` on every
             production ``/chat``/``/voice`` turn), or ``"ha"``/``"cloud"``
             to select exactly one leg.  Forcing never bypasses that leg's
@@ -16644,7 +16622,7 @@ def _relay_route(
 
     # Try the HA door first — it has tools and real-time data.
     if _leg_open(forced_leg, "ha"):
-        result = answer_via_ha(outbound, ha_client, ha_graph=ha_graph)
+        result = answer_via_ha(outbound, ha_client)
         if result is not None:
             logger.info("Relay route: HA door responded")
             result.diagnostics.update(turn_diags)

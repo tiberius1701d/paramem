@@ -713,7 +713,7 @@ class TestDegradedServingGate:
     network, so it stays open in every degraded state. The HA door itself
     (its scrub, its own refusal causes) is exercised by dedicated egress
     tests; here it is stubbed to isolate ``_relay_route``'s HA-then-cloud
-    dispatch from the door's own tagger dependency.
+    dispatch.
     """
 
     def _run(self, *, cloud_permitted, ha_answers):
@@ -723,7 +723,7 @@ class TestDegradedServingGate:
         ha_client = MagicMock()
         ha_client.conversation_process.return_value = "HA answer" if ha_answers else None
 
-        def fake_ha_door(outbound, client, *, ha_graph=None):
+        def fake_ha_door(outbound, client):
             if client is None:
                 return None
             reply = client.conversation_process(outbound.text, agent_id=outbound.config.ha_agent_id)
@@ -786,7 +786,7 @@ class TestCloudPermittedStillThreadedToTheFunnelOnDecline:
         config = MagicMock()
         config.ha_agent_id = "conversation.test_agent"
 
-        def fake_ha_door(outbound, client, *, ha_graph=None):
+        def fake_ha_door(outbound, client):
             if client is None:
                 return None
             reply = client.conversation_process(outbound.text, agent_id=outbound.config.ha_agent_id)

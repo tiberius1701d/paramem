@@ -183,64 +183,73 @@ def anonymizer_type_to_prefix(path: str | None = None) -> dict[str, str]:
 
 @dataclass(frozen=True)
 class ScrubCategory:
-    """One local-anonymizer SCAN category: a placeholder prefix, the
-    ``sanitization.scrub`` hints it groups, and the span tagger's own
-    label vocabulary for it.
+    """One ``configs/schema.yaml`` ``anonymizer.prefixes`` row the
+    operator's ``sanitization.scrub`` activates.
 
     Attributes:
-        name: The category's display name — the owning
-            ``configs/schema.yaml`` ``anonymizer.prefixes`` row's
-            ``prefix``.
-        prefix: The placeholder-minting prefix for this category — the
-            owning row's ``prefix``.
-        hints: This category's configured ``scrub`` hints, in ``scrub``
-            order. Never empty — :func:`resolve_scrub_categories` only
-            emits a category for a row with at least one configured hint.
-        tagger_labels: The owning row's ``tagger_labels`` — the strings
-            handed to the span tagger for this category. Never empty —
-            :func:`resolve_scrub_categories` refuses a row that is
-            activated (at least one hint configured) but declares none.
+        prefix: The row's placeholder-minting prefix — also the keyword
+            the SCAN call must name, folded through
+            :func:`~paramem.utils.identity.canonical`, for a value to be
+            kept under this row (see
+            :func:`~paramem.cloud.anonymize_steps.scan_values`).
     """
 
-    name: str
     prefix: str
-    hints: tuple[str, ...]
-    tagger_labels: tuple[str, ...]
+
+
+def prefix_descriptions(path: str | None = None) -> tuple[tuple[str, str], ...]:
+    """Return every ``anonymizer.prefixes`` row as ``(prefix, description)``
+    pairs, in table order — configured or not.
+
+    THE one accessor the SCAN prompt's ``{keywords}`` slot renders from
+    (:func:`~paramem.cloud.anonymize_steps.scan_values`) — no second
+    reader of the table exists. Every row is included regardless of
+    whether the operator's ``sanitization.scrub`` activates it, so the
+    model is shown the full keyword vocabulary and never learns which
+    kinds are actually scrubbed.
+
+    Args:
+        path: Optional override path for the schema YAML.
+    """
+    cfg = load_schema_config(path)
+    return tuple((row["prefix"], row["description"]) for row in cfg["anonymizer"]["prefixes"])
 
 
 def resolve_scrub_categories(
     scrub: Sequence[str], path: str | None = None
 ) -> tuple[ScrubCategory, ...]:
-    """Group configured ``sanitization.scrub`` hints into SCAN categories.
+    """Resolve configured ``sanitization.scrub`` hints into active rows.
 
-    A category is a ``configs/schema.yaml`` ``anonymizer.prefixes`` row
-    that claims at least one hint present in *scrub* — all of that row's
-    claimed hints, in *scrub* order, become one category named after the
-    row's prefix, carrying that row's ``tagger_labels`` verbatim. Category
-    order is schema row order.
+    A row is active when it claims at least one hint present in *scrub* —
+    :attr:`ScrubCategory.prefix` names it. Order is schema row order.
 
-    Six conditions are refused at this door rather than resolved
+    Seven conditions are refused at this door rather than resolved
     arbitrarily or silently under-scrubbing:
 
     1. A ``scrub_categories`` hint claimed by two distinct prefix rows —
        an ambiguous owner for one hint has no correct answer.
-    2. A ``tagger_labels`` label claimed by two distinct prefix rows — a
-       tagged span would have two owning categories, and the partition
-       the span tagger's caller performs by label would be arbitrary.
-    3. A hint present in *scrub* that no row claims — it can carry no
-       tagger label, so it would silently scrub nothing.
-    4. A row activated by *scrub* (at least one of its ``scrub_categories``
-       hints configured) that declares no ``tagger_labels`` — it would
-       contribute no label, yield zero tagged spans, and report success.
-    5. More than one prefix row setting ``primary_for_type: true`` for the
+    2. A hint present in *scrub* that no row claims — it can activate
+       nothing, so it would silently scrub nothing.
+    3. More than one prefix row setting ``primary_for_type: true`` for the
        same ``entity_type`` — the placeholder-prefix map assumes exactly
        one primary row per entity type.
-    6. Two prefix rows whose ``prefix`` values are equal under
-       ``casefold()`` — the placeholder tokens each row mints
-       (``paramem.cloud.placeholders.mint_placeholder``) would then
-       collide under the reply-side rendering equivalence
-       (``paramem.cloud.placeholders._rendering_fold``), so the declared
-       placeholder vocabulary would not be distinct.
+    4. Two prefix rows whose ``prefix`` values collide under
+       ``casefold()`` (the mint's rendering equivalence,
+       ``paramem.cloud.placeholders._rendering_fold``) — the declared
+       placeholder vocabulary would not be distinct. Condition 6's shape
+       rule (one word of ASCII letters) makes ``canonical()`` (the keyword
+       resolution the SCAN reply is matched against) fold a legal prefix
+       identically to ``casefold()`` — no diacritic, blank, or underscore
+       for it to collapse — so this one check already covers a
+       ``canonical()`` collision between two prefixes too; there is no
+       separate arm for it.
+    5. A hint whose ``canonical()`` form equals another row's folded
+       ``prefix`` — the SCAN reply's keyword-matching step could not tell
+       the hint from a real keyword.
+    6. A ``prefix`` that is not one word of letters starting with a
+       capital — the placeholder shape (``Prefix_N``) and the exact
+       folded keyword match both depend on this shape.
+    7. An ``entity_type`` not declared under ``entity_types``.
 
     Args:
         scrub: The configured PII-vocabulary hints
@@ -250,62 +259,88 @@ def resolve_scrub_categories(
         path: Optional override path for the schema YAML.
 
     Returns:
-        Categories in schema row order. Never contains a category with
-        empty ``hints`` or empty ``tagger_labels``.
+        Active rows in schema row order.
 
     Raises:
-        ValueError: On any of the six conditions above.
+        ValueError: On any of the seven conditions above.
     """
     cfg = load_schema_config(path)
     prefixes = cfg["anonymizer"]["prefixes"]
+    declared_entity_types = set(cfg["entity_types"].keys())
 
     hint_owner: dict[str, str] = {}
-    label_owner: dict[str, str] = {}
     primary_owner: dict[str, str] = {}
-    prefix_owner: dict[str, int] = {}
+    prefix_owner_casefold: dict[str, int] = {}
+    prefix_owner_canonical: set[str] = set()
     for idx, row in enumerate(prefixes):
-        folded_prefix = str(row["prefix"]).casefold()
-        owner_idx = prefix_owner.get(folded_prefix)
+        prefix = str(row["prefix"])
+        if not (prefix.isascii() and prefix.isalpha() and prefix[:1].isupper()):
+            raise ValueError(
+                f"Prefix {prefix!r} in schema.yaml's anonymizer.prefixes is not one "
+                "word of letters starting with a capital — the placeholder shape "
+                "(Prefix_N) and the SCAN keyword match both depend on this shape."
+            )
+        entity_type = row["entity_type"]
+        if entity_type not in declared_entity_types:
+            raise ValueError(
+                f"Prefix row {prefix!r} in schema.yaml's anonymizer.prefixes "
+                f"declares entity_type {entity_type!r}, which is not one of "
+                f"the declared entity_types: {sorted(declared_entity_types)}."
+            )
+        folded_casefold = prefix.casefold()
+        owner_idx = prefix_owner_casefold.get(folded_casefold)
         if owner_idx is not None and owner_idx != idx:
             raise ValueError(
-                f"Prefix {row['prefix']!r} collides under case-folding with "
-                f"prefix {prefixes[owner_idx]['prefix']!r} in schema.yaml's "
+                f"Prefix {prefix!r} collides under case-folding with prefix "
+                f"{prefixes[owner_idx]['prefix']!r} in schema.yaml's "
                 "anonymizer.prefixes — the declared placeholder vocabulary "
                 "must be distinct under case-folding."
             )
-        prefix_owner[folded_prefix] = idx
+        prefix_owner_casefold[folded_casefold] = idx
+        # No separate canonical()-collision check here: the shape rule
+        # (enforced above) makes canonical() fold a legal prefix
+        # identically to casefold(), so a canonical() collision between
+        # two prefixes would already have raised as a casefold() collision
+        # above (see condition 4's docstring). This set exists only to
+        # build all_canon_prefixes for the hint-vs-prefix check below.
+        prefix_owner_canonical.add(canonical(prefix))
         for hint in row.get("scrub_categories") or []:
             owner = hint_owner.get(hint)
-            if owner is not None and owner != row["prefix"]:
+            if owner is not None and owner != prefix:
                 raise ValueError(
                     f"Scrub hint {hint!r} is claimed by both prefix row "
-                    f"{owner!r} and {row['prefix']!r} in schema.yaml's "
+                    f"{owner!r} and {prefix!r} in schema.yaml's "
                     "anonymizer.prefixes — a hint may be claimed by at most "
                     "one prefix row."
                 )
-            hint_owner[hint] = row["prefix"]
-        for label in row.get("tagger_labels") or []:
-            owner = label_owner.get(label)
-            if owner is not None and owner != row["prefix"]:
-                raise ValueError(
-                    f"Tagger label {label!r} is claimed by both prefix row "
-                    f"{owner!r} and {row['prefix']!r} in schema.yaml's "
-                    "anonymizer.prefixes — a tagger label may be claimed by "
-                    "at most one prefix row."
-                )
-            label_owner[label] = row["prefix"]
+            hint_owner[hint] = prefix
         if row.get("primary_for_type", False):
-            entity_type = row["entity_type"]
             owner = primary_owner.get(entity_type)
-            if owner is not None and owner != row["prefix"]:
+            if owner is not None and owner != prefix:
                 raise ValueError(
                     f"entity_type {entity_type!r} has more than one "
                     f"primary_for_type row in schema.yaml's "
-                    f"anonymizer.prefixes: {owner!r} and {row['prefix']!r} — "
+                    f"anonymizer.prefixes: {owner!r} and {prefix!r} — "
                     "only one prefix row per entity_type may set "
                     "primary_for_type: true."
                 )
-            primary_owner[entity_type] = row["prefix"]
+            primary_owner[entity_type] = prefix
+
+    # A hint whose canonical() form equals another row's folded prefix
+    # would make the SCAN keyword match unable to tell the hint from a
+    # real keyword — checked once the full prefix index is built, so a
+    # hint equal to its OWN row's prefix (never ambiguous) is not flagged.
+    all_canon_prefixes = prefix_owner_canonical
+    for row in prefixes:
+        prefix = str(row["prefix"])
+        for hint in row.get("scrub_categories") or []:
+            if canonical(hint) in all_canon_prefixes and canonical(hint) != canonical(prefix):
+                raise ValueError(
+                    f"Scrub hint {hint!r} on prefix row {prefix!r} in "
+                    "schema.yaml's anonymizer.prefixes has the same canonical() "
+                    "form as another row's prefix — the SCAN keyword match "
+                    "could not tell the hint from a real keyword."
+                )
 
     configured = list(scrub)
     categories: list[ScrubCategory] = []
@@ -317,22 +352,7 @@ def resolve_scrub_categories(
         row_hints = tuple(hint for hint in configured if hint in row_claims)
         if not row_hints:
             continue
-        tagger_labels = tuple(row.get("tagger_labels") or [])
-        if not tagger_labels:
-            raise ValueError(
-                f"Prefix row {row['prefix']!r} is activated by configured "
-                f"scrub hint(s) {row_hints!r} but declares no tagger_labels "
-                "in schema.yaml's anonymizer.prefixes — it would contribute "
-                "no label to the span tagger and silently scrub nothing."
-            )
-        categories.append(
-            ScrubCategory(
-                name=row["prefix"],
-                prefix=row["prefix"],
-                hints=row_hints,
-                tagger_labels=tagger_labels,
-            )
-        )
+        categories.append(ScrubCategory(prefix=row["prefix"]))
         covered.update(row_hints)
 
     uncovered = [hint for hint in configured if hint not in covered]
@@ -340,8 +360,7 @@ def resolve_scrub_categories(
         raise ValueError(
             f"Configured scrub hint(s) {uncovered!r} are not claimed by any "
             "prefix row in schema.yaml's anonymizer.prefixes — an uncovered "
-            "hint can carry no tagger label and would silently scrub "
-            "nothing."
+            "hint would silently scrub nothing."
         )
     return tuple(categories)
 
@@ -363,30 +382,25 @@ def resolve_scrub_categories(
 def entity_type_to_prefix(entity_type: str) -> str:
     """Convert an entity-type label to its PascalCase placeholder prefix.
 
-    Closed vocabulary first: :func:`anonymizer_type_to_prefix`
+    Closed vocabulary only: :func:`anonymizer_type_to_prefix`
     (schema.yaml's ``primary_for_type`` entries — ``person`` -> ``Person``,
     ``place`` -> ``City``, ``organization`` -> ``Org``, ``concept`` ->
-    ``Thing``). Any other label is PascalCase-joined on whitespace /
-    hyphen / underscore — ``"work_of_art"`` -> ``"WorkOfArt"``,
-    ``"language"`` -> ``"Language"``. Empty / whitespace-only input, or a
-    type that PascalCase-joins to nothing, falls back to ``"Entity"``.
+    ``Thing``). THE only place an entity type becomes a placeholder
+    prefix; the one production caller passes ``"person"``, which the
+    shipped schema always declares a primary row for.
 
-    THE only place an entity type becomes a placeholder prefix.
+    Raises:
+        ValueError: *entity_type* is empty, or no ``primary_for_type`` row
+            declares it.
     """
-    if not entity_type:
-        return "Entity"
     e = canonical(entity_type)
-    if not e:
-        return "Entity"
-    closed = anonymizer_type_to_prefix().get(e)
-    if closed is not None:
-        return closed
-    # ``canonical`` has already folded ``_`` and whitespace runs to single
-    # spaces, so only ``-`` (which it preserves verbatim) still separates
-    # words here.  Splitting on ``[\s_\-]+`` again would re-apply a fold that
-    # has already run.
-    pascal = "".join(p.capitalize() for p in e.replace("-", " ").split())
-    return pascal or "Entity"
+    closed = anonymizer_type_to_prefix().get(e) if e else None
+    if closed is None:
+        raise ValueError(
+            f"entity_type_to_prefix: no primary_for_type row in schema.yaml's "
+            f"anonymizer.prefixes declares entity_type {entity_type!r}."
+        )
+    return closed
 
 
 def prefix_to_entity_type(prefix: str) -> str:

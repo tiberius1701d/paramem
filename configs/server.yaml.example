@@ -517,7 +517,12 @@ cloud:
   # returns the canned limited-mode reply rather than routing the household's
   # questions to a third party you did not choose for them. Deliberate
   # cloud-only (`cloud_only: true`, POST /gpu/release) and transient internal
-  # states (training, live reload) are NOT gated by this and always proceed.
+  # states (training, live reload) are NOT gated by this flag; under
+  # `sanitization.cloud_mode: block` they always proceed. Under `anonymize`
+  # or `both` the cloud leg's anonymizer needs the local model resident, so
+  # a cloud-only server — deliberate or degraded alike — answers through HA
+  # or the canned limited-mode reply on that leg instead, whatever this
+  # flag says; `block` is unaffected either way.
   allow_degraded_serving: false
 
 # --- Agents ---
@@ -593,26 +598,35 @@ tools:
 #   `cloud_mode`  — egress policy for direct cloud escalation
 #                     block      : PERSONAL queries dropped before cloud;
 #                                  non-PERSONAL sent verbatim. Default,
-#                                  zero anonymizer cost, smallest cloud surface.
+#                                  zero anonymizer cost, smallest cloud
+#                                  surface. The local model does not need
+#                                  to be resident for this mode.
 #                     anonymize  : cloud-bound text is anonymized before it
 #                                  leaves (categories chosen by `scrub`), sent
 #                                  to cloud as placeholders, and de-anonymized
 #                                  on the way back. PERSONAL queries reach
-#                                  cloud as redacted text.
+#                                  cloud as redacted text. Needs the local
+#                                  model resident to run the anonymizer — on
+#                                  a cloud-only server (deliberate or
+#                                  degraded) the cloud leg is unavailable
+#                                  and the turn answers through HA or the
+#                                  canned limited-mode reply instead.
 #                     both       : strictest privacy posture — PERSONAL is
 #                                  blocked AND non-PERSONAL is anonymized
-#                                  per `scrub`.
+#                                  per `scrub`. Needs the local model
+#                                  resident, as `anonymize` above.
 #
 #   `scrub` — a flat list of PII-vocabulary HINTS (free text, e.g. "person
 #             name", "phone number") naming what counts as in scope when
 #             `cloud_mode` is `anonymize` or `both`.  `scrub` decides WHAT
 #             gets marked; it has no bearing on how much work marking
-#             costs — a small, dedicated, CPU-only detection model (see
-#             `span_tagger` below) reads the outbound payload once and
-#             marks every value belonging to a configured hint, and the
-#             pipeline, never a model, mints and substitutes every
-#             placeholder.  Each hint must be one a `configs/schema.yaml`
-#             category actually claims — a hint nothing claims is refused
+#             costs — the resident conversational model reads the outbound
+#             payload once and names every value it finds with a keyword
+#             from `configs/schema.yaml`, and the pipeline, never the
+#             model, decides which keyword's values are kept and mints and
+#             substitutes every placeholder.  Each hint must be one a
+#             `configs/schema.yaml` category actually claims — a hint
+#             nothing claims is refused
 #             at config load rather than silently scrubbing nothing.
 #             Default is a load-bearing set of name / phone / address /
 #             online-identity sub-terms (person name, full name, given
@@ -623,26 +637,25 @@ tools:
 #             the cloud can still answer questions like "What's a good
 #             restaurant in Berlin?" sensibly.  Empty list `[]` disables
 #             anonymization entirely under anonymizing modes (cloud sees
-#             the original text) — this is the operator opt-out, and,
-#             together with `span_tagger` below, is what keeps a
-#             deployment that opts out bootable without the detection
-#             model.  Operator owns the privacy/utility tradeoff.  Novel
-#             categories beyond the default core above (e.g. "date of
-#             birth", "passport number") are legal and honoured as-is,
-#             provided a schema row claims them.
+#             the original text) — this is the operator opt-out.  Operator
+#             owns the privacy/utility tradeoff.  Novel categories beyond
+#             the default core above (e.g. "date of birth", "passport
+#             number") are legal and honoured as-is, provided a schema row
+#             claims them.
 #
-# The conversational model is asked exactly one question over this
-# payload — not classification, not rewriting — which of the marked names,
-# if any, the speaker introduced as their own; substitution into the
-# outbound text is mechanical table lookup, so there is nothing left to
-# verify or re-ask. Residual, stated plainly: a value the detection model
-# fails to mark in the first place egresses verbatim with no downstream
-# repair — that step is the detector's judgment, not mechanics, and
-# nothing re-checks it. See SECURITY.md for the full accounting.
+# The conversational model is asked a second question over the same
+# payload — not classification, not rewriting — which of the named person
+# values, if any, the speaker introduced as their own; substitution into
+# the outbound text is mechanical table lookup, so there is nothing left
+# to verify or re-ask. Residual, stated plainly: a value the model fails
+# to name in the first place egresses verbatim with no downstream repair
+# — that step is the model's judgment, not mechanics, and nothing
+# re-checks it. See SECURITY.md for the full accounting.
 #
-# HA path (HA conversation agent) is NOT affected by `cloud_mode`/`scrub`.
-# HA receives cleartext, gated by intent classification. Hardening the HA hop
-# is a planned follow-up package.
+# HA path (HA conversation agent) is NOT affected by `cloud_mode`/`scrub` at
+# all: the HA leg carries every turn verbatim, unconditionally, on every
+# routing path that reaches it. See `ha_agent_id` above for what that means
+# for the provider you point it at.
 #
 # Cloud reachability is independent: with `cloud.enabled: false` (or no API key
 # env var), no queries reach cloud regardless of `cloud_mode`.
@@ -663,37 +676,13 @@ sanitization:
     - social media handle
 
 # ============================================================================
-# SPAN TAGGER (cloud-egress anonymizer)
+# CPU
 # ============================================================================
-# The local anonymizer identifies the values named by `sanitization.scrub`
-# with a small CPU-only detection model, loaded once at startup from the
-# Hugging Face cache exactly like the conversational model.  It runs on the
-# CPU and never competes for the GPU.  It is loaded only when this
-# deployment can actually reach a cloud with scrubbing on — a non-empty
-# `sanitization.scrub` together with either a usable cloud enrichment
-# provider or `cloud.enabled` plus `cloud_mode: anonymize|both`.  In that
-# case the server refuses to start when the model cannot be resolved;
-# otherwise it starts without it.  With the model absent, no anonymized
-# payload is ever produced — outbound calls that would need one are
-# declined rather than sent unmasked.  The first start on a machine that
-# has never loaded it downloads it (about 1.2 GB, plus its encoder's
-# tokenizer); afterwards it is served from the cache.
-#
-# checkpoint:      Hugging Face model id of the detection model.
-# revision:        exact commit of that model — pinned so an upstream
-#                  change cannot alter what this deployment scrubs.
-# score_threshold: minimum confidence for a value to be treated as in
-#                  scope.  Lower marks more (over-scrubbing costs cloud
-#                  utility); higher marks less (under-scrubbing sends real
-#                  data).  Re-measure against a labelled sample after any
-#                  checkpoint change.
-# threads:         CPU threads the detector may use.  Host-dependent: too
-#                  many oversubscribes the machine and gets dramatically
-#                  SLOWER, not faster.  This setting is process-wide.
-span_tagger:
-  checkpoint: urchade/gliner_multi_pii-v1
-  revision: 1fcf13e85f4eef5394e1fcd406cf2ca9ea82351d
-  score_threshold: 0.4
+# threads: the process-wide CPU thread count for torch, applied before the
+#          speaker-embedding, text-to-speech and sentence-encoder loads at
+#          startup.  Host-dependent: too many threads oversubscribes the
+#          machine and gets dramatically SLOWER, not faster.
+cpu:
   threads: 8
 
 # ============================================================================

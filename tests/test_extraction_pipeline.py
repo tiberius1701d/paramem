@@ -88,21 +88,17 @@ def _anonymize_contract(mapping, anon_transcript: str, raw: str, *, facts=None):
     ``anonymize()`` call would return for a given ``(mapping,
     anon_transcript, raw)`` triple — the pre-split combined-call shape
     most tests in this file were written against, and still the most
-    convenient shape for a test to hand-author. ``mapping is None`` (the
-    old parse-failure signal) maps to ``status="failed", failure="tagger"``
-    — the nearest surviving failure member for a detector-side failure,
-    now that there is no JSON envelope to fail parsing; otherwise
-    ``status="ok"`` with the given forward table and rewrite.
+    convenient shape for a test to hand-author. ``status="ok"`` with the
+    given forward table and rewrite; every caller in this file supplies a
+    real ``mapping``, so there is no failure-shaped branch here.
 
     ``facts`` defaults to ``[]`` when not supplied — callers that need a
     realistic (non-empty) ``payload.facts`` use :func:`_anonymize_stub`
     instead, which reads the REAL call's own ``facts`` argument.
     """
-    from paramem.cloud.anonymize import AnonymizedContract, failed_contract
+    from paramem.cloud.anonymize import AnonymizedContract
     from paramem.cloud.placeholders import invert_forward_mapping
 
-    if mapping is None:
-        return failed_contract(failure="tagger", raw=raw, tagger_windows=1, model_calls=1)
     reverse = invert_forward_mapping(dict(mapping))
     return AnonymizedContract(
         status="ok",
@@ -113,7 +109,6 @@ def _anonymize_contract(mapping, anon_transcript: str, raw: str, *, facts=None):
         rekey_dropped=0,
         raw=raw,
         facts=list(facts) if facts is not None else [],
-        tagger_windows=1,
         model_calls=1,
     )
 
@@ -1625,30 +1620,6 @@ class TestCloudEnrichmentProvider:
         normalized, stats = _normalize_anonymization_mapping({})
         assert normalized == {}
         assert stats == {"inverted": 0, "dropped": 0, "dropped_entries": []}
-
-    def test_entity_type_to_prefix_closed_vocab_and_derivations(self):
-        """Pin the contract for ``entity_type_to_prefix``: closed-vocabulary
-        common types map via schema.yaml's ``anonymizer_type_to_prefix()``;
-        everything else is PascalCase-joined; empty input falls back to
-        ``Entity``."""
-        from paramem.config.taxonomy import entity_type_to_prefix
-
-        # Closed vocabulary — match anonymizer LLM conventions.
-        assert entity_type_to_prefix("person") == "Person"
-        assert entity_type_to_prefix("place") == "City"
-        assert entity_type_to_prefix("organization") == "Org"
-        assert entity_type_to_prefix("concept") == "Thing"
-        # Open types — derived directly.
-        assert entity_type_to_prefix("product") == "Product"
-        assert entity_type_to_prefix("language") == "Language"
-        assert entity_type_to_prefix("event") == "Event"
-        # Multi-word labels collapse to PascalCase.
-        assert entity_type_to_prefix("work_of_art") == "WorkOfArt"
-        assert entity_type_to_prefix("self-driving") == "SelfDriving"
-        assert entity_type_to_prefix("law enforcement") == "LawEnforcement"
-        # Empty / whitespace fall back to a generic recoverable shape.
-        assert entity_type_to_prefix("") == "Entity"
-        assert entity_type_to_prefix("   ") == "Entity"
 
     def test_pipeline_normalizes_mixed_direction_mapping_per_pair(self):
         """Mixed-direction mappings from the anonymizer are normalized per-pair.

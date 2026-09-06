@@ -46,23 +46,24 @@ def _stage_anonymize(ctx: StageContext, state: StageState) -> StageState:
 
     Two branches:
 
-    1. ``ctx.scrub_categories`` empty — operator opt-out: no tagger call,
-       no anonymizer call, no phase trace — including that a
+    1. ``ctx.scrub_categories`` empty — operator opt-out: no model call,
+       no phase trace — including that a
        ``stop_at("anonymize")`` request does NOT short-circuit here, since
        there is nothing to stop after: the "anonymize" phase never fires.
        The transcript egresses verbatim,
        sourced from the passed-in transcript — never a model artifact.
        The ``enrich`` stage derives the (empty-mapping, identity)
        anonymized fact array from the returned ``payload``.
-    2. Non-empty ``scrub_categories`` — the span tagger's configured
-       labels are the SOLE scope authority: it tags real values against
-       those labels, and code-side substitution
+    2. Non-empty ``scrub_categories`` — the SCAN call names every value in
+       the payload with a keyword from the schema table, and code decides
+       which keyword's values are kept (the operator's active rows) and
+       which revert; code-side substitution
        (:func:`~paramem.cloud.placeholders._substitute_whole_words`)
        produces both the real_name -> placeholder mapping AND the
-       rewritten transcript with those values placeholdered. The one
-       remaining local model call is the ANCHOR self-introduction
-       question. The ``anonymize`` phase trace captures the raw tagger +
-       ANCHOR record, plus ``status``/``failure``/``model_calls``/
+       rewritten transcript with the kept values placeholdered. The
+       second local model call is the ANCHOR self-introduction question.
+       The ``anonymize`` phase trace captures the raw SCAN + ANCHOR
+       record, plus ``status``/``failure``/``model_calls``/
        ``call_tokens`` (the SAME per-call telemetry
        :func:`~paramem.server.calibrate.dispatch_anonymize_facts`
        surfaces for the graph tier — one carrier, both calibration doors,
@@ -71,7 +72,7 @@ def _stage_anonymize(ctx: StageContext, state: StageState) -> StageState:
        failed run's specific cause from the same record.
 
     Fail-closed divert: ``payload.status == "failed"`` (``failure`` is
-    ``"guard"`` or ``"tagger"`` — see
+    ``"guard"``, ``"model_unavailable"`` or ``"scan_failed"`` — see
     :attr:`~paramem.cloud.anonymize.AnonymizedContract.failure` —
     recorded on this stage's own phase-trace record, never just a
     generic "failed") falls back to local plausibility on the
@@ -105,7 +106,7 @@ def _stage_anonymize(ctx: StageContext, state: StageState) -> StageState:
 
     _vram_snapshot(f"cloud_pipeline_entry session={graph.session_id}")
     if not ctx.scrub_categories:
-        # Operator opt-out: no tagger call, no anonymizer call, no phase
+        # Operator opt-out: no model call, no phase
         # trace, no prompt load — the ONE opt-out constructor, called
         # directly rather than routing through ``anonymize()`` purely to
         # reach it. A ``stop_at("anonymize")`` request does NOT
@@ -120,13 +121,13 @@ def _stage_anonymize(ctx: StageContext, state: StageState) -> StageState:
         graph.diagnostics["anonymize"] = "opted_out"
     else:
         # Anonymization step — THE one anonymize chain (A), shared with
-        # every other cloud-egress path.  The span tagger's configured
-        # labels are the SOLE scope authority: it tags real values in
-        # scope, and code-side substitution rewrites both the forward
-        # table and the transcript.  The one remaining local model call
-        # is the ANCHOR self-introduction question.  Phase trace captures
-        # the raw record so calibration can diagnose the anonymizer in
-        # isolation.
+        # every other cloud-egress path.  The SCAN call names every value
+        # with a schema keyword; code decides which keyword's values are
+        # kept (the operator's active rows), and code-side substitution
+        # rewrites both the forward table and the transcript.  The second
+        # local model call is the ANCHOR self-introduction question.
+        # Phase trace captures the raw record so calibration can diagnose
+        # the anonymizer in isolation.
         with phase_trace("anonymize") as t:
             anon_prompts = load_anonymizer_prompts(prompts_dir=ctx.prompts_dir)
             payload = anonymize(
@@ -154,7 +155,6 @@ def _stage_anonymize(ctx: StageContext, state: StageState) -> StageState:
                     "status": payload.status,
                     "failure": payload.failure,
                     "anonymized_transcript_len": len(payload.anon_transcript or ""),
-                    "tagger_windows": payload.tagger_windows,
                     "model_calls": payload.model_calls,
                     "scan_dropped": payload.scan_dropped,
                     "call_tokens": list(payload.call_tokens),
@@ -176,7 +176,7 @@ def _stage_anonymize(ctx: StageContext, state: StageState) -> StageState:
         # terminal (the scan ran; pruning ran; the reconciliation guard
         # fired afterward, on the pruned table) still carries the real
         # accumulated counts instead of any key being silently absent; a
-        # tagger-failure terminal (the scan never ran) carries them at
+        # model-unavailable terminal (the scan never ran) carries them at
         # their 0/empty default instead, since there is nothing to
         # report.  Diagnostics carry counts and categories only — never a
         # dropped entry's real text (that stays in-memory on ``payload``
@@ -192,11 +192,12 @@ def _stage_anonymize(ctx: StageContext, state: StageState) -> StageState:
             ]
         if payload.status == "failed":
             # Fail-closed: the identity-reconciliation guard fired
-            # (payload.failure == "guard"), or the span tagger was
-            # unavailable (payload.failure == "tagger").  Never fall back
-            # to raw plausibility on the ORIGINAL real-name transcript —
-            # fall back to local plausibility on the LOCAL-EXTRACT facts
-            # instead (no cloud egress at all).
+            # (payload.failure == "guard"), the base model was not
+            # resident (payload.failure == "model_unavailable"), or the
+            # SCAN call failed (payload.failure == "scan_failed").  Never
+            # fall back to raw plausibility on the ORIGINAL real-name
+            # transcript — fall back to local plausibility on the
+            # LOCAL-EXTRACT facts instead (no cloud egress at all).
             logger.warning("Anonymization failed — falling back to raw plausibility")
             graph.diagnostics["anonymize"] = "failed"
             return StageState(

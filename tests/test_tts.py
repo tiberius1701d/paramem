@@ -1349,8 +1349,7 @@ class TestHaDoorThreading:
     """``answer_via_ha`` threads the turn's resolved language and the
     configured HA supported-languages list straight through to
     ``ha_client.conversation_process`` — the HA conversation API's own
-    language-negotiation parameters, untouched by the scrub step above
-    them."""
+    language-negotiation parameters."""
 
     def _outbound(self, *, language):
         from paramem.server.config import ServerConfig
@@ -1358,9 +1357,9 @@ class TestHaDoorThreading:
 
         config = ServerConfig()
         config.ha_agent_id = "conversation.test_agent"
-        # Operator opt-out: the anonymize chain short-circuits to
-        # "opted_out" without a span tagger call, so this test needs no
-        # tagger stub to exercise the door end-to-end.
+        # The HA door builds no contract and calls no model on any path,
+        # so this test needs no model stub to exercise the door
+        # end-to-end.
         config.sanitization.scrub_categories = ()
         config.tools.ha.supported_languages = ["en", "de"]
         return OutboundText(

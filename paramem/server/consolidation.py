@@ -171,10 +171,9 @@ def create_consolidation_loop(
         # cloud_anonymizer egress path, so the privacy policy must match.
         # ``config.sanitization.scrub_categories`` is resolved once at
         # config construction from the operator's ``scrub`` hints — the
-        # span tagger's configured labels are the sole scope authority.
-        # An empty tuple disables anonymization entirely (the operator's
-        # opt-out): no tagger call, no anonymizer call, content egresses
-        # verbatim.
+        # activated prefix rows are the sole scope authority. An empty
+        # tuple disables anonymization entirely (the operator's opt-out):
+        # no anonymize call, content egresses verbatim.
         extraction_scrub_categories=config.sanitization.scrub_categories,
         extraction_correction_entity_types=set(
             config.consolidation.extraction_correction_entity_types

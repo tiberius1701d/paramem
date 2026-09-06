@@ -1,13 +1,18 @@
-"""The anonymizer's step functions: the tagger-backed scan, and the one
-remaining local-model call (ANCHOR).
+"""The anonymizer's step functions: the SCAN call and the ANCHOR call — the
+two local model calls one ``anonymize()`` run may issue.
 
-``scan_values`` names every in-scope value with a single
-:func:`~paramem.cloud.span_tagger.tag` call — no ``generate()``, no
-tokenizer, no envelope, no re-ask: a span tagger has no JSON envelope to
-malform and no empty case to hallucinate into. ``ask_speaker_anchor`` is
-the one remaining local model call — a single micro-question deciding
-which of the tagged person values the speaker introduced as their own,
-never re-asked, and never failing the whole ``anonymize()`` call.
+``scan_values`` names every value in the payload with a single
+``generate()`` call: the resident base model reads the payload once and
+returns ``{"mapping": {value: keyword}}`` over the keyword set
+:func:`~paramem.config.taxonomy.prefix_descriptions` publishes (every
+``configs/schema.yaml`` ``anonymizer.prefixes`` row, configured or not).
+Code — never the model — decides which keyword's values are kept: a value
+whose keyword names a row the operator's ``scrub`` activates is kept under
+that row; every other value is reverted (left in the payload verbatim).
+``ask_speaker_anchor`` is the second and last local model call — a single
+micro-question deciding which of the kept person values the speaker
+introduced as their own, never re-asked, and never failing the whole
+``anonymize()`` call.
 
 :func:`~paramem.cloud.anonymize.anonymize` (the chain) is the only
 production caller of every function here.
@@ -17,13 +22,13 @@ JSON extraction: this module does NOT reuse
 recovery modes (list-unwrapping, fact-shape detection, bracketed-index
 reasoning-prose deferral) are tailored to the extraction pipeline's own
 closed envelope-key vocabulary (``_JSON_ENVELOPE_KEYS``), and widening
-that vocabulary for this module's one single-array envelope shape
-(``self_introduced``) would blur two distinct contracts —
+that vocabulary for this module's own envelope shapes (``mapping``,
+``self_introduced``) would blur two distinct contracts —
 :mod:`paramem.cloud.deanonymize` is excluded entirely.
 :func:`_extract_json_envelope` below is a smaller, dedicated extractor:
 strip a markdown code fence, then return the first well-formed JSON
 object/array `json.JSONDecoder.raw_decode` finds — no envelope-key
-classification, since the one caller here already validates its own
+classification, since each caller here already validates its own
 top-level key immediately after parsing.
 """
 
@@ -34,14 +39,16 @@ import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from paramem.cloud import span_tagger
-from paramem.cloud.placeholders import _MAX_MAPPING_TEXT_CHARS, _word_boundary_ok
-from paramem.cloud.span_tagger import TaggedSpan, TagResult
-from paramem.config.taxonomy import ScrubCategory
+from paramem.cloud.placeholders import _MAX_MAPPING_TEXT_CHARS, _first_occurrence
+from paramem.config.taxonomy import ScrubCategory, prefix_descriptions
 from paramem.evaluation.recall import generate_answer
 from paramem.models.loader import render_chat_prompt
-from paramem.utils.identity import is_speaker_id
-from paramem.utils.tokens import anchor_output_reserve_tokens, estimate_tokens
+from paramem.utils.identity import canonical, is_speaker_id
+from paramem.utils.tokens import (
+    anchor_output_reserve_tokens,
+    estimate_tokens,
+    scan_output_reserve_tokens,
+)
 from paramem.utils.vram_guard import vram_scope
 
 logger = logging.getLogger(__name__)
@@ -54,7 +61,7 @@ def _extract_json_envelope(text: str) -> object:
     or ```` ``` ... ``` ````) if present, then walks every ``{``/``[``
     position and returns the first one ``json.JSONDecoder.raw_decode``
     parses successfully — the ALREADY-PARSED value, never the matched
-    substring: the one caller here immediately does its own shape check on
+    substring: each caller here immediately does its own shape check on
     the result, so returning the parsed object (rather than a string a
     caller would re-``json.loads``) avoids parsing the same substring
     twice. See the module docstring for why this is a separate, smaller
@@ -110,17 +117,46 @@ class AnonymizeBudgetRefused(Exception):
     """One local call's rendered prompt plus its derived output reserve
     does not fit the effective token envelope — the call was never issued.
 
-    Raised by :func:`_generate`, the one render+generate chokepoint the
-    ANCHOR call funnels through. A structured control-flow signal
-    (mirroring :class:`~paramem.utils.vram_guard.VramExhausted`'s role for
-    VRAM), never a suppressed error. :func:`ask_speaker_anchor` catches it
-    internally — the anchor decision degrades to "no self-introduction"
-    rather than failing the whole call.
+    Raised by :func:`_generate`, the one render+generate chokepoint both
+    the SCAN and ANCHOR calls funnel through. A structured control-flow
+    signal (mirroring :class:`~paramem.utils.vram_guard.VramExhausted`'s
+    role for VRAM), never a suppressed error. :func:`ask_speaker_anchor`
+    catches it internally — the anchor decision degrades to "no
+    self-introduction" rather than failing the whole call; a SCAN-call
+    refusal is NOT caught here — :func:`~paramem.cloud.anonymize.anonymize`
+    catches it and fails the whole call closed (``failure="scan_failed"``),
+    since a SCAN that never ran leaves nothing to keep or revert.
     """
 
     def __init__(self, call_label: str) -> None:
         super().__init__(call_label)
         self.call_label = call_label
+
+
+class ScanFailed(Exception):
+    """The SCAN call was issued but its reply did not parse to
+    ``{"mapping": {str: str}}``.
+
+    Raised by :func:`scan_values`. Distinct from
+    :class:`AnonymizeBudgetRefused` (the call was never issued at all):
+    here a real ``generate()`` call ran and consumed the telemetry carried
+    on :attr:`call_tokens`, so :func:`~paramem.cloud.anonymize.anonymize`
+    reports it as one issued call even on this failure path.
+
+    Attributes:
+        raw: The unparsed model output.
+        reason: A generic, non-sensitive description of why parsing failed
+            (e.g. ``"scan reply did not parse: <json error>"``) — never the
+            model's reply text itself, so logging it carries no PII.
+        call_tokens: The one-entry ``call_tokens`` tuple the issued call
+            produced (see :func:`_call_token_record`).
+    """
+
+    def __init__(self, raw: str, reason: str, call_tokens: tuple[dict, ...]) -> None:
+        super().__init__(reason)
+        self.raw = raw
+        self.reason = reason
+        self.call_tokens = call_tokens
 
 
 def _render(system_prompt: str, user_prompt: str, tokenizer):
@@ -148,7 +184,7 @@ def _generate(
     seed: int | None,
 ) -> tuple[str, int, int]:
     """Shared render + budget-precondition + generate chokepoint for the
-    ANCHOR call.
+    SCAN and ANCHOR calls.
 
     Renders *system_prompt*/*user_prompt*, measures the rendered prompt's
     token count, and enforces the budget precondition: when
@@ -163,7 +199,7 @@ def _generate(
     Returns ``(raw_output, prompt_tokens, output_tokens)`` — *output_tokens*
     is :func:`~paramem.utils.tokens.estimate_tokens` over the raw
     completion (the same estimator, exact when *tokenizer* supports it) —
-    the per-call telemetry the anchor call attaches to its own return.
+    the per-call telemetry each caller attaches to its own return.
 
     Raises:
         AnonymizeBudgetRefused: The budget precondition failed; no
@@ -207,8 +243,9 @@ def _generate(
 
 def _call_token_record(label: str, prompt_tokens: int, output_tokens: int) -> dict:
     """Build one per-call token-telemetry record — ``{label, prompt_tokens,
-    output_tokens}``. Attached to the anchor call's own return, consumed by
-    :func:`~paramem.cloud.anonymize.anonymize` (which accumulates it into
+    output_tokens}``. Attached to the SCAN and ANCHOR calls' own returns,
+    consumed by :func:`~paramem.cloud.anonymize.anonymize` (which
+    accumulates it into
     :attr:`~paramem.cloud.anonymize.AnonymizedContract.call_tokens`) and
     surfaced verbatim by
     :func:`~paramem.server.calibrate.dispatch_anonymize_facts`'s ``parsed``
@@ -217,208 +254,216 @@ def _call_token_record(label: str, prompt_tokens: int, output_tokens: int) -> di
     return {"label": label, "prompt_tokens": prompt_tokens, "output_tokens": output_tokens}
 
 
-def _dropped_scan_entry(category: ScrubCategory, text: str, reason: str) -> dict:
-    """Build one ``scan_dropped_entries`` record — the SAME truncation
-    cap :func:`~paramem.cloud.placeholders._dropped_mapping_entry` uses
-    (:data:`~paramem.cloud.placeholders._MAX_MAPPING_TEXT_CHARS`, imported
-    rather than re-typed), even though the record SHAPE here (``category``/
-    ``side``/``reason``) is scan-specific and not built by that function.
+def _dropped_scan_entry(category: str, text: str, reason: str, *, word: str | None = None) -> dict:
+    """Build one ``scan_dropped_entries`` record.
+
+    ``category`` is the row NAME (the row's own ``prefix`` string) the
+    model's keyword resolved to — ``""`` when the keyword names no row at
+    all (``reason="unknown_word"``). ``text`` is always the value,
+    truncated to the same cap :func:`~paramem.cloud.placeholders._dropped_inert_entry`
+    uses (:data:`~paramem.cloud.placeholders._MAX_MAPPING_TEXT_CHARS`,
+    imported rather than re-typed). ``word`` carries the model's own
+    unrecognised keyword and is set only for ``reason="unknown_word"`` —
+    every other reason leaves it ``None``. Both fields reach
+    :attr:`~paramem.cloud.anonymize.AnonymizedContract.scan_dropped_entries`
+    but neither reaches ``graph.diagnostics``: the projection in
+    :mod:`paramem.graph.stage_anonymize` keeps ``category``/``side``/``reason``
+    only.
     """
     return {
-        "category": category.name,
+        "category": category,
         "side": "scan",
         "text": text[:_MAX_MAPPING_TEXT_CHARS],
         "reason": reason,
+        "word": word,
     }
 
 
-def _scan_drop_reason(payload_text: str, span: TaggedSpan) -> str | None:
-    """The one drop reason for a tagged span, or ``None`` when it survives
-    single-span verification.
+def _render_keywords() -> str:
+    """Render the SCAN prompt's ``{keywords}`` slot: one ``Prefix:
+    description`` line per row of ``configs/schema.yaml``'s
+    ``anonymizer.prefixes`` table, in table order, every row whether the
+    operator's ``sanitization.scrub`` activates it or not — so the model
+    never learns which kinds are actually scrubbed.
 
-    The two single-span checks: a speaker-id-shaped surface
-    (:func:`~paramem.utils.identity.is_speaker_id`, ``reason="speaker_id"``),
-    or a surface that is not an edge-aware whole word at its own tagged
-    offset (:func:`~paramem.cloud.placeholders._word_boundary_ok`,
-    ``reason="not_whole_word"``) — a kept value that
-    :func:`~paramem.cloud.placeholders._substitute_whole_words` could not
-    later match would be an inert forward-table key. A third reason,
-    ``"contained"``, exists but is not decidable per-span — it needs the
-    OTHER spans of the same category to compare against — so it is applied
-    by :func:`_contained_in_another` in a second pass inside
-    :func:`scan_values`, over the spans this function already kept.
-
-    The tagger already guarantees ``payload_text[span.start:span.end] ==
-    span.text`` for every span it returns (verified at the tagger's own
-    remap boundary), so there is no "value not present" case here — unlike
-    a generative scan, a span tagger has no envelope to malform and
-    nothing to canonically fold back onto the source text.
+    Reads :func:`~paramem.config.taxonomy.prefix_descriptions` — the one
+    accessor for the table; no second reader exists.
     """
-    if is_speaker_id(span.text):
-        return "speaker_id"
-    if not _word_boundary_ok(payload_text, span.text, span.start):
-        return "not_whole_word"
-    return None
+    return "\n".join(f"{prefix}: {description}" for prefix, description in prefix_descriptions())
 
 
-def _contained_in_another(span: TaggedSpan, candidates: Sequence[TaggedSpan]) -> bool:
-    """True when *span* lies strictly inside a longer *candidate* span:
-    ``other.start <= span.start`` and ``span.end <= other.end`` and
-    ``other`` is longer than *span* itself.
+def render_scan_section(section: str, payload_text: str) -> str:
+    """Render the SCAN prompt section's ``{keywords}``/``{text}`` slots.
 
-    Catches a tagger window seam landing mid-value: the offset-remapped
-    window overlap (see :func:`~paramem.cloud.span_tagger.tag`'s own
-    docstring) can return a shorter dependent span alongside the value it
-    is cut from (``ammerschlaeger@example.de`` beside
-    ``friedrich.ammerschlaeger@example.de``) — the edge-aware whole-word
-    check cannot see this, because the cut lands on a non-word separator
-    (``.``, ``@``, ``-``) on both sides. A fragment and the value it is
-    cut from are one entity, never two, so the fragment is dropped rather
-    than becoming an inert or misresolving forward-table key.
+    The one renderer for the SCAN section: :func:`scan_values` calls it for
+    every anonymize call with the real payload, and the startup skeleton-
+    drift check (``paramem/server/app.py``) calls it with an empty payload
+    to measure the pinned skeleton constant against the operator's current
+    prefix table. No second render of this section exists.
 
-    *candidates* is compared by identity (``is``), not value equality, so
-    two genuinely distinct occurrences of the identical surface at the
-    identical offsets (impossible for the tagger's own ``(start, end,
-    label)`` dedup) never mask each other.
+    Args:
+        section: The SCAN section's template text, carrying ``{keywords}``
+            and ``{text}`` placeholders.
+        payload_text: The text to render into the ``{text}`` slot — ``""``
+            for a skeleton-only render.
+
+    Returns:
+        The fully rendered SCAN user prompt.
     """
-    for other in candidates:
-        if other is span:
-            continue
-        if (
-            other.start <= span.start
-            and span.end <= other.end
-            and (other.end - other.start) > (span.end - span.start)
-        ):
-            return True
-    return False
+    return section.format(keywords=_render_keywords(), text=payload_text)
 
 
 @dataclass(frozen=True)
 class ScanResult:
-    """One category's verified SCAN output.
+    """One active category's kept SCAN values.
 
     Attributes:
         category: The :class:`~paramem.config.taxonomy.ScrubCategory` this
-            scan ran for.
-        values: Verified, verbatim real-value surfaces the tagger found for
-            *category* — deduplicated on the EXACT verbatim surface (never
-            canonically folded; canonical equality decides placeholder
-            SHARING downstream, in
+            result is for — one of the operator's activated rows.
+        values: Verbatim real-value surfaces the SCAN call named under
+            this category's keyword, deduplicated on the exact verbatim
+            surface (never canonically folded; canonical equality decides
+            placeholder SHARING downstream, in
             :func:`~paramem.cloud.placeholders.build_forward_table`, never
-            deletion here), speaker-id and non-whole-word surfaces dropped,
-            ordered by first-occurrence offset in the scanned payload. See
-            :func:`_scan_drop_reason`.
-        dropped: One record per tagged surface that did NOT survive
-            verification — ``{category, side: "scan", text, reason}``, one
-            of ``"speaker_id"``, ``"not_whole_word"`` (see
-            :func:`_scan_drop_reason`) or ``"contained"`` (see
-            :func:`_contained_in_another`) — the per-entry payload
-            :attr:`~paramem.cloud.anonymize.AnonymizedContract.scan_dropped_entries`
-            accumulates across every category.
+            deduplication here) and ordered by first-occurrence offset in
+            the scanned payload (:func:`~paramem.cloud.placeholders.
+            _first_occurrence` — the SCAN reply carries no offsets of its
+            own).
     """
 
     category: ScrubCategory
     values: tuple[str, ...]
-    dropped: tuple[dict, ...]
 
 
 def scan_values(
     payload_text: str,
+    model,
+    tokenizer,
     *,
     categories: Sequence[ScrubCategory],
-) -> tuple[tuple[ScanResult, ...], TagResult]:
-    """List every value in *payload_text* that is an instance of one of
-    *categories* — one :func:`~paramem.cloud.span_tagger.tag` call, no
-    local model call.
+    section: str,
+    system_prompt: str,
+    token_envelope: int,
+    seed: int | None = None,
+) -> tuple[tuple[ScanResult, ...], tuple[dict, ...], str, tuple[dict, ...]]:
+    """Name every value in *payload_text* and keep the ones whose keyword
+    names an active category — one ``generate()`` call.
 
-    Builds the label list handed to the tagger as the ordered union of
-    every category's ``tagger_labels`` (a label claimed by two categories
-    is refused at config load — :func:`~paramem.config.taxonomy.
-    resolve_scrub_categories` — so the union here never arbitrates a real
-    ambiguity). Partitions the returned spans by label into their owning
-    category, then verifies each surface in two passes: single-span
-    verification (:func:`_scan_drop_reason`), then, over the survivors of
-    that pass, a same-category containment check
-    (:func:`_contained_in_another`) that drops a span strictly covered by
-    a longer kept span — the fragment case a window seam can produce. The
-    remaining survivors are deduplicated on the exact verbatim string,
-    ordered by first-occurrence offset.
+    Renders *section* with the schema's full keyword table
+    (:func:`_render_keywords`) and *payload_text*, sizes the call's output
+    reserve from the PAYLOAD's own token count
+    (:func:`~paramem.utils.tokens.scan_output_reserve_tokens` — a function
+    of *payload_text*, not of the rendered prompt, since the number of
+    values the model will name is unknown before the call), and issues one
+    call via :func:`_generate`.
 
-    Returns exactly one :class:`ScanResult` per entry of *categories*, in
-    that order, including a category the tagger found nothing for
-    (``values=()``) — so
-    :func:`~paramem.cloud.placeholders.build_forward_table`'s category-order
-    precedence and the calibration door's per-category scoring both read a
-    total, positionally-stable result.
+    The reply is parsed by :func:`_extract_json_envelope` and validated as
+    ``{"mapping": {value: keyword}}`` (every key and value a string) —
+    anything else is a scan failure
+    (:class:`ScanFailed`). A budget refusal
+    (:class:`AnonymizeBudgetRefused`) propagates unchanged — neither is
+    caught here; :func:`~paramem.cloud.anonymize.anonymize` is the one
+    catch site for both, and treats them identically
+    (``failure="scan_failed"``).
 
-    Dropping never fails the call — an empty tag result is the tagger's
-    legitimate "nothing in scope" answer, and unlike a generative scan it
-    has no empty case to hallucinate into.
+    For each ``(value, keyword)`` pair (exact-surface duplicates already
+    collapse — *value* is the mapping's own key, so the JSON object itself
+    can carry no duplicate), *keyword* is folded through
+    :func:`~paramem.utils.identity.canonical` and matched against every
+    row's identically-folded ``prefix``
+    (:func:`~paramem.config.taxonomy.prefix_descriptions`):
+
+    * *value* is speaker-id-shaped
+      (:func:`~paramem.utils.identity.is_speaker_id`) — dropped,
+      ``reason="speaker_id"``, regardless of what *keyword* named.
+    * *keyword* names no row at all — dropped, ``reason="unknown_word"``,
+      a format error of the model rather than a category decision.
+    * *keyword* names a row, but not one of *categories* (the operator's
+      active rows) — dropped, ``reason="reverted"``: the value leaves the
+      payload verbatim, no placeholder minted.
+    * *keyword* names an active row — kept under that row's
+      :class:`ScanResult`.
+
+    Returns:
+        ``(scan_results, dropped_entries, raw, call_tokens)`` —
+        *scan_results* has exactly one :class:`ScanResult` per entry of
+        *categories*, in that order, including a category the SCAN call
+        named nothing for (``values=()``); *dropped_entries* is the FLAT
+        list of every ``speaker_id``/``unknown_word``/``reverted`` record
+        (see :func:`_dropped_scan_entry`) — a reverted value belongs to an
+        out-of-scope row, never one of *categories*, so it cannot be
+        attached to a :class:`ScanResult`; *raw* is the model's raw reply;
+        *call_tokens* is the one-entry tuple :func:`_call_token_record`
+        builds for this call.
 
     Raises:
-        ~paramem.cloud.span_tagger.TaggerUnavailable: Propagated unchanged
-            from :func:`~paramem.cloud.span_tagger.tag` — no handle loaded,
-            or the model call raised. NOT caught here;
-            :func:`~paramem.cloud.anonymize.anonymize` is the one catch
-            site.
+        AnonymizeBudgetRefused: The call's rendered prompt plus its output
+            reserve does not fit the effective envelope; no ``generate()``
+            call was issued.
+        ScanFailed: The call was issued but its reply did not parse to
+            ``{"mapping": {str: str}}``.
     """
-    label_owner_index: dict[str, int] = {}
-    labels: list[str] = []
-    for idx, category in enumerate(categories):
-        for label in category.tagger_labels:
-            if label in label_owner_index:
-                continue
-            label_owner_index[label] = idx
-            labels.append(label)
+    payload_tokens = estimate_tokens(payload_text, tokenizer)
+    reserve = scan_output_reserve_tokens(payload_tokens)
+    user_prompt = render_scan_section(section, payload_text)
 
-    tag_result = span_tagger.tag(payload_text, labels)
+    raw, prompt_tokens, output_tokens = _generate(
+        "anonymize.scan",
+        system_prompt,
+        user_prompt,
+        model,
+        tokenizer,
+        reserve_tokens=reserve,
+        token_envelope=token_envelope,
+        seed=seed,
+    )
+    call_tokens = (_call_token_record("anonymize.scan", prompt_tokens, output_tokens),)
 
-    # Bucketed by POSITION in *categories*, not by ``category.name`` — two
-    # categories sharing a name would silently merge into one bucket under
-    # a name-keyed dict; nothing here refuses that collision, so position
-    # is the only assumption-free index.
-    survived_by_index: list[list[TaggedSpan]] = [[] for _ in categories]
-    dropped_by_index: list[list[dict]] = [[] for _ in categories]
+    try:
+        data = _extract_json_envelope(raw)
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise ScanFailed(raw, f"scan reply did not parse: {exc}", call_tokens) from exc
+    mapping = data.get("mapping") if isinstance(data, dict) else None
+    if not isinstance(mapping, dict):
+        raise ScanFailed(raw, 'scan reply is not a {"mapping": {...}} object', call_tokens)
+    if not all(isinstance(k, str) and isinstance(v, str) for k, v in mapping.items()):
+        raise ScanFailed(raw, "scan mapping keys/values must all be strings", call_tokens)
 
-    # Pass 1 — single-span verification (speaker id, whole-word boundary).
-    for span in tag_result.spans:
-        idx = label_owner_index.get(span.label)
-        if idx is None:
+    active_by_canon = {canonical(c.prefix): c for c in categories}
+    all_by_canon = {canonical(prefix): prefix for prefix, _description in prefix_descriptions()}
+    category_index = {c: i for i, c in enumerate(categories)}
+
+    kept_by_index: list[list[str]] = [[] for _ in categories]
+    dropped: list[dict] = []
+    for value, keyword in mapping.items():
+        if not value:
             continue
-        category = categories[idx]
-        reason = _scan_drop_reason(payload_text, span)
-        if reason is not None:
-            dropped_by_index[idx].append(_dropped_scan_entry(category, span.text, reason))
+        resolved_prefix = all_by_canon.get(canonical(keyword))
+        if is_speaker_id(value):
+            dropped.append(_dropped_scan_entry(resolved_prefix or "", value, "speaker_id"))
             continue
-        survived_by_index[idx].append(span)
-
-    # Pass 2 — same-category containment, then exact-surface dedup, over
-    # the survivors of pass 1.
-    kept_by_index: list[list[tuple[int, str]]] = [[] for _ in categories]
-    seen_by_index: list[set[str]] = [set() for _ in categories]
-    for idx, category in enumerate(categories):
-        spans = survived_by_index[idx]
-        seen = seen_by_index[idx]
-        for span in spans:
-            if _contained_in_another(span, spans):
-                dropped_by_index[idx].append(_dropped_scan_entry(category, span.text, "contained"))
-                continue
-            if span.text in seen:
-                continue
-            seen.add(span.text)
-            kept_by_index[idx].append((span.start, span.text))
+        if resolved_prefix is None:
+            dropped.append(_dropped_scan_entry("", value, "unknown_word", word=keyword))
+            continue
+        active = active_by_canon.get(canonical(keyword))
+        if active is None:
+            dropped.append(_dropped_scan_entry(resolved_prefix, value, "reverted"))
+            continue
+        kept_by_index[category_index[active]].append(value)
 
     scan_results = tuple(
         ScanResult(
             category=category,
             values=tuple(
-                surface for _offset, surface in sorted(kept_by_index[idx], key=lambda t: t[0])
+                sorted(
+                    dict.fromkeys(kept_by_index[idx]),
+                    key=lambda v: _first_occurrence(payload_text, v),
+                )
             ),
-            dropped=tuple(dropped_by_index[idx]),
         )
         for idx, category in enumerate(categories)
     )
-    return scan_results, tag_result
+    return scan_results, tuple(dropped), raw, call_tokens
 
 
 def ask_speaker_anchor(
@@ -486,7 +531,7 @@ def ask_speaker_anchor(
     # scanned against, and its answer is checked back against the
     # unescaped ``values_set`` below (never re-parsed through JSON), so
     # the model-facing rendering and the check must use the same
-    # characters. See `paramem.cloud.anonymize._assemble_payload`'s
+    # characters. See `paramem.cloud.anonymize.assemble_payload`'s
     # `TagPayload.tag_text` docstring for the same encoding hazard.
     user_prompt = section.format(
         speaker_id=speaker_id, values=json.dumps(list(values), ensure_ascii=False), text=text

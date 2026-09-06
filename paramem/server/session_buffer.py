@@ -51,6 +51,8 @@ from paramem.utils.tokens import (
     ANONYMIZE_ANCHOR_MAX_CANDIDATES,
     ANONYMIZE_ANCHOR_PROMPT_SKELETON_TOKENS,
     ANONYMIZE_ENVELOPE_TOKENS,
+    ANONYMIZE_SCAN_MAX_OUTPUT_TOKENS,
+    ANONYMIZE_SCAN_PROMPT_SKELETON_TOKENS,
     TRANSCRIPT_TOKENS_PER_WORD,
     anchor_output_reserve_tokens,
     anonymize_payload_cap_tokens,
@@ -62,31 +64,34 @@ logger = logging.getLogger(__name__)
 
 # Size-rotation cap for a conversation's open session, in the estimator's
 # unit. HELD at the operating-point value the shipped extraction quality
-# was measured at, rather than computed at import time. The anonymizer's
-# only envelope-bearing call is the ANCHOR generate()
-# (paramem.utils.tokens.ANONYMIZE_ENVELOPE_TOKENS, 8192); the SCAN step is
-# a CPU span tagger with no envelope of its own. See
-# paramem.graph.document_chunker's _DOC_MAX_TOKENS for the sibling
-# derivation over the document-ingest path.
+# was measured at, rather than computed at import time. One anonymize()
+# call on a transcript this size issues up to two local generate() calls
+# against the SAME 8192-token envelope (paramem.utils.tokens.
+# ANONYMIZE_ENVELOPE_TOKENS): SCAN (every call) and ANCHOR (when a kept
+# person value is a candidate). See paramem.graph.document_chunker's
+# _DOC_MAX_TOKENS for the sibling derivation over the document-ingest path.
 # 1098 words -> 4062 estimator tokens (MEASURED_TOKENS_PER_WORD = 3.7):
 # deliberately sized against the CONFIGURED 8192 envelope, not the live
 # VRAM-clamped envelope (a dense session can still fail anonymize under a
 # tight free-VRAM moment — self-healing incident, not silent loss).
 _TRANSCRIPT_MAX_TOKENS: int = 4062
 
-# Slack tripwire, not a tight bound: the ANCHOR call is far cheaper than a
+# Slack tripwire, not a tight bound: both calls are far cheaper than a
 # cap-sized transcript, so this assertion passes with room to spare. It
 # fires only if ANONYMIZE_ENVELOPE_TOKENS is lowered, _TRANSCRIPT_MAX_TOKENS
-# is raised, or the ANCHOR prompt is inflated far enough that a cap-sized
-# transcript could no longer fit the one remaining envelope-bearing call.
+# is raised, or either call's own skeleton/reserve is inflated far enough
+# that a cap-sized transcript could no longer fit both call shapes.
 assert _TRANSCRIPT_MAX_TOKENS <= anonymize_payload_cap_tokens(
     envelope_tokens=ANONYMIZE_ENVELOPE_TOKENS,
     anchor_skeleton_tokens=ANONYMIZE_ANCHOR_PROMPT_SKELETON_TOKENS,
     anchor_reserve_tokens=anchor_output_reserve_tokens(ANONYMIZE_ANCHOR_MAX_CANDIDATES),
+    scan_skeleton_tokens=ANONYMIZE_SCAN_PROMPT_SKELETON_TOKENS,
+    scan_reserve_tokens=ANONYMIZE_SCAN_MAX_OUTPUT_TOKENS,
     payload_tokens_per_word=TRANSCRIPT_TOKENS_PER_WORD,
 ), (
-    "_TRANSCRIPT_MAX_TOKENS exceeds the anchor-shape cap — the envelope, "
-    "the held cap, or the ANCHOR prompt moved; re-measure jointly."
+    "_TRANSCRIPT_MAX_TOKENS exceeds the SCAN/ANCHOR-shape cap — the "
+    "envelope, the held cap, or a call's own skeleton/reserve moved; "
+    "re-measure jointly."
 )
 
 # How many of a conversation's most recent turns any caller reading history

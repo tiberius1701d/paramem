@@ -17,11 +17,14 @@ from __future__ import annotations
 
 import logging
 
+import pytest
+
+from paramem.cloud.anonymize_steps import ScanResult
 from paramem.cloud.placeholders import (
     _MAX_MAPPING_TEXT_CHARS,
     PLACEHOLDER_SHAPE_RE,
     PLACEHOLDER_TOKEN_RE,
-    _applied_whole_word_keys,
+    ForwardTable,
     _binding_collisions,
     _decompose_token,
     _fact_orphans,
@@ -32,7 +35,9 @@ from paramem.cloud.placeholders import (
     _resolution_map,
     _substitute_whole_words,
     _substitute_whole_words_and_applied,
+    applied_whole_word_keys,
     braced,
+    build_forward_table,
     insert_placeholders,
     invert_forward_mapping,
     mint_placeholder,
@@ -40,6 +45,7 @@ from paramem.cloud.placeholders import (
     unbraced,
 )
 from paramem.config.taxonomy import (
+    ScrubCategory,
     entity_type_to_prefix,
     placeholder_entity_type,
     prefix_to_entity_type,
@@ -77,24 +83,29 @@ class TestBraced:
 
 
 class TestEntityTypeToPrefix:
+    """Closed vocabulary only (:func:`~paramem.config.taxonomy.
+    anonymizer_type_to_prefix` — the schema's ``primary_for_type`` rows):
+    an entity type with no primary row raises rather than composing an
+    open-vocabulary PascalCase prefix."""
+
     def test_closed_vocabulary_matches_taxonomy(self):
         assert entity_type_to_prefix("person") == "Person"
         assert entity_type_to_prefix("place") == "City"
         assert entity_type_to_prefix("organization") == "Org"
         assert entity_type_to_prefix("concept") == "Thing"
 
-    def test_open_vocabulary_pascal_cases_multi_word_labels(self):
-        """The PascalCase rule wins over the ``.capitalize()`` rule for
-        any open type."""
-        assert entity_type_to_prefix("event") == "Event"
-        assert entity_type_to_prefix("work_of_art") == "WorkOfArt"
-        assert entity_type_to_prefix("self-driving") == "SelfDriving"
-        assert entity_type_to_prefix("law enforcement") == "LawEnforcement"
+    def test_a_type_with_no_primary_row_raises(self):
+        """``event`` is a declared entity_type but no shipped row sets
+        ``primary_for_type`` for it (only person/place/organization/
+        concept do) — this must raise, not compose ``"Event"``."""
+        with pytest.raises(ValueError, match="no primary_for_type row"):
+            entity_type_to_prefix("event")
 
-    def test_empty_or_blank_falls_back_to_entity(self):
-        assert entity_type_to_prefix("") == "Entity"
-        assert entity_type_to_prefix("   ") == "Entity"
-        assert entity_type_to_prefix(None) == "Entity"
+    def test_empty_or_blank_raises(self):
+        with pytest.raises(ValueError):
+            entity_type_to_prefix("")
+        with pytest.raises(ValueError):
+            entity_type_to_prefix(None)
 
 
 class TestPrefixToEntityType:
@@ -342,7 +353,7 @@ class TestPossessiveIsASubstitutionProperty:
 
 class TestAppliedWholeWordKeys:
     """The reporting form of :func:`_substitute_whole_words` —
-    :func:`_applied_whole_word_keys` — the ONE substitution walk
+    :func:`applied_whole_word_keys` — the ONE substitution walk
     (:func:`_substitute_whole_words_and_applied`) shared by both. Used by
     :func:`build_forward_table`'s prune pass to keep only the keys that
     are actually live over one payload.
@@ -350,12 +361,12 @@ class TestAppliedWholeWordKeys:
 
     def test_returns_only_the_keys_that_actually_matched(self) -> None:
         mapping = {"Alex": "Person_1", "Riley": "Person_2"}
-        applied = _applied_whole_word_keys("Alex went to the store.", mapping.keys())
+        applied = applied_whole_word_keys("Alex went to the store.", mapping.keys())
         assert applied == {"Alex"}
 
     def test_a_key_present_nowhere_in_text_is_not_applied(self) -> None:
         mapping = {"Alex": "Person_1"}
-        assert _applied_whole_word_keys("Nothing here matches.", mapping.keys()) == set()
+        assert applied_whole_word_keys("Nothing here matches.", mapping.keys()) == set()
 
     def test_overlapping_non_nesting_spans_only_the_first_applied_key_survives(self) -> None:
         # Longest-first substitution consumes the first key's match; the
@@ -367,7 +378,7 @@ class TestAppliedWholeWordKeys:
             "Schillerpromenade 63, 12049 Berlin": "Address_1",
             "12049 Berlin, Abteilung 3": "Address_2",
         }
-        applied = _applied_whole_word_keys(text, mapping.keys())
+        applied = applied_whole_word_keys(text, mapping.keys())
         assert applied == {"Schillerpromenade 63, 12049 Berlin"}
 
     def test_applied_keys_agree_with_the_str_only_forms_own_substitutions(self) -> None:
@@ -378,8 +389,8 @@ class TestAppliedWholeWordKeys:
         assert applied == {"Person_10", "Person_1"}
 
     def test_empty_text_or_mapping_yields_an_empty_applied_set(self) -> None:
-        assert _applied_whole_word_keys("", {"Alex": "Person_1"}.keys()) == set()
-        assert _applied_whole_word_keys("Alex", {}.keys()) == set()
+        assert applied_whole_word_keys("", {"Alex": "Person_1"}.keys()) == set()
+        assert applied_whole_word_keys("Alex", {}.keys()) == set()
 
 
 class TestInsertPlaceholders:
@@ -742,7 +753,7 @@ class TestReverseMapInversionAgreement:
     :func:`build_forward_table` -> :func:`invert_forward_mapping` chain —
     :func:`invert_forward_mapping`'s first-wins tie-break on a many-to-one
     forward map is exercised directly here (the map-construction side is
-    covered by ``tests/test_build_forward_table_sharing.py``).
+    covered by :class:`TestBuildForwardTable` below).
     """
 
     _MANY_TO_ONE = {"Alice": "Person_1", "Bob": "Person_1"}
@@ -1027,3 +1038,334 @@ class TestRenderingFoldDistinctness:
             "Person_1", {"Person_1": "Person_2", "Person_2": "Riley"}
         )
         assert out == "Person_2"
+
+
+def _build(
+    scans,
+    tag_text,
+    *,
+    anchor_names=frozenset(),
+    speaker_id=None,
+    speaker_name=None,
+    identity_domain=None,
+    person_prefix="Person",
+) -> ForwardTable:
+    return build_forward_table(
+        scans,
+        tag_text=tag_text,
+        anchor_names=anchor_names,
+        speaker_id=speaker_id,
+        speaker_name=speaker_name,
+        identity_domain=identity_domain,
+        person_prefix=person_prefix,
+    )
+
+
+class TestBuildForwardTable:
+    """``build_forward_table`` — the CORE table's one constructor: canonical
+    sharing, per-prefix uniqueness, first-category-wins, containment
+    pooling, the speaker fold, reconciliation before pruning, the prune of
+    inert entries, and the :class:`ForwardTable` return invariants.
+    """
+
+    def test_canonically_equal_surfaces_share_one_placeholder(self):
+        scans = (ScanResult(category=ScrubCategory("Person"), values=("Alex", "ALEX")),)
+        table = _build(scans, "Alex met ALEX.")
+        assert table.forward == {"Alex": "Person_1", "ALEX": "Person_1"}
+
+    def test_distinct_surfaces_mint_distinct_numbers_in_first_occurrence_order(self):
+        scans = (ScanResult(category=ScrubCategory("Person"), values=("Alex", "Riley")),)
+        table = _build(scans, "Alex met Riley.")
+        assert table.forward["Alex"] == "Person_1"
+        assert table.forward["Riley"] == "Person_2"
+
+    def test_a_value_scanned_under_two_categories_keeps_the_first_categorys_prefix(self):
+        scans = (
+            ScanResult(category=ScrubCategory("Person"), values=("Alex",)),
+            ScanResult(category=ScrubCategory("Artist"), values=("Alex",)),
+        )
+        table = _build(scans, "Alex is here.")
+        assert table.forward["Alex"] == "Person_1"
+
+    def test_a_bare_surface_beside_its_longer_container_shares_the_containers_placeholder(self):
+        scans = (
+            ScanResult(category=ScrubCategory("Person"), values=("Bettina Schuster", "Bettina")),
+        )
+        table = _build(scans, "Bettina Schuster and Bettina came.")
+        assert table.forward["Bettina"] == table.forward["Bettina Schuster"]
+        # Exactly one mint — the pooled group takes one placeholder.
+        assert len(set(table.forward.values())) == 1
+
+    def test_speaker_fold_on_attestation(self):
+        scans = (ScanResult(category=ScrubCategory("Person"), values=("Priya",)),)
+        table = _build(
+            scans,
+            "Hi, I'm Priya.",
+            anchor_names=frozenset({"Priya"}),
+            speaker_id="speaker1",
+        )
+        assert table.forward["Priya"] == "speaker1"
+
+    def test_speaker_fold_on_exact_enrolled_name_needs_no_attestation(self):
+        scans = (ScanResult(category=ScrubCategory("Person"), values=("Alex",)),)
+        table = _build(
+            scans,
+            "Alex went home.",
+            speaker_id="speaker1",
+            speaker_name="Alex",
+        )
+        assert table.forward["Alex"] == "speaker1"
+
+    def test_an_attested_namesake_inconsistent_with_the_enrolled_name_does_not_fold(self):
+        """Attested but NOT the enrolled speaker (a different person the
+        speaker introduces) — mints its own placeholder, never the
+        speaker's token."""
+        scans = (ScanResult(category=ScrubCategory("Person"), values=("Mira",)),)
+        table = _build(
+            scans,
+            "This is Mira.",
+            anchor_names=frozenset({"Mira"}),
+            speaker_id="speaker1",
+            speaker_name="Alex",
+        )
+        assert table.forward["Mira"] == "Person_1"
+
+    def test_speaker_group_is_never_a_containment_merge_target(self):
+        """A shorter surface (``Rivera``) whose only textual container is
+        the enrolled speaker's own longer surface (``Alex Rivera``, folded
+        onto the speaker token by exact match) keeps its own identity — the
+        speaker group absorbs nothing via containment."""
+        scans = (ScanResult(category=ScrubCategory("Person"), values=("Alex Rivera", "Rivera")),)
+        table = _build(
+            scans,
+            "Alex Rivera introduced Rivera to everyone.",
+            speaker_id="speaker1",
+            speaker_name="Alex Rivera",
+        )
+        assert table.forward["Alex Rivera"] == "speaker1"
+        assert table.forward["Rivera"] not in ("speaker1",)
+        assert table.forward["Rivera"].startswith("Person_")
+
+    def test_reconciliation_rekeys_onto_the_domain_surface_before_the_prune(self):
+        """A scanned surface that differs from the fold graph's own
+        (canonical) node key is re-keyed onto that node key — and it is
+        the RE-KEYED surface the prune tests against ``tag_text``, not the
+        original scanned one."""
+        scans = (ScanResult(category=ScrubCategory("Person"), values=("Yang Ming",)),)
+        table = _build(
+            scans,
+            "yang ming is a colleague.",
+            identity_domain=["yang ming"],
+        )
+        assert table.forward == {"yang ming": "Person_1"}
+        assert table.rekey_dropped == 0
+
+    def test_reconciliation_drops_a_surface_with_no_domain_match(self):
+        scans = (ScanResult(category=ScrubCategory("Person"), values=("Alex",)),)
+        table = _build(
+            scans,
+            "Alex is here.",
+            identity_domain=["someone else"],
+        )
+        assert table.forward == {}
+        assert table.rekey_dropped == 1
+
+    def test_a_surface_absent_from_tag_text_is_pruned_as_inert(self):
+        scans = (ScanResult(category=ScrubCategory("Person"), values=("Alex",)),)
+        table = _build(scans, "Nothing about anyone here.")
+        assert table.forward == {}
+        [entry] = table.inert_entries
+        assert entry == {"category": "Person", "side": "table", "text": "Alex", "reason": "inert"}
+
+    def test_forward_table_return_shape(self):
+        scans = (ScanResult(category=ScrubCategory("Person"), values=("Alex",)),)
+        table = _build(scans, "Alex is here.")
+        assert isinstance(table, ForwardTable)
+        assert table.forward == {"Alex": "Person_1"}
+        assert table.rekey_dropped == 0
+        assert table.inert_entries == ()
+
+    def test_prefix_numbering_stays_contiguous_after_a_share_and_an_inert_prune(self):
+        """A canonical share consumes no mint number of its own (pass 1),
+        and a group pruned as inert (pass 4) leaves no gap in the
+        surviving mint order (pass 5's "no holes" invariant): "Alex"/"ALEX"
+        share one number, the inert "Ghost" group between them in creation
+        order is dropped before minting, and "Riley" still mints 2, not 3."""
+        scans = (
+            ScanResult(category=ScrubCategory("Person"), values=("Alex", "ALEX", "Ghost", "Riley")),
+        )
+        table = _build(scans, "Alex met ALEX and Riley.")
+        assert table.forward == {"Alex": "Person_1", "ALEX": "Person_1", "Riley": "Person_2"}
+        [entry] = table.inert_entries
+        assert entry["text"] == "Ghost"
+
+    def test_a_three_way_containment_chain_collapses_onto_one_group(self):
+        """Longest-first judging (pass 2) settles a container's own merge
+        before a shorter member is judged, so a transitive chain collapses
+        onto one group in a single pass: "Ann" inside "Ann Marie" inside
+        "Ann Marie Bell"."""
+        scans = (
+            ScanResult(
+                category=ScrubCategory("Person"), values=("Ann Marie", "Ann Marie Bell", "Ann")
+            ),
+        )
+        table = _build(scans, "Ann Marie Bell introduced Ann Marie and Ann.")
+        assert table.forward == {
+            "Ann": "Person_1",
+            "Ann Marie": "Person_1",
+            "Ann Marie Bell": "Person_1",
+        }
+
+    def test_the_transitive_partition_is_invariant_under_scan_order(self):
+        """The containment judging order is sorted by surface length
+        (pass 2's ``judged_groups.sort``), never by scan/creation order —
+        so the same three surfaces collapse onto the identical one-group
+        partition whichever order they arrive in."""
+        tag_text = "Ann Marie Bell introduced Ann Marie and Ann."
+        ascending = _build(
+            (
+                ScanResult(
+                    category=ScrubCategory("Person"), values=("Ann", "Ann Marie", "Ann Marie Bell")
+                ),
+            ),
+            tag_text,
+        ).forward
+        descending = _build(
+            (
+                ScanResult(
+                    category=ScrubCategory("Person"), values=("Ann Marie Bell", "Ann Marie", "Ann")
+                ),
+            ),
+            tag_text,
+        ).forward
+        assert (
+            ascending
+            == descending
+            == {"Ann": "Person_1", "Ann Marie": "Person_1", "Ann Marie Bell": "Person_1"}
+        )
+
+    def test_a_canonical_equality_group_moves_together_on_a_containment_repoint(self):
+        """Two surfaces "Bettina" and "BETTINA" share one group by
+        canonical equality (pass 1) before containment runs; when that
+        group is later found contained in "Bettina Schuster" (pass 2),
+        EVERY member of the shared group repoints to the container — not
+        only the member whose literal surface matched it."""
+        scans = (
+            ScanResult(
+                category=ScrubCategory("Person"), values=("Bettina", "BETTINA", "Bettina Schuster")
+            ),
+        )
+        table = _build(scans, "Bettina Schuster met Bettina and BETTINA.")
+        assert table.forward == {
+            "Bettina Schuster": "Person_1",
+            "Bettina": "Person_1",
+            "BETTINA": "Person_1",
+        }
+
+    def test_speaker_fold_on_an_attested_extension_of_the_enrolled_name(self):
+        """``_is_speaker_surface``: an attested surface that EXTENDS the
+        enrolled name ("Alex Rivera" attested, enrolled "Alex") is
+        consistent (``low.startswith(name + " ")``) and folds onto the
+        speaker token."""
+        scans = (ScanResult(category=ScrubCategory("Person"), values=("Alex Rivera",)),)
+        table = _build(
+            scans,
+            "This is Alex Rivera.",
+            anchor_names=frozenset({"Alex Rivera"}),
+            speaker_id="speaker1",
+            speaker_name="Alex",
+        )
+        assert table.forward == {"Alex Rivera": "speaker1"}
+
+    def test_speaker_fold_on_an_attested_short_form_of_the_enrolled_name(self):
+        """``_is_speaker_surface``: an attested surface that is a SHORT
+        FORM of the enrolled name ("Alex" attested, enrolled "Alex
+        Rivera") is consistent (``name.startswith(low + " ")``) and folds
+        onto the speaker token."""
+        scans = (ScanResult(category=ScrubCategory("Person"), values=("Alex",)),)
+        table = _build(
+            scans,
+            "This is Alex.",
+            anchor_names=frozenset({"Alex"}),
+            speaker_id="speaker1",
+            speaker_name="Alex Rivera",
+        )
+        assert table.forward == {"Alex": "speaker1"}
+
+    def test_no_person_category_active_means_no_speaker_entry_at_all(self):
+        """``person_idx`` is ``-1`` when no scan category's prefix equals
+        ``person_prefix`` (the operator narrowed ``scrub`` away from
+        person names): both speaker-fold gates (``target``, ``enrolled``)
+        resolve to ``None`` regardless of ``speaker_id``/``speaker_name``/
+        ``anchor_names``, so nothing ever reaches the speaker token."""
+        scans = (ScanResult(category=ScrubCategory("City"), values=("Ghent",)),)
+        table = _build(
+            scans,
+            "Alex went to Ghent.",
+            anchor_names=frozenset({"Alex"}),
+            speaker_id="speaker1",
+            speaker_name="Alex",
+        )
+        assert "speaker1" not in table.forward.values()
+        assert table.forward == {"Ghent": "City_1"}
+
+    def test_speaker_name_without_a_speaker_id_is_never_consumed(self):
+        """``target`` gates on ``speaker_id`` alone (truthy AND well-shaped
+        AND a person category active); every read of ``enrolled`` sits
+        inside a ``target is not None`` branch, so a ``speaker_name`` with
+        no ``speaker_id`` is inert and the value mints an ordinary
+        placeholder instead of folding."""
+        scans = (ScanResult(category=ScrubCategory("Person"), values=("Alex",)),)
+        table = _build(
+            scans,
+            "Alex is here.",
+            anchor_names=frozenset({"Alex"}),
+            speaker_name="Alex",
+        )
+        assert table.forward == {"Alex": "Person_1"}
+
+    def test_the_enrolled_name_is_pruned_like_any_other_key_when_absent_from_the_text(self):
+        """The enrolled name is entered as an additional forward key on
+        the speaker group (pass 1b) whenever it is not already a member;
+        it is then an ordinary member for pass 4's prune, same as any
+        other key — absent from ``tag_text``, it is dropped and recorded
+        with ``category=""`` (the speaker group mints nothing, so it
+        carries no mint prefix), while the surface that actually folded
+        survives."""
+        scans = (ScanResult(category=ScrubCategory("Person"), values=("ALEX",)),)
+        table = _build(
+            scans,
+            "ALEX said hi.",
+            speaker_id="speaker1",
+            speaker_name="Alex",
+        )
+        assert table.forward == {"ALEX": "speaker1"}
+        [entry] = table.inert_entries
+        assert entry == {"category": "", "side": "table", "text": "Alex", "reason": "inert"}
+
+    def test_containment_matching_is_case_sensitive(self):
+        """``_whole_word_contains`` folds only through ``canonical(...,
+        mode="spaces")`` — blanks only, case and diacritics preserved —
+        unlike pass 1's canonical-equality SHARE, which folds full
+        casefold. Two surfaces differing only in case ("MIRA" vs "Mira
+        Santos") are therefore never pooled by containment, even though
+        "MIRA" would be a substring of "Mira Santos" case-insensitively;
+        each mints its own placeholder."""
+        scans = (ScanResult(category=ScrubCategory("Person"), values=("MIRA", "Mira Santos")),)
+        table = _build(scans, "MIRA and Mira Santos both replied.")
+        assert table.forward == {"MIRA": "Person_1", "Mira Santos": "Person_2"}
+
+    def test_containment_pooling_never_crosses_a_category_boundary(self):
+        """Pass 2's containment loop is scoped per category ``idx``: the
+        candidate containers considered for a judged group are only that
+        SAME category's own ``surfaces`` list, and only that category's
+        OWN groups (``owner == idx``) are ever judged. A surface scanned
+        under one category is never absorbed by a same-text container
+        scanned under a DIFFERENT category, even when one textually
+        contains the other."""
+        scans = (
+            ScanResult(category=ScrubCategory("Person"), values=("Bettina",)),
+            ScanResult(category=ScrubCategory("Artist"), values=("Bettina Schuster",)),
+        )
+        table = _build(scans, "Bettina Schuster and Bettina performed.")
+        assert table.forward == {"Bettina": "Person_1", "Bettina Schuster": "Artist_1"}

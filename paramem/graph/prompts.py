@@ -88,13 +88,15 @@ _REQUIRED_PROMPT_FILES = (
 
 # The sectioned local-anonymization prompt home
 # (`paramem.graph.anonymizer_prompts.load_anonymizer_prompts` is the one
-# composer that reads it). Every section here is required — an anchor call
-# with a missing section would otherwise fail at the first request that
-# needs it rather than at boot. The home is anchor-only and
-# category-independent: every render is the same two sections regardless of
-# the configured scrub categories.
+# composer that reads it). Every section here is required — a scan or
+# anchor call with a missing section would otherwise fail at the first
+# request that needs it rather than at boot. The SCAN section carries the
+# configured categories only through its own `{keywords}` render slot,
+# formatted per call — the home itself takes no category argument.
 _ANONYMIZATION_PROMPT_FILE = "anonymization.txt"
 _ANONYMIZATION_REQUIRED_SECTIONS = (
+    "SCAN-SYSTEM",
+    "SCAN",
     "ANCHOR-SYSTEM",
     "ANCHOR",
 )
@@ -104,6 +106,7 @@ _ANONYMIZATION_REQUIRED_SECTIONS = (
 # rather than raising, because `str.format` ignores a slot the section text
 # never references.
 _ANONYMIZATION_SECTION_SLOTS: dict[str, tuple[str, ...]] = {
+    "SCAN": ("{keywords}", "{text}"),
     "ANCHOR": ("{speaker_id}", "{values}", "{text}"),
 }
 
@@ -268,9 +271,9 @@ def _load_prompt_sections(filename: str, *, prompts_dir: Path | None = None) -> 
     * ``serving_directives.txt`` — ``IDENTITY-LINE``, ``LANGUAGE-LINE``,
       ``REASONING-TURN``, ``RECORDED-DATES-SUFFIX``, ``EMPTY-PERIOD-NOTE``,
       the serving turn's slot-bearing fragments (:mod:`paramem.server.prompts`).
-    * ``anonymization.txt`` — the local-anonymizer home: ``ANCHOR-SYSTEM``
-      and ``ANCHOR``, the two sections every render composes, regardless of
-      the configured scrub categories — composed by
+    * ``anonymization.txt`` — the local-anonymizer home: ``SCAN-SYSTEM``,
+      ``SCAN``, ``ANCHOR-SYSTEM`` and ``ANCHOR``, the four sections every
+      render composes — composed by
       :func:`paramem.graph.anonymizer_prompts.load_anonymizer_prompts`.
 
     The file is read via :func:`_load_prompt` rather than a bare

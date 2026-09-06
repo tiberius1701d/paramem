@@ -771,7 +771,7 @@ class TestRelationsFromSnapshot:
         snap_path = tmp_path / "graph_merged_snapshot.json"
         snap_path.write_text(json.dumps(snap), encoding="utf-8")
 
-        relations = calibrate._relations_from_snapshot(str(snap_path))
+        relations = calibrate.relations_from_snapshot(str(snap_path))
 
         assert len(relations) == 2
         assert "speaker_id" not in relations[0]
@@ -793,7 +793,7 @@ class TestRelationsFromSnapshot:
         snap_path = tmp_path / "graph_merged_snapshot.json"
         snap_path.write_text(json.dumps(snap), encoding="utf-8")
 
-        relations = calibrate._relations_from_snapshot(str(snap_path))
+        relations = calibrate.relations_from_snapshot(str(snap_path))
 
         assert relations[0]["speaker_id"] == "speaker3"
 
@@ -863,7 +863,7 @@ class TestCalibrateNormalize:
         """A snapshot edge carrying no ``speaker_id`` reaches the merger's
         ``Relation`` construction through the dispatcher's structural
         ``"speaker0"`` default — not an empty string baked in by the
-        reader. Mutation: reverting ``_relations_from_snapshot`` to always
+        reader. Mutation: reverting ``relations_from_snapshot`` to always
         emit ``speaker_id`` (even as ``""``) makes this fail, since ``""``
         is present and skips the ``.get(..., "speaker0")`` default."""
         snap = {

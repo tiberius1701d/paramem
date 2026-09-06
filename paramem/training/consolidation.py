@@ -788,7 +788,7 @@ class ConsolidationLoop:
         # list already resolved once at config construction — so consolidation
         # honours the same operator policy as inference-time cloud egress.
         # Required — no implicit default anywhere below the config layer (the
-        # tagger's configured labels are the sole scope authority; a
+        # operator's ``scrub`` selection is the sole scope authority; a
         # graph-layer fallback constant would be a duplicated, out-of-layer
         # privacy policy — see ``paramem/cloud/placeholders.py``'s
         # ``build_forward_table`` docstring).
@@ -3031,9 +3031,9 @@ class ConsolidationLoop:
             "Graph-tier cloud enrichment degraded (merged graph, full fold "
             "only) — VRAM exhausted; kept already-merged chunks"
         ),
-        "tagger": (
+        "scan_failed": (
             "Graph-tier cloud enrichment degraded (merged graph, full fold "
-            "only) — span tagger unavailable; kept already-merged chunks"
+            "only) — SCAN call failed; kept already-merged chunks"
         ),
     }
 
@@ -3046,11 +3046,11 @@ class ConsolidationLoop:
         :func:`~paramem.training.graph_enrich.enrich_graph` returns.
         ``aborted_reason`` names which degrade stopped the chunk loop
         early — ``"vram"`` (:class:`~paramem.utils.vram_guard.VramExhausted`)
-        or ``"tagger"`` (the span tagger unavailable, or its model call
-        raised) — while keeping whatever the pass already merged rather
-        than aborting the fold. Each reason records under its own key
-        (``graph_enrich_vram`` / ``graph_enrich_tagger``) so the two
-        degrades are distinguishable in the incident store. Severity
+        or ``"scan_failed"`` (the SCAN call's reply failed to parse, or its
+        budget precondition refused it) — while keeping whatever the pass
+        already merged rather than aborting the fold. Each reason records
+        under its own key (``graph_enrich_vram`` / ``graph_enrich_scan_failed``)
+        so the two degrades are distinguishable in the incident store. Severity
         ``"warning"`` (the fold succeeds regardless): enrichment
         self-heals at the next FULL fold, since the pass runs over the
         cumulative graph every full fold (never at an intervening interim

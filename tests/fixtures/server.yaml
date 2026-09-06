@@ -412,7 +412,12 @@ cloud:
   # returns the canned limited-mode reply rather than routing the household's
   # questions to a third party you did not choose for them. Deliberate
   # cloud-only (`cloud_only: true`, POST /gpu/release) and transient internal
-  # states (training, live reload) are NOT gated by this and always proceed.
+  # states (training, live reload) are NOT gated by this flag; under
+  # `sanitization.cloud_mode: block` they always proceed. Under `anonymize`
+  # or `both` the cloud leg's anonymizer needs the local model resident, so
+  # a cloud-only server — deliberate or degraded alike — answers through HA
+  # or the canned limited-mode reply on that leg instead, whatever this
+  # flag says; `block` is unaffected either way.
   allow_degraded_serving: false
 
 # --- Agents ---
@@ -484,15 +489,16 @@ tools:
 #                                  Cloud only ever sees non-personal text, and
 #                                  even that is placeholder-substituted.
 #
-# `scrub` names what counts as in scope: a small, dedicated, CPU-only
-# detection model (`span_tagger` below) marks every value belonging to a
-# configured hint, and the pipeline, never a model, mints and substitutes
-# every placeholder — there is no code-side entity-type gate. See
-# SECURITY.md for the residual this leaves.
+# `scrub` names what counts as in scope: the resident conversational model
+# reads the outbound payload once and names every value it finds with a
+# keyword from `configs/schema.yaml`, and the pipeline, never the model,
+# decides which keyword's values are kept and mints and substitutes every
+# placeholder — there is no code-side entity-type gate. See SECURITY.md for
+# the residual this leaves.
 #
-# HA path (HA conversation agent) is NOT affected by `cloud_mode`. HA receives
-# cleartext, gated by intent classification. Hardening the HA hop is a planned
-# follow-up package.
+# HA path (HA conversation agent) is NOT affected by `cloud_mode`/`scrub` at
+# all: the HA leg carries every turn verbatim, unconditionally, on every
+# routing path that reaches it.
 #
 # Cloud reachability is independent: with `cloud.enabled: false` (or no API key
 # env var), no queries reach cloud regardless of `cloud_mode`.
@@ -500,44 +506,20 @@ sanitization:
   cloud_mode: anonymize  # block | anonymize | both — direct-cloud egress policy
   # Empty on purpose: this fixture is egress-capable unconditionally
   # (cloud.enabled: true above, cloud_mode: anonymize on this same block),
-  # so a non-empty scrub would make span_tagger load the real checkpoint
-  # at every test run. Anonymize tests set categories in code and inject
-  # a tagger test double instead (the project's per-test value-override
-  # rule).
+  # so a non-empty scrub would make every such test's anonymize() call
+  # issue a real SCAN generate() call against the resident model. Anonymize
+  # tests set categories in code instead (the project's per-test
+  # value-override rule).
   scrub: []
 
 # ============================================================================
-# SPAN TAGGER (cloud-egress anonymizer)
+# CPU
 # ============================================================================
-# The local anonymizer identifies the values named by `sanitization.scrub`
-# with a small CPU-only detection model, loaded once at startup from the
-# Hugging Face cache exactly like the conversational model.  It runs on the
-# CPU and never competes for the GPU.  It is loaded only when this
-# deployment can actually reach a cloud with scrubbing on — a non-empty
-# `sanitization.scrub` together with either a usable cloud enrichment
-# provider or `cloud.enabled` plus `cloud_mode: anonymize|both`.  In that
-# case the server refuses to start when the model cannot be resolved;
-# otherwise it starts without it.  With the model absent, no anonymized
-# payload is ever produced — outbound calls that would need one are
-# declined rather than sent unmasked.  The first start on a machine that
-# has never loaded it downloads it (about 1.2 GB, plus its encoder's
-# tokenizer); afterwards it is served from the cache.
-#
-# checkpoint:      Hugging Face model id of the detection model.
-# revision:        exact commit of that model — pinned so an upstream
-#                  change cannot alter what this deployment scrubs.
-# score_threshold: minimum confidence for a value to be treated as in
-#                  scope.  Lower marks more (over-scrubbing costs cloud
-#                  utility); higher marks less (under-scrubbing sends real
-#                  data).  Re-measure against a labelled sample after any
-#                  checkpoint change.
-# threads:         CPU threads the detector may use.  Host-dependent: too
-#                  many oversubscribes the machine and gets dramatically
-#                  SLOWER, not faster.  This setting is process-wide.
-span_tagger:
-  checkpoint: urchade/gliner_multi_pii-v1
-  revision: 1fcf13e85f4eef5394e1fcd406cf2ca9ea82351d
-  score_threshold: 0.4
+# threads: the process-wide CPU thread count for torch, applied before the
+#          speaker-embedding, text-to-speech and sentence-encoder loads at
+#          startup.  Host-dependent: too many threads oversubscribes the
+#          machine and gets dramatically SLOWER, not faster.
+cpu:
   threads: 8
 
 # ============================================================================

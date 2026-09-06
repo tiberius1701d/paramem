@@ -25,8 +25,8 @@ union of the intent classifier's ``PERSONAL`` verdict and
 :func:`~paramem.server.sanitizer.is_self_referential`'s verdict on the
 raw text.  It travels the call tree as ``is_personal`` and gates the
 CLOUD leg and the choice of the local parametric-memory probe branch — the
-HA leg stays reachable on every path and is scrubbed under
-``sanitization.scrub`` regardless of the verdict.  The one exception is
+HA leg stays reachable on every path and carries the turn verbatim
+regardless of the verdict.  The one exception is
 the model-authored forwarded query behind ``[ESCALATE]``: it is a
 different artifact from the turn, so :func:`_maybe_escalate` computes a
 second verdict on it with the same predicate and suppresses the HA hop
@@ -64,7 +64,6 @@ from paramem.server.chat_result import ChatResult
 from paramem.server.config import ServerConfig
 from paramem.server.egress import LEG_NAMES, OutboundText, answer_via_cloud, answer_via_ha
 from paramem.server.escalation import detect_escalation
-from paramem.server.ha_graph import HAEntityGraph
 from paramem.server.prompts import (
     empty_period_note,
     identity_line,
@@ -300,7 +299,6 @@ def handle_chat(
     speaker_id: str | None = None,
     language: str | None = None,
     effective_mode: str | None = None,
-    ha_graph: HAEntityGraph | None = None,
     forced_leg: str | None = None,
 ) -> ChatResult:
     """Process a chat message via intent-keyed dispatch.
@@ -328,7 +326,7 @@ def handle_chat(
     the speaker is therefore personal too, even though the classifier
     said otherwise.  The verdict gates the CLOUD leg and selects the
     local parametric-memory probe branch; the HA leg stays reachable on
-    every path and is scrubbed under ``sanitization.scrub`` regardless of
+    every path and carries the turn verbatim regardless of
     the verdict, and a personal turn that neither HA nor the cloud
     answered falls to abstention before the base model.
 
@@ -348,9 +346,6 @@ def handle_chat(
     function exit.
 
     Args:
-        ha_graph: The live HA entity graph (``_state["ha_graph"]``), or
-            ``None`` when HA is not configured or its build failed at
-            boot — retains nothing in that case, never "send verbatim".
         forced_leg: The probe door's resolved route (``None`` on every
             production ``/chat``/``/voice`` turn — the routed dispatch
             below), or ``"ha"``/``"cloud"`` to select exactly one leg.
@@ -450,7 +445,6 @@ def handle_chat(
                     effective_mode=effective_mode,
                     is_personal=True,
                     memory_store=memory_store,
-                    ha_graph=ha_graph,
                 )
 
             # COMMAND / GENERAL / UNKNOWN (and the defensive PERSONAL-without-
@@ -473,7 +467,7 @@ def handle_chat(
             )
             if _leg_open(forced_leg, "ha"):
                 logger.info("Intent dispatch: %s → HA door first", intent_label)
-                result = answer_via_ha(outbound, ha_client, ha_graph=ha_graph)
+                result = answer_via_ha(outbound, ha_client)
                 if result is not None:
                     routing_diags["exit_via"] = f"{intent_label}_ha"
                     return result
@@ -529,7 +523,6 @@ def handle_chat(
                 speaker_id=speaker_id,
                 language=language,
                 is_personal=is_personal,
-                ha_graph=ha_graph,
             )
 
     try:
@@ -733,7 +726,6 @@ def _probe_and_reason(
     language: str | None = None,
     is_personal: bool = False,
     effective_mode: str | None = None,
-    ha_graph: HAEntityGraph | None = None,
 ) -> ChatResult:
     """Probe adapters in memory hierarchy order, assemble layered context.
 
@@ -934,7 +926,6 @@ def _probe_and_reason(
                     model=model,
                     tokenizer=tokenizer,
                     is_truncated=is_truncated,
-                    ha_graph=ha_graph,
                 )
 
         # Build ordered keys_by_adapter dict from routing steps.
@@ -1032,7 +1023,7 @@ def _probe_and_reason(
                 language=language,
                 is_personal=is_personal,
             )
-            result = answer_via_ha(outbound, ha_client, ha_graph=ha_graph)
+            result = answer_via_ha(outbound, ha_client)
             if result is not None:
                 return result
             cloud_result = answer_via_cloud(outbound, cloud_agent)
@@ -1074,7 +1065,6 @@ def _probe_and_reason(
                 speaker_id=speaker_id,
                 language=language,
                 is_personal=is_personal,
-                ha_graph=ha_graph,
             )
 
         total_facts = sum(len(f) for f in layers.values())
@@ -1152,7 +1142,6 @@ def _probe_and_reason(
             model=model,
             tokenizer=tokenizer,
             is_truncated=is_truncated,
-            ha_graph=ha_graph,
         )
 
     result = _run()
@@ -1174,7 +1163,6 @@ def _base_model_answer(
     speaker_id: str | None = None,
     language: str | None = None,
     is_personal: bool = False,
-    ha_graph: HAEntityGraph | None = None,
 ) -> ChatResult:
     """Answer from base model without context — escalation candidate.
 
@@ -1184,10 +1172,7 @@ def _base_model_answer(
     unchanged to :func:`_maybe_escalate` (and, through it, to
     :func:`~paramem.server.egress.answer_via_cloud`) so a [ESCALATE] cloud
     hop from this leg authors the egress record into the same dict the
-    caller merges onto its returned :class:`ChatResult`.  ``ha_graph`` is
-    threaded the same way, to the [ESCALATE] HA hop, so a hop reached from
-    this direct call site retains HA-registered names exactly like every
-    other HA send.
+    caller merges onto its returned :class:`ChatResult`.
     """
     response, is_truncated = _generate_local_reply(
         text,
@@ -1213,7 +1198,6 @@ def _base_model_answer(
         model=model,
         tokenizer=tokenizer,
         is_truncated=is_truncated,
-        ha_graph=ha_graph,
     )
 
 
@@ -1337,7 +1321,6 @@ def _maybe_escalate(
     model=None,
     tokenizer=None,
     is_truncated: bool = False,
-    ha_graph: HAEntityGraph | None = None,
 ) -> ChatResult:
     """Check for [ESCALATE] tag and route through the HA door then the cloud door.
 
@@ -1407,10 +1390,10 @@ def _maybe_escalate(
         # whitespace/a bare ":") — there is no forwarded query to
         # escalate, so neither door (answer_via_ha, answer_via_cloud) is
         # consulted.  Building an OutboundText from it and calling either
-        # door would hand it an empty transcript, a caller-side
-        # precondition failure neither door has a cause for (see
-        # egress._refuse_failed_contract, which only recognises "tagger"
-        # and "guard").
+        # door would hand it an empty transcript — a caller-side
+        # precondition an empty anonymize_turn call refuses on
+        # (raises ValueError), not a cause either door's own refusal
+        # vocabulary carries.
         return _pre_escalation_result(response)
 
     forwarded_is_personal = is_self_referential(
@@ -1439,7 +1422,7 @@ def _maybe_escalate(
         )
     else:
         logger.info("[ESCALATE] → HA door (intent=%s): %s", intent_label, forwarded_query[:100])
-        result = answer_via_ha(forwarded, ha_client, ha_graph=ha_graph)
+        result = answer_via_ha(forwarded, ha_client)
         if result is not None:
             return result
     cloud_result = answer_via_cloud(forwarded, cloud_agent)
