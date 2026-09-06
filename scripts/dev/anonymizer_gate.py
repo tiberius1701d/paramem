@@ -17,18 +17,38 @@ Usage::
       $HOME/miniforge3/envs/paramem/bin/python \\
       scripts/dev/anonymizer_gate.py [options]
 
-The tool always runs inside the experiment GPU guard (the server released
-for the whole run) and restores the server's GPU with ``POST <--server
-URL>/gpu/acquire`` in a ``finally``, retrying on a busy server (503 while a
-fold runs, 409 during a base swap). ``--dry-run`` is the one mode that
-touches neither the GPU nor a model — it only assembles the corpus and
-validates its shape.
+A model-bearing run runs inside the experiment GPU guard (the server
+released for the whole run) and restores the server's GPU with ``POST
+<--server URL>/gpu/acquire`` in a ``finally``, retrying on a busy server
+(503 while a fold runs, 409 during a base swap). Two modes never touch a
+model or the GPU: ``--dry-run``, which assembles and validates the corpus
+then loads the bare tokenizer on the CPU
+(:func:`~paramem.models.loader.load_tokenizer`) to re-measure the two
+anonymizer prompt skeletons (see below); and ``--resume`` onto a run
+directory that is already complete — every corpus entry (after any
+``--limit``) already has a written artifact on disk — which scores
+straight from those artifacts instead of running anything, also loading
+only the bare tokenizer for the same skeleton print. A ``--resume`` run
+still missing entries, or any run without ``--resume``, proceeds under the
+GPU guard as normal.
 
 The corpus run chunks its GPU burst: every ``--cooldown-every`` (default
 20) model-bearing entries, the tool pauses for the GPU to cool
 (``wait_for_cooldown``) before continuing, the same chunked-burst pattern
 any long GPU run in this project uses. ``--dry-run`` never runs a
 model-bearing entry, so it never pauses.
+
+Every run, ``--dry-run`` included, re-measures the SCAN and ANCHOR prompt
+skeletons against their pinned reference constants
+(``paramem.utils.tokens.ANONYMIZE_SCAN_PROMPT_SKELETON_TOKENS`` /
+``ANONYMIZE_ANCHOR_PROMPT_SKELETON_TOKENS``): it renders each section with
+an empty payload through the production section renderers
+(``paramem.cloud.anonymize_steps.render_scan_section`` /
+``render_anchor_section``) and the production chat template
+(``paramem.cloud.anonymize_steps.render_call_prompt``), counts each
+directly with the tokenizer (``paramem.utils.tokens.encode_rendered``,
+never ``estimate_tokens``), and prints measured against reference for
+both.
 
 The category set scrubbed is never read from a live server config's
 ``sanitization.scrub`` — ``tests/fixtures/server.yaml`` deliberately empties
@@ -53,6 +73,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import json
 import sys
 import time
@@ -363,6 +384,8 @@ class Result:
     unknown_word_census: Counter = field(default_factory=Counter)
     unknown_word_by_word: Counter = field(default_factory=Counter)
     skipped: list = field(default_factory=list)
+    skipped_gold_names: int = 0
+    skipped_gold_contact: int = 0
 
 
 def score_entry(
@@ -501,7 +524,13 @@ def score_corpus(
 
     An entry whose contract is missing or did not complete
     (``opted_out``/``failed``) contributes no gold coverage and is listed
-    in :attr:`Result.skipped` rather than silently dropped.
+    in :attr:`Result.skipped` rather than silently dropped; its gold values
+    are tallied into :attr:`Result.skipped_gold_names` /
+    :attr:`Result.skipped_gold_contact` so the printed detail can state how
+    much gold sits outside the recall percentages. The tally counts only
+    gold categories in *configured* — the same gate the percentages' own
+    denominators (``gold_names``/``gold_contact``) apply — so an
+    out-of-scope category never inflates the excluded-gold count.
     """
     result = Result()
     for entry in entries:
@@ -509,6 +538,13 @@ def score_corpus(
         if contract is None or contract.status != "ok":
             status = contract.status if contract is not None else "missing"
             result.skipped.append((entry["id"], status))
+            for gold in entry["gold"]:
+                if gold["category"] not in configured:
+                    continue
+                if gold["category"] == "Person":
+                    result.skipped_gold_names += 1
+                if gold["category"] in _CONTACT_PREFIXES:
+                    result.skipped_gold_contact += 1
             continue
         score_entry(entry, contract, configured, result)
     return result
@@ -533,12 +569,17 @@ _HIGHER_IS_BETTER = (
     "contact",
     "precision",
 )
-_LOWER_IS_BETTER = ("junk", "wrong_type", "partial", "unsubstitutable")
+_LOWER_IS_BETTER = ("junk", "wrong_type", "partial", "unsubstitutable", "failed")
 
 
 def scorecard_dict(r: Result) -> dict:
     """The scorecard's primary columns, as a plain dict — the shape both
     ``baseline.json`` and the regression check read.
+
+    ``failed`` is the count of entries whose contract did not complete
+    (every entry :func:`score_corpus` lists in :attr:`Result.skipped`) —
+    lower is better, carried in the baseline file and the regression check
+    alongside the other primary columns.
     """
     tot = r.tot
     low = r.by_casing["lower"]
@@ -556,6 +597,7 @@ def scorecard_dict(r: Result) -> dict:
         "wrong_type": tot["scrubbed_wrong_type"],
         "partial": tot["partial_in_scope"],
         "unsubstitutable": tot["unsubstitutable"],
+        "failed": len(r.skipped),
     }
 
 
@@ -580,6 +622,12 @@ def regression_columns(current: dict, baseline: dict) -> list[str]:
 def print_detail(r: Result) -> None:
     """Print the run's aggregates and the FULL junk, miss, partial, inert
     and unknown-word lists, for the owner's reading.
+
+    States the recall denominators explicitly: after the skipped-entry
+    list, one line gives how many gold values the skipped (failed) entries
+    hold — split into names (``Person``) and contact — so a recall
+    percentage is always read beside the share of the corpus it does not
+    cover.
     """
     tot = r.tot
     print("\n" + "=" * 72)
@@ -589,6 +637,10 @@ def print_detail(r: Result) -> None:
     if r.skipped:
         for entry_id, status in r.skipped:
             print(f"    skipped {entry_id}: status={status}")
+    print(
+        f"  skipped-entry gold outside the percentages: "
+        f"names {r.skipped_gold_names}, contact {r.skipped_gold_contact}"
+    )
     print(
         f"  in-scope gold {tot['gold_in_scope']} (names {tot['gold_names']}, "
         f"contact {tot['gold_contact']})   out-of-scope gold {tot['gold_out_scope']}"
@@ -648,18 +700,101 @@ def print_scorecard(scorecard: dict) -> None:
 # ---------------------------------------------------------------------------
 
 
-def load_baseline(path: Path = _BASELINE_PATH) -> dict | None:
-    """The last accepted scorecard, or ``None`` when no baseline exists yet."""
+def load_baseline(path: Path) -> dict | None:
+    """The last accepted scorecard, or ``None`` when no baseline exists yet.
+
+    Args:
+        path: Baseline file path. No import-time default — ``main``
+            resolves the module constant ``_BASELINE_PATH`` once and
+            threads it through explicitly, so a test that redirects the
+            baseline redirects it the same way it redirects every other
+            disk access this tool makes.
+    """
     if not path.exists():
         return None
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def write_baseline(scorecard: dict, *, source: str, path: Path = _BASELINE_PATH) -> None:
-    """Record *scorecard* as the new accepted baseline, tagged with *source*."""
+def write_baseline(scorecard: dict, *, source: str, path: Path) -> None:
+    """Record *scorecard* as the new accepted baseline, tagged with *source*.
+
+    Args:
+        scorecard: The primary-column scorecard to record.
+        source: Free-text provenance for the accepted run (e.g. its run
+            directory name).
+        path: Baseline file path. No import-time default — see
+            :func:`load_baseline`.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {**scorecard, "source": source}
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def _score_and_report(
+    entries: list[dict],
+    contracts: dict[str, AnonymizedContract],
+    configured: set[str],
+    run_dir: Path,
+    baseline_path: Path,
+    *,
+    accept: bool,
+    write_scorecard: bool,
+) -> int:
+    """The one scoring-and-verdict sequence: score *contracts*, print the
+    detail and scorecard, compare against the last accepted baseline, and
+    optionally accept a new one — reached by both the guarded (model-
+    bearing) run and the score-only path (:func:`_score_from_disk`) so
+    there is exactly one place this sequence is written.
+
+    Args:
+        entries: The (possibly ``--limit``-sliced) corpus entries.
+        contracts: Every entry's completed contract, keyed by entry id —
+            freshly run or loaded from a prior run's artifacts.
+        configured: The active scrub categories' prefixes.
+        run_dir: The run directory the scorecard is written beside.
+        baseline_path: The accepted-baseline file path, resolved once by
+            ``main`` from the module constant ``_BASELINE_PATH`` and
+            threaded through explicitly.
+        accept: Whether to record this run's scorecard as the new baseline
+            (``--accept``; already refused together with ``--limit`` by the
+            caller).
+        write_scorecard: Whether to write ``run_dir/scorecard.json``.
+            ``False`` when ``--limit`` sliced the entries, so a pilot
+            slice never overwrites a complete run's own full-corpus
+            scorecard.
+
+    Returns:
+        ``0`` always.
+
+    Raises:
+        AssertionError: ``score_corpus`` (via ``score_entry``'s
+            ``_self_check``) raises when the scorer's own reconstruction
+            of what substitutes disagrees with production's own
+            substitution walk over the reconstructed payload text — never
+            a normal scoring outcome.
+    """
+    result = score_corpus(entries, contracts, configured)
+    print_detail(result)
+    scorecard = scorecard_dict(result)
+    print_scorecard(scorecard)
+
+    baseline = load_baseline(baseline_path)
+    if baseline is None:
+        print("\nno accepted baseline on disk yet")
+    else:
+        regressed = regression_columns(scorecard, baseline)
+        if regressed:
+            print(f"\nREGRESSION on columns: {regressed}")
+        else:
+            print("\nno regression against the accepted baseline")
+
+    if accept:
+        write_baseline(scorecard, source=f"run {run_dir.name}", path=baseline_path)
+        print(f"baseline accepted from run {run_dir.name}")
+
+    if write_scorecard:
+        (run_dir / "scorecard.json").write_text(json.dumps(scorecard, indent=2), encoding="utf-8")
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -667,12 +802,27 @@ def write_baseline(scorecard: dict, *, source: str, path: Path = _BASELINE_PATH)
 # ---------------------------------------------------------------------------
 
 
-def _new_run_dir(root: Path = _RUN_ROOT) -> Path:
+def _new_run_dir(root: Path) -> Path:
+    """A fresh, timestamped run directory path under *root*.
+
+    Args:
+        root: The run root. No import-time default — ``main`` resolves
+            the module constant ``_RUN_ROOT`` once and threads it through
+            explicitly, so a test that redirects the run root redirects
+            it the same way it redirects every other disk access this
+            tool makes.
+    """
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     return root / stamp
 
 
-def _latest_run_dir(root: Path = _RUN_ROOT) -> Path | None:
+def _latest_run_dir(root: Path) -> Path | None:
+    """The most recent run directory under *root*, or ``None`` when *root*
+    does not exist or holds none.
+
+    Args:
+        root: The run root. No import-time default — see :func:`_new_run_dir`.
+    """
     if not root.exists():
         return None
     candidates = [d for d in root.iterdir() if d.is_dir()]
@@ -716,7 +866,9 @@ def _write_entry_artifact(
 
 def _load_entry_artifact(base_dir: Path, entry_id: str) -> AnonymizedContract | None:
     """Reconstruct the :class:`AnonymizedContract` fields the scorer reads
-    from a previously written artifact — the ``--resume`` read path.
+    from a previously written artifact — the ``--resume`` read path, and
+    the score-only path's (:func:`_score_from_disk`) only source of
+    contracts.
     """
     path = _entry_artifact_path(base_dir, entry_id)
     if not path.exists():
@@ -737,6 +889,223 @@ def _load_entry_artifact(base_dir: Path, entry_id: str) -> AnonymizedContract | 
         scan_dropped=0,
         scan_dropped_entries=data["scan_dropped_entries"],
         inert_dropped=data["inert_dropped"],
+    )
+
+
+def _run_dir_complete(entries: list[dict], run_dir: Path) -> bool:
+    """Whether every entry in *entries* (after any ``--limit``) already has
+    a written artifact under ``run_dir/entries`` — the score-only path's
+    completeness test. A freshly created run directory (no ``--resume``,
+    or ``--resume`` with nothing yet on disk) is never complete, so this
+    always answers ``False`` for a run that has not actually finished. An
+    empty *entries* list is never complete either — no entries were ever
+    run, so there is nothing to score from disk.
+    """
+    entries_dir = run_dir / "entries"
+    return bool(entries) and all(
+        _entry_artifact_path(entries_dir, entry["id"]).exists() for entry in entries
+    )
+
+
+@dataclass
+class RunRecord:
+    """The provenance a run directory pins at creation: the scrub prefixes
+    configured, the model id loaded, the ``--prompt-file`` path (or
+    ``None`` for the shipped prompt home), and ``prompt_sha256`` — the
+    sha256 hex digest of the prompt file's text, or ``None`` when no
+    override was given. One shape serves both roles — what a fresh run
+    directory writes (:func:`_write_run_record`) and what the current
+    invocation's own values are compared against
+    (:func:`_current_run_record`, :func:`_report_run_record`) — so there is
+    no second JSON layout for the same provenance.
+    """
+
+    configured_prefixes: list[str]
+    model_id: str
+    prompt_file: str | None
+    prompt_sha256: str | None = None
+
+
+def _run_record_path(run_dir: Path) -> Path:
+    return run_dir / "run.json"
+
+
+def _current_run_record(
+    *,
+    configured: set[str],
+    model_id: str,
+    prompt_file: Path | None,
+    prompt_override_text: str | None = None,
+) -> RunRecord:
+    """Build the :class:`RunRecord` for this invocation's own values —
+    used both to write a fresh run directory's ``run.json`` and to compare
+    against a prior run's recorded one. ``prompt_sha256`` is the sha256 hex
+    digest of *prompt_override_text* when given, else ``None`` — the same
+    digest a fresh run directory pins and a later score-from-disk
+    invocation compares against.
+    """
+    return RunRecord(
+        configured_prefixes=sorted(configured),
+        model_id=model_id,
+        prompt_file=str(prompt_file) if prompt_file is not None else None,
+        prompt_sha256=(
+            hashlib.sha256(prompt_override_text.encode("utf-8")).hexdigest()
+            if prompt_override_text is not None
+            else None
+        ),
+    )
+
+
+def _write_run_record(run_dir: Path, record: RunRecord) -> None:
+    """Write *record* to *run_dir*'s ``run.json`` — called once, by ``main``,
+    only when it creates a fresh run directory. ``--resume`` onto an
+    existing run directory never calls this, so the record always reflects
+    the run's original configuration.
+    """
+    _run_record_path(run_dir).write_text(
+        json.dumps(
+            {
+                "configured_prefixes": record.configured_prefixes,
+                "model_id": record.model_id,
+                "prompt_file": record.prompt_file,
+                "prompt_sha256": record.prompt_sha256,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
+def _read_run_record(run_dir: Path) -> RunRecord | None:
+    """Read *run_dir*'s ``run.json``, or ``None`` when the directory holds
+    no record file.
+    """
+    path = _run_record_path(run_dir)
+    if not path.exists():
+        return None
+    data = json.loads(path.read_text(encoding="utf-8"))
+    return RunRecord(
+        configured_prefixes=data["configured_prefixes"],
+        model_id=data["model_id"],
+        prompt_file=data["prompt_file"],
+        prompt_sha256=data["prompt_sha256"],
+    )
+
+
+def _report_run_record(run_dir: Path, current: RunRecord) -> None:
+    """Print *run_dir*'s recorded provenance beside *current*'s own values,
+    naming any field that differs — never a refusal; a complete run
+    directory is always scored from its entry files as written, and the
+    operator reads the mismatch to decide whether the re-score is
+    meaningful. A run directory with no record file prints that fact
+    instead and scores anyway.
+
+    The prompt-file comparison is by content: ``prompt_sha256`` is the
+    sha256 hex digest of the prompt override text (or ``None`` when no
+    ``--prompt-file`` was given), so it names a difference whenever the
+    override's actual content changed — including one side carrying no
+    override at all — never merely whether a ``--prompt-file`` was given.
+    """
+    record = _read_run_record(run_dir)
+    if record is None:
+        print(f"run {run_dir.name} carries no run.json record")
+        return
+
+    print(
+        f"run {run_dir.name} recorded: prefixes={record.configured_prefixes} "
+        f"model_id={record.model_id!r} prompt_file={record.prompt_file!r}"
+    )
+
+    differing = []
+    if current.configured_prefixes != record.configured_prefixes:
+        differing.append("configured prefixes")
+    if current.model_id != record.model_id:
+        differing.append("model id")
+    if current.prompt_sha256 != record.prompt_sha256:
+        differing.append("prompt sha256")
+    if differing:
+        print(f"differs from this invocation: {', '.join(differing)}")
+
+
+def _score_from_disk(
+    entries: list[dict],
+    model_cfg,
+    configured: set[str],
+    run_dir: Path,
+    prompt_override_text: str | None,
+    baseline_path: Path,
+    prompt_file: Path | None,
+    *,
+    accept: bool,
+    write_scorecard: bool,
+) -> int:
+    """Score a complete run directory from its entry artifacts alone.
+
+    No GPU is acquired and no model is loaded: only the bare tokenizer
+    (:func:`~paramem.models.loader.load_tokenizer`) for the skeleton
+    re-measurement print every run makes. Every entry's contract comes from
+    :func:`_load_entry_artifact`, over the same artifact reader
+    ``--resume`` already uses — this is not a second reader. Delegates the
+    scoring, detail print, scorecard, baseline comparison and ``--accept``
+    handling to :func:`_score_and_report`, the one sequence the guarded
+    (model-bearing) run also uses.
+
+    Args:
+        entries: The (possibly ``--limit``-sliced) corpus entries; every
+            one of them is already known to have an artifact on disk (see
+            :func:`_run_dir_complete`).
+        model_cfg: The resolved model config, used only to load the bare
+            tokenizer for the skeleton print — never a model.
+        configured: The active scrub categories' prefixes.
+        run_dir: The complete run directory being re-scored.
+        prompt_override_text: The ``--prompt-file`` contents to measure the
+            skeletons under, or ``None`` for the shipped prompt home.
+        baseline_path: The accepted-baseline file path, resolved once by
+            ``main`` and threaded through explicitly.
+        prompt_file: This invocation's own ``--prompt-file`` path, or
+            ``None`` — compared against the run directory's recorded
+            provenance (see :func:`_report_run_record`).
+        accept: Whether to record this run's scorecard as the new baseline.
+        write_scorecard: Whether to write ``run_dir/scorecard.json``
+            (``False`` under ``--limit``; see :func:`_score_and_report`).
+
+    Returns:
+        ``0`` always.
+
+    Raises:
+        AssertionError: Via :func:`_score_and_report`'s own scoring call —
+            the scorer's self-check disagreeing with production's own
+            substitution walk; never a normal scoring outcome.
+    """
+    from paramem.models.loader import load_tokenizer
+
+    tokenizer = load_tokenizer(model_cfg)
+    _print_skeleton_measurements(tokenizer, prompt_override_text=prompt_override_text)
+
+    _report_run_record(
+        run_dir,
+        _current_run_record(
+            configured=configured,
+            model_id=model_cfg.model_id,
+            prompt_file=prompt_file,
+            prompt_override_text=prompt_override_text,
+        ),
+    )
+
+    entries_dir = run_dir / "entries"
+    contracts = {entry["id"]: _load_entry_artifact(entries_dir, entry["id"]) for entry in entries}
+    print(
+        f"run {run_dir.name} is complete on disk; scored from disk, "
+        "no GPU acquired, no model loaded"
+    )
+    return _score_and_report(
+        entries,
+        contracts,
+        configured,
+        run_dir,
+        baseline_path,
+        accept=accept,
+        write_scorecard=write_scorecard,
     )
 
 
@@ -945,6 +1314,88 @@ def _cooldown_if_due(count: int, *, every: int) -> None:
         _wait_for_cooldown()
 
 
+def _prompt_override_context(prompt_override_text: str | None):
+    """A ``prompt_overrides({"anonymization.txt": ...})`` context when
+    *prompt_override_text* is given, else a no-op context — the one place
+    a ``--prompt-file`` value becomes a prompt-home substitution, used by
+    both :func:`_print_skeleton_measurements` and ``main``'s guarded
+    (model-bearing) run.
+
+    Args:
+        prompt_override_text: The ``--prompt-file`` contents to substitute
+            for ``anonymization.txt``, or ``None`` for the shipped prompt
+            home.
+    """
+    from paramem.graph.prompts import prompt_overrides
+
+    if prompt_override_text is None:
+        return contextlib.nullcontext()
+    return prompt_overrides({"anonymization.txt": prompt_override_text})
+
+
+def _print_skeleton_measurements(tokenizer, *, prompt_override_text: str | None) -> None:
+    """Re-measure the SCAN and ANCHOR prompt skeletons against their pinned
+    reference constants and print one line per skeleton.
+
+    Renders each section with an empty payload through the production
+    section renderers (:func:`~paramem.cloud.anonymize_steps.render_scan_section`,
+    :func:`~paramem.cloud.anonymize_steps.render_anchor_section`) and the
+    production chat-wrapping render
+    (:func:`~paramem.cloud.anonymize_steps.render_call_prompt`), counts
+    each rendered prompt with *tokenizer* through
+    :func:`~paramem.utils.tokens.encode_rendered` (never
+    :func:`~paramem.utils.tokens.estimate_tokens`, whose word-count
+    fallback would print as a measurement rather than an exact count), and
+    prints the measured count, the pinned reference constant, and the
+    signed difference for both skeletons — the operator decides whether to
+    re-pin the constant, revert the edit, or accept the difference.
+
+    Loads the anonymizer prompts inside the same
+    :func:`_prompt_override_context` the corpus run itself uses when
+    ``--prompt-file`` substitutes a variant, so a skeleton measured under
+    an overridden prompt reflects the override, not the shipped file.
+
+    Args:
+        tokenizer: The tokenizer to measure with — the bare tokenizer from
+            :func:`~paramem.models.loader.load_tokenizer` whenever no
+            model is loaded (``--dry-run`` and the score-from-disk path
+            alike), the loaded base model's tokenizer otherwise.
+        prompt_override_text: The ``--prompt-file`` contents to substitute
+            for ``anonymization.txt``, or ``None`` to measure the shipped
+            prompt home.
+    """
+    from paramem.cloud.anonymize_steps import (
+        render_anchor_section,
+        render_call_prompt,
+        render_scan_section,
+    )
+    from paramem.graph.anonymizer_prompts import load_anonymizer_prompts
+    from paramem.utils.tokens import (
+        ANONYMIZE_ANCHOR_PROMPT_SKELETON_TOKENS,
+        ANONYMIZE_SCAN_PROMPT_SKELETON_TOKENS,
+        encode_rendered,
+    )
+
+    with _prompt_override_context(prompt_override_text):
+        prompts = load_anonymizer_prompts()
+        scan_prompt = render_call_prompt(
+            prompts.scan_system, render_scan_section(prompts.scan, ""), tokenizer
+        )
+        anchor_prompt = render_call_prompt(
+            prompts.anchor_system,
+            render_anchor_section(prompts.anchor, speaker_id="speaker1", values=(), text=""),
+            tokenizer,
+        )
+
+    for label, rendered, reference in (
+        ("SCAN", scan_prompt, ANONYMIZE_SCAN_PROMPT_SKELETON_TOKENS),
+        ("ANCHOR", anchor_prompt, ANONYMIZE_ANCHOR_PROMPT_SKELETON_TOKENS),
+    ):
+        measured = len(encode_rendered(tokenizer, rendered)["input_ids"])
+        diff = measured - reference
+        print(f"{label} skeleton: measured={measured} reference={reference} diff={diff:+d}")
+
+
 def _restore_server_gpu(
     *, server_base_url: str = _SERVER_BASE_URL, retries: int = 5, delay_seconds: float = 15.0
 ) -> None:
@@ -1056,7 +1507,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--limit",
-        type=int,
+        type=_positive_int,
         default=None,
         help="Run only the first N corpus entries (a pilot).",
     )
@@ -1064,8 +1515,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help=(
-            "Assemble every corpus entry and validate the corpus; exit without "
-            "loading a model or touching the GPU."
+            "Assemble every corpus entry and validate the corpus, then re-measure "
+            "the anonymizer prompt skeletons with a CPU-only tokenizer load; exit "
+            "without loading a model or touching the GPU."
         ),
     )
     parser.add_argument(
@@ -1110,7 +1562,28 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """CLI entry point."""
+    """CLI entry point.
+
+    ``--resume`` continues the most recent run directory. When every
+    corpus entry (after any ``--limit``) already has a written artifact
+    there (:func:`_run_dir_complete`), the run is scored straight from
+    those artifacts (:func:`_score_from_disk`): no GPU is acquired and no
+    model is loaded, only the bare tokenizer for the skeleton
+    re-measurement print. Otherwise — a fresh run directory, or a
+    ``--resume`` directory with entries still missing — the run proceeds
+    under the GPU guard as normal, resuming only the entries not yet on
+    disk. ``--accept`` records the resulting scorecard as the new baseline
+    either way, and is refused together with ``--limit`` before either path
+    is chosen.
+
+    A freshly created run directory writes its own provenance
+    (:class:`RunRecord` — configured prefixes, model id, prompt sha256) to
+    ``run.json``; ``--resume`` onto an existing directory
+    never rewrites it, and the score-from-disk path reports it beside this
+    invocation's own values (see :func:`_report_run_record`). ``--limit``
+    slices the entries scored but never writes ``run_dir/scorecard.json``
+    — that file always reflects a full-corpus run.
+    """
     args = build_arg_parser().parse_args(argv)
 
     if args.accept and args.limit is not None:
@@ -1138,18 +1611,6 @@ def main(argv: list[str] | None = None) -> int:
     configured = {c.prefix for c in categories}
     category_source = "--scrub override" if args.scrub is not None else "shipped default scrub set"
 
-    if args.dry_run:
-        for entry in entries:
-            entry_surfaces(entry)  # touches every entry's payload shape
-        print(f"corpus valid: {len(entries)} entries assembled")
-        print(f"configured categories ({category_source}): {sorted(configured) or '[]'}")
-        print("dry run complete; no model loaded, no GPU touched")
-        return 0
-
-    import os
-
-    os.environ.setdefault("HF_DEACTIVATE_ASYNC_LOAD", "1")
-
     from paramem.server.config import MODEL_REGISTRY, load_server_config
 
     server_cfg = load_server_config("tests/fixtures/server.yaml")
@@ -1162,22 +1623,70 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         server_cfg.model_name = args.model
     model_cfg = server_cfg.model_config
-    token_envelope = server_cfg.consolidation.extraction_anonymize_token_envelope
-    print(f"model: {model_cfg.model_id}")
-    print(f"configured categories ({category_source}): {sorted(configured) or '[]'}")
-
-    run_dir = (_latest_run_dir() if args.resume else None) or _new_run_dir()
-    run_dir.mkdir(parents=True, exist_ok=True)
-    print(f"run directory: {run_dir}")
 
     prompt_override_text = (
         args.prompt_file.read_text(encoding="utf-8") if args.prompt_file is not None else None
     )
 
+    if args.dry_run:
+        for entry in entries:
+            entry_surfaces(entry)  # touches every entry's payload shape
+        print(f"corpus valid: {len(entries)} entries assembled")
+        print(f"configured categories ({category_source}): {sorted(configured) or '[]'}")
+
+        from paramem.models.loader import load_tokenizer
+
+        tokenizer = load_tokenizer(model_cfg)
+        _print_skeleton_measurements(tokenizer, prompt_override_text=prompt_override_text)
+
+        print("dry run complete; tokenizer loaded, no model, no GPU touched")
+        return 0
+
+    print(f"configured categories ({category_source}): {sorted(configured) or '[]'}")
+
+    run_root = _RUN_ROOT
+    baseline_path = _BASELINE_PATH
+    write_scorecard = args.limit is None
+
+    existing_run_dir = _latest_run_dir(run_root) if args.resume else None
+    run_dir = existing_run_dir or _new_run_dir(run_root)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    print(f"run directory: {run_dir}")
+
+    if existing_run_dir is None:
+        _write_run_record(
+            run_dir,
+            _current_run_record(
+                configured=configured,
+                model_id=model_cfg.model_id,
+                prompt_file=args.prompt_file,
+                prompt_override_text=prompt_override_text,
+            ),
+        )
+
+    if args.payloads is None and _run_dir_complete(entries, run_dir):
+        return _score_from_disk(
+            entries,
+            model_cfg,
+            configured,
+            run_dir,
+            prompt_override_text,
+            baseline_path,
+            args.prompt_file,
+            accept=args.accept,
+            write_scorecard=write_scorecard,
+        )
+
+    import os
+
+    os.environ.setdefault("HF_DEACTIVATE_ASYNC_LOAD", "1")
+
+    token_envelope = server_cfg.consolidation.extraction_anonymize_token_envelope
+    print(f"model: {model_cfg.model_id}")
+
     from gpu_guard import GPUConfigMissing
 
     from experiments.utils.gpu_guard import acquire_gpu
-    from paramem.graph.prompts import prompt_overrides
     from paramem.models.loader import load_base_model
 
     contracts: dict[str, AnonymizedContract] | None = None
@@ -1187,13 +1696,9 @@ def main(argv: list[str] | None = None) -> int:
             print("loading model ...")
             model, tokenizer = load_base_model(model_cfg, server_cfg.tier_config_map())
             print("model ready")
+            _print_skeleton_measurements(tokenizer, prompt_override_text=prompt_override_text)
 
-            override_ctx = (
-                prompt_overrides({"anonymization.txt": prompt_override_text})
-                if prompt_override_text is not None
-                else contextlib.nullcontext()
-            )
-            with override_ctx:
+            with _prompt_override_context(prompt_override_text):
                 if args.payloads is not None:
                     _run_payloads_mode(
                         args.payloads,
@@ -1232,27 +1737,15 @@ def main(argv: list[str] | None = None) -> int:
     if contracts is None:
         return 1
 
-    result = score_corpus(entries, contracts, configured)
-    print_detail(result)
-    scorecard = scorecard_dict(result)
-    print_scorecard(scorecard)
-
-    baseline = load_baseline()
-    if baseline is None:
-        print("\nno accepted baseline on disk yet")
-    else:
-        regressed = regression_columns(scorecard, baseline)
-        if regressed:
-            print(f"\nREGRESSION on columns: {regressed}")
-        else:
-            print("\nno regression against the accepted baseline")
-
-    if args.accept:
-        write_baseline(scorecard, source=f"run {run_dir.name}")
-        print(f"baseline accepted from run {run_dir.name}")
-
-    (run_dir / "scorecard.json").write_text(json.dumps(scorecard, indent=2), encoding="utf-8")
-    return 0
+    return _score_and_report(
+        entries,
+        contracts,
+        configured,
+        run_dir,
+        baseline_path,
+        accept=args.accept,
+        write_scorecard=write_scorecard,
+    )
 
 
 if __name__ == "__main__":

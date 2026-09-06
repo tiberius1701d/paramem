@@ -1,21 +1,13 @@
 """``_stage_anonymize``'s opted-out diagnostic (``scrub_categories`` empty
-— no model call), its drop-record projection (``category``/``side``/
-``reason`` only — never ``text``/``word``), and ``_live_reload_base_model``'s
-handling of a SCAN prompt skeleton drift refusal raised during a live
-reload: the server stays up, cloud-only, with ``reload_failed``.
-
-Driving patterns (state builders) copied from ``tests/server/test_calibrate.py``
-and ``tests/server/test_calibrate_routes.py`` (read-only — never imported
-from).
+— no model call) and its drop-record projection (``category``/``side``/
+``reason`` only — never ``text``/``word``).
 """
 
 from __future__ import annotations
 
-from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import paramem.graph.stage_anonymize as stage_anonymize_module
-import paramem.server.app as app_module
 from paramem.cloud.anonymize import AnonymizedContract
 from paramem.config.taxonomy import ScrubCategory
 from paramem.graph.flow import StageContext, StageState
@@ -123,37 +115,3 @@ class TestStageAnonymizeDropRecordProjection:
         assert result.graph.diagnostics["scan_dropped_entries"] == [
             {"category": "City", "side": "scan", "reason": "reverted"}
         ]
-
-
-class TestLiveReloadRefusesOnScanSkeletonDrift:
-    def test_drift_refusal_sets_reload_failed_and_stays_up(self, tmp_path, monkeypatch) -> None:
-        state = {
-            "config": SimpleNamespace(
-                model_config=SimpleNamespace(model_id="test-model"),
-                model_name="test-model",
-                vram=SimpleNamespace(nf4_disk_to_runtime_factor=1.0),
-                paths=SimpleNamespace(data=tmp_path),
-            ),
-            "mode": "local",
-            "cloud_only_reason": None,
-            "voice_profile": "cpu",
-        }
-        monkeypatch.setattr(app_module, "_state", state)
-        monkeypatch.setattr(app_module, "_refresh_config_from_disk_into_state", lambda: None)
-        monkeypatch.setattr(app_module, "_release_base_model_in_process", lambda: None)
-        monkeypatch.setattr(app_module, "_compute_topology_assessment", lambda *a, **k: None)
-
-        def _raise_drift(config):
-            raise RuntimeError(
-                "SCAN prompt skeleton drift: the live configs/schema.yaml anonymizer "
-                "prefix table renders a SCAN skeleton over the pinned token budget"
-            )
-
-        monkeypatch.setattr(app_module, "_load_model_into_state", _raise_drift)
-
-        outcome = app_module._live_reload_base_model(refresh_config_from_disk=True, lock_held=True)
-
-        assert outcome == "reload_failed"
-        assert state["cloud_only_reason"] == "reload_failed"
-        # The server is left up (this call returned normally, not raised) —
-        # the caller's own contract for "leaves the server up and cloud-only".

@@ -5,7 +5,7 @@ system sizes before a local ``generate()`` call.
 uses to size a payload — exact when a tokenizer is supplied, a
 conservative words-based bound otherwise. Every payload-sizing call site,
 including :func:`paramem.graph.extractor.judge_plausibility`,
-:func:`paramem.server.calibrate._count_tokens`, and
+:mod:`paramem.server.calibrate`'s own token-count sites, and
 :mod:`paramem.graph.document_chunker`, routes through this one function
 rather than re-implementing its own count.
 
@@ -183,7 +183,8 @@ ANONYMIZE_ENVELOPE_TOKENS: int = 8192
 # JSON array, ``{text}`` empty, ``add_generation_prompt=True``), counted
 # with the production tokenizer (Mistral 7B,
 # ``mistralai/Mistral-7B-Instruct-v0.3``), CPU-only (tokenizer load, no
-# model, no GPU).
+# model, no GPU). The anonymizer gate tool (``scripts/dev/anonymizer_gate.py``) re-measures
+# this constant on every run.
 ANONYMIZE_ANCHOR_PROMPT_SKELETON_TOKENS: int = 523
 
 # SCAN prompt skeleton — the fixed system-prompt + chat-markup + call-body
@@ -199,7 +200,8 @@ ANONYMIZE_ANCHOR_PROMPT_SKELETON_TOKENS: int = 523
 # ``add_generation_prompt=True``), counted with the production tokenizer
 # (Mistral 7B, ``mistralai/Mistral-7B-Instruct-v0.3``), CPU-only (tokenizer
 # load, no model, no GPU). Re-measure whenever the shipped table gains or
-# loses a row.
+# loses a row. The anonymizer gate tool (``scripts/dev/anonymizer_gate.py``) re-measures
+# this constant on every run.
 ANONYMIZE_SCAN_PROMPT_SKELETON_TOKENS: int = 768
 
 # ---------------------------------------------------------------------------

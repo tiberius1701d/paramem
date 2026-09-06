@@ -1,7 +1,8 @@
 """``ask_speaker_anchor`` — the ANCHOR call's non-ASCII value rendering —
-and ``scan_values``/``render_scan_section`` — the SCAN call's one model
+``scan_values``/``render_scan_section`` — the SCAN call's one model
 call, its keyword-resolution keep/revert/drop rules, and its rendered
-skeleton.
+skeleton — and ``render_call_prompt``, the one chat-wrapping render every
+step function in this module (and the anonymizer gate tool) shares.
 """
 
 from __future__ import annotations
@@ -13,10 +14,12 @@ from paramem.cloud import anonymize_steps as anonymize_steps_module
 from paramem.cloud.anonymize_steps import (
     ScanFailed,
     ask_speaker_anchor,
+    render_call_prompt,
     render_scan_section,
     scan_values,
 )
 from paramem.config.taxonomy import ScrubCategory
+from paramem.models.loader import render_chat_prompt
 from tests.anonymizer_doubles import basic_category
 
 
@@ -300,3 +303,53 @@ class TestRenderScanSection:
         )
         rendered = render_scan_section("Keywords:\n{keywords}\n\nText:\n{text}", "hello world")
         assert rendered == "Keywords:\nPerson: a person\nCity: a city\n\nText:\nhello world"
+
+
+# ---------------------------------------------------------------------------
+# render_call_prompt — the one chat-wrapping render every step function in
+# this module (and the anonymizer gate tool) shares.
+# ---------------------------------------------------------------------------
+
+
+class _StubChatTemplateTokenizer:
+    """A tokenizer stub whose ``apply_chat_template`` deterministically
+    joins ``role:content`` per message and appends a generation-prompt
+    marker — real enough that :func:`~paramem.models.loader.
+    supports_system_role`'s own probe call (which checks its own marker
+    string survives the render) reports the system role as supported, so
+    ``adapt_messages`` leaves the system/user pair unfolded.
+    """
+
+    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True):
+        rendered = "\n".join(f"{m['role']}:{m['content']}" for m in messages)
+        if add_generation_prompt:
+            rendered += "\nassistant:"
+        return rendered
+
+
+class TestRenderCallPrompt:
+    def test_builds_the_system_and_user_pair_and_matches_render_chat_prompt(self) -> None:
+        """``render_call_prompt`` is not a second renderer — it builds
+        exactly the ``[{"role": "system", ...}, {"role": "user", ...}]``
+        pair and renders it through
+        :func:`~paramem.models.loader.render_chat_prompt` with the
+        generation prompt appended, so it must produce byte-identical
+        output to calling ``render_chat_prompt`` directly on the same
+        messages.
+        """
+        tokenizer = _StubChatTemplateTokenizer()
+
+        result = render_call_prompt("system text", "user text", tokenizer)
+
+        expected = render_chat_prompt(
+            [
+                {"role": "system", "content": "system text"},
+                {"role": "user", "content": "user text"},
+            ],
+            tokenizer,
+            add_generation_prompt=True,
+        )
+        assert result == expected
+        assert "system:system text" in result
+        assert "user:user text" in result
+        assert result.endswith("assistant:")

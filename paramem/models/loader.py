@@ -495,6 +495,31 @@ def _apply_wsl2_async_load_workaround() -> None:
         logger.debug("HF_DEACTIVATE_ASYNC_LOAD=1: threaded weight loading disabled")
 
 
+def load_tokenizer(model_config: ModelConfig) -> PreTrainedTokenizer:
+    """Load the bare tokenizer for *model_config* — no model, no GPU.
+
+    The one tokenizer load for the base model's own tokenizer: called by
+    :func:`load_base_model` for its own load, and by the anonymizer gate
+    tool (``scripts/dev/anonymizer_gate.py``) whenever it re-measures the
+    anonymizer's two prompt skeletons against their reference constants
+    without a model loaded — its ``--dry-run`` mode and its score-from-disk
+    path alike, both CPU alone. Callers that need a padding token default
+    (which reads the loaded model's config) apply it themselves after
+    loading a model — this function does not.
+
+    Args:
+        model_config: Base-model load settings; only ``model_id`` and
+            ``trust_remote_code`` are read.
+
+    Returns:
+        The tokenizer, unmodified from ``AutoTokenizer.from_pretrained``.
+    """
+    return AutoTokenizer.from_pretrained(
+        model_config.model_id,
+        trust_remote_code=model_config.trust_remote_code,
+    )
+
+
 def load_base_model(
     model_config: ModelConfig,
     adapters: Mapping[str, AdapterConfig],
@@ -562,10 +587,7 @@ def load_base_model(
         **load_kwargs,
     )
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_config.model_id,
-        trust_remote_code=model_config.trust_remote_code,
-    )
+    tokenizer = load_tokenizer(model_config)
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token

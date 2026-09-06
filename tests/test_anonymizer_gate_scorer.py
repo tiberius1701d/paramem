@@ -346,3 +346,104 @@ def test_scorecard_dict_and_regression_columns():
     # A baseline with fewer junk scrubs than achieved here names the column.
     better_junk_baseline = {**scorecard, "junk": 0}
     assert "junk" in anonymizer_gate.regression_columns(scorecard, better_junk_baseline)
+
+
+# ---------------------------------------------------------------------------
+# `failed` — the scorecard's own column for the count of skipped
+# (non-``"ok"``) entries; the skipped entries' own gold, tallied so the
+# printed detail can state how much gold sits outside the recall
+# percentages.
+# ---------------------------------------------------------------------------
+
+
+def test_score_corpus_tallies_a_missing_contracts_gold_into_names_and_contact():
+    """An entry with no contract at all (never run, or its artifact absent)
+    is skipped with status ``"missing"`` — never silently dropped — and its
+    own gold is tallied into ``skipped_gold_names``/``skipped_gold_contact``,
+    never into the recall counters ``score_entry`` would have produced."""
+    text = "Nora called from +49 152 0 445 3311."
+    phone = "+49 152 0 445 3311"
+    p_start = text.index(phone)
+    entry = _entry(
+        "syn-006",
+        text,
+        [
+            _gold("Nora", "Person", -1, 0, 4),
+            _gold(phone, "Phone", -1, p_start, p_start + len(phone)),
+        ],
+    )
+
+    result = anonymizer_gate.score_corpus([entry], {}, CONFIGURED)
+
+    assert result.skipped == [("syn-006", "missing")]
+    assert result.skipped_gold_names == 1
+    assert result.skipped_gold_contact == 1
+    assert result.tot["entries"] == 0
+    assert result.tot["gold_in_scope"] == 0
+
+
+def test_score_corpus_tallies_a_failed_status_contracts_gold_too():
+    """A contract that completed but did not reach ``"ok"`` (``"failed"``)
+    is skipped identically to a missing one — its own status is recorded,
+    and its gold still counts toward the skipped-gold tallies."""
+    entry = _entry("syn-007", "Nora said hi.", [_gold("Nora", "Person", -1, 0, 4)])
+    failed_contract = AnonymizedContract(
+        status="failed",
+        forward={},
+        reverse={},
+        anon_transcript="",
+        declared=frozenset(),
+        rekey_dropped=0,
+        raw="",
+        failure="scan_failed",
+        facts=[],
+        model_calls=1,
+        call_tokens=(),
+        scan_dropped=0,
+        scan_dropped_entries=[],
+        inert_dropped=0,
+    )
+
+    result = anonymizer_gate.score_corpus([entry], {"syn-007": failed_contract}, CONFIGURED)
+
+    assert result.skipped == [("syn-007", "failed")]
+    assert result.skipped_gold_names == 1
+    assert result.skipped_gold_contact == 0
+
+
+def test_scorecard_dict_carries_failed_as_the_count_of_skipped_entries():
+    entry = _entry("syn-008", "Nora said hi.", [_gold("Nora", "Person", -1, 0, 4)])
+    result = anonymizer_gate.score_corpus([ENTRY_A, entry], {"syn-001": CONTRACT_A}, CONFIGURED)
+
+    scorecard = anonymizer_gate.scorecard_dict(result)
+
+    assert scorecard["failed"] == 1
+    assert "failed" in anonymizer_gate._LOWER_IS_BETTER
+
+
+def test_regression_columns_names_failed_when_current_exceeds_the_baseline():
+    scorecard = anonymizer_gate.scorecard_dict(_score())
+    current = {**scorecard, "failed": 3}
+    baseline = {**scorecard, "failed": 1}
+
+    assert "failed" in anonymizer_gate.regression_columns(current, baseline)
+
+
+def test_regression_columns_is_silent_on_failed_when_the_baseline_lacks_the_key():
+    """A baseline file carrying no ``failed`` key compares as ``None`` on
+    that key — never a false regression."""
+    scorecard = anonymizer_gate.scorecard_dict(_score())
+    current = {**scorecard, "failed": 3}
+    baseline = {k: v for k, v in scorecard.items() if k != "failed"}
+
+    assert "failed" not in anonymizer_gate.regression_columns(current, baseline)
+
+
+def test_print_detail_states_the_skipped_entry_gold_outside_the_percentages(capsys):
+    entry = _entry("syn-006", "Nora called.", [_gold("Nora", "Person", -1, 0, 4)])
+    result = anonymizer_gate.score_corpus([entry], {}, CONFIGURED)
+
+    anonymizer_gate.print_detail(result)
+
+    out = capsys.readouterr().out
+    assert "skipped-entry gold outside the percentages: names 1, contact 0" in out

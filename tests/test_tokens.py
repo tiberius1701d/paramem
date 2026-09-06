@@ -223,8 +223,8 @@ class TestWordsToEstimatorTokens:
         ("words", "expected"),
         [
             (200, 740),  # document context floor
-            (828, 3063),  # document-path cap word count
-            (431, 1594),  # conversation-path cap word count
+            (828, 3063),  # representative payload size, below the document-path cap
+            (431, 1594),  # representative payload size, below the conversation-path cap
         ],
     )
     def test_floors_at_shipped_ratio(self, words, expected):

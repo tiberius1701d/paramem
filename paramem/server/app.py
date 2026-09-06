@@ -2819,62 +2819,6 @@ def _check_token_ratio_drift(config) -> None:
     }
 
 
-def _check_scan_skeleton_drift(config, tokenizer) -> None:
-    """Refuse a model load whose live prefix table renders a SCAN skeleton
-    over the pinned token budget.
-
-    The anonymizer's SCAN prompt renders its ``{keywords}`` slot from the
-    operator-editable ``configs/schema.yaml`` ``anonymizer.prefixes``
-    table (:func:`paramem.cloud.anonymize_steps.render_scan_section`), so
-    an edited table can grow the rendered skeleton past
-    :data:`~paramem.utils.tokens.ANONYMIZE_SCAN_PROMPT_SKELETON_TOKENS` —
-    the constant the anonymizer's token budget was measured and pinned
-    against. This re-renders the SCAN section with an empty payload over
-    the live table, wraps it with the ``SCAN-SYSTEM`` section through
-    :func:`~paramem.models.loader.render_chat_prompt` — the same two-message
-    render :func:`paramem.cloud.anonymize_steps._generate` issues for the
-    real call — and counts the rendered text with *tokenizer* through
-    :func:`~paramem.utils.tokens.estimate_tokens`, the same measurement
-    the constant itself was pinned with, mirroring
-    :func:`paramem.utils.tokens.check_ratio_drift`'s re-measure-at-load
-    shape.
-
-    Called from :func:`_load_model_into_state`, the one site every model
-    load — boot and live reload alike — passes through, so a table edit is
-    caught before the anonymizer ever runs against it.
-
-    Args:
-        config: The just-loaded :class:`~paramem.server.config.ServerConfig`.
-        tokenizer: The tokenizer paired with the just-loaded base model.
-
-    Raises:
-        RuntimeError: When the live-table render exceeds
-            :data:`~paramem.utils.tokens.ANONYMIZE_SCAN_PROMPT_SKELETON_TOKENS`
-            — names the constant and the measured size.
-    """
-    from paramem.cloud.anonymize_steps import render_scan_section
-    from paramem.graph.anonymizer_prompts import load_anonymizer_prompts
-    from paramem.models.loader import render_chat_prompt
-    from paramem.utils.tokens import ANONYMIZE_SCAN_PROMPT_SKELETON_TOKENS, estimate_tokens
-
-    prompts = load_anonymizer_prompts(prompts_dir=config.prompts_dir)
-    messages = [
-        {"role": "system", "content": prompts.scan_system},
-        {"role": "user", "content": render_scan_section(prompts.scan, "")},
-    ]
-    rendered = render_chat_prompt(messages, tokenizer, add_generation_prompt=True)
-    measured = estimate_tokens(rendered, tokenizer)
-    if measured > ANONYMIZE_SCAN_PROMPT_SKELETON_TOKENS:
-        raise RuntimeError(
-            "SCAN prompt skeleton drift: the live configs/schema.yaml "
-            f"anonymizer.prefixes table renders to {measured} tokens, exceeding "
-            f"the pinned ANONYMIZE_SCAN_PROMPT_SKELETON_TOKENS "
-            f"({ANONYMIZE_SCAN_PROMPT_SKELETON_TOKENS}). Re-measure the constant "
-            "against the edited table (paramem/utils/tokens.py), or revert the "
-            "table edit."
-        )
-
-
 # GPU-lock timeout for lifespan shutdown's base-model release: long enough for
 # a background-trainer worker mid-fold to reach its next epoch boundary and
 # release (the shutdown flag set earlier in this same teardown only stops
@@ -7869,9 +7813,6 @@ def _load_model_into_state(config) -> None:
     Refuses (``ConfigStoreMismatch``) on a config that contradicts the
     tier store already on disk — see
     :func:`~paramem.server.config_store_validator.check_config_against_store`.
-    Refuses (``RuntimeError``) when the live anonymizer prefix table
-    renders a SCAN prompt skeleton over the pinned token budget — see
-    :func:`_check_scan_skeleton_drift`.
     """
     apply_process_cap(fraction=config.vram.process_cap_fraction)
     logger.info("Loading model: %s (%s)", config.model_name, config.model_config.model_id)
@@ -7890,11 +7831,6 @@ def _load_model_into_state(config) -> None:
     # Store the measured delta in the per-component VRAM ledger (bytes).
     # vram_measure stores an INT — no BASE-MODEL HOLDER created here.
     _state["vram_components"]["base"] = _base_vm["delta"]
-
-    # Live prefix table can grow the SCAN skeleton past its pinned token
-    # budget; catch it here, before the model is committed into _state, on
-    # every load (boot and live reload alike).
-    _check_scan_skeleton_drift(config, tokenizer)
 
     # Manifest caches are model-specific; re-init on every load.
     _state["adapter_manifest_status"] = {}

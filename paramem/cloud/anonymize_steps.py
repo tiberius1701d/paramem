@@ -159,11 +159,14 @@ class ScanFailed(Exception):
         self.call_tokens = call_tokens
 
 
-def _render(system_prompt: str, user_prompt: str, tokenizer):
+def render_call_prompt(system_prompt: str, user_prompt: str, tokenizer):
     """Render one system+user turn via the shared chat-template renderer.
 
-    THE one prompt renderer for every step function in this module — no
-    step re-implements ``apply_chat_template`` directly.
+    THE one chat-wrapping render for every step function in this module —
+    no step re-implements ``apply_chat_template`` directly — and for the
+    anonymizer gate tool's (``scripts/dev/anonymizer_gate.py``) skeleton
+    re-measurement, which wraps the same rendered sections through this
+    function before counting them.
     """
     messages = [
         {"role": "system", "content": system_prompt},
@@ -205,7 +208,7 @@ def _generate(
         AnonymizeBudgetRefused: The budget precondition failed; no
             ``generate()`` call was issued.
     """
-    formatted = _render(system_prompt, user_prompt, tokenizer)
+    formatted = render_call_prompt(system_prompt, user_prompt, tokenizer)
     prompt_tokens = estimate_tokens(formatted, tokenizer)
     if prompt_tokens + reserve_tokens > token_envelope:
         logger.warning(
@@ -296,10 +299,11 @@ def render_scan_section(section: str, payload_text: str) -> str:
     """Render the SCAN prompt section's ``{keywords}``/``{text}`` slots.
 
     The one renderer for the SCAN section: :func:`scan_values` calls it for
-    every anonymize call with the real payload, and the startup skeleton-
-    drift check (``paramem/server/app.py``) calls it with an empty payload
-    to measure the pinned skeleton constant against the operator's current
-    prefix table. No second render of this section exists.
+    every anonymize call with the real payload, and the anonymizer gate
+    tool (``scripts/dev/anonymizer_gate.py``) calls it with an empty
+    payload to re-measure the pinned skeleton constant against the
+    operator's current prefix table. No second render of this section
+    exists.
 
     Args:
         section: The SCAN section's template text, carrying ``{keywords}``
@@ -311,6 +315,44 @@ def render_scan_section(section: str, payload_text: str) -> str:
         The fully rendered SCAN user prompt.
     """
     return section.format(keywords=_render_keywords(), text=payload_text)
+
+
+def render_anchor_section(
+    section: str, *, speaker_id: str, values: Sequence[str], text: str
+) -> str:
+    """Render the ANCHOR prompt section's ``{speaker_id}``/``{values}``/
+    ``{text}`` slots.
+
+    The one renderer for the ANCHOR section: :func:`ask_speaker_anchor`
+    calls it for every anonymize call with the real evidence text, and the
+    anonymizer gate tool (``scripts/dev/anonymizer_gate.py``) calls it
+    with an empty *values*/*text* to re-measure the pinned skeleton
+    constant. No second render of this section exists.
+
+    Args:
+        section: The ANCHOR section's template text, carrying
+            ``{speaker_id}``, ``{values}`` and ``{text}`` placeholders.
+        speaker_id: The session's ``speaker{N}`` token — ``"speaker1"``
+            for a skeleton-only render.
+        values: The candidate surfaces to render into ``{values}`` — an
+            empty sequence for a skeleton-only render.
+        text: The evidence text to render into ``{text}`` — ``""`` for a
+            skeleton-only render.
+
+    Returns:
+        The fully rendered ANCHOR user prompt.
+    """
+    # ensure_ascii=False: *values* are real (possibly non-ASCII) fact
+    # surfaces shown to the model as literal text — an escaped rendering
+    # (``ß`` -> ``\uXXXX``) is not the surface the model was actually
+    # scanned against, and its answer is checked back against the
+    # unescaped ``values_set`` (never re-parsed through JSON), so the
+    # model-facing rendering and the check must use the same characters.
+    # See `paramem.cloud.anonymize.assemble_payload`'s `TagPayload.tag_text`
+    # docstring for the same encoding hazard.
+    return section.format(
+        speaker_id=speaker_id, values=json.dumps(list(values), ensure_ascii=False), text=text
+    )
 
 
 @dataclass(frozen=True)
@@ -525,17 +567,7 @@ def ask_speaker_anchor(
         return frozenset(), "", ()
 
     reserve = anchor_output_reserve_tokens(len(values))
-    # ensure_ascii=False: *values* are real (possibly non-ASCII) fact
-    # surfaces shown to the model as literal text — an escaped rendering
-    # (``ß`` -> ``\uXXXX``) is not the surface the model was actually
-    # scanned against, and its answer is checked back against the
-    # unescaped ``values_set`` below (never re-parsed through JSON), so
-    # the model-facing rendering and the check must use the same
-    # characters. See `paramem.cloud.anonymize.assemble_payload`'s
-    # `TagPayload.tag_text` docstring for the same encoding hazard.
-    user_prompt = section.format(
-        speaker_id=speaker_id, values=json.dumps(list(values), ensure_ascii=False), text=text
-    )
+    user_prompt = render_anchor_section(section, speaker_id=speaker_id, values=values, text=text)
     try:
         raw, prompt_tokens, output_tokens = _generate(
             "anonymize.anchor",

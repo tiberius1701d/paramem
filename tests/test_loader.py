@@ -21,13 +21,21 @@ Covers:
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 from peft import PeftModel
 
-from paramem.models.loader import has_prior_trained_weights, render_chat_prompt, tier_backup_scope
-from paramem.utils.config import AdapterConfig
+from paramem.models import loader as loader_module
+from paramem.models.loader import (
+    has_prior_trained_weights,
+    load_base_model,
+    load_tokenizer,
+    render_chat_prompt,
+    tier_backup_scope,
+)
+from paramem.utils.config import AdapterConfig, ModelConfig
 from paramem.utils.tokens import RenderedPrompt
 
 
@@ -502,3 +510,119 @@ class TestHasPriorTrainedWeights:
 
     def test_no_peft_config_attribute_is_false(self):
         assert has_prior_trained_weights(object(), "episodic") is False
+
+
+# ---------------------------------------------------------------------------
+# load_tokenizer / load_base_model — CPU-only, no real model or tokenizer
+# weights: AutoTokenizer.from_pretrained and AutoModelForCausalLM.from_pretrained
+# are stubbed at their one call site inside loader.py.
+# ---------------------------------------------------------------------------
+
+
+class _FakeDeviceParam:
+    """Stand-in for a model parameter — ``_verify_device_placement`` reads
+    ``.device`` (stringified) and ``.numel()`` over ``model.parameters()``.
+    """
+
+    def __init__(self, device: str, numel: int = 10):
+        self.device = device
+        self._numel = numel
+
+    def numel(self) -> int:
+        return self._numel
+
+
+class TestLoadTokenizer:
+    """``load_tokenizer`` calls ``AutoTokenizer.from_pretrained(model_id,
+    trust_remote_code=...)`` and returns the result UNMODIFIED — no
+    pad-token default applied here (that stays with ``load_base_model``,
+    which reads the loaded model's config)."""
+
+    def test_calls_autotokenizer_from_pretrained_with_model_id_and_trust_remote_code(
+        self, monkeypatch
+    ) -> None:
+        fake_tokenizer = MagicMock(pad_token=None)
+        from_pretrained = MagicMock(return_value=fake_tokenizer)
+        monkeypatch.setattr(loader_module.AutoTokenizer, "from_pretrained", from_pretrained)
+
+        model_config = ModelConfig(model_id="fake/model-id", trust_remote_code=True)
+        result = load_tokenizer(model_config)
+
+        from_pretrained.assert_called_once_with("fake/model-id", trust_remote_code=True)
+        assert result is fake_tokenizer
+
+    def test_a_stub_tokenizer_with_no_pad_token_stays_none(self, monkeypatch) -> None:
+        """No pad-token default is applied inside ``load_tokenizer`` itself —
+        a tokenizer whose ``pad_token`` is ``None`` on return from
+        ``AutoTokenizer.from_pretrained`` stays ``None``."""
+        fake_tokenizer = MagicMock(pad_token=None)
+        monkeypatch.setattr(
+            loader_module.AutoTokenizer, "from_pretrained", MagicMock(return_value=fake_tokenizer)
+        )
+
+        result = load_tokenizer(ModelConfig())
+
+        assert result.pad_token is None
+
+
+class TestLoadBaseModelObtainsTokenizerThroughLoadTokenizer:
+    """``load_base_model`` obtains its tokenizer through
+    :func:`~paramem.models.loader.load_tokenizer` (never a second,
+    independent ``AutoTokenizer.from_pretrained`` call of its own) and
+    still applies the pad-token default from the loaded MODEL's config —
+    that part of the pad-token logic stays in ``load_base_model``, not in
+    ``load_tokenizer``.
+    """
+
+    def _model_config(self) -> ModelConfig:
+        # quantization="none" -> _get_quantization_config returns None
+        # immediately, so this test never constructs a BitsAndBytesConfig.
+        return ModelConfig(quantization="none", cpu_offload=False)
+
+    def test_pad_token_default_is_applied_from_the_models_eos_token_id(self, monkeypatch) -> None:
+        fake_model = MagicMock()
+        fake_model.config = SimpleNamespace(eos_token_id=2)
+        fake_model.parameters = lambda: [_FakeDeviceParam("cuda:0")]
+        monkeypatch.setattr(
+            loader_module.AutoModelForCausalLM,
+            "from_pretrained",
+            MagicMock(return_value=fake_model),
+        )
+
+        fake_tokenizer = SimpleNamespace(pad_token=None, eos_token="</s>")
+        load_tokenizer_calls: list[ModelConfig] = []
+
+        def _fake_load_tokenizer(cfg):
+            load_tokenizer_calls.append(cfg)
+            return fake_tokenizer
+
+        monkeypatch.setattr(loader_module, "load_tokenizer", _fake_load_tokenizer)
+        monkeypatch.setattr(loader_module, "ensure_resident_tiers", lambda model, adapters: model)
+
+        model_config = self._model_config()
+        model, tokenizer = load_base_model(model_config, {"episodic": AdapterConfig()})
+
+        assert load_tokenizer_calls == [model_config]
+        assert tokenizer is fake_tokenizer
+        assert tokenizer.pad_token == "</s>"
+        assert fake_model.config.pad_token_id == 2
+        assert model is fake_model
+
+    def test_a_tokenizer_with_an_existing_pad_token_is_left_unchanged(self, monkeypatch) -> None:
+        fake_model = MagicMock()
+        fake_model.config = SimpleNamespace(eos_token_id=2, pad_token_id=None)
+        fake_model.parameters = lambda: [_FakeDeviceParam("cuda:0")]
+        monkeypatch.setattr(
+            loader_module.AutoModelForCausalLM,
+            "from_pretrained",
+            MagicMock(return_value=fake_model),
+        )
+
+        fake_tokenizer = SimpleNamespace(pad_token="<pad>", eos_token="</s>")
+        monkeypatch.setattr(loader_module, "load_tokenizer", lambda cfg: fake_tokenizer)
+        monkeypatch.setattr(loader_module, "ensure_resident_tiers", lambda model, adapters: model)
+
+        _model, tokenizer = load_base_model(self._model_config(), {"episodic": AdapterConfig()})
+
+        assert tokenizer.pad_token == "<pad>"
+        assert fake_model.config.pad_token_id is None
