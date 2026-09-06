@@ -66,3 +66,8 @@ Editing `tests/fixtures/server.yaml` ripples to every test that loads it.
 * `perltqa_probe_sample.json` — PerLTQA dataset probe sample.
 * `text_pdf_sample.pdf`, `scanned_pdf_sample.pdf` — document-extraction
   fixtures.
+* `anonymizer_gate.json` — fictional multilingual household-turn corpus
+  with gold entity spans, used by the anonymizer gate
+  (`scripts/dev/anonymizer_gate.py`) and its corpus checker
+  (`tests/test_anonymizer_gate_corpus.py`) to measure and regression-test
+  the local anonymization chain's recall and precision.
