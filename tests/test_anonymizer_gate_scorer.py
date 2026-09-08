@@ -31,6 +31,10 @@ if str(_SCRIPTS_DEV) not in sys.path:
 import anonymizer_gate  # noqa: E402 (scripts/dev is not a package)
 
 from paramem.cloud.anonymize import AnonymizedContract  # noqa: E402
+from paramem.utils.tokens import (  # noqa: E402
+    ANONYMIZE_SCAN_PROMPT_SKELETON_TOKENS,
+    ANONYMIZE_SCAN_REPLY_RATIO,
+)
 
 CONFIGURED = {"Person", "Phone", "Email"}
 
@@ -61,6 +65,7 @@ def _contract(
     dropped: list[dict] = (),
     inert: int = 0,
     raw: str = "{}",
+    call_tokens: tuple[dict, ...] = (),
 ) -> AnonymizedContract:
     return AnonymizedContract(
         status="ok",
@@ -73,11 +78,20 @@ def _contract(
         failure=None,
         facts=[],
         model_calls=1,
-        call_tokens=(),
+        call_tokens=call_tokens,
         scan_dropped=len(dropped),
         scan_dropped_entries=list(dropped),
         inert_dropped=inert,
     )
+
+
+def _scan_call(prompt_tokens: int, output_tokens: int) -> dict:
+    """One synthetic ``anonymize.scan`` ``call_tokens`` record."""
+    return {
+        "label": "anonymize.scan",
+        "prompt_tokens": prompt_tokens,
+        "output_tokens": output_tokens,
+    }
 
 
 # --- Entry A (syn-001): partial catch; an occurrence LARGER than gold
@@ -98,9 +112,10 @@ CONTRACT_A = _contract(
     inert=1,
 )
 
-# --- Entry B (syn-002): a reversed LONGER value containing a scrubbed
-#     shorter one; the shorter one's own separate occurrence overlaps an
-#     out-of-scope gold (a wrong-type scrub). ---
+# --- Entry B (syn-002): a reverted LONGER value containing a scrubbed
+#     shorter one; the shorter one substitutes inside that reverted
+#     surface and at its own standalone position, and each of the two
+#     lands on an out-of-scope gold (a wrong-type scrub). ---
 
 ENTRY_B = _entry(
     "syn-002",
@@ -224,10 +239,15 @@ def test_value_inside_longer_word_is_inert_not_forward():
 
 
 def test_reversed_longer_value_contains_scrubbed_shorter_one():
+    """The reverted surface never reaches the forward table, so nothing
+    shields the kept shorter value inside it: "Sonos" substitutes both
+    inside "Sonos Office Speaker" and at its own standalone position.
+    """
     r = _score()
-    assert ("syn-002", "Sonos", "Person_1", "Org") in r.wrong_type_list
-    assert r.tot["out_scope_scrubbed"] == 1
-    assert r.tot["out_scope_reversed"] == 1  # "Sonos Office Speaker" itself
+    # The first of the two positions sits inside the Product gold.
+    assert ("syn-002", "Sonos", "Person_1", "Product") in r.wrong_type_list
+    assert r.tot["out_scope_scrubbed"] == 2  # Product in part, Org in full
+    assert r.tot["out_scope_reversed"] == 0
 
 
 def test_phone_starting_with_plus_glued_to_letter():
@@ -447,3 +467,257 @@ def test_print_detail_states_the_skipped_entry_gold_outside_the_percentages(caps
 
     out = capsys.readouterr().out
     assert "skipped-entry gold outside the percentages: names 1, contact 0" in out
+
+
+# ---------------------------------------------------------------------------
+# `invented` — the scorecard's own column for the count of `unknown_word`
+# drop records over the run.
+# ---------------------------------------------------------------------------
+
+
+def test_scorecard_dict_carries_invented_as_the_sum_of_unknown_word_by_word():
+    """ENTRY_E's one ``unknown_word`` drop record is the run's only one."""
+    r = _score()
+    scorecard = anonymizer_gate.scorecard_dict(r)
+
+    assert scorecard["invented"] == sum(r.unknown_word_by_word.values())
+    assert scorecard["invented"] == 1
+    assert "invented" in anonymizer_gate._LOWER_IS_BETTER
+
+
+def test_scorecard_dict_invented_sums_multiple_drop_records():
+    """Two ``unknown_word`` drops on one entry — same word twice, a
+    different word once — all count, since ``invented`` counts records,
+    not distinct words."""
+    entry = _entry("syn-invented", "Ana met Timo and Vera.", [])
+    unknown = {"category": "", "side": "scan", "reason": "unknown_word"}
+    contract = _contract(
+        {},
+        dropped=[
+            {**unknown, "text": "Ana", "word": "Nom"},
+            {**unknown, "text": "Timo", "word": "Nom"},
+            {**unknown, "text": "Vera", "word": "Tag"},
+        ],
+    )
+
+    result = anonymizer_gate.Result()
+    anonymizer_gate.score_entry(entry, contract, CONFIGURED, result)
+    scorecard = anonymizer_gate.scorecard_dict(result)
+
+    assert scorecard["invented"] == 3
+
+
+def test_regression_columns_names_invented_when_current_exceeds_the_baseline():
+    scorecard = anonymizer_gate.scorecard_dict(_score())
+    current = {**scorecard, "invented": 5}
+    baseline = {**scorecard, "invented": 1}
+
+    assert "invented" in anonymizer_gate.regression_columns(current, baseline)
+
+
+def test_regression_columns_is_silent_on_invented_when_the_baseline_lacks_the_key():
+    """A baseline file lacking the ``invented`` key compares as ``None``
+    on that key — never a false regression, and never a crash."""
+    scorecard = anonymizer_gate.scorecard_dict(_score())
+    current = {**scorecard, "invented": 5}
+    baseline = {k: v for k, v in scorecard.items() if k != "invented"}
+
+    assert "invented" not in anonymizer_gate.regression_columns(current, baseline)
+
+
+# ---------------------------------------------------------------------------
+# The scan reply ratio readout — two distinct trackings updated inside
+# score_entry from each contract's own `anonymize.scan` call_tokens
+# record: the run totals (Result.scan_reply_run_output_tokens /
+# Result.scan_reply_run_payload_tokens, whose ratio is the re-pin source
+# for ANONYMIZE_SCAN_REPLY_RATIO) and the per-entry maximum
+# (Result.largest_scan_reply_ratio / Result.largest_scan_reply_ratio_entry,
+# a reading of the ANONYMIZE_SCAN_MAX_OUTPUT_TOKENS plateau).
+# ---------------------------------------------------------------------------
+
+
+def test_largest_scan_reply_ratio_tracks_the_maximum_and_its_entry():
+    entry_low = _entry("ratio-low", "Nora said hi.", [])
+    entry_high = _entry("ratio-high", "Omar said hi.", [])
+    contract_low = _contract(
+        {}, call_tokens=(_scan_call(ANONYMIZE_SCAN_PROMPT_SKELETON_TOKENS + 100, 50),)
+    )
+    contract_high = _contract(
+        {}, call_tokens=(_scan_call(ANONYMIZE_SCAN_PROMPT_SKELETON_TOKENS + 100, 250),)
+    )
+
+    result = anonymizer_gate.Result()
+    anonymizer_gate.score_entry(entry_low, contract_low, CONFIGURED, result)
+    anonymizer_gate.score_entry(entry_high, contract_high, CONFIGURED, result)
+
+    assert result.largest_scan_reply_ratio == pytest.approx(2.5)
+    assert result.largest_scan_reply_ratio_entry == "ratio-high"
+
+
+def test_scan_reply_run_totals_sum_across_entries():
+    """The run totals sum every scored call's output and payload tokens —
+    distinct from the per-entry maximum tracked alongside them."""
+    entry_low = _entry("ratio-low", "Nora said hi.", [])
+    entry_high = _entry("ratio-high", "Omar said hi.", [])
+    contract_low = _contract(
+        {}, call_tokens=(_scan_call(ANONYMIZE_SCAN_PROMPT_SKELETON_TOKENS + 100, 50),)
+    )
+    contract_high = _contract(
+        {}, call_tokens=(_scan_call(ANONYMIZE_SCAN_PROMPT_SKELETON_TOKENS + 100, 250),)
+    )
+
+    result = anonymizer_gate.Result()
+    anonymizer_gate.score_entry(entry_low, contract_low, CONFIGURED, result)
+    anonymizer_gate.score_entry(entry_high, contract_high, CONFIGURED, result)
+
+    assert result.scan_reply_run_output_tokens == 300
+    assert result.scan_reply_run_payload_tokens == 200
+
+
+@pytest.mark.parametrize("payload_delta", [0, -5])
+def test_largest_scan_reply_ratio_skips_a_call_with_non_positive_payload_tokens(payload_delta):
+    """A call whose payload tokens (prompt tokens less the pinned skeleton)
+    are zero or below takes no part in the maximum, nor in the run totals."""
+    entry = _entry("ratio-empty", "hi.", [])
+    contract = _contract(
+        {}, call_tokens=(_scan_call(ANONYMIZE_SCAN_PROMPT_SKELETON_TOKENS + payload_delta, 5),)
+    )
+
+    result = anonymizer_gate.Result()
+    anonymizer_gate.score_entry(entry, contract, CONFIGURED, result)
+
+    assert result.largest_scan_reply_ratio is None
+    assert result.largest_scan_reply_ratio_entry is None
+    assert result.scan_reply_run_output_tokens == 0
+    assert result.scan_reply_run_payload_tokens == 0
+
+
+def test_largest_scan_reply_ratio_ignores_non_scan_call_labels():
+    entry = _entry("ratio-anchor-only", "hi.", [])
+    contract = _contract(
+        {},
+        call_tokens=(
+            {
+                "label": "anonymize.anchor",
+                "prompt_tokens": ANONYMIZE_SCAN_PROMPT_SKELETON_TOKENS + 500,
+                "output_tokens": 400,
+            },
+        ),
+    )
+
+    result = anonymizer_gate.Result()
+    anonymizer_gate.score_entry(entry, contract, CONFIGURED, result)
+
+    assert result.largest_scan_reply_ratio is None
+    assert result.scan_reply_run_payload_tokens == 0
+
+
+def test_print_detail_prints_the_scan_reply_ratio_line(capsys):
+    result = anonymizer_gate.Result(
+        largest_scan_reply_ratio=3.10,
+        largest_scan_reply_ratio_entry="de-dev-057",
+        scan_reply_run_output_tokens=142,
+        scan_reply_run_payload_tokens=100,
+    )
+
+    anonymizer_gate.print_detail(result)
+
+    out = capsys.readouterr().out
+    assert (
+        f"scan reply ratio: run 1.42 "
+        f"(pinned ANONYMIZE_SCAN_REPLY_RATIO={ANONYMIZE_SCAN_REPLY_RATIO}); "
+        "largest single entry 3.10 (de-dev-057)" in out
+    )
+
+
+def test_print_detail_prints_na_when_no_scan_reply_ratio_observed(capsys):
+    result = anonymizer_gate.Result()
+
+    anonymizer_gate.print_detail(result)
+
+    out = capsys.readouterr().out
+    assert "scan reply ratio: n/a" in out
+
+
+# ---------------------------------------------------------------------------
+# Three populations, three walks. Production substitutes the forward table
+# by itself (``paramem.cloud.placeholders._substitute_whole_words``), so
+# the scorer's view of what substitutes is a walk over the forward keys
+# alone; the reverted surfaces and the unknown-word values — which
+# production substitutes nowhere — are located by walks of their own,
+# since the gate scores their positions against gold spans.
+# ---------------------------------------------------------------------------
+
+
+def test_kept_value_inside_a_reverted_surface_is_scrubbed_where_it_sits():
+    """A kept value whose only occurrence lies inside a longer reverted
+    surface still substitutes there: the reverted surface never reaches
+    the forward table, so nothing shields the name inside it.
+    """
+    text = "My boss Mara Feldmann wants the report by Monday."
+    name_start = text.index("Mara Feldmann")
+    entry = _entry(
+        "syn-009",
+        text,
+        [_gold("Mara Feldmann", "Person", -1, name_start, name_start + len("Mara Feldmann"))],
+    )
+    contract = _contract(
+        {"Mara Feldmann": "Person_1"},
+        dropped=[
+            {
+                "category": "Org",
+                "side": "scan",
+                "text": "My boss Mara Feldmann",
+                "reason": "reverted",
+                "word": None,
+            }
+        ],
+    )
+
+    result = anonymizer_gate.score_corpus([entry], {"syn-009": contract}, CONFIGURED)
+
+    assert result.tot["caught_in_scope"] == 1
+    assert result.tot["caught_names"] == 1
+    assert result.miss_list == []
+    assert result.partial_list == []
+    assert result.tot["scrubbed_correct"] == 1
+    assert result.junk_list == []
+    assert result.wrong_type_list == []
+
+
+def test_reverted_surface_keeps_its_own_position_under_a_longer_forward_key():
+    """A reverted surface is scored by position against out-of-scope gold,
+    so it is located by its own walk: a longer forward key covering one of
+    its occurrences leaves its other occurrences intact.
+    """
+    text = "The landlord asked; write to landlord@example.de."
+    email = "landlord@example.de"
+    email_start = text.index(email)
+    role_start = text.index("landlord")  # the standalone one, before the address
+    entry = _entry(
+        "syn-010",
+        text,
+        [
+            _gold(email, "Email", -1, email_start, email_start + len(email)),
+            _gold("landlord", "Profession", -1, role_start, role_start + len("landlord")),
+        ],
+    )
+    contract = _contract(
+        {email: "Email_1"},
+        dropped=[
+            {
+                "category": "Profession",
+                "side": "scan",
+                "text": "landlord",
+                "reason": "reverted",
+                "word": None,
+            }
+        ],
+    )
+
+    result = anonymizer_gate.score_corpus([entry], {"syn-010": contract}, CONFIGURED)
+
+    assert result.tot["caught_in_scope"] == 1
+    assert result.tot["out_scope_reversed"] == 1
+    assert result.tot["out_scope_scrubbed"] == 0
+    assert result.tot["out_scope_untagged"] == 0

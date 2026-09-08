@@ -1,161 +1,164 @@
-"""``assemble_payload`` — the one assembler producing both ``TagPayload``
-derivations (``tag_text`` for the SCAN call, ``anchor_evidence`` for the
-ANCHOR call).
+"""``assemble_payload`` — the SCAN payload's turn slicing and the four
+derivations (``tag_text``, ``slice_ranges``, ``anchor_range``,
+``anchor_evidence``) it produces from one set of inputs.
 """
 
 from __future__ import annotations
 
 from paramem.cloud.anonymize import assemble_payload
 
+# ---------------------------------------------------------------------------
+# The slices.
+# ---------------------------------------------------------------------------
+
+
+class TestHistorySlicing:
+    def test_each_history_turn_is_its_own_slice(self) -> None:
+        payload = assemble_payload(["[user] first turn", "[assistant] second turn"], "", [])
+        assert len(payload.slice_ranges) == 2
+        texts = [payload.tag_text[s:e] for s, e in payload.slice_ranges]
+        assert texts == ["first turn", "second turn"]
+
+
+class TestTranscriptSlicing:
+    def test_a_multi_line_turn_is_one_slice(self) -> None:
+        transcript = "[user] line one\nline two\nline three"
+        payload = assemble_payload([], transcript, [])
+        assert len(payload.slice_ranges) == 1
+        (start, end) = payload.slice_ranges[0]
+        assert payload.tag_text[start:end] == "line one\nline two\nline three"
+
+    def test_each_marker_line_opens_a_new_slice(self) -> None:
+        transcript = "[user] hi there\n[assistant] hello back"
+        payload = assemble_payload([], transcript, [])
+        assert len(payload.slice_ranges) == 2
+        texts = [payload.tag_text[s:e] for s, e in payload.slice_ranges]
+        assert texts == ["hi there", "hello back"]
+
+    def test_a_continuation_line_shaped_like_a_marker_opens_its_own_slice(self) -> None:
+        """A continuation line that itself begins with a bracketed word
+        followed by a space is indistinguishable, by the marker regex, from
+        a real turn marker — it opens its own slice. This is the accepted
+        behaviour, not a defect: the marker grammar has no way to tell
+        "[bracketed]" prose apart from a role marker.
+        """
+        transcript = "[user] hello\n[bracketed] like a marker\nplain continuation"
+        payload = assemble_payload([], transcript, [])
+        assert len(payload.slice_ranges) == 2
+        texts = [payload.tag_text[s:e] for s, e in payload.slice_ranges]
+        assert texts == ["hello", "like a marker\nplain continuation"]
+
+
+class TestFactBlockSlicing:
+    def test_the_fact_block_is_one_slice_for_any_number_of_facts(self) -> None:
+        facts = [
+            {"subject": "Alex", "predicate": "works_at", "object": "Acme"},
+            {"subject": "Alex", "predicate": "lives_in", "object": "Berlin"},
+            {"subject": "Riley", "predicate": "knows", "object": "Alex"},
+        ]
+        payload = assemble_payload([], "", facts)
+        assert len(payload.slice_ranges) == 1
+        (start, end) = payload.slice_ranges[0]
+        assert payload.tag_text[start:end] == "Alex Acme\nAlex Berlin\nRiley Alex"
+
+    def test_no_facts_contributes_no_slice(self) -> None:
+        payload = assemble_payload(["[user] hi"], "", [])
+        assert len(payload.slice_ranges) == 1  # only the history turn
+        texts = [payload.tag_text[s:e] for s, e in payload.slice_ranges]
+        assert texts == ["hi"]
+
+
+class TestPayloadShapesPerCaller:
+    def test_chat_egress_payload_is_one_turn_no_history_no_facts(self) -> None:
+        """No history, one transcript turn, no facts -> exactly one slice,
+        costing exactly one SCAN call."""
+        payload = assemble_payload([], "[user] hello there", [])
+        assert len(payload.slice_ranges) == 1
+        (start, end) = payload.slice_ranges[0]
+        assert payload.tag_text[start:end] == "hello there"
+
+    def test_graph_tier_payload_is_facts_only_no_transcript(self) -> None:
+        """No transcript, facts only -> exactly one slice."""
+        facts = [{"subject": "Alex", "predicate": "works_at", "object": "Acme"}]
+        payload = assemble_payload([], "", facts)
+        assert len(payload.slice_ranges) == 1
+        (start, end) = payload.slice_ranges[0]
+        assert payload.tag_text[start:end] == "Alex Acme"
+
+
+# ---------------------------------------------------------------------------
+# What the payload keeps.
+# ---------------------------------------------------------------------------
+
 
 class TestTagTextIsMarkerFreeAndOrdered:
-    def test_tag_text_orders_history_then_transcript_then_fact_lines(self) -> None:
-        history = ["[user] earlier turn", "[assistant] earlier reply"]
-        transcript = "[user] current turn"
-        facts = [{"subject": "alex", "predicate": "lives in", "object": "berlin"}]
+    def test_history_then_transcript_then_facts_marker_free(self) -> None:
+        history = ["[user] HISTORY_SENTINEL turn"]
+        transcript = "[assistant] TRANSCRIPT_SENTINEL turn"
+        facts = [{"subject": "FACT_SENTINEL_SUBJ", "predicate": "p", "object": "FACT_SENTINEL_OBJ"}]
 
         payload = assemble_payload(history, transcript, facts)
 
-        lines = payload.tag_text.split("\n")
-        assert lines[0] == "earlier turn"
-        assert lines[1] == "earlier reply"
-        assert lines[2] == "current turn"
-        # One line per fact: subject and object verbatim, space-joined —
-        # the same two fields insert_placeholders later substitutes.
-        # predicate is deliberately excluded (never a substitution target).
-        assert lines[3] == "alex berlin"
-
-    def test_every_marker_is_stripped_from_tag_text(self) -> None:
-        payload = assemble_payload(["[user] hi"], "[assistant] hello there", facts=[])
         assert "[user]" not in payload.tag_text
         assert "[assistant]" not in payload.tag_text
-
-    def test_the_marker_stripped_word_user_never_survives_into_tag_text(self) -> None:
-        # The historical false-positive: "[user" tagged as a person span
-        # when the marker is left in. Stripping it means the bare word
-        # "user" is never produced by the marker itself.
-        payload = assemble_payload([], "[user] hello", facts=[])
-        assert "user" not in payload.tag_text
+        assert (
+            payload.tag_text.index("HISTORY_SENTINEL")
+            < payload.tag_text.index("TRANSCRIPT_SENTINEL")
+            < payload.tag_text.index("FACT_SENTINEL_SUBJ")
+        )
 
 
-class TestAnchorRangeSelectsExactlyTheTranscriptRegion:
-    def test_anchor_range_slice_equals_the_stripped_transcript_text(self) -> None:
-        history = ["[user] earlier"]
-        transcript = "[user] current turn text"
-        payload = assemble_payload(history, transcript, facts=[])
-
-        start, end = payload.anchor_range
-        assert payload.tag_text[start:end] == "current turn text"
-
-    def test_empty_transcript_gives_an_empty_anchor_range(self) -> None:
-        payload = assemble_payload(["[user] hi"], "", facts=[])
-        start, end = payload.anchor_range
-        assert start == end
-
-
-class TestAnchorEvidenceIsMarkerBearingAndExcludesFacts:
-    def test_anchor_evidence_is_the_exact_join_of_history_and_transcript_lines(self) -> None:
-        history = ["[user] earlier turn", "[assistant] earlier reply"]
-        transcript = "[user] current turn"
-        facts = [{"subject": "alex", "predicate": "lives in", "object": "berlin"}]
+class TestAnchorRangeSelectsExactlyTheTranscript:
+    def test_anchor_range_covers_only_the_stripped_transcript(self) -> None:
+        history = ["[user] history turn"]
+        transcript = "[user] transcript line one\ntranscript line two"
+        facts = [{"subject": "S", "predicate": "p", "object": "O"}]
 
         payload = assemble_payload(history, transcript, facts)
 
-        assert payload.anchor_evidence == "\n".join([*history, transcript])
-
-    def test_anchor_evidence_carries_markers_verbatim(self) -> None:
-        payload = assemble_payload(["[user] hi"], "[assistant] hello", facts=[])
-        assert "[user] hi" in payload.anchor_evidence
-        assert "[assistant] hello" in payload.anchor_evidence
-
-    def test_anchor_evidence_excludes_the_fact_block(self) -> None:
-        facts = [{"subject": "alex", "predicate": "lives in", "object": "berlin"}]
-        payload = assemble_payload([], "[user] hi", facts)
-        assert "berlin" not in payload.anchor_evidence
-        assert "subject" not in payload.anchor_evidence
-
-    def test_empty_history_makes_anchor_evidence_equal_the_transcript(self) -> None:
-        transcript = "[user] just this turn"
-        payload = assemble_payload([], transcript, facts=[])
-        assert payload.anchor_evidence == transcript
+        start, end = payload.anchor_range
+        assert payload.tag_text[start:end] == "transcript line one\ntranscript line two"
+        # Neither the history nor the fact block leaks into the region.
+        assert "history turn" not in payload.tag_text[start:end]
+        assert "S O" not in payload.tag_text[start:end]
 
 
-class TestFactBlockPreservesNonAsciiCharactersVerbatim:
-    """The SCAN call reads exactly the strings the consumer substitutes: a
-    non-ASCII fact value (e.g. ``ß``) must appear verbatim in ``tag_text``
-    — a rendering that escapes it to ``\\uXXXX`` would make the SCAN call
-    name a surface that never equals the real value at substitution time.
-    """
+class TestAnchorEvidenceIsMarkerBearingWithNoFactBlock:
+    def test_anchor_evidence_joins_history_and_transcript_lines_verbatim(self) -> None:
+        history = ["[user] history turn"]
+        transcript = "[user] transcript line one\n[assistant] transcript line two"
+        facts = [{"subject": "FACT_SUBJ", "predicate": "p", "object": "FACT_OBJ"}]
 
-    def test_a_non_ascii_fact_value_appears_verbatim_in_tag_text(self) -> None:
-        facts = [
-            {
-                "subject": "speaker0",
-                "predicate": "lives at",
-                "object": "Lindenstraße 44, 10115 Berlin",
-            }
-        ]
+        payload = assemble_payload(history, transcript, facts)
+
+        assert payload.anchor_evidence == (
+            "[user] history turn\n[user] transcript line one\n[assistant] transcript line two"
+        )
+        assert "FACT_SUBJ" not in payload.anchor_evidence
+        assert "FACT_OBJ" not in payload.anchor_evidence
+
+    def test_anchor_evidence_is_empty_facts_agnostic_when_no_facts(self) -> None:
+        history = ["[user] hi"]
+        transcript = "[assistant] hello"
+        payload = assemble_payload(history, transcript, [])
+        assert payload.anchor_evidence == "[user] hi\n[assistant] hello"
+
+
+class TestFactValuesReachThePayloadVerbatim:
+    def test_subject_and_object_reach_tag_text_verbatim_including_special_characters(self) -> None:
+        subject = 'Café "Chéz" \\René\\'
+        obj = "Müller & Söhne"
+        facts = [{"subject": subject, "predicate": "works_at", "object": obj}]
+
         payload = assemble_payload([], "", facts)
-        assert "Lindenstraße 44, 10115 Berlin" in payload.tag_text
-        assert "\\u00df" not in payload.tag_text
 
+        assert subject in payload.tag_text
+        assert obj in payload.tag_text
+        # No JSON quoting/escaping of the special characters.
+        assert '\\"' not in payload.tag_text
+        assert "\\\\" not in payload.tag_text
 
-class TestFactBlockPreservesQuotesAndBackslashesVerbatim:
-    """The same "the SCAN call reads exactly the consumer's substitution
-    string" invariant applies to a literal ``"`` or ``\\`` inside a fact
-    value: a rendering that escapes either (a JSON string literal escapes
-    both) produces a surface the SCAN call names that never equals the raw
-    value :func:`~paramem.cloud.placeholders.insert_placeholders` later
-    substitutes against.
-    """
-
-    def test_a_double_quote_in_a_fact_value_survives_verbatim_in_tag_text(self) -> None:
-        facts = [{"subject": "speaker0", "predicate": "said", "object": 'the "best" cafe'}]
+    def test_predicate_never_appears_in_the_payload(self) -> None:
+        facts = [{"subject": "A", "predicate": "UNIQUE_PREDICATE_TOKEN", "object": "B"}]
         payload = assemble_payload([], "", facts)
-        assert 'the "best" cafe' in payload.tag_text
-
-    def test_a_backslash_in_a_fact_value_survives_verbatim_in_tag_text(self) -> None:
-        facts = [{"subject": "speaker0", "predicate": "saved path", "object": "C:\\Users\\alex"}]
-        payload = assemble_payload([], "", facts)
-        assert "C:\\Users\\alex" in payload.tag_text
-
-
-class TestFactBlockIsBuiltFromRawSubjectAndObjectStrings:
-    """The fact block carries each fact's own raw ``subject``/``object``
-    strings — asserted by presence in ``tag_text``, never by a specific
-    rendering format (JSON, plain lines, or otherwise), since the
-    rendering choice is an internal representation detail the SCAN call
-    and the consumer never need to agree on beyond "the raw string appears".
-
-    ``predicate`` is deliberately never rendered into the fact block
-    (:func:`~paramem.cloud.anonymize.render_fact_lines`'s own docstring):
-    it is never a substitution target for
-    :func:`~paramem.cloud.placeholders.insert_placeholders`, so tagging it
-    would only inflate ``scan_dropped``/``inert_dropped`` for no
-    substitution benefit — this class asserts that omission explicitly
-    rather than assuming subject/object presence implies predicate
-    presence too.
-    """
-
-    def test_every_facts_subject_and_object_string_is_present_in_tag_text(self) -> None:
-        facts = [{"subject": "Alex Rivera", "predicate": "lives at", "object": "Lindenstraße 44"}]
-        payload = assemble_payload([], "", facts)
-        assert "Alex Rivera" in payload.tag_text
-        assert "Lindenstraße 44" in payload.tag_text
-
-    def test_multiple_facts_subject_and_object_strings_are_all_present_in_tag_text(self) -> None:
-        facts = [
-            {"subject": "Alex Rivera", "predicate": "knows", "object": "Jamie Lee"},
-            {"subject": "Jamie Lee", "predicate": "works at", "object": "Northwind Traders"},
-        ]
-        payload = assemble_payload([], "", facts)
-        for fact in facts:
-            assert fact["subject"] in payload.tag_text
-            assert fact["object"] in payload.tag_text
-
-    def test_the_predicate_is_never_rendered_into_the_fact_block(self) -> None:
-        facts = [
-            {"subject": "Alex Rivera", "predicate": "has_unique_marker_predicate", "object": "x"}
-        ]
-        payload = assemble_payload([], "", facts)
-        assert "has_unique_marker_predicate" not in payload.tag_text
+        assert "UNIQUE_PREDICATE_TOKEN" not in payload.tag_text

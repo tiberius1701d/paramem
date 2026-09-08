@@ -3,10 +3,11 @@ cloud round trip.
 
 Serves every cloud-bound path (session-tier extraction, graph-tier
 enrichment, chat egress, and their calibration harnesses) through
-:func:`anonymize` — the chain around the SCAN call
-(:func:`~paramem.cloud.anonymize_steps.scan_values`) and the ANCHOR
-self-introduction question
-(:func:`~paramem.cloud.anonymize_steps.ask_speaker_anchor`), the two local
+:func:`anonymize` — the chain around one SCAN call per payload slice
+(:func:`~paramem.cloud.anonymize_steps.mark_values`, merged via
+:func:`~paramem.cloud.anonymize_steps.merge_scan_mappings`) and the
+ANCHOR self-introduction question
+(:func:`~paramem.cloud.anonymize_steps.ask_speaker_anchor`) — the local
 model calls one call may issue. Every placeholder is minted in code
 (:func:`~paramem.cloud.placeholders.build_forward_table`) and the
 anonymized transcript is produced by the same exact, case-sensitive
@@ -42,22 +43,31 @@ depends on ``paramem.cloud``, never the reverse) — this module does not,
 and must not, import ``paramem.graph.anonymizer_prompts`` or anything else
 under ``paramem.graph``.
 
-The payload is a single text the SCAN call reads once, in the model's own
-token units — there is no fact-boundary slicing and no per-category local
-call. The ANCHOR call's own evidence is the history-plus-transcript region
-of that same payload, never the fact block. A single :func:`anonymize`
-call therefore costs at most two local ``generate()`` calls (SCAN, then
-ANCHOR when a kept person value is a candidate), never one per configured
+The payload carries its own turn boundaries (``TagPayload.slice_ranges`` —
+one per history turn, one per transcript turn, one for the fact block,
+each only when it holds real text). A SCAN call reads exactly one slice,
+in the model's own token units; this module issues one such call per
+slice, in payload order, collects the slices' own replies, and calls
+:func:`~paramem.cloud.anonymize_steps.merge_scan_mappings` to combine them
+into one mapping before the mechanical keep-or-revert step
+(:func:`~paramem.cloud.anonymize_steps.keep_or_revert`) runs over the
+whole payload — there is no per-category local call. The ANCHOR call's own
+evidence is the
+history-plus-transcript region of that same payload, never the fact
+block, and is still a single call. A single :func:`anonymize` call
+therefore costs one local ``generate()`` per scanned slice, plus ANCHOR
+when a kept person value is a candidate — never one per configured
 category.
 
 Dynamic VRAM clamp: the configured ``token_envelope`` is the operator
 CEILING, not a guarantee of what live free VRAM can support at call time —
 free VRAM varies within one fold.  :func:`anonymize` measures free VRAM ONCE, via
 :func:`~paramem.utils.vram_guard.effective_token_envelope`, and threads
-the resulting effective (possibly smaller) envelope to both local calls.
-The measurement runs right after the model-residency check, before either
-call: a cloud-only deferral (``model=None, tokenizer=None``) never reaches
-it, so it opens no CUDA context and measures nothing.
+the resulting effective (possibly smaller) envelope to every local call —
+every scanned slice and the ANCHOR call alike. The measurement runs right
+after the model-residency check, before the first call: a cloud-only
+deferral (``model=None, tokenizer=None``) never reaches it, so it opens no
+CUDA context and measures nothing.
 """
 
 from __future__ import annotations
@@ -73,7 +83,9 @@ from paramem.cloud.anonymize_steps import (
     ScanFailed,
     ScanResult,
     ask_speaker_anchor,
-    scan_values,
+    keep_or_revert,
+    mark_values,
+    merge_scan_mappings,
 )
 from paramem.cloud.placeholders import (
     ForwardTable,
@@ -113,8 +125,8 @@ class AnonymizerPrompts:
     Attributes:
         scan_system: The ``SCAN-SYSTEM`` section, category-independent.
         scan: The ``SCAN`` section (``{keywords}``, ``{text}`` both
-            deferred — formatted per call by
-            :func:`~paramem.cloud.anonymize_steps.scan_values`).
+            deferred — formatted once per scanned slice by
+            :func:`~paramem.cloud.anonymize_steps.mark_values`).
         anchor_system: The ``ANCHOR-SYSTEM`` section, category-independent.
         anchor: The ``ANCHOR`` section (``{speaker_id}``, ``{values}``,
             ``{text}`` all deferred).
@@ -128,9 +140,9 @@ class AnonymizerPrompts:
 
 @dataclass(frozen=True)
 class TagPayload:
-    """The two derivations :func:`assemble_payload` produces from one set
-    of inputs — the SCAN call's payload, and the ANCHOR call's own
-    evidence.
+    """The derivations :func:`assemble_payload` produces from one set of
+    inputs — the SCAN calls' payload (whole, and sliced into turns), and
+    the ANCHOR call's own evidence.
 
     Attributes:
         tag_text: Marker-FREE, newline-joined: every history line, every
@@ -138,18 +150,31 @@ class TagPayload:
             :func:`~paramem.utils.turn_markers.split_marker`), then one
             line per fact — that fact's ``subject`` and ``object`` joined
             verbatim by a single space, unquoted, unescaped (see
-            :func:`render_fact_lines`) — the ONE text handed to
-            :func:`~paramem.cloud.anonymize_steps.scan_values`. This is
-            load-bearing: the SCAN call must read exactly the strings
+            :func:`render_fact_lines`) — the text
+            :attr:`slice_ranges` cuts into the pieces
+            :func:`~paramem.cloud.anonymize_steps.mark_values` reads one
+            at a time, and the text :func:`~paramem.cloud.anonymize_steps.
+            keep_or_revert` walks whole once their replies are merged. This
+            is load-bearing: a SCAN call must read exactly the strings
             :func:`~paramem.cloud.placeholders.insert_placeholders` later
             substitutes over (``subject``/``object`` only — ``predicate``
             is never a substitution target and carries nothing here). A
             rendering that quotes or escapes a fact value (for any value
-            containing ``"`` or ``\\``) would make the SCAN call name the
+            containing ``"`` or ``\\``) would make a SCAN call name the
             ESCAPED surface — a string that never equals the real value
             the consumer substitutes, so the real value would egress
             unsubstituted. Its coordinates are the only offset space the
             arc uses.
+        slice_ranges: ``[start, end)`` ranges of ``tag_text``, in payload
+            order: one per history turn, one per transcript turn (a marker
+            line plus every following line carrying no marker — see
+            :func:`~paramem.utils.turn_markers.split_marker`), then one for
+            the fact block, however many facts it holds. A range whose
+            text holds no non-whitespace character is not carried at all
+            — an empty fact block contributes nothing. :func:`anonymize`
+            calls :func:`~paramem.cloud.anonymize_steps.mark_values` once
+            per entry, in order, and merges the replies before
+            :func:`~paramem.cloud.anonymize_steps.keep_or_revert` runs.
         anchor_range: ``[start, end)`` of the transcript region inside
             ``tag_text`` — contiguous by construction, since the
             transcript lines are joined immediately after the history
@@ -162,6 +187,7 @@ class TagPayload:
     """
 
     tag_text: str
+    slice_ranges: tuple[tuple[int, int], ...]
     anchor_range: tuple[int, int]
     anchor_evidence: str
 
@@ -186,12 +212,59 @@ def render_fact_lines(facts: list[dict]) -> str:
     return "\n".join(f"{str(f.get('subject', ''))} {str(f.get('object', ''))}" for f in facts)
 
 
+def _cumulative_ranges(parts: Sequence[str]) -> tuple[tuple[int, int], ...]:
+    """``[start, end)`` for each of *parts* as if joined by a single
+    ``"\\n"`` — mirrors ``"\\n".join(parts)``'s own offset arithmetic
+    exactly, so a caller building ``tag_text`` from the SAME *parts* list
+    gets ranges that line up with it by construction, with no separate
+    reconciliation step.
+    """
+    ranges: list[tuple[int, int]] = []
+    offset = 0
+    for part in parts:
+        start = offset
+        end = start + len(part)
+        ranges.append((start, end))
+        offset = end + 1
+    return tuple(ranges)
+
+
+def _transcript_turn_ranges(
+    transcript_lines: Sequence[str], line_ranges: Sequence[tuple[int, int]]
+) -> tuple[tuple[int, int], ...]:
+    """Group *line_ranges* (one entry per line of the stripped transcript,
+    same order and length as *transcript_lines*) into turns: a marker line
+    plus every following line carrying no marker.
+
+    Marker presence is read off *transcript_lines* — the ORIGINAL,
+    marker-bearing lines — via
+    :func:`~paramem.utils.turn_markers.split_marker`; *line_ranges* covers
+    the stripped text, so the two are paired by index. A line carrying no
+    marker while no turn is yet open (the transcript's own first line,
+    on the rare input that happens to start without one) opens its own
+    turn rather than being silently dropped.
+    """
+    turns: list[tuple[int, int]] = []
+    current: tuple[int, int] | None = None
+    for line, (start, end) in zip(transcript_lines, line_ranges):
+        marker, _text = split_marker(line)
+        if marker or current is None:
+            if current is not None:
+                turns.append(current)
+            current = (start, end)
+        else:
+            current = (current[0], end)
+    if current is not None:
+        turns.append(current)
+    return tuple(turns)
+
+
 def assemble_payload(
     history_lines: Sequence[str], transcript: str, facts: list[dict]
 ) -> TagPayload:
-    """Build the SCAN payload and the ANCHOR evidence text from one set of
-    inputs — the ONE assembler producing both :class:`TagPayload`
-    derivations.
+    """Build the SCAN payload (whole and sliced into turns) and the ANCHOR
+    evidence text from one set of inputs — the ONE assembler producing
+    every :class:`TagPayload` derivation.
 
     ``history_lines`` and ``transcript`` both arrive marker-bearing: each
     entry of *history_lines* is one turn already rendered via
@@ -201,7 +274,7 @@ def assemble_payload(
     or a synthetic single line at chat egress, or ``""`` at the graph
     tier. Each line's role marker is removed via
     :func:`~paramem.utils.turn_markers.split_marker` — the ONE site above
-    :func:`~paramem.cloud.anonymize_steps.scan_values` that changes offset
+    :func:`~paramem.cloud.anonymize_steps.mark_values` that changes offset
     space, and the only use of ``split_marker`` in the arc.
 
     ``tag_text`` orders history, then transcript, then the rendered fact
@@ -209,10 +282,15 @@ def assemble_payload(
     and ``object`` verbatim, the SAME strings
     :func:`~paramem.cloud.placeholders.insert_placeholders` later
     substitutes), so the transcript region is contiguous and recorded
-    exactly as ``anchor_range``. ``anchor_evidence`` is a separate join of
-    the SAME lines, marker-bearing and with no fact block — it is never
-    derived from ``tag_text`` (which has already had every marker
-    stripped).
+    exactly as ``anchor_range``. ``slice_ranges`` is computed over that
+    SAME ordered parts list (:func:`_cumulative_ranges`), so it lines up
+    with ``tag_text`` by construction: one range per history turn, one per
+    transcript turn (:func:`_transcript_turn_ranges`), then one for the
+    fact block — a range whose text is entirely whitespace is dropped, so
+    an empty fact block contributes nothing. ``anchor_evidence`` is a
+    separate join of the SAME lines, marker-bearing and with no fact block
+    — it is never derived from ``tag_text`` (which has already had every
+    marker stripped).
     """
     stripped_history = [split_marker(line)[1] for line in history_lines]
     transcript_lines = transcript.split("\n") if transcript else []
@@ -226,8 +304,23 @@ def assemble_payload(
     tag_text = "\n".join([*stripped_history, *stripped_transcript, fact_lines])
     anchor_evidence = "\n".join([*history_lines, *transcript_lines])
 
+    full_ranges = _cumulative_ranges([*stripped_history, *stripped_transcript, fact_lines])
+    history_ranges = full_ranges[: len(stripped_history)]
+    transcript_line_ranges = full_ranges[
+        len(stripped_history) : len(stripped_history) + len(stripped_transcript)
+    ]
+    fact_range = full_ranges[-1]
+
+    candidate_ranges = [
+        *history_ranges,
+        *_transcript_turn_ranges(transcript_lines, transcript_line_ranges),
+        fact_range,
+    ]
+    slice_ranges = tuple(r for r in candidate_ranges if tag_text[r[0] : r[1]].strip())
+
     return TagPayload(
         tag_text=tag_text,
+        slice_ranges=slice_ranges,
         anchor_range=(transcript_start, transcript_end),
         anchor_evidence=anchor_evidence,
     )
@@ -269,23 +362,30 @@ def _anchor_candidates(
     return tuple(candidates)
 
 
-def _render_scan_raw(scan_raw: str, anchor_raw: str) -> str:
-    """THE named ``contract.raw`` derivation for a completed run: the SCAN
-    call's own raw reply plus the ANCHOR call's own raw text, rendered as
-    one JSON object.
+def _render_scan_raw(scan_raws: Sequence[str], anchor_raw: str) -> str:
+    """THE named ``contract.raw`` derivation: every scanned slice's own raw
+    reply, in payload order, plus the ANCHOR call's own raw text, rendered
+    as one JSON object.
 
-    On a SCAN failure ``anonymize()`` never calls this — ``raw`` is the
-    SCAN call's own raw reply, or its budget-refusal message, instead (see
-    :func:`anonymize`'s ``ScanFailed``/``AnonymizeBudgetRefused`` catch).
+    Called both for a completed run (every slice scanned, ``anchor_raw``
+    the ANCHOR call's own text or ``""`` when it never ran) and for
+    :func:`anonymize`'s scan-failure terminal — there *scan_raws* is the
+    earlier slices' own raw replies followed by the failing slice's raw
+    reply, or its budget-refusal message when the precondition refused the
+    call before one was ever issued, and ``anchor_raw`` is always ``""``
+    (a scan failure never reaches the ANCHOR call).
 
-    ``ensure_ascii=False``: a value the SCAN call named verbatim (see
+    ``ensure_ascii=False``: a value a SCAN call named verbatim (see
     ``TagPayload.tag_text``'s docstring) must read verbatim here too — the
     default (``ensure_ascii=True``) would escape every non-ASCII
     character, making a correctly-named value indistinguishable from an
     escaped-surface naming defect, which this raw record exists to let an
     operator diagnose.
     """
-    return json.dumps({"scan": scan_raw, "anchor": anchor_raw}, ensure_ascii=False)
+    return json.dumps(
+        {"scan": list(scan_raws), "anchor": anchor_raw},
+        ensure_ascii=False,
+    )
 
 
 @dataclass(frozen=True)
@@ -313,8 +413,10 @@ class AnonymizedContract:
       :func:`failed_contract` carries the real accumulation up to the
       point the terminal fired, so a failed run's calibration artifact can
       still say WHY it failed.
-    * ``"ok"`` — the SCAN call ran, the domain guard did not fire, and the
-      table was built.  ``forward`` / ``reverse`` may still be empty — a
+    * ``"ok"`` — every payload slice was scanned (no SCAN call is issued
+      at all when the payload carries no slice — e.g. an empty transcript
+      and no facts), the domain guard did not fire, and the table was
+      built.  ``forward`` / ``reverse`` may still be empty — a
       legitimate verdict ("ran, found nothing in scope"), not a failure;
       egress proceeds.  ``facts`` is the input ``facts`` verbatim.
 
@@ -326,12 +428,13 @@ class AnonymizedContract:
       onto this call's actual domain.
     * ``"model_unavailable"`` — the base model is not resident
       (``model is None``), so the SCAN call cannot be issued at all.
-    * ``"scan_failed"`` — the SCAN call's reply did not parse to
-      ``{"mapping": {str: str}}``
+    * ``"scan_failed"`` — one payload slice's own SCAN call reply did not
+      parse to ``{"mapping": {str: str}}``
       (:class:`~paramem.cloud.anonymize_steps.ScanFailed`), or its budget
-      precondition refused the call
+      precondition refused that call
       (:class:`~paramem.cloud.anonymize_steps.AnonymizeBudgetRefused`).
-      ``raw`` carries the reply or the refusal.
+      ``raw`` carries every slice's reply scanned before the failing one,
+      followed by the failing slice's reply or its refusal message.
 
     ``reverse`` is the de-anonymization key: it must NEVER egress. The
     field that DOES egress is ``forward`` (used to placeholder outbound
@@ -345,9 +448,10 @@ class AnonymizedContract:
     over ``facts`` and ``forward``, never storing the substituted array
     here.
 
-    ``model_calls`` — local ``generate()`` calls actually issued: SCAN
-    (when ``status`` is not ``"opted_out"``/``"model_unavailable"``) and
-    ANCHOR (0 or 1) — so ``model_calls`` is ``0``, ``1``, or ``2``.
+    ``model_calls`` — local ``generate()`` calls actually issued: one SCAN
+    call per scanned payload slice (when ``status`` is not
+    ``"opted_out"``/``"model_unavailable"`` — see ``TagPayload.slice_ranges``
+    for what a slice is), plus ANCHOR (0 or 1).
 
     ``call_tokens`` — one record per ``generate()`` call actually issued,
     matching ``model_calls`` in length: ``{"label", "prompt_tokens",
@@ -360,9 +464,9 @@ class AnonymizedContract:
     ``scan_dropped`` / ``scan_dropped_entries`` are the mapping-quality
     signal: per-entry records ``{category, side: "scan"|"table",
     text: <truncated>, reason: "speaker_id" | "reverted" | "unknown_word" |
-    "inert"}``, accumulated across the whole SCAN call — see
-    :func:`~paramem.cloud.anonymize_steps.scan_values`'s docstring for the
-    ``side="scan"`` reasons. ``scan_dropped`` (the int) counts ONLY the
+    "inert"}``, accumulated across every scanned slice's merged mapping —
+    see :func:`~paramem.cloud.anonymize_steps.keep_or_revert`'s docstring
+    for the ``side="scan"`` reasons. ``scan_dropped`` (the int) counts ONLY the
     ``side="scan"`` entries — the scan step's own drops, before a forward
     table even exists; it can be smaller than ``len(scan_dropped_entries)``
     once the ``side="table"``/``reason="inert"`` entries below are
@@ -554,9 +658,9 @@ def anonymize(
     time. This function measures free VRAM exactly ONCE, via
     :func:`~paramem.utils.vram_guard.effective_token_envelope`, right after
     the model-residency check, and threads the resulting effective
-    envelope to BOTH local calls below. A deferral (``model=None,
-    tokenizer=None``) never reaches the measurement, so it opens no CUDA
-    context and measures nothing.
+    envelope to EVERY local call below — every scanned slice and ANCHOR
+    alike. A deferral (``model=None, tokenizer=None``) never reaches the
+    measurement, so it opens no CUDA context and measures nothing.
     :func:`~paramem.utils.vram_guard.effective_token_envelope` calls
     ``torch.cuda.mem_get_info()`` when CUDA is available, which would
     otherwise initialise a CUDA context on a device another process
@@ -571,19 +675,34 @@ def anonymize(
        :func:`opted_out_contract` — no model call at all. This is the ONE
        opt-out door: every caller reaches it through this function's own
        ``categories`` argument.
-    2. :func:`assemble_payload` builds the SCAN payload and the ANCHOR
-       evidence text from ``history``, ``transcript`` and ``facts``.
+    2. :func:`assemble_payload` builds the SCAN payload — whole (``tag_text``)
+       and pre-sliced along its turn boundaries (``slice_ranges``) — and
+       the ANCHOR evidence text, from ``history``, ``transcript`` and
+       ``facts``.
     3. ``model is None or tokenizer is None`` -> ``status="failed"``,
-       ``failure="model_unavailable"`` — the SCAN call needs a resident
+       ``failure="model_unavailable"`` — a SCAN call needs a resident
        model and cannot be deferred the way the ANCHOR call can.
-    4. **SCAN** — :func:`~paramem.cloud.anonymize_steps.scan_values`: one
-       ``generate()`` call over every active category's keyword, plus
-       every other row's keyword (the full table, so the model never
-       learns which kinds are scrubbed). ``AnonymizeBudgetRefused`` (the
-       call's budget precondition refused it) and
-       ``ScanFailed`` (the call ran but its reply did not parse) are both
-       caught HERE and only here -> ``status="failed"``,
-       ``failure="scan_failed"`` (:func:`failed_contract`).
+    4. **SCAN, one call per slice** — for each of ``payload.slice_ranges``,
+       in payload order:
+       :func:`~paramem.cloud.anonymize_steps.mark_values` issues one
+       ``generate()`` call over that slice's own text, against every
+       active category's keyword plus every other row's keyword (the full
+       table, so the model never learns which kinds are scrubbed).
+       ``AnonymizeBudgetRefused`` (the call's budget precondition refused
+       it) and ``ScanFailed`` (the call ran but its reply did not parse)
+       are both caught HERE and only here -> ``status="failed"``,
+       ``failure="scan_failed"`` (:func:`failed_contract`), carrying every
+       call actually issued before the failing slice. Each scanned slice's
+       own ``{value: keyword}`` reply is collected; once every slice has
+       been scanned,
+       :func:`~paramem.cloud.anonymize_steps.merge_scan_mappings` combines
+       them into one mapping: a value keeps the keyword named by the
+       earliest slice that named it under one of *categories*, or, when no
+       slice ever did, the earliest slice's own keyword for it.
+       :func:`~paramem.cloud.anonymize_steps.keep_or_revert` then walks the
+       merged mapping exactly once, over the whole ``payload.tag_text``,
+       into per-category kept values and dropped-entry records, ordered by
+       first occurrence in the whole payload.
     5. **ANCHOR** — :func:`_anchor_candidates` names the kept person
        values that substitute inside the transcript region. The call is
        issued when that sequence is non-empty AND ``transcript`` is
@@ -640,8 +759,9 @@ def anonymize(
         substitutes the facts
         (:func:`~paramem.cloud.placeholders.insert_placeholders`, at the
         caller). ``""`` when ``transcript`` is ``""`` (the graph tier).
-    11. ``reverse`` / ``declared`` / ``raw = _render_scan_raw(scan_raw,
-        anchor_raw)`` — all derived from ``table.forward``.
+    11. ``reverse`` / ``declared`` / ``raw = _render_scan_raw(scan_raws,
+        anchor_raw)`` — all derived from ``table.forward``; ``scan_raws``
+        is every scanned slice's own raw reply, in payload order.
 
     This function does NOT build the anonymized fact array itself — every
     production reader derives it on demand instead, via
@@ -666,32 +786,56 @@ def anonymize(
 
     effective_envelope, _free_mib = effective_token_envelope(token_envelope)
 
-    try:
-        scans, scan_dropped_entries, scan_raw, scan_call_tokens = scan_values(
-            payload.tag_text,
-            model,
-            tokenizer,
-            categories=categories,
-            section=prompts.scan,
-            system_prompt=prompts.scan_system,
-            token_envelope=effective_envelope,
-            seed=seed,
-        )
-    except AnonymizeBudgetRefused as exc:
-        return failed_contract(
-            failure="scan_failed", raw=f"anonymize.scan budget refused: {exc.call_label}"
-        )
-    except ScanFailed as exc:
-        logger.warning("anonymize.scan failed: %s", exc.reason)
-        return failed_contract(
-            failure="scan_failed", raw=exc.raw, model_calls=1, call_tokens=exc.call_tokens
-        )
+    slice_mappings: list[dict[str, str]] = []
+    scan_raws: list[str] = []
+    call_tokens_total: list[dict] = []
+    model_calls = 0
 
+    for start, end in payload.slice_ranges:
+        slice_text = payload.tag_text[start:end]
+        try:
+            slice_mapping, slice_raw, slice_call_tokens = mark_values(
+                slice_text,
+                model,
+                tokenizer,
+                section=prompts.scan,
+                system_prompt=prompts.scan_system,
+                token_envelope=effective_envelope,
+                seed=seed,
+            )
+        except AnonymizeBudgetRefused as exc:
+            scan_raws.append(f"anonymize.scan budget refused: {exc.call_label}")
+            return failed_contract(
+                failure="scan_failed",
+                raw=_render_scan_raw(scan_raws, ""),
+                model_calls=model_calls,
+                call_tokens=tuple(call_tokens_total),
+            )
+        except ScanFailed as exc:
+            logger.warning("anonymize.scan failed: %s", exc.reason)
+            scan_raws.append(exc.raw)
+            model_calls += 1
+            call_tokens_total.extend(exc.call_tokens)
+            return failed_contract(
+                failure="scan_failed",
+                raw=_render_scan_raw(scan_raws, ""),
+                model_calls=model_calls,
+                call_tokens=tuple(call_tokens_total),
+            )
+
+        scan_raws.append(slice_raw)
+        model_calls += 1
+        call_tokens_total.extend(slice_call_tokens)
+
+        slice_mappings.append(slice_mapping)
+
+    merged_mapping = merge_scan_mappings(slice_mappings, categories)
+    scans, scan_dropped_entries = keep_or_revert(
+        merged_mapping, categories=categories, payload_text=payload.tag_text
+    )
     scan_dropped_entries = list(scan_dropped_entries)
     scan_dropped_total = len(scan_dropped_entries)
 
-    model_calls = 1
-    call_tokens_total: list[dict] = list(scan_call_tokens)
     anchor_raw = ""
     anchor_names: frozenset[str] = frozenset()
 
@@ -732,7 +876,7 @@ def anonymize(
         if _domain_guard_fires(dict.fromkeys(scan_union), forward, facts):
             return failed_contract(
                 failure="guard",
-                raw=_render_scan_raw(scan_raw, anchor_raw),
+                raw=_render_scan_raw(scan_raws, anchor_raw),
                 model_calls=model_calls,
                 call_tokens=tuple(call_tokens_total),
                 rekey_dropped=rekey_dropped,
@@ -752,7 +896,7 @@ def anonymize(
         anon_transcript=anon_transcript,
         declared=declared,
         rekey_dropped=rekey_dropped,
-        raw=_render_scan_raw(scan_raw, anchor_raw),
+        raw=_render_scan_raw(scan_raws, anchor_raw),
         facts=list(facts),
         model_calls=model_calls,
         scan_dropped=scan_dropped_total,

@@ -105,7 +105,7 @@ class TestLoadSchemaConfigValidLoadCachesAndResets:
             "fallback_entity_type: thing\n"
             "relation_types: [factual]\n"
             "fallback_relation_type: factual\n"
-            "anonymizer:\n  prefixes: []\n"
+            "anonymizer:\n  scrub: []\n  allow: []\n"
         )
         default_cfg = taxonomy.load_schema_config()
         custom_cfg = taxonomy.load_schema_config(str(custom))

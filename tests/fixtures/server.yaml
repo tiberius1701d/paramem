@@ -490,11 +490,14 @@ tools:
 #                                  even that is placeholder-substituted.
 #
 # `scrub` names what counts as in scope: the resident conversational model
-# reads the outbound payload once and names every value it finds with a
-# keyword from `configs/schema.yaml`, and the pipeline, never the model,
-# decides which keyword's values are kept and mints and substitutes every
-# placeholder — there is no code-side entity-type gate. See SECURITY.md for
-# the residual this leaves.
+# reads the outbound payload once and marks each value that is an instance
+# of a keyword from `configs/schema.yaml`'s `anonymizer.scrub` and
+# `anonymizer.allow` lists with that keyword, and the pipeline, never the
+# model, decides which keyword's values are kept (a `scrub` row `scrub`
+# activates) and mints and substitutes every placeholder; a value whose
+# keyword names an `allow` row always reaches the cloud verbatim — there is
+# no code-side entity-type gate. See SECURITY.md for the residual this
+# leaves.
 #
 # HA path (HA conversation agent) is NOT affected by `cloud_mode`/`scrub` at
 # all: the HA leg carries every turn verbatim, unconditionally, on every

@@ -116,7 +116,7 @@ shared loader that cannot know whether it is being called from inside a
 phase; one real production call path still runs it with no phase scope
 open — the full-fold graph-tier enrichment pass
 (``GraphTierRefiner.run_enrichment`` → ``enrich_graph`` → ``anonymize`` →
-its per-category ``scan_values`` calls in
+its per-slice ``mark_values`` calls in
 :mod:`paramem.cloud.anonymize_steps`, none of which open
 ``extraction_trace``/``phase_trace``) — so a raise there would break
 legitimate production behaviour. The live chat egress's own calls into
@@ -724,7 +724,7 @@ def record_prompt(*, path: str | None, content: str) -> None:
       (``GraphTierRefiner.run_enrichment`` in
       ``paramem/training/graph_tier.py`` → ``enrich_graph`` in
       ``paramem/training/graph_enrich.py`` → ``anonymize`` → its
-      per-category ``scan_values`` calls in
+      per-slice ``mark_values`` calls in
       ``paramem/cloud/anonymize_steps.py``), none of which open
       ``extraction_trace``/``phase_trace``.  The live chat egress's own
       calls into ``anonymize`` (``answer_via_cloud`` →

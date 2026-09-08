@@ -1,15 +1,28 @@
-"""The anonymizer's step functions: the SCAN call and the ANCHOR call — the
-two local model calls one ``anonymize()`` run may issue.
+"""The anonymizer's step functions: the SCAN calls and the ANCHOR call — the
+local model calls one ``anonymize()`` run may issue.
 
-``scan_values`` names every value in the payload with a single
-``generate()`` call: the resident base model reads the payload once and
-returns ``{"mapping": {value: keyword}}`` over the keyword set
-:func:`~paramem.config.taxonomy.prefix_descriptions` publishes (every
-``configs/schema.yaml`` ``anonymizer.prefixes`` row, configured or not).
-Code — never the model — decides which keyword's values are kept: a value
-whose keyword names a row the operator's ``scrub`` activates is kept under
-that row; every other value is reverted (left in the payload verbatim).
-``ask_speaker_anchor`` is the second and last local model call — a single
+The payload arrives pre-sliced along its turn boundaries
+(``TagPayload.slice_ranges`` — one per history turn, one per transcript
+turn, one for the fact block). :func:`mark_values` marks each value in ONE
+such slice that is an instance of one of the schema's keywords with that
+keyword, in a single ``generate()`` call: the resident base model reads
+that slice's text and returns ``{"mapping": {value: keyword}}`` over the
+keyword set :func:`~paramem.config.taxonomy.prefix_descriptions` publishes
+(every row of ``configs/schema.yaml``'s ``anonymizer.scrub`` and
+``anonymizer.allow`` lists, together) — the chain (:func:`~paramem.cloud.
+anonymize.anonymize`) calls it once per slice, collects the per-slice
+mappings, and calls :func:`merge_scan_mappings` to combine them into one
+mapping before deciding anything. :func:`row_for_keyword` is the one place
+a model-emitted keyword is classified against the schema: which row it
+names, if any, and whether that row is one the operator activated —
+:func:`merge_scan_mappings` and :func:`keep_or_revert` both call it.
+:func:`keep_or_revert` is the mechanical walk over the merged mapping —
+code, never the model, decides which values are kept: a value whose
+keyword names a ``scrub`` row the operator's ``scrub`` hints activate is
+kept under that row; every other value — including one whose keyword names
+an ``allow`` row — is reverted (left in the payload verbatim).
+
+``ask_speaker_anchor`` is the last local model call — a single
 micro-question deciding which of the kept person values the speaker
 introduced as their own, never re-asked, and never failing the whole
 ``anonymize()`` call.
@@ -117,15 +130,16 @@ class AnonymizeBudgetRefused(Exception):
     """One local call's rendered prompt plus its derived output reserve
     does not fit the effective token envelope — the call was never issued.
 
-    Raised by :func:`_generate`, the one render+generate chokepoint both
-    the SCAN and ANCHOR calls funnel through. A structured control-flow
-    signal (mirroring :class:`~paramem.utils.vram_guard.VramExhausted`'s
-    role for VRAM), never a suppressed error. :func:`ask_speaker_anchor`
-    catches it internally — the anchor decision degrades to "no
-    self-introduction" rather than failing the whole call; a SCAN-call
-    refusal is NOT caught here — :func:`~paramem.cloud.anonymize.anonymize`
-    catches it and fails the whole call closed (``failure="scan_failed"``),
-    since a SCAN that never ran leaves nothing to keep or revert.
+    Raised by :func:`_generate`, the one render+generate chokepoint every
+    SCAN slice and the ANCHOR call funnel through. A structured
+    control-flow signal (mirroring
+    :class:`~paramem.utils.vram_guard.VramExhausted`'s role for VRAM),
+    never a suppressed error. :func:`ask_speaker_anchor` catches it
+    internally — the anchor decision degrades to "no self-introduction"
+    rather than failing the whole call; a :func:`mark_values` refusal is
+    NOT caught here — :func:`~paramem.cloud.anonymize.anonymize` catches it
+    for the slice it was scanning and fails the whole call closed
+    (``failure="scan_failed"``), since an unscanned turn must not egress.
     """
 
     def __init__(self, call_label: str) -> None:
@@ -134,14 +148,14 @@ class AnonymizeBudgetRefused(Exception):
 
 
 class ScanFailed(Exception):
-    """The SCAN call was issued but its reply did not parse to
+    """One slice's SCAN call was issued but its reply did not parse to
     ``{"mapping": {str: str}}``.
 
-    Raised by :func:`scan_values`. Distinct from
+    Raised by :func:`mark_values`. Distinct from
     :class:`AnonymizeBudgetRefused` (the call was never issued at all):
     here a real ``generate()`` call ran and consumed the telemetry carried
     on :attr:`call_tokens`, so :func:`~paramem.cloud.anonymize.anonymize`
-    reports it as one issued call even on this failure path.
+    counts it as one issued call even on this failure path.
 
     Attributes:
         raw: The unparsed model output.
@@ -285,9 +299,9 @@ def _dropped_scan_entry(category: str, text: str, reason: str, *, word: str | No
 def _render_keywords() -> str:
     """Render the SCAN prompt's ``{keywords}`` slot: one ``Prefix:
     description`` line per row of ``configs/schema.yaml``'s
-    ``anonymizer.prefixes`` table, in table order, every row whether the
-    operator's ``sanitization.scrub`` activates it or not — so the model
-    never learns which kinds are actually scrubbed.
+    ``anonymizer.scrub`` and ``anonymizer.allow`` lists, scrub rows then
+    allow rows, every row of both — so the model never learns which list a
+    keyword belongs to, or which kinds are actually scrubbed.
 
     Reads :func:`~paramem.config.taxonomy.prefix_descriptions` — the one
     accessor for the table; no second reader exists.
@@ -298,12 +312,12 @@ def _render_keywords() -> str:
 def render_scan_section(section: str, payload_text: str) -> str:
     """Render the SCAN prompt section's ``{keywords}``/``{text}`` slots.
 
-    The one renderer for the SCAN section: :func:`scan_values` calls it for
-    every anonymize call with the real payload, and the anonymizer gate
-    tool (``scripts/dev/anonymizer_gate.py``) calls it with an empty
+    The one renderer for the SCAN section: :func:`mark_values` calls it for
+    every scanned slice with that slice's real text, and the anonymizer
+    gate tool (``scripts/dev/anonymizer_gate.py``) calls it with an empty
     payload to re-measure the pinned skeleton constant against the
-    operator's current prefix table. No second render of this section
-    exists.
+    operator's current ``anonymizer.scrub``/``anonymizer.allow`` lists. No
+    second render of this section exists.
 
     Args:
         section: The SCAN section's template text, carrying ``{keywords}``
@@ -362,14 +376,15 @@ class ScanResult:
     Attributes:
         category: The :class:`~paramem.config.taxonomy.ScrubCategory` this
             result is for — one of the operator's activated rows.
-        values: Verbatim real-value surfaces the SCAN call named under
-            this category's keyword, deduplicated on the exact verbatim
-            surface (never canonically folded; canonical equality decides
-            placeholder SHARING downstream, in
+        values: Verbatim real-value surfaces named under this category's
+            keyword by one or more scanned slices' SCAN replies,
+            deduplicated on the exact verbatim surface (never canonically
+            folded; canonical equality decides placeholder SHARING
+            downstream, in
             :func:`~paramem.cloud.placeholders.build_forward_table`, never
             deduplication here) and ordered by first-occurrence offset in
-            the scanned payload (:func:`~paramem.cloud.placeholders.
-            _first_occurrence` — the SCAN reply carries no offsets of its
+            the whole payload (:func:`~paramem.cloud.placeholders.
+            _first_occurrence` — no SCAN reply carries offsets of its
             own).
     """
 
@@ -377,23 +392,23 @@ class ScanResult:
     values: tuple[str, ...]
 
 
-def scan_values(
+def mark_values(
     payload_text: str,
     model,
     tokenizer,
     *,
-    categories: Sequence[ScrubCategory],
     section: str,
     system_prompt: str,
     token_envelope: int,
     seed: int | None = None,
-) -> tuple[tuple[ScanResult, ...], tuple[dict, ...], str, tuple[dict, ...]]:
-    """Name every value in *payload_text* and keep the ones whose keyword
-    names an active category — one ``generate()`` call.
+) -> tuple[dict[str, str], str, tuple[dict, ...]]:
+    """Mark each value in *payload_text* that is an instance of a schema
+    keyword with that keyword — one ``generate()`` call over ONE slice of
+    the overall payload.
 
     Renders *section* with the schema's full keyword table
     (:func:`_render_keywords`) and *payload_text*, sizes the call's output
-    reserve from the PAYLOAD's own token count
+    reserve from THIS slice's own token count
     (:func:`~paramem.utils.tokens.scan_output_reserve_tokens` — a function
     of *payload_text*, not of the rendered prompt, since the number of
     values the model will name is unknown before the call), and issues one
@@ -401,42 +416,24 @@ def scan_values(
 
     The reply is parsed by :func:`_extract_json_envelope` and validated as
     ``{"mapping": {value: keyword}}`` (every key and value a string) —
-    anything else is a scan failure
-    (:class:`ScanFailed`). A budget refusal
-    (:class:`AnonymizeBudgetRefused`) propagates unchanged — neither is
-    caught here; :func:`~paramem.cloud.anonymize.anonymize` is the one
-    catch site for both, and treats them identically
+    anything else is a scan failure (:class:`ScanFailed`). Neither
+    :class:`ScanFailed` nor a budget refusal
+    (:class:`AnonymizeBudgetRefused`) is caught here — both propagate
+    unchanged to :func:`~paramem.cloud.anonymize.anonymize`'s own per-slice
+    loop, the one catch site for both, which treats them identically
     (``failure="scan_failed"``).
 
-    For each ``(value, keyword)`` pair (exact-surface duplicates already
-    collapse — *value* is the mapping's own key, so the JSON object itself
-    can carry no duplicate), *keyword* is folded through
-    :func:`~paramem.utils.identity.canonical` and matched against every
-    row's identically-folded ``prefix``
-    (:func:`~paramem.config.taxonomy.prefix_descriptions`):
-
-    * *value* is speaker-id-shaped
-      (:func:`~paramem.utils.identity.is_speaker_id`) — dropped,
-      ``reason="speaker_id"``, regardless of what *keyword* named.
-    * *keyword* names no row at all — dropped, ``reason="unknown_word"``,
-      a format error of the model rather than a category decision.
-    * *keyword* names a row, but not one of *categories* (the operator's
-      active rows) — dropped, ``reason="reverted"``: the value leaves the
-      payload verbatim, no placeholder minted.
-    * *keyword* names an active row — kept under that row's
-      :class:`ScanResult`.
+    This function makes no keep-or-revert decision and reads no
+    :class:`~paramem.config.taxonomy.ScrubCategory` — classifying a
+    keyword against the schema is :func:`row_for_keyword`'s job, and
+    deciding which values survive is :func:`keep_or_revert`'s; a caller
+    scanning several slices merges their mappings before either step runs.
 
     Returns:
-        ``(scan_results, dropped_entries, raw, call_tokens)`` —
-        *scan_results* has exactly one :class:`ScanResult` per entry of
-        *categories*, in that order, including a category the SCAN call
-        named nothing for (``values=()``); *dropped_entries* is the FLAT
-        list of every ``speaker_id``/``unknown_word``/``reverted`` record
-        (see :func:`_dropped_scan_entry`) — a reverted value belongs to an
-        out-of-scope row, never one of *categories*, so it cannot be
-        attached to a :class:`ScanResult`; *raw* is the model's raw reply;
-        *call_tokens* is the one-entry tuple :func:`_call_token_record`
-        builds for this call.
+        ``(mapping, raw, call_tokens)`` — *mapping* is the model's own
+        ``{value: keyword}`` object, unfiltered and unclassified; *raw* is
+        the model's raw reply; *call_tokens* is the one-entry tuple
+        :func:`_call_token_record` builds for this call.
 
     Raises:
         AnonymizeBudgetRefused: The call's rendered prompt plus its output
@@ -471,27 +468,171 @@ def scan_values(
     if not all(isinstance(k, str) and isinstance(v, str) for k, v in mapping.items()):
         raise ScanFailed(raw, "scan mapping keys/values must all be strings", call_tokens)
 
-    active_by_canon = {canonical(c.prefix): c for c in categories}
-    all_by_canon = {canonical(prefix): prefix for prefix, _description in prefix_descriptions()}
-    category_index = {c: i for i, c in enumerate(categories)}
+    return mapping, raw, call_tokens
+
+
+def _row_lookup_table() -> dict[str, str]:
+    """Build the canonical-keyword -> row-prefix lookup once: every row of
+    ``configs/schema.yaml``'s ``anonymizer.scrub`` and ``anonymizer.allow``
+    lists (:func:`~paramem.config.taxonomy.prefix_descriptions`), folded
+    through :func:`~paramem.utils.identity.canonical`.
+
+    A caller that classifies several keywords in a loop
+    (:func:`merge_scan_mappings`, :func:`keep_or_revert`) builds this ONCE
+    per run and threads it to every :func:`row_for_keyword` call in that
+    loop, rather than rebuilding it per call.
+    """
+    return {canonical(prefix): prefix for prefix, _description in prefix_descriptions()}
+
+
+def row_for_keyword(
+    keyword: str, categories: Sequence[ScrubCategory], *, row_by_canon: dict[str, str]
+) -> tuple[str | None, bool]:
+    """Classify one model-emitted *keyword* against the schema's keyword
+    table — THE one place a keyword becomes a row decision; both
+    :func:`merge_scan_mappings` and :func:`keep_or_revert` call this rather
+    than comparing raw keyword strings themselves.
+
+    *keyword* is folded through :func:`~paramem.utils.identity.canonical`
+    and matched against *row_by_canon* (:func:`_row_lookup_table` — every
+    row's identically-folded ``prefix``, ``scrub`` rows and ``allow`` rows
+    together, the full table the model was shown).
+
+    Args:
+        keyword: The keyword one SCAN slice's reply named for some value.
+        categories: The operator's active ``scrub`` rows.
+        row_by_canon: The canonical-keyword -> prefix table
+            (:func:`_row_lookup_table`), built once by the caller's own
+            loop and passed to every call rather than rebuilt per call.
+
+    Returns:
+        ``(prefix, active)`` — *prefix* is the matched row's own ``prefix``
+        string, or ``None`` when *keyword* names no row at all (a format
+        error of the model, never a category decision); *active* is
+        ``True`` exactly when *prefix* names one of *categories* — always
+        ``False`` when *prefix* is ``None``, when it names an ``allow``
+        row, or when it names a ``scrub`` row the operator did not
+        activate.
+    """
+    resolved_prefix = row_by_canon.get(canonical(keyword))
+    if resolved_prefix is None:
+        return None, False
+    active_by_canon = {canonical(c.prefix) for c in categories}
+    return resolved_prefix, canonical(keyword) in active_by_canon
+
+
+def merge_scan_mappings(
+    slice_mappings: Sequence[dict[str, str]],
+    categories: Sequence[ScrubCategory],
+) -> dict[str, str]:
+    """Combine several scanned slices' own ``{value: keyword}`` replies
+    into one mapping, in slice (payload) order — the step
+    :func:`~paramem.cloud.anonymize.anonymize` calls once every
+    ``payload.slice_ranges`` entry has been scanned, before
+    :func:`keep_or_revert` walks the result.
+
+    For each value: the keyword named by the earliest slice that named it
+    under one of *categories* (an operator-activated row, via
+    :func:`row_for_keyword`) settles the value permanently — a later
+    slice's naming of the same value, active or not, is never applied once
+    settled. When no slice ever names the value under an active row, the
+    earliest slice's own keyword for it stands, whatever row (if any) that
+    keyword names.
+
+    Args:
+        slice_mappings: One ``{value: keyword}`` object per scanned slice
+            (:func:`mark_values`'s own return), in the SAME payload order
+            the slices were scanned in.
+        categories: The operator's active ``scrub`` rows.
+
+    Returns:
+        One merged ``{value: keyword}`` mapping — the input to
+        :func:`keep_or_revert`.
+    """
+    row_by_canon = _row_lookup_table()
+    merged: dict[str, str] = {}
+    settled_active: set[str] = set()
+    for slice_mapping in slice_mappings:
+        for value, keyword in slice_mapping.items():
+            if value in settled_active:
+                continue
+            _resolved_prefix, active = row_for_keyword(
+                keyword, categories, row_by_canon=row_by_canon
+            )
+            if value not in merged:
+                merged[value] = keyword
+            if active:
+                merged[value] = keyword
+                settled_active.add(value)
+    return merged
+
+
+def keep_or_revert(
+    mapping: dict[str, str],
+    *,
+    categories: Sequence[ScrubCategory],
+    payload_text: str,
+) -> tuple[tuple[ScanResult, ...], tuple[dict, ...]]:
+    """Walk the merged SCAN mapping mechanically into per-category kept
+    values and dropped-entry records — no model call, no judgement beyond
+    :func:`row_for_keyword`'s schema lookup.
+
+    For each ``(value, keyword)`` pair of *mapping* (exact-surface
+    duplicates already collapse — *value* is the mapping's own key, so it
+    carries no duplicate), *keyword* is resolved via :func:`row_for_keyword`:
+
+    * *value* is speaker-id-shaped
+      (:func:`~paramem.utils.identity.is_speaker_id`) — dropped,
+      ``reason="speaker_id"``, regardless of what *keyword* named.
+    * *keyword* names no row at all — dropped, ``reason="unknown_word"``,
+      a format error of the model rather than a category decision.
+    * *keyword* names a row, but not one of *categories* (the operator's
+      active ``scrub`` rows) — dropped, ``reason="reverted"``: the value
+      leaves the payload verbatim, no placeholder minted. This is every
+      ``allow``-row match (an allow row is never in *categories*) and
+      every ``scrub``-row match the operator did not activate.
+    * *keyword* names an active ``scrub`` row — kept under that row's
+      :class:`ScanResult`.
+
+    Args:
+        mapping: The merged ``{value: keyword}`` object — one or more
+            slices' :func:`mark_values` replies already combined by the
+            caller.
+        categories: The operator's active ``scrub`` rows.
+        payload_text: The complete payload text (every slice, in payload
+            order) — kept values are ordered by first-occurrence offset in
+            THIS text, not in any one slice.
+
+    Returns:
+        ``(scan_results, dropped_entries)`` — *scan_results* has exactly
+        one :class:`ScanResult` per entry of *categories*, in that order,
+        including a category nothing was kept for (``values=()``);
+        *dropped_entries* is the FLAT list of every
+        ``speaker_id``/``unknown_word``/``reverted`` record (see
+        :func:`_dropped_scan_entry`) — a reverted value belongs to a row
+        outside *categories* (an unactivated ``scrub`` row or any
+        ``allow`` row), never one of *categories*, so it cannot be
+        attached to a :class:`ScanResult`.
+    """
+    index_by_canon_prefix = {canonical(c.prefix): i for i, c in enumerate(categories)}
+    row_by_canon = _row_lookup_table()
 
     kept_by_index: list[list[str]] = [[] for _ in categories]
     dropped: list[dict] = []
     for value, keyword in mapping.items():
         if not value:
             continue
-        resolved_prefix = all_by_canon.get(canonical(keyword))
+        resolved_prefix, active = row_for_keyword(keyword, categories, row_by_canon=row_by_canon)
         if is_speaker_id(value):
             dropped.append(_dropped_scan_entry(resolved_prefix or "", value, "speaker_id"))
             continue
         if resolved_prefix is None:
             dropped.append(_dropped_scan_entry("", value, "unknown_word", word=keyword))
             continue
-        active = active_by_canon.get(canonical(keyword))
-        if active is None:
+        if not active:
             dropped.append(_dropped_scan_entry(resolved_prefix, value, "reverted"))
             continue
-        kept_by_index[category_index[active]].append(value)
+        kept_by_index[index_by_canon_prefix[canonical(keyword)]].append(value)
 
     scan_results = tuple(
         ScanResult(
@@ -505,7 +646,7 @@ def scan_values(
         )
         for idx, category in enumerate(categories)
     )
-    return scan_results, tuple(dropped), raw, call_tokens
+    return scan_results, tuple(dropped)
 
 
 def ask_speaker_anchor(

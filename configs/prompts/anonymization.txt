@@ -1,46 +1,50 @@
 # Sectioned prompt home for local anonymization. Two duties, four sections:
-# SCAN names every value in the payload and marks it with one keyword from
-# `configs/schema.yaml`'s `anonymizer.prefixes` table (every row, whether
-# the operator scrubs it or not — `sanitization.scrub` selects nothing in
-# this file); ANCHOR decides which tagged person value, if any, the speaker
-# introduced as their own name. Code — never the model — decides which
-# keyword's values are kept and which are reverted. Sections are composed
-# by paramem.graph.anonymizer_prompts and parsed via the `===` sentinel
+# SCAN marks each value in the payload that is an instance of one of the
+# keywords named in `configs/schema.yaml`'s `anonymizer.scrub` and
+# `anonymizer.allow` lists, rendered here as one combined keyword list —
+# `sanitization.scrub` selects nothing in this file. What the operator
+# scrubs leaves the text as a placeholder; what the table allows leaves
+# the text verbatim; what the model marks with no keyword is restored as
+# well. ANCHOR decides which marked person value the speaker introduced
+# as their own name. Code — never the model — decides which keyword's
+# values are kept and which are reverted. Sections are composed by
+# paramem.graph.anonymizer_prompts and parsed via the `===` sentinel
 # format (paramem/graph/prompts.py::_load_prompt_sections).
 
 === SCAN-SYSTEM ===
-You are the tagging step inside a privacy filter for a home voice assistant. Output valid JSON only.
+You mark the values in a text with keywords from a given list. Your reply is one JSON object.
 
 === SCAN ===
-Do not decide what is sensitive: a later mechanical step keeps only the categories the operator configured and restores everything else verbatim. Your job is complete and accurate naming — list every value in the text below that names a specific real-world thing, and mark each one with the single keyword it is an instance of.
-
 Keywords:
 {keywords}
 
-Rules:
-- Tag only spans that occur verbatim in the text. Copy the value exactly as written, including casing.
-- Pronouns (I, you, he, she, me, my, mine, ich, du, je, yo ...) and kinship or role words (my wife, your son, meine Mutter, ma femme, mi esposa, the tenant, the assessor) are NEVER values.
-- A token of the form speaker0, speaker1 ... is already anonymous and is never a value.
-- Common nouns are never values, even when capitalised.
-- A possessive on a device name ("Oskar's Echo Dot") names the person ("Oskar") as Person and the device ("Echo Dot") as Product.
+Find every span of the text below that is an instance of one of these keywords, and mark it with that keyword, spelled as in the list. Each value in the mapping is a span copied exactly as it occurs in the text, including casing. When the text holds no such span, the mapping is empty: {{"mapping": {{}}}}.
+
+Return one JSON object with exactly the key "mapping": an object pairing each value, exactly as written, with one keyword from the list. An empty result is {{"mapping": {{}}}}.
+
+Example:
+Text:
+Can you save Mira Sandberg's number, it's +46 70 555 01 23.
+Output: {{"mapping": {{"Mira Sandberg": "Person", "+46 70 555 01 23": "Phone"}}}}
+
+Example:
+Text:
+Jonas and I watched Interstellar and then some Adele videos on his new Samsung TV.
+Output: {{"mapping": {{"Jonas": "Person", "Adele": "Artist"}}}}
+
+Example:
+Text:
+call emil back and tell him the parcel is here.
+Output: {{"mapping": {{"emil": "Person"}}}}
+
+Example:
+Text:
+Turn the hallway light off at ten, please.
+Output: {{"mapping": {{}}}}
 
 Text:
 {text}
-
-POSITIVE example:
-Text: "[user] Play Queen on the Sonos office speaker. My wife Anna Schmidt called earlier from +49 152 0 445 3311."
-Output: {{"mapping": {{"Queen": "Artist", "Sonos": "Product", "office": "Room", "Anna Schmidt": "Person", "+49 152 0 445 3311": "Phone"}}}}
-
-POSITIVE example, nothing to name:
-Text: "[user] Turn off the lights, please."
-Output: {{"mapping": {{}}}}
-
-POSITIVE example, a room name:
-Text: "[user] Turn off the lights in the kitchen, please."
-Output: {{"mapping": {{"kitchen": "Room"}}}}
-
-Return JSON only, with exactly the key "mapping" (an object mapping each value, exactly as written, to one keyword from the list above). An empty result is {{"mapping": {{}}}}. No prose, no markdown, no extra keys.
-
+Output:
 === ANCHOR-SYSTEM ===
 You decide which of the given values, if any, the speaker introduced as their own name. Output valid JSON only.
 

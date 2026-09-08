@@ -293,12 +293,12 @@ class TestPlaceholderLocus:
         """corrected == value never counts as an applied change, even when
         is_known_entity is true."""
         model, tokenizer = _model_tokenizer()
-        reverse_mapping = {"Thing_1": "Pytorch"}
+        reverse_mapping = {"City_1": "Frankfurt"}
 
         monkeypatch.setattr(
             "paramem.graph.entity_correction.generate_answer",
             lambda *a, **kw: (
-                '{"input": "Pytorch", "kind": "concept", "corrected": "Pytorch", '
+                '{"input": "Frankfurt", "kind": "place", "corrected": "Frankfurt", '
                 '"is_known_entity": true}'
             ),
         )
@@ -311,16 +311,16 @@ class TestPlaceholderLocus:
             correction_entity_types=_DEFAULT_SCOPE,
         )
 
-        assert reverse_mapping["Thing_1"] == "Pytorch"
+        assert reverse_mapping["City_1"] == "Frankfurt"
         assert result["applied"] == []
         assert result["verdicts"] == [
             {
                 "locus": "placeholder",
-                "placeholder": "Thing_1",
-                "type": "concept",
-                "kind": "concept",
+                "placeholder": "City_1",
+                "type": "place",
+                "kind": "place",
                 "is_known_entity": True,
-                "proposed": "Pytorch",
+                "proposed": "Frankfurt",
                 "applied": False,
                 "reject_reason": "no_change",
             }
@@ -328,14 +328,15 @@ class TestPlaceholderLocus:
 
     def test_product_kind_normalizes_to_concept_and_applies(self, monkeypatch):
         """(i) A model-returned kind of "product" normalizes to "concept" so
-        the gate's vocabulary stays stable, and the correction applies."""
+        the gate's vocabulary stays stable — independently of the
+        placeholder's own type — and the correction applies."""
         model, tokenizer = _model_tokenizer()
-        reverse_mapping = {"Thing_1": "Pyttorch"}
+        reverse_mapping = {"Org_1": "Sonoss"}
 
         monkeypatch.setattr(
             "paramem.graph.entity_correction.generate_answer",
             lambda *a, **kw: (
-                '{"input": "Pyttorch", "kind": "product", "corrected": "Pytorch", '
+                '{"input": "Sonoss", "kind": "product", "corrected": "Sonos", '
                 '"is_known_entity": true}'
             ),
         )
@@ -348,20 +349,20 @@ class TestPlaceholderLocus:
             correction_entity_types=_DEFAULT_SCOPE,
         )
 
-        assert reverse_mapping == {"Thing_1": "Pyttorch"}
+        assert reverse_mapping == {"Org_1": "Sonoss"}
         assert result["applied"] == [
             {
                 "locus": "placeholder",
-                "placeholder": "Thing_1",
-                "type": "concept",
+                "placeholder": "Org_1",
+                "type": "organization",
                 "kind": "concept",
-                "before": "Pyttorch",
-                "after": "Pytorch",
+                "before": "Sonoss",
+                "after": "Sonos",
             }
         ]
 
         _apply_corrections(reverse_mapping, [], result["applied"])
-        assert reverse_mapping["Thing_1"] == "Pytorch"
+        assert reverse_mapping["Org_1"] == "Sonos"
 
     def test_parse_failure_skips_target_without_raising(self, monkeypatch):
         """A malformed model response for one target is skipped (leaves that

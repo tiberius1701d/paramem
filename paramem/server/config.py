@@ -682,18 +682,22 @@ class SanitizationConfig:
       name"``, ``"phone number"``) anonymized when ``cloud_mode`` selects
       an anonymizing mode. Each hint resolves, via
       :func:`~paramem.config.taxonomy.resolve_scrub_categories`, to a row
-      of ``configs/schema.yaml``'s ``anonymizer.prefixes`` table — the
-      row's ``prefix`` becomes an ACTIVE keyword. The anonymizer's SCAN
-      call is shown every row's keyword and description, active or not
-      (so the model never learns which kinds are scrubbed), names every
-      value it finds with one keyword, and mints nothing; CODE then folds
-      the returned keyword through ``canonical()`` and keeps a value only
-      when its keyword names an active row — every other value reverts
-      (left verbatim), whatever entity/attribute it lives on. Defaults to
+      of ``configs/schema.yaml``'s ``anonymizer.scrub`` list — the row's
+      ``prefix`` becomes an ACTIVE keyword. The anonymizer's SCAN call is
+      shown every row's keyword and description from both
+      ``anonymizer.scrub`` and ``anonymizer.allow`` (so the model never
+      learns which kinds are scrubbed, and reaches for the right keyword
+      for a public person or place too), marks each value it finds that is
+      an instance of one keyword with that keyword, and mints nothing;
+      CODE then folds the returned keyword through ``canonical()`` and
+      keeps a value only when its keyword names an active ``scrub`` row —
+      every other value reverts (left verbatim, including any value whose
+      keyword names an ``allow`` row), whatever entity/attribute it lives
+      on. Defaults to
       a load-bearing set of name / phone / address / online-identity
       sub-terms (e.g. ``"given name"``, ``"mobile number"``, ``"street
       address"``, ``"social media handle"``): direct contact identifiers
-      are scrubbed while city, organization, product, etc. are omitted so
+      are scrubbed while city, organization, profession, etc. are omitted so
       the cloud can still reason about places and things sensibly (e.g.
       "What's a good restaurant in Berlin?").  An empty list (``[]``)
       disables the anonymization branch entirely under
@@ -720,7 +724,7 @@ class SanitizationConfig:
     construction, so the pair can never disagree regardless of which
     construction site (YAML load via :func:`build_server_config`, or a
     dev script's direct ``SanitizationConfig()``) built this object. Each
-    resolved category is one ``configs/schema.yaml`` ``anonymizer.prefixes``
+    resolved category is one ``configs/schema.yaml`` ``anonymizer.scrub``
     row the configured ``scrub`` hints activate.
     """
 

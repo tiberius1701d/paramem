@@ -585,14 +585,19 @@ def _require_turn_marked_transcript(transcript: str) -> None:
     """Fail loud (HTTP 400) when ``transcript`` is not the production
     turn-marked surface.
 
-    Every extraction/anonymization/plausibility prompt's few-shots
-    (``configs/prompts/extraction.txt``, ``anonymization.txt``, …) are
-    calibrated exclusively on the ``[user] <text>`` / ``[assistant]
-    <text>`` surface :meth:`SessionBuffer._format_turns` renders in
-    production (``/chat``, document ingest, cloud egress). A bare,
-    unmarked transcript puts the model off-distribution from every
-    example it was tuned on, defeating the purpose of calibrating
-    against the production surface at all.
+    Extraction and plausibility prompts' few-shots
+    (``configs/prompts/extraction.txt``, …) are calibrated exclusively on
+    the ``[user] <text>`` / ``[assistant] <text>`` surface
+    :meth:`SessionBuffer._format_turns` renders in production (``/chat``,
+    document ingest, cloud egress) — a bare, unmarked transcript puts the
+    model off-distribution from every example it was tuned on. For the
+    anonymize chain specifically, the marker-bearing shape is also
+    structurally required regardless of calibration:
+    :func:`~paramem.cloud.anonymize.assemble_payload` splits it into the
+    transcript's ``anchor_range`` and the marker-bearing anchor evidence
+    the ANCHOR call is shown — the SCAN call's own payload is marker-free
+    (``assemble_payload`` strips markers before building it), so it is the
+    split, not a SCAN few-shot, that requires marked input here.
 
     This is a CHECK, not a repair: an unmarked transcript is an operator
     error, so it is rejected with a message naming the expected surface —
@@ -1221,13 +1226,14 @@ def dispatch_anonymize_facts(
             seed=req.params.seed,
             prompts=anon_prompts,
         )
-        # ``t.set_raw`` carries ``_render_scan_raw``'s output verbatim — the
-        # SCAN call's own raw reply plus the anchor's raw text, and on a
-        # ``failure="scan_failed"`` terminal the SCAN call's own reply or
-        # refusal message instead — into the phase record only, never
-        # ``graph.diagnostics`` (counts only).  On this facts-only door it
-        # includes no history surfaces (``history=()`` here), unlike the
-        # session-tier door.
+        # ``t.set_raw`` carries ``_render_scan_raw``'s output verbatim — one
+        # raw reply per scanned payload slice plus the anchor's raw text,
+        # and on a ``failure="scan_failed"`` terminal the earlier slices'
+        # own raw replies followed by the failing slice's raw reply or its
+        # budget-refusal message instead — into the phase record only,
+        # never ``graph.diagnostics`` (counts only).  On this facts-only
+        # door it includes no history surfaces (``history=()`` here),
+        # unlike the session-tier door.
         t.set_raw(payload.raw)
         t.set_parsed(
             {

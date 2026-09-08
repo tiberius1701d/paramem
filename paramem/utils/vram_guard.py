@@ -444,15 +444,17 @@ def effective_token_envelope(configured_envelope: int) -> tuple[int, float | Non
     there is no cost-driven reason to skip the reclaim step and risk
     reading stale, fragmentation-depressed free memory.
 
-    Measured ONCE per caller invocation (no mid-call re-measurement): a
-    caller that slices multiple local ``generate()`` calls off one
-    measurement (:func:`~paramem.cloud.anonymize.anonymize`'s per-slice
-    loop) gets a conservative sizing for later slices — each
-    ``generate()`` frees its own KV cache before the next one starts, so
-    free VRAM typically recovers between slices, and an entry-time
-    measurement therefore never OVER-estimates what a later slice can
-    use. Re-measuring per slice would not be wrong, but it is not what
-    this call does; that tradeoff is the caller's, not this function's.
+    Measured ONCE per caller invocation (no mid-call re-measurement):
+    :func:`~paramem.cloud.anonymize.anonymize` calls this once, before its
+    own per-slice loop, and threads the one resulting effective envelope
+    to every local ``generate()`` call the loop then issues (one per
+    payload slice, plus ANCHOR) — a conservative sizing for later slices,
+    since each ``generate()`` frees its own KV cache before the next one
+    starts, so free VRAM typically recovers between slices, and an
+    entry-time measurement therefore never OVER-estimates what a later
+    slice can use. Re-measuring per slice would not be wrong, but it is
+    not what the caller does; that tradeoff is the caller's, not this
+    function's.
     """
     if not torch.cuda.is_available():
         return configured_envelope, None

@@ -23,14 +23,26 @@ fallback_relation_type: factual
 # into the local anonymizer's SCAN categories
 # (paramem.config.taxonomy.resolve_scrub_categories).
 #
-# Every row is also a keyword the anonymizer's SCAN call may answer with:
-# the resident base model is shown every row's `prefix`/`description` pair
-# (paramem.config.taxonomy.prefix_descriptions, in table order, whether
-# the row is scrubbed or not) and returns each value it finds mapped to
-# one of these keywords. Code then folds the returned keyword through
-# canonical() and matches it exactly against a row's folded prefix: a
-# value whose keyword names a row the operator's `scrub` activates is
-# kept, every other value reverts.
+# Two named lists, `scrub` and `allow`. A `scrub` row is a kind the
+# operator can choose to scrub: the operator's `sanitization.scrub` hints
+# activate it, and code replaces its values with placeholders. An `allow`
+# row is a kind that always reaches the cloud verbatim: it gives the model
+# a keyword for that kind so the value is filed under its own kind rather
+# than swept into a scrub kind, and code restores every allow-row value
+# unchanged. What the operator scrubs leaves as a placeholder; what the
+# table allows leaves verbatim so a cloud answer about a public person or
+# place stays meaningful; what the model marks with a keyword that names
+# neither list's row is restored as well (an unrecognised word).
+#
+# Every row of both lists is also a keyword the anonymizer's SCAN call may
+# answer with: the resident base model is shown every row's
+# `prefix`/`description` pair from both lists together
+# (paramem.config.taxonomy.prefix_descriptions, scrub rows then allow rows,
+# each list in its own order) and marks each value it finds that is an
+# instance of one of these keywords with that keyword. Code then folds the
+# returned keyword through canonical() and matches it exactly against a
+# row's folded prefix: a value whose keyword names a row the operator's
+# `scrub` activates is kept, every other value reverts.
 #
 # prefix           — the literal token ("Person", "City", etc.) and the
 #                    keyword the SCAN call answers with. One word of
@@ -40,30 +52,34 @@ fallback_relation_type: factual
 #                    keyword resolution matches against, so a looser
 #                    shape would make either ambiguous. Config load
 #                    refuses a row whose prefix does not match, and
-#                    refuses two rows whose prefixes collide under either
-#                    `casefold()` (the mint's rendering equivalence) or
-#                    `canonical()` (the keyword resolution).
+#                    refuses two rows — from either list — whose prefixes
+#                    collide under either `casefold()` (the mint's
+#                    rendering equivalence) or `canonical()` (the keyword
+#                    resolution).
 # entity_type      — the graph type that this prefix represents. Must be one
 #                    of entity_types above — an undeclared entity_type fails
-#                    config load. Multiple prefixes may map to the same
-#                    entity_type (City → place, Country → place).
+#                    config load. Multiple prefixes, in either list, may map
+#                    to the same entity_type (City → place, Country → place).
 # description      — the keyword's one-line definition, in the model's own
 #                    words — this file's readers and the SCAN call both
 #                    read it verbatim; it is vocabulary, not instruction.
-# primary_for_type — only one prefix per entity_type may set this. Used by
-#                    the repair path to pick a canonical prefix when
-#                    re-anonymizing a leaked real name; a second row
-#                    setting it for the same entity_type fails config load.
-# scrub_categories — optional list of `sanitization.scrub` hints this row
-#                    serves. A configured hint claimed by this row activates
-#                    this row: the operator's `sanitization.scrub` selection
-#                    decides which rows the SCAN keep-or-revert step keeps. A
-#                    hint claimed by two rows, an uncovered configured hint,
-#                    or a hint whose `canonical()` form equals another row's
-#                    folded prefix all fail config load. A row without
-#                    `scrub_categories` can never be activated — its values
-#                    always revert. An active row always carries at least
-#                    the hint that activated it.
+# primary_for_type — only one prefix per entity_type, across both lists, may
+#                    set this. Used by the repair path to pick a canonical
+#                    prefix when re-anonymizing a leaked real name; a second
+#                    row setting it for the same entity_type fails config
+#                    load.
+# scrub_categories — the list of `sanitization.scrub` hints this row serves.
+#                    Required on every `scrub` row and absent from every
+#                    `allow` row — a `scrub` row with no hints, an `allow`
+#                    row that carries hints, or a missing `scrub`/`allow`
+#                    list all fail config load. A configured hint claimed by
+#                    this row activates it: the operator's
+#                    `sanitization.scrub` selection decides which `scrub`
+#                    rows the SCAN keep-or-revert step keeps. A hint claimed
+#                    by two rows, an uncovered configured hint, or a hint
+#                    whose `canonical()` form equals another row's folded
+#                    prefix all fail config load. An active row always
+#                    carries at least the hint that activated it.
 #
 # This file is the ONE declaration of both vocabularies — every reader
 # (relation types, entity types, the placeholder-prefix map, and
@@ -71,45 +87,37 @@ fallback_relation_type: factual
 # (missing file, malformed YAML, a missing required key) is a hard
 # failure at that reader's first use, never a silent fallback.
 #
-# The four contact-identifier rows below (Phone / Email / Address /
+# The four contact-identifier scrub rows below (Phone / Email / Address /
 # Profile) declare `entity_type: person` even though they are not person
 # NAMES — they are private identifiers OF a person, and `person` is the
 # only closed-vocabulary entity_type structurally outside the
 # entity-correction rewrite path
 # (paramem.graph.entity_correction._CORRECTABLE), so a restored phone
 # number, address, or handle is never routed through a "correction" that
-# could mutate it. City / Country / Place are the OPPOSITE case: they
-# declare `entity_type: place`, because a place name is NOT a private
-# identifier of a person — it is a legitimately correctable entity class
-# (`place` IS a member of `_CORRECTABLE`), so world-knowledge entity
-# correction is exactly the repair pass a restored place name should be
-# eligible for. Place carries no `scrub_categories` below — declaring one
-# without a measured need would refuse config load the moment an operator
-# activated it.
+# could mutate it. City / Country are the OPPOSITE case: they declare
+# `entity_type: place`, because a place name is NOT a private identifier
+# of a person — it is a legitimately correctable entity class (`place` IS
+# a member of `_CORRECTABLE`), so world-knowledge entity correction is
+# exactly the repair pass a restored place name should be eligible for.
 #
-# Product / Room / Profession / Work carry `entity_type` values that ARE
-# correctable (`concept` / `place` / `concept` / `concept`); Artist / Date /
-# Other do not (`person` / `event` / `person`) — a musician or author name,
-# a calendar date, and the catch-all (which may hold a private name) are
-# the kinds this design keeps outside the entity-correction rewrite path.
-# None of the seven set `primary_for_type` — the four primaries above
-# already cover their entity types.
+# Person, City and Org are the primaries for person, place and
+# organization. Profession declares `entity_type: concept`, which IS
+# correctable, and is not primary for it — a primary is not required for
+# every entity type. Artist declares `entity_type: person`, which is NOT
+# correctable, since an artist's or author's name is a personal name and
+# stays outside the entity-correction rewrite path
+# (paramem.graph.entity_correction._CORRECTABLE) like the contact rows
+# above; it is likewise not primary for its type.
 anonymizer:
-  prefixes:
-    - { prefix: Person,     entity_type: person,       description: "a person's given name, family name or full name (not a job title)", primary_for_type: true, scrub_categories: [person name, full name, given name, family name] }
+  scrub:
+    - { prefix: Person,     entity_type: person,       description: "a person's given name, family name or full name", primary_for_type: true, scrub_categories: [person name, full name, given name, family name] }
     - { prefix: Phone,      entity_type: person,       description: "a telephone number",                               scrub_categories: [phone number, mobile number, landline number] }
     - { prefix: Email,      entity_type: person,       description: "an email address",                                 scrub_categories: [email address] }
     - { prefix: Address,    entity_type: person,       description: "a street address (street plus number, optionally postal code)", scrub_categories: [street address, postal address] }
     - { prefix: Profile,    entity_type: person,       description: "a profile URL or social-media handle",            scrub_categories: [profile URL, social media handle] }
+  allow:
     - { prefix: City,       entity_type: place,        description: "a city, town or village name",                     primary_for_type: true }
     - { prefix: Country,    entity_type: place,        description: "a country name" }
-    - { prefix: Place,      entity_type: place,        description: "a named place that is not a street address, city or country (a landmark, a region, a venue)" }
     - { prefix: Org,        entity_type: organization,  description: "a company, institution, club or organisation name", primary_for_type: true }
-    - { prefix: Thing,      entity_type: concept,       description: "an identifying thing that is not a product, brand, device, app or service (a project name, an internal code name)", primary_for_type: true }
-    - { prefix: Product,    entity_type: concept,       description: "a product, brand, device, app or service name, including a named smart-home device" }
-    - { prefix: Room,       entity_type: place,        description: "a room or area of a home" }
     - { prefix: Profession, entity_type: concept,       description: "a job title or profession" }
-    - { prefix: Artist,     entity_type: person,       description: "a musician, band, author or performer name" }
-    - { prefix: Work,       entity_type: concept,       description: "a song, album, film, book or show title" }
-    - { prefix: Date,       entity_type: event,        description: "a calendar date, a weekday or month name, or a date of birth" }
-    - { prefix: Other,      entity_type: person,       description: "any other proper noun or identifier that fits no listed kind" }
+    - { prefix: Artist,     entity_type: person,        description: "a musician, band, author or performer name" }

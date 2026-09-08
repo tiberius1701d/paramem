@@ -903,9 +903,12 @@ def anonymize_turn(
     ``transcript`` (the current turn's bare text) and every turn of
     ``history`` are rendered through
     :func:`~paramem.utils.turn_markers.format_turn` into the
-    ``[<role>] <text>`` surface every anonymization few-shot is
-    calibrated on, then handed to :func:`~paramem.cloud.anonymize.anonymize`
-    as its ``transcript`` and ``history`` arguments respectively - the
+    ``[<role>] <text>`` surface — structurally required because
+    :func:`~paramem.cloud.anonymize.assemble_payload` splits it into the
+    transcript's anchor range and the marker-bearing anchor evidence the
+    ANCHOR call is shown — then handed to
+    :func:`~paramem.cloud.anonymize.anonymize` as its ``transcript`` and
+    ``history`` arguments respectively - the
     same SCAN call that names values in the current turn also names them
     in the drop-gated history, and both surfaces build ONE forward table,
     so a value named only in an earlier turn is placeholdered exactly like

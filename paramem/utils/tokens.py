@@ -156,12 +156,15 @@ MEASURED_TOKENS_PER_WORD: float = 3.7
 # "envelope - skeleton - reserve" (payload carried once) plus the
 # ratio-cancellation unit rule, shared by every caller that must fit a
 # payload (a document chunk, a conversation transcript) inside one
-# anonymize-call token envelope. One ``anonymize()`` call issues up to two
-# local ``generate()`` calls that each carry the payload once: SCAN (every
-# call, when a model is resident) and ANCHOR (only when a kept person
-# value is a candidate). A compile-time payload cap must fit BOTH call
-# shapes, so :func:`anonymize_payload_cap_tokens` takes the tighter of the
-# two constraints. See that function's docstring for the identity itself.
+# anonymize-call token envelope. One ``anonymize()`` call issues one SCAN
+# local ``generate()`` call per payload slice, plus one ANCHOR call (only
+# when a kept person value is a candidate) — all against the same
+# envelope. A compile-time payload cap is checked against the largest
+# single call shape (a slice is never larger than the whole payload it is
+# cut from, so this is conservative rather than tight), and
+# :func:`anonymize_payload_cap_tokens` takes the tighter of the SCAN- and
+# ANCHOR-shape constraints. See that function's docstring for the identity
+# itself.
 # ---------------------------------------------------------------------------
 
 # Total tokens (prompt + output) one local anonymize() call may occupy.
@@ -190,8 +193,9 @@ ANONYMIZE_ANCHOR_PROMPT_SKELETON_TOKENS: int = 523
 # SCAN prompt skeleton — the fixed system-prompt + chat-markup + call-body
 # token cost of the SCAN call, excluding the payload text (``{text}``) but
 # INCLUDING the rendered keyword table (``{keywords}`` — every row of the
-# shipped ``configs/schema.yaml`` ``anonymizer.prefixes`` table, since the
-# skeleton must reflect what a real call actually carries). Measured via
+# shipped ``configs/schema.yaml``'s ``anonymizer.scrub`` and
+# ``anonymizer.allow`` lists, together, since the skeleton must reflect
+# what a real call actually carries). Measured via
 # the ACTUAL runtime render path (``paramem.models.loader.render_chat_prompt``
 # over the ``SCAN-SYSTEM`` + ``SCAN`` sections as
 # ``paramem.graph.anonymizer_prompts.load_anonymizer_prompts`` composes
@@ -202,7 +206,7 @@ ANONYMIZE_ANCHOR_PROMPT_SKELETON_TOKENS: int = 523
 # load, no model, no GPU). Re-measure whenever the shipped table gains or
 # loses a row. The anonymizer gate tool (``scripts/dev/anonymizer_gate.py``) re-measures
 # this constant on every run.
-ANONYMIZE_SCAN_PROMPT_SKELETON_TOKENS: int = 768
+ANONYMIZE_SCAN_PROMPT_SKELETON_TOKENS: int = 450
 
 # ---------------------------------------------------------------------------
 # SCAN OUTPUT reserve constants — the SCAN reply's size is bounded by how
@@ -392,8 +396,8 @@ def anonymize_payload_cap_tokens(
     tokens_per_word: float = MEASURED_TOKENS_PER_WORD,
 ) -> int:
     """THE one door every anonymize-payload cap consumer calls — the payload
-    size ceiling that fits BOTH local ``generate()`` call shapes one
-    ``anonymize()`` call may issue (SCAN, ANCHOR): the tighter of the two.
+    size ceiling that fits both REQUIRED local ``generate()`` call shapes
+    one ``anonymize()`` call issues (SCAN, ANCHOR): the tighter of the two.
 
     A payload of ``P`` real tokens is carried once by each call, alongside
     that call's own fixed prompt skeleton and its own output reserve,

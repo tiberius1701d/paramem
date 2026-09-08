@@ -85,15 +85,18 @@ class ScannedPdfRejectedError(ValueError):
 #
 # A document chunk is consumed by two local calls, in order: session-tier
 # extraction (``configs/prompts/extraction.txt``, the chunk fills its
-# ``{transcript}`` slot), then anonymize on the extracted facts AND the
-# chunk itself (``paramem/graph/stage_anonymize.py`` threads
+# ``{transcript}`` slot), then the anonymize chain over the extracted facts
+# AND the chunk itself (``paramem/graph/stage_anonymize.py`` threads
 # ``ctx.transcript`` — the same chunk text — into
-# ``anonymize(transcript=...)``). ``_DOC_MAX_TOKENS`` is a HELD operating-
+# ``anonymize(transcript=...)``, which issues one SCAN call per payload
+# slice plus one ANCHOR call). ``_DOC_MAX_TOKENS`` is a HELD operating-
 # point literal, not a value computed at import time from the
 # anonymize-call token envelope. Instead, the import-time tripwire below
-# validates the held value against BOTH local calls the anonymize chain
-# may issue on a chunk-sized payload — SCAN (every call) and ANCHOR (when
-# a kept person value is a candidate).
+# validates the held value against the largest single call shape either
+# local call may issue against a chunk-sized payload — one SCAN call sized
+# for the whole chunk (a slice is never larger than the whole payload it
+# is cut from, so this is conservative rather than tight) and one ANCHOR
+# call (when a kept person value is a candidate).
 #
 # Two paragraphs of design rationale:
 #

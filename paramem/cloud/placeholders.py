@@ -79,9 +79,9 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 # One-or-more PascalCase segments, underscore-joined, + "_" + positive
-# integer. The prefix vocabulary is open: "Person" / "City" / "Org" /
-# "Thing" are common (configured in configs/schema.yaml) but any
-# PascalCase noun is well-formed — a model is free to mint
+# integer. The prefix vocabulary is open: "Person" / "City" / "Org" are
+# common (configured in configs/schema.yaml) but any PascalCase noun is
+# well-formed — a model is free to mint
 # "University_1" / "Project_1" / "Language_1" for a type none of the
 # common prefixes fit. The prefix itself may be MULTI-SEGMENT
 # (underscore-joined PascalCase words, e.g. "Home_Address_1",
@@ -897,7 +897,7 @@ def _first_occurrence(haystack: str, needle: str) -> int:
 
     Two production callers: :func:`_whole_word_contains` below (does
     *needle* occur at all) and
-    :func:`~paramem.cloud.anonymize_steps.scan_values` /
+    :func:`~paramem.cloud.anonymize_steps.keep_or_revert` /
     :func:`~paramem.cloud.anonymize._anchor_candidates` (order several
     surviving values by where each first appears in the payload — the SCAN
     reply carries no offsets of its own).

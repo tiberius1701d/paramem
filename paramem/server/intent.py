@@ -27,10 +27,14 @@ Routing decisions follow a tiered model:
    block cloud escalation — the query routes through the normal
    HA → cloud → base-model chain, same as :attr:`Intent.GENERAL`.
 
-PA graph match is **not** a state signal here.  Speaker enrollment must
-not classify the speaker's queries as PERSONAL — that signal is the
-residual classifier's job, derived from query content.  The router
-scopes keys by speaker but lets the classifier decide intent.
+The classifier decides intent from query content.  The only deterministic
+signal it receives is the HA entity match: :meth:`~paramem.server.router.
+QueryRouter.route` matches the query against the HA entity graph and
+passes that one boolean in as ``has_ha_match``.  Speaker enrollment is
+deliberately not a signal here — the router scopes keys to the speaker
+through its own key index, separately from intent — so an imperative from
+an enrolled speaker stays on the command path rather than being
+reclassified as personal.
 
 The encoder, exemplar bank, and (when ``mode=llm``) the local model
 handle are loaded once at server lifespan startup and live in
@@ -486,9 +490,12 @@ def classify_intent(
     positively PERSONAL": no personal-memory access, and escalation
     stays available.
 
-    PA graph match is intentionally **not** a state signal.  Speaker
-    enrollment scopes keys at the router layer; intent comes from query
-    content via the encoder.
+    The only deterministic signal this function receives is
+    ``has_ha_match``, the HA entity-graph match the router passes in.
+    Speaker enrollment is deliberately not a signal: the router scopes
+    keys to the speaker through its own key index, separate from intent,
+    so an imperative from an enrolled speaker stays on the command path
+    rather than being reclassified as personal.
 
     The function never raises — encoder/embedding errors or
     misconfiguration produce a fail-safe result rather than blocking

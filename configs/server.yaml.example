@@ -621,13 +621,16 @@ tools:
 #             `cloud_mode` is `anonymize` or `both`.  `scrub` decides WHAT
 #             gets marked; it has no bearing on how much work marking
 #             costs — the resident conversational model reads the outbound
-#             payload once and names every value it finds with a keyword
-#             from `configs/schema.yaml`, and the pipeline, never the
-#             model, decides which keyword's values are kept and mints and
-#             substitutes every placeholder.  Each hint must be one a
-#             `configs/schema.yaml` category actually claims — a hint
-#             nothing claims is refused
-#             at config load rather than silently scrubbing nothing.
+#             payload once and marks each value that is an instance of a
+#             keyword from `configs/schema.yaml`'s `anonymizer.scrub` and
+#             `anonymizer.allow` lists with that keyword, and the pipeline,
+#             never the model, decides which keyword's values are kept
+#             (a `scrub` row `scrub` activates) and mints and substitutes
+#             every placeholder; a value whose keyword names an `allow`
+#             row always reaches the cloud verbatim.  Each hint must be
+#             one a `configs/schema.yaml` `anonymizer.scrub` row actually
+#             claims — a hint nothing claims is refused at config load
+#             rather than silently scrubbing nothing.
 #             Default is a load-bearing set of name / phone / address /
 #             online-identity sub-terms (person name, full name, given
 #             name, family name, phone number, mobile number, landline
@@ -640,8 +643,8 @@ tools:
 #             the original text) — this is the operator opt-out.  Operator
 #             owns the privacy/utility tradeoff.  Novel categories beyond
 #             the default core above (e.g. "date of birth", "passport
-#             number") are legal and honoured as-is, provided a schema row
-#             claims them.
+#             number") are legal and honoured as-is, provided a schema
+#             `anonymizer.scrub` row claims them.
 #
 # The conversational model is asked a second question over the same
 # payload — not classification, not rewriting — which of the named person

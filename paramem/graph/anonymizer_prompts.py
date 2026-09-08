@@ -1,17 +1,17 @@
 """Prompt composer for local anonymization.
 
 The ONE place that turns the sectioned ``configs/prompts/anonymization.txt``
-home into the ``AnonymizerPrompts`` value the anonymizer chain's two local
-model calls — SCAN and ANCHOR — consume. No model-facing prompt TEXT lives
+home into the ``AnonymizerPrompts`` value the anonymizer chain's two
+local model calls — SCAN and ANCHOR — consume. No model-facing prompt TEXT lives
 in this module — composition logic only; every string a model sees is
 loaded from the home via :func:`paramem.graph.prompts._load_prompt_sections`.
 
 The home carries the configured categories only through the SCAN section's
-own ``{keywords}`` render slot (formatted by
-:func:`~paramem.cloud.anonymize_steps.scan_values` from
-:func:`~paramem.config.taxonomy.prefix_descriptions`, every row whether
-scrubbed or not) — this module takes no category argument and does no
-category resolution.
+own ``{keywords}`` render slot (filled per call by
+:func:`~paramem.cloud.anonymize_steps.render_scan_section` from
+:func:`~paramem.config.taxonomy.prefix_descriptions`, every row of both the
+``anonymizer.scrub`` and ``anonymizer.allow`` lists) — this module takes no
+category argument and does no category resolution.
 
 This module cannot live in ``paramem.cloud`` (that package must not do
 prompt IO or import ``paramem.graph``) and cannot live in
@@ -41,13 +41,13 @@ _ANONYMIZATION_PROMPT_FILE = "anonymization.txt"
 def load_anonymizer_prompts(*, prompts_dir: str | Path | None = None) -> AnonymizerPrompts:
     """Compose the prompt sections one ``anonymize()`` run needs.
 
-    Loads all four sections of the sectioned ``anonymization.txt`` home
+    Loads all six sections of the sectioned ``anonymization.txt`` home
     (:func:`~paramem.graph.prompts._load_prompt_sections`) into an
     :class:`AnonymizerPrompts`. The SCAN section carries a ``{keywords}``
-    render slot, formatted per call by
-    :func:`~paramem.cloud.anonymize_steps.scan_values` — this composer
-    itself does no per-call formatting, no ``scrub`` or resolved-category
-    argument.
+    render slot, filled per call by
+    :func:`~paramem.cloud.anonymize_steps.render_scan_section` — this
+    composer itself does no per-call formatting, no ``scrub`` or
+    resolved-category argument.
 
     Args:
         prompts_dir: Optional operator ``paths.prompts`` override, threaded
@@ -61,7 +61,8 @@ def load_anonymizer_prompts(*, prompts_dir: str | Path | None = None) -> Anonymi
         FileNotFoundError: When ``anonymization.txt`` is absent from every
             searched directory.
         KeyError: When a required section (``SCAN-SYSTEM``, ``SCAN``,
-            ``ANCHOR-SYSTEM``, ``ANCHOR``) is absent from the home —
+            ``ANCHOR-SYSTEM``, ``ANCHOR``) is
+            absent from the home —
             normally caught earlier at boot by
             :func:`paramem.graph.prompts.ensure_prompt_assets`.
     """

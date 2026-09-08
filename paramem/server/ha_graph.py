@@ -1,8 +1,12 @@
 """HA entity graph — indexes HA devices, areas, and action verbs for routing.
 
 Built from HA REST API responses (/api/states and /api/services) at server
-startup. The router uses this graph alongside the PA knowledge graph to
-distinguish personal-knowledge queries from device/action queries.
+startup. The router's :meth:`~paramem.server.router.QueryRouter.route` asks
+this graph whether the query text matches an HA entity; the match feeds the
+intent classifier's HA-match fast path and, separately, the routing plan's
+``ha_domains`` observability field. The speaker-scoped memory keys the
+router returns come from its own key index, built from the memory store —
+not from this graph.
 
 Matching is pure string ops (substring + fuzzy) — zero LLM inference cost.
 """

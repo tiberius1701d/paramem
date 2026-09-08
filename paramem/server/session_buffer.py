@@ -65,22 +65,26 @@ logger = logging.getLogger(__name__)
 # Size-rotation cap for a conversation's open session, in the estimator's
 # unit. HELD at the operating-point value the shipped extraction quality
 # was measured at, rather than computed at import time. One anonymize()
-# call on a transcript this size issues up to two local generate() calls
-# against the SAME 8192-token envelope (paramem.utils.tokens.
-# ANONYMIZE_ENVELOPE_TOKENS): SCAN (every call) and ANCHOR (when a kept
-# person value is a candidate). See paramem.graph.document_chunker's
-# _DOC_MAX_TOKENS for the sibling derivation over the document-ingest path.
+# call on a transcript this size issues one SCAN local generate() call per
+# payload slice, plus one ANCHOR call (when a kept person value is a
+# candidate) — all against the SAME 8192-token envelope
+# (paramem.utils.tokens.ANONYMIZE_ENVELOPE_TOKENS). See
+# paramem.graph.document_chunker's _DOC_MAX_TOKENS for the sibling
+# derivation over the document-ingest path.
 # 1098 words -> 4062 estimator tokens (MEASURED_TOKENS_PER_WORD = 3.7):
 # deliberately sized against the CONFIGURED 8192 envelope, not the live
 # VRAM-clamped envelope (a dense session can still fail anonymize under a
 # tight free-VRAM moment — self-healing incident, not silent loss).
 _TRANSCRIPT_MAX_TOKENS: int = 4062
 
-# Slack tripwire, not a tight bound: both calls are far cheaper than a
-# cap-sized transcript, so this assertion passes with room to spare. It
-# fires only if ANONYMIZE_ENVELOPE_TOKENS is lowered, _TRANSCRIPT_MAX_TOKENS
-# is raised, or either call's own skeleton/reserve is inflated far enough
-# that a cap-sized transcript could no longer fit both call shapes.
+# Slack tripwire, not a tight bound: the tripwire checks a cap-sized
+# transcript against one SCAN call sized for the whole transcript (a slice
+# is never larger than the whole payload it is cut from, so this is
+# conservative rather than tight), so this assertion passes with room to
+# spare. It fires only if ANONYMIZE_ENVELOPE_TOKENS is lowered,
+# _TRANSCRIPT_MAX_TOKENS is raised, or either call's own skeleton/reserve
+# is inflated far enough that a cap-sized transcript could no longer fit
+# both call shapes.
 assert _TRANSCRIPT_MAX_TOKENS <= anonymize_payload_cap_tokens(
     envelope_tokens=ANONYMIZE_ENVELOPE_TOKENS,
     anchor_skeleton_tokens=ANONYMIZE_ANCHOR_PROMPT_SKELETON_TOKENS,

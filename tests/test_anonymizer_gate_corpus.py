@@ -31,6 +31,8 @@ from pathlib import Path
 
 import pytest
 
+from paramem.config.taxonomy import prefix_descriptions
+
 # Make the tool importable without installing it as a package — the same
 # shim tests/test_calibrate_prompts_harness.py uses for scripts/dev.
 _SCRIPTS_DEV = Path(__file__).resolve().parents[1] / "scripts" / "dev"
@@ -380,16 +382,48 @@ def test_decoys_occur_in_the_entry_text(entries):
     assert errors == [], "\n".join(errors)
 
 
-def test_gold_categories_map_to_a_schema_prefix_row(entries):
-    """Every gold category is one of ``configs/schema.yaml``'s
-    ``anonymizer.prefixes`` row names — the corpus never invents its own
-    category vocabulary.
-    """
-    from paramem.config.taxonomy import prefix_descriptions
+# The corpus's own closed vocabulary of gold categories -- not table
+# membership (some of these are deliberately outside
+# configs/schema.yaml's anonymizer.scrub and anonymizer.allow lists, to
+# exercise the out-of-scope path).
+_GOLD_CATEGORIES = (
+    "Person",
+    "Phone",
+    "Email",
+    "Address",
+    "Profile",
+    "City",
+    "Country",
+    "Org",
+    "Profession",
+    "Room",
+    "Product",
+    "Date",
+    "Artist",
+    "Work",
+)
 
-    known = {prefix for prefix, _description in prefix_descriptions()}
-    bad = {g["category"] for e in entries for g in e["gold"]} - known
-    assert bad == set(), f"gold categories with no schema.yaml row: {sorted(bad)}"
+
+def test_gold_categories_are_the_closed_corpus_vocabulary(entries):
+    """Every ``gold[*].category`` in the fixture is a name the corpus
+    uses, and every name the corpus uses appears in the fixture -- a
+    mechanical pin on the vocabulary itself in both directions, not on
+    which of those names a shipped ``configs/schema.yaml`` row claims.
+    """
+    found = {g["category"] for e in entries for g in e["gold"]}
+    assert found == set(_GOLD_CATEGORIES)
+
+
+def test_every_shipped_prefix_is_a_corpus_gold_category():
+    """Every shipped ``configs/schema.yaml`` anonymizer prefix
+    (``paramem.config.taxonomy.prefix_descriptions``) is a name in
+    ``_GOLD_CATEGORIES`` -- so renaming a shipped prefix breaks this test
+    rather than silently reclassifying its corpus gold as out of scope.
+    Room, Product, Date and Work are the corpus's own off-table names and
+    are not required to appear here.
+    """
+    shipped = {prefix for prefix, _description in prefix_descriptions()}
+    assert shipped <= set(_GOLD_CATEGORIES)
 
 
 def test_census_by_kind_and_lang(entries):

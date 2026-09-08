@@ -86,6 +86,7 @@ from paramem.cloud.anonymize import AnonymizedContract, assemble_payload, render
 from paramem.cloud.placeholders import applied_whole_word_keys, word_boundary_ok
 from paramem.config.taxonomy import ScrubCategory, resolve_scrub_categories
 from paramem.training.thermal_throttle import wait_for_cooldown
+from paramem.utils.tokens import ANONYMIZE_SCAN_PROMPT_SKELETON_TOKENS, ANONYMIZE_SCAN_REPLY_RATIO
 from paramem.utils.turn_markers import format_turn
 
 # Mirrors the ``_REPO_ROOT`` pattern used by every other ``scripts/dev/*.py``
@@ -108,7 +109,7 @@ _COOLDOWN_THRESHOLD_C = 52
 _COOLDOWN_MAX_WAIT_S = 600
 
 # The "contact" primary column of the scorecard: phone, email and street
-# address together (paramem's Phone/Email/Address prefix rows) — never
+# address together (paramem's Phone/Email/Address scrub rows) — never
 # Profile, which is a different kind of value entirely.
 _CONTACT_PREFIXES = frozenset({"Phone", "Email", "Address"})
 
@@ -130,7 +131,7 @@ def resolve_categories(scrub_hints: list[str] | None) -> tuple[ScrubCategory, ..
         scrub_hints: ``--scrub`` values, or ``None`` for the shipped default.
 
     Returns:
-        Active rows in schema row order.
+        Active rows in ``anonymizer.scrub`` list order.
     """
     if scrub_hints is not None:
         return resolve_scrub_categories(scrub_hints)
@@ -247,6 +248,18 @@ def find_occurrences(text: str, values: list[str]) -> list[tuple[str, int, int]]
     gold span. Never used as the self-check's own reference (see
     :func:`_self_check`, which uses ``applied_whole_word_keys`` directly).
 
+    *values* is ONE population — the forward table's keys, the reverted
+    surfaces, or the unknown-word values — never a mixture of them.
+    Production substitutes the forward table by itself
+    (:func:`~paramem.cloud.placeholders._substitute_whole_words`, over
+    ``table.forward``), so the forward keys' placements here are the text
+    that actually gets replaced; the other two populations are values
+    production substitutes nowhere, located only so the gate can test
+    them against a gold span. Each character of *text* is consumed by at
+    most one match, so two populations walked together would compete for
+    characters: the longer surface would take the position and the other
+    population's own match there would go unplaced.
+
     Returns:
         Matches found, as ``(value, start, end)``, in left-to-right order.
     """
@@ -269,6 +282,29 @@ def find_occurrences(text: str, values: list[str]) -> list[tuple[str, int, int]]
         if not matched:
             pos += 1
     return occurrences
+
+
+def _occurrences_over_surfaces(
+    surfaces: list[tuple[object, str]], values: list[str]
+) -> list[tuple[object, str, int, int]]:
+    """Walk ONE population of *values* over each of *surfaces* in turn
+    (:func:`find_occurrences` — see there for the one-population rule).
+
+    Args:
+        surfaces: ``[(turn_id, text), ...]`` as :func:`entry_surfaces`
+            returns them; gold offsets are relative to one surface's own
+            text, so each is walked on its own.
+        values: The one population to locate.
+
+    Returns:
+        ``[(turn_id, value, start, end), ...]``, surface by surface in
+        *surfaces* order and left to right within each surface.
+    """
+    return [
+        (turn_id, value, start, end)
+        for turn_id, text in surfaces
+        for value, start, end in find_occurrences(text, values)
+    ]
 
 
 def spans_overlap(a_start: int, a_end: int, b_start: int, b_end: int) -> bool:
@@ -386,6 +422,13 @@ class Result:
     skipped: list = field(default_factory=list)
     skipped_gold_names: int = 0
     skipped_gold_contact: int = 0
+    largest_scan_reply_ratio: float | None = None
+    largest_scan_reply_ratio_entry: str | None = None
+    scan_reply_run_output_tokens: int = 0
+    scan_reply_run_payload_tokens: int = 0
+    scan_call_run_total: int = 0
+    largest_scan_call_count: int | None = None
+    largest_scan_call_count_entry: str | None = None
 
 
 def score_entry(
@@ -402,6 +445,42 @@ def score_entry(
     real value, :func:`_unknown_word_values`); the unknown-word census by
     the model's own malformed word uses that same record's ``word``.
 
+    Each of those three populations — the forward keys, the reverted
+    surfaces, the unknown-word values — is walked over the entry's
+    surfaces by itself (:func:`_occurrences_over_surfaces`), so a forward
+    key's placements are exactly the text production's own substitution
+    over the forward table replaces, and a reverted or unknown-word
+    surface is located wherever it sits, including inside or across one
+    of those replacements.
+
+    Also updates the run's scan-reply-ratio tracking: for every
+    ``contract.call_tokens`` record labelled ``"anonymize.scan"``, the
+    payload tokens are that call's ``prompt_tokens`` less the pinned
+    :data:`~paramem.utils.tokens.ANONYMIZE_SCAN_PROMPT_SKELETON_TOKENS``; a
+    call whose payload tokens are zero or below takes no part (there is no
+    payload to ratio against). Among the rest, this call's
+    ``output_tokens`` and payload tokens are added into
+    :attr:`Result.scan_reply_run_output_tokens` /
+    :attr:`Result.scan_reply_run_payload_tokens` — the run totals whose
+    ratio is the source for re-pinning
+    :data:`~paramem.utils.tokens.ANONYMIZE_SCAN_REPLY_RATIO` — and,
+    separately, this call's own ``output_tokens / payload_tokens`` updates
+    :attr:`Result.largest_scan_reply_ratio` /
+    :attr:`Result.largest_scan_reply_ratio_entry` when it exceeds the
+    running maximum — the per-entry reading of the plateau
+    (:data:`~paramem.utils.tokens.ANONYMIZE_SCAN_MAX_OUTPUT_TOKENS`), never
+    itself the re-pin source.
+
+    Also tallies how many scan calls this one entry cost: every
+    ``contract.call_tokens`` record labelled ``"anonymize.scan"`` counts,
+    regardless of its payload tokens (the local anonymizer now issues one
+    scan call per turn of the payload, so this is the reader's count of
+    those calls, not a ratio input). The count adds into
+    :attr:`Result.scan_call_run_total` — the numerator for the run's mean
+    calls-per-entry — and updates :attr:`Result.largest_scan_call_count` /
+    :attr:`Result.largest_scan_call_count_entry` when it exceeds the
+    running maximum.
+
     Runs :func:`_self_check` once the scorer's own occurrence walk is
     built — a disagreement, in either of its two arms, stops the run.
     """
@@ -412,23 +491,35 @@ def score_entry(
     }
     unknown_values = _unknown_word_values(contract)
 
-    candidate_values = list(dict.fromkeys([*forward.keys(), *reverted_category.keys()]))
-    all_occ: list[tuple[object, str, int, int]] = []
-    unknown_occ: list[tuple[object, str, int, int]] = []
-    for turn_id, text in surfaces:
-        for value, start, end in find_occurrences(text, candidate_values):
-            all_occ.append((turn_id, value, start, end))
-        for value, start, end in find_occurrences(text, unknown_values):
-            unknown_occ.append((turn_id, value, start, end))
-
-    scrubbed_occ = [o for o in all_occ if o[1] in forward]
-    reverted_occ = [o for o in all_occ if o[1] in reverted_category]
+    scrubbed_occ = _occurrences_over_surfaces(surfaces, list(forward))
+    reverted_occ = _occurrences_over_surfaces(surfaces, list(reverted_category))
+    unknown_occ = _occurrences_over_surfaces(surfaces, unknown_values)
 
     _self_check(entry, forward, {o[1] for o in scrubbed_occ})
 
     for dropped in contract.scan_dropped_entries:
         if dropped["reason"] == "unknown_word":
             result.unknown_word_by_word[dropped["word"]] += 1
+
+    scan_call_count = 0
+    for call in contract.call_tokens:
+        if call["label"] != "anonymize.scan":
+            continue
+        scan_call_count += 1
+        payload_tokens = call["prompt_tokens"] - ANONYMIZE_SCAN_PROMPT_SKELETON_TOKENS
+        if payload_tokens <= 0:
+            continue
+        result.scan_reply_run_output_tokens += call["output_tokens"]
+        result.scan_reply_run_payload_tokens += payload_tokens
+        ratio = call["output_tokens"] / payload_tokens
+        if result.largest_scan_reply_ratio is None or ratio > result.largest_scan_reply_ratio:
+            result.largest_scan_reply_ratio = ratio
+            result.largest_scan_reply_ratio_entry = entry["id"]
+
+    result.scan_call_run_total += scan_call_count
+    if result.largest_scan_call_count is None or scan_call_count > result.largest_scan_call_count:
+        result.largest_scan_call_count = scan_call_count
+        result.largest_scan_call_count_entry = entry["id"]
 
     result.tot["entries"] += 1
     for gold in entry["gold"]:
@@ -569,7 +660,7 @@ _HIGHER_IS_BETTER = (
     "contact",
     "precision",
 )
-_LOWER_IS_BETTER = ("junk", "wrong_type", "partial", "unsubstitutable", "failed")
+_LOWER_IS_BETTER = ("junk", "wrong_type", "partial", "unsubstitutable", "failed", "invented")
 
 
 def scorecard_dict(r: Result) -> dict:
@@ -580,6 +671,12 @@ def scorecard_dict(r: Result) -> dict:
     (every entry :func:`score_corpus` lists in :attr:`Result.skipped`) —
     lower is better, carried in the baseline file and the regression check
     alongside the other primary columns.
+
+    ``invented`` is the count of ``reason="unknown_word"`` drop records
+    over the run — the sum of :attr:`Result.unknown_word_by_word`'s values
+    — lower is better, carried in the baseline file and the regression
+    check alongside the other primary columns: a keyword outside the
+    table is the model leaving the closed list.
     """
     tot = r.tot
     low = r.by_casing["lower"]
@@ -598,6 +695,7 @@ def scorecard_dict(r: Result) -> dict:
         "partial": tot["partial_in_scope"],
         "unsubstitutable": tot["unsubstitutable"],
         "failed": len(r.skipped),
+        "invented": sum(r.unknown_word_by_word.values()),
     }
 
 
@@ -628,6 +726,25 @@ def print_detail(r: Result) -> None:
     hold — split into names (``Person``) and contact — so a recall
     percentage is always read beside the share of the corpus it does not
     cover.
+
+    Also prints one scan-reply-ratio line carrying two distinct readings:
+    the run ratio (:attr:`Result.scan_reply_run_output_tokens` over
+    :attr:`Result.scan_reply_run_payload_tokens`) beside the pinned
+    :data:`~paramem.utils.tokens.ANONYMIZE_SCAN_REPLY_RATIO` constant —
+    this is the source to re-pin that constant from — and the largest
+    single entry's own ratio (:attr:`Result.largest_scan_reply_ratio` /
+    :attr:`Result.largest_scan_reply_ratio_entry`), which reads the
+    output-reserve plateau
+    (:data:`~paramem.utils.tokens.ANONYMIZE_SCAN_MAX_OUTPUT_TOKENS`)
+    instead — a readout only, no threshold or warning logic.
+
+    Also prints one scan-call-count line: the mean number of scan calls
+    per scored entry (:attr:`Result.scan_call_run_total` over the scored
+    entry count) beside the largest single entry's own count
+    (:attr:`Result.largest_scan_call_count` /
+    :attr:`Result.largest_scan_call_count_entry`) — the local anonymizer
+    now issues one scan call per turn of the payload, so this is how many
+    calls an entry cost, a readout only.
     """
     tot = r.tot
     print("\n" + "=" * 72)
@@ -666,6 +783,25 @@ def print_detail(r: Result) -> None:
         print(f"    {entry_id}: {decoy!r}")
     print(f"  unknown-word census by gold category: {dict(r.unknown_word_census)}")
     print(f"  unknown-word census by the model's own word: {dict(r.unknown_word_by_word)}")
+    if r.largest_scan_reply_ratio is None:
+        print("  scan reply ratio: n/a (no scan call had payload tokens)")
+    else:
+        run_ratio = r.scan_reply_run_output_tokens / r.scan_reply_run_payload_tokens
+        print(
+            f"  scan reply ratio: run {run_ratio:.2f} "
+            f"(pinned ANONYMIZE_SCAN_REPLY_RATIO={ANONYMIZE_SCAN_REPLY_RATIO}); "
+            f"largest single entry {r.largest_scan_reply_ratio:.2f} "
+            f"({r.largest_scan_reply_ratio_entry})"
+        )
+    if tot["entries"] == 0:
+        print("  scan calls per entry: n/a (no entries scored)")
+    else:
+        mean_scan_calls = r.scan_call_run_total / tot["entries"]
+        print(
+            f"  scan calls per entry: mean {mean_scan_calls:.2f} "
+            f"over {tot['entries']} entries; largest single entry "
+            f"{r.largest_scan_call_count} ({r.largest_scan_call_count_entry})"
+        )
 
     print(f"\n  MISS list ({len(r.miss_list)}):")
     for entry_id, turn_id, cat, value in r.miss_list:

@@ -171,7 +171,7 @@ def create_consolidation_loop(
         # cloud_anonymizer egress path, so the privacy policy must match.
         # ``config.sanitization.scrub_categories`` is resolved once at
         # config construction from the operator's ``scrub`` hints — the
-        # activated prefix rows are the sole scope authority. An empty
+        # activated scrub rows are the sole scope authority. An empty
         # tuple disables anonymization entirely (the operator's opt-out):
         # no anonymize call, content egresses verbatim.
         extraction_scrub_categories=config.sanitization.scrub_categories,

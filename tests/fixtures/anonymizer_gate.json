@@ -8560,6 +8560,166 @@
         }
       ],
       "decoys": []
+    },
+    {
+      "id": "homograph_person_and_invoice",
+      "lang": "en",
+      "casing": "cased",
+      "kind": "name_mention",
+      "description": "a person's name and its lowercase common-noun homograph in one English sentence",
+      "speaker_id": null,
+      "speaker_name": null,
+      "history": [],
+      "text": "Ask Bill whether he settled the bill on Friday.",
+      "gold": [
+        {
+          "value": "Bill",
+          "category": "Person",
+          "turn": -1,
+          "start": 4,
+          "end": 8
+        }
+      ],
+      "decoys": [
+        "bill"
+      ]
+    },
+    {
+      "id": "homograph_common_noun_sentence_initial",
+      "lang": "en",
+      "casing": "cased",
+      "kind": "name_mention",
+      "description": "a common noun that is also a given name, capitalised only by sentence position",
+      "speaker_id": null,
+      "speaker_name": null,
+      "history": [],
+      "text": "Rose bushes need cutting back before the first frost.",
+      "gold": [],
+      "decoys": [
+        "Rose"
+      ]
+    },
+    {
+      "id": "homograph_lowercase_names_no_case_signal",
+      "lang": "en",
+      "casing": "lower",
+      "kind": "name_mention",
+      "description": "two given names that are also common nouns, in a wholly lowercase utterance",
+      "speaker_id": null,
+      "speaker_name": null,
+      "history": [],
+      "text": "tell bill the invoice is paid and ask rose to sign it.",
+      "gold": [
+        {
+          "value": "bill",
+          "category": "Person",
+          "turn": -1,
+          "start": 5,
+          "end": 9
+        },
+        {
+          "value": "rose",
+          "category": "Person",
+          "turn": -1,
+          "start": 38,
+          "end": 42
+        }
+      ],
+      "decoys": [
+        "invoice"
+      ]
+    },
+    {
+      "id": "homograph_city_and_activity",
+      "lang": "en",
+      "casing": "cased",
+      "kind": "mixed",
+      "description": "a city name that is also an English verb form, both present in one sentence",
+      "speaker_id": null,
+      "speaker_name": null,
+      "history": [],
+      "text": "She was reading on the train to Reading last Tuesday.",
+      "gold": [
+        {
+          "value": "Reading",
+          "category": "City",
+          "turn": -1,
+          "start": 32,
+          "end": 39
+        }
+      ],
+      "decoys": [
+        "reading"
+      ]
+    },
+    {
+      "id": "homograph_surname_and_capitalised_noun_de",
+      "lang": "de",
+      "casing": "cased",
+      "kind": "name_mention",
+      "description": "a German surname beside an ordinary capitalised German noun, where casing separates nothing",
+      "speaker_id": null,
+      "speaker_name": null,
+      "history": [],
+      "text": "Sag Frau Koch bitte ab, der Termin passt diese Woche nicht.",
+      "gold": [
+        {
+          "value": "Koch",
+          "category": "Person",
+          "turn": -1,
+          "start": 9,
+          "end": 13
+        }
+      ],
+      "decoys": [
+        "Termin"
+      ]
+    },
+    {
+      "id": "homograph_person_and_stone_fr",
+      "lang": "fr",
+      "casing": "cased",
+      "kind": "name_mention",
+      "description": "a French given name and its lowercase common-noun homograph in one sentence",
+      "speaker_id": null,
+      "speaker_name": null,
+      "history": [],
+      "text": "Demande à Pierre de déplacer la pierre près du portail.",
+      "gold": [
+        {
+          "value": "Pierre",
+          "category": "Person",
+          "turn": -1,
+          "start": 10,
+          "end": 16
+        }
+      ],
+      "decoys": [
+        "pierre"
+      ]
+    },
+    {
+      "id": "homograph_person_and_colour_es",
+      "lang": "es",
+      "casing": "cased",
+      "kind": "name_mention",
+      "description": "a Spanish given name and its lowercase common-noun homograph in one sentence",
+      "speaker_id": null,
+      "speaker_name": null,
+      "history": [],
+      "text": "Dile a Rosa que la manta rosa está en el armario.",
+      "gold": [
+        {
+          "value": "Rosa",
+          "category": "Person",
+          "turn": -1,
+          "start": 7,
+          "end": 11
+        }
+      ],
+      "decoys": [
+        "rosa"
+      ]
     }
   ]
 }

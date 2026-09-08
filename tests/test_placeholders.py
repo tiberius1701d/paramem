@@ -86,18 +86,26 @@ class TestEntityTypeToPrefix:
     """Closed vocabulary only (:func:`~paramem.config.taxonomy.
     anonymizer_type_to_prefix` — the schema's ``primary_for_type`` rows):
     an entity type with no primary row raises rather than composing an
-    open-vocabulary PascalCase prefix."""
+    open-vocabulary PascalCase prefix. Person, City and Org are the only
+    three primaries, for person, place and organization; every other
+    entity type — including concept — has no primary row and raises."""
 
     def test_closed_vocabulary_matches_taxonomy(self):
         assert entity_type_to_prefix("person") == "Person"
         assert entity_type_to_prefix("place") == "City"
         assert entity_type_to_prefix("organization") == "Org"
-        assert entity_type_to_prefix("concept") == "Thing"
+
+    def test_concept_has_no_primary_row_and_raises(self):
+        """``concept`` is a declared entity_type (Profession's own type)
+        but no shipped row sets ``primary_for_type`` for it — this must
+        raise, not compose ``"Concept"``."""
+        with pytest.raises(ValueError, match="no primary_for_type row"):
+            entity_type_to_prefix("concept")
 
     def test_a_type_with_no_primary_row_raises(self):
         """``event`` is a declared entity_type but no shipped row sets
-        ``primary_for_type`` for it (only person/place/organization/
-        concept do) — this must raise, not compose ``"Event"``."""
+        ``primary_for_type`` for it (only person/place/organization
+        do) — this must raise, not compose ``"Event"``."""
         with pytest.raises(ValueError, match="no primary_for_type row"):
             entity_type_to_prefix("event")
 
@@ -111,9 +119,11 @@ class TestEntityTypeToPrefix:
 class TestPrefixToEntityType:
     def test_closed_vocabulary_matches_taxonomy(self):
         assert prefix_to_entity_type("City") == "place"
+        assert prefix_to_entity_type("Country") == "place"
         assert prefix_to_entity_type("Org") == "organization"
         assert prefix_to_entity_type("Person") == "person"
-        assert prefix_to_entity_type("Thing") == "concept"
+        assert prefix_to_entity_type("Artist") == "person"
+        assert prefix_to_entity_type("Profession") == "concept"
 
     def test_open_vocabulary_derives_type_from_prefix_itself(self):
         """The open policy (cloud's brace-binding protocol: the prefix IS

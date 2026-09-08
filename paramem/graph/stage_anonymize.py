@@ -54,14 +54,15 @@ def _stage_anonymize(ctx: StageContext, state: StageState) -> StageState:
        sourced from the passed-in transcript — never a model artifact.
        The ``enrich`` stage derives the (empty-mapping, identity)
        anonymized fact array from the returned ``payload``.
-    2. Non-empty ``scrub_categories`` — the SCAN call names every value in
-       the payload with a keyword from the schema table, and code decides
-       which keyword's values are kept (the operator's active rows) and
-       which revert; code-side substitution
+    2. Non-empty ``scrub_categories`` — one SCAN call per payload slice
+       marks each value in that slice that is an instance of one of the
+       schema table's keywords with that keyword; code merges the slices'
+       replies and decides which keyword's values are kept (the operator's
+       active rows) and which revert; code-side substitution
        (:func:`~paramem.cloud.placeholders._substitute_whole_words`)
        produces both the real_name -> placeholder mapping AND the
-       rewritten transcript with the kept values placeholdered. The
-       second local model call is the ANCHOR self-introduction question.
+       rewritten transcript with the kept values placeholdered. The ANCHOR
+       self-introduction question is the one remaining local model call.
        The ``anonymize`` phase trace captures the raw SCAN + ANCHOR
        record, plus ``status``/``failure``/``model_calls``/
        ``call_tokens`` (the SAME per-call telemetry
@@ -120,12 +121,14 @@ def _stage_anonymize(ctx: StageContext, state: StageState) -> StageState:
         payload = opted_out_contract(ctx.transcript, facts=facts_from_relations(graph.relations))
         graph.diagnostics["anonymize"] = "opted_out"
     else:
-        # Anonymization step — THE one anonymize chain (A), shared with
-        # every other cloud-egress path.  The SCAN call names every value
-        # with a schema keyword; code decides which keyword's values are
-        # kept (the operator's active rows), and code-side substitution
-        # rewrites both the forward table and the transcript.  The second
-        # local model call is the ANCHOR self-introduction question.
+        # Anonymization step — THE one anonymize chain (A), shared with every
+        # other cloud-egress path.  One SCAN call per payload slice marks
+        # each value in that slice that is an instance of a schema keyword
+        # with that keyword; code merges the slices' replies and decides
+        # which keyword's values are kept (the operator's active rows), and
+        # code-side substitution rewrites both the forward table and the
+        # transcript.  The ANCHOR self-introduction question is the one
+        # remaining local model call.
         # Phase trace captures the raw record so calibration can diagnose
         # the anonymizer in isolation.
         with phase_trace("anonymize") as t:
