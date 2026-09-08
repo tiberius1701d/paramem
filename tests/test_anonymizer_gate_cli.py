@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -50,6 +51,24 @@ def _fake_contract(*, raw: str = "{}") -> AnonymizedContract:
         scan_dropped_entries=[],
         inert_dropped=0,
     )
+
+
+def _stub_gpu_guard(monkeypatch, acquire_gpu) -> None:
+    """Put *acquire_gpu* behind the tool's own GPU-guard imports.
+
+    ``main`` reaches the guard through ``gpu_guard`` and
+    ``experiments.utils.gpu_guard``; the package behind both is a separate
+    lab-tools repo that this one does not depend on, so patching either by
+    name would import it and fail wherever it is not installed. Both are
+    stubbed in ``sys.modules`` instead, which leaves every assertion these
+    tests make intact and never imports the real guard.
+    """
+    guard = types.ModuleType("gpu_guard")
+    guard.GPUConfigMissing = type("GPUConfigMissing", (Exception,), {})
+    wrapper = types.ModuleType("experiments.utils.gpu_guard")
+    wrapper.acquire_gpu = acquire_gpu
+    monkeypatch.setitem(sys.modules, "gpu_guard", guard)
+    monkeypatch.setitem(sys.modules, "experiments.utils.gpu_guard", wrapper)
 
 
 class TestAcceptRefusedUnderLimit:
@@ -445,7 +464,7 @@ class TestMainDryRun:
         def _must_not_be_called(*args, **kwargs):
             raise AssertionError("--dry-run must never reach the GPU guard or a model load")
 
-        monkeypatch.setattr("experiments.utils.gpu_guard.acquire_gpu", _must_not_be_called)
+        _stub_gpu_guard(monkeypatch, _must_not_be_called)
         monkeypatch.setattr("paramem.models.loader.load_base_model", _must_not_be_called)
 
         code = anonymizer_gate.main(["--dry-run"])
@@ -476,7 +495,7 @@ class TestMainResume:
         def _must_not_be_called(*args, **kwargs):
             raise AssertionError("the score-only path must never reach the GPU guard or a model")
 
-        monkeypatch.setattr("experiments.utils.gpu_guard.acquire_gpu", _must_not_be_called)
+        _stub_gpu_guard(monkeypatch, _must_not_be_called)
         monkeypatch.setattr("paramem.models.loader.load_base_model", _must_not_be_called)
 
     def test_a_complete_run_directory_is_scored_from_disk_without_gpu_or_model(
@@ -579,7 +598,7 @@ class TestMainResume:
         def _acquire_gpu(*args, **kwargs):
             raise _GuardedPathReached("acquire_gpu was called — the guarded path was entered")
 
-        monkeypatch.setattr("experiments.utils.gpu_guard.acquire_gpu", _acquire_gpu)
+        _stub_gpu_guard(monkeypatch, _acquire_gpu)
 
         with pytest.raises(_GuardedPathReached):
             anonymizer_gate.main(["--resume"])
@@ -639,7 +658,7 @@ class TestMainResume:
         def _acquire_gpu(*args, **kwargs):
             raise _GuardedPathReached("acquire_gpu was called — the guarded path was entered")
 
-        monkeypatch.setattr("experiments.utils.gpu_guard.acquire_gpu", _acquire_gpu)
+        _stub_gpu_guard(monkeypatch, _acquire_gpu)
 
         with pytest.raises(_GuardedPathReached):
             anonymizer_gate.main([])
