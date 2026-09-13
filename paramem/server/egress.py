@@ -168,7 +168,11 @@ class OutboundText:
         """The anonymize chain's result for this object's text, memoised.
 
         Calls :func:`~paramem.graph.flows.anonymize_turn` at most once per
-        object. A raise propagates — no handler here.
+        object, passing ``self.config.prompts_dir`` through — the same
+        operator prompts-directory source the fold, graph enrichment and
+        calibration read, and the one the boot check validates, so an
+        operator's own anonymization prompt copy governs chat egress too.
+        A raise propagates — no handler here.
 
         Returns:
             The memoised :class:`~paramem.cloud.anonymize.AnonymizedContract`.
@@ -183,6 +187,7 @@ class OutboundText:
                 history=self.gated_history(),
                 speaker_id=self.speaker_id,
                 speaker_name=self.speaker,
+                prompts_dir=self.config.prompts_dir,
                 categories=self.config.sanitization.scrub_categories,
                 token_envelope=self.config.consolidation.extraction_anonymize_token_envelope,
             )

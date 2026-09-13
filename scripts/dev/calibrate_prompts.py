@@ -72,6 +72,7 @@ from paramem.graph.document_chunker import (  # noqa: E402
     chunk_pdf_file,
     chunk_text_file,
 )
+from paramem.graph.prompts import ANONYMIZATION_PROMPT_FILE  # noqa: E402
 from paramem.server.session_buffer import SessionBuffer  # noqa: E402
 from paramem.utils.artifacts import artifact_run_dir, run_stamp, write_artifact  # noqa: E402
 
@@ -698,7 +699,7 @@ _STAGE_FILENAME = {
     "extract_user": "extraction.txt",
     "extract_system": "extraction_system.txt",
     "document_directive": "document_directive.txt",
-    "anonymize": "anonymization.txt",
+    "anonymize": ANONYMIZATION_PROMPT_FILE,
     "enrich": "cloud_enrichment.txt",
     "plausibility": "cloud_plausibility.txt",
     "normalize_filter": "predicate_normalization.txt",

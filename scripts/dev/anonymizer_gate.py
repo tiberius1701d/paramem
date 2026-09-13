@@ -28,9 +28,21 @@ anonymizer prompt skeletons (see below); and ``--resume`` onto a run
 directory that is already complete — every corpus entry (after any
 ``--limit``) already has a written artifact on disk — which scores
 straight from those artifacts instead of running anything, also loading
-only the bare tokenizer for the same skeleton print. A ``--resume`` run
-still missing entries, or any run without ``--resume``, proceeds under the
-GPU guard as normal.
+only the bare tokenizer for the same skeleton print; any input this run
+records that differs from the run directory's own recorded provenance
+(scrubbed kinds, model, prompt, keyword table, test set, token budget)
+prints as a notice, never a refusal, since scoring from disk issues no model call —
+except when ``--accept`` is also given: recording a scorecard as the new
+baseline is refused instead when the run's own recorded inputs differ
+from this invocation's, or the run recorded none of them, and no baseline
+is written; a re-score without ``--accept`` still prints the notice and
+scores. A ``--resume`` run
+still missing entries would run the model on the rest; that run is refused
+before the GPU guard, before any model or tokenizer load, and before any
+entry runs, when its own recorded provenance differs from this invocation's
+or was never recorded at all — continuing would blend two distinct
+detector configurations into one run directory. A run without ``--resume``
+always proceeds under the GPU guard as normal.
 
 The corpus run chunks its GPU burst: every ``--cooldown-every`` (default
 20) model-bearing entries, the tool pauses for the GPU to cool
@@ -78,13 +90,13 @@ import json
 import sys
 import time
 from collections import Counter, defaultdict
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
 from paramem.cloud.anonymize import AnonymizedContract, assemble_payload, render_fact_lines
 from paramem.cloud.placeholders import applied_whole_word_keys, word_boundary_ok
-from paramem.config.taxonomy import ScrubCategory, resolve_scrub_categories
+from paramem.config.taxonomy import ScrubCategory, load_schema_config, resolve_scrub_categories
 from paramem.training.thermal_throttle import wait_for_cooldown
 from paramem.utils.tokens import ANONYMIZE_SCAN_PROMPT_SKELETON_TOKENS, ANONYMIZE_SCAN_REPLY_RATIO
 from paramem.utils.turn_markers import format_turn
@@ -138,6 +150,13 @@ def resolve_categories(scrub_hints: list[str] | None) -> tuple[ScrubCategory, ..
     from paramem.server.config import SanitizationConfig
 
     return SanitizationConfig().scrub_categories
+
+
+def _format_prefixes(prefixes: set[str]) -> str:
+    """*prefixes* as comma-separated words for a printed line, never a
+    Python list/set repr — ``"none"`` when *prefixes* is empty.
+    """
+    return ", ".join(sorted(prefixes)) if prefixes else "none"
 
 
 # ---------------------------------------------------------------------------
@@ -395,7 +414,7 @@ def _self_check(entry: dict, forward: dict[str, str], scrubbed_values: set[str])
 def _unknown_word_values(contract: AnonymizedContract) -> list[str]:
     """The real values the SCAN call dropped as ``reason="unknown_word"``.
 
-    The drop record itself now carries the value directly on ``text``
+    The drop record itself carries the value directly on ``text``
     (:func:`~paramem.cloud.anonymize_steps._dropped_scan_entry` — ``word``
     holds the model's own unrecognised keyword instead), so this is a
     plain projection, never a re-parse of ``contract.raw``.
@@ -473,7 +492,7 @@ def score_entry(
 
     Also tallies how many scan calls this one entry cost: every
     ``contract.call_tokens`` record labelled ``"anonymize.scan"`` counts,
-    regardless of its payload tokens (the local anonymizer now issues one
+    regardless of its payload tokens (the local anonymizer issues one
     scan call per turn of the payload, so this is the reader's count of
     those calls, not a ratio input). The count adds into
     :attr:`Result.scan_call_run_total` — the numerator for the run's mean
@@ -743,7 +762,7 @@ def print_detail(r: Result) -> None:
     entry count) beside the largest single entry's own count
     (:attr:`Result.largest_scan_call_count` /
     :attr:`Result.largest_scan_call_count_entry`) — the local anonymizer
-    now issues one scan call per turn of the payload, so this is how many
+    issues one scan call per turn of the payload, so this is how many
     calls an entry cost, a readout only.
     """
     tot = r.tot
@@ -851,19 +870,241 @@ def load_baseline(path: Path) -> dict | None:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def write_baseline(scorecard: dict, *, source: str, path: Path) -> None:
-    """Record *scorecard* as the new accepted baseline, tagged with *source*.
+def write_baseline(
+    scorecard: dict,
+    *,
+    source: str,
+    current: RunRecord,
+    run_record: RunRecord | None,
+    entries: list[dict],
+    path: Path,
+) -> None:
+    """Record *scorecard* as the new accepted baseline, tagged with *source*
+    and the inputs this scorecard was computed under (:func:`_scored_inputs`).
+
+    The ``--accept`` refusal (:func:`_refuse_on_input_mismatch`) already
+    guarantees, by the time this is called, that *run_record*'s own
+    recorded model/prompt/table/token-budget match *current*'s own — so
+    this function does no comparison of its own; it only records.
+    ``--accept`` is also refused together with ``--limit`` (before either
+    path is chosen), so *entries* here is always the full corpus.
 
     Args:
         scorecard: The primary-column scorecard to record.
         source: Free-text provenance for the accepted run (e.g. its run
             directory name).
+        current: This invocation's own freshly built :class:`RunRecord` —
+            its scrubbed kinds are the ones :func:`_scored_inputs` records
+            (see there for why).
+        run_record: The accepted run's own ``run.json`` record (see
+            :func:`_read_run_record`) — its model, prompt, keyword-table
+            digest and token budget are copied onto the baseline. ``None``
+            (a run directory with no ``run.json``) records ``None`` for
+            all four.
+        entries: The entries this scorecard was actually computed over —
+            forwarded to :func:`_scored_inputs` for its own ``corpus_sha256``
+            (the entries scored, not *current*'s whole-corpus digest).
         path: Baseline file path. No import-time default — see
             :func:`load_baseline`.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {**scorecard, "source": source}
+    payload = {**scorecard, "source": source, **_scored_inputs(run_record, current, entries)}
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+# The plain-language label each of the six inputs a run's identity turns
+# on prints under — the one listing of those six inputs; every other
+# input-identity name (`_INPUT_KEYS`, the "records none" line, the
+# refusal line) is derived from this mapping rather than re-listed.
+_INPUT_LABELS = {
+    "configured_prefixes": "scrubbed kinds",
+    "model_id": "model",
+    "prompt_sha256": "prompt",
+    "table_sha256": "keyword table",
+    "corpus_sha256": "test set",
+    "token_envelope": "token budget",
+}
+_INPUT_KEYS = tuple(_INPUT_LABELS)
+_ALL_INPUT_LABELS = ", ".join(_INPUT_LABELS.values())
+
+
+def _recorded_inputs(record: RunRecord | None) -> dict[str, object]:
+    """The six inputs a run's identity turns on, read off *record* verbatim.
+
+    The one description of a run's OWN recorded inputs: every comparison
+    this tool makes (:func:`_describe_differences`) reads both of its
+    sides through this function or through :func:`_scored_inputs`, rather
+    than re-listing the six fields at each call site.
+
+    Args:
+        record: A run's own recorded provenance (:func:`_read_run_record`
+            or :func:`_current_run_record`), or ``None`` when the run
+            carries no record at all (e.g. a run directory with no
+            ``run.json``).
+
+    Returns:
+        ``{"configured_prefixes": ..., "model_id": ..., "prompt_sha256":
+        ..., "table_sha256": ..., "corpus_sha256": ..., "token_envelope":
+        ...}`` — every value ``None`` when *record* is ``None``.
+    """
+    if record is None:
+        return dict.fromkeys(_INPUT_KEYS)
+    return {key: getattr(record, key) for key in _INPUT_KEYS}
+
+
+def _scored_inputs(
+    run_record: RunRecord | None, current: RunRecord, entries: list[dict]
+) -> dict[str, object]:
+    """The six inputs THIS scorecard was computed under.
+
+    Two roles a "test set" plays are kept apart on purpose:
+    :func:`_current_run_record`'s own ``corpus_sha256`` (on *current* and on
+    every ``run.json``) is always the WHOLE corpus a run belongs to — the
+    identity a fresh ``--resume`` or ``--accept`` checks match against, so a
+    ``--limit`` pilot and its later full-corpus continuation are the same
+    run. This function's own ``corpus_sha256`` is the OTHER role: the
+    entries THIS scoring actually read its gold from, i.e. *entries* itself
+    (``--limit``-sliced when a pilot is running) — never *current*'s own
+    (whole-corpus) digest. A pilot's scorecard therefore differs, correctly,
+    from a baseline recorded on the full corpus: the columns really were
+    computed over fewer entries.
+
+    ``configured_prefixes`` is always *current*'s own: the categories this
+    scoring invocation actually used, derived fresh every invocation, never
+    *run_record*'s own recorded ones — a complete run directory can be
+    re-scored under a different ``--scrub`` (:func:`_score_from_disk`), and
+    it is *this* scoring's own categories that the printed columns reflect.
+    ``model_id``, ``prompt_sha256``, ``table_sha256`` and ``token_envelope``
+    come from *run_record* (:func:`_recorded_inputs`) — what actually
+    generated the entries on disk — never from *current*, since a resumed
+    or re-scored invocation's own model/prompt/table/token-budget choice
+    can differ from what produced them; all four read ``None`` when
+    *run_record* is ``None``.
+
+    Used by the baseline verdict (:func:`_identity_verdict_line`, compared
+    against the accepted baseline's own recorded inputs) and by
+    :func:`write_baseline` (written as the new baseline) — the one builder
+    of "the inputs this scorecard was computed under", so the two never
+    disagree on what that phrase means.
+
+    Args:
+        run_record: The scored run's own ``run.json`` record
+            (:func:`_read_run_record`), or ``None`` when the run directory
+            carries none.
+        current: This invocation's own freshly built :class:`RunRecord`
+            (:func:`_current_run_record`).
+        entries: The entries actually scored (the ``--limit``-sliced list
+            passed to :func:`score_corpus`) — hashed directly, never read
+            off *current* or *run_record*.
+
+    Returns:
+        ``{"configured_prefixes": ..., "model_id": ..., "prompt_sha256":
+        ..., "table_sha256": ..., "corpus_sha256": ..., "token_envelope":
+        ...}``.
+    """
+    recorded = _recorded_inputs(run_record)
+    return {
+        "configured_prefixes": current.configured_prefixes,
+        "model_id": recorded["model_id"],
+        "prompt_sha256": recorded["prompt_sha256"],
+        "table_sha256": recorded["table_sha256"],
+        "corpus_sha256": _sha256_json(entries),
+        "token_envelope": recorded["token_envelope"],
+    }
+
+
+def _describe_differences(
+    reference: dict, compared: dict, *, reference_name: str, compared_name: str
+) -> list[str]:
+    """One plain-language phrase per input where *reference* and *compared*
+    (two recorded-input descriptions, :func:`_recorded_inputs`) do not
+    equally match, in :data:`_INPUT_KEYS` order — the one comparison this
+    tool makes, read by both the run identity check
+    (:func:`_input_mismatch_phrases`) and the baseline verdict
+    (:func:`_identity_verdict_line`).
+
+    Args:
+        reference: The input description held as the point of comparison
+            (e.g. the accepted baseline's, or a run directory's own
+            recorded one).
+        compared: The input description being checked against it (e.g.
+            this invocation's own current values).
+        reference_name: Plain-language name for the reference side, used
+            when *reference* lacks a value *compared* has, and when
+            neither side recorded a value.
+        compared_name: Plain-language name for the compared side, used
+            when *compared* lacks a value *reference* has.
+
+    Returns:
+        One phrase per non-matching input: the label alone when both
+        sides recorded a value and it differs (e.g. ``"prompt"``); the
+        label plus which side is missing it when only one side recorded a
+        value (e.g. ``"keyword table (not recorded by the baseline)"``);
+        the label plus ``"(recorded by neither)"`` when neither side
+        recorded it — an input absent from both sides is never silently
+        treated as a match. An input where both sides recorded the SAME
+        value contributes no phrase. Empty when every input matches.
+    """
+    phrases = []
+    for key in _INPUT_KEYS:
+        label = _INPUT_LABELS[key]
+        ref_value, cmp_value = reference.get(key), compared.get(key)
+        if ref_value is None and cmp_value is None:
+            phrases.append(f"{label} (recorded by neither)")
+        elif ref_value is None:
+            phrases.append(f"{label} (not recorded by {reference_name})")
+        elif cmp_value is None:
+            phrases.append(f"{label} (not recorded by {compared_name})")
+        elif ref_value != cmp_value:
+            phrases.append(label)
+    return phrases
+
+
+def _identity_verdict_line(
+    run_record: RunRecord | None, baseline: dict, current: RunRecord, entries: list[dict]
+) -> str | None:
+    """One verdict line naming which of the inputs this scorecard was
+    computed under (:func:`_scored_inputs` — this invocation's own
+    scrubbed kinds and the entries actually scored; the run's model,
+    prompt, keyword table and token budget) differ from the accepted
+    baseline's recorded ones — never a refusal, printed beside the
+    regression columns whenever it is not ``None``.
+
+    Args:
+        run_record: The scored run's own ``run.json`` record (see
+            :func:`_read_run_record`), or ``None`` when the run directory
+            carries none.
+        baseline: The loaded baseline dict (:func:`load_baseline`'s
+            return, guaranteed non-``None`` by the caller).
+        current: This invocation's own freshly built :class:`RunRecord` —
+            its scrubbed kinds are the ones :func:`_scored_inputs` compares
+            (see there for why), never *run_record*'s own recorded ones,
+            which can differ when a complete run directory is re-scored
+            under a different ``--scrub``.
+        entries: The entries actually scored — hashed by
+            :func:`_scored_inputs` for the test-set comparison, e.g. a
+            ``--limit`` pilot's own sliced entries against a full-corpus
+            baseline, which correctly reports the test set as differing.
+
+    Returns:
+        A line naming every one of the six inputs by their plain labels,
+        when every one of :data:`_INPUT_KEYS` is absent from *baseline*; a line
+        naming each differing input, when at least one differs or is
+        recorded on only one side; ``None`` when every recorded input
+        matches.
+    """
+    baseline_inputs = {key: baseline.get(key) for key in _INPUT_KEYS}
+    if all(value is None for value in baseline_inputs.values()):
+        return f"the accepted baseline records none of these inputs: {_ALL_INPUT_LABELS}"
+    phrases = _describe_differences(
+        baseline_inputs,
+        _scored_inputs(run_record, current, entries),
+        reference_name="the baseline",
+        compared_name="this run",
+    )
+    if not phrases:
+        return None
+    return f"differs from the accepted baseline: {', '.join(phrases)}"
 
 
 def _score_and_report(
@@ -875,12 +1116,20 @@ def _score_and_report(
     *,
     accept: bool,
     write_scorecard: bool,
+    current: RunRecord,
+    run_record: RunRecord | None,
 ) -> int:
     """The one scoring-and-verdict sequence: score *contracts*, print the
     detail and scorecard, compare against the last accepted baseline, and
     optionally accept a new one — reached by both the guarded (model-
     bearing) run and the score-only path (:func:`_score_from_disk`) so
     there is exactly one place this sequence is written.
+
+    Also prints one notice line (:func:`_identity_verdict_line`) naming
+    which of the inputs this scorecard was computed under (scrubbed kinds,
+    model, prompt, keyword table, test set, token budget) differ from the
+    accepted baseline's, stated beside the regression columns, never as a
+    refusal.
 
     Args:
         entries: The (possibly ``--limit``-sliced) corpus entries.
@@ -894,13 +1143,38 @@ def _score_and_report(
         accept: Whether to record this run's scorecard as the new baseline
             (``--accept``; already refused together with ``--limit`` by the
             caller).
-        write_scorecard: Whether to write ``run_dir/scorecard.json``.
-            ``False`` when ``--limit`` sliced the entries, so a pilot
-            slice never overwrites a complete run's own full-corpus
-            scorecard.
+        write_scorecard: Whether ``run_dir/scorecard.json`` may be written
+            at all. ``False`` when ``--limit`` sliced the entries, so a
+            pilot slice never overwrites a complete run's own full-corpus
+            scorecard. Even when ``True``, the file is written only when
+            the inputs this scorecard was computed under match *run_dir*'s
+            own recorded ones (:func:`_inputs_match` — the same comparison
+            the ``--resume``/``--accept`` refusal uses, no special case for
+            a run directory with no ``run.json``): a run with no ``run.json``,
+            or one that does not record an input, cannot match, so a
+            re-score under different or unrecorded inputs prints its
+            scorecard without writing the file.
+        current: This invocation's own freshly built :class:`RunRecord`
+            (:func:`_current_run_record`, always the whole corpus's own
+            digest) — compared against *run_record* for both the
+            ``--accept`` refusal and the ``scorecard.json`` write. *entries*
+            itself, not *current*, is what the baseline verdict and
+            ``write_baseline`` hash for the test-set comparison
+            (:func:`_scored_inputs`) — the entries actually scored, so a
+            ``--limit`` pilot correctly reports its test set as differing
+            from a full-corpus baseline while still matching *run_record*'s
+            own (whole-corpus) run identity.
+        run_record: *run_dir*'s own recorded provenance
+            (:func:`_read_run_record`), or ``None`` when it carries no
+            ``run.json``. Read exactly once per invocation, by ``main``
+            (or, for a freshly created run directory, taken to be
+            *current* itself — the record ``main`` just wrote) — this
+            function never re-reads ``run_dir/run.json`` on its own.
 
     Returns:
-        ``0`` always.
+        ``0``, or ``1`` when *accept* is set and refused because *run_dir*'s
+        recorded inputs differ from *current*'s own, or were never
+        recorded — no baseline is written in that case.
 
     Raises:
         AssertionError: ``score_corpus`` (via ``score_entry``'s
@@ -914,22 +1188,48 @@ def _score_and_report(
     scorecard = scorecard_dict(result)
     print_scorecard(scorecard)
 
+    inputs_match = _inputs_match(run_record, current)
+
     baseline = load_baseline(baseline_path)
     if baseline is None:
         print("\nno accepted baseline on disk yet")
     else:
         regressed = regression_columns(scorecard, baseline)
         if regressed:
-            print(f"\nREGRESSION on columns: {regressed}")
+            print(f"\nREGRESSION on columns: {', '.join(regressed)}")
         else:
             print("\nno regression against the accepted baseline")
+        identity_line = _identity_verdict_line(run_record, baseline, current, entries)
+        if identity_line is not None:
+            print(identity_line)
 
     if accept:
-        write_baseline(scorecard, source=f"run {run_dir.name}", path=baseline_path)
+        if _refuse_on_input_mismatch(run_dir, run_record, current, action="--accept"):
+            return 1
+        write_baseline(
+            scorecard,
+            source=f"run {run_dir.name}",
+            current=current,
+            run_record=run_record,
+            entries=entries,
+            path=baseline_path,
+        )
         print(f"baseline accepted from run {run_dir.name}")
 
     if write_scorecard:
-        (run_dir / "scorecard.json").write_text(json.dumps(scorecard, indent=2), encoding="utf-8")
+        if inputs_match:
+            (run_dir / "scorecard.json").write_text(
+                json.dumps(scorecard, indent=2), encoding="utf-8"
+            )
+        else:
+            phrases = _input_mismatch_phrases(run_record, current)
+            if phrases is None:
+                print(f"scorecard.json not written: {_no_run_record_line(run_dir.name)}")
+            else:
+                print(
+                    f"scorecard.json not written: differs from run {run_dir.name}'s "
+                    f"own recorded inputs: {', '.join(phrases)}"
+                )
     return 0
 
 
@@ -1002,7 +1302,7 @@ def _write_entry_artifact(
 
 def _load_entry_artifact(base_dir: Path, entry_id: str) -> AnonymizedContract | None:
     """Reconstruct the :class:`AnonymizedContract` fields the scorer reads
-    from a previously written artifact — the ``--resume`` read path, and
+    from an entry's own artifact on disk — the ``--resume`` read path, and
     the score-only path's (:func:`_score_from_disk`) only source of
     contracts.
     """
@@ -1043,23 +1343,99 @@ def _run_dir_complete(entries: list[dict], run_dir: Path) -> bool:
     )
 
 
+def _sha256_json(value: object) -> str:
+    """The sha256 hex digest of *value*'s deterministic JSON serialization
+    (``sort_keys=True, ensure_ascii=False``) — so a value that differs only
+    in dict key order still hashes identically when its content is
+    unchanged. List order (row order inside ``scrub``/``allow``) is
+    preserved, since ``sort_keys`` sorts only dict keys, never a list's own
+    elements — the anonymizer table's row order matters (it is the order
+    the model reads the keyword list in), so it must not cancel out here.
+    """
+    serialized = json.dumps(value, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _prompt_home_sha256(prompt_override_text: str | None) -> str:
+    """The sha256 hex digest of the prompt home text this run reads.
+
+    Loads the anonymizer prompts through the same resolution the anonymize
+    chain itself uses — :func:`~paramem.graph.anonymizer_prompts.
+    load_anonymizer_prompts`, inside :func:`_prompt_override_context` —
+    so *prompt_override_text* substitutes for ``anonymization.txt`` when
+    given, and the shipped prompt home resolves as normal otherwise; no
+    second path to ``configs/prompts/anonymization.txt`` is hardcoded
+    here. The composed :class:`~paramem.cloud.anonymize.AnonymizerPrompts`
+    is hashed field by field, via ``dataclasses.asdict``, through
+    :func:`_sha256_json` — together its four fields are every piece of
+    model-facing text a scan or anchor call actually reads from the home.
+    """
+    from paramem.graph.anonymizer_prompts import load_anonymizer_prompts
+
+    with _prompt_override_context(prompt_override_text):
+        prompts = load_anonymizer_prompts()
+    return _sha256_json(asdict(prompts))
+
+
 @dataclass
 class RunRecord:
-    """The provenance a run directory pins at creation: the scrub prefixes
-    configured, the model id loaded, the ``--prompt-file`` path (or
-    ``None`` for the shipped prompt home), and ``prompt_sha256`` — the
-    sha256 hex digest of the prompt file's text, or ``None`` when no
-    override was given. One shape serves both roles — what a fresh run
-    directory writes (:func:`_write_run_record`) and what the current
-    invocation's own values are compared against
-    (:func:`_current_run_record`, :func:`_report_run_record`) — so there is
-    no second JSON layout for the same provenance.
+    """The provenance a run directory pins at creation.
+
+    One shape serves both roles — what a fresh run directory writes
+    (:func:`_write_run_record`) and what the current invocation's own
+    values are compared against (:func:`_current_run_record`,
+    :func:`_report_run_record`) — so there is no second JSON layout for
+    the same provenance. A freshly built record (:func:`_current_run_record`)
+    always derives real values for every one of the six identity inputs
+    (:data:`_INPUT_KEYS`); a record read back from disk
+    (:func:`_read_run_record`) reads any of the six as ``None`` when the
+    on-disk JSON carries no value for it — a missing key, or an explicit
+    ``null`` — the same way a missing ``run.json`` file itself is reported
+    as no record at all.
+
+    Attributes:
+        configured_prefixes: The active scrub categories' prefixes,
+            sorted, or ``None`` when a ``run.json`` on disk carries no
+            value for it (:func:`_read_run_record`) — the same way a
+            missing ``run.json`` file itself is reported as no record at
+            all.
+        model_id: The loaded (or to-be-loaded) base model's id, or
+            ``None`` when a ``run.json`` on disk carries no value for it
+            (:func:`_read_run_record`) — the same way a missing
+            ``run.json`` file itself is reported as no record at all.
+        prompt_file: The ``--prompt-file`` path this run read, or
+            ``None`` for the shipped prompt home.
+        prompt_sha256: The sha256 hex digest of the four composed prompt
+            sections this run reads, or ``None`` when a ``run.json`` on
+            disk carries no value for it (:func:`_read_run_record`) — the
+            same way a missing ``run.json`` file itself is reported as no
+            record at all.
+        table_sha256: The sha256 hex digest of the anonymizer keyword
+            table this run reads, or ``None`` when a ``run.json`` on disk
+            carries no value for it (:func:`_read_run_record`) — the same
+            way a missing ``run.json`` file itself is reported as no
+            record at all.
+        corpus_sha256: The sha256 hex digest of the loaded corpus (the
+            entries :func:`load_corpus` returns), or ``None`` when a
+            ``run.json`` on disk carries no value for it
+            (:func:`_read_run_record`) — the same way a missing
+            ``run.json`` file itself is reported as no record at all.
+        token_envelope: The per-call token budget the anonymize chain reads
+            for this run (``server_cfg.consolidation.
+            extraction_anonymize_token_envelope``, the same value ``main``
+            passes as ``token_envelope`` to every entry it runs), or
+            ``None`` when a ``run.json`` on disk carries no value for it
+            (:func:`_read_run_record`) — the same way a missing
+            ``run.json`` file itself is reported as no record at all.
     """
 
-    configured_prefixes: list[str]
-    model_id: str
+    configured_prefixes: list[str] | None
+    model_id: str | None
     prompt_file: str | None
-    prompt_sha256: str | None = None
+    prompt_sha256: str | None
+    table_sha256: str | None
+    corpus_sha256: str | None
+    token_envelope: int | None
 
 
 def _run_record_path(run_dir: Path) -> Path:
@@ -1071,24 +1447,58 @@ def _current_run_record(
     configured: set[str],
     model_id: str,
     prompt_file: Path | None,
+    token_envelope: int,
     prompt_override_text: str | None = None,
 ) -> RunRecord:
-    """Build the :class:`RunRecord` for this invocation's own values —
-    used both to write a fresh run directory's ``run.json`` and to compare
-    against a prior run's recorded one. ``prompt_sha256`` is the sha256 hex
-    digest of *prompt_override_text* when given, else ``None`` — the same
-    digest a fresh run directory pins and a later score-from-disk
-    invocation compares against.
+    """Build the :class:`RunRecord` for this invocation's own values — used
+    both to write a fresh run directory's ``run.json`` and to compare
+    against a prior run's recorded one (a ``--resume``/``--accept`` run
+    IDENTITY check). ``prompt_sha256`` and ``table_sha256`` are always
+    derived, never taken as parameters: the first is
+    :func:`_prompt_home_sha256` of *prompt_override_text* (or the shipped
+    prompt home when ``None``); the second is :func:`_sha256_json` of the
+    anonymizer keyword table as the schema loader returns it right now
+    (:func:`~paramem.config.taxonomy.load_schema_config`'s ``"anonymizer"``
+    entry — both the ``scrub`` and ``allow`` lists, every row field).
+    ``token_envelope`` IS taken as a parameter, unlike the two digests
+    above: it is a plain integer, not something this function derives from
+    a file it can load itself — ``main`` reads it once
+    (``server_cfg.consolidation.extraction_anonymize_token_envelope``) and
+    passes it through here, the same value it then hands to every entry it
+    runs.
+
+    ``corpus_sha256`` is always :func:`_sha256_json` of the WHOLE corpus
+    (:func:`load_corpus`), never a ``--limit`` slice — this digest names
+    the run the entry belongs to, not the entries a given invocation
+    happens to score, so a ``--limit`` pilot and its later full-corpus
+    ``--resume`` continuation are recognized as the same run and never
+    refused for a mismatched test set. (The OTHER role a "test set" plays
+    — the entries a scorecard was actually computed over, which DOES
+    reflect a ``--limit`` slice — is :func:`_scored_inputs`'s own
+    ``corpus_sha256``, built from the entries handed to scoring, not from
+    this record.) The fixture's own ``_about`` text (outside the
+    ``entries`` list :func:`load_corpus` returns) never moves this digest.
+    All three digests, and ``token_envelope``, are the same values a fresh
+    run directory pins and a later score-from-disk invocation compares
+    against.
+
+    Args:
+        configured: The active scrub categories' prefixes.
+        model_id: The loaded (or to-be-loaded) base model's id.
+        prompt_file: The ``--prompt-file`` path, or ``None`` for the
+            shipped prompt home.
+        token_envelope: The per-call token budget this run passes to the
+            anonymize chain.
+        prompt_override_text: The ``--prompt-file`` contents, or ``None``.
     """
     return RunRecord(
         configured_prefixes=sorted(configured),
         model_id=model_id,
         prompt_file=str(prompt_file) if prompt_file is not None else None,
-        prompt_sha256=(
-            hashlib.sha256(prompt_override_text.encode("utf-8")).hexdigest()
-            if prompt_override_text is not None
-            else None
-        ),
+        prompt_sha256=_prompt_home_sha256(prompt_override_text),
+        table_sha256=_sha256_json(load_schema_config()["anonymizer"]),
+        corpus_sha256=_sha256_json(load_corpus()),
+        token_envelope=token_envelope,
     )
 
 
@@ -1105,6 +1515,9 @@ def _write_run_record(run_dir: Path, record: RunRecord) -> None:
                 "model_id": record.model_id,
                 "prompt_file": record.prompt_file,
                 "prompt_sha256": record.prompt_sha256,
+                "table_sha256": record.table_sha256,
+                "corpus_sha256": record.corpus_sha256,
+                "token_envelope": record.token_envelope,
             },
             indent=2,
         ),
@@ -1115,52 +1528,212 @@ def _write_run_record(run_dir: Path, record: RunRecord) -> None:
 def _read_run_record(run_dir: Path) -> RunRecord | None:
     """Read *run_dir*'s ``run.json``, or ``None`` when the directory holds
     no record file.
+
+    All six of the run's own identity inputs (:data:`_INPUT_KEYS`) —
+    ``configured_prefixes``, ``model_id``, ``prompt_sha256``,
+    ``table_sha256``, ``corpus_sha256`` and ``token_envelope`` — are read
+    with ``.get`` the same way: a record on disk lacking any of the six
+    keys, or carrying an explicit ``null`` for one, reads it as ``None``
+    (that input not recorded), never a ``KeyError``. A record missing a
+    key and one carrying every key are read identically wherever the
+    value itself is ``None`` — the same tolerance :func:`_recorded_inputs`
+    and :func:`_describe_differences` already assume of every one of the
+    six when they report an input as "not recorded" rather than raising.
+    ``prompt_file`` (the literal ``--prompt-file`` path, not one of the
+    six identity inputs) is read the same tolerant way for consistency,
+    though ``_write_run_record`` always writes it.
     """
     path = _run_record_path(run_dir)
     if not path.exists():
         return None
     data = json.loads(path.read_text(encoding="utf-8"))
     return RunRecord(
-        configured_prefixes=data["configured_prefixes"],
-        model_id=data["model_id"],
-        prompt_file=data["prompt_file"],
-        prompt_sha256=data["prompt_sha256"],
+        configured_prefixes=data.get("configured_prefixes"),
+        model_id=data.get("model_id"),
+        prompt_file=data.get("prompt_file"),
+        prompt_sha256=data.get("prompt_sha256"),
+        table_sha256=data.get("table_sha256"),
+        corpus_sha256=data.get("corpus_sha256"),
+        token_envelope=data.get("token_envelope"),
     )
 
 
-def _report_run_record(run_dir: Path, current: RunRecord) -> None:
-    """Print *run_dir*'s recorded provenance beside *current*'s own values,
-    naming any field that differs — never a refusal; a complete run
-    directory is always scored from its entry files as written, and the
-    operator reads the mismatch to decide whether the re-score is
-    meaningful. A run directory with no record file prints that fact
-    instead and scores anyway.
+def _input_mismatch_phrases(run_record: RunRecord | None, current: RunRecord) -> list[str] | None:
+    """Which of *current*'s six inputs differ from *run_record*'s own
+    recorded ones (:func:`_describe_differences`) — the one comparison
+    shared by the complete-resume notice (:func:`_report_run_record`), the
+    ``--resume``/``--accept`` refusal (:func:`_refuse_on_input_mismatch`)
+    and, via :func:`_inputs_match`, the scorecard-overwrite gate
+    (:func:`_score_and_report`), so a run directory's own recorded
+    provenance is read and compared the same way everywhere it matters.
 
-    The prompt-file comparison is by content: ``prompt_sha256`` is the
-    sha256 hex digest of the prompt override text (or ``None`` when no
-    ``--prompt-file`` was given), so it names a difference whenever the
-    override's actual content changed — including one side carrying no
-    override at all — never merely whether a ``--prompt-file`` was given.
+    Args:
+        run_record: The run directory's own recorded provenance
+            (:func:`_read_run_record`), or ``None`` when it carries no
+            ``run.json``.
+        current: This invocation's own freshly built :class:`RunRecord`.
+
+    Returns:
+        ``None`` when *run_record* is ``None`` — nothing recorded to
+        compare; callers needing the plainer "no record at all" phrasing
+        branch on this directly rather than reading an empty list.
+        Otherwise the phrases :func:`_describe_differences` returns,
+        empty exactly when every input matches.
     """
-    record = _read_run_record(run_dir)
+    if run_record is None:
+        return None
+    return _describe_differences(
+        _recorded_inputs(run_record),
+        _recorded_inputs(current),
+        reference_name="the run",
+        compared_name="this invocation",
+    )
+
+
+def _inputs_match(run_record: RunRecord | None, current: RunRecord) -> bool:
+    """Whether *run_record*'s recorded inputs match *current*'s own —
+    built on :func:`_input_mismatch_phrases`, the one comparison this tool
+    makes, so the ``--resume``/``--accept`` refusal
+    (:func:`_refuse_on_input_mismatch`) and the scorecard-overwrite gate
+    (:func:`_score_and_report`) test the identical condition rather than
+    two hand-written versions of it.
+
+    A run directory with no ``run.json`` at all (*run_record* is ``None``)
+    and one that does not record a given input both fail to match — there
+    is no permissive case for either.
+
+    Args:
+        run_record: The run directory's own recorded provenance
+            (:func:`_read_run_record`), or ``None`` when it carries no
+            ``run.json``.
+        current: This invocation's own freshly built :class:`RunRecord`.
+
+    Returns:
+        ``True`` only when *run_record* is not ``None`` and every one of
+        the six inputs equals *current*'s own; ``False`` otherwise.
+    """
+    phrases = _input_mismatch_phrases(run_record, current)
+    return phrases is not None and not phrases
+
+
+def _describe_prompt_file(prompt_file: str | None) -> str:
+    """*prompt_file* in a printed notice, or ``"the shipped prompt home"``
+    when *prompt_file* is ``None`` — the one place a recorded
+    ``prompt_file`` becomes human-readable text, so a notice never prints
+    the bare word ``None`` for the common case of no ``--prompt-file``.
+    """
+    return prompt_file if prompt_file is not None else "the shipped prompt home"
+
+
+def _no_run_record_line(run_dir_name: str) -> str:
+    """The one line for a run directory carrying no ``run.json`` at all —
+    printed bare by the notice (:func:`_report_run_record`) and, prefixed
+    with the refused action, by :func:`_refuse_on_input_mismatch`.
+    """
+    return f"run {run_dir_name} has no run.json; none of {_ALL_INPUT_LABELS} are recorded"
+
+
+def _report_run_record(run_dir: Path, record: RunRecord | None, current: RunRecord) -> None:
+    """Print *run_dir*'s recorded provenance beside *current*'s own values
+    as a notice, naming any input that differs — never a refusal.
+
+    Reserved for a COMPLETE run directory (the score-from-disk path):
+    scoring from disk runs no model call, so a differing prompt, keyword
+    table, model, scrubbed-kinds set, test set or token budget cannot blend
+    into the entries already on disk — the operator reads the mismatch to
+    decide whether the re-score is meaningful, and the run is scored either
+    way. An
+    INCOMPLETE run directory takes the refusal path instead
+    (:func:`_refuse_on_input_mismatch`), since resuming it would run the
+    model on further entries under inputs the earlier entries did not
+    share.
+
+    Args:
+        run_dir: The complete run directory being reported on — named in
+            the printed notice only; not re-read (the caller already read
+            it into *record*, ``main``'s one ``run.json`` read for this
+            invocation).
+        record: *run_dir*'s own recorded provenance (:func:`_read_run_record`,
+            read once by the caller), or ``None`` when it carries no
+            ``run.json``.
+        current: This invocation's own freshly built :class:`RunRecord`.
+    """
     if record is None:
-        print(f"run {run_dir.name} carries no run.json record")
+        print(_no_run_record_line(run_dir.name))
         return
 
+    phrases = _input_mismatch_phrases(record, current)
+    scrubbed = ", ".join(record.configured_prefixes) if record.configured_prefixes else "none"
     print(
-        f"run {run_dir.name} recorded: prefixes={record.configured_prefixes} "
-        f"model_id={record.model_id!r} prompt_file={record.prompt_file!r}"
+        f"run {run_dir.name} recorded: scrubbed kinds {scrubbed}, "
+        f"model {record.model_id}, prompt file {_describe_prompt_file(record.prompt_file)}"
     )
+    if phrases:
+        print(f"differs from this invocation: {', '.join(phrases)}")
 
-    differing = []
-    if current.configured_prefixes != record.configured_prefixes:
-        differing.append("configured prefixes")
-    if current.model_id != record.model_id:
-        differing.append("model id")
-    if current.prompt_sha256 != record.prompt_sha256:
-        differing.append("prompt sha256")
-    if differing:
-        print(f"differs from this invocation: {', '.join(differing)}")
+
+def _refuse_on_input_mismatch(
+    run_dir: Path,
+    run_record: RunRecord | None,
+    current: RunRecord,
+    *,
+    action: str,
+    advice: str | None = None,
+) -> bool:
+    """Refuse *action* when *run_record* differs from *current*'s own
+    inputs, or was never recorded at all — the one refusal shared by an
+    incomplete ``--resume`` continuing the model run and ``--accept``
+    recording a new baseline. Both test the same match condition
+    (:func:`_inputs_match`, over :func:`_input_mismatch_phrases`),
+    differing only in the word for what is refused and, for ``--resume``,
+    one extra line of advice.
+
+    An incomplete ``--resume`` run directory still has entries left to run
+    through the model; continuing it under a different prompt, keyword
+    table, model, scrubbed-kinds set, test set or token budget — or one the
+    recorded run never named at all — would blend two distinct detector
+    configurations into one run directory's entries. Accepting a scorecard
+    as the new baseline copies the run's own recorded model, prompt and
+    keyword-table digests, and its token budget, onto ``baseline.json``
+    (:func:`write_baseline`); a run this invocation cannot vouch for must
+    not become the accepted baseline. A
+    COMPLETE run directory (score-from-disk) never reaches the ``--resume``
+    case — it issues no model call, so no blending is possible, and prints
+    the same differences as a notice instead (:func:`_report_run_record`);
+    a re-score without ``--accept`` prints the baseline difference instead
+    (:func:`_identity_verdict_line`) and still scores.
+
+    Args:
+        run_dir: The run directory *action* would continue or accept —
+            named in the printed refusal only, never re-read (the caller
+            already read it into *run_record*).
+        run_record: *run_dir*'s own recorded provenance
+            (:func:`_read_run_record`), read once by the caller and passed
+            in here rather than re-read.
+        current: This invocation's own freshly built :class:`RunRecord`.
+        action: The word printed for what is refused (``"--resume"`` or
+            ``"--accept"``).
+        advice: An optional second line printed after the refusal (the
+            fresh-run suggestion ``--resume`` prints; ``--accept`` prints
+            none).
+
+    Returns:
+        ``True`` when *action* must be refused; ``False`` when
+        *run_record* is not ``None`` and every input matches *current*'s
+        own.
+    """
+    if _inputs_match(run_record, current):
+        return False
+    phrases = _input_mismatch_phrases(run_record, current)
+    if phrases is None:
+        print(f"{action} refused: {_no_run_record_line(run_dir.name)}")
+        if advice:
+            print(advice)
+        return True
+    print(f"{action} refused: differs from the run: {', '.join(phrases)}")
+    if advice:
+        print(advice)
+    return True
 
 
 def _score_from_disk(
@@ -1170,10 +1743,11 @@ def _score_from_disk(
     run_dir: Path,
     prompt_override_text: str | None,
     baseline_path: Path,
-    prompt_file: Path | None,
     *,
     accept: bool,
     write_scorecard: bool,
+    current: RunRecord,
+    run_record: RunRecord | None,
 ) -> int:
     """Score a complete run directory from its entry artifacts alone.
 
@@ -1183,8 +1757,14 @@ def _score_from_disk(
     :func:`_load_entry_artifact`, over the same artifact reader
     ``--resume`` already uses — this is not a second reader. Delegates the
     scoring, detail print, scorecard, baseline comparison and ``--accept``
-    handling to :func:`_score_and_report`, the one sequence the guarded
-    (model-bearing) run also uses.
+    handling (including the ``--accept`` refusal,
+    :func:`_refuse_on_input_mismatch`) to :func:`_score_and_report`, the
+    one sequence the guarded (model-bearing) run also uses.
+
+    ``main`` reports this run directory's recorded provenance against the
+    current invocation's own (:func:`_report_run_record`) before reaching
+    this function — a complete run directory is scored either way, so this
+    function takes no part in that comparison.
 
     Args:
         entries: The (possibly ``--limit``-sliced) corpus entries; every
@@ -1198,15 +1778,19 @@ def _score_from_disk(
             skeletons under, or ``None`` for the shipped prompt home.
         baseline_path: The accepted-baseline file path, resolved once by
             ``main`` and threaded through explicitly.
-        prompt_file: This invocation's own ``--prompt-file`` path, or
-            ``None`` — compared against the run directory's recorded
-            provenance (see :func:`_report_run_record`).
         accept: Whether to record this run's scorecard as the new baseline.
         write_scorecard: Whether to write ``run_dir/scorecard.json``
             (``False`` under ``--limit``; see :func:`_score_and_report`).
+        current: This invocation's own freshly built :class:`RunRecord`,
+            forwarded to :func:`_score_and_report` for the ``--accept``
+            refusal check.
+        run_record: *run_dir*'s own recorded provenance, read once by
+            ``main`` and forwarded unchanged to :func:`_score_and_report`
+            — this function never reads ``run_dir/run.json`` itself.
 
     Returns:
-        ``0`` always.
+        ``0``, or ``1`` when *accept* is set and refused (see
+        :func:`_score_and_report`).
 
     Raises:
         AssertionError: Via :func:`_score_and_report`'s own scoring call —
@@ -1217,16 +1801,6 @@ def _score_from_disk(
 
     tokenizer = load_tokenizer(model_cfg)
     _print_skeleton_measurements(tokenizer, prompt_override_text=prompt_override_text)
-
-    _report_run_record(
-        run_dir,
-        _current_run_record(
-            configured=configured,
-            model_id=model_cfg.model_id,
-            prompt_file=prompt_file,
-            prompt_override_text=prompt_override_text,
-        ),
-    )
 
     entries_dir = run_dir / "entries"
     contracts = {entry["id"]: _load_entry_artifact(entries_dir, entry["id"]) for entry in entries}
@@ -1242,6 +1816,8 @@ def _score_from_disk(
         baseline_path,
         accept=accept,
         write_scorecard=write_scorecard,
+        current=current,
+        run_record=run_record,
     )
 
 
@@ -1454,7 +2030,9 @@ def _prompt_override_context(prompt_override_text: str | None):
     """A ``prompt_overrides({"anonymization.txt": ...})`` context when
     *prompt_override_text* is given, else a no-op context — the one place
     a ``--prompt-file`` value becomes a prompt-home substitution, used by
-    both :func:`_print_skeleton_measurements` and ``main``'s guarded
+    ``main``'s own ``--prompt-file`` validation (via
+    :func:`~paramem.graph.prompts.check_anonymization_prompt_sections`),
+    :func:`_print_skeleton_measurements` and ``main``'s guarded
     (model-bearing) run.
 
     Args:
@@ -1462,11 +2040,11 @@ def _prompt_override_context(prompt_override_text: str | None):
             for ``anonymization.txt``, or ``None`` for the shipped prompt
             home.
     """
-    from paramem.graph.prompts import prompt_overrides
+    from paramem.graph.prompts import ANONYMIZATION_PROMPT_FILE, prompt_overrides
 
     if prompt_override_text is None:
         return contextlib.nullcontext()
-    return prompt_overrides({"anonymization.txt": prompt_override_text})
+    return prompt_overrides({ANONYMIZATION_PROMPT_FILE: prompt_override_text})
 
 
 def _print_skeleton_measurements(tokenizer, *, prompt_override_text: str | None) -> None:
@@ -1639,7 +2217,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--resume",
         action="store_true",
-        help="Continue the most recent run directory, skipping entries already on disk.",
+        help=(
+            "Continue the most recent run directory, skipping entries already on "
+            "disk. Refused before any load when the directory is incomplete and its "
+            "recorded scrubbed kinds, model, prompt, keyword table, test set or "
+            "token budget differ from this invocation's, or were never recorded."
+        ),
     )
     parser.add_argument(
         "--limit",
@@ -1671,7 +2254,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=(
             "Record this run's scorecard as the new accepted baseline. Refused "
             "when --limit is set (a pilot's scorecard is not a corpus-wide "
-            "baseline)."
+            "baseline), and refused when the run's recorded scrubbed kinds, "
+            "model, prompt, keyword table, test set or token budget differ from "
+            "this invocation's, or were never recorded -- no baseline is written "
+            "either way."
         ),
     )
     parser.add_argument(
@@ -1705,20 +2291,88 @@ def main(argv: list[str] | None = None) -> int:
     there (:func:`_run_dir_complete`), the run is scored straight from
     those artifacts (:func:`_score_from_disk`): no GPU is acquired and no
     model is loaded, only the bare tokenizer for the skeleton
-    re-measurement print. Otherwise — a fresh run directory, or a
-    ``--resume`` directory with entries still missing — the run proceeds
-    under the GPU guard as normal, resuming only the entries not yet on
-    disk. ``--accept`` records the resulting scorecard as the new baseline
-    either way, and is refused together with ``--limit`` before either path
-    is chosen.
+    re-measurement print, and any input difference from the run's own
+    recorded provenance prints as a notice (:func:`_report_run_record`) —
+    scoring from disk issues no model call, so a differing prompt, table,
+    model, scrubbed-kinds set, test set or token budget cannot blend into
+    the entries already on disk. A ``--resume`` directory with entries still missing would run
+    the model on those entries next; when its recorded inputs differ from
+    this invocation's own, the run is refused before the GPU guard is
+    acquired, before any model or tokenizer is loaded, and before any
+    entry runs (:func:`_refuse_on_input_mismatch`) — continuing it would
+    blend two distinct detector configurations into one run directory. A
+    fresh run directory (no ``--resume``) always proceeds under the GPU
+    guard, and every input comparison above is model-independent, so it is
+    resolved before either directory branch (see below). ``--accept``
+    records the resulting scorecard as the new baseline when this
+    invocation's own inputs match what the scored run itself recorded, and
+    is refused otherwise (:func:`_refuse_on_input_mismatch`) — no baseline
+    written; that comparison, and the write it may follow, run only inside
+    :func:`_score_and_report`, AFTER the scorecard has already been
+    computed and printed (on both the freshly-run and the score-from-disk
+    paths), so an operator always sees the scorecard even when acceptance
+    is about to be refused. ``--accept`` is also refused together with
+    ``--limit``, before either path is chosen.
 
-    A freshly created run directory writes its own provenance
-    (:class:`RunRecord` — configured prefixes, model id, prompt sha256) to
-    ``run.json``; ``--resume`` onto an existing directory
-    never rewrites it, and the score-from-disk path reports it beside this
-    invocation's own values (see :func:`_report_run_record`). ``--limit``
-    slices the entries scored but never writes ``run_dir/scorecard.json``
-    — that file always reflects a full-corpus run.
+    An unusable ``--prompt-file`` is reported here and returns 1, the same
+    way an invalid ``--scrub`` is reported above, for six cases: the file
+    is missing; it exists but cannot otherwise be read; its bytes are not
+    UTF-8; it is missing a required section (``SCAN-SYSTEM``/``SCAN``/
+    ``ANCHOR-SYSTEM``/``ANCHOR``); a present section is missing one of its
+    own required slots, or carries a ``{slot}``-shaped placeholder the
+    table does not list for it; or a present section carries a malformed
+    placeholder (a lone ``{`` or ``}``)
+    (:func:`~paramem.graph.prompts.check_anonymization_prompt_sections`, the
+    same check :func:`~paramem.graph.prompts.ensure_prompt_assets` runs
+    against whichever copy is actually loaded — an operator override or
+    the shipped tree — at boot).
+
+    Before ``--dry-run``'s own early return, ``main`` has already: parsed
+    args and refused ``--accept`` together with ``--limit``; loaded and
+    validated the corpus (sliced under ``--limit``); resolved ``--scrub``
+    into the active categories; resolved the model config (``--model`` or
+    the fixture's own) and read the per-call token budget
+    (``server_cfg.consolidation.extraction_anonymize_token_envelope``); and,
+    when ``--prompt-file`` is given, run the six-case check above. The dry
+    run itself then touches every entry's
+    payload shape (:func:`entry_surfaces`), prints the corpus count and
+    configured categories, loads the bare tokenizer
+    (:func:`~paramem.models.loader.load_tokenizer`) and prints both
+    prompt-skeleton measurements, and returns 0 — no run directory is
+    created and no :class:`RunRecord` is built, since a dry run neither
+    writes nor compares against one.
+
+    Past that return, this invocation's own provenance (:class:`RunRecord`
+    — the scrubbed kinds configured, the model id, the prompt,
+    keyword-table and (always whole-corpus) test-set digests, and the
+    per-call token budget) is built once (:func:`_current_run_record`) —
+    never over a ``--limit`` slice,
+    so a pilot and its later full-corpus ``--resume`` continuation carry
+    the identical run identity and are recognized as the same run. A
+    freshly created run directory writes that record to ``run.json``
+    (:func:`_write_run_record`) and takes it as its own recorded
+    provenance directly, with no read-back; ``--resume`` onto an existing
+    directory never rewrites it, and reads it back exactly once
+    (:func:`_read_run_record`) — this is the one ``run.json`` read the
+    whole invocation makes, threaded from here into
+    :func:`_report_run_record`, :func:`_refuse_on_input_mismatch`,
+    :func:`_score_from_disk` and :func:`_score_and_report`, none of which
+    reads the file itself. Separately, the entries actually handed to
+    scoring (``--limit``-sliced when a pilot is running) are hashed fresh
+    by :func:`_scored_inputs` — the OTHER "test set" role, what a
+    scorecard was actually computed over, so a pilot's own verdict
+    correctly reports its test set as differing from a full-corpus
+    baseline even though its run identity matches. Accepting a baseline
+    (``--accept``) copies the accepted run's own recorded model, prompt,
+    keyword-table and token-budget values, beside this invocation's own
+    scrubbed kinds and the (always full, since ``--accept`` is refused
+    together with ``--limit``) scored entries' digest, onto ``baseline.json``
+    (:func:`write_baseline`), and every later verdict against that
+    baseline names any of them that differ (:func:`_identity_verdict_line`).
+    ``--limit`` slices the entries scored but never writes
+    ``run_dir/scorecard.json`` — that file always reflects a full-corpus
+    run whose inputs matched the run directory's own recorded ones
+    (:func:`_score_and_report`).
     """
     args = build_arg_parser().parse_args(argv)
 
@@ -1759,16 +2413,42 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         server_cfg.model_name = args.model
     model_cfg = server_cfg.model_config
+    token_envelope = server_cfg.consolidation.extraction_anonymize_token_envelope
 
-    prompt_override_text = (
-        args.prompt_file.read_text(encoding="utf-8") if args.prompt_file is not None else None
-    )
+    if args.prompt_file is not None:
+        from paramem.graph.prompts import (
+            AnonymizationPromptInvalid,
+            check_anonymization_prompt_sections,
+        )
+
+        if not args.prompt_file.exists():
+            print(f"--prompt-file unusable: {args.prompt_file} does not exist", file=sys.stderr)
+            return 1
+        try:
+            prompt_override_text = args.prompt_file.read_text(encoding="utf-8")
+        except OSError as exc:
+            print(
+                f"--prompt-file unusable: {args.prompt_file} could not be read ({exc})",
+                file=sys.stderr,
+            )
+            return 1
+        except UnicodeDecodeError:
+            print(f"--prompt-file unusable: {args.prompt_file} is not valid UTF-8", file=sys.stderr)
+            return 1
+        try:
+            with _prompt_override_context(prompt_override_text):
+                check_anonymization_prompt_sections()
+        except AnonymizationPromptInvalid as exc:
+            print(f"--prompt-file unusable: {'; '.join(exc.problems)}", file=sys.stderr)
+            return 1
+    else:
+        prompt_override_text = None
 
     if args.dry_run:
         for entry in entries:
             entry_surfaces(entry)  # touches every entry's payload shape
         print(f"corpus valid: {len(entries)} entries assembled")
-        print(f"configured categories ({category_source}): {sorted(configured) or '[]'}")
+        print(f"configured categories ({category_source}): {_format_prefixes(configured)}")
 
         from paramem.models.loader import load_tokenizer
 
@@ -1778,7 +2458,15 @@ def main(argv: list[str] | None = None) -> int:
         print("dry run complete; tokenizer loaded, no model, no GPU touched")
         return 0
 
-    print(f"configured categories ({category_source}): {sorted(configured) or '[]'}")
+    print(f"configured categories ({category_source}): {_format_prefixes(configured)}")
+
+    current_record = _current_run_record(
+        configured=configured,
+        model_id=model_cfg.model_id,
+        prompt_file=args.prompt_file,
+        token_envelope=token_envelope,
+        prompt_override_text=prompt_override_text,
+    )
 
     run_root = _RUN_ROOT
     baseline_path = _BASELINE_PATH
@@ -1789,18 +2477,34 @@ def main(argv: list[str] | None = None) -> int:
     run_dir.mkdir(parents=True, exist_ok=True)
     print(f"run directory: {run_dir}")
 
+    # This run directory's own recorded provenance, read exactly once for
+    # the whole invocation: a freshly created directory's record is
+    # `current_record` itself (the record just written to its `run.json`,
+    # below), so reading it back from disk would only reproduce the same
+    # values; an existing directory's record is read here, the one
+    # `_read_run_record` call `main` makes, and threaded to every
+    # downstream comparison and scoring call rather than re-read there.
     if existing_run_dir is None:
-        _write_run_record(
-            run_dir,
-            _current_run_record(
-                configured=configured,
-                model_id=model_cfg.model_id,
-                prompt_file=args.prompt_file,
-                prompt_override_text=prompt_override_text,
-            ),
-        )
+        _write_run_record(run_dir, current_record)
+        run_record = current_record
+    else:
+        run_record = _read_run_record(run_dir)
 
-    if args.payloads is None and _run_dir_complete(entries, run_dir):
+    run_dir_complete = args.payloads is None and _run_dir_complete(entries, run_dir)
+
+    if existing_run_dir is not None:
+        if run_dir_complete:
+            _report_run_record(run_dir, run_record, current_record)
+        elif _refuse_on_input_mismatch(
+            run_dir,
+            run_record,
+            current_record,
+            action="--resume",
+            advice="start a fresh run (without --resume) instead",
+        ):
+            return 1
+
+    if run_dir_complete:
         return _score_from_disk(
             entries,
             model_cfg,
@@ -1808,16 +2512,16 @@ def main(argv: list[str] | None = None) -> int:
             run_dir,
             prompt_override_text,
             baseline_path,
-            args.prompt_file,
             accept=args.accept,
             write_scorecard=write_scorecard,
+            current=current_record,
+            run_record=run_record,
         )
 
     import os
 
     os.environ.setdefault("HF_DEACTIVATE_ASYNC_LOAD", "1")
 
-    token_envelope = server_cfg.consolidation.extraction_anonymize_token_envelope
     print(f"model: {model_cfg.model_id}")
 
     from gpu_guard import GPUConfigMissing
@@ -1881,6 +2585,8 @@ def main(argv: list[str] | None = None) -> int:
         baseline_path,
         accept=args.accept,
         write_scorecard=write_scorecard,
+        current=current_record,
+        run_record=run_record,
     )
 
 

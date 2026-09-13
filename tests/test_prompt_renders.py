@@ -9,7 +9,6 @@ leftover-placeholder check.
 
 from __future__ import annotations
 
-import re
 from pathlib import Path
 
 import pytest
@@ -24,11 +23,7 @@ from paramem.graph.extractor import (
     load_extraction_prompts,
 )
 from paramem.graph.prompts import _DEFAULT_PROMPT_DIR, _load_prompt
-
-# Matches single-brace placeholders like {transcript} that are NOT part of
-# a double-brace escape ({{ or }}).  After a successful .format() call all
-# such tokens must be gone.
-_LEFTOVER_PLACEHOLDER = re.compile(r"(?<!\{)\{[A-Za-z_]+\}(?!\})")
+from tests._prompt_text_parsing import json_objects, stray_placeholders
 
 # `{SPEAKER_NAME}` appears literally in the rendered prompt: the few-shot
 # examples show the subject slot wrapped in template-variable syntax so the
@@ -39,7 +34,13 @@ _LEFTOVER_PLACEHOLDER = re.compile(r"(?<!\{)\{[A-Za-z_]+\}(?!\})")
 # cloud_graph_enrichment.txt): it documents an indexed placeholder pattern —
 # produced by writing ``{{N}}`` in the prompt source, same mechanism as
 # `{SPEAKER_NAME}` above.
-_INTENTIONAL_LITERALS = {"{SPEAKER_NAME}", "{N}"}
+_INTENTIONAL_LITERALS = frozenset({"{SPEAKER_NAME}", "{N}"})
+
+
+def _leftover_placeholders(rendered: str) -> list[str]:
+    """Word-shaped placeholders left in *rendered* after a successful
+    render, excluding the documented intentional literals."""
+    return stray_placeholders(rendered, intentional_literals=_INTENTIONAL_LITERALS)
 
 
 def _variant_paths_for(filename: str) -> list[Path]:
@@ -71,16 +72,14 @@ class TestExtractionPromptRender:
         )
         assert isinstance(rendered, str)
 
-    def test_no_leftover_placeholders(self):
+    def test_render_leaves_no_placeholders(self):
         _, prompt = load_extraction_prompts()
         rendered = prompt.format(
             transcript="sample",
             speaker_context="",
             document_context="",
         )
-        leftover = [
-            m for m in _LEFTOVER_PLACEHOLDER.findall(rendered) if m not in _INTENTIONAL_LITERALS
-        ]
+        leftover = _leftover_placeholders(rendered)
         assert leftover == [], f"Leftover placeholders after render: {leftover}"
 
     def test_example_entity_types_are_within_schema(self):
@@ -102,7 +101,7 @@ class TestExtractionPromptRender:
             document_context="",
         )
         allowed = set(entity_types())
-        used = set(re.findall(r'"entity_type":\s*"([^"]+)"', rendered))
+        used = {obj["entity_type"] for obj in json_objects(rendered) if "entity_type" in obj}
         # The {SPEAKER_NAME} placeholder substitution leaves no entity_type
         # tokens — every match in the rendered output is an example literal.
         offenders = used - allowed
@@ -123,7 +122,7 @@ class TestExtractionPromptRender:
             document_context="",
         )
         allowed = set(relation_types())
-        used = set(re.findall(r'"relation_type":\s*"([^"]+)"', rendered))
+        used = {obj["relation_type"] for obj in json_objects(rendered) if "relation_type" in obj}
         offenders = used - allowed
         assert not offenders, (
             f"Off-schema relation_types in prompt examples: {sorted(offenders)}. "
@@ -145,16 +144,14 @@ class TestProceduralPromptRender:
         )
         assert isinstance(rendered, str)
 
-    def test_no_leftover_placeholders(self):
+    def test_render_leaves_no_placeholders(self):
         _, prompt = load_extraction_prompts(user_filename=DEFAULT_PROCEDURAL_USER_PROMPT_FILENAME)
         rendered = prompt.format(
             transcript="sample",
             speaker_context="",
             document_context="",
         )
-        leftover = [
-            m for m in _LEFTOVER_PLACEHOLDER.findall(rendered) if m not in _INTENTIONAL_LITERALS
-        ]
+        leftover = _leftover_placeholders(rendered)
         assert leftover == [], f"Leftover placeholders after render: {leftover}"
 
     def test_procedural_entity_types_in_rendered_output(self):
@@ -203,11 +200,9 @@ class TestSecondOrderExtractionPromptRender:
         assert isinstance(rendered, str)
         assert "Dana, Riley" in rendered
 
-    def test_no_leftover_placeholders(self):
+    def test_render_leaves_no_placeholders(self):
         rendered = self._render()
-        leftover = [
-            m for m in _LEFTOVER_PLACEHOLDER.findall(rendered) if m not in _INTENTIONAL_LITERALS
-        ]
+        leftover = _leftover_placeholders(rendered)
         assert leftover == [], f"Leftover placeholders after render: {leftover}"
 
     def test_omitted_named_people_slot_raises_key_error(self):
@@ -261,7 +256,7 @@ class TestSecondOrderExtractionPromptRenderAllVariants:
                 "— override dropped the slot, reverting to prose re-derivation."
             )
 
-    def test_every_variant_has_no_leftover_placeholders(self):
+    def test_every_variant_render_leaves_no_placeholders(self):
         for path in self._variant_paths():
             tmpl = path.read_text(encoding="utf-8")
             rendered = tmpl.format(
@@ -270,9 +265,7 @@ class TestSecondOrderExtractionPromptRenderAllVariants:
                 document_context="",
                 named_people="Dana, Riley",
             )
-            leftover = [
-                m for m in _LEFTOVER_PLACEHOLDER.findall(rendered) if m not in _INTENTIONAL_LITERALS
-            ]
+            leftover = _leftover_placeholders(rendered)
             assert leftover == [], f"{path}: leftover placeholders after render: {leftover}"
 
     def test_every_variant_omitted_named_people_slot_raises_key_error(self):
@@ -367,12 +360,12 @@ class TestPredicateNormalizationPromptRender:
         assert isinstance(rendered, str)
 
     def test_only_expected_format_fields(self):
-        import string
+        from paramem.graph.prompts import _template_slots
 
         prompt = self._load()
-        fields = {f for _, f, _, _ in string.Formatter().parse(prompt) if f}
-        assert fields == {"predicates_json"}, (
-            f"Unexpected format fields (JSON braces likely unescaped): {sorted(fields)}"
+        slots = _template_slots(prompt)
+        assert slots == {"{predicates_json}"}, (
+            f"Unexpected format fields (JSON braces likely unescaped): {sorted(slots)}"
         )
 
     def test_json_examples_render_to_valid_single_brace(self):
@@ -383,10 +376,10 @@ class TestPredicateNormalizationPromptRender:
         # Double-brace escape collapses to real single-brace JSON in examples.
         assert '{"clusters":' in rendered
 
-    def test_no_leftover_placeholders(self):
+    def test_render_leaves_no_placeholders(self):
         import json
 
         prompt = self._load()
         rendered = prompt.format(predicates_json=json.dumps(["works_for"]))
-        leftover = _LEFTOVER_PLACEHOLDER.findall(rendered)
+        leftover = _leftover_placeholders(rendered)
         assert leftover == [], f"Leftover placeholders after render: {leftover}"

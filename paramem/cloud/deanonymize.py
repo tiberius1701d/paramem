@@ -10,11 +10,14 @@ legality/resolution scope for a response), :func:`deanonymize_facts` (the
 fact-list exit), :func:`deanonymize_text` (the prose exit).
 
 ``_extract_json_block`` lives here (the generic model-output JSON-envelope
-parser every cloud-response parser in :mod:`paramem.graph.extractor` and
-:func:`~paramem.cloud.anonymize.anonymize_transcript` uses) rather than in
-``paramem.graph.extractor`` because that module imports FROM this one — a
-function-local import to dodge the reverse direction would split one
-contract across two files for no reason other than import ordering.
+parser every structured-output parser in :mod:`paramem.graph.extractor`
+uses) rather than in ``paramem.graph.extractor`` because that module
+imports FROM this one — a function-local import to dodge the reverse
+direction would split one contract across two files for no reason other
+than import ordering. The anonymizer's own SCAN/ANCHOR replies are a
+narrower shape — a single object; a list-wrapped reply is rejected, never
+unwrapped — and parse through their own
+:func:`~paramem.cloud.anonymize_steps._extract_json_envelope` instead.
 """
 
 from __future__ import annotations
@@ -162,12 +165,10 @@ def _extract_json_block(text: str) -> str:
        one mode UNWRAPS: the returned text is the INNER envelope dict's
        JSON (``json.dumps`` of the single element), not the outer list —
        every caller (every structured-output parser in
-       ``paramem.graph.extractor`` plus
-       :func:`~paramem.cloud.anonymize.anonymize_transcript`) recovers a
-       plain envelope dict from ``json.loads`` on this function's return
-       value regardless of whether the model wrapped it in a list, rather
-       than each caller re-detecting and unwrapping this exact shape for
-       itself.
+       ``paramem.graph.extractor``) recovers a plain envelope dict from
+       ``json.loads`` on this function's return value regardless of
+       whether the model wrapped it in a list, rather than each caller
+       re-detecting and unwrapping this exact shape for itself.
     5. **Reasoning prose that indexes facts in brackets**: the cloud
        enrichment model narrates its plan before emitting the delta —
        "Fact ``[9]`` is a compound", "Facts ``[0]`` and ``[5]`` are
@@ -418,10 +419,11 @@ class CloudScope:
                 result this response's round trip is scoped against —
                 ``.declared`` and ``.reverse`` are read.  The type import
                 is ``TYPE_CHECKING``-only (never at runtime): this
-                function reads structurally, so nothing here creates a
-                runtime import cycle with ``anonymize.py`` (which DOES
-                import this module at runtime, for
-                :data:`_extract_json_block`).
+                function reads structurally, and ``anonymize.py`` never
+                imports this module at runtime — its own SCAN/ANCHOR
+                replies parse through their own
+                :func:`~paramem.cloud.anonymize_steps._extract_json_envelope`,
+                never this module's :data:`_extract_json_block`.
         """
         raw_bindings = cloud_bindings or {}
         normalized_bindings, _stats = _normalize_anonymization_mapping(

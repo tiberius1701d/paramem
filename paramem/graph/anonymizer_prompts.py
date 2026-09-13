@@ -33,15 +33,13 @@ from __future__ import annotations
 from pathlib import Path
 
 from paramem.cloud.anonymize import AnonymizerPrompts
-from paramem.graph.prompts import _load_prompt_sections
-
-_ANONYMIZATION_PROMPT_FILE = "anonymization.txt"
+from paramem.graph.prompts import ANONYMIZATION_PROMPT_FILE, _load_prompt_sections
 
 
 def load_anonymizer_prompts(*, prompts_dir: str | Path | None = None) -> AnonymizerPrompts:
     """Compose the prompt sections one ``anonymize()`` run needs.
 
-    Loads all six sections of the sectioned ``anonymization.txt`` home
+    Loads all four sections of the sectioned ``anonymization.txt`` home
     (:func:`~paramem.graph.prompts._load_prompt_sections`) into an
     :class:`AnonymizerPrompts`. The SCAN section carries a ``{keywords}``
     render slot, filled per call by
@@ -67,7 +65,7 @@ def load_anonymizer_prompts(*, prompts_dir: str | Path | None = None) -> Anonymi
             :func:`paramem.graph.prompts.ensure_prompt_assets`.
     """
     resolved_dir = Path(prompts_dir) if prompts_dir is not None else None
-    sections = _load_prompt_sections(_ANONYMIZATION_PROMPT_FILE, prompts_dir=resolved_dir)
+    sections = _load_prompt_sections(ANONYMIZATION_PROMPT_FILE, prompts_dir=resolved_dir)
 
     return AnonymizerPrompts(
         scan_system=sections["SCAN-SYSTEM"],

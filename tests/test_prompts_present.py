@@ -16,6 +16,15 @@ from pathlib import Path
 
 import pytest
 
+from tests.anonymizer_doubles import (
+    INVALID_ANONYMIZATION_SECTIONS_DOUBLED_SLOT,
+    INVALID_ANONYMIZATION_SECTIONS_MALFORMED_PLACEHOLDER,
+    INVALID_ANONYMIZATION_SECTIONS_MISSING_SECTION,
+    INVALID_ANONYMIZATION_SECTIONS_MISSING_SLOT,
+    INVALID_ANONYMIZATION_SECTIONS_UNKNOWN_SLOT,
+    VALID_ANONYMIZATION_SECTIONS,
+)
+
 _PROMPTS_DIR = Path(__file__).resolve().parent.parent / "configs" / "prompts"
 
 
@@ -39,22 +48,6 @@ class TestPromptFilesPresent:
         content = (_PROMPTS_DIR / "document_directive.txt").read_text()
         assert "{speaker_id}" in content
         assert "{speaker_name}" in content
-
-    def test_extraction_txt_has_transcript_placeholder(self):
-        content = (_PROMPTS_DIR / "extraction.txt").read_text()
-        assert "{transcript}" in content
-
-    def test_extraction_txt_has_speaker_context_placeholder(self):
-        content = (_PROMPTS_DIR / "extraction.txt").read_text()
-        assert "{speaker_context}" in content
-
-    def test_extraction_txt_has_document_context_placeholder(self):
-        content = (_PROMPTS_DIR / "extraction.txt").read_text()
-        assert "{document_context}" in content
-
-    def test_extraction_procedural_txt_has_transcript_placeholder(self):
-        content = (_PROMPTS_DIR / "extraction_procedural.txt").read_text()
-        assert "{transcript}" in content
 
     def test_extraction_system_txt_no_braces(self):
         """Regression guard: system prompt must be plain-English directives only.
@@ -96,44 +89,6 @@ class TestPromptFilesPresent:
             "extraction.txt missing 'relations' keyword — JSON output contract may be broken."
         )
 
-    def test_extraction_procedural_txt_has_required_placeholders(self):
-        """Procedural template must carry the slot-substituted placeholders.
-
-        ``{entity_types}`` and ``{predicate_examples}`` are deliberately
-        absent — verbatim taxonomy listings empirically license the
-        model to invent off-list types (same finding that drove the
-        factual ``extraction.txt`` to drop those slots).  Schema
-        coverage is now carried by the few-shot examples.
-
-        ``{speaker_context}``, ``{document_context}``, and ``{transcript}``
-        ARE required — the call site at
-        :func:`paramem.graph.extractor.extract_procedural_graph` (via
-        ``_generate_extraction``) passes those values, and missing
-        placeholders mean the speaker directive / document cue / chunk
-        text never reach the model.
-        """
-        content = (_PROMPTS_DIR / "extraction_procedural.txt").read_text()
-        required = ("{speaker_context}", "{document_context}", "{transcript}")
-        for placeholder in required:
-            assert placeholder in content, (
-                f"extraction_procedural.txt missing placeholder {placeholder!r} — "
-                "the format-kwargs call site expects this slot."
-            )
-
-    def test_extraction_procedural_txt_no_taxonomy_slots(self):
-        """Regression guard: the procedural prompt must NOT reintroduce
-        the verbatim taxonomy slots.  See the docstring on
-        :meth:`test_extraction_procedural_txt_has_required_placeholders`
-        for the empirical reason.
-        """
-        content = (_PROMPTS_DIR / "extraction_procedural.txt").read_text()
-        for forbidden in ("{entity_types}", "{predicate_examples}"):
-            assert forbidden not in content, (
-                f"extraction_procedural.txt re-introduced {forbidden!r} — "
-                "verbatim taxonomy slots license invented types; remove and let "
-                "the few-shots carry schema coverage instead."
-            )
-
     def test_extraction_procedural_txt_has_json_output_directive(self):
         """Procedural template must carry the JSON output directive."""
         content = (_PROMPTS_DIR / "extraction_procedural.txt").read_text()
@@ -144,24 +99,6 @@ class TestPromptFilesPresent:
 
     def test_extraction_second_order_txt_exists(self):
         assert (_PROMPTS_DIR / "extraction_second_order.txt").exists()
-
-    def test_extraction_second_order_txt_has_required_placeholders(self):
-        """The second-order user template requires ``{transcript}``,
-        ``{speaker_context}``, and ``{document_context}`` (same call-site
-        contract as ``extraction.txt``/``extraction_procedural.txt``) plus
-        ``{named_people}`` — the gate-derived closed target set threaded
-        via ``extra_slots`` (:func:`paramem.graph.flows._stage_second_order_extract`).
-        A missing ``{named_people}`` slot means the phase silently reverts
-        to asking the model to re-derive the target set from raw prose —
-        the double-derivation defect this slot exists to close.
-        """
-        content = (_PROMPTS_DIR / "extraction_second_order.txt").read_text()
-        required = ("{transcript}", "{speaker_context}", "{document_context}", "{named_people}")
-        for placeholder in required:
-            assert placeholder in content, (
-                f"extraction_second_order.txt missing placeholder {placeholder!r} — "
-                "the format-kwargs call site expects this slot."
-            )
 
 
 class TestSystemPromptFilesPresent:
@@ -499,16 +436,18 @@ class TestEnsurePromptAssets:
         import paramem.graph.prompts as prompts_mod
 
         monkeypatch.setattr(prompts_mod, "_DEFAULT_PROMPT_DIR", tmp_path / "absent")
-        with pytest.raises(RuntimeError, match="Prompt asset directory not found"):
+        with pytest.raises(RuntimeError) as exc_info:
             prompts_mod.ensure_prompt_assets()
+        assert "Prompt asset directory not found" in str(exc_info.value)
 
     def test_raises_when_required_file_missing(self, monkeypatch, tmp_path):
         # Directory exists but lacks the load-bearing extraction files.
         import paramem.graph.prompts as prompts_mod
 
         monkeypatch.setattr(prompts_mod, "_DEFAULT_PROMPT_DIR", tmp_path)
-        with pytest.raises(RuntimeError, match="Required prompt file"):
+        with pytest.raises(RuntimeError) as exc_info:
             prompts_mod.ensure_prompt_assets()
+        assert "Required prompt file" in str(exc_info.value)
 
     def test_raises_when_document_directive_missing(self, monkeypatch, tmp_path):
         """``document_directive.txt`` is required with no fallback — its
@@ -520,8 +459,67 @@ class TestEnsurePromptAssets:
                 continue
             (tmp_path / filename).write_text("placeholder")
         monkeypatch.setattr(prompts_mod, "_DEFAULT_PROMPT_DIR", tmp_path)
-        with pytest.raises(RuntimeError, match="document_directive.txt"):
+        with pytest.raises(RuntimeError) as exc_info:
             prompts_mod.ensure_prompt_assets()
+        assert "document_directive.txt" in str(exc_info.value)
+
+    def test_raises_when_the_anonymization_home_is_invalid(self):
+        """A ``--prompt-file``-shaped invalid override, substituted the
+        same way :func:`~paramem.graph.prompts.prompt_overrides` does for
+        the gate tool, turns into the boot ``RuntimeError`` naming the
+        problem and the file it came from (the override label, since this
+        copy is substituted rather than resolved from disk) — every other
+        required file resolves from the real shipped tree unaffected."""
+        from paramem.graph.prompts import (
+            ANONYMIZATION_PROMPT_FILE,
+            ensure_prompt_assets,
+            prompt_overrides,
+        )
+
+        with prompt_overrides(
+            {ANONYMIZATION_PROMPT_FILE: INVALID_ANONYMIZATION_SECTIONS_MISSING_SECTION}
+        ):
+            with pytest.raises(RuntimeError) as exc_info:
+                ensure_prompt_assets()
+        message = str(exc_info.value)
+        assert f"<override:{ANONYMIZATION_PROMPT_FILE}>" in message
+        assert "missing section ANCHOR-SYSTEM" in message
+
+    def test_reports_every_problem_across_both_files_and_names_the_loaded_path(self, tmp_path):
+        """One call surfaces every problem in one report: two defects in
+        the anonymization home (SCAN missing its own ``{text}`` slot;
+        ANCHOR carrying an unlisted ``{extra}`` slot) plus one defect in an
+        extraction template (an unlisted ``{surprise}`` slot) under one
+        operator ``prompts_dir`` — each problem naming the file it belongs
+        to, and both files' problems present in the one raised message."""
+        import paramem.graph.prompts as prompts_mod
+
+        two_anonymization_defects = (
+            "=== SCAN-SYSTEM ===\nx\n\n"
+            "=== SCAN ===\n{keywords}\n\n"  # defect 1: missing {text}
+            "=== ANCHOR-SYSTEM ===\ny\n\n"
+            "=== ANCHOR ===\n{speaker_id}\n{values}\n{text}\n{extra}\n"  # defect 2: {extra}
+        )
+        (tmp_path / prompts_mod.ANONYMIZATION_PROMPT_FILE).write_text(
+            two_anonymization_defects, encoding="utf-8"
+        )
+        (tmp_path / "extraction.txt").write_text(
+            "{transcript} {speaker_context} {document_context} {surprise}", encoding="utf-8"
+        )
+
+        with pytest.raises(RuntimeError) as exc_info:
+            prompts_mod.ensure_prompt_assets(prompts_dir=tmp_path)
+        message = str(exc_info.value)
+
+        anonymization_path = str(tmp_path / prompts_mod.ANONYMIZATION_PROMPT_FILE)
+        extraction_path = str(tmp_path / "extraction.txt")
+        assert anonymization_path in message
+        assert "section SCAN is missing slot {text}" in message
+        assert "section ANCHOR carries an unknown slot {extra}" in message
+        # Tied to its own file — a generic "unknown slot" substring could
+        # otherwise be satisfied by the anonymization home's own unrelated
+        # {extra} problem above.
+        assert f"{extraction_path}: carries an unknown slot {{surprise}}" in message
 
     def test_passes_with_operator_prompts_dir_argument(self, tmp_path):
         """An operator ``prompts_dir`` with no local overrides falls
@@ -540,3 +538,278 @@ class TestEnsurePromptAssets:
         from paramem.graph.prompts import ensure_prompt_assets
 
         ensure_prompt_assets(prompts_dir=None)
+
+    def test_a_problem_under_an_operators_own_prompts_dir_reads_fix_only(self, tmp_path):
+        """A defect in a file living under an operator's own ``prompts_dir``
+        (no shipped fallback to fall back on) names one remedy — fix that
+        file directly — since there is no shipped copy to restore it from."""
+        import paramem.graph.prompts as prompts_mod
+
+        (tmp_path / "extraction.txt").write_text(
+            "{transcript} {speaker_context} {document_context} {surprise}", encoding="utf-8"
+        )
+        with pytest.raises(RuntimeError) as exc_info:
+            prompts_mod.ensure_prompt_assets(prompts_dir=tmp_path)
+        message = str(exc_info.value)
+        extraction_path = str(tmp_path / "extraction.txt")
+        assert f"{extraction_path}: carries an unknown slot {{surprise}} (fix that file)" in (
+            message
+        )
+
+    def test_a_problem_in_the_shipped_tree_names_both_remedies(self, monkeypatch, tmp_path):
+        """A defect in a file resolving inside the shipped
+        ``configs/prompts/`` tree names both remedies — fix that file in
+        place, or restore the shipped copy from the repository — because
+        an in-place edit of a shipped file is a documented operator
+        practice (``DEPLOYMENT.md``'s Prompt Engineering section) and the
+        path alone cannot tell that apart from a broken checkout."""
+        import paramem.graph.prompts as prompts_mod
+
+        (tmp_path / "extraction.txt").write_text(
+            "{transcript} {speaker_context} {document_context} {surprise}", encoding="utf-8"
+        )
+        for filename in prompts_mod._REQUIRED_PROMPT_FILES:
+            if filename != "extraction.txt" and not (tmp_path / filename).exists():
+                (tmp_path / filename).write_text("placeholder", encoding="utf-8")
+        monkeypatch.setattr(prompts_mod, "_DEFAULT_PROMPT_DIR", tmp_path)
+        with pytest.raises(RuntimeError) as exc_info:
+            prompts_mod.ensure_prompt_assets()
+        message = str(exc_info.value)
+        extraction_path = str(tmp_path / "extraction.txt")
+        assert (
+            f"{extraction_path}: carries an unknown slot {{surprise}} "
+            "(fix that file, or restore the shipped copy from the repository)" in message
+        )
+
+
+class TestCheckAnonymizationPromptSections:
+    """``check_anonymization_prompt_sections`` — the one section/slot check
+    shared by :func:`~paramem.graph.prompts.ensure_prompt_assets` (whichever
+    copy the server loads — an operator's configured prompts directory, or
+    the shipped copy when none is configured — at boot) and the anonymizer
+    gate tool's ``--prompt-file`` validation (an override, at CLI startup).
+    """
+
+    def test_passes_on_the_shipped_home(self):
+        from paramem.graph.prompts import check_anonymization_prompt_sections
+
+        check_anonymization_prompt_sections()
+
+    def test_doubled_braces_are_not_counted_as_a_slot(self):
+        """A JSON-literal ``{{...}}`` fragment, the shape every example in
+        the shipped home uses, must not be read as an unknown slot —
+        ``string.Formatter().parse`` already treats a doubled brace as
+        literal text."""
+        from paramem.graph.prompts import (
+            ANONYMIZATION_PROMPT_FILE,
+            check_anonymization_prompt_sections,
+            prompt_overrides,
+        )
+
+        with prompt_overrides({ANONYMIZATION_PROMPT_FILE: VALID_ANONYMIZATION_SECTIONS}):
+            check_anonymization_prompt_sections()
+
+    def test_raises_on_a_missing_section(self):
+        from paramem.graph.prompts import (
+            ANONYMIZATION_PROMPT_FILE,
+            AnonymizationPromptInvalid,
+            check_anonymization_prompt_sections,
+            prompt_overrides,
+        )
+
+        with prompt_overrides(
+            {ANONYMIZATION_PROMPT_FILE: INVALID_ANONYMIZATION_SECTIONS_MISSING_SECTION}
+        ):
+            with pytest.raises(AnonymizationPromptInvalid) as exc_info:
+                check_anonymization_prompt_sections()
+        # This body drops BOTH ANCHOR sections — every missing section is
+        # reported, not only the first.
+        assert exc_info.value.problems == [
+            "missing section ANCHOR-SYSTEM",
+            "missing section ANCHOR",
+        ]
+
+    def test_raises_on_a_section_missing_a_required_slot(self):
+        from paramem.graph.prompts import (
+            ANONYMIZATION_PROMPT_FILE,
+            AnonymizationPromptInvalid,
+            check_anonymization_prompt_sections,
+            prompt_overrides,
+        )
+
+        with prompt_overrides(
+            {ANONYMIZATION_PROMPT_FILE: INVALID_ANONYMIZATION_SECTIONS_MISSING_SLOT}
+        ):
+            with pytest.raises(AnonymizationPromptInvalid) as exc_info:
+                check_anonymization_prompt_sections()
+        assert str(exc_info.value) == "section SCAN is missing slot {text}"
+
+    def test_raises_on_a_section_carrying_an_unknown_slot(self):
+        from paramem.graph.prompts import (
+            ANONYMIZATION_PROMPT_FILE,
+            AnonymizationPromptInvalid,
+            check_anonymization_prompt_sections,
+            prompt_overrides,
+        )
+
+        with prompt_overrides(
+            {ANONYMIZATION_PROMPT_FILE: INVALID_ANONYMIZATION_SECTIONS_UNKNOWN_SLOT}
+        ):
+            with pytest.raises(AnonymizationPromptInvalid) as exc_info:
+                check_anonymization_prompt_sections()
+        assert str(exc_info.value) == "section ANCHOR carries an unknown slot {extra}"
+
+    def test_raises_a_plain_message_on_a_malformed_placeholder(self):
+        """A lone ``}`` is not a doubled brace and not a named slot — the
+        standard library format parser's own ``ValueError`` on it, restated
+        in plain words by :func:`~paramem.graph.prompts._template_slots`,
+        the one reader every slot check in ``prompts.py`` uses."""
+        from paramem.graph.prompts import (
+            ANONYMIZATION_PROMPT_FILE,
+            AnonymizationPromptInvalid,
+            check_anonymization_prompt_sections,
+            prompt_overrides,
+        )
+
+        with prompt_overrides(
+            {ANONYMIZATION_PROMPT_FILE: INVALID_ANONYMIZATION_SECTIONS_MALFORMED_PLACEHOLDER}
+        ):
+            with pytest.raises(AnonymizationPromptInvalid) as exc_info:
+                check_anonymization_prompt_sections()
+        message = str(exc_info.value)
+        assert message.startswith("section SCAN: malformed placeholder")
+
+    def test_a_doubled_slot_fails_the_required_slot_rule(self):
+        """``{{text}}`` renders as the literal text ``{text}``, never a
+        slot — a section carrying only the doubled form is reported as
+        missing the real ``{text}`` slot, confirming the required-slot
+        check reads through :func:`_template_slots`."""
+        from paramem.graph.prompts import (
+            ANONYMIZATION_PROMPT_FILE,
+            AnonymizationPromptInvalid,
+            check_anonymization_prompt_sections,
+            prompt_overrides,
+        )
+
+        with prompt_overrides(
+            {ANONYMIZATION_PROMPT_FILE: INVALID_ANONYMIZATION_SECTIONS_DOUBLED_SLOT}
+        ):
+            with pytest.raises(AnonymizationPromptInvalid) as exc_info:
+                check_anonymization_prompt_sections()
+        assert str(exc_info.value) == "section SCAN is missing slot {text}"
+
+    def test_raises_every_problem_in_one_exception_across_two_sections(self):
+        """A missing section plus a present section's own unknown slot are
+        both carried on the one raised exception's ``problems`` list — the
+        check never stops at the first problem it finds."""
+        from paramem.graph.prompts import (
+            ANONYMIZATION_PROMPT_FILE,
+            AnonymizationPromptInvalid,
+            check_anonymization_prompt_sections,
+            prompt_overrides,
+        )
+
+        text = (
+            "=== SCAN-SYSTEM ===\nx\n\n"
+            "=== SCAN ===\n{keywords}\n{text}\n{extra}\n"  # unknown slot
+            # ANCHOR-SYSTEM/ANCHOR both absent -> two missing-section problems
+        )
+        with prompt_overrides({ANONYMIZATION_PROMPT_FILE: text}):
+            with pytest.raises(AnonymizationPromptInvalid) as exc_info:
+                check_anonymization_prompt_sections()
+        assert exc_info.value.problems == [
+            "missing section ANCHOR-SYSTEM",
+            "missing section ANCHOR",
+            "section SCAN carries an unknown slot {extra}",
+        ]
+
+
+class TestTemplateSlots:
+    """:func:`~paramem.graph.prompts._template_slots` — the one slot reader
+    every check in ``prompts.py`` uses."""
+
+    def test_a_doubled_brace_pair_is_literal_text_not_a_slot(self):
+        from paramem.graph.prompts import _template_slots
+
+        assert _template_slots('before {{"mapping": {{}}}} after') == set()
+
+    def test_an_auto_numbered_slot_is_counted(self):
+        from paramem.graph.prompts import _template_slots
+
+        assert _template_slots("value: {}") == {"{}"}
+
+    def test_a_named_slot_is_counted(self):
+        from paramem.graph.prompts import _template_slots
+
+        assert _template_slots("{text} and {keywords}") == {"{text}", "{keywords}"}
+
+    def test_a_lone_closing_brace_raises_a_plain_value_error(self):
+        from paramem.graph.prompts import _template_slots
+
+        with pytest.raises(ValueError) as exc_info:
+            _template_slots("stray brace: }")
+        assert str(exc_info.value).startswith("malformed placeholder")
+
+
+class TestExtractionTemplateSlots:
+    """The extraction user templates' required-and-allowed slot rule
+    (:data:`~paramem.graph.prompts._EXTRACTION_TEMPLATE_SLOTS`), read
+    through the shared :func:`~paramem.graph.prompts._template_slots`
+    reader inside :func:`~paramem.graph.prompts.ensure_prompt_assets`.
+    """
+
+    def _run_with_template(self, tmp_path, filename: str, content: str) -> None:
+        """Write only *filename* under *tmp_path* and check it as an
+        operator override directory: every other required file, and every
+        other extraction template, still resolves from the real shipped
+        tree (:func:`~paramem.graph.prompts._load_prompt`'s fall-through),
+        so only *filename*'s own deliberately malformed content can fail
+        the walk.
+        """
+        import paramem.graph.prompts as prompts_mod
+
+        (tmp_path / filename).write_text(content, encoding="utf-8")
+        prompts_mod.ensure_prompt_assets(prompts_dir=tmp_path)
+
+    def test_extraction_txt_missing_a_required_slot_is_rejected(self, tmp_path):
+        extraction_path = str(tmp_path / "extraction.txt")
+        with pytest.raises(RuntimeError) as exc_info:
+            self._run_with_template(tmp_path, "extraction.txt", "{transcript} {speaker_context}")
+        message = str(exc_info.value)
+        assert f"{extraction_path}: is missing slot {{document_context}}" in message
+
+    def test_extraction_txt_carrying_an_unlisted_slot_is_rejected(self, tmp_path):
+        extraction_path = str(tmp_path / "extraction.txt")
+        with pytest.raises(RuntimeError) as exc_info:
+            self._run_with_template(
+                tmp_path,
+                "extraction.txt",
+                "{transcript} {speaker_context} {document_context} {surprise}",
+            )
+        message = str(exc_info.value)
+        assert f"{extraction_path}: carries an unknown slot {{surprise}}" in message
+
+    def test_extraction_txt_with_a_malformed_placeholder_is_reported_not_crashed(self, tmp_path):
+        """A lone ``}`` in an extraction template is reported as a problem
+        of that file — the same plain-words treatment the anonymization
+        home gets — never an uncaught parser exception."""
+        with pytest.raises(RuntimeError) as exc_info:
+            self._run_with_template(
+                tmp_path,
+                "extraction.txt",
+                "{transcript} {speaker_context} {document_context} stray brace: }",
+            )
+        message = str(exc_info.value)
+        assert "extraction.txt" in message
+        assert "malformed placeholder" in message
+
+    def test_extraction_second_order_txt_requires_named_people_too(self, tmp_path):
+        with pytest.raises(RuntimeError) as exc_info:
+            self._run_with_template(
+                tmp_path,
+                "extraction_second_order.txt",
+                "{transcript} {speaker_context} {document_context}",
+            )
+        message = str(exc_info.value)
+        assert "extraction_second_order.txt" in message
+        assert "{named_people}" in message

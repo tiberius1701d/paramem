@@ -12,8 +12,6 @@ unit-test time.
 from __future__ import annotations
 
 import hashlib
-import json
-import re
 
 import pytest
 
@@ -22,6 +20,19 @@ from paramem.graph.extractor import build_speaker_context
 from paramem.graph.phase_trace import extraction_trace, phase_trace
 from paramem.graph.prompts import _DEFAULT_PROMPT_DIR, _load_prompt, prompt_overrides
 from paramem.utils.identity import is_speaker_id
+from tests._prompt_text_parsing import (
+    double_quoted_spans,
+    example_json_objects,
+    has_first_person_pronoun,
+    has_glued_possessive_object,
+    has_non_speaker_alpha_subject,
+    is_proper_name,
+    json_objects,
+    leading_rule_id,
+    split_blocks,
+    stray_placeholders,
+    subject_values,
+)
 
 
 class TestLoadPromptPerModelResolution:
@@ -298,9 +309,10 @@ class TestPromptOverrides:
         """The ``ContextVar.reset`` runs in a ``finally`` — an exception
         inside the ``with`` block must not leak the override past it."""
         (tmp_path / "extraction.txt").write_text("on-disk content")
-        with pytest.raises(RuntimeError, match="boom"):
+        with pytest.raises(RuntimeError) as exc_info:
             with prompt_overrides({"extraction.txt": "overridden content"}):
                 raise RuntimeError("boom")
+        assert str(exc_info.value) == "boom"
         result = _load_prompt("extraction.txt", prompts_dir=tmp_path)
         assert result == "on-disk content"
 
@@ -362,11 +374,11 @@ def _extraction_prompt(model: str | None) -> str:
 
 
 def _positive_blocks(tmpl: str) -> list[str]:
-    return [b for b in re.split(r"\n\s*\n", tmpl) if b.lstrip().startswith("POSITIVE example")]
+    return [b for b in split_blocks(tmpl) if b.lstrip().startswith("POSITIVE example")]
 
 
 def _negative_blocks(tmpl: str) -> list[str]:
-    return [b for b in re.split(r"\n\s*\n", tmpl) if b.lstrip().startswith("NEGATIVE example")]
+    return [b for b in split_blocks(tmpl) if b.lstrip().startswith("NEGATIVE example")]
 
 
 class TestExtractionPromptThirdPartySubjectContract:
@@ -401,8 +413,8 @@ class TestExtractionPromptThirdPartySubjectContract:
         is a constant'."""
         tmpl = _extraction_prompt(model)
         blocks = _positive_blocks(tmpl)
-        assert blocks, "No POSITIVE example blocks found — block-split regex or markers drifted."
-        subjects_per_block = [set(re.findall(r'"subject":\s*"([^"]+)"', b)) for b in blocks]
+        assert blocks, "No POSITIVE example blocks found — block split or markers drifted."
+        subjects_per_block = [subject_values(b) for b in blocks]
         # Only consider blocks that actually contain relations (subjects non-empty).
         relation_blocks = [subs for subs in subjects_per_block if subs]
         assert relation_blocks, "No POSITIVE block contains a relation subject to check."
@@ -418,7 +430,7 @@ class TestExtractionPromptThirdPartySubjectContract:
         speaker0) surviving in the subject slot of a relation."""
         tmpl = _extraction_prompt(model)
         blocks = _positive_blocks(tmpl)
-        assert any(re.search(r'"subject":\s*"(?!speaker0")[A-Za-z][^"]*"', b) for b in blocks), (
+        assert any(has_non_speaker_alpha_subject(b) for b in blocks), (
             "No POSITIVE example shows a non-speaker0 entity surviving in the subject slot."
         )
 
@@ -436,10 +448,8 @@ class TestExtractionPromptThirdPartySubjectContract:
             if "BAD output" not in block or "CORRECT output" not in block:
                 continue
             bad_part, _, correct_part = block.partition("CORRECT output")
-            bad_uses_speaker0_subject = re.search(r'"subject":\s*"speaker0"', bad_part)
-            correct_uses_third_party_subject = re.search(
-                r'"subject":\s*"(?!speaker0")[A-Za-z][^"]*"', correct_part
-            )
+            bad_uses_speaker0_subject = "speaker0" in subject_values(bad_part)
+            correct_uses_third_party_subject = has_non_speaker_alpha_subject(correct_part)
             if bad_uses_speaker0_subject and correct_uses_third_party_subject:
                 found = True
                 break
@@ -465,10 +475,9 @@ class TestExtractionPromptThirdPartySubjectContract:
                 f"Banned compound-possessive predicate {banned_predicate!r} "
                 "is emitted as a predicate value in a worked example."
             )
-        glued_object_re = re.compile(r'"object":\s*"[^"]*\'s [^"]*"')
         # POSITIVE blocks must never contain a glued-possessive object.
         for block in _positive_blocks(tmpl):
-            assert not glued_object_re.search(block), (
+            assert not has_glued_possessive_object(block), (
                 f"POSITIVE example teaches a glued-possessive object: {block!r}"
             )
         # NEGATIVE blocks: the glued form is allowed ONLY in the BAD half;
@@ -477,7 +486,7 @@ class TestExtractionPromptThirdPartySubjectContract:
             if "CORRECT output" not in block:
                 continue
             _, _, correct_part = block.partition("CORRECT output")
-            assert not glued_object_re.search(correct_part), (
+            assert not has_glued_possessive_object(correct_part), (
                 f"NEGATIVE example's CORRECT output still contains a "
                 f"glued-possessive object: {correct_part!r}"
             )
@@ -488,7 +497,7 @@ class TestExtractionPromptThirdPartySubjectContract:
         self-reference, not claim it applies to every fact."""
         tmpl = _extraction_prompt(model)
         prose = tmpl.split("POSITIVE example")[0]
-        assert re.search(r"self-reference|self-referen", prose, re.IGNORECASE), (
+        assert "self-referen" in prose.lower(), (
             "Rule prose does not condition the speaker0 binding on self-reference."
         )
         assert "for every fact about the speaker" not in prose, (
@@ -508,7 +517,7 @@ class TestExtractionPromptThirdPartySubjectContract:
         assert "[assistant]" in prose, (
             "Rule prose does not explicitly mention [assistant] turns as a fact source."
         )
-        assert re.search(r"never the speaker by default", prose, re.IGNORECASE), (
+        assert "never the speaker by default" in prose.lower(), (
             "Rule prose does not state that the subject defaults to whoever the "
             "sentence names, not the speaker."
         )
@@ -532,12 +541,11 @@ class TestExtractionPromptThirdPartySubjectContract:
         stray generic-noun subject in a future example fails immediately.
         """
         tmpl = _extraction_prompt(model)
-        subjects = re.findall(r'"subject":\s*"([^"]+)"', tmpl)
-        assert subjects, "No relation subjects found in prompt — scan regex drifted."
+        subjects = [obj["subject"] for obj in json_objects(tmpl) if "subject" in obj]
+        assert subjects, "No relation subjects found in prompt — JSON extraction drifted."
         # Speaker-id membership is asked of the owner of that format
         # (paramem/utils/identity.py), never re-spelled as a pattern here.
-        proper_name = re.compile(r"^[A-Z][A-Za-z]*(?: [A-Z][A-Za-z]*)*$")
-        offenders = [s for s in subjects if not is_speaker_id(s) and not proper_name.match(s)]
+        offenders = [s for s in subjects if not is_speaker_id(s) and not is_proper_name(s)]
         assert not offenders, (
             f"Generic/common-noun or lowercase subject(s) found in relation "
             f"subject position: {offenders!r} — only a speaker id or a "
@@ -559,16 +567,13 @@ class TestExtractionPromptThirdPartySubjectContract:
         teaches the correct split without ever pairing it against the
         wrong form."""
         tmpl = _extraction_prompt(model)
-        glued_object_re = re.compile(r'"object":\s*"[^"]*\'s [^"]*"')
         found = False
         for block in _negative_blocks(tmpl):
             if "BAD output" not in block or "CORRECT output" not in block:
                 continue
             bad_part, _, correct_part = block.partition("CORRECT output")
-            bad_has_glued_object = glued_object_re.search(bad_part)
-            correct_splits_subject = re.search(
-                r'"subject":\s*"(?!speaker0")[A-Za-z][^"]*"', correct_part
-            )
+            bad_has_glued_object = has_glued_possessive_object(bad_part)
+            correct_splits_subject = has_non_speaker_alpha_subject(correct_part)
             if bad_has_glued_object and correct_splits_subject:
                 found = True
                 break
@@ -596,7 +601,7 @@ class TestExtractionPromptThirdPartySubjectContract:
             # BAD half mangles the fact onto speaker0; CORRECT half emits
             # no relations at all (the structural signature of "an
             # unnamed third party yields no relation").
-            bad_mangles_onto_speaker = re.search(r'"subject":\s*"speaker0"', bad_part)
+            bad_mangles_onto_speaker = "speaker0" in subject_values(bad_part)
             correct_has_no_relations = '"relations": []' in correct_part
             if bad_mangles_onto_speaker and correct_has_no_relations:
                 found = True
@@ -623,14 +628,15 @@ class TestExtractionPromptThirdPartySubjectContract:
         demands.
         """
         tmpl = _extraction_prompt(model)
-        triple_re = re.compile(
-            r'"subject":\s*"([^"]+)",\s*"predicate":\s*"([^"]+)",\s*"object":\s*"([^"]+)"'
-        )
         found = False
         for block in _positive_blocks(tmpl):
-            triples = triple_re.findall(block)
-            speaker_objects = {obj for subj, _pred, obj in triples if subj == "speaker0"}
-            if any(subj in speaker_objects for subj, _pred, _obj in triples):
+            triples = [
+                (obj["subject"], obj.get("object"))
+                for obj in json_objects(block)
+                if "subject" in obj and "object" in obj
+            ]
+            speaker_objects = {obj for subj, obj in triples if subj == "speaker0"}
+            if any(subj in speaker_objects for subj, _obj in triples):
                 found = True
                 break
         assert found, (
@@ -656,20 +662,19 @@ class TestExtractionPromptThirdPartySubjectContract:
         """
         tmpl = _extraction_prompt(model)
         prose = tmpl.split("POSITIVE example")[0]
-        assert re.search(r"relationship edge", prose, re.IGNORECASE), (
+        lower_prose = prose.lower()
+        assert "relationship edge" in lower_prose, (
             "Rule prose does not state the relationship-edge half of the "
             "named-relative decomposition."
         )
-        assert re.search(r"own (fact|node)", prose, re.IGNORECASE), (
+        assert "own fact" in lower_prose or "own node" in lower_prose, (
             "Rule prose does not state the relative's-own-fact half of "
             "the named-relative decomposition."
         )
-        assert re.search(r"collapse", prose, re.IGNORECASE), (
+        assert "collapse" in lower_prose, (
             "Rule prose does not forbid collapsing the two relations into one."
         )
-        assert re.search(r"drop", prose, re.IGNORECASE), (
-            "Rule prose does not forbid dropping either relation."
-        )
+        assert "drop" in lower_prose, "Rule prose does not forbid dropping either relation."
 
 
 def _second_order_prompt(model: str | None) -> str:
@@ -708,7 +713,7 @@ class TestExtractionSecondOrderPromptContract:
         assert blocks, "No POSITIVE example blocks found in extraction_second_order.txt."
         found = False
         for block in blocks:
-            subjects = set(re.findall(r'"subject":\s*"([^"]+)"', block))
+            subjects = subject_values(block)
             if subjects and "speaker0" not in subjects:
                 found = True
                 break
@@ -726,7 +731,7 @@ class TestExtractionSecondOrderPromptContract:
         blocks = _positive_blocks(tmpl)
         assert blocks, "No POSITIVE example blocks found in extraction_second_order.txt."
         for block in blocks:
-            subjects = set(re.findall(r'"subject":\s*"([^"]+)"', block))
+            subjects = subject_values(block)
             assert "speaker0" not in subjects, (
                 "POSITIVE example re-emits a speaker0-subject relation — the "
                 f"second-order pass must not re-emit kinship edges: {block!r}"
@@ -745,11 +750,10 @@ class TestExtractionSecondOrderPromptContract:
 # rule's `("my father", "the workshop last spring")`) — that narrowing is
 # what makes "first line is the transcript excerpt" true in the first
 # place.
-_FIRST_PERSON_PRONOUN_RE = re.compile(r"\b(I|me|my|we|our)\b", re.IGNORECASE)
 
 
 def _first_person_blocks(rendered: str) -> list[str]:
-    blocks = re.split(r"\n\s*\n", rendered)
+    blocks = split_blocks(rendered)
     selected = []
     for block in blocks:
         if "WRONG" in block or block.lstrip().startswith("NEGATIVE"):
@@ -757,8 +761,8 @@ def _first_person_blocks(rendered: str) -> list[str]:
         if "→ add" not in block and "→ bindings" not in block:
             continue
         first_line = block.split("\n", 1)[0]
-        quoted_spans = re.findall(r'"([^"]*)"', first_line)
-        if any(_FIRST_PERSON_PRONOUN_RE.search(span) for span in quoted_spans):
+        quoted_spans = double_quoted_spans(first_line)
+        if any(has_first_person_pronoun(span) for span in quoted_spans):
             selected.append(block)
     return selected
 
@@ -822,7 +826,9 @@ class TestEnrichmentPromptContract:
         # Look for a hard requirement that braced placeholders appear in
         # both `add` (facts) and `bindings`.  Phrasing is free to evolve;
         # the structural claim is not.
-        assert re.search(r"MUST.*appear|appear.*MUST", tmpl, re.IGNORECASE), (
+        assert any(
+            "must" in line.lower() and "appear" in line.lower() for line in tmpl.splitlines()
+        ), (
             "Enrichment prompt must contain a hard requirement that new "
             "braced placeholders appear in both `add` and `bindings`."
         )
@@ -860,23 +866,29 @@ class TestEnrichmentPromptContract:
         # Co-temporal attributes must be bound to {{Role_1}} (subject
         # position).  A flat-triples regression would have them on
         # Person_1 instead.  The delta protocol uses JSON-shaped facts
-        # (``"subject": "{{Role_1}}", "predicate": "start_date"``);
-        # match either ordering of those two key/value pairs within a
-        # short window so the test is robust to minor reformatting.
-        assert re.search(
-            r'"\{\{Role_1\}\}"[^{}]{0,200}start_date'
-            r"|"
-            r'start_date[^{}]{0,200}"\{\{Role_1\}\}"',
-            tmpl,
+        # parsed directly, so field order in the source text does not
+        # matter — only that some worked object has {{Role_1}} as its
+        # subject and start_date as its predicate.
+        assert any(
+            obj.get("subject") == "{{Role_1}}" and obj.get("predicate") == "start_date"
+            for obj in json_objects(tmpl)
         ), (
             "Role example must show start_date with {{Role_1}} as subject — "
             "the structural teaching is that dates bind to the role-instance, "
             "not to the speaker."
         )
+
         # The NEGATIVE block must spell out the speaker-flattening anti-
         # pattern so a future prompt edit cannot keep the POSITIVE
         # example while quietly removing the warning.
-        assert re.search(r"WRONG.*speaker|flat.*speaker|speaker.*flat", tmpl, re.IGNORECASE), (
+        def _flags_speaker_flattening(line: str) -> bool:
+            lower = line.lower()
+            wrong_idx = lower.find("wrong")
+            if wrong_idx != -1 and lower.find("speaker", wrong_idx) != -1:
+                return True
+            return "flat" in lower and "speaker" in lower
+
+        assert any(_flags_speaker_flattening(line) for line in tmpl.splitlines()), (
             "Enrichment prompt must call out the flat-triples-on-speaker "
             "anti-pattern in a NEGATIVE block."
         )
@@ -923,7 +935,7 @@ class TestEnrichmentPromptContract:
         opposite; this one cannot pass while any block does."""
         tmpl = _load_prompt("cloud_enrichment.txt")
         rendered = tmpl.format(transcript="x", facts_json="[]", speaker_id="speaker0")
-        blocks = re.split(r"\n\s*\n", rendered)
+        blocks = split_blocks(rendered)
         for block in blocks:
             if "speaker" not in block.lower():
                 continue
@@ -932,7 +944,8 @@ class TestEnrichmentPromptContract:
                 # work in this block — Person_1, if it also appears, is
                 # not standing in for it.
                 continue
-            assert not re.search(r'"subject"\s*:\s*"\{?\{?Person_1\}?\}?"', block), (
+            block_subjects = subject_values(block)
+            assert not block_subjects & {"Person_1", "{Person_1}", "{{Person_1}}"}, (
                 "Block mentions 'speaker' but has no speaker0 anchor "
                 "while using Person_1 as a fact subject — this re-"
                 f"teaches Person_1 == the speaker: {block!r}"
@@ -998,7 +1011,7 @@ class TestEnrichmentPromptContract:
         failure as the thing NOT to do."""
         tmpl = _load_prompt("cloud_enrichment.txt")
         rendered = tmpl.format(transcript="x", facts_json="[]", speaker_id="speaker0")
-        blocks = re.split(r"\n\s*\n", rendered)
+        blocks = split_blocks(rendered)
         checked_any = False
         for block in blocks:
             if "WRONG" in block or block.lstrip().startswith("NEGATIVE"):
@@ -1095,7 +1108,7 @@ class TestPlausibilityPromptContract:
         tmpl = _load_prompt("cloud_plausibility.txt")
         output_section = tmpl[tmpl.index("## Output") :]
         rendered = output_section.format(transcript="x", facts_json="[]")
-        examples = [json.loads(m) for m in re.findall(r"Example[^\n:]*:\s*(\{.*\})", rendered)]
+        examples = example_json_objects(rendered)
         assert len(examples) >= 2, "Expected at least a firing example and a clean example."
         for example in examples:
             assert set(example) == {"drop"}
@@ -1151,10 +1164,9 @@ class TestPlausibilityPromptContract:
 
         # The span from the contract heading up to (not including) the
         # NEXT `## ` heading.
-        next_header_match = re.search(r"\n## ", tmpl[contract_idx + 1 :])
-        assert next_header_match, "No section header found after the speaker-identity contract."
-        section_end = contract_idx + 1 + next_header_match.start()
-        section = tmpl[contract_idx:section_end]
+        next_header_pos = tmpl.find("\n## ", contract_idx + 1)
+        assert next_header_pos != -1, "No section header found after the speaker-identity contract."
+        section = tmpl[contract_idx:next_header_pos]
 
         assert "Example — KEEP" in section, (
             "Speaker-identity contract section is missing a KEEP-annotated example."
@@ -1171,15 +1183,19 @@ class TestPlausibilityPromptContract:
             label: section[bounds[i] : bounds[i + 1]] for i, (_pos, label) in enumerate(markers)
         }
 
-        keep_subject_match = re.search(r'"subject":\s*"([^"]+)"', blocks["keep"])
-        assert keep_subject_match, "KEEP example has no subject field to check."
-        assert is_speaker_id(keep_subject_match.group(1)), (
+        keep_objects = json_objects(blocks["keep"])
+        assert keep_objects and "subject" in keep_objects[0], (
+            "KEEP example has no subject field to check."
+        )
+        assert is_speaker_id(keep_objects[0]["subject"]), (
             "KEEP example's subject must be a speaker{N} token."
         )
 
-        drop_subject_match = re.search(r'"subject":\s*"([^"]+)"', blocks["drop"])
-        assert drop_subject_match, "DROP example has no subject field to check."
-        assert not is_speaker_id(drop_subject_match.group(1)), (
+        drop_objects = json_objects(blocks["drop"])
+        assert drop_objects and "subject" in drop_objects[0], (
+            "DROP example has no subject field to check."
+        )
+        assert not is_speaker_id(drop_objects[0]["subject"]), (
             "DROP example's subject must be a conversation-role reference, not a speaker{N} token."
         )
 
@@ -1230,7 +1246,11 @@ class TestPlausibilityPromptContract:
         section_start = tmpl.index("## Drop rules")
         section_end = tmpl.index("## Input")
         section = tmpl[section_start:section_end]
-        rule_ids = {m.group(1) for m in re.finditer(r"^(R\d+)\.", section, flags=re.MULTILINE)}
+        rule_ids = {
+            rule_id
+            for rule_id in (leading_rule_id(line) for line in section.splitlines())
+            if rule_id is not None
+        }
         assert rule_ids == set(PLAUSIBILITY_RULES)
 
 
@@ -1297,7 +1317,7 @@ class TestEntityCorrectionPrompt:
     def test_no_stray_unescaped_placeholders(self):
         """No stray {word} tokens remain after render (only JSON literal braces)."""
         rendered = self._render(_load_prompt("entity_correction.txt"))
-        stray = re.findall(r"(?<!\{)\{[a-z_]+\}", rendered)
+        stray = stray_placeholders(rendered)
         assert not stray, f"Stray unrendered placeholder(s) found in rendered prompt: {stray!r}"
 
     def test_contains_output_contract_tokens(self):
@@ -1369,11 +1389,11 @@ class TestMergerCoexistencePrompt:
 
     def test_only_predicate_slot_present(self):
         """The prompt must use only ``{predicate}`` — no value-pair slots."""
-        import re
+        from paramem.graph.prompts import _template_slots
 
         tmpl = self._load()
-        slots = re.findall(r"\{(\w+)\}", tmpl)
-        assert set(slots) == {"predicate"}, f"Expected only {{predicate}} slot; found: {set(slots)}"
+        slots = _template_slots(tmpl)
+        assert slots == {"{predicate}"}, f"Expected only {{predicate}} slot; found: {slots}"
 
 
 class TestCheckPredicateCoexistenceParser:
@@ -1464,8 +1484,9 @@ class TestSpeakerDirectiveFile:
 
         from paramem.graph.prompts import _load_prompt_section
 
-        with pytest.raises(KeyError, match="INFERENCE-IDENTITY"):
+        with pytest.raises(KeyError) as exc_info:
             _load_prompt_section("speaker_directive.txt", "INFERENCE-IDENTITY")
+        assert "INFERENCE-IDENTITY" in str(exc_info.value)
 
     def test_third_party_descriptor_loads_non_empty(self):
         """THIRD-PARTY-DESCRIPTOR section loads successfully and is non-empty."""
@@ -1506,8 +1527,9 @@ class TestSpeakerDirectiveFile:
 
         from paramem.graph.prompts import _load_prompt_section
 
-        with pytest.raises(KeyError, match="NONEXISTENT"):
+        with pytest.raises(KeyError) as exc_info:
             _load_prompt_section("speaker_directive.txt", "NONEXISTENT")
+        assert "NONEXISTENT" in str(exc_info.value)
 
     def test_build_speaker_context_two_arg_renders_speaker_id(self):
         """build_speaker_context(speaker_id, speaker_name) pins id as subject."""
@@ -1739,7 +1761,8 @@ class TestServingPrompts:
     ``configs/prompts/serving_directives.txt``.
     """
 
-    # Per-section EXACT slot set (regex over ``\\{[^}]*\\}``). A stray
+    # Per-section EXACT slot set, read through the shared
+    # :func:`~paramem.graph.prompts._template_slots` reader. A stray
     # literal brace in this operator-editable file must fail here, in a
     # test — not as a request-time KeyError on a reasoning leg with no
     # enclosing try.
@@ -1759,11 +1782,11 @@ class TestServingPrompts:
             assert content, f"{section} section must be non-empty"
 
     def test_serving_directives_exact_slot_set_per_section(self):
-        from paramem.graph.prompts import _load_prompt_section
+        from paramem.graph.prompts import _load_prompt_section, _template_slots
 
         for section, expected in self._EXPECTED_SLOTS.items():
             content = _load_prompt_section("serving_directives.txt", section)
-            actual = set(re.findall(r"\{[^}]*\}", content))
+            actual = _template_slots(content)
             assert actual == expected, (
                 f"{section} section slot set drifted: expected {expected}, got {actual}"
             )

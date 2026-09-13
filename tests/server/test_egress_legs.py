@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -17,6 +18,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 from fastapi.testclient import TestClient
 
+import paramem.graph.flows as flows_module
+from paramem.cloud import anonymize as anonymize_module
+from paramem.cloud import anonymize_steps as anonymize_steps_module
 from paramem.cloud.anonymize import AnonymizedContract, failed_contract
 from paramem.cloud.providers.base import CloudAgent
 from paramem.config.taxonomy import ScrubCategory
@@ -32,6 +36,7 @@ from paramem.server.egress import (
     answer_via_cloud,
     answer_via_ha,
 )
+from tests.anonymizer_doubles import ScriptedGenerate, ScriptedTokenizer
 
 # ---------------------------------------------------------------------------
 # Per-leg record
@@ -176,8 +181,11 @@ class TestAnswerViaHaCarriesTheTurnVerbatim:
 # ---------------------------------------------------------------------------
 
 
-def _anonymize_config(*, cloud_mode: str = "anonymize") -> SimpleNamespace:
+def _anonymize_config(
+    *, cloud_mode: str = "anonymize", prompts_dir: Path | None = None
+) -> SimpleNamespace:
     return SimpleNamespace(
+        prompts_dir=prompts_dir,
         sanitization=SimpleNamespace(
             cloud_mode=cloud_mode, scrub_categories=(ScrubCategory("Person"),)
         ),
@@ -261,6 +269,54 @@ class TestAnswerViaCloudUnderAnonymize:
         assert result is None
         assert outbound.diagnostics["cloud_refusal"] == failure
         cloud_agent.call.assert_not_called()
+
+
+class TestContractHonoursTheOperatorPromptsDirectory:
+    """``OutboundText.contract()`` must read the anonymization prompt home
+    from ``ServerConfig.prompts_dir`` — the same source the fold, graph
+    enrichment, calibration and the boot check honour — so an operator's
+    own prompts directory copy governs chat egress too."""
+
+    def test_the_scan_call_is_rendered_from_the_configured_prompts_directory(
+        self, tmp_path, monkeypatch
+    ):
+        """A distinguishable ``anonymization.txt`` placed under a config's
+        ``prompts_dir`` must show up in the actual SCAN model call the
+        contract issues — not the shipped copy under ``configs/prompts/``."""
+        marker = "MARKER-OPERATOR-SCAN-COPY"
+        anonymization_text = (
+            "=== SCAN-SYSTEM ===\nx\n\n"
+            "=== SCAN ===\n" + marker + "\n{keywords}\n{text}\n"
+            'Empty result: {{"mapping": {{}}}}\n\n'
+            "=== ANCHOR-SYSTEM ===\ny\n\n"
+            "=== ANCHOR ===\n{speaker_id}\n{values}\n{text}\n"
+        )
+        (tmp_path / "anonymization.txt").write_text(anonymization_text, encoding="utf-8")
+
+        # base_model_inference requires a real PeftModel; this test only
+        # cares which prompt file was read, so the adapter-disable scope
+        # is stubbed to a no-op the way the model itself is stubbed below.
+        monkeypatch.setattr(flows_module, "base_model_inference", lambda model: nullcontext())
+        monkeypatch.setattr(anonymize_module, "effective_token_envelope", lambda te: (te, None))
+        fake_generate = ScriptedGenerate(['{"mapping": {}}'])
+        monkeypatch.setattr(anonymize_steps_module, "generate_answer", fake_generate)
+
+        outbound = OutboundText(
+            "Hello there.",
+            _anonymize_config(prompts_dir=tmp_path),
+            diagnostics={},
+            model=MagicMock(),
+            tokenizer=ScriptedTokenizer(),
+        )
+
+        contract = outbound.contract()
+
+        assert contract.failure is None
+        assert fake_generate.calls, "no SCAN call was issued"
+        assert marker in fake_generate.calls[0], (
+            "the SCAN call was not rendered from the operator's prompts "
+            "directory copy of anonymization.txt"
+        )
 
 
 class TestRefuseFailedContractRaisesOnAnUnrecognisedFailure:

@@ -3,7 +3,7 @@ hand-built corpus and hand-built :class:`AnonymizedContract` objects — no
 model, no GPU.
 
 Cases built by hand against the forward-table contract this gate actually
-scores: a partial catch, a value inside a longer word (now an ``inert``
+scores: a partial catch, a value inside a longer word (an ``inert``
 drop, never a forward key — production's own table build already prunes
 an unsubstitutable candidate before the contract is returned), a reversed
 longer value containing a scrubbed shorter one, a phone number starting
@@ -310,12 +310,21 @@ def test_self_check_runs_clean_over_the_hand_built_corpus():
 
 
 def test_self_check_raises_when_it_disagrees_with_production(monkeypatch):
-    """A forward table naming a key production's own walk would never
-    place must be caught, not silently under-reported.
+    """The walk-agreement arm (``scrubbed_values != applied``) fires first:
+    forcing production's own ``applied_whole_word_keys`` to report nothing
+    disagrees with the scorer's own occurrence walk, which still placed
+    ``Ada``/``Bill Gates`` — caught before the prune arm below is ever
+    reached, since a mismatched population makes the prune check's own
+    ``missing`` set meaningless.
     """
     monkeypatch.setattr(anonymizer_gate, "applied_whole_word_keys", lambda text, keys: set())
-    with pytest.raises(AssertionError, match="self-check disagreement"):
+    with pytest.raises(AssertionError) as exc_info:
         anonymizer_gate.score_entry(ENTRY_A, CONTRACT_A, CONFIGURED, anonymizer_gate.Result())
+    assert str(exc_info.value) == (
+        "self-check disagreement on entry 'syn-001': the scorer's own occurrence "
+        "walk placed ['Ada', 'Bill Gates'], but production's own "
+        "applied_whole_word_keys reports [] over the reconstructed payload text"
+    )
 
 
 def test_self_check_raises_when_the_scorers_own_walk_diverges(monkeypatch):
@@ -324,11 +333,38 @@ def test_self_check_raises_when_the_scorers_own_walk_diverges(monkeypatch):
     places nothing, while production's own ``applied_whole_word_keys``
     finds the forward keys in the reconstructed payload, is caught by the
     walk-agreement arm — distinct from (and checked before) the prune arm
-    the test above exercises.
+    :func:`test_self_check_raises_on_a_forward_key_absent_from_the_text`
+    exercises. The exact message pins which arm fired,
+    naming both sides of the disagreement.
     """
     monkeypatch.setattr(anonymizer_gate, "find_occurrences", lambda text, values: [])
-    with pytest.raises(AssertionError, match="scorer's own occurrence walk"):
+    with pytest.raises(AssertionError) as exc_info:
         anonymizer_gate.score_entry(ENTRY_A, CONTRACT_A, CONFIGURED, anonymizer_gate.Result())
+    assert str(exc_info.value) == (
+        "self-check disagreement on entry 'syn-001': the scorer's own occurrence "
+        "walk placed [], but production's own applied_whole_word_keys reports "
+        "['Ada', 'Bill Gates'] over the reconstructed payload text"
+    )
+
+
+def test_self_check_raises_on_a_forward_key_absent_from_the_text():
+    """The prune-guarantee arm (``missing = set(forward) - applied``)
+    fires on a forward key that occurs nowhere in the entry's text: the
+    walk-agreement arm passes first (both the scorer's own walk and
+    production's ``applied_whole_word_keys`` agree on ``Ada``/``Bill
+    Gates``, the only keys either side ever finds), so this is the OTHER
+    arm firing, not the one the two tests above exercise. The exact
+    message names the stray key and the branch's own wording.
+    """
+    stale_forward = {**CONTRACT_A.forward, "Zorblatt": "Person_9"}
+    contract = _contract(stale_forward)
+    with pytest.raises(AssertionError) as exc_info:
+        anonymizer_gate.score_entry(ENTRY_A, contract, CONFIGURED, anonymizer_gate.Result())
+    assert str(exc_info.value) == (
+        "self-check disagreement on entry 'syn-001': production's own forward "
+        "table names ['Zorblatt'] as substitutable, but they do not occur "
+        "(whole-word) anywhere in the reconstructed payload text"
+    )
 
 
 def test_gold_category_with_no_configured_membership_is_out_of_scope():
@@ -337,7 +373,7 @@ def test_gold_category_with_no_configured_membership_is_out_of_scope():
     is a plain set lookup, never a literal list in the scorer.
     """
     r = anonymizer_gate.score_corpus([ENTRY_B], {"syn-002": CONTRACT_B}, set())
-    # With nothing configured, "Lena" itself is now out-of-scope too.
+    # With nothing configured, "Lena" itself is out-of-scope too.
     assert r.tot["gold_in_scope"] == 0
     assert r.tot["gold_out_scope"] == 3
 
@@ -353,19 +389,6 @@ def test_unknown_word_values_reads_the_drop_records_own_text():
 def test_unknown_word_values_empty_without_a_drop_record():
     values = anonymizer_gate._unknown_word_values(CONTRACT_A)
     assert values == []
-
-
-def test_scorecard_dict_and_regression_columns():
-    r = _score()
-    scorecard = anonymizer_gate.scorecard_dict(r)
-    # A baseline identical to the current run regresses on nothing.
-    assert anonymizer_gate.regression_columns(scorecard, scorecard) == []
-    # A baseline with a higher precision than achieved here names the column.
-    worse_precision = {**scorecard, "precision": 100.0}
-    assert "precision" in anonymizer_gate.regression_columns(scorecard, worse_precision)
-    # A baseline with fewer junk scrubs than achieved here names the column.
-    better_junk_baseline = {**scorecard, "junk": 0}
-    assert "junk" in anonymizer_gate.regression_columns(scorecard, better_junk_baseline)
 
 
 # ---------------------------------------------------------------------------
@@ -441,24 +464,6 @@ def test_scorecard_dict_carries_failed_as_the_count_of_skipped_entries():
     assert "failed" in anonymizer_gate._LOWER_IS_BETTER
 
 
-def test_regression_columns_names_failed_when_current_exceeds_the_baseline():
-    scorecard = anonymizer_gate.scorecard_dict(_score())
-    current = {**scorecard, "failed": 3}
-    baseline = {**scorecard, "failed": 1}
-
-    assert "failed" in anonymizer_gate.regression_columns(current, baseline)
-
-
-def test_regression_columns_is_silent_on_failed_when_the_baseline_lacks_the_key():
-    """A baseline file carrying no ``failed`` key compares as ``None`` on
-    that key — never a false regression."""
-    scorecard = anonymizer_gate.scorecard_dict(_score())
-    current = {**scorecard, "failed": 3}
-    baseline = {k: v for k, v in scorecard.items() if k != "failed"}
-
-    assert "failed" not in anonymizer_gate.regression_columns(current, baseline)
-
-
 def test_print_detail_states_the_skipped_entry_gold_outside_the_percentages(capsys):
     entry = _entry("syn-006", "Nora called.", [_gold("Nora", "Person", -1, 0, 4)])
     result = anonymizer_gate.score_corpus([entry], {}, CONFIGURED)
@@ -505,24 +510,6 @@ def test_scorecard_dict_invented_sums_multiple_drop_records():
     scorecard = anonymizer_gate.scorecard_dict(result)
 
     assert scorecard["invented"] == 3
-
-
-def test_regression_columns_names_invented_when_current_exceeds_the_baseline():
-    scorecard = anonymizer_gate.scorecard_dict(_score())
-    current = {**scorecard, "invented": 5}
-    baseline = {**scorecard, "invented": 1}
-
-    assert "invented" in anonymizer_gate.regression_columns(current, baseline)
-
-
-def test_regression_columns_is_silent_on_invented_when_the_baseline_lacks_the_key():
-    """A baseline file lacking the ``invented`` key compares as ``None``
-    on that key — never a false regression, and never a crash."""
-    scorecard = anonymizer_gate.scorecard_dict(_score())
-    current = {**scorecard, "invented": 5}
-    baseline = {k: v for k, v in scorecard.items() if k != "invented"}
-
-    assert "invented" not in anonymizer_gate.regression_columns(current, baseline)
 
 
 # ---------------------------------------------------------------------------
@@ -721,3 +708,43 @@ def test_reverted_surface_keeps_its_own_position_under_a_longer_forward_key():
     assert result.tot["out_scope_reversed"] == 1
     assert result.tot["out_scope_scrubbed"] == 0
     assert result.tot["out_scope_untagged"] == 0
+
+
+# ---------------------------------------------------------------------------
+# regression_columns — which primary columns count as worse than baseline.
+# ---------------------------------------------------------------------------
+
+
+def test_a_higher_is_better_column_is_named_when_current_falls_below_baseline():
+    current = {"names_all": 80.0}
+    baseline = {"names_all": 90.0}
+
+    assert anonymizer_gate.regression_columns(current, baseline) == ["names_all"]
+
+
+def test_a_lower_is_better_column_is_named_when_current_rises_above_baseline():
+    current = {"junk": 10, "failed": 2, "invented": 5}
+    baseline = {"junk": 5, "failed": 2, "invented": 1}
+
+    assert anonymizer_gate.regression_columns(current, baseline) == ["junk", "invented"]
+
+
+def test_a_column_matching_or_beating_baseline_is_never_named():
+    current = {"names_all": 95.0, "junk": 3}
+    baseline = {"names_all": 90.0, "junk": 3}
+
+    assert anonymizer_gate.regression_columns(current, baseline) == []
+
+
+def test_a_column_absent_from_the_baseline_is_silent_even_when_current_looks_worse():
+    current = {"names_all": 10.0, "junk": 999}
+    baseline = {}
+
+    assert anonymizer_gate.regression_columns(current, baseline) == []
+
+
+def test_a_none_value_on_either_side_never_counts_as_a_regression():
+    current = {"names_all": None, "junk": 50}
+    baseline = {"names_all": 90.0, "junk": None}
+
+    assert anonymizer_gate.regression_columns(current, baseline) == []

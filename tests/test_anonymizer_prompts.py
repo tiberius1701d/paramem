@@ -13,7 +13,7 @@ from __future__ import annotations
 from paramem.cloud.anonymize import AnonymizerPrompts
 from paramem.cloud.deanonymize import _JSON_ENVELOPE_KEYS
 from paramem.graph.anonymizer_prompts import load_anonymizer_prompts
-from paramem.graph.prompts import ensure_prompt_assets
+from paramem.graph.prompts import _template_slots, ensure_prompt_assets
 
 
 class TestLoadAnonymizerPromptsOverTheShippedFile:
@@ -25,16 +25,13 @@ class TestLoadAnonymizerPromptsOverTheShippedFile:
         assert prompts.anchor_system
         assert prompts.anchor
 
-    def test_the_scan_section_carries_its_two_slots(self):
+    def test_the_scan_section_carries_exactly_its_two_slots(self):
         prompts = load_anonymizer_prompts()
-        assert "{keywords}" in prompts.scan
-        assert "{text}" in prompts.scan
+        assert _template_slots(prompts.scan) == {"{keywords}", "{text}"}
 
-    def test_the_anchor_section_carries_its_three_slots(self):
+    def test_the_anchor_section_carries_exactly_its_three_slots(self):
         prompts = load_anonymizer_prompts()
-        assert "{speaker_id}" in prompts.anchor
-        assert "{values}" in prompts.anchor
-        assert "{text}" in prompts.anchor
+        assert _template_slots(prompts.anchor) == {"{speaker_id}", "{values}", "{text}"}
 
 
 class TestPromptsRequiredSectionsAndSlotsAgreeWithTheShippedFile:

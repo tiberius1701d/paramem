@@ -612,7 +612,7 @@ def enrich_graph(
             # directly, never a graph carrier).
             # ``transcript=""`` — there is no transcript at this tier.
             # ``identity_domain=chunk_nodes`` drives (A)'s
-            # identity-reconciliation step (5) — the local model's
+            # identity-reconciliation pass (step 7) — the local model's
             # mapping is keyed by whatever real-name surface it
             # independently produced (e.g. "Yang Ming"); the fold
             # graph's own node keys are already canonicalized (e.g.
@@ -622,31 +622,42 @@ def enrich_graph(
             # would never match the "yang ming" text
             # ``_substitute_whole_words`` compares against inside
             # ``triples``' subject/object fields below. (A)'s
-            # domain-scoped fail-closed guard (step 6) is derived from
-            # ``facts`` — the SLICE's own facts at evaluation time (fact
-            # boundaries slice ``triples`` into token-envelope-bounded
-            # pieces), NOT
-            # necessarily the whole ``triples`` list, and NOT the same as
-            # what this chunk ultimately sends to cloud: under a partial
-            # fail-closed drop ``payload.facts`` is ``triples`` MINUS every
-            # fail-closed slice's facts (see ``AnonymizedContract``'s
-            # ``facts`` field docstring) — never from ``identity_domain``
-            # (see that function's docstring for why the two domains must
-            # stay distinct). The anonymization prompt instructs the model
-            # to leave speaker{N} ids verbatim (never map them), so a
-            # speaker anchor never becomes a ``chunk_mapping`` entry here
-            # — it is already anonymous and reaches the cloud payload bare
-            # by design (ONE-lowercase-speaker{N} invariant), with no
-            # mint/restore round trip needed.
+            # domain-scoped fail-closed guard (step 9) is evaluated once,
+            # over this chunk's WHOLE ``triples`` list — the guard's unit
+            # is the whole chunk, never one fact within it. A chunk's
+            # facts travel together: on a completed ("ok") call, ``payload.facts``
+            # is ``triples`` verbatim, unchanged, and the chunk's cloud call
+            # goes ahead with all of it — an empty local mapping is a
+            # legitimate "nothing in scope" verdict, not a reason to hold
+            # anything back. The guard fires only when the scan DID mark at
+            # least one value of an active category, this chunk's own
+            # ``triples`` name someone other than the speaker, and nothing
+            # it marked survives BOTH the identity-reconciliation pass
+            # above (step 7) AND the inert-key prune (step 8 — every
+            # surviving member is checked against the outbound payload
+            # text and dropped if it substitutes nowhere); when it fires
+            # the WHOLE chunk's cloud call is skipped (see the
+            # ``payload.status == "failed"`` handling below), never a
+            # partial subset of ``triples``. A value shaped like
+            # ``speaker{N}`` is dropped by code from the scan's own
+            # mapping before the table is ever built, whatever keyword the
+            # model gave it (see
+            # :func:`~paramem.cloud.anonymize_steps.keep_or_revert`) — the
+            # SCAN prompt carries no instruction about speaker ids at all
+            # — so a speaker anchor never becomes a ``chunk_mapping``
+            # entry here; it is already anonymous and reaches the cloud
+            # payload bare by design (ONE-lowercase-speaker{N} invariant),
+            # with no mint/restore round trip needed.
             #
             # ``_chunk_session_graph`` carries no relations of its own —
             # it exists ONLY as the diagnostics sink
             # ``request_graph_enrichment`` writes the binding-collision
             # findings to below; it is NOT how this chunk's facts reach
             # that call — ``request_graph_enrichment`` reads
-            # ``payload.facts`` (the anonymize contract's egress-cleared
-            # subset of ``triples``), never ``triples`` directly (see that
-            # function's ``anon_triples = insert_placeholders(payload.facts,
+            # ``payload.facts`` (the anonymize contract's own copy of
+            # ``triples``, carried once the call has completed and the
+            # guard above has cleared it), never ``triples`` directly (see
+            # that function's ``anon_triples = insert_placeholders(payload.facts,
             # payload.forward)``, ``paramem/graph/extractor.py``).
             _chunk_session_graph = SessionGraph(session_id="__graph_enrichment__", timestamp="")
             # anonymize calls model.generate() internally (CLAUDE.md:

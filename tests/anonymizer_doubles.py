@@ -1,5 +1,15 @@
 """Shared test doubles for the anonymize chain: a ready-made
-``AnonymizerPrompts`` construction and a bare ``ScrubCategory``.
+``AnonymizerPrompts`` construction, a bare ``ScrubCategory``, a
+syntactically complete ``anonymization.txt`` body
+(``VALID_ANONYMIZATION_SECTIONS``), and five deliberately invalid bodies
+covering the four problem kinds ``check_anonymization_prompt_sections``
+reports — missing section, missing slot, unknown slot, malformed
+placeholder — one shape per kind plus a second missing-slot shape
+(``INVALID_ANONYMIZATION_SECTIONS_MISSING_SECTION``,
+``INVALID_ANONYMIZATION_SECTIONS_MISSING_SLOT``,
+``INVALID_ANONYMIZATION_SECTIONS_UNKNOWN_SLOT``,
+``INVALID_ANONYMIZATION_SECTIONS_MALFORMED_PLACEHOLDER``,
+``INVALID_ANONYMIZATION_SECTIONS_DOUBLED_SLOT``).
 
 Not a test module itself — imported by the anonymizer test files so none
 of them re-implements the same constructions.
@@ -12,6 +22,63 @@ from __future__ import annotations
 from paramem.cloud.anonymize import AnonymizerPrompts
 from paramem.config.taxonomy import ScrubCategory
 from paramem.graph.anonymizer_prompts import load_anonymizer_prompts
+
+# A syntactically complete anonymization home: every required section,
+# every required slot, plus a doubled-brace JSON-literal fragment (the
+# shape every example in the shipped home uses) that must NOT be read as
+# a slot. The one copy of this text — every test that needs a valid
+# ``anonymization.txt`` body imports it here rather than hand-typing its
+# own, so the two shapes never drift apart.
+VALID_ANONYMIZATION_SECTIONS = (
+    "=== SCAN-SYSTEM ===\nx\n\n"
+    '=== SCAN ===\n{keywords}\n{text}\nEmpty result: {{"mapping": {{}}}}\n\n'
+    "=== ANCHOR-SYSTEM ===\ny\n\n"
+    "=== ANCHOR ===\n{speaker_id}\n{values}\n{text}\n"
+)
+
+# One shared set of deliberately invalid anonymization-home bodies,
+# covering the four problem kinds
+# :func:`~paramem.graph.prompts.check_anonymization_prompt_sections` reports
+# (missing section, missing slot, unknown slot, malformed placeholder) —
+# every test needing one of these five shapes imports it here rather than
+# hand-typing its own, so the check's problem kinds and their test coverage
+# never drift apart.
+INVALID_ANONYMIZATION_SECTIONS_MISSING_SECTION = (
+    "=== SCAN-SYSTEM ===\nx\n\n=== SCAN ===\n{keywords}\n{text}\n"
+)
+# SCAN carries {keywords} but drops {text} -- a call through it would
+# silently render with no text to scan.
+INVALID_ANONYMIZATION_SECTIONS_MISSING_SLOT = (
+    "=== SCAN-SYSTEM ===\nx\n\n"
+    "=== SCAN ===\n{keywords}\n\n"
+    "=== ANCHOR-SYSTEM ===\ny\n\n"
+    "=== ANCHOR ===\n{speaker_id}\n{values}\n{text}\n"
+)
+# ANCHOR carries every required slot plus a stray {extra} the table does
+# not list for it -- str.format would KeyError on it at call time rather
+# than at load time.
+INVALID_ANONYMIZATION_SECTIONS_UNKNOWN_SLOT = (
+    "=== SCAN-SYSTEM ===\nx\n\n"
+    "=== SCAN ===\n{keywords}\n{text}\n\n"
+    "=== ANCHOR-SYSTEM ===\ny\n\n"
+    "=== ANCHOR ===\n{speaker_id}\n{values}\n{text}\n{extra}\n"
+)
+# A lone `}` inside SCAN -- not a doubled brace, not a named slot, the
+# standard library format parser's own error on it.
+INVALID_ANONYMIZATION_SECTIONS_MALFORMED_PLACEHOLDER = (
+    "=== SCAN-SYSTEM ===\nx\n\n"
+    "=== SCAN ===\n{keywords}\n{text}\nstray brace: }\n\n"
+    "=== ANCHOR-SYSTEM ===\ny\n\n"
+    "=== ANCHOR ===\n{speaker_id}\n{values}\n{text}\n"
+)
+# {{text}} renders as the literal text "{text}", never a slot -- SCAN must
+# still be reported as missing the real {text} slot.
+INVALID_ANONYMIZATION_SECTIONS_DOUBLED_SLOT = (
+    "=== SCAN-SYSTEM ===\nx\n\n"
+    "=== SCAN ===\n{keywords}\n{{text}}\n\n"
+    "=== ANCHOR-SYSTEM ===\ny\n\n"
+    "=== ANCHOR ===\n{speaker_id}\n{values}\n{text}\n"
+)
 
 
 def basic_prompts(
