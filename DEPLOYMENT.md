@@ -510,7 +510,7 @@ Voice Satellite → Wyoming STT (Whisper + pyannote) → HA → ParaMem /chat
 Response → HA TTS → Sonos (announce)
 ```
 
-ParaMem owns memory (speaker identification, entity routing, adapter recall, consolidation). Home Assistant owns everything else (device control, search, weather, music, prompt engineering, model selection). Non-memory queries — and model-authored queries forwarded behind `[ESCALATE]` — are scrubbed under `sanitization.scrub` before they reach HA's configured conversation agent, which handles tool execution, entity resolution, and room-aware context internally; entity and area names Home Assistant itself registered stay readable so device control still works.
+ParaMem owns memory (speaker identification, entity routing, adapter recall, consolidation). Home Assistant owns everything else (device control, search, weather, music, prompt engineering, model selection). Non-memory queries reach HA's configured conversation agent exactly as spoken: this leg carries no scrub and no placeholders, so device control, entity resolution, and room-aware context all see the household's own words unchanged. A model-authored query forwarded behind `[ESCALATE]` follows the same HA leg unless the query is personal to the speaker, in which case the HA hop is skipped and the query goes to the cloud leg instead. Every cloud hop — the direct `Neither → cloud agent` leg, the leg reached after an HA miss, and the leg reached after `[ESCALATE]` — is anonymized only when `cloud_mode` is `anonymize` or `both`; under the shipped default (`block`), a non-personal query still reaches the cloud as written, and a personal one is refused outright.
 
 ### Consolidation & Crash Safety
 
@@ -1188,6 +1188,8 @@ the server process — see its row above. `response.json`'s
 `wall_clock_seconds` measures the step's own cost and excludes any time the
 run spent queued behind another run.
 
+#### Anonymizer test tool
+
 The local anonymizer's own repeatable test corpus lives in
 `tests/fixtures/anonymizer_gate.json` — a tracked, entirely fictional
 payload set (conversational transcripts, dense contact lists, and
@@ -1198,9 +1200,24 @@ can load a different base model or a different prompt variant for the
 comparison, and checks a run against the last accepted scorecard rather
 than a fixed pass/fail threshold — so a change to the wording the model
 reads, the `scrub`/`allow` lists, or the base model itself can be checked before
-it reaches a deployment.
+it reaches a deployment. See
+[Cloud-Egress Anonymizer: Detector Choice](benchmarking.md#cloud-egress-anonymizer-detector-choice-2026-09-08)
+for what the accepted scorecard measures and where it stands.
 
-**Chat request:**
+Each run records which prompt wording, list of kinds, base model,
+scrubbed-kind selection, test set and token budget it used, and states
+plainly when any of these differs from the last accepted scorecard's own
+record. Resuming a
+run that was interrupted partway through is refused when any single
+one of those inputs differs from what the interrupted run recorded, or
+was not recorded by it at all — a fresh run is the way forward, never
+continuing an old one under changed or unrecorded inputs. Recording a re-scored run as the new
+accepted scorecard is refused the same way: when any single one of this
+invocation's own inputs differs from what that run itself recorded, or
+was not recorded by it, accepting is refused and the scorecard is not
+written.
+
+#### Example chat request
 
 ```bash
 curl -X POST http://localhost:8420/chat \
@@ -1252,8 +1269,8 @@ govern those files and the calibration loop used to iterate on them. **Read
 this before editing any prompt** — most of the principles below were learned
 empirically and contradict natural intuition about how to write LLM prompts.
 
-Two files carry hazards specific to this directory and deserve a read before
-editing:
+Three hazards specific to this directory span six of its files and deserve a
+read before editing:
 
 - **`trained_recall.txt` is the trained interface, not a tunable prompt.**
   Every adapter currently in production was trained on this exact text.
@@ -1267,6 +1284,14 @@ editing:
   request-time failure rather than a controlled fallback. A test guards the
   placeholder set for the shipped copy of this file, but an operator's own
   edit is not covered by it.
+- **`anonymization.txt`'s sections and the extraction templates' placeholders
+  are checked at startup.** `anonymization.txt` must carry every one of its
+  required sections, and each of those sections must in turn carry its own
+  required placeholders; each extraction template must carry every
+  placeholder its own render call supplies. None of these files may carry a
+  placeholder outside what it is allowed to carry — a missing section, a
+  missing placeholder, an unknown one, or a malformed `{placeholder}` stops
+  the server from starting rather than surfacing as a request-time surprise.
 
 ### Principles
 
