@@ -956,7 +956,6 @@ def train_phase(
             training_config=training_config,
             adapter_config=adapter_config,
             output_dir=adapter_dir,
-            run_name="quad-adapter-train",
             hooks=hooks,
             callbacks_extra=callbacks_extra if callbacks_extra else None,
             resume_from_checkpoint=resume_ckpt,

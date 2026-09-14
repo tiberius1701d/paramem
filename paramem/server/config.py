@@ -114,8 +114,6 @@ def _interpolate_env_vars(value):
     return value
 
 
-# Duplicated from experiments/utils/test_harness.py to avoid modifying that file
-# while benchmarks are running.
 MODEL_REGISTRY = {
     "mistral": ModelConfig(
         model_id="mistralai/Mistral-7B-Instruct-v0.3",
@@ -1249,12 +1247,6 @@ class ConsolidationScheduleConfig(ConsolidationConfig):
     # --- Graph-level cloud enrichment neighborhood knobs ---
     graph_enrichment_neighborhood_hops: int = 2
     graph_enrichment_max_entities_per_pass: int = 50
-    # RAM-mode checkpointing: when > 0, train_adapter writes checkpoints to
-    # /dev/shm instead of the caller's output_dir, then copies the latest
-    # checkpoint to <output_dir>/bg_checkpoint_epoch/ at each epoch boundary.
-    # Trade-off: /dev/shm is not durable across restarts; a crash loses the
-    # in-flight checkpoint.  Set to 0 (default) to disable.
-    training_save_steps_ram: int = 0
     # Slot retention — see paramem.memory.persistence.prune_old_slots.
     #
     # After each promotion atomic_save_adapter writes a NEW timestamped slot
@@ -1320,11 +1312,6 @@ class ConsolidationScheduleConfig(ConsolidationConfig):
         not caught. No production path mutates ``mode`` after load.
         """
         super().__post_init__()
-        if self.training_save_steps_ram < 0:
-            raise ValueError(
-                f"consolidation.training_save_steps_ram must be >= 0; "
-                f"got {self.training_save_steps_ram!r}"
-            )
         if self.training_keep_prior_slots < 0:
             raise ValueError(
                 f"consolidation.training_keep_prior_slots must be >= 0; "
@@ -1777,9 +1764,11 @@ class TextLangDetectionConfig:
 class MobilePwaConfig:
     """Progressive Web App (PWA) configuration for the mobile client.
 
-    ``enabled``: serve the static PWA bundle and activate cookie-based
-    authentication for the mobile web client.  False by default so an
-    existing deployment is unaffected until the mobile client is wired in.
+    ``enabled``: serve the static PWA bundle at ``/app`` and wire the
+    per-user token store that gates per-user authentication.  The store is
+    also wired without this flag when ``user_tokens.json`` already exists
+    on disk, from a prior ``paramem mint-user-token`` run.  False by
+    default.
 
     ``static_dir``: filesystem path to the compiled static bundle.  Empty
     string defers resolution to the built-in bundle at
@@ -1789,18 +1778,16 @@ class MobilePwaConfig:
     client presents one.  The server does not issue this cookie; tokens are
     carried via the ``Authorization: Bearer`` header in practice.
 
-    ``push_enabled``: enable Web Push notifications.  When true, the server
-    auto-generates a VAPID EC P-256 keypair on first startup (persisted as
-    ``vapid_keys.json`` in the data directory, age-encrypted when a daily key
-    is loaded) and activates the ``/push/vapid-public-key`` and
-    ``/push/subscribe`` endpoints.  Requires an ATTRIBUTED per-user bearer
-    token (the subscribe endpoint returns 403 for an unattributed token or
-    an unauthenticated request).  False by default (opt-in).
-
-    ``vapid_contact``: the ``sub`` claim in the VAPID JWT.  Must be a
-    ``mailto:`` URI identifying the server operator; sent to push relays for
-    abuse-contact purposes.  A sane default is provided; operators should
-    replace it with their own address.
+    ``push_enabled``: together with ``enabled``, activates the VAPID
+    keypair generation and the two push endpoints
+    (``/push/vapid-public-key``, ``/push/subscribe``); both must be true.
+    When active, the server auto-generates a VAPID EC P-256 keypair on
+    first startup (persisted as ``vapid_keys.json`` in the data directory,
+    age-encrypted when a daily key is loaded).  The subscribe endpoint
+    requires an ATTRIBUTED per-user bearer token and returns 403 for an
+    authenticated but unattributed token; a missing or invalid token is
+    rejected at the auth middleware with 401 before either endpoint runs.
+    The server stores each subscription. False by default (opt-in).
     """
 
     enabled: bool = False
@@ -1808,7 +1795,6 @@ class MobilePwaConfig:
     static_dir: str = ""
     cookie_name: str = "paramem_token"
     push_enabled: bool = False
-    vapid_contact: str = "mailto:admin@localhost"
 
 
 @dataclass
@@ -2083,7 +2069,6 @@ class ServerConfig:
             recall_window=self.consolidation.recall_window,
             recall_probe_every_n_epochs=self.consolidation.recall_probe_every_n_epochs,
             recall_probe_batch_size=self.consolidation.recall_probe_batch_size,
-            save_steps_ram=self.consolidation.training_save_steps_ram,
         )
 
     @property
@@ -2309,18 +2294,22 @@ def build_server_config(raw: dict, *, source_path: str | Path) -> ServerConfig:
     # message is faster to diagnose).
     _retired_consolidation_keys = {
         "training_save_strategy_bg": (
-            "config error: `consolidation.training_save_strategy_bg` was "
-            "removed. Use `training.save_strategy` and `training.save_steps` "
-            "directly, or set `consolidation.training_save_steps_ram` for "
-            "RAM-mode checkpointing. Remove `training_save_strategy_bg` from "
-            "your config file."
+            "config error: `consolidation.training_save_strategy_bg` is "
+            "not accepted: training writes a checkpoint at every epoch end "
+            "and at the step a stop request lands; no setting controls it. "
+            "Remove it from your config file."
         ),
         "training_save_steps_bg": (
-            "config error: `consolidation.training_save_steps_bg` was "
-            "removed. Use `training.save_strategy` and `training.save_steps` "
-            "directly, or set `consolidation.training_save_steps_ram` for "
-            "RAM-mode checkpointing. Remove `training_save_steps_bg` from "
-            "your config file."
+            "config error: `consolidation.training_save_steps_bg` is not "
+            "accepted: training writes a checkpoint at every epoch end and "
+            "at the step a stop request lands; no setting controls it. "
+            "Remove it from your config file."
+        ),
+        "training_save_steps_ram": (
+            "config error: `consolidation.training_save_steps_ram` is not "
+            "accepted: training writes a checkpoint at every epoch end and "
+            "at the step a stop request lands; no setting controls it. "
+            "Remove it from your config file."
         ),
         "indexed_key_replay": (
             "config error: `consolidation.indexed_key_replay` was removed. "
@@ -2444,7 +2433,17 @@ def build_server_config(raw: dict, *, source_path: str | Path) -> ServerConfig:
     if cpu_raw:
         config.cpu = CpuConfig(**cpu_raw)
 
-    mobile_pwa_raw = raw.get("mobile_pwa", {})
+    mobile_pwa_raw = raw.get("mobile_pwa") or {}
+    _retired_mobile_pwa_keys = {
+        "vapid_contact": (
+            "config error: `mobile_pwa.vapid_contact` is not accepted: "
+            "the server sends no notifications, so no contact is used. "
+            "Remove it from your config file."
+        ),
+    }
+    for _retired_key, _message in _retired_mobile_pwa_keys.items():
+        if _retired_key in mobile_pwa_raw:
+            raise ValueError(_message)
     if mobile_pwa_raw:
         config.mobile_pwa = MobilePwaConfig(**mobile_pwa_raw)
 

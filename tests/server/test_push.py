@@ -474,7 +474,6 @@ def _call_push_subscribe(
 
     mock_config = MagicMock()
     mock_config.mobile_pwa.push_enabled = push_enabled
-    mock_config.mobile_pwa.vapid_contact = "mailto:test@localhost"
 
     saved = {
         "config": _app._state.get("config"),
@@ -635,11 +634,6 @@ class TestPushSubscribeEndpoint:
 
 
 # ---------------------------------------------------------------------------
-# send_ping self-verification (keygen + send construct correctly)
-# ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
 # Subscription validation — add() rejects malformed/unsafe endpoints
 # ---------------------------------------------------------------------------
 
@@ -753,49 +747,135 @@ class TestPushSubscribeEndpointValidation:
 
 
 # ---------------------------------------------------------------------------
-# send_ping transport
+# Lifespan wiring — the VAPID keypair and the push subscription store are
+# constructed only when both mobile_pwa.enabled and mobile_pwa.push_enabled
+# are true; either alone leaves both unset.
 # ---------------------------------------------------------------------------
 
 
-class TestSendPingConstruct:
-    def test_send_ping_uses_http2_transport(self, tmp_path, monkeypatch):
-        """send_ping sends over httpx with http2=True and gets an HTTP-level response.
+def _make_cloud_only_pwa_config(tmp_path: Path, *, enabled: bool, push_enabled: bool):
+    """A cloud-only ``ServerConfig`` (no model or GPU load) with ``mobile_pwa``
+    set to *enabled*/*push_enabled*."""
+    from paramem.server.config import (
+        MobilePwaConfig,
+        PathsConfig,
+        ServerConfig,
+        STTConfig,
+        TTSConfig,
+    )
 
-        Sends to a well-formed but dummy Apple push endpoint.  The real endpoint
-        returns a 4xx (not a BadStatusLine or ConnectionError), which confirms:
-        (a) HTTP/2 was negotiated (http_version=="HTTP/2"), and
-        (b) the VAPID JWT construction is syntactically correct.
+    config = ServerConfig(model_name="mistral")
+    config.cloud_only = True
+    config.stt = STTConfig(enabled=False)
+    config.tts = TTSConfig(enabled=False)
+    config.mobile_pwa = MobilePwaConfig(enabled=enabled, push_enabled=push_enabled)
+    root = tmp_path / "data"
+    config.paths = PathsConfig(data=root, sessions=root / "sessions", debug=root / "debug")
+    return config
 
-        Set NO_NETWORK=1 to skip in environments without internet access.
-        """
-        import os
 
-        if os.environ.get("NO_NETWORK"):
-            pytest.skip("NO_NETWORK set — skipping network probe")
+def _run_lifespan_and_read_push_state(tmp_path: Path, *, enabled: bool, push_enabled: bool) -> dict:
+    """Run the real ``lifespan()`` through its yield with the model load, GPU
+    probes, timer reconcile, backup and consolidation dispatch patched out,
+    and return what it wired into ``_state["vapid"]`` / ``_state["push_store"]``.
+    """
+    import asyncio
+    from unittest.mock import MagicMock, patch
 
-        from paramem.server.push import send_ping
-        from paramem.server.vapid import ensure_vapid_keypair
+    import paramem.server.app as app_module
 
-        _setup_daily(tmp_path, monkeypatch)
-        handle = ensure_vapid_keypair(tmp_path)
-        # A syntactically valid but non-existent Apple push path.
-        dummy_subscription = {
-            "endpoint": "https://web.push.apple.com/DUMMY_PARAMEM_SELF_TEST",
-            "keys": {"p256dh": "AAAA", "auth": "BBBB"},
-        }
+    config = _make_cloud_only_pwa_config(tmp_path, enabled=enabled, push_enabled=push_enabled)
 
-        http_version, status_code = send_ping(dummy_subscription, handle, "mailto:test@localhost")
-
-        # Apple returns a 4xx for an invalid token — NOT a BadStatusLine.
-        # http_version=="HTTP/2" proves the http2 transport is in use.
-        assert http_version == "HTTP/2", (
-            f"Expected HTTP/2 transport; got {http_version!r}. "
-            "Check that h2 is installed and httpx.Client(http2=True) is used."
+    saved_state = {
+        key: app_module._state.get(key)
+        for key in (
+            "config",
+            "cloud_only_startup",
+            "defer_model",
+            "boot_completion_task",
+            "base_swap_task",
+            "vapid",
+            "push_store",
         )
-        assert status_code is not None, (
-            "Expected an HTTP status code (4xx); got None (network-level failure). "
-            f"http_version was: {http_version!r}"
-        )
-        assert isinstance(status_code, int)
-        # Any 4xx is correct: 400/404/410 are all expected for a dummy endpoint.
-        assert 400 <= status_code < 500, f"Expected a 4xx for a dummy endpoint; got {status_code}"
+    }
+    app_module._state["config"] = config
+    app_module._state["cloud_only_startup"] = True
+    app_module._state["defer_model"] = False
+    app_module._state["boot_completion_task"] = None
+    app_module._state["base_swap_task"] = None
+
+    # ``lifespan()`` mounts /app onto the shared module-level app when
+    # mobile_pwa.enabled is true and never unmounts it —
+    # snapshot and restore the route table so this helper leaves the shared
+    # app as it found it.
+    saved_routes = list(app_module.app.router.routes)
+
+    observed: dict = {}
+
+    async def _run():
+        with (
+            patch.object(app_module, "predict_base_bytes", return_value=None),
+            patch.object(app_module, "_gpu_occupied", return_value=False),
+            patch.object(app_module, "_build_runtime_components"),
+            patch.object(app_module, "_arm_active_store_migration", return_value=False),
+            patch.object(app_module, "_release_base_model_in_process"),
+            patch.object(app_module, "safe_empty_cache"),
+            patch.object(app_module, "_reconcile_scheduling_timers"),
+            patch.object(app_module, "_create_backup"),
+            patch.object(app_module, "_dispatch_consolidation"),
+            patch.dict(
+                app_module._state,
+                {"session_buffer": MagicMock(), "speaker_store": MagicMock()},
+                clear=False,
+            ),
+        ):
+            async with app_module.lifespan(app_module.app):
+                observed["vapid"] = app_module._state.get("vapid")
+                observed["push_store"] = app_module._state.get("push_store")
+
+    try:
+        asyncio.run(_run())
+    finally:
+        for key, val in saved_state.items():
+            if val is None:
+                app_module._state.pop(key, None)
+            else:
+                app_module._state[key] = val
+        app_module.app.router.routes[:] = saved_routes
+
+    return observed
+
+
+class TestLifespanPushWiring:
+    """``lifespan()`` wires the VAPID keypair and the push subscription
+    store only when both ``mobile_pwa.enabled`` and ``mobile_pwa.push_enabled``
+    are true."""
+
+    def test_both_flags_true_wires_vapid_and_push_store(self, tmp_path):
+        """enabled=True, push_enabled=True: both are constructed."""
+        observed = _run_lifespan_and_read_push_state(tmp_path, enabled=True, push_enabled=True)
+
+        assert observed["vapid"] is not None
+        assert observed["push_store"] is not None
+
+    def test_enabled_without_push_enabled_leaves_both_unset(self, tmp_path):
+        """enabled=True, push_enabled=False: neither is constructed."""
+        from paramem.server.vapid import vapid_keys_path
+
+        observed = _run_lifespan_and_read_push_state(tmp_path, enabled=True, push_enabled=False)
+
+        assert observed["vapid"] is None
+        assert observed["push_store"] is None
+        assert not vapid_keys_path(tmp_path / "data").exists()
+
+    def test_push_enabled_without_enabled_leaves_both_unset(self, tmp_path):
+        """enabled=False, push_enabled=True: neither is constructed —
+        ``mobile_pwa.enabled`` is required even though push_enabled alone
+        might read as sufficient."""
+        from paramem.server.vapid import vapid_keys_path
+
+        observed = _run_lifespan_and_read_push_state(tmp_path, enabled=False, push_enabled=True)
+
+        assert observed["vapid"] is None
+        assert observed["push_store"] is None
+        assert not vapid_keys_path(tmp_path / "data").exists()

@@ -2952,11 +2952,12 @@ async def lifespan(app: FastAPI):
             len(_state["user_token_store"].list()),
         )
 
-    # VAPID keypair — opt-in via mobile_pwa.push_enabled.  Generated once and
-    # persisted as vapid_keys.json (age-encrypted when a daily key is loaded).
-    # Loaded after assert_mode_consistency so the write lands in the validated
-    # encryption mode.  Skipped when push_enabled=false so default deployments
-    # hold zero VAPID state.
+    # VAPID keypair — opt-in via mobile_pwa.enabled AND mobile_pwa.push_enabled
+    # (both required).  Generated once and persisted as vapid_keys.json
+    # (age-encrypted when a daily key is loaded).  Loaded after
+    # assert_mode_consistency so the write lands in the validated encryption
+    # mode.  Skipped when either flag is false so default deployments hold
+    # zero VAPID state.
     _state["vapid"] = None
     _state["push_store"] = None
     if config.mobile_pwa.enabled and config.mobile_pwa.push_enabled:
@@ -5186,10 +5187,12 @@ async def push_subscribe(body: PushSubscribeRequest, http_request: Request):
 
     The subscription is persisted under the speaker_id bound to an
     ATTRIBUTED per-user bearer token (set by
-    :class:`~paramem.server.auth.BearerTokenMiddleware`).  An unattributed
-    per-user token or an unauthenticated request is rejected with HTTP 403.
-    The endpoint is deduplicated per speaker — re-subscribing the same
-    endpoint is a no-op.
+    :class:`~paramem.server.auth.BearerTokenMiddleware`).  A missing or
+    invalid token is rejected with HTTP 401 by the auth middleware before
+    this handler runs; an authenticated but unattributed per-user token
+    reaches the handler and is rejected here with HTTP 403.  The endpoint
+    is deduplicated per speaker — re-subscribing the same endpoint is a
+    no-op.
 
     Request body (``application/json``) must be the browser
     ``PushSubscription.toJSON()`` shape::
@@ -5203,9 +5206,12 @@ async def push_subscribe(body: PushSubscribeRequest, http_request: Request):
     -------
     JSON
         ``{"status": "subscribed"}`` on success (new or duplicate).
+    HTTP 401
+        When the request carries a missing or invalid bearer token
+        (raised by the auth middleware; this handler never runs).
     HTTP 403
-        When no per-user speaker_id is attached to the request (an
-        unattributed per-user token, or unauthenticated).
+        When the request is authenticated but the token carries no
+        speaker attribution (an unattributed per-user token).
     HTTP 503
         When ``push_enabled`` is false or the push store is not initialised.
     """
@@ -11309,8 +11315,9 @@ async def reconsolidate():
 
     A reconcile IS a full consolidation whose input excludes pending
     sessions: one fold topology throughout — the interim ring is recalled,
-    absorbed into the main tiers, and reaped, exactly as any full fold; warm
-    start is uniform, with no cold-start arm.  Only pending sessions differ:
+    absorbed into the main tiers, and reaped, exactly as any full fold;
+    every tier's starting weights are decided the same way (own weights,
+    else a valid donor, else LoRA-zero).  Only pending sessions differ:
     they stay pending here, unlike an ordinary full fold at
     ``max_interim_count == 0``.  The pending conversations are still there
     for ``POST /consolidate`` or the schedule to absorb afterwards.
@@ -18825,7 +18832,6 @@ def _await_bg_cycle(
     procedural_rels: list,
     speaker_id: str,
     mode: "Literal['simulate', 'train']",
-    run_label: str,
     pending: "PendingRelations",
     schedule: str = "",
     max_interim_count: int = 7,
@@ -18856,7 +18862,6 @@ def _await_bg_cycle(
         speaker_id: Default speaker tag for relations without one.
         mode: ``"train"`` writes adapter weights; ``"simulate"`` writes a
             ``graph.json`` payload into the same written-slot envelope.
-        run_label: Traceability tag passed to ``run_consolidation_cycle``.
         pending: The batch's merged extraction product — the caller's own
             :meth:`~paramem.training.consolidation.ConsolidationLoop.take_pending_relations`
             take, forwarded verbatim to ``run_consolidation_cycle``.
@@ -18907,7 +18912,6 @@ def _await_bg_cycle(
             procedural_rels,
             speaker_id=speaker_id,
             mode=mode,
-            run_label=run_label,
             pending=pending,
             schedule=schedule,
             max_interim_count=max_interim_count,
@@ -19116,7 +19120,6 @@ def _run_extraction_phase(
                 all_procedural_rels,
                 speaker_id=primary_speaker_sim,
                 mode="simulate",
-                run_label=f"full-{primary_speaker_sim or 'anon'}",
                 pending=pending_relations,
                 schedule=config.consolidation.refresh_cadence,
                 max_interim_count=config.consolidation.max_interim_count,
@@ -19186,7 +19189,6 @@ def _run_extraction_phase(
                 all_procedural_rels,
                 speaker_id=primary_speaker,
                 mode="train",
-                run_label=f"full-{primary_speaker or 'anon'}",
                 pending=pending_relations,
                 schedule=config.consolidation.refresh_cadence,
                 max_interim_count=config.consolidation.max_interim_count,
@@ -20306,7 +20308,6 @@ def _extract_and_start_training():
             procedural_rels=all_procedural_rels,
             speaker_id=primary_speaker_sim,
             mode="simulate",
-            run_label=f"tick-{primary_speaker_sim or 'anon'}",
             pending=extraction.pending,
             schedule=config.consolidation.refresh_cadence,
             max_interim_count=config.consolidation.max_interim_count,
@@ -20390,7 +20391,6 @@ def _extract_and_start_training():
             all_procedural_rels,
             speaker_id=primary_speaker,
             mode="train",
-            run_label=f"tick-{primary_speaker or 'anon'}",
             pending=extraction.pending,
             schedule=schedule,
             max_interim_count=max_interim_count,
@@ -20696,9 +20696,11 @@ def _run_full_consolidation_sync(event: "Literal['full', 'reconcile']") -> None:
     on a failed recall-sanity check ``tier_backup_scope`` restores only the
     in-VRAM state of the one tier that was training — the tier's on-disk and
     live-serving state are untouched — and the fold aborts that tier.
-    Warm start is uniform for every tier of every event — no cold-start arm:
-    a resident tier's weights are kept, and the funnel's staging copy
-    warm-starts from them (``paramem.training.trainer.train_adapter``). The
+    Every tier's starting weights are decided the same way for every event:
+    a resident tier's weights are kept and the funnel's staging copy
+    warm-starts from them; a tier with no prior weights starts from a valid
+    donor checkpoint, or LoRA-zero otherwise
+    (``paramem.training.trainer.train_adapter``). The
     tier itself is never deleted or recreated by this call — only a resident
     tier's LoRA config that no longer matches the tier config is recreated
     (still never written live) ahead of the snapshot via

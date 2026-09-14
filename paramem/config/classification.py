@@ -5,8 +5,9 @@ source of truth for tier assignment.  The lookup table is a module-level dict
 literal — no file I/O, no YAML dependency — easy to audit by diff.
 
 Scope: ``configs/server.yaml`` only (server runtime config; experiment-script config excluded).
-Fields in ``configs/default.yaml`` (``training:``, ``replay:``, ``graph:``, ``wandb:``)
-are experiment-script config, not server runtime, and are excluded.
+Fields in ``archive/configs/default.yaml`` (``training:``, ``replay:``,
+``graph:``, ``wandb:``) are experiment-script config, not server runtime,
+and are excluded.
 
 Fallback rule: any path that is not present in
 :data:`CLASSIFICATION` and not reachable via wildcard substitution is treated

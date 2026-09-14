@@ -104,7 +104,7 @@ server:
   port: 8420                    # tests use TestClient (in-process ASGI) — no socket bound; matches example for fixture/example parity
   reclaim_interval_minutes: 10  # how often to check if GPU is free for auto-reclaim
 
-model: mistral  # mistral | gemma | qwen3b | gemma4
+model: mistral  # base model alias (a model registry key)
 
 debug: true   # dev-test posture: full diagnostic artefacts (per-session graph dumps, cycle
               # snapshots, JSONL transcripts) under paths.debug for failure triage. Safe because
@@ -267,7 +267,7 @@ consolidation:
   promotion_threshold: 3       # reinforcement_count threshold for key promotion to semantic
   retain_sessions: true        # archive transcripts after consolidation (false = delete)
   refinement_enrichment: "on"   # graph-stage cloud enrichment — on in tests; requires the top-level `cloud.enabled: true` master switch. This is the flag that actually triggers the graph-content cloud call — same real-name-leak residual on misclassification.
-  refinement_normalization: "on"  # full-fold predicate-synonym collapse (per-group cluster model call); local-7B precision ~0.89 accepted
+  refinement_normalization: "on"  # full-fold predicate-synonym collapse, one model call per candidate group
   refinement_contradiction: "on"  # Case-2 recency-backed contradiction: freshest last_seen wins; empty/tied → coexist. off|on.
   recall_sanity_threshold: 1.0  # minimum recall fraction (0, 1] for the simulate->train active-store migration's recall gate; 1.0 = sharp (all keys must be recalled). Fold gates require exact recall and do not read this.
   # Per-fold training-budget derivation and donor seeding are the
@@ -366,9 +366,6 @@ consolidation:
   # --- Graph-level cloud enrichment neighborhood knobs ---
   graph_enrichment_neighborhood_hops: 2      # N-hop ego-graph radius per focal entity
   graph_enrichment_max_entities_per_pass: 50 # max nodes per cloud chunk call
-  # RAM-mode checkpointing. Mirrors server.yaml.example (same values required
-  # for fixture/example parity). Per-test overrides go in code.
-  training_save_steps_ram: 0
   # Post-promotion slot retention: mirrors server.yaml.example.
   training_keep_prior_slots: 3
   # Idle debounce: mirrors server.yaml.example.
@@ -687,7 +684,6 @@ mobile_pwa:
   static_dir: ""
   cookie_name: "paramem_token"
   push_enabled: false
-  vapid_contact: "mailto:admin@localhost"
 
 # ============================================================================
 # PROCESS

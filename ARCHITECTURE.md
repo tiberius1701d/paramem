@@ -11,7 +11,6 @@
 | **Framework** | PyTorch + HuggingFace Transformers + PEFT + Accelerate | Industry standard, best LoRA multi-adapter support |
 | **Graph Extractor** | LLM-based structured output | Generate-once, parse-once; prompts externalized to `configs/prompts/` |
 | **Knowledge Graph** | NetworkX (in-memory) + JSON persistence | Sufficient for personal-scale data; no external DB dependency |
-| **Experiment Tracking** | Weights & Biases (wandb) | Most popular for research, zero-config HF integration, free tier sufficient |
 | **Evaluation** | Custom probing harness | Keyed-recall probing against the trained adapters; no external evaluation dependency |
 
 ## Alternatives Considered
@@ -43,13 +42,6 @@ Which mechanism reads an outbound text and marks the values that belong to the o
 | Span-tagging model | Lightweight, CPU-resident, fast | Offered a set of labels, it files a person-like phrase under the nearest one and has no outcome for "none of these" — a pronoun, a kinship phrase or a whole question gets a label regardless; its labels act as one joint prompt, so every change to the operator's list of kinds is a different detector to re-measure; its error classes hold steady across checkpoints, so a threshold is the only lever | Rejected — the keyword vocabulary the operator configures needs a reader that can decide a phrase is not an instance of any offered kind, which filing under the nearest label cannot do |
 | Supervised NER / pattern recognisers | Fast, deterministic | Several checkpoints catch no contact data at all and catch few or no lowercase names; a validated pattern recogniser paired with one of them misses most street addresses, English ones included | Rejected — blind on exactly the shapes household speech takes |
 | A cloud model as the detector | Best measured accuracy of any candidate | Its own provider reads the raw, unmarked text — defeating the reason to mark it before it leaves the house | Rejected — inadmissible as a detector by construction, whatever its accuracy |
-
-### Experiment Tracking
-
-| Option | Pros | Cons | Decision |
-|--------|------|------|----------|
-| wandb | Best UI, HF integration, community standard | Cloud-hosted (free tier) | **Chosen** |
-| MLflow | Self-hosted, open-source | More operational overhead, weaker UI | Skip — unnecessary for solo research |
 
 ## Memory & Adapters
 

@@ -105,7 +105,6 @@ def _make_bare_loop(tmp_path: Path) -> ConsolidationLoop:
         "semantic": AdapterConfig(rank=8, alpha=16, target_modules=["q_proj"]),
         "procedural": AdapterConfig(rank=8, alpha=16, target_modules=["q_proj", "gate_proj"]),
     }
-    loop.wandb_config = None
     loop.output_dir = tmp_path
     loop._thermal_policy = None
     return loop
@@ -193,8 +192,8 @@ class TestDonorFixture:
 
     def test_fixture_pool_disjoint_from_donor_content_pools(self):
         """donor.py's synthetic content pools must never reproduce a fixture
-        value verbatim (H1 docstring-accuracy fix): every pool is checked
-        against the fixture's own 21 subject/object values."""
+        value verbatim: every pool is checked against the fixture's own 21
+        subject/object values."""
         import paramem.training.donor as donor_module
 
         with _FIXTURE_PATH.open() as f:
@@ -266,7 +265,7 @@ class TestDonorEntries:
         same-(subject,predicate) 'expertise' cluster -- the structural
         property the donor exists to teach (divergence depth). Block 0 is
         the real fixture (subject "speaker0"); every later block has its
-        own distinct primary subject (H1 fix) -- detected here as the
+        own distinct primary subject -- detected here as the
         block's own first entry's subject, not hardcoded."""
         entries = donor_entries(seed=5, n=128)
         for start in range(0, len(entries), 21):
@@ -287,7 +286,7 @@ class TestDonorEntries:
             assert proc_count == 6
 
     def test_zero_duplicate_triples_at_multiple_seeds(self):
-        """H1: no (subject, predicate, object) triple may ever be trained
+        """No (subject, predicate, object) triple may ever be trained
         under more than one key -- that is exactly the crowded-predicate
         collapse pattern the donor exists to cure."""
         for seed in range(10):
@@ -299,7 +298,7 @@ class TestDonorEntries:
             )
 
     def test_no_conflicting_objects_for_single_valued_predicates_at_multiple_seeds(self):
-        """H1: no subject may carry two different objects for a
+        """No subject may carry two different objects for a
         single-cardinality predicate (has spouse / graduation date /
         birth date) -- that would be contradictory training data, distinct
         from the intentionally multi-valued clusters (expertise etc.)."""
@@ -435,11 +434,14 @@ class TestResolveDonorCheckpoint:
     resolution and gating logic.
 
     Donor resolution is the unconditional standard mechanism (no feature
-    flag; see benchmarking.md). This method resolves and
+    flag). This method resolves and
     validates a checkpoint directory -- it copies NOTHING; the copy into the
     transient staging slot, and the load-failure degrade, are
-    ``train_adapter``'s own job (see ``tests/test_staging_adapter.py``'s
-    staging-init pins). Every test below builds a plain ``TrainingConfig()``.
+    ``train_adapter``'s own job, which records the outcome as
+    ``metrics["init"]``: ``"warm"`` when the target already has prior
+    trained weights, ``"donor"`` when it does not but a valid donor
+    checkpoint is set, ``"cold"`` (LoRA-zero) otherwise.
+    Every test below builds a plain ``TrainingConfig()``.
     """
 
     def test_resolves_valid_checkpoint_for_a_measured_cold_target(self, tmp_path):
@@ -580,7 +582,6 @@ class TestResolveDonorCheckpoint:
                 adapter_config=loop.tier_adapters["episodic"],
                 training_config=loop.training_config,
                 output_dir=tmp_path / "scratch",
-                run_name="test",
                 phase_name="test",
             )
 
@@ -623,7 +624,6 @@ class TestResolveDonorCheckpoint:
                 adapter_config=loop.tier_adapters["episodic"],
                 training_config=loop.training_config,
                 output_dir=tmp_path / "scratch",
-                run_name="test",
                 phase_name="test",
             )
 
@@ -664,7 +664,6 @@ class TestTrainTierAdapterEntryFormatting:
                 adapter_config=loop.tier_adapters["episodic"],
                 training_config=loop.training_config,
                 output_dir=tmp_path / "scratch",
-                run_name="test",
                 phase_name="test",
             )
 

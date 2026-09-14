@@ -153,8 +153,8 @@ Token minting, revocation, and the `mint-user-token` CLI syntax are documented i
 - `vapid_keys.json` — EC P-256 VAPID private key (PEM). Auto-generated on first startup when push is enabled; auto-loaded on subsequent startups.
 - `push_subscriptions.json` — per-speaker Web Push endpoint registrations: the browser-supplied endpoint URL and its subscription keys, grouped by speaker.
 - `vapid_keys.json` and `push_subscriptions.json` follow the same encryption posture as `user_tokens.json`: plaintext under Security OFF, age-encrypted under Security ON, covered by the startup mode-consistency scan.
-- **VAPID key stability:** rotating `vapid_keys.json` invalidates all existing browser push subscriptions (browsers will not receive notifications until they re-subscribe). Treat the keypair as effectively immutable once browsers have subscribed. Key rotation is intentionally out of scope.
-- **Notification-only ping posture:** no personal content passes through the push relay. The push payload is intentionally empty (or carries only a generic title); real content is fetched by the client after the user taps the notification.
+- **VAPID key stability:** rotating `vapid_keys.json` invalidates all existing browser push subscriptions (the browser's existing subscription becomes unusable until it re-subscribes). Treat the keypair as effectively immutable once browsers have subscribed. Key rotation is intentionally out of scope.
+- **Storage-only posture:** the server generates the keypair and stores each subscription's endpoint and keys; it sends no notification, so no content ever passes through the push relay.
 - **Revocation** is per-token or per-speaker and takes effect immediately on the next request.
 - **Token carriers:** `Authorization: Bearer <token>` HTTP header — this is the carrier the PWA uses in practice. The middleware also accepts the configured cookie name if one is presented by the client, but the server does not issue a cookie; the PWA stores the token in `localStorage` and sends it exclusively via the `Authorization` header.
 

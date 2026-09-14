@@ -60,31 +60,10 @@ class TestConfig:
         with pytest.raises(ValueError, match="Unknown model"):
             _ = config.model_config
 
-    def test_adapter_config(self):
-        config = ServerConfig()
-        ac = config.tier_config_map()["episodic"]
-        assert ac.rank == 8
-        assert ac.alpha == 16
-        assert ac.dropout == 0.0
-
-    def test_training_config(self):
-        config = ServerConfig()
-        tc = config.training_config
-        # Epochs and gradient accumulation are derived per fold from the
-        # key-triple count via budget_for -- unconditional and unclamped,
-        # no operator ceiling -- so they are not asserted here.
-        assert tc.batch_size == 1
-        assert tc.max_seq_length == 1024
-
     def test_consolidation_config(self):
         config = ServerConfig()
         cc = config.consolidation_config
         assert cc.promotion_threshold == 3
-
-    def test_missing_config_file_returns_defaults(self):
-        config = load_server_config("nonexistent.yaml")
-        assert config.model_name == "mistral"
-        assert config.server.port == 8420
 
     def test_env_var_interpolation(self, tmp_path, monkeypatch):
         monkeypatch.setenv("TEST_API_KEY", "sk-secret-123")

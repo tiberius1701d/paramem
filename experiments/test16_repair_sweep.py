@@ -790,7 +790,6 @@ def _run_phase(
     lr_decay_steps: int | None,
     weight_decay: float,
     early_stop_policy: EarlyStopPolicy,
-    run_name: str,
     retention_keyed: list[dict] | None = None,
     retention_registry: dict[str, int] | None = None,
     resume_from_checkpoint: Path | None = None,
@@ -814,7 +813,6 @@ def _run_phase(
         early_stop_policy: EarlyStopPolicy controlling probe schedule and
             optional floor-relative stop via
             ``extra_epochs_past_first_perfect``.
-        run_name: WandB / HF run name.
         retention_keyed: Optional unchanged-key list for dual-probe logging.
         retention_registry: Required if retention_keyed is provided.
         resume_from_checkpoint: Checkpoint path for tresume; None for fresh.
@@ -880,7 +878,6 @@ def _run_phase(
         training_config=training_cfg,
         adapter_config=adapter_cfg,
         output_dir=phase_dir,
-        run_name=run_name,
         callbacks_extra=[callback],
         resume_from_checkpoint=str(resume_from_checkpoint) if resume_from_checkpoint else None,
     )
@@ -1125,7 +1122,6 @@ def run_repair_loop_v2(
             training_config=training_cfg,
             adapter_config=adapter_cfg,
             output_dir=ep_dir,
-            run_name=f"test16-repair-{cell_dir.name}-ep{episode}",
         )
         ep_wall = time.time() - t0
         train_loss = metrics.get("train_loss")
@@ -1492,7 +1488,6 @@ def run_cell(
             lr_decay_steps=pretrain_decay,
             weight_decay=pretrain_wd,
             early_stop_policy=base_stop_policy,
-            run_name=f"test16-base{D}-seed{seed}",
             resume_from_checkpoint=a_ckpt,
         )
 
@@ -1626,7 +1621,6 @@ def run_cell(
             lr_decay_steps=overwrite_decay,
             weight_decay=pretrain_wd,
             early_stop_policy=no_stop_policy,
-            run_name=f"test16-corrupted{D}-seed{seed}",
             retention_keyed=unchanged_keyed,
             retention_registry=unchanged_registry,
             resume_from_checkpoint=c_ckpt,

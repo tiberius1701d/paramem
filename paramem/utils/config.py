@@ -4,8 +4,7 @@ plus a live per-fold training-budget derivation.
 This module is the YAML loader for the archived research scripts under
 ``archive/experiments/`` and their reference YAML at
 ``archive/configs/default.yaml``. Active runtime, server, test, and
-example code never calls ``load_config``; the lint guard
-``tests/test_test_config_loader_usage.py`` enforces this.
+example code never calls ``load_config``.
 
 The dataclasses defined below (``ParaMemConfig``, ``AdapterConfig``,
 ``TrainingConfig``, ``ConsolidationConfig``, etc.) remain importable by
@@ -33,7 +32,7 @@ from paramem.utils.paths import find_project_root
 _REFINEMENT_TOGGLES: frozenset[str] = frozenset({"off", "on"})
 
 
-@dataclass
+@dataclass(frozen=True)
 class ModelConfig:
     model_id: str = "Qwen/Qwen2.5-3B"
     quantization: str = "nf4"
@@ -80,20 +79,12 @@ class TrainingConfig:
     max_grad_norm: float = 1.0
     seed: int = 42
     save_strategy: str = "epoch"
-    save_steps: int = 0  # Steps between saves when save_strategy="steps"; 0 → HF default (500)
     save_total_limit: int = 2
     # HF Trainer logging cadence. Default 1 (verbose). The BG-trainer call
     # site overrides via dataclasses.replace to log every 10 steps when
     # delegating to train_adapter; other callers inherit the verbose
     # default.
     logging_steps: int = 1
-    # RAM-mode checkpointing: when > 0, train_adapter writes checkpoints to
-    # /dev/shm instead of the caller's output_dir (avoids encrypted-disk IO
-    # overhead on every save), then copies the latest checkpoint to
-    # <output_dir>/bg_checkpoint_epoch/checkpoint-N/ at each epoch boundary.
-    # Trade-off: /dev/shm is not durable across restarts; a crash loses the
-    # in-flight checkpoint.  Set to 0 (default) to disable.
-    save_steps_ram: int = 0
     early_stopping: bool = False
     early_stopping_threshold: float = 0.01
     early_stopping_floor: int = 10
@@ -134,10 +125,6 @@ class TrainingConfig:
 # recall gate terminates training before the cap in the common case.
 # `lr_decay_steps` defaults to None for every bucket (create_scheduler's
 # no-op passthrough; see TrainingConfig.lr_decay_steps).
-#
-# See configs/server.yaml.example for the per-bucket epoch/accum values,
-# and benchmarking.md's "Test 20: Small-N Cold-Init Recall Gate" section
-# for the supporting evidence.
 _BUDGET_TABLE: tuple[tuple[int, int, int, "int | None"], ...] = (
     # (n_keys floor, epochs, accum, lr_decay_steps)
     (128, 30, 2, None),
@@ -149,9 +136,11 @@ _BUDGET_TABLE: tuple[tuple[int, int, int, "int | None"], ...] = (
 def budget_for(n_keys: int) -> "tuple[int, int, int | None]":
     """Derive the per-fold training budget from the key-triple count.
 
-    The unconditional standard mechanism — see ``benchmarking.md``, "Test
-    20", for the supporting evidence. Pure, module-level, and callable
-    independently of whether training has run (see the call sites in
+    The unconditional standard mechanism: every fold's epoch cap,
+    gradient-accumulation step count, and LR-decay-step count come from
+    the matching row of ``_BUDGET_TABLE``, chosen by the first floor the
+    key count meets. Pure, module-level, and callable independently of
+    whether training has run (see the call sites in
     ``paramem.training.consolidation``, which invoke this in the enclosing
     scope BEFORE the training ``try`` block so the ``finally``-path
     telemetry records the true budget even when training raises).
@@ -244,13 +233,6 @@ class ConsolidationConfig:
 
 
 @dataclass
-class WandbConfig:
-    project: str = "paramem"
-    entity: str = ""
-    enabled: bool = True
-
-
-@dataclass
 class PathsConfig:
     data_dir: str = "data"
     output_dir: str = "outputs"
@@ -265,7 +247,6 @@ class ParaMemConfig:
     training: TrainingConfig = field(default_factory=TrainingConfig)
     graph: GraphConfig = field(default_factory=GraphConfig)
     consolidation: ConsolidationConfig = field(default_factory=ConsolidationConfig)
-    wandb: WandbConfig = field(default_factory=WandbConfig)
     paths: PathsConfig = field(default_factory=PathsConfig)
 
 
@@ -284,9 +265,8 @@ def load_config(
     Archived loader: the reference YAML lives at
     ``archive/configs/default.yaml`` alongside the archived research scripts
     that depend on it; when that file is absent this returns
-    ``ParaMemConfig()`` defaults rather than raising. Active code does not
-    call this function -- enforced by
-    ``tests/test_test_config_loader_usage.py``.
+    ``ParaMemConfig()`` defaults rather than raising. Called only by scripts
+    under ``archive/experiments/``.
     """
     if config_path is None:
         config_path = (
@@ -308,7 +288,6 @@ def load_config(
     training = _build_dataclass(TrainingConfig, raw.get("training", {}))
     graph = _build_dataclass(GraphConfig, raw.get("graph", {}))
     consolidation = _build_dataclass(ConsolidationConfig, raw.get("consolidation", {}))
-    wandb_cfg = _build_dataclass(WandbConfig, raw.get("wandb", {}))
     paths = _build_dataclass(PathsConfig, raw.get("paths", {}))
 
     adapters = {}
@@ -321,6 +300,5 @@ def load_config(
         training=training,
         graph=graph,
         consolidation=consolidation,
-        wandb=wandb_cfg,
         paths=paths,
     )

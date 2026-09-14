@@ -1387,9 +1387,7 @@ class TestStageBCycleInterimRecallGateKeepsSessionsPending:
             # run_consolidation_cycle returns successfully, so a raise here
             # means the mark_consolidated call below is never reached.
             loop.run_consolidation_cycle.side_effect = exc
-            loop.run_consolidation_cycle(
-                [], [], speaker_id="speaker0", mode="train", run_label="tick"
-            )
+            loop.run_consolidation_cycle([], [], speaker_id="speaker0", mode="train")
             session_buffer.mark_consolidated(["session-a"], retention_dir=None)
             return "trained", None
 

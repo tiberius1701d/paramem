@@ -1,4 +1,4 @@
-"""Web Push subscription registry and send helper.
+"""Web Push subscription registry.
 
 ``PushSubscriptionStore`` mirrors :class:`~paramem.server.user_tokens.UserTokenStore`
 in structure and encryption posture: subscriptions are keyed per speaker, written
@@ -24,14 +24,11 @@ On-disk schema (``push_subscriptions.json``):
 Subscriptions are deduplicated per speaker by endpoint URL.  An endpoint that
 appears more than once for the same speaker is silently ignored on ``add``.
 
-Send helper
------------
-:func:`send_ping` posts a contentless push notification via
-``httpx.Client(http2=True)`` (requires the ``h2`` package for HTTP/2).  Only
-the VAPID ``Authorization`` header and a ``TTL`` header are sent — no body,
-no personal content.  The push payload is intentionally empty: the service
-worker's ``push`` event handler shows a generic notification badge; real
-content is fetched by the client after the user taps.
+This module is the subscription store only: it persists and deduplicates
+per-speaker Web Push endpoints. It holds no VAPID key material and
+defines no HTTP routes — the VAPID keypair is generated and held in
+``paramem.server.vapid``, and the ``/push/vapid-public-key`` and
+``/push/subscribe`` endpoints are FastAPI routes in ``paramem.server.app``.
 
 Security properties
 -------------------
@@ -57,9 +54,6 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 _STORE_VERSION = 1
-# TTL in seconds — how long the push relay holds the notification if the device
-# is offline.  60 seconds is appropriate for a conversational assistant ping.
-_PUSH_TTL = "60"
 
 
 def _validate_subscription(subscription: dict) -> None:
@@ -304,9 +298,6 @@ class PushSubscriptionStore:
     def remove(self, endpoint: str) -> int:
         """Remove all subscriptions matching *endpoint* across all speakers.
 
-        Used to prune dead/expired subscriptions (e.g. after a 404/410 response
-        from the push relay).
-
         Parameters
         ----------
         endpoint:
@@ -337,68 +328,3 @@ class PushSubscriptionStore:
         if removed:
             logger.info("Pruned %d subscription(s) for endpoint=%s…", removed, endpoint[:60])
         return removed
-
-
-def send_ping(subscription: dict, vapid_handle, contact: str) -> tuple[str, int | None]:
-    """Send a contentless Web Push ping to a single subscription.
-
-    The push carries no body — only ``Authorization`` (VAPID JWT) and ``TTL``
-    headers are set.  The service worker's ``push`` event shows a generic
-    notification badge; real content is fetched by the client on tap.
-
-    Transport is ``httpx.Client(http2=True)`` (requires the ``h2`` package),
-    which negotiates HTTP/2 with ``web.push.apple.com`` via TLS ALPN.  HTTP/1.1
-    is rejected by Apple's push endpoint at the protocol layer.
-
-    Parameters
-    ----------
-    subscription:
-        Push subscription dict with ``endpoint`` (and optional ``keys``).
-    vapid_handle:
-        A loaded :class:`py_vapid.Vapid` instance.
-    contact:
-        The VAPID JWT ``sub`` claim (e.g. ``"mailto:admin@localhost"``).
-
-    Returns
-    -------
-    tuple[str, int | None]
-        ``(http_version, status_code)`` where ``http_version`` is ``"HTTP/2"``
-        when the transport is working correctly.  ``status_code`` is ``None``
-        only on a network-level exception; in that case ``http_version`` carries
-        a descriptive error string.
-
-    Notes
-    -----
-    - A 404 or 410 response means the subscription is expired or revoked — the
-      caller should prune it via
-      :meth:`PushSubscriptionStore.remove`.
-    - A 201 response is the success code from most push relays.
-    - Network-level failures (connection refused, DNS failure, TLS error) are
-      boundary-handled: they return an error string in ``http_version`` and
-      ``None`` in ``status_code``.  They are NOT silently swallowed — the caller
-      can inspect and decide whether to retry or log.
-    """
-    import httpx
-
-    from paramem.server.vapid import vapid_authorization_header
-
-    endpoint = subscription["endpoint"]
-    auth_header = vapid_authorization_header(vapid_handle, endpoint, contact)
-
-    headers = {
-        "Authorization": auth_header,
-        "TTL": _PUSH_TTL,
-        "Content-Length": "0",
-    }
-
-    try:
-        with httpx.Client(http2=True) as client:
-            response = client.post(endpoint, headers=headers)
-        return (response.http_version, response.status_code)
-    except httpx.HTTPError as exc:
-        # Boundary error: network-level failure (connection refused, DNS failure,
-        # TLS error, protocol mismatch).  NOT control-flow suppression — real
-        # transport problems from a dead or unreachable endpoint.
-        error_str = f"network_error:{type(exc).__name__}: {exc}"
-        logger.warning("push send failed for endpoint=%s…: %s", endpoint[:60], exc)
-        return (error_str, None)

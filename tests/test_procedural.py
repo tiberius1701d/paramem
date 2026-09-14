@@ -172,7 +172,6 @@ class TestProceduralRoutedToInterim:
             speaker_id="speaker0",
             mode="train",
             pending=pending,
-            run_label="test_interim_route",
             stamp=_INTERIM_STAMP,
         )
 
@@ -217,7 +216,6 @@ class TestProceduralRoutedToInterim:
             speaker_id="speaker0",
             mode="train",
             pending=pending,
-            run_label="test_interim_probe_target",
             stamp=_INTERIM_STAMP,
         )
 
@@ -275,7 +273,6 @@ class TestSimulateModeRegistersProceduralKeys:
             speaker_id="speaker0",
             mode="simulate",
             pending=pending,
-            run_label="test_simulate",
             stamp=_INTERIM_STAMP,
         )
 
@@ -375,7 +372,6 @@ class TestProceduralRecallGateAllOrNothing:
                 speaker_id="speaker0",
                 mode="train",
                 pending=pending,
-                run_label="test_all_or_nothing",
                 stamp=_INTERIM_STAMP,
             )
 
@@ -436,7 +432,6 @@ class TestProceduralKeyRegisteredInInterimTier:
             speaker_id="speaker0",
             mode="train",
             pending=pending,
-            run_label="test_tier_regression",
             stamp=_INTERIM_STAMP,
         )
 
@@ -478,7 +473,6 @@ class TestProceduralKeyRegisteredInInterimTier:
             speaker_id="speaker0",
             mode="train",
             pending=pending,
-            run_label="test_bk_preference",
             stamp=_INTERIM_STAMP,
         )
 
@@ -527,7 +521,6 @@ class TestProceduralKeyRegisteredInInterimTier:
             speaker_id="speaker0",
             mode="train",
             pending=pending,
-            run_label="test_active_keys",
             stamp=_INTERIM_STAMP,
         )
 

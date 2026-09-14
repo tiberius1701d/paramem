@@ -38,8 +38,7 @@ the example via the structural parity test
 against drift.
 
 Lint guard `tests/test_test_config_loader_usage.py` forbids tests from
-loading `configs/server.yaml.example` outside an explicit allowlist, and
-forbids the legacy `paramem.utils.config.load_config()` path entirely.
+loading `configs/server.yaml.example` outside an explicit allowlist.
 
 ### Override per-test
 

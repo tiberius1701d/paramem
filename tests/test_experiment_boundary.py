@@ -32,6 +32,8 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 EXPERIMENTS_ROOT = REPO_ROOT / "experiments"
 
@@ -93,14 +95,6 @@ _GRANDFATHERED_PUBLIC_IMPORTS: frozenset[tuple[str, str, str]] = frozenset(
         ("experiments/dataset_probe.py", "paramem.server.config", "load_server_config"),
         (
             "experiments/dataset_probe.py",
-            "paramem.server.consolidation",
-            "create_consolidation_loop",
-        ),
-        # lme_graph_builder.py
-        ("experiments/lme_graph_builder.py", "paramem.models.loader", "load_base_model"),
-        ("experiments/lme_graph_builder.py", "paramem.server.config", "load_server_config"),
-        (
-            "experiments/lme_graph_builder.py",
             "paramem.server.consolidation",
             "create_consolidation_loop",
         ),
@@ -630,3 +624,46 @@ def test_public_allowlist_entries_still_exist():
         "Stale entries in _GRANDFATHERED_PUBLIC_IMPORTS (no longer found in "
         "the tree).  Remove them:\n" + "\n".join(f"  {p}: from {m} import {s}" for p, m, s in stale)
     )
+
+
+def test_benchmark_models_bound_from_model_registry():
+    """``BENCHMARK_MODELS`` names the four benchmark aliases, each bound to
+    the identical ``ModelConfig`` object held by
+    ``paramem.server.config.MODEL_REGISTRY`` under the same alias.
+    """
+    from experiments.utils.test_harness import BENCHMARK_MODELS
+    from paramem.server.config import MODEL_REGISTRY
+
+    assert set(BENCHMARK_MODELS.keys()) == {"gemma", "mistral", "gemma4", "qwen3-4b"}
+    for alias, model_config in BENCHMARK_MODELS.items():
+        assert model_config is MODEL_REGISTRY[alias]
+
+
+def test_add_model_args_rejects_a_registry_alias_outside_the_benchmark_set():
+    """``--model`` only accepts the four benchmark aliases — ``qwen`` is a
+    ``MODEL_REGISTRY`` key (Qwen 2.5 7B) but not one of them, so it is
+    rejected by the parser before any model work begins."""
+    import argparse
+
+    from experiments.utils.test_harness import add_model_args
+
+    parser = argparse.ArgumentParser()
+    add_model_args(parser)
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--model", "qwen"])
+
+
+def test_add_model_args_help_names_all_four_aliases():
+    """The ``--model`` help text names every benchmark alias, so a run
+    without ``--model`` is documented as covering all four in turn."""
+    import argparse
+
+    from experiments.utils.test_harness import BENCHMARK_MODELS, add_model_args
+
+    parser = argparse.ArgumentParser()
+    add_model_args(parser)
+
+    help_text = parser.format_help()
+    for alias in BENCHMARK_MODELS:
+        assert alias in help_text, f"expected {alias!r} named in --model help text"

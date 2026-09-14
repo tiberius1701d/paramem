@@ -639,12 +639,6 @@ def parse_args() -> argparse.Namespace:
         help="Random seed for deterministic per-bucket shuffling (default: 42).",
     )
     parser.add_argument(
-        "--num-epochs",
-        type=int,
-        default=20,
-        help="Training epochs for indexed key training (default: 20).",
-    )
-    parser.add_argument(
         "--no-train",
         action="store_true",
         dest="no_train",
@@ -834,8 +828,6 @@ def main() -> None:
         cfg.adapters.episodic.learning_rate = 1e-4
         cfg.adapters.semantic = dataclasses.replace(cfg.adapters.episodic)
         cfg.adapters.procedural.enabled = False
-
-        cfg.consolidation.max_epochs = args.num_epochs
 
         # --no-cloud path: zero cloud cost for loop defaults. Per-call
         # extract_session overrides (enrichment_provider=, plausibility_judge=) below

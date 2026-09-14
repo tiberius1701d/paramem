@@ -303,7 +303,6 @@ def _make_loop(tmp_path, *, procedural: bool = False, resident_tiers=()) -> Cons
         loop.tier_adapters["procedural"] = AdapterConfig(
             rank=8, alpha=16, target_modules=["q_proj"]
         )
-    loop.wandb_config = None
     loop._thermal_policy = None
     loop.output_dir = tmp_path / "adapters"
     loop.output_dir.mkdir(parents=True, exist_ok=True)

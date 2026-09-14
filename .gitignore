@@ -9,7 +9,6 @@ build/
 # Experiment outputs (large, reproducible)
 outputs/
 outputs
-wandb/
 
 # External datasets (download manually, see README)
 data/external/

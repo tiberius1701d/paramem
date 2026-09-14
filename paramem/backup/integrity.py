@@ -549,9 +549,11 @@ def cleanup_partial_slots(adapter_dir: Path) -> list[dict]:
       here would be a parallel-topology drift bug.
     - The staging slot conventions are in-memory PEFT keys, not on disk —
       this function cannot affect them.
-    - The ``bg_checkpoint_epoch`` and ``checkpoint-*`` scratch dirs written
-      by HF Trainer live UNDER the caller's ``output_dir`` (training-side),
-      not under ``adapter_dir/<tier>/`` — they are out of scope.
+
+    Not skipped: a fold's main-tier training scratch (``<tier>/cycle_<N>/``,
+    holding Hugging Face ``checkpoint-*`` folders and the resume marker)
+    carries no ``meta.json``, so this walk removes it like any other
+    incomplete slot.
 
     Args:
         adapter_dir: Root adapter directory (``config.adapter_dir`` /

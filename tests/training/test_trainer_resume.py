@@ -726,7 +726,7 @@ class TestFingerprintDatasetContentStable:
         fp_config = "aabbccdd" * 8  # stable stand-in for config fingerprint
 
         # Create a fake checkpoint directory that _resolve_resume_checkpoint will verify
-        ckpt_dir = tmp_path / "bg_checkpoint_epoch"
+        ckpt_dir = tmp_path / "checkpoint-5"
         ckpt_dir.mkdir()
 
         # Write staging_resume.json as plaintext (Security OFF — no daily identity)
@@ -817,15 +817,17 @@ class TestFingerprintTrainingConfigScheduleFields:
 class TestStagingResumeCallbackOnSave:
     """Verify ``_StagingResumeCallback.on_save`` records the correct checkpoint path.
 
-    Three scenarios:
-    1. Default epoch-save mode (``save_steps_ram==0``): HF Trainer writes
-       ``checkpoint-N`` directly under ``output_dir``; ``on_save`` must record
-       that as ``disk_checkpoint_path`` and ``_resolve_resume_checkpoint`` must
-       return it on a fresh-process simulation with matching fingerprints.
-    2. When ``bg_checkpoint_epoch/`` exists (RAM copy-back mode), that dir is
-       preferred over ``output_dir/checkpoint-*`` (existing behaviour preserved).
+    Four tests:
+    1. Default epoch-save mode: HF Trainer writes ``checkpoint-N`` directly
+       under ``output_dir``; ``on_save`` must record that as
+       ``disk_checkpoint_path``.
+    2. ``_resolve_resume_checkpoint`` must return that path on a
+       fresh-process simulation with matching fingerprints.
     3. A dir recorded by ``on_save`` that was subsequently deleted (cleaned) must
        cause ``_resolve_resume_checkpoint`` to return ``None``.
+    4. A marker holding a checkpoint pointer under a key other than
+       ``disk_checkpoint_path`` must cause ``_resolve_resume_checkpoint`` to
+       return ``None``.
 
     All tests are no-GPU; no real HF Trainer is invoked.
     """
@@ -842,7 +844,6 @@ class TestStagingResumeCallbackOnSave:
             "adapter_name": "episodic",
             "dataset_fingerprint": fp_dataset,
             "training_config_fingerprint": fp_config,
-            "ram_checkpoint_path": "",
             "disk_checkpoint_path": "",
             "started_at": "2026-06-21T00:00:00+00:00",
             "updated_at": "2026-06-21T00:00:00+00:00",
@@ -862,11 +863,11 @@ class TestStagingResumeCallbackOnSave:
         with patch("paramem.backup.encryption.read_maybe_encrypted", side_effect=read_plain):
             return _read_staging_resume(scratch_path)
 
-    def test_on_save_records_output_dir_checkpoint_when_no_epoch_mirror(self, tmp_path):
-        """Default epoch-save mode: on_save sets disk_checkpoint_path to output_dir/checkpoint-N.
+    def test_on_save_records_output_dir_checkpoint(self, tmp_path):
+        """on_save sets disk_checkpoint_path to output_dir/checkpoint-N.
 
-        Simulates the consolidation fold's save mode where save_steps_ram==0 and
-        HF Trainer writes checkpoint-N directly under output_dir (no bg_checkpoint_epoch/).
+        Simulates the consolidation fold's save mode: HF Trainer writes
+        checkpoint-N directly under output_dir at every epoch end.
         """
         from paramem.training.trainer import _StagingResumeCallback
 
@@ -885,7 +886,6 @@ class TestStagingResumeCallbackOnSave:
 
         cb = _StagingResumeCallback(
             scratch_path=scratch_path,
-            ram_dir=None,
             output_dir=output_dir,
             base_state=base_state,
         )
@@ -933,7 +933,6 @@ class TestStagingResumeCallbackOnSave:
             "adapter_name": "episodic",
             "dataset_fingerprint": fp_dataset,
             "training_config_fingerprint": fp_config,
-            "ram_checkpoint_path": "",
             "disk_checkpoint_path": str(ckpt_dir),
             "started_at": "2026-06-21T00:00:00+00:00",
             "updated_at": "2026-06-21T00:00:00+00:00",
@@ -979,7 +978,6 @@ class TestStagingResumeCallbackOnSave:
             "adapter_name": "episodic",
             "dataset_fingerprint": fp_dataset,
             "training_config_fingerprint": fp_config,
-            "ram_checkpoint_path": "",
             "disk_checkpoint_path": str(output_dir / "checkpoint-5"),  # dir absent
             "started_at": "2026-06-21T00:00:00+00:00",
             "updated_at": "2026-06-21T00:00:00+00:00",
@@ -997,46 +995,79 @@ class TestStagingResumeCallbackOnSave:
 
         assert result is None, f"Expected None when checkpoint dir was cleaned; got {result!r}"
 
-    def test_on_save_epoch_mirror_takes_precedence_over_output_dir_checkpoint(self, tmp_path):
-        """When bg_checkpoint_epoch/ exists, it is preferred over output_dir/checkpoint-*.
-
-        This is the existing RAM copy-back mode behaviour; the new else-branch
-        must not activate when the epoch mirror dir is present.
+    def test_ignores_marker_without_disk_checkpoint_path(self, tmp_path):
+        """A marker that carries no ``disk_checkpoint_path`` entry resolves
+        to no checkpoint, whatever other keys it holds.
         """
-        from paramem.training.trainer import _StagingResumeCallback
+        from paramem.training.trainer import _resolve_resume_checkpoint
 
-        output_dir = tmp_path / "adapter"
+        output_dir = tmp_path / "consolidation_refresh" / "episodic"
         output_dir.mkdir(parents=True)
-
-        # Both bg_checkpoint_epoch/ and a plain checkpoint-N exist.
-        epoch_mirror = output_dir / "bg_checkpoint_epoch"
-        epoch_mirror.mkdir()
-        (epoch_mirror / "checkpoint-10").mkdir()
-        (output_dir / "checkpoint-5").mkdir()
+        ckpt_dir = output_dir / "checkpoint-5"
+        ckpt_dir.mkdir()
 
         fp_dataset = "aabbccdd" * 8
         fp_config = "11223344" * 8
+
         scratch_path = output_dir / "staging_resume.json"
-        base_state = self._base_state(fp_dataset, fp_config)
-        self._write_resume(scratch_path, base_state)
+        state = {
+            "adapter_name": "episodic",
+            "dataset_fingerprint": fp_dataset,
+            "training_config_fingerprint": fp_config,
+            "checkpoint_path": str(ckpt_dir),
+            "started_at": "2026-06-21T00:00:00+00:00",
+            "updated_at": "2026-06-21T00:00:00+00:00",
+        }
+        scratch_path.write_bytes(json.dumps(state, indent=2).encode())
 
-        cb = _StagingResumeCallback(
-            scratch_path=scratch_path,
-            ram_dir=None,
-            output_dir=output_dir,
-            base_state=base_state,
-        )
-        self._invoke_on_save(cb)
+        fingerprints = {"dataset": fp_dataset, "config": fp_config}
 
-        state = self._read_resume_plain(scratch_path)
-        assert state is not None
-        recorded = state["disk_checkpoint_path"]
-        assert "bg_checkpoint_epoch" in recorded, (
-            f"Expected bg_checkpoint_epoch to be preferred; got {recorded!r}"
+        read_plain = lambda p: Path(p).read_bytes()  # noqa: E731
+        with (
+            patch("paramem.backup.key_store.daily_identity_loadable", return_value=False),
+            patch("paramem.backup.encryption.read_maybe_encrypted", side_effect=read_plain),
+        ):
+            result = _resolve_resume_checkpoint(scratch_path, fingerprints)
+
+        assert result is None, (
+            f"Expected None — only disk_checkpoint_path is read as a pointer; got {result!r}"
         )
-        assert "checkpoint-10" in recorded, (
-            f"Expected checkpoint-10 from epoch mirror; got {recorded!r}"
-        )
+
+
+class TestCleanScratch:
+    """``_clean_scratch(output_dir)`` removes ``checkpoint-*`` dirs directly
+    under *output_dir* and leaves every other file or directory there
+    untouched."""
+
+    def test_removes_checkpoint_dirs_and_nothing_else(self, tmp_path):
+        from paramem.training.trainer import _clean_scratch
+
+        output_dir = tmp_path / "adapter"
+        (output_dir / "checkpoint-5").mkdir(parents=True)
+        (output_dir / "checkpoint-5" / "adapter_model.safetensors").write_bytes(b"x")
+        (output_dir / "checkpoint-10").mkdir(parents=True)
+        (output_dir / "checkpoint-10" / "adapter_model.safetensors").write_bytes(b"x")
+        (output_dir / "staging_resume.json").write_text("{}")
+        (output_dir / "logs").mkdir()
+        (output_dir / "logs" / "trainer_log.jsonl").write_text("{}")
+
+        _clean_scratch(output_dir)
+
+        assert not (output_dir / "checkpoint-5").exists()
+        assert not (output_dir / "checkpoint-10").exists()
+        assert (output_dir / "staging_resume.json").exists()
+        assert (output_dir / "logs" / "trainer_log.jsonl").exists()
+
+    def test_noop_when_no_checkpoint_dirs_present(self, tmp_path):
+        from paramem.training.trainer import _clean_scratch
+
+        output_dir = tmp_path / "adapter"
+        output_dir.mkdir(parents=True)
+        (output_dir / "staging_resume.json").write_text("{}")
+
+        _clean_scratch(output_dir)
+
+        assert (output_dir / "staging_resume.json").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -1055,9 +1086,9 @@ class TestFreshStartStaleCheckpointPurge:
     ``checkpoint-N/README.md``.  The next cycle has DIFFERENT content (new
     sessions) so fingerprints mismatch → fresh-start branch.  PEFT's
     ``save_pretrained`` calls ``ModelCard.load(checkpoint-N/README.md)`` which
-    opens the file as UTF-8 and crashes on the age magic bytes.  The fix calls
-    ``_clean_scratch(output_dir, ram_dir=None)`` at the TOP of the fresh-start
-    block, before ``_write_staging_resume``.
+    opens the file as UTF-8 and crashes on the age magic bytes.
+    ``train_adapter`` therefore calls ``_clean_scratch(output_dir)`` at the
+    top of the fresh-start block, before ``_write_staging_resume``.
     """
 
     # AGE file magic: first 4 bytes of a typical age-encrypted file.
@@ -1094,7 +1125,6 @@ class TestFreshStartStaleCheckpointPurge:
             "adapter_name": "episodic",
             "dataset_fingerprint": fp_dataset + "_STALE",
             "training_config_fingerprint": fp_config + "_STALE",
-            "ram_checkpoint_path": "",
             "disk_checkpoint_path": "",
             "started_at": "2026-01-01T00:00:00+00:00",
             "updated_at": "2026-01-01T00:00:00+00:00",
@@ -1238,7 +1268,6 @@ class TestFreshStartStaleCheckpointPurge:
             "adapter_name": "episodic",
             "dataset_fingerprint": fp_dataset,
             "training_config_fingerprint": fp_config,
-            "ram_checkpoint_path": "",
             "disk_checkpoint_path": str(valid_ckpt),
             "started_at": "2026-06-21T00:00:00+00:00",
             "updated_at": "2026-06-21T00:00:00+00:00",

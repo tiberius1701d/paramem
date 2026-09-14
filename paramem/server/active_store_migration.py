@@ -898,7 +898,6 @@ def _migrate_tier_simulate_to_train(
         adapter_config=tier_config,
         training_config=loop.training_config,
         output_dir=_migrate_output_dir,
-        run_name=f"migrate-simulate-to-train-{name}",
         phase_name=f"migrate-{name}",
     )
     if _migrate_metrics is None:

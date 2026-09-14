@@ -265,6 +265,21 @@ class TestBucketTableGovernsUnclamped:
         assert epochs == expected_epochs
 
 
+class TestModelRegistryFrozen:
+    """``ModelConfig`` is a frozen dataclass — an instance cannot be mutated
+    in place; a variant is derived with ``dataclasses.replace`` instead.
+    """
+
+    def test_model_config_mutation_raises(self):
+        import dataclasses
+
+        from paramem.utils.config import ModelConfig
+
+        config = ModelConfig()
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            config.model_id = "some/other-model"
+
+
 class TestRejectedConsolidationKeys:
     """Rejected ``consolidation:`` keys fail loud at config load, not silently.
 
@@ -411,6 +426,59 @@ class TestRejectedDecayWindowKey:
             load_server_config(yaml_file)
 
 
+class TestRejectedTrainingSaveStepsRamKey:
+    """``consolidation.training_save_steps_ram`` is a rejected key: training
+    writes a checkpoint at every epoch end and at the step a stop request
+    lands, unconditionally; no setting controls it. Same dedicated
+    named-guard convention as ``decay_window``.
+    """
+
+    def test_stale_training_save_steps_ram_key_raises_named_value_error(self, tmp_path):
+        yaml_file = _write_yaml(
+            tmp_path,
+            """\
+            model: mistral
+            consolidation:
+              training_save_steps_ram: 100
+            """,
+        )
+        with pytest.raises(ValueError, match="consolidation.training_save_steps_ram"):
+            load_server_config(yaml_file)
+
+
+class TestRejectedMobilePwaVapidContactKey:
+    """``mobile_pwa.vapid_contact`` is a rejected key: push generates its
+    VAPID keypair, serves the public-key endpoint and stores subscriptions,
+    none of which reads a contact URI.
+    """
+
+    def test_stale_vapid_contact_key_raises_named_value_error(self, tmp_path):
+        yaml_file = _write_yaml(
+            tmp_path,
+            """\
+            model: mistral
+            mobile_pwa:
+              vapid_contact: "mailto:test@example.com"
+            """,
+        )
+        with pytest.raises(ValueError, match="mobile_pwa.vapid_contact"):
+            load_server_config(yaml_file)
+
+    def test_empty_mobile_pwa_section_loads_with_defaults(self, tmp_path):
+        """Empty mobile_pwa: section (every child commented out, so YAML
+        parses it to None) loads to MobilePwaConfig defaults rather than
+        raising."""
+        yaml_file = _write_yaml(
+            tmp_path,
+            """\
+            model: mistral
+            mobile_pwa:
+            """,
+        )
+        config = load_server_config(yaml_file)
+        assert config.mobile_pwa.enabled is False
+
+
 class TestAnonymizeTokenEnvelopeAndRatioConfig:
     """The envelope/ratio defaults and their ``<= 0`` load-time rejection."""
 
@@ -546,97 +614,6 @@ class TestRatioIsACheckedMirrorOfTheCodeConstant:
         assert "extraction_token_estimate_ratio" in str(excinfo.value)
 
 
-class TestAdaptersFactoryDefaultMerge:
-    """Loader contract for adapter target_modules under the explicit-yaml posture.
-
-    The yaml is the contract for load-bearing fields. When an operator
-    partially specifies an adapter tier in yaml and that tier ends up
-    enabled, the loader refuses to start without an explicit
-    ``target_modules`` — silent fallback to the factory default would
-    hide architectural choices like procedural's attn+mlp targeting.
-    """
-
-    def test_procedural_partial_yaml_without_target_modules_refuses(self, tmp_path):
-        """Partial procedural YAML without target_modules must refuse loud."""
-        from paramem.backup.types import FatalConfigError
-
-        yaml_file = _write_yaml(
-            tmp_path,
-            """\
-            model: mistral
-            adapters:
-              procedural:
-                enabled: true
-                rank: 8
-                alpha: 16
-                learning_rate: 5.0e-5
-            """,
-        )
-        with pytest.raises(FatalConfigError, match="adapters.procedural.enabled=true"):
-            load_server_config(yaml_file)
-
-    def test_episodic_partial_yaml_without_target_modules_refuses(self, tmp_path):
-        """Partial episodic YAML without target_modules must refuse loud."""
-        from paramem.backup.types import FatalConfigError
-
-        yaml_file = _write_yaml(
-            tmp_path,
-            """\
-            model: mistral
-            adapters:
-              episodic:
-                enabled: true
-                rank: 16
-            """,
-        )
-        with pytest.raises(FatalConfigError, match="adapters.episodic.enabled=true"):
-            load_server_config(yaml_file)
-
-    def test_disabled_tier_with_partial_yaml_passes(self, tmp_path):
-        """When the tier is explicitly disabled, the missing-target_modules guard does not fire."""
-        yaml_file = _write_yaml(
-            tmp_path,
-            """\
-            model: mistral
-            adapters:
-              procedural:
-                enabled: false
-                rank: 8
-            """,
-        )
-        cfg = load_server_config(yaml_file)
-        assert cfg.adapters.procedural.enabled is False
-
-    def test_procedural_yaml_full_override_target_modules(self, tmp_path):
-        """Explicit target_modules in YAML must win over the factory default."""
-        yaml_file = _write_yaml(
-            tmp_path,
-            """\
-            model: mistral
-            adapters:
-              procedural:
-                enabled: true
-                target_modules: ["q_proj", "v_proj"]
-            """,
-        )
-        cfg = load_server_config(yaml_file)
-        assert cfg.adapters.procedural.target_modules == ["q_proj", "v_proj"]
-
-    def test_no_adapters_block_uses_factory_defaults(self, tmp_path):
-        """YAML without an adapters block falls through to the full factory defaults."""
-        yaml_file = _write_yaml(
-            tmp_path,
-            """\
-            model: mistral
-            """,
-        )
-        cfg = load_server_config(yaml_file)
-        # Procedural factory ships MLP-targeting + enabled=True (symmetric with
-        # episodic and semantic — all three main tiers default on).
-        assert "gate_proj" in cfg.adapters.procedural.target_modules
-        assert cfg.adapters.procedural.enabled is True
-
-
 class TestAdapterDropoutConfig:
     """``adapters.<tier>.dropout`` is a live yaml key (operator-settable).
 
@@ -645,18 +622,6 @@ class TestAdapterDropoutConfig:
     resident adapter for a dropout-only edit) — so it carries no
     ``target_modules``-style refuse-loud guard, only a value range check.
     """
-
-    def test_default_dropout_is_zero(self, tmp_path):
-        """Omitting dropout in yaml falls through to 0.0 (mechanism kept, off)."""
-        yaml_file = _write_yaml(
-            tmp_path,
-            """\
-            model: mistral
-            """,
-        )
-        cfg = load_server_config(yaml_file)
-        assert cfg.adapters.episodic.dropout == 0.0
-        assert cfg.tier_config_map()["episodic"].dropout == 0.0
 
     def test_yaml_dropout_flows_to_adapter_config(self, tmp_path):
         """A non-default yaml dropout reaches the built AdapterConfig."""
@@ -883,17 +848,6 @@ class TestTrainingHyperparamsFromYaml:
         assert tc.seed == 42
         assert tc.max_grad_norm == 1.0
         assert tc.gradient_checkpointing is True
-
-    def test_consolidation_max_seq_length_default_matches_training_config_default(self):
-        """``ConsolidationScheduleConfig.training_max_seq_length`` and
-        ``TrainingConfig.max_seq_length`` are two literals for one bound --
-        this pins them to the same value so the two cannot drift apart."""
-        from paramem.server.config import ConsolidationScheduleConfig
-        from paramem.utils.config import TrainingConfig
-
-        assert (
-            ConsolidationScheduleConfig().training_max_seq_length == TrainingConfig().max_seq_length
-        )
 
     def test_training_hyperparams_yaml_override_flows_through(self, tmp_path):
         """Explicit consolidation.training_* yaml values flow through to TrainingConfig."""

@@ -316,9 +316,8 @@ class RecallEarlyStopCallback(TrainerCallback):
         staging+promote contract: HF trains the transient ``in_training``
         slot, so the probe must measure that slot, not the caller-supplied
         production name (which holds un-promoted weights until the post-train
-        promote).  The callback never infers the trained slot — the owner
-        states it.  For compose/direct training the owner does not call this,
-        so the constructor's production ``adapter_name`` stands.
+        promote).  The callback never infers the trained slot — the staging
+        owner always binds it explicitly, on every training call.
         """
         self._adapter_name = adapter_name
 

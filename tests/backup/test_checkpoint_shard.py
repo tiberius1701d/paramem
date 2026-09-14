@@ -436,7 +436,6 @@ class TestPurgePartialCheckpoints:
             "adapter_name": "episodic",
             "dataset_fingerprint": "aabbccdd" * 8,
             "training_config_fingerprint": "11223344" * 8,
-            "ram_checkpoint_path": "",
             "disk_checkpoint_path": "",
             "started_at": "2026-07-03T00:00:00+00:00",
             "updated_at": "2026-07-03T00:00:00+00:00",
@@ -565,68 +564,6 @@ class TestPurgePartialCheckpoints:
             f"got: {exc_info.value}"
         )
 
-    def test_pointer_clear_disk_checkpoint_path(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """staging_resume.json's disk_checkpoint_path into a purged dir is cleared."""
-        from paramem.training.trainer import (
-            _read_staging_resume,
-            _write_staging_resume,
-            purge_partial_checkpoints,
-        )
-
-        _setup_daily_identity(tmp_path, monkeypatch)
-        adapters_root = tmp_path / "adapters"
-        slot = adapters_root / "episodic" / "interim_20260703T1200"
-        ckpt = slot / "checkpoint-14"
-        _seed_checkpoint(ckpt)
-
-        resume_path = slot / "staging_resume.json"
-        state = self._base_state(disk_checkpoint_path=str(ckpt))
-        _write_staging_resume(resume_path, state)
-        assert is_age_envelope(resume_path)
-
-        purge_partial_checkpoints(adapters_root)
-
-        assert not ckpt.exists()
-        reread = _read_staging_resume(resume_path)
-        assert reread["disk_checkpoint_path"] == ""
-        assert reread["ram_checkpoint_path"] == ""
-        assert reread["adapter_name"] == "episodic"
-        assert reread["dataset_fingerprint"] == state["dataset_fingerprint"]
-        assert is_age_envelope(resume_path)
-
-    def test_pointer_clear_ram_checkpoint_path_nested_bg_mirror(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """A ram_checkpoint_path nested at <slot>/bg_checkpoint_epoch/checkpoint-N
-        is cleared even though the marker lives at the enclosing <slot>/ root
-        (no enclosing-directory proximity matching — resolves by path
-        containment)."""
-        from paramem.training.trainer import (
-            _read_staging_resume,
-            _write_staging_resume,
-            purge_partial_checkpoints,
-        )
-
-        _setup_daily_identity(tmp_path, monkeypatch)
-        adapters_root = tmp_path / "adapters"
-        slot = adapters_root / "episodic" / "interim_20260703T1200"
-        ckpt = slot / "bg_checkpoint_epoch" / "checkpoint-9"
-        _seed_checkpoint(ckpt)
-
-        resume_path = slot / "staging_resume.json"
-        state = self._base_state(ram_checkpoint_path=str(ckpt))
-        _write_staging_resume(resume_path, state)
-
-        purged = purge_partial_checkpoints(adapters_root)
-
-        assert purged == [ckpt]
-        assert not ckpt.exists()
-        reread = _read_staging_resume(resume_path)
-        assert reread["ram_checkpoint_path"] == ""
-        assert reread["disk_checkpoint_path"] == ""
-
     def test_pointer_not_cleared_for_surviving_complete_checkpoint(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -662,6 +599,41 @@ class TestPurgePartialCheckpoints:
         assert complete_ckpt.is_dir()
         reread_b = _read_staging_resume(resume_path_b)
         assert reread_b["disk_checkpoint_path"] == str(complete_ckpt)
+
+    def test_pointer_clear_disk_checkpoint_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A pointer resolving into a purged partial checkpoint dir is
+        cleared to the empty string — ``disk_checkpoint_path`` is the one
+        field this reconciliation touches. Every other field in the marker
+        (adapter name, both fingerprints, the timestamps) survives the
+        clear untouched, and the marker itself is re-written through the
+        same age-encrypted write path it started in."""
+        from paramem.training.trainer import (
+            _read_staging_resume,
+            _write_staging_resume,
+            purge_partial_checkpoints,
+        )
+
+        _setup_daily_identity(tmp_path, monkeypatch)
+        adapters_root = tmp_path / "adapters"
+
+        slot = adapters_root / "episodic" / "interim_20260703T1200"
+        partial_ckpt = slot / "checkpoint-14"
+        _seed_checkpoint(partial_ckpt)
+
+        resume_path = slot / "staging_resume.json"
+        state = self._base_state(disk_checkpoint_path=str(partial_ckpt))
+        _write_staging_resume(resume_path, state)
+
+        purged = purge_partial_checkpoints(adapters_root)
+
+        assert purged == [partial_ckpt]
+        assert is_age_envelope(resume_path), (
+            "staging_resume.json must stay age-encrypted after the pointer clear"
+        )
+        reread = _read_staging_resume(resume_path)
+        assert reread == {**state, "disk_checkpoint_path": ""}
 
     def test_security_off_returns_empty_and_purges_nothing(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

@@ -1344,8 +1344,8 @@ def lora_b_frobenius_norm(model: PeftModel, adapter_name: str) -> float:
     non-zero norm after training together prove cold init actually ran end
     to end. Shared by the consolidation fold-telemetry measurement
     (:func:`measured_adapter_init_state`) and
-    ``experiments/test20_smallN_cold_gate.py`` (its Hard Assertion #3) —
-    one implementation, not a copy in each caller.
+    ``experiments/test20_smallN_cold_gate.py`` (its LoRA-B norm
+    assertion) — one implementation, not a copy in each caller.
 
     Args:
         model: PeftModel carrying *adapter_name*.

@@ -56,7 +56,8 @@ from paramem.memory.entry import (
     build_registry,
     format_entry_training,
 )
-from paramem.memory.persistence import load_registry, save_registry
+from paramem.memory.persistence import load_memory_from_disk, load_registry, save_registry
+from paramem.memory.store import MemoryStore
 
 # --- models ---------------------------------------------------------------
 from paramem.models.loader import (
@@ -125,8 +126,10 @@ __all__ = [
     "assign_keys",
     "build_registry",
     "format_entry_training",
+    "load_memory_from_disk",
     "load_registry",
     "save_registry",
+    "MemoryStore",
     # artifacts
     "write_artifact",
     # models

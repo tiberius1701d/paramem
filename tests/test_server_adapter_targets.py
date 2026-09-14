@@ -12,27 +12,6 @@ from __future__ import annotations
 from paramem.server.config import ServerAdapterConfig, ServerConfig
 
 
-def test_episodic_defaults_to_attention_only():
-    cfg = ServerConfig()
-    adapter = cfg._make_adapter_config(cfg.adapters.episodic)
-    assert adapter.target_modules == ["q_proj", "v_proj", "k_proj", "o_proj"]
-
-
-def test_semantic_defaults_to_attention_only():
-    cfg = ServerConfig()
-    adapter = cfg._make_adapter_config(cfg.adapters.semantic)
-    assert adapter.target_modules == ["q_proj", "v_proj", "k_proj", "o_proj"]
-
-
-def test_procedural_defaults_to_attention_plus_mlp():
-    """Procedural adapter must target MLP layers in addition to attention —
-    design intent for persistent preferences/habits."""
-    cfg = ServerConfig()
-    adapter = cfg._make_adapter_config(cfg.adapters.procedural)
-    for m in ["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]:
-        assert m in adapter.target_modules, f"procedural adapter missing {m}"
-
-
 def test_override_per_adapter_targets():
     """User can override via explicit ServerAdapterConfig construction."""
     custom = ServerAdapterConfig(target_modules=["q_proj", "o_proj"])

@@ -34,21 +34,21 @@ Key namespace reservation
 ``proc1``-``proc{width}`` for the donor's synthetic population; real
 minting floors (``ConsolidationLoop._indexed_next_index`` /
 ``_procedural_next_index``) start at ``DONOR_KEY_FLOOR = width + 1``
-unconditionally, so real keys can never collide with the reserved band.
-The width bounds the maximum key-surface *divergence depth* the donor's
-OWN fixture/synthesized population is trained at (the separating variable
-in production cold-fold failures is cluster depth, not absolute key
-magnitude — see ``experiments/test20_smallN_cold_gate.py``): a 1-200 band
-spans depths 1-3. Widening this constant is a key-NAMESPACE-headroom
-decision (avoiding real-key collision as production keys grow past 200),
-NOT a donor-teaching requirement: donor task-skill transfer is
-depth-general, not depth-matched (see ``benchmarking.md``, "Test 20:
-Small-N Cold-Init Recall Gate", "Depth scaling" section), so a depth-4+
-cluster observed in production does NOT by itself require rebuilding the
-donor at a wider band. ONE shared constant (not two independently-tunable
-per-prefix widths) because both prefixes are reserved at the SAME width
-symmetrically ("Donors own graph1-200 AND proc1-200") — two constants
-that could drift apart would only reintroduce an asymmetry.
+unconditionally, so no key minted from ``DONOR_KEY_FLOOR`` upward falls
+inside the reserved band. ``_derive_key_counters``
+(``paramem.training.consolidation``) only raises the counters from a
+store's known keys and never renumbers them, so a key a store already
+holds below ``DONOR_KEY_FLOOR`` keeps its name and can coincide with a
+key in the donor's synthetic population. The width bounds the maximum
+key-surface *divergence depth* the donor's OWN fixture/synthesized
+population is trained at: a 1-200 band spans depths 1-3. Widening this
+constant makes room for a larger synthetic donor population
+(``_allocate_block_keys`` refuses a population the band cannot hold); a
+production cluster deeper than the donor's own population does not by
+itself call for rebuilding the donor at a wider band. ONE shared
+constant (not two independently-tunable per-prefix widths) because both
+prefixes are reserved at the same width; two constants could drift
+apart and reserve the prefixes unequally.
 
 Fixture provenance
 -------------------
@@ -59,16 +59,13 @@ equivalent of similar shape (predicates are preserved verbatim — they
 are the training mechanism, not personal content). The un-anonymized
 source never enters this repository.
 
-The fixture's keys are ``graph101``-``graph115`` + ``proc101``-``proc106``
-(see ``experiments/test20_smallN_cold_gate.py`` and ``benchmarking.md``):
-donor seeding transfers with zero key overlap between the donor's own
-population and the target keys being trained. The fixture preserves the
-crowded-cluster shape exactly (same 21 subject/predicate/object triples
+The fixture's keys are ``graph101``-``graph115`` + ``proc101``-``proc106``,
+inside the reserved band, so no key minted from ``DONOR_KEY_FLOOR`` upward
+collides with them. The fixture preserves the
+crowded-cluster shape exactly (same 21 predicates
 in the same order; same crowded 7-wide ``expertise`` cluster; same
 depth-3 divergence — ``graph101``-``graph109`` share the leading ``"10"``,
-``graph110``-``graph115`` share ``"11"``) while landing on numerals outside
-every documented live-store key range, so the donor's synthetic population
-can never collide with a real production key by construction. The synthetic
+``graph110``-``graph115`` share ``"11"``). The synthetic
 content pools below
 (``_PRIMARY_NAMES`` etc., used to extend the fixture's 21 entries to
 ``N >= DONOR_MIN_ENTRIES``) are disjoint from every one of the fixture's own
@@ -89,22 +86,28 @@ a ``DONOR_MIN_ENTRIES`` request rounds up to the next whole block, trained
 at the anchored epoch budget for either topology. The dominant per-step
 cost is the frozen base model's forward/backward pass, not the LoRA
 update, so wall time scales only weakly with the trainable-parameter
-count across topologies (see ``benchmarking.md``, "Test 20", for measured
-figures). The practical consequence: the first measured-cold fold of EACH
-topology in a deployment's lifetime (or after a base-model swap) absorbs
-a full donor training run for that topology IN ADDITION TO its own
-training — with the shipped two-topology config (episodic and semantic
-share one attention-only topology; procedural is the only attention+MLP
-topology), a deployment pays this cost at most twice across its
-lifetime, never stacked into the same fold (a fold trains one tier at a
-time). The multiplier this adds to the triggering fold's own wall time
-depends on how small the triggering fold's OWN key count is, and it is
-small by construction (the first measured-cold adapter of that topology
-in a deployment's lifetime). Every fold after the triggering one reuses
-that topology's persisted checkpoint and pays no extra cost until it is
-invalidated again (base-model swap, a shape edit to THAT topology, or a
-donor-recipe change — see :func:`donor_checkpoint_valid`); a shape edit to
-a DIFFERENT tier's topology does not invalidate this one.
+count across topologies. The practical consequence: the first
+measured-cold tier of a topology (or the first tier trained after a
+base-model swap) absorbs a full donor training run for that topology IN
+ADDITION TO its own training — with the shipped two-topology config
+(episodic and semantic share one attention-only topology; procedural is
+the only attention+MLP topology), a deployment pays this cost once per
+topology, each the first time a cold tier of that topology trains. A
+fold trains its tiers one at a time, so a fold covering a cold tier of
+each topology — for example the first full fold at ``max_interim_count:
+0`` that trains both an episodic and a procedural tier, before either
+topology has a checkpoint — pays both costs within that one fold,
+each before its own tier trains. The donor build is a fixed-size run, so
+the multiplier it adds to a triggering tier's own wall time is largest
+when that tier holds few keys. A later invalidation (a base-model swap,
+or a shape edit to that topology) recreates an already-populated tier
+cold, and the same fixed cost lands on a tier of whatever size it has
+reached. Every tier trained
+after a topology's checkpoint exists reuses it and pays no extra cost
+until the checkpoint is invalidated again (base-model swap, a shape edit
+to THAT topology, or a donor-recipe change — see
+:func:`donor_checkpoint_valid`); a shape edit to a DIFFERENT tier's
+topology does not invalidate this one.
 """
 
 from __future__ import annotations
@@ -184,11 +187,10 @@ synthesis-logic change, or one of the hyperparameters below)."""
 DONOR_RECIPE_LEARNING_RATE: float = 1e-4
 """The donor's own training learning rate -- fixed by the recipe, NEVER
 read from a live tier's ``AdapterConfig.learning_rate`` (see
-:func:`build_donor`'s docstring). Matches the episodic tier's shipped LR
-(``configs/server.yaml.example``, the LR ``benchmarking.md``'s "Test 20"
-donor-uplift evidence measured), so an operator edit to any tier's own
-``learning_rate`` cannot silently change the donor recipe. Changing the
-recipe deliberately means editing this constant (and bumping
+:func:`build_donor`'s docstring). Matches the episodic tier's shipped
+learning rate (``configs/server.yaml.example``), so an operator edit to any
+tier's own ``learning_rate`` cannot silently change the donor recipe.
+Changing the recipe deliberately means editing this constant (and bumping
 :data:`DONOR_RECIPE_ID`)."""
 DONOR_RECIPE_DROPOUT: float = 0.0
 """The donor's own training dropout -- fixed by the recipe for the same
@@ -198,9 +200,7 @@ dataclass default (``paramem.utils.config``, ``0.0``) so a future default
 or config change cannot silently alter the donor recipe -- the two happen
 to agree, but this constant does not read from either the dataclass
 default or a live tier's ``AdapterConfig.dropout``. This constant pins the
-donor recipe to what production training actually runs at, and to what the
-measured donor anchor (Test 20, ``benchmarking.md``) was itself trained
-at."""
+donor recipe to what production training actually runs at."""
 DONOR_DEFAULT_SEED: int = 42  # matches TrainingConfig.seed's project-standard default
 DONOR_MIN_ENTRIES: int = 128
 """Minimum donor population size. This is the training-budget table's
@@ -602,9 +602,7 @@ def donor_slot_valid(slot: Path, base_model_id: "str | None", lora_shape: dict) 
     store-scoped entry point that resolves the live slot and delegates here.
     Split out because a donor slot is also handled outside a store — a
     detached slot path, or a copy of one — and those callers must apply the
-    SAME rule rather than re-implement a weaker version of it
-    (``experiments/test20_smallN_cold_gate.py`` verifies both a
-    ``--donor-checkpoint`` slot and its own scratch copytree this way).
+    SAME rule rather than re-implement a weaker version of it.
 
     Same never-raise contract and same checks as
     :func:`donor_checkpoint_valid` — see that function's docstring.
@@ -1120,7 +1118,6 @@ def build_donor(
             adapter_config=recipe_config,
             training_config=loop.training_config,
             output_dir=store_dir / ".training_scratch",
-            run_name="donor-build",
             phase_name="donor-build",
         )
         if metrics is None or metrics.get("aborted"):

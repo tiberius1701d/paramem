@@ -12,7 +12,7 @@ Design:
   at the session level (fast), but if re-extraction does happen the merger is
   idempotent (safe).
 - On ``--resume``:  load the existing ``graph_snapshot.json`` into the merger
-  via ``merger.load_graph()`` and skip any session whose id appears in
+  via ``load_memory_from_disk`` and skip any session whose id appears in
   ``build_state.json["sessions_done"]``.  If ``graph_done.json`` is present
   and ``--target-keys`` has not been raised, exit immediately.
 - Output dir is a SINGLE canonical directory (default
@@ -284,6 +284,13 @@ def main() -> None:
     from experiments.quadruple_adapter import load_unique_triples
     from experiments.utils.gpu_guard import acquire_gpu
     from experiments.utils.longmemeval_loader import LongMemEvalLoader
+    from experiments.utils.production import (
+        MemoryStore,
+        create_consolidation_loop,
+        load_base_model,
+        load_memory_from_disk,
+        load_server_config,
+    )
     from experiments.utils.speaker_names import SpeakerNamePool
     from experiments.utils.test_harness import BENCHMARK_MODELS
 
@@ -295,9 +302,6 @@ def main() -> None:
         # load_base_model needs the resolved tier map (config.tier_config_map())
         # before the model can be wrapped.
         import dataclasses
-
-        from paramem.server.config import load_server_config
-        from paramem.server.consolidation import create_consolidation_loop
 
         cfg = load_server_config("tests/fixtures/server.yaml")
         cfg.model_name = args.model
@@ -316,8 +320,6 @@ def main() -> None:
         # Load base model (exactly as dataset_probe.py), wrapped with the
         # tiers this config actually enables (episodic + semantic;
         # procedural disabled above).
-        from paramem.models.loader import load_base_model
-
         model_cfg = BENCHMARK_MODELS[args.model]
         logger.info("Loading base model: %s", model_cfg.model_id)
         model, tokenizer = load_base_model(model_cfg, cfg.tier_config_map())
@@ -326,6 +328,7 @@ def main() -> None:
             model=model,
             tokenizer=tokenizer,
             config=cfg,
+            memory_store=MemoryStore(),
             state_provider=None,
             output_dir=output_dir,
             save_cycle_snapshots=None,
@@ -336,7 +339,7 @@ def main() -> None:
         # dedup is correct and triple counts are accurate.
         if args.resume and snapshot_path.exists():
             logger.info("Loading existing graph snapshot from %s", snapshot_path)
-            loop.merger.load_graph(snapshot_path)
+            loop.merger.graph = load_memory_from_disk(snapshot_path)
             logger.info(
                 "Graph loaded: %d nodes, %d edges",
                 loop.merger.graph.number_of_nodes(),

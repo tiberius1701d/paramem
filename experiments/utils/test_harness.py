@@ -1,24 +1,22 @@
 """Shared experiment infrastructure for extended evaluation tests.
 
-Wraps the existing indexed key pipeline into reusable functions
-for consistent experiment setup across all 7 tests.
+Wraps the indexed key pipeline into reusable functions for consistent
+setup across the experiment scripts and dev probes that import it.
 
 Environment loading is a per-script concern — call
 :func:`load_test_env` from a script's main() / argparse entrypoint
-when you need ``.env`` populated. Module-level ``load_dotenv`` was
-removed on 2026-04-28 because importing this module from a production
-consolidation code path (a staged-weights recall probe — the
-surviving equivalent is ``ConsolidationLoop._probe_recall``) re-set
-operator env vars on first import, defeating any caller that had
-explicitly cleared a key — e.g. the smoke harness running under
-Security OFF saw ``PARAMEM_DAILY_PASSPHRASE`` snap back from disk
-mid-run, with subsequent saves silently encrypted under a "popped"
-identity.
+when you need ``.env`` populated. This module never loads it at
+import time: importing a module must not change the process
+environment. A caller may have cleared an operator variable on
+purpose, and a load at import would restore, e.g.,
+``PARAMEM_DAILY_PASSPHRASE`` from disk mid-run, silently encrypting
+later saves under an identity the caller had removed.
 
 QA-shape harness functions (distill_qa_pairs, distill_session,
 train_indexed_keys, evaluate_indexed_recall, evaluate_individual_qa,
-smoke_test_adapter) were retired on 2026-05-20 to
-:mod:`archive.experiments.legacy_harness`.  Live tests use the
+smoke_test_adapter) raise ``NotImplementedError`` here, naming their
+replacement; the retired implementation lives in
+:mod:`archive.experiments.legacy_harness`. Live tests use the
 entry-format evaluation path via
 :func:`paramem.training.recall_eval.evaluate_indexed_recall` directly.
 """
@@ -39,9 +37,7 @@ def load_test_env() -> None:
     """Source ``.env`` into the current process and set the CUDA alloc default.
 
     Call from a script's main() / CLI entrypoint, NOT at module scope.
-    Module-scope ``load_dotenv`` re-sets env vars at first import, which
-    breaks any caller that has explicitly cleared a var between server
-    startup and a downstream import — see the module docstring.
+    Module-scope ``load_dotenv`` re-sets env vars at first import.
     """
     load_dotenv(PROJECT_ROOT / ".env")
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -50,70 +46,38 @@ def load_test_env() -> None:
 from collections.abc import Mapping  # noqa: E402
 
 from paramem.models.loader import load_base_model  # noqa: E402
+from paramem.server.config import MODEL_REGISTRY  # noqa: E402
 from paramem.utils.config import AdapterConfig, ModelConfig  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
 # Benchmark models — each owns the full pipeline (extraction → keyed-entry
-# assembly → training → eval)
+# assembly → training → eval). Bound directly from the one model registry
+# (paramem.server.config.MODEL_REGISTRY) so an experiment run and a
+# deployment restart read identical entries.
 BENCHMARK_MODELS = {
-    "gemma": ModelConfig(
-        model_id="google/gemma-2-9b-it",
-        quantization="nf4",
-        compute_dtype="bfloat16",
-        trust_remote_code=True,
-        cpu_offload=True,
-        max_memory_gpu="7GiB",
-        max_memory_cpu="20GiB",
-    ),
-    "mistral": ModelConfig(
-        model_id="mistralai/Mistral-7B-Instruct-v0.3",
-        quantization="nf4",
-        compute_dtype="bfloat16",
-        trust_remote_code=True,
-        cpu_offload=False,
-    ),
-    "gemma4": ModelConfig(
-        model_id="principled-intelligence/gemma-4-E4B-it-text-only",
-        quantization="nf4",
-        compute_dtype="bfloat16",
-        trust_remote_code=True,
-        cpu_offload=False,
-    ),
-    # Qwen3-4B-Instruct-2507 — benchmark candidate, not the production model
-    # (production is Mistral 7B; see the "mistral" entry above and
-    # configs/server.yaml.example:74 / tests/fixtures/server.yaml:107).
-    # NF4 4-bit, bfloat16 compute, no CPU offload (4 B fits in 8 GiB).
-    # cpu_offload=False → device_map={"":0} in load_base_model (loader.py:211-216).
-    # max_memory_gpu/cpu are kept as constructor defaults; only the fields that
-    # differ from the mistral entry (model_id, no cpu_offload already False) need
-    # explicit values.  Verified against ModelConfig field names at config.py:25-33.
-    "qwen": ModelConfig(
-        model_id="Qwen/Qwen3-4B-Instruct-2507",
-        quantization="nf4",
-        compute_dtype="bfloat16",
-        trust_remote_code=True,
-        cpu_offload=False,
-    ),
+    alias: MODEL_REGISTRY[alias] for alias in ("gemma", "mistral", "gemma4", "qwen3-4b")
 }
 
 
 def add_model_args(parser):
     """Add --model argument to an experiment's argparse."""
+    aliases = list(BENCHMARK_MODELS.keys())
+    default_order = ", ".join(aliases[:-1]) + f" and {aliases[-1]}"
     parser.add_argument(
         "--model",
         type=str,
         default=None,
-        choices=list(BENCHMARK_MODELS.keys()),
-        help="Model to benchmark (default: run both gemma and mistral)",
+        choices=aliases,
+        help=f"Model to benchmark (default: run {default_order} in turn)",
     )
 
 
 def get_benchmark_models(args):
     """Return list of (name, ModelConfig) to run.
 
-    If --model is set, returns that single model.
-    Otherwise returns both models for direct comparison.
+    If --model is set, returns that single model. Otherwise returns all
+    four ``BENCHMARK_MODELS`` entries, in turn.
     """
     model_name = getattr(args, "model", None)
     if model_name is not None:

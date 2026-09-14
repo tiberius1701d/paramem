@@ -10,12 +10,9 @@ import pytest
 import torch
 
 from paramem.server.gpu_lock import (
-    acquire_gpu,
     gpu_lock,
     gpu_lock_is_held,
-    gpu_lock_released,
     gpu_lock_sync,
-    release_gpu,
 )
 from paramem.utils.config import ModelConfig
 
@@ -46,15 +43,6 @@ class TestGpuLockSync:
         # t1 must fully complete before t2 enters
         assert results.index("a_exit") < results.index("b_enter")
 
-    def test_timeout_raises(self):
-        acquire_gpu()
-        try:
-            with pytest.raises(TimeoutError):
-                with gpu_lock_sync(timeout=0.01):
-                    pass
-        finally:
-            release_gpu()
-
     def test_released_on_exception(self):
         """Lock is released even if the body raises."""
         with pytest.raises(ValueError):
@@ -63,6 +51,28 @@ class TestGpuLockSync:
         # Should be acquirable again
         with gpu_lock_sync(timeout=0.1):
             pass
+
+    def test_timeout_raises(self):
+        """A bounded acquire against a lock held by another thread raises
+        TimeoutError instead of blocking forever."""
+        acquired = threading.Event()
+        release = threading.Event()
+
+        def holder():
+            with gpu_lock_sync():
+                acquired.set()
+                release.wait(timeout=5)
+
+        t = threading.Thread(target=holder)
+        t.start()
+        try:
+            assert acquired.wait(timeout=5), "holder thread never acquired the lock"
+            with pytest.raises(TimeoutError, match="Could not acquire GPU lock"):
+                with gpu_lock_sync(timeout=0.05):
+                    pass
+        finally:
+            release.set()
+            t.join(timeout=5)
 
 
 class TestGpuLockAsync:
@@ -95,92 +105,11 @@ class TestGpuLockAsync:
         assert results.index("sync_exit") < results.index("async_enter")
 
 
-class TestAcquireReleaseGpu:
-    def test_acquire_release_pair(self):
-        acquire_gpu()
-        release_gpu()
-
-    def test_acquire_blocks_sync(self):
-        acquire_gpu()
-        try:
-            with pytest.raises(TimeoutError):
-                with gpu_lock_sync(timeout=0.01):
-                    pass
-        finally:
-            release_gpu()
-
-
-class TestGpuLockReleased:
-    def test_yields_and_reacquires(self):
-        """Body runs with lock released; lock is held again after exit."""
-        acquire_gpu()
-        try:
-            body_ran = threading.Event()
-            other_acquired = threading.Event()
-
-            def _other():
-                # Should be able to acquire while body is executing.
-                got = _acquire_with_timeout(0.5)
-                if got:
-                    other_acquired.set()
-                    release_gpu()
-
-            with gpu_lock_released():
-                body_ran.set()
-                t = threading.Thread(target=_other, daemon=True)
-                t.start()
-                t.join(timeout=1.0)
-
-            assert body_ran.is_set(), "body never ran"
-            assert other_acquired.is_set(), "other thread could not acquire during yield"
-            # After context exit, lock must be held again — another thread
-            # should time out trying to acquire.
-            got = _acquire_with_timeout(0.05)
-            assert not got, "lock should be held after gpu_lock_released exit"
-        finally:
-            release_gpu()
-
-    def test_reacquires_on_exception(self):
-        """Exception propagates and lock is still held on exit."""
-        acquire_gpu()
-        try:
-            with pytest.raises(ValueError, match="boom"):
-                with gpu_lock_released():
-                    raise ValueError("boom")
-            # Lock must be held again after the exception path.
-            got = _acquire_with_timeout(0.05)
-            assert not got, "lock should be held after exception in gpu_lock_released"
-        finally:
-            release_gpu()
-
-    def test_called_without_holding_raises(self):
-        """Calling gpu_lock_released without holding the lock raises RuntimeError."""
-        # Ensure the lock is free before this test.
-        # serial: same fragility as TestGpuLockSync.test_timeout_raises.
-        with pytest.raises(RuntimeError):
-            with gpu_lock_released():
-                pass  # should not be reached
-
-
-def _acquire_with_timeout(timeout: float) -> bool:
-    """Helper: try to acquire _gpu_thread_lock, return True if successful."""
-    from paramem.server.gpu_lock import _gpu_thread_lock
-
-    return _gpu_thread_lock.acquire(timeout=timeout)
-
-
 class TestGpuLockIsHeld:
     """gpu_lock_is_held() is a read-only probe — it never takes the lock."""
 
     def test_false_when_free(self):
         assert gpu_lock_is_held() is False
-
-    def test_true_when_held(self):
-        acquire_gpu()
-        try:
-            assert gpu_lock_is_held() is True
-        finally:
-            release_gpu()
 
     def test_does_not_take_the_lock(self):
         """Calling the probe must not itself acquire the lock — a real
@@ -190,24 +119,31 @@ class TestGpuLockIsHeld:
         with gpu_lock_sync(timeout=0.1):
             pass
 
+    def test_true_when_held(self):
+        """Reads True while a caller holds the lock, False again once released."""
+        with gpu_lock_sync():
+            assert gpu_lock_is_held() is True
+        assert gpu_lock_is_held() is False
+
     def test_reflects_held_state_from_another_thread(self):
-        holder_ready = threading.Event()
-        release_now = threading.Event()
+        """The probe reflects the lock's state regardless of which thread
+        holds it — a threading.Lock is not owned by the acquiring thread."""
+        acquired = threading.Event()
+        release = threading.Event()
 
-        def _hold():
-            acquire_gpu()
-            holder_ready.set()
-            release_now.wait(timeout=2.0)
-            release_gpu()
+        def holder():
+            with gpu_lock_sync():
+                acquired.set()
+                release.wait(timeout=5)
 
-        t = threading.Thread(target=_hold, daemon=True)
+        t = threading.Thread(target=holder)
         t.start()
         try:
-            assert holder_ready.wait(timeout=2.0)
+            assert acquired.wait(timeout=5), "holder thread never acquired the lock"
             assert gpu_lock_is_held() is True
         finally:
-            release_now.set()
-            t.join(timeout=2.0)
+            release.set()
+            t.join(timeout=5)
         assert gpu_lock_is_held() is False
 
 
@@ -339,15 +275,6 @@ class TestGpuTemp:
 
 
 class TestConsolidateGuard:
-    def test_consolidate_rejects_during_training(self):
-        """Manual /consolidate returns training_active when bg trainer is running."""
-        from paramem.server.config import ConsolidationScheduleConfig
-
-        # Minimal test — just verify the config field exists and defaults
-        config = ConsolidationScheduleConfig()
-        assert config.training_temp_limit == 0
-        assert config.training_temp_check_interval == 5
-
     @pytest.mark.skipif(
         not Path("configs/server.yaml").exists(),
         reason="operator-local configs/server.yaml absent (CI / fresh clone)",

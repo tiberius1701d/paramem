@@ -1,7 +1,6 @@
 """Unit tests for BackgroundTrainer.
 
 Covers:
-  - TrainingJob.inference_fallback_adapter field defaults to "episodic".
   - abort_for_inference() returns False when idle, sets abort event, quiesces.
   - training_hooks_for_job ORs shutdown_requested, abort flag, and caller gate.
   - Per-job abort events do not leak across jobs.
@@ -16,10 +15,7 @@ from __future__ import annotations
 import threading
 from unittest.mock import MagicMock, patch
 
-from paramem.server.background_trainer import (
-    BackgroundTrainer,
-    TrainingJob,
-)
+from paramem.server.background_trainer import BackgroundTrainer
 from paramem.training.trainer import TrainingHooks, _HooksAdapterCallback
 from paramem.utils.config import AdapterConfig, TrainingConfig
 
@@ -48,9 +44,9 @@ def _make_staging_safe_model(
     (staging → production).
 
     Use this whenever a test needs to drive ``train_adapter`` to inspect
-    something orthogonal to staging (abort metric, RAM-mode arg routing,
-    callback assembly).  Tests that exercise the staging contract itself
-    should construct their own model via ``_make_staging_model`` in
+    something orthogonal to staging (abort metric, callback assembly).
+    Tests that exercise the staging contract itself should construct their
+    own model via ``_make_staging_model`` in
     ``tests/training/test_train_adapter_callbacks.py``.
     """
     import torch
@@ -81,48 +77,8 @@ def _minimal_training_config() -> TrainingConfig:
     )
 
 
-def _minimal_adapter_config() -> AdapterConfig:
-    return AdapterConfig(rank=4, alpha=8, learning_rate=1e-4, target_modules=["q_proj"])
-
-
 # ---------------------------------------------------------------------------
-# Test — TrainingJob.inference_fallback_adapter field
-# ---------------------------------------------------------------------------
-
-
-class TestTrainingJobInferenceFallbackAdapter:
-    def test_default_fallback_is_episodic(self) -> None:
-        """TrainingJob defaults inference_fallback_adapter to 'episodic'."""
-        job = TrainingJob(
-            entries=[],
-            adapter_name="episodic_interim_20260418T1430",
-            adapter_config=_minimal_adapter_config(),
-        )
-        assert job.inference_fallback_adapter == "episodic"
-
-    def test_explicit_fallback_stored(self) -> None:
-        """An explicitly set inference_fallback_adapter is preserved."""
-        job = TrainingJob(
-            entries=[],
-            adapter_name="episodic_interim_20260418T1430",
-            adapter_config=_minimal_adapter_config(),
-            inference_fallback_adapter="episodic",
-        )
-        assert job.inference_fallback_adapter == "episodic"
-
-    def test_custom_fallback_stored(self) -> None:
-        """A non-default inference_fallback_adapter is preserved."""
-        job = TrainingJob(
-            entries=[],
-            adapter_name="episodic",
-            adapter_config=_minimal_adapter_config(),
-            inference_fallback_adapter="episodic_backup_20260418",
-        )
-        assert job.inference_fallback_adapter == "episodic_backup_20260418"
-
-
-# ---------------------------------------------------------------------------
-# Test 9 — abort_for_inference() replaces pause/resume
+# abort_for_inference() — stop the running job so inference can take the GPU
 # ---------------------------------------------------------------------------
 
 
@@ -278,7 +234,7 @@ class TestSetIsTrainingAPI:
 
 
 # ---------------------------------------------------------------------------
-# Test 10 — submit() serialises concurrent BG-trainer jobs
+# submit() serialises concurrent BG-trainer jobs
 # ---------------------------------------------------------------------------
 
 
@@ -365,7 +321,7 @@ class TestSubmitSerialises:
 
 
 # ---------------------------------------------------------------------------
-# Test 11 — persistent callable worker
+# Persistent callable worker
 # ---------------------------------------------------------------------------
 
 
@@ -594,7 +550,7 @@ class TestPersistentCallableWorker:
 
 
 # ---------------------------------------------------------------------------
-# Test 12 — train_adapter aborted return value
+# train_adapter aborted return value
 # ---------------------------------------------------------------------------
 
 
@@ -706,7 +662,7 @@ class TestTrainAdapterAbortReturn:
 
 
 # ---------------------------------------------------------------------------
-# Test 13 — Step-end shutdown via TrainingHooks
+# Step-end shutdown via TrainingHooks
 # ---------------------------------------------------------------------------
 
 
@@ -728,190 +684,7 @@ class TestStepEndShutdown:
 
 
 # ---------------------------------------------------------------------------
-# Test 14 — RAM-mode checkpointing
-# ---------------------------------------------------------------------------
-
-
-class TestRamCheckpointMode:
-    """train_adapter RAM-mode: save_steps_ram > 0 routes checkpoints to /dev/shm.
-
-    Verifies:
-    - When save_steps_ram > 0, TrainingArguments receives output_dir=/dev/shm/...
-      and save_strategy="steps" with save_steps=save_steps_ram.
-    - On clean (non-abort) completion, /dev/shm directory is deleted.
-    - _RamEpochCopyCallback is registered and copies the latest checkpoint
-      to <output_dir>/bg_checkpoint_epoch/ at epoch_end.
-    """
-
-    def _make_tc(self, save_steps_ram: int = 50) -> "TrainingConfig":
-        return TrainingConfig(
-            num_epochs=1,
-            gradient_checkpointing=False,
-            batch_size=1,
-            warmup_steps=0,
-            save_steps_ram=save_steps_ram,
-        )
-
-    def test_ram_mode_routes_output_dir_to_dev_shm(self, tmp_path) -> None:
-        """When save_steps_ram > 0, HF TrainingArguments receives /dev/shm path."""
-        from paramem.training.trainer import train_adapter
-
-        captured_args: list = []
-
-        class _CapturingTrainer:
-            def __init__(self, *, model, args, train_dataset, data_collator, callbacks, **kwargs):
-                captured_args.append(args)
-
-            def train(self, resume_from_checkpoint=None):
-                return MagicMock(metrics={"train_loss": 0.1})
-
-        ac = AdapterConfig(rank=4, alpha=8, learning_rate=1e-4, target_modules=["q_proj"])
-        model = _make_staging_safe_model(ac)
-        tc = self._make_tc(save_steps_ram=50)
-
-        with (
-            patch("paramem.training.trainer.ParamemTrainer", new=_CapturingTrainer),
-            patch(
-                "paramem.training.trainer.TrainingArguments",
-                side_effect=lambda **kw: MagicMock(**kw),
-            ),
-            patch(
-                "paramem.training.encrypted_checkpoint_callback.EncryptCheckpointCallback",
-                MagicMock,
-            ),
-            patch("paramem.training.trainer._ensure_staging_slot", return_value=None),
-        ):
-            train_adapter(
-                model=model,
-                tokenizer=MagicMock(),
-                train_dataset=[{"input_ids": [1], "labels": [1], "attention_mask": [1]}],
-                adapter_name="test_adapter",
-                training_config=tc,
-                adapter_config=ac,
-                output_dir=tmp_path,
-            )
-
-        assert captured_args, "Trainer was not constructed"
-        args = captured_args[0]
-        # TrainingArguments.output_dir must point to /dev/shm.
-        assert str(args.output_dir).startswith("/dev/shm"), (
-            f"save_steps_ram>0 must route output_dir to /dev/shm; got {args.output_dir!r}"
-        )
-        # save_strategy must be "steps" and save_steps must equal save_steps_ram.
-        assert str(args.save_strategy) == "steps", (
-            f"save_steps_ram>0 must set save_strategy='steps'; got {args.save_strategy!r}"
-        )
-        assert args.save_steps == 50, (
-            f"save_steps must equal save_steps_ram; got {args.save_steps!r}"
-        )
-
-    def test_ram_dir_cleaned_on_successful_completion(self, tmp_path) -> None:
-        """On non-abort completion, train_adapter removes the /dev/shm directory."""
-        from pathlib import Path
-
-        from paramem.training.trainer import train_adapter
-
-        class _NullTrainer:
-            def __init__(self, **kwargs):
-                pass
-
-            def train(self, resume_from_checkpoint=None):
-                return MagicMock(metrics={"train_loss": 0.1})
-
-        ac = AdapterConfig(rank=4, alpha=8, learning_rate=1e-4, target_modules=["q_proj"])
-        model = _make_staging_safe_model(ac)
-        tc = self._make_tc(save_steps_ram=50)
-
-        created_ram_dir: list[Path] = []
-        _original_mkdir = Path.mkdir
-
-        def _intercept_mkdir(self_path, **kwargs):
-            if "paramem-bg-checkpoint-" in str(self_path):
-                created_ram_dir.append(self_path)
-            return _original_mkdir(self_path, **kwargs)
-
-        with (
-            patch("paramem.training.trainer.ParamemTrainer", new=_NullTrainer),
-            patch("paramem.training.trainer.TrainingArguments", return_value=MagicMock()),
-            patch(
-                "paramem.training.encrypted_checkpoint_callback.EncryptCheckpointCallback",
-                MagicMock,
-            ),
-            patch("pathlib.Path.mkdir", _intercept_mkdir),
-            patch("paramem.training.trainer._ensure_staging_slot", return_value=None),
-        ):
-            train_adapter(
-                model=model,
-                tokenizer=MagicMock(),
-                train_dataset=[{"input_ids": [1], "labels": [1], "attention_mask": [1]}],
-                adapter_name="test_adapter",
-                training_config=tc,
-                adapter_config=ac,
-                output_dir=tmp_path / "output",
-            )
-
-        # If a ram_dir was created, it must have been removed on success.
-        for rd in created_ram_dir:
-            assert not rd.exists(), (
-                f"RAM checkpoint dir must be deleted on successful completion; {rd} still exists"
-            )
-
-    def test_zero_save_steps_ram_disables_ram_mode(self, tmp_path) -> None:
-        """When save_steps_ram=0 (default), TrainingArguments uses the caller's output_dir."""
-        from paramem.training.trainer import train_adapter
-
-        captured_args: list = []
-
-        class _CapturingTrainer:
-            def __init__(self, *, model, args, train_dataset, data_collator, callbacks, **kwargs):
-                captured_args.append(args)
-
-            def train(self, resume_from_checkpoint=None):
-                return MagicMock(metrics={"train_loss": 0.1})
-
-        ac = AdapterConfig(rank=4, alpha=8, learning_rate=1e-4, target_modules=["q_proj"])
-        model = _make_staging_safe_model(ac)
-
-        tc = TrainingConfig(
-            num_epochs=1,
-            gradient_checkpointing=False,
-            batch_size=1,
-            warmup_steps=0,
-            save_steps_ram=0,
-        )
-
-        with (
-            patch("paramem.training.trainer.ParamemTrainer", new=_CapturingTrainer),
-            patch(
-                "paramem.training.trainer.TrainingArguments",
-                side_effect=lambda **kw: MagicMock(**kw),
-            ),
-            patch(
-                "paramem.training.encrypted_checkpoint_callback.EncryptCheckpointCallback",
-                MagicMock,
-            ),
-            patch("paramem.training.trainer._ensure_staging_slot", return_value=None),
-        ):
-            train_adapter(
-                model=model,
-                tokenizer=MagicMock(),
-                train_dataset=[{"input_ids": [1], "labels": [1], "attention_mask": [1]}],
-                adapter_name="test_adapter",
-                training_config=tc,
-                adapter_config=ac,
-                output_dir=tmp_path,
-            )
-
-        assert captured_args, "Trainer was not constructed"
-        args = captured_args[0]
-        # output_dir must NOT start with /dev/shm when save_steps_ram=0.
-        assert not str(args.output_dir).startswith("/dev/shm"), (
-            f"save_steps_ram=0 must use caller's output_dir; got {args.output_dir!r}"
-        )
-
-
-# ---------------------------------------------------------------------------
-# Test 15 — safe_empty_cache called after job completion + _shutdown_requested reset
+# safe_empty_cache called after job completion + _shutdown_requested reset
 # ---------------------------------------------------------------------------
 
 

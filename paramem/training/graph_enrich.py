@@ -280,10 +280,7 @@ def enrich_graph(
     names, the chain's own domain-scoped guard fires (``payload.failure
     == "guard"``) — a classification/identity-match failure, not a scope
     verdict — so that chunk's cloud call is skipped (fail-closed) and
-    counted in the returned ``privacy_skipped_chunks``. This residual (an
-    entity the SCAN call named but reconciliation could not match
-    to a node) is not otherwise engineered around — see
-    ``benchmarking.md``.
+    counted in the returned ``privacy_skipped_chunks``.
 
     The function mutates ``merger.graph`` in place: first applying
     ``same_as`` node contractions, then inserting new edges tagged with

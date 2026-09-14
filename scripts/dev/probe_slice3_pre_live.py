@@ -243,7 +243,6 @@ def run_gpu_extraction_check(out_dir: Path) -> dict:
         tier_adapters=tier_adapters,
         # Required kwarg (no default on ConsolidationLoop.__init__).
         memory_store=MemoryStore(),
-        wandb_config=None,
         output_dir=out_dir,
         save_cycle_snapshots=False,
         extraction_enrichment_provider="off",

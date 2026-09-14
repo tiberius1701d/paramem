@@ -30,13 +30,6 @@ import pytest
 class TestIdleDebounceConfig:
     """ConsolidationScheduleConfig.training_idle_debounce_s field validation."""
 
-    def test_debounce_default_30_seconds(self) -> None:
-        """training_idle_debounce_s defaults to 30."""
-        from paramem.server.config import ConsolidationScheduleConfig
-
-        cfg = ConsolidationScheduleConfig()
-        assert cfg.training_idle_debounce_s == 30
-
     def test_debounce_negative_rejected(self) -> None:
         """Negative training_idle_debounce_s raises ValueError."""
         import pytest

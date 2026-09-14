@@ -12,7 +12,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Literal, Optional, Sequence
+from typing import TYPE_CHECKING, Literal, Optional, Sequence
 
 from torch.utils.data import Dataset
 
@@ -57,7 +57,6 @@ from paramem.utils.config import (
     ConsolidationConfig,
     GraphConfig,
     TrainingConfig,
-    WandbConfig,
     budget_for,
 )
 from paramem.utils.identity import canonical
@@ -675,7 +674,6 @@ class ConsolidationLoop:
         *,
         memory_store,
         tier_adapters: Mapping[str, AdapterConfig],
-        wandb_config: Optional[WandbConfig] = None,
         output_dir: str | Path = "outputs/phase3",
         extraction_temperature: float = 0.0,
         extraction_max_tokens: int,
@@ -753,7 +751,6 @@ class ConsolidationLoop:
         # config.tier_config_map(), threaded by
         # paramem.server.consolidation.create_consolidation_loop.
         self.tier_adapters: dict[str, AdapterConfig] = dict(tier_adapters)
-        self.wandb_config = wandb_config
         self.save_cycle_snapshots = save_cycle_snapshots
         # Run ID identifies a single ConsolidationLoop construction so successive
         # /consolidate calls (and parallel test workers) don't clobber each
@@ -884,12 +881,7 @@ class ConsolidationLoop:
         # the abort event is included in the shutdown predicate.
         self._bg_trainer = None
 
-    def _build_training_hooks(
-        self,
-        *,
-        on_epoch_persist: "Optional[Callable[[int, str], None]]" = None,
-        on_save_persist: "Optional[Callable[[int, str], None]]" = None,
-    ) -> TrainingHooks:
+    def _build_training_hooks(self) -> TrainingHooks:
         """Construct TrainingHooks honouring consolidation shutdown + BG abort.
 
         Routes through ``self._bg_trainer.training_hooks_for_job`` when a
@@ -900,10 +892,6 @@ class ConsolidationLoop:
         When no BackgroundTrainer is wired (experiment paths), returns a plain
         ``TrainingHooks`` with just the consolidation shutdown_requested check.
 
-        Args:
-            on_epoch_persist: Passed through to ``TrainingHooks`` unchanged.
-            on_save_persist: Passed through to ``TrainingHooks`` unchanged.
-
         Returns:
             A ``TrainingHooks`` instance ready to pass to ``train_adapter``.
         """
@@ -913,16 +901,8 @@ class ConsolidationLoop:
 
         bt = getattr(self, "_bg_trainer", None)
         if bt is not None:
-            return bt.training_hooks_for_job(
-                base_shutdown_predicate=base,
-                on_epoch_persist=on_epoch_persist,
-                on_save_persist=on_save_persist,
-            )
-        return TrainingHooks(
-            on_shutdown_check=base,
-            on_epoch_persist=on_epoch_persist,
-            on_save_persist=on_save_persist,
-        )
+            return bt.training_hooks_for_job(base_shutdown_predicate=base)
+        return TrainingHooks(on_shutdown_check=base)
 
     def release(self) -> None:
         """Drop all base-model references this loop holds so the model can be freed.
@@ -1782,7 +1762,6 @@ class ConsolidationLoop:
             speaker_id=speaker_id,
             mode="train",
             pending=pending,
-            run_label=f"train-adapters-cycle{self.cycle_count}",
         )
 
         # --- Roll interim slot into main ---
@@ -1960,11 +1939,14 @@ class ConsolidationLoop:
         concept.  HF writes its ``checkpoint-<step>/`` subdirs there at every
         epoch (live config: ``save_strategy="epoch"``, ``save_total_limit=2``);
         :class:`EncryptCheckpointCallback` wraps each one in the age envelope
-        in-place.  The :class:`BackgroundTrainer` resume path
-        (``trainer.train(resume_from_checkpoint=...)``) reads the latest
-        ``checkpoint-<step>/`` from the same directory after a graceful
-        shutdown / restart, so this is NOT throwaway scratch — it is the
-        substrate the resume mechanism depends on.
+        in-place.  ``train_adapter``'s own crash-resume logic
+        (``paramem.training.trainer._resolve_resume_checkpoint``, read via
+        ``staging_resume.json``) reads the latest ``checkpoint-<step>/`` from
+        the same directory when a fold resumes this tier's training after an
+        interruption — a crash, a :class:`BackgroundTrainer`
+        ``abort_for_inference`` abort, or a graceful shutdown — so this is
+        NOT throwaway scratch — it is the substrate the resume mechanism
+        depends on.
 
         Distinct from:
 
@@ -1982,8 +1964,7 @@ class ConsolidationLoop:
         surface at that root — the timestamped slot dir, and (interim only)
         ``indexed_key_registry.json`` / ``key_metadata.json`` — and HF's
         step-numbered ``checkpoint-<step>/`` subdirs never collide with any
-        of them. This directory is disposable scratch: a caller may
-        ``shutil.rmtree`` it without touching anything published. The same
+        of them. The same
         ``cycle_<N>`` shape nested under ``interim_<stamp>/`` is also the
         debug-snapshot layout's convention (:meth:`snapshot_dir_for`).
 
@@ -2033,7 +2014,6 @@ class ConsolidationLoop:
         *,
         speaker_id: str,
         mode: "Literal['simulate', 'train']",
-        run_label: str,
         pending: "PendingRelations",
         schedule: str = "",
         max_interim_count: int = 7,
@@ -2104,9 +2084,6 @@ class ConsolidationLoop:
             mode: ``"train"`` writes adapter weights; ``"simulate"`` writes
                 a ``graph.json`` payload into the same written-slot envelope,
                 without touching PEFT.
-            run_label: Tag woven into the wandb ``run_name`` for traceability.
-                Pass ``session_id`` for per-session calls, or
-                ``"tick-<stamp>"`` for batch calls from the scheduled tick.
             pending: The batch's merged extraction product — the caller's own
                 :meth:`take_pending_relations` take, captured at the
                 extraction boundary before this call.  Required: the
@@ -2757,8 +2734,9 @@ class ConsolidationLoop:
         A reconcile (``/reconsolidate``) IS a full consolidation whose input
         excludes pending sessions: one fold topology throughout — the interim
         ring is always recalled, always absorbed into the main tiers, and
-        always reaped, exactly as any full fold; warm start is uniform, with
-        no cold-start arm.  *event* exists only to name the door in the
+        always reaped, exactly as any full fold; every tier's starting
+        weights are decided the same way (own weights, else a valid donor,
+        else LoRA-zero).  *event* exists only to name the door in the
         ledger and in reporting; it changes no fold behaviour here beyond the
         recorded label — the caller is what keeps sessions pending for a
         reconcile, via *pending*.
@@ -2881,9 +2859,11 @@ class ConsolidationLoop:
         :func:`~paramem.models.loader.tier_backup_scope`, because
         shape-mismatched weights cannot be kept — otherwise a live tier's
         weights change only at the go-live mount.  Every tier's transient
-        staging slot warm-starts uniformly (see
-        :func:`~paramem.training.trainer.train_adapter`'s ``warm_start``
-        table) — there is no cold-start arm for either door.
+        staging slot starts uniformly from its own prior trained weights
+        when it has any, from a valid donor checkpoint when it does not,
+        and from LoRA-zero otherwise — the same three-outcome decision
+        :func:`~paramem.training.trainer.train_adapter` makes for its
+        starting weights, applied uniformly to both doors.
 
         Args:
             source: ``"weights"`` (train) or ``"disk"`` (simulate) — this
@@ -3250,7 +3230,6 @@ class ConsolidationLoop:
         adapter_config,
         training_config,
         output_dir,
-        run_name: str,
         phase_name: str,
         retain_scratch_until_external_commit: bool = False,
     ):
@@ -3267,11 +3246,10 @@ class ConsolidationLoop:
         steps, LR-decay steps) is derived here from ``len(entries)`` via
         ``paramem.utils.config.budget_for`` and applied to the incoming
         ``training_config`` via ``dataclasses.replace`` — every production
-        caller (interim, the full fold, and
-        ``active_store_migration._migrate_tier_simulate_to_train``) inherits
-        the SAME derivation with no special case; there is no off switch
-        (the derivation is the unconditional standard mechanism, validated
-        via Test 20 -- see ``benchmarking.md``).
+        caller inherits the SAME derivation with no special case; there is
+        no off switch (the derivation is the unconditional standard
+        mechanism, derived per fold from the key-triple count -- see
+        ``budget_for``).
 
         The ``from paramem.training.trainer import train_adapter`` import is
         kept INSIDE this method so tests can patch
@@ -3289,16 +3267,17 @@ class ConsolidationLoop:
                 mutated (``dataclasses.replace`` returns a new instance).
             output_dir: HF Trainer ``output_dir``; also used by the recall
                 callback for ``progress.json`` / ``epoch_log.json``.
-            run_name: W&B / HF Trainer run name.
-            phase_name: Label for the recall callback's ``progress.json``
-                (e.g. ``"interim-episodic-tick42"``, ``"consolidate-semantic"``).
+            phase_name: Label for the recall callback's ``progress.json``.
             retain_scratch_until_external_commit: Forwarded verbatim to
-                :func:`paramem.training.trainer.train_adapter`.  When ``True``,
-                the success path skips ``_clean_scratch`` / ``staging_resume.json``
-                deletion so the durable ``checkpoint-N`` directory survives until
-                the fold's own external ``commit_tier_slot`` call.  Default
-                ``False`` preserves clean-on-success for all other callers (BG
-                trainer, replay, migration, interim).
+                :func:`paramem.training.trainer.train_adapter`.  ``True``
+                keeps ``checkpoint-N`` and ``staging_resume.json`` on disk
+                after success and after an abort; the event's disposal
+                (``stage_ledger.dispose``) removes them.  ``False``
+                (default) removes them on both.  :meth:`_train_gate_write`,
+                the call site for a full or interim fold's tier training,
+                passes ``True``; the active-store migration and
+                :func:`~paramem.training.donor.build_donor` take the
+                default.
 
         Returns:
             ``(metrics_dict, recall_state)`` on success; ``(None, None)`` if
@@ -3309,27 +3288,21 @@ class ConsolidationLoop:
             and ``"epochs"`` (this call's derived training budget) for the
             caller's telemetry record.
 
-        Donor resolution: unconditional (no feature flag; validated via Test
-        20 -- see ``benchmarking.md``). This method is reachable ONLY from
-        the weights venue (every call site sits inside its enclosing ``if
-        scope.source == "weights":`` branch — see ``consolidation.py``'s own
-        ``_train_tier_adapter`` call site and
-        ``active_store_migration._migrate_tier_simulate_to_train``, plus
-        :func:`~paramem.training.donor.build_donor`'s own funnel call
-        (training the donor's transient build slot itself, gated out of
-        recursive resolution below) — all routed through this one funnel),
-        so the disk/simulate venue never resolves a donor. When
-        *adapter_name* is not the donor's own transient build slot
-        (``DONOR_BUILD_ADAPTER_NAME`` — excluding it here is what stops
-        :func:`~paramem.training.donor.build_donor`'s own funnel call from
-        recursively re-triggering donor resolution on the adapter it is
-        training), the donor checkpoint is resolved via
-        :meth:`_resolve_donor_checkpoint` and handed to
+        Donor resolution is unconditional (no feature flag): every call with
+        training examples resolves a donor, whatever the key count, except
+        on the donor's own build slot (``DONOR_BUILD_ADAPTER_NAME``), so
+        :func:`~paramem.training.donor.build_donor`'s own call here never
+        re-triggers resolution. Every caller trains weights —
+        :meth:`_train_gate_write` runs only for a train-mode event, the
+        active-store migration trains a simulate store into weights, and
+        :func:`~paramem.training.donor.build_donor` trains the donor
+        adapter — so the disk/simulate venue never resolves a donor. The
+        checkpoint :meth:`_resolve_donor_checkpoint` returns is handed to
         :func:`~paramem.training.trainer.train_adapter` as
-        ``donor_checkpoint_dir`` — that call, not this one, decides whether
-        the donor actually applies (only when the tier has no prior trained
-        weights) and performs the copy into the transient staging slot. This
-        method never writes any adapter's weights itself.
+        ``donor_checkpoint_dir``; that call decides whether it applies
+        (only when the tier has no prior trained weights) and copies it
+        into the transient staging slot. This method never writes any
+        adapter's weights itself.
         """
         from paramem.training.trainer import train_adapter
 
@@ -3366,9 +3339,7 @@ class ConsolidationLoop:
             adapter_name=adapter_name,
             training_config=training_config,
             adapter_config=adapter_config,
-            wandb_config=self.wandb_config,
             output_dir=output_dir,
-            run_name=run_name,
             thermal_policy=self._thermal_policy,
             hooks=self._build_training_hooks(),
             callbacks_extra=[recall_cb] if recall_cb is not None else None,
@@ -4998,8 +4969,9 @@ class ConsolidationLoop:
         writes, so the scope's only job is the unwind of a tier trained warm
         in place.  The shape-mismatch recreate above is this method's only
         adapter recreate; every event's transient staging slot inside
-        ``train_adapter`` warm-starts uniformly (no cold-start arm for a
-        RECONCILE event), never touching *tier* itself.  The gate
+        ``train_adapter`` decides its starting weights the same way for a
+        RECONCILE event as any other (own weights, else a valid donor, else
+        LoRA-zero), never touching *tier* itself.  The gate
         (:meth:`_probe_recall` -> :meth:`_assert_tier_recall`) runs once, on
         the staged weights,
         immediately before the write — the design's one-probe rule; a
@@ -5049,7 +5021,6 @@ class ConsolidationLoop:
                 adapter_config=adapter_config,
                 training_config=self.training_config,
                 output_dir=output_dir,
-                run_name=f"consolidate-{tier}",
                 phase_name=f"consolidate-{tier}",
                 retain_scratch_until_external_commit=True,
             )

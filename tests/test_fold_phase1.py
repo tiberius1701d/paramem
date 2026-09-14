@@ -51,7 +51,6 @@ def _make_loop(tmp_path, *, procedural: bool = False) -> ConsolidationLoop:
     }
     if procedural:
         loop.tier_adapters["procedural"] = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
-    loop.wandb_config = None
     loop._thermal_policy = None
     loop.output_dir = tmp_path / "adapters"
     loop.output_dir.mkdir(parents=True, exist_ok=True)

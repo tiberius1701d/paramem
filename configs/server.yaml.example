@@ -71,7 +71,7 @@ server:
   port: 8420
   reclaim_interval_minutes: 10  # how often to check if GPU is free for auto-reclaim
 
-model: mistral  # mistral | gemma | qwen3b | gemma4
+model: mistral  # base model alias (a model registry key)
 
 debug: false  # ship-safe default — true writes plaintext fact copies to data/ha/sessions/*.jsonl
               # and data/ha/debug/cycle_*/ on every consolidation. Flip true ONLY when actively
@@ -272,56 +272,48 @@ consolidation:
   # Per-fold training-budget derivation (standard mechanism, unconditional).
   # epochs/gradient-accumulation/lr_decay_steps are ALWAYS derived from the
   # fold's key-triple count at the training funnel
-  # (N>=128 -> 30 epochs; 16-127 -> 50; <16 -> 80; batch stays 1) -- there is
-  # no fixed-budget mode and no operator ceiling. Each bucket is a derived
-  # budget anchored by measurement recorded in benchmarking.md.
+  # (N>=128 -> 30 epochs; 16-127 -> 50; <16 -> 80; batch stays 1); the budget
+  # is derived per fold from the key count.
   # recall_early_stopping (below) is the wall-time feedback channel -- it
   # usually terminates training before the bucket cap is reached; hit_cap
   # telemetry records when it does not.
   #
-  # Donor seeding (standard mechanism, unconditional -- validated via
-  # Test 20). A measured-cold target adapter (LoRA-B ~= 0) is seeded from
-  # ITS OWN TOPOLOGY's donor checkpoint (paramem.training.donor) before
-  # training, instead of training from LoRA-zero. Every distinct LoRA
-  # topology (rank, alpha, target_modules) gets its own checkpoint -- the
-  # shipped config has two: episodic+semantic+every interim adapter share
-  # one attention-only topology, procedural is the only attention+MLP
-  # topology. The donor is a synthetic crowded-predicate-cluster population
-  # (>= 128 keys, in practice 147 -- donor_entries returns whole 21-entry
-  # blocks) trained through the SAME funnel/budget table as any other fold,
-  # at either topology: 2220 steps (30-epoch bucket) either way -- the step
-  # count is topology-independent. Keys graph1-200/proc1-200 are always
-  # reserved for it (real minting starts at 201). A topology's checkpoint is
-  # NOT built at boot as a separate step: it is built INLINE, synchronously,
-  # the first time a fold measures a target of that topology cold with no
-  # valid checkpoint yet -- that ONE fold absorbs a full donor training run
-  # in addition to its own training before it starts. Measured (attention-
-  # only topology, ~1.0s/step -> ~37 min): an N=21 triggering fold (550 of
-  # its own steps) pays ~5x its own wall time that one cycle; an N=2
-  # triggering fold (160 of its own steps) pays ~14x -- the multiplier is
-  # NOT a flat "roughly doubling": it shrinks as the triggering fold's own
-  # key count grows, and the triggering fold is small by construction (the
-  # first measured-cold adapter OF THAT TOPOLOGY in a deployment's lifetime,
-  # or after a base-model swap). The attention+MLP topology's per-step cost
-  # is now measured too (Test 20, donor_build_smoke_procedural,
-  # 20260727_183637/build_results.json): attention-only ~1.0s/step -> ~37
-  # min; attention+MLP ~1.2285s/step -> ~45.5 min (both at the same 2220
-  # steps). In the worst case a deployment pays this cost twice across
-  # its lifetime (once per topology), never in the same fold. Every fold
-  # after the triggering one reuses that topology's persisted checkpoint
-  # until it is invalidated (base-model swap, a rank/target_modules edit to
-  # THAT topology, or a change to the donor generation recipe itself) -- an
-  # edit to a different tier's topology leaves this checkpoint valid. Disk:
-  # ~26 MiB per attention-only checkpoint, ~80 MiB per attention+MLP one,
-  # under <adapter_dir>/_donor/<topology>/. A restore wipes the whole donor
-  # tree (both topologies), so a restored deployment pays both inline builds
-  # again on first encounter. Each successful donor build also deletes any
-  # _donor/ child directory whose name is not a currently-live topology id
-  # (dot-prefixed children are skipped), so anything parked there by hand is
-  # removed on the next build. Disabling a tier (e.g.
-  # adapters.procedural.enabled: false) makes its donor's topology dead --
-  # the next build of another topology deletes it, and re-enabling the tier
-  # later costs a fresh inline build.
+  # Donor seeding (standard mechanism, unconditional). A measured-cold
+  # target adapter (LoRA-B ~= 0) is seeded from ITS OWN TOPOLOGY's donor
+  # checkpoint before training, instead of
+  # training from LoRA-zero. Every distinct LoRA topology (rank, alpha,
+  # target_modules) gets its own checkpoint -- the shipped config has two:
+  # episodic+semantic+every interim adapter share one attention-only
+  # topology, procedural is the only attention+MLP topology. The donor is
+  # a synthetic crowded-predicate-cluster population (>= 128 keys, built
+  # in whole 21-entry blocks) trained through the SAME
+  # funnel/budget table as any other fold. Keys graph1-200/proc1-200 are
+  # always reserved for it (real minting starts at 201). A topology's
+  # checkpoint is NOT built at boot as a separate step: it is built
+  # INLINE, synchronously, the first time a fold measures a target of
+  # that topology cold with no valid checkpoint yet -- that ONE fold
+  # absorbs a full donor training run in addition to its own training
+  # before it starts. The attention+MLP topology costs more per step to
+  # build than the attention-only one. A fold trains its tiers one at a
+  # time; when more than one tier in the same fold is measured cold with
+  # no valid checkpoint for its own topology -- for example the first full
+  # fold at max_interim_count: 0 that trains both an episodic and a
+  # procedural tier, before either topology has a checkpoint --
+  # that fold builds a donor for each cold topology, each before its own
+  # tier trains.
+  # Every tier trained after a topology's checkpoint exists reuses it,
+  # kept per (base model, topology) pair in its own
+  # donor-<topology>-b<base8> store beside the tier stores under
+  # <adapter_dir>/, until the checkpoint is invalidated (base-model swap,
+  # a rank/alpha/target_modules edit to THAT topology, or a change to the
+  # donor generation recipe itself) -- an edit to a different tier's
+  # topology leaves this checkpoint valid.
+  # A backup captures every donor store present on disk and a restore
+  # writes each one back; a donor store the restored bundle does not
+  # carry is removed. Disabling a tier (e.g.
+  # adapters.procedural.enabled: false) leaves its topology's donor store
+  # on disk untouched, so re-enabling the tier later reuses it instead of
+  # paying a fresh inline build.
   # Recall-based early stopping. Default OFF; flip to true after one clean
   # cycle on your deployment to start saving training wall time by stopping
   # each fold once the staged adapter recalls its training set. See
@@ -441,13 +433,6 @@ consolidation:
   # --- Graph-level cloud enrichment neighborhood knobs ---
   graph_enrichment_neighborhood_hops: 2      # N-hop ego-graph radius per focal entity
   graph_enrichment_max_entities_per_pass: 50 # max nodes per cloud chunk call
-  # RAM-mode checkpointing: when > 0, train_adapter writes HF Trainer checkpoints
-  # to /dev/shm (RAM-backed tmpfs) instead of the encrypted adapter slot.  At each
-  # epoch boundary the latest checkpoint is copied to the caller's output_dir.
-  # Trade-off: /dev/shm is not durable across restarts — a crash loses the
-  # in-flight checkpoint; the last committed adapter slot is always intact.
-  # Set to 0 (default) to keep the default "epoch" save behaviour on disk.
-  training_save_steps_ram: 0
   # Post-promotion slot retention: how many prior timestamped adapter slots to
   # keep per tier alongside the live (registry-matched) slot. Older slots beyond
   # this budget are deleted after the registry-commit step. 0 = live slot only.
@@ -878,31 +863,32 @@ text_lang_detection:
 # ============================================================================
 # Progressive Web App (PWA) support for the mobile client.
 #
-# enabled:       serve the static bundle and activate cookie-based auth.
-#                Disabled by default; enable after running the mobile-client
-#                build (not yet implemented).
-# static_dir:    path to the compiled static bundle.  Empty → resolved to
-#                paramem/web/static once the static-mount path is implemented.
-# cookie_name:   session cookie name the SPA sets after login.
-# push_enabled:  enable Web Push notifications.  When true, a VAPID EC P-256
-#                keypair is auto-generated on first startup and persisted as
-#                vapid_keys.json (age-encrypted when a daily key is loaded).
-#                The /push/vapid-public-key and /push/subscribe endpoints become
-#                active.  Requires per-user bearer tokens — shared-token or
-#                unauthenticated subscribe requests are rejected with 403.
-#                False by default (opt-in).  Set to true after confirming
-#                mobile_pwa.enabled=true and per-user tokens are minted.
-# vapid_contact: JWT sub claim sent to push relays for abuse-contact purposes.
-#                Must be a mailto: URI.  Replace with your own address.
-#                IMPORTANT: "mailto:admin@localhost" is a placeholder — real push
-#                relays reject it.  Set to a real reachable mailto: or https:
-#                contact before enabling push_enabled.
+# enabled:       serve the static PWA bundle at /app and wire the per-user
+#                token store that activates the auth middleware.  False by
+#                default so a deployment with no minted tokens stays open.
+# static_dir:    path to the compiled static bundle.  Empty → the built-in
+#                bundle at paramem/web/static.
+# cookie_name:   name of the cookie the auth middleware accepts a bearer
+#                token from, in addition to the Authorization header.  The
+#                server does not set this cookie itself.
+# push_enabled:  activates Web Push subscriptions together with enabled —
+#                both must be true.  A VAPID EC P-256 keypair is then
+#                auto-generated on first startup and persisted as
+#                vapid_keys.json (age-encrypted when a daily key is
+#                loaded), and the /push/vapid-public-key and /push/subscribe
+#                endpoints become active; the server stores each
+#                subscription and sends no notification.  /push/subscribe
+#                requires an attributed per-user bearer token and returns
+#                403 for an authenticated but unattributed token; a missing
+#                or invalid token is rejected with 401 before either
+#                endpoint runs, and /push/vapid-public-key has no 403 path.
+#                False by default (opt-in).  Set to true once per-user
+#                tokens are minted.
 mobile_pwa:
   enabled: false
   static_dir: ""
   cookie_name: "paramem_token"
   push_enabled: false
-  vapid_contact: "mailto:admin@localhost"
 
 # ============================================================================
 # PROCESS

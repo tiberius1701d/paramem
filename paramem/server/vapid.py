@@ -1,4 +1,4 @@
-"""VAPID keypair lifecycle and signing helper for Web Push.
+"""VAPID keypair lifecycle for Web Push.
 
 The keypair is persisted as a Tier-2 infrastructure file (same encryption
 posture as ``user_tokens.json``): age-encrypted when a daily identity is loaded
@@ -19,21 +19,20 @@ private key.  This avoids any risk of public/private key skew on disk.
 
 VAPID key stability
 -------------------
-The ``applicationServerKey`` delivered to browsers and the VAPID JWT ``aud``
-claim are derived from the same EC P-256 private key.  Replacing
-``vapid_keys.json`` invalidates all existing browser subscriptions; operators
-should treat the keypair as effectively immutable once browsers have subscribed.
+The ``applicationServerKey`` delivered to browsers is derived from the
+EC P-256 private key persisted here.  Replacing ``vapid_keys.json``
+invalidates all existing browser subscriptions; operators should treat the
+keypair as effectively immutable once browsers have subscribed.
 
 Security properties
 -------------------
-- The keypair is auto-generated on first startup when ``push_enabled`` is true.
+- The keypair is auto-generated on first startup when both
+  ``mobile_pwa.enabled`` and ``mobile_pwa.push_enabled`` are true.
 - The private key PEM is written via :func:`~paramem.backup.encryption.write_infra_bytes`
   (age-encrypted when a daily key is loaded).
 - ``application_server_key`` returns the unpadded base64url-encoded
   uncompressed EC point (65 bytes, ``0x04`` prefix) required by the
   ``PushManager.subscribe()`` browser API.
-- The VAPID JWT is signed per-request with claims ``aud`` (endpoint origin),
-  ``sub`` (configured contact URI), ``exp`` (now + 12 h).
 """
 
 from __future__ import annotations
@@ -41,7 +40,6 @@ from __future__ import annotations
 import base64
 import json
 import logging
-import time
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -81,7 +79,8 @@ def ensure_vapid_keypair(data_dir: Path):
     Returns
     -------
     py_vapid.Vapid
-        A loaded Vapid instance ready for signing.
+        A loaded Vapid instance whose public key
+        :func:`application_server_key` can derive.
 
     Raises
     ------
@@ -153,41 +152,3 @@ def application_server_key(handle) -> str:
         format=PublicFormat.UncompressedPoint,
     )
     return base64.urlsafe_b64encode(pub_bytes).rstrip(b"=").decode("ascii")
-
-
-def vapid_authorization_header(handle, endpoint: str, contact: str) -> str:
-    """Build the VAPID ``Authorization`` header value for a push request.
-
-    Constructs claims with ``aud`` set to the endpoint's scheme+host, ``sub``
-    set to *contact* (typically ``mailto:admin@...``), and ``exp`` set to
-    now + 12 hours.  Signs with the loaded private key via
-    :meth:`py_vapid.Vapid.sign` (RFC 8292 ``vapid t=...,k=...`` format).
-
-    Parameters
-    ----------
-    handle:
-        A loaded :class:`py_vapid.Vapid` instance.
-    endpoint:
-        The push subscription endpoint URL (used to derive ``aud``).
-    contact:
-        The JWT ``sub`` claim — a ``mailto:`` URI identifying the server
-        operator (from ``mobile_pwa.vapid_contact`` in the server config).
-
-    Returns
-    -------
-    str
-        The full ``Authorization`` header value, e.g.
-        ``vapid t=<jwt>,k=<pubkey>``.
-    """
-    from urllib.parse import urlparse
-
-    parsed = urlparse(endpoint)
-    aud = f"{parsed.scheme}://{parsed.netloc}"
-
-    claims = {
-        "sub": contact,
-        "aud": aud,
-        "exp": int(time.time()) + 12 * 3600,
-    }
-    signed = handle.sign(claims)
-    return signed["Authorization"]

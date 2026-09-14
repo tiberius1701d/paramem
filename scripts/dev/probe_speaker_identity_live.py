@@ -304,7 +304,6 @@ def run_gpu_render_resolution(out_dir: Path) -> dict:
         training_config=training_cfg,
         tier_adapters=tier_adapters,
         memory_store=MemoryStore(),
-        wandb_config=None,
         output_dir=out_dir,
         save_cycle_snapshots=False,
         extraction_enrichment_provider="off",

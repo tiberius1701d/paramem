@@ -14,7 +14,7 @@ The ``TestStagingPromoteContract`` class verifies the staging contract:
 - a second call without caller disposal trips the lifecycle guard
 - abort path does NOT promote, deletes staging, and still cleans scratch
 - crash path preserves scratch for crash-resume and still deletes staging
-- 3-way resume resolution (RAM → disk → absent)
+- resume resolution via the on-disk checkpoint pointer (found → absent)
 
 No GPU required: the test patches ``ParamemTrainer``, PEFT, and encryption
 helpers so staging logic runs without a real training run.
@@ -24,15 +24,17 @@ from __future__ import annotations
 
 import json
 import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
+import pytest
 import torch
 from transformers import TrainerCallback
 
 from paramem.training.thermal_throttle import ThermalPolicy
 from paramem.training.trainer import (
-    LossEarlyStoppingCallback,
     TrainingHooks,
     _HooksAdapterCallback,
     train_adapter,
@@ -126,14 +128,6 @@ class TestCallbackOrdering:
         types = [type(cb).__name__ for cb in cbs]
         assert types == ["EncryptCheckpointCallback", "_StagingResumeCallback"]
 
-    def test_loss_early_stop_when_enabled(self):
-        cfg = TrainingConfig(early_stopping=True)
-        cbs = _capture_callbacks(training_config=cfg)
-        types = [type(cb).__name__ for cb in cbs]
-        assert "LossEarlyStoppingCallback" in types
-        # LossEarlyStoppingCallback is registered immediately after Encrypt.
-        assert types.index("LossEarlyStoppingCallback") == 1
-
     def test_extra_callbacks_trail(self):
         marker = _MarkerCallback()
         hooks = TrainingHooks(on_shutdown_check=lambda: False)
@@ -147,14 +141,13 @@ class TestCallbackOrdering:
         assert cbs[-1] is marker
 
     def test_full_assembly_order(self):
-        # All slots populated → exact expected order:
-        # Encrypt → LossEarlyStop → HooksAdapter → ThermalThrottle →
-        # _StagingResumeCallback → marker.
-        cfg = TrainingConfig(early_stopping=True)
-        hooks = TrainingHooks(on_shutdown_check=lambda: False)
+        """With loss early stopping off, the cross-cutting callbacks register
+        in one fixed order: EncryptCheckpointCallback, _HooksAdapterCallback,
+        ThermalThrottleCallback, _StagingResumeCallback, then
+        callbacks_extra."""
         marker = _MarkerCallback()
+        hooks = TrainingHooks(on_shutdown_check=lambda: False)
         cbs = _capture_callbacks(
-            training_config=cfg,
             hooks=hooks,
             thermal_policy=self._policy(),
             callbacks_extra=[marker],
@@ -162,7 +155,6 @@ class TestCallbackOrdering:
         types = [type(cb).__name__ for cb in cbs]
         assert types == [
             "EncryptCheckpointCallback",
-            "LossEarlyStoppingCallback",
             "_HooksAdapterCallback",
             "ThermalThrottleCallback",
             "_StagingResumeCallback",
@@ -171,23 +163,6 @@ class TestCallbackOrdering:
 
 
 class TestHooksAdapterCallbackBehaviour:
-    def test_epoch_persist_invoked_at_epoch_end(self):
-        """on_epoch_persist receives (global_step, output_dir) at epoch end.
-
-        Both on_epoch_end and on_save normalize to state.global_step so that
-        the BackgroundTrainer dedup key matches across both callbacks at every
-        epoch boundary.  The stored value is always the step count.
-        """
-        seen = []
-        hooks = TrainingHooks(
-            on_epoch_persist=lambda step, output_dir: seen.append((step, output_dir))
-        )
-        cb = _HooksAdapterCallback(hooks)
-        args = MagicMock(output_dir="/tmp/test")
-        state = MagicMock(epoch=3.0, global_step=1500)
-        cb.on_epoch_end(args=args, state=state, control=MagicMock())
-        assert seen == [(1500, "/tmp/test")]
-
     def test_shutdown_check_sets_should_stop(self):
         hooks = TrainingHooks(on_shutdown_check=lambda: True)
         cb = _HooksAdapterCallback(hooks)
@@ -215,18 +190,6 @@ class TestHooksAdapterCallbackBehaviour:
             control=MagicMock(),
         )
 
-    def test_on_save_invokes_persist_with_global_step(self):
-        """on_save_persist receives (global_step, output_dir) from on_save."""
-        seen: list = []
-        hooks = TrainingHooks(on_save_persist=lambda step, d: seen.append((step, d)))
-        cb = _HooksAdapterCallback(hooks)
-        cb.on_save(
-            args=MagicMock(output_dir="/tmp/x"),
-            state=MagicMock(global_step=87),
-            control=MagicMock(),
-        )
-        assert seen == [(87, "/tmp/x")]
-
     def test_step_end_shutdown_check_sets_should_stop(self):
         """on_shutdown_check=True at step_end sets control.should_training_stop."""
         hooks = TrainingHooks(on_shutdown_check=lambda: True)
@@ -239,12 +202,6 @@ class TestHooksAdapterCallbackBehaviour:
             control=control,
         )
         assert control.should_training_stop is True
-
-
-# Touch LossEarlyStoppingCallback so the import is exercised (no behavior test
-# needed — its existing tests in tests/test_trainer_callbacks.py cover behaviour).
-def test_loss_early_stopping_class_importable():
-    assert LossEarlyStoppingCallback is not None
 
 
 # ---------------------------------------------------------------------------
@@ -307,7 +264,7 @@ def _make_staging_model(
 
 
 def _minimal_tc(**overrides) -> TrainingConfig:
-    """Return a minimal ``TrainingConfig`` for staging tests (no RAM mode)."""
+    """Return a minimal ``TrainingConfig`` for staging tests."""
     cfg = TrainingConfig(
         num_epochs=1,
         batch_size=1,
@@ -320,7 +277,6 @@ def _minimal_tc(**overrides) -> TrainingConfig:
         seed=42,
         save_strategy="no",
         save_total_limit=1,
-        save_steps_ram=0,
     )
     for k, v in overrides.items():
         setattr(cfg, k, v)
@@ -512,6 +468,110 @@ def _staging_patches(tmp_path, *, trainer_cls=_NullTrainer, abort_shutdown=False
     return stack, mock_create, mock_copy, mock_switch
 
 
+def _track_adapter_state(model: MagicMock, mock_create: MagicMock, mock_switch: MagicMock) -> None:
+    """Give a staging model PEFT's adapter bookkeeping.
+
+    The production tier ``"episodic"`` starts active. ``set_adapter``
+    activates only a resident adapter, ``delete_adapter`` removes the slot
+    from ``peft_config``, and the patched ``create_adapter`` and
+    ``switch_adapter`` from :func:`_staging_patches` register and activate
+    adapters through the model as the real helpers do, so a test can assert
+    on the model's resulting state instead of on the calls made to it.
+
+    Args:
+        model: A model from :func:`_make_staging_model`.
+        mock_create: The patched ``create_adapter``.
+        mock_switch: The patched ``switch_adapter``.
+    """
+    model.active_adapter = "episodic"
+
+    def _set_adapter(name: str) -> None:
+        if name not in model.peft_config:
+            raise ValueError(f"Adapter {name} not found.")
+        model.active_adapter = name
+
+    def _delete_adapter(name: str) -> None:
+        del model.peft_config[name]
+
+    def _create_adapter(model_arg, adapter_config, name: str) -> None:
+        model_arg.peft_config[name] = MagicMock()
+        model_arg.set_adapter(name)
+
+    model.set_adapter.side_effect = _set_adapter
+    model.delete_adapter.side_effect = _delete_adapter
+    mock_create.side_effect = _create_adapter
+    mock_switch.side_effect = lambda model_arg, name: model_arg.set_adapter(name)
+
+
+def _plant_resume_checkpoint(
+    out_dir: Path,
+    dataset: list[dict],
+    training_config: TrainingConfig,
+    adapter_config: AdapterConfig,
+) -> Path:
+    """Leave an interrupted run's crash-resume state under *out_dir*.
+
+    Creates ``checkpoint-10`` and a ``staging_resume.json`` whose fingerprints
+    match *dataset* and the two configs, so ``train_adapter`` resumes from
+    that checkpoint.
+
+    Args:
+        out_dir: The ``output_dir`` the test passes to ``train_adapter``.
+        dataset: The training dataset the test passes.
+        training_config: The training config the test passes.
+        adapter_config: The adapter config the test passes.
+
+    Returns:
+        The checkpoint directory.
+    """
+    from paramem.training.trainer import _fingerprint_dataset, _fingerprint_training_config
+
+    ckpt_dir = out_dir / "checkpoint-10"
+    ckpt_dir.mkdir(parents=True)
+    resume_state = {
+        "adapter_name": "episodic",
+        "dataset_fingerprint": _fingerprint_dataset(dataset),
+        "training_config_fingerprint": _fingerprint_training_config(
+            training_config, adapter_config
+        ),
+        "disk_checkpoint_path": str(ckpt_dir),
+    }
+    (out_dir / "staging_resume.json").write_bytes(json.dumps(resume_state, indent=2).encode())
+    return ckpt_dir
+
+
+@contextmanager
+def _failing_warm_start_copy(error: BaseException) -> Iterator[None]:
+    """Make copying the production weights into the staging slot raise *error*."""
+    with patch("paramem.models.loader.copy_adapter_weights", side_effect=error):
+        yield
+
+
+@contextmanager
+def _failing_training_arguments(error: BaseException) -> Iterator[None]:
+    """Make building ``TrainingArguments`` raise *error*."""
+    with patch("paramem.training.trainer.TrainingArguments", side_effect=error):
+        yield
+
+
+@contextmanager
+def _failing_trainer_construction(error: BaseException) -> Iterator[None]:
+    """Make constructing ``ParamemTrainer`` raise *error*."""
+    with patch("paramem.training.trainer.ParamemTrainer", side_effect=error):
+        yield
+
+
+@contextmanager
+def _failing_resume_checkpoint_materialization(error: BaseException) -> Iterator[None]:
+    """Report a daily identity as available and make decrypting the resume
+    checkpoint raise *error*."""
+    with (
+        patch("paramem.backup.key_store.daily_identity_available", return_value=True),
+        patch("paramem.backup.checkpoint_shard.materialize_checkpoint_to_shm", side_effect=error),
+    ):
+        yield
+
+
 # ---------------------------------------------------------------------------
 # TestStagingPromoteContract — staging slot lifecycle and promote semantics
 # ---------------------------------------------------------------------------
@@ -522,15 +582,18 @@ class TestStagingPromoteContract:
 
     Staged invariants:
     1. ``in_training`` slot is created when absent (correct shape).
-    2. ``in_training`` slot is deleted+recreated when target_modules change.
+    2. A pre-existing ``in_training`` slot at entry trips the lifecycle guard
+       — the prior training event's caller did not dispose of it.
     3. Production weights are copied to staging at entry.
-    4. Normal completion promotes staging → production and cleans scratch.
+    4. Normal completion leaves staging resident and active for the caller,
+       and cleans scratch — ``train_adapter`` itself never promotes or
+       deletes the slot; the caller promotes it with
+       ``promote_staging_adapter`` and disposes of it with ``staged_weights``.
     5. Abort path: no promote; scratch cleaned.
     6. Crash path: scratch preserved (staging_resume.json + checkpoint).
     7. Crash-resume: staging_resume.json fingerprint match → checkpoint forwarded.
-    8. 3-way resume preference: RAM first, then disk, then absent.
-    9. Normal completion cleans staging_resume.json + bg_checkpoint_epoch.
-    10. Abort completion cleans staging_resume.json + bg_checkpoint_epoch.
+    8. Resume resolution: a recorded on-disk checkpoint pointer that still
+       exists is forwarded; otherwise resume is absent.
     """
 
     def test_staging_slot_created_at_entry_with_shape_match(self, tmp_path):
@@ -559,9 +622,13 @@ class TestStagingPromoteContract:
         """Pre-existing 'in_training' at entry violates the staging lifecycle — RuntimeError."""
         import pytest
 
-        # Staging is transient (created at training entry, deleted at exit on both
-        # success and abort paths). If 'in_training' is present at entry, the
-        # prior training event failed to clean up — a real bug.
+        # Staging is transient (created at training entry). On abort or an
+        # exception, train_adapter drops it itself before returning or
+        # re-raising; on normal completion it stays resident for the
+        # caller's probe -> promote -> dispose sequence. If 'in_training'
+        # is present at entry, the prior event's caller skipped that
+        # sequence or a disposal failed and was only logged — a real bug
+        # either way.
         model = _make_staging_model(has_staging=True)
         stack, mock_create, mock_copy, mock_switch = _staging_patches(tmp_path)
         with stack, pytest.raises(RuntimeError, match="Lifecycle invariant violated"):
@@ -608,6 +675,12 @@ class TestStagingPromoteContract:
                     adapter_config=_minimal_ac(),
                     output_dir=tmp_path / "adapter_2",
                 )
+
+        # The refusal leaves the first call's staged weights resident for
+        # that call's caller: the teardown covers only a slot this call made.
+        assert "in_training" in model.peft_config
+        assert call("in_training") not in model.delete_adapter.call_args_list
+        mock_switch.assert_not_called()
 
     def test_staging_active_at_normal_completion(self, tmp_path):
         """On normal completion, 'in_training' is the active adapter — the caller
@@ -658,6 +731,67 @@ class TestStagingPromoteContract:
         assert call("in_training") in model.delete_adapter.call_args_list, (
             "Exception path must still delete the staging slot (best-effort)"
         )
+
+    @pytest.mark.parametrize(
+        "failing_step",
+        [
+            pytest.param(_failing_warm_start_copy, id="warm_start_copy"),
+            pytest.param(_failing_training_arguments, id="training_arguments"),
+            pytest.param(_failing_trainer_construction, id="trainer_construction"),
+            pytest.param(
+                _failing_resume_checkpoint_materialization,
+                id="resume_checkpoint_materialization",
+            ),
+        ],
+    )
+    def test_failure_before_training_tears_down_staging_slot(self, tmp_path, failing_step):
+        """An exception raised after the staging slot exists but before
+        ``trainer.train()`` runs leaves the model as an exception inside
+        training does: it propagates unchanged, the staging slot is deleted,
+        the production adapter is active again, and the crash-resume scratch
+        survives. The next call therefore trains instead of tripping the
+        lifecycle guard.
+
+        Kills: a teardown that covers only ``trainer.train()``.
+        """
+        out_dir = tmp_path / "adapter"
+        dataset = _minimal_dataset()
+        training_config = _minimal_tc()
+        adapter_config = _minimal_ac()
+        ckpt_dir = _plant_resume_checkpoint(out_dir, dataset, training_config, adapter_config)
+
+        # Trained production weights, so the warm-start copy into the slot runs.
+        model = _make_staging_model(has_staging=False, production_warm=True)
+        stack, mock_create, _, mock_switch = _staging_patches(tmp_path)
+        _track_adapter_state(model, mock_create, mock_switch)
+        injected = RuntimeError("injected failure before training")
+
+        def _train() -> dict:
+            return train_adapter(
+                model=model,
+                tokenizer=MagicMock(),
+                train_dataset=dataset,
+                adapter_name="episodic",
+                training_config=training_config,
+                adapter_config=adapter_config,
+                output_dir=out_dir,
+            )
+
+        with stack:
+            with failing_step(injected), pytest.raises(RuntimeError) as raised:
+                _train()
+
+            assert raised.value is injected, "the original exception must propagate"
+            assert "in_training" not in model.peft_config, "the staging slot must be deleted"
+            assert model.active_adapter == "episodic", "the production adapter must be active"
+            assert (out_dir / "staging_resume.json").is_file(), "the resume marker must survive"
+            assert ckpt_dir.is_dir(), "the resume checkpoint must survive"
+
+            metrics = _train()
+
+        assert metrics["aborted"] is False
+        assert "in_training" in model.peft_config
+        assert model.active_adapter == "in_training"
 
     def test_staging_survives_at_normal_completion(self, tmp_path):
         """On normal completion, 'in_training' is left resident — the caller owns disposal.
@@ -876,36 +1010,10 @@ class TestStagingPromoteContract:
         """When staging_resume.json fingerprints match and a checkpoint dir exists,
         train_adapter resolves the checkpoint and passes it to trainer.train()."""
         out_dir = tmp_path / "adapter"
-        out_dir.mkdir(parents=True, exist_ok=True)
-
-        # Plant a real checkpoint directory (disk path).
-        ckpt_dir = out_dir / "bg_checkpoint_epoch" / "checkpoint-10"
-        ckpt_dir.mkdir(parents=True)
-
-        # Compute the fingerprints that train_adapter will compute for the same dataset/config.
-        from paramem.training.trainer import (
-            _fingerprint_dataset,
-            _fingerprint_training_config,
-        )
-
         ds = _minimal_dataset()
         tc = _minimal_tc()
         ac = _minimal_ac()
-        fp_ds = _fingerprint_dataset(ds)
-        fp_cfg = _fingerprint_training_config(tc, ac)
-
-        # Write a matching staging_resume.json.
-        resume_state = {
-            "adapter_name": "episodic",
-            "dataset_fingerprint": fp_ds,
-            "training_config_fingerprint": fp_cfg,
-            "ram_checkpoint_path": "",
-            "disk_checkpoint_path": str(ckpt_dir),
-            "started_at": "2026-05-27T00:00:00+00:00",
-            "updated_at": "2026-05-27T00:00:00+00:00",
-        }
-        scratch = out_dir / "staging_resume.json"
-        scratch.write_bytes(json.dumps(resume_state, indent=2).encode())
+        ckpt_dir = _plant_resume_checkpoint(out_dir, ds, tc, ac)
 
         # Capture the resume_from_checkpoint kwarg passed to trainer.train().
         captured_resume: list = []
@@ -937,112 +1045,26 @@ class TestStagingPromoteContract:
             f"Expected resume_from_checkpoint={ckpt_dir!r}; got {captured_resume[0]!r}"
         )
 
-    def test_resume_3way_prefers_ram_then_disk(self, tmp_path):
-        """3-way resume: RAM checkpoint is preferred over disk epoch-mirror."""
-        out_dir = tmp_path / "adapter"
-        out_dir.mkdir(parents=True, exist_ok=True)
 
-        # Create both a RAM and a disk checkpoint directory.
-        ram_ckpt = tmp_path / "shm_fake" / "checkpoint-20"
-        ram_ckpt.mkdir(parents=True)
-        disk_ckpt = out_dir / "bg_checkpoint_epoch" / "checkpoint-10"
-        disk_ckpt.mkdir(parents=True)
+# ---------------------------------------------------------------------------
+# TrainingArguments construction
+# ---------------------------------------------------------------------------
 
-        from paramem.training.trainer import (
-            _fingerprint_dataset,
-            _fingerprint_training_config,
-        )
 
-        ds = _minimal_dataset()
-        tc = _minimal_tc()
-        ac = _minimal_ac()
-        fp_ds = _fingerprint_dataset(ds)
-        fp_cfg = _fingerprint_training_config(tc, ac)
+class TestTrainingArgumentsConstruction:
+    """``train_adapter`` builds ``TrainingArguments`` with the caller's own
+    ``output_dir``, reports to no tracker, and passes no run name."""
 
-        resume_state = {
-            "adapter_name": "episodic",
-            "dataset_fingerprint": fp_ds,
-            "training_config_fingerprint": fp_cfg,
-            "ram_checkpoint_path": str(ram_ckpt),
-            "disk_checkpoint_path": str(disk_ckpt),
-            "started_at": "2026-05-27T00:00:00+00:00",
-            "updated_at": "2026-05-27T00:00:00+00:00",
-        }
-        scratch = out_dir / "staging_resume.json"
-        scratch.write_bytes(json.dumps(resume_state, indent=2).encode())
-
-        captured_resume: list = []
-
-        class _CapturingTrainer2(_NullTrainer):
-            def train(self, resume_from_checkpoint=None):
-                captured_resume.append(resume_from_checkpoint)
-                result = MagicMock()
-                result.metrics = {"train_loss": 0.01}
-                return result
-
+    def test_output_dir_report_to_none_and_no_run_name(self, tmp_path):
         model = _make_staging_model(has_staging=False)
-
-        # --- Part 1: both RAM and disk exist → RAM wins ---
-        stack, _, _, _ = _staging_patches(tmp_path, trainer_cls=_CapturingTrainer2)
-        with stack:
-            train_adapter(
-                model=model,
-                tokenizer=MagicMock(),
-                train_dataset=ds,
-                adapter_name="episodic",
-                training_config=tc,
-                adapter_config=ac,
-                output_dir=out_dir,
-            )
-
-        assert captured_resume[0] == str(ram_ckpt), (
-            f"RAM checkpoint must be preferred; got {captured_resume[0]!r}"
-        )
-
-        # --- Part 2: remove RAM dir → disk wins ---
-        import shutil
-
-        shutil.rmtree(ram_ckpt)
-
-        # Part 1's successful train_adapter completion ran _clean_scratch which
-        # removed both the staging_resume.json AND the bg_checkpoint_epoch dir.
-        # Recreate both so Part 2's _resolve_resume_checkpoint sees a valid
-        # disk fallback (state present AND disk_checkpoint_path is_dir()).
-        disk_ckpt.mkdir(parents=True, exist_ok=True)
-        scratch.write_bytes(json.dumps(resume_state, indent=2).encode())
-        captured_resume.clear()
-
-        model2 = _make_staging_model(has_staging=False)
-        stack2, _, _, _ = _staging_patches(tmp_path, trainer_cls=_CapturingTrainer2)
-        with stack2:
-            train_adapter(
-                model=model2,
-                tokenizer=MagicMock(),
-                train_dataset=ds,
-                adapter_name="episodic",
-                training_config=tc,
-                adapter_config=ac,
-                output_dir=out_dir,
-            )
-
-        assert captured_resume[0] == str(disk_ckpt), (
-            f"Disk checkpoint must be fallback when RAM absent; got {captured_resume[0]!r}"
-        )
-
-    def test_successful_completion_cleans_scratch(self, tmp_path):
-        """After normal completion, staging_resume.json and bg_checkpoint_epoch are deleted."""
         out_dir = tmp_path / "adapter"
-        out_dir.mkdir(parents=True, exist_ok=True)
-
-        # Pre-create scratch artifacts to verify they are cleaned.
-        scratch = out_dir / "staging_resume.json"
-        scratch.write_bytes(b"{}")
-        epoch_mirror = out_dir / "bg_checkpoint_epoch" / "checkpoint-5"
-        epoch_mirror.mkdir(parents=True)
-
-        model = _make_staging_model(has_staging=False)
-        stack, _, _, _ = _staging_patches(tmp_path, trainer_cls=_NullTrainer)
-        with stack:
+        stack, mock_create, mock_copy, mock_switch = _staging_patches(tmp_path)
+        with (
+            stack,
+            patch(
+                "paramem.training.trainer.TrainingArguments", return_value=MagicMock()
+            ) as mock_training_args,
+        ):
             train_adapter(
                 model=model,
                 tokenizer=MagicMock(),
@@ -1053,23 +1075,118 @@ class TestStagingPromoteContract:
                 output_dir=out_dir,
             )
 
-        assert not scratch.exists(), "staging_resume.json must be deleted on successful completion"
-        assert not (out_dir / "bg_checkpoint_epoch").exists(), (
-            "bg_checkpoint_epoch must be deleted on successful completion"
-        )
+        assert mock_training_args.call_count == 1
+        kwargs = mock_training_args.call_args.kwargs
+        assert kwargs["output_dir"] == str(out_dir)
+        assert kwargs["report_to"] == "none"
+        assert "run_name" not in kwargs
 
-    def test_abort_cleans_scratch(self, tmp_path):
-        """After abort, staging_resume.json and bg_checkpoint_epoch are deleted."""
-        out_dir = tmp_path / "adapter"
-        out_dir.mkdir(parents=True, exist_ok=True)
 
-        scratch = out_dir / "staging_resume.json"
-        scratch.write_bytes(b"{}")
-        epoch_mirror = out_dir / "bg_checkpoint_epoch" / "checkpoint-3"
-        epoch_mirror.mkdir(parents=True)
+# ---------------------------------------------------------------------------
+# Staging slot starting-weights outcome (warm / donor / cold)
+# ---------------------------------------------------------------------------
 
-        model = _make_staging_model(has_staging=False)
-        stack, _, _, _ = _staging_patches(tmp_path, abort_shutdown=True)
+
+class TestStagingInitOutcome:
+    """``train_adapter``'s staging-slot starting-weights decision, recorded
+    as ``metrics["init"]``:
+
+    | prior trained weights | staging starts from | ``init`` |
+    |---|---|---|
+    | yes | copy of *adapter_name* (warm) | ``"warm"`` |
+    | no, donor_checkpoint_dir set | copy of the donor checkpoint | ``"donor"`` |
+    | no, no valid donor | LoRA-zero | ``"cold"`` |
+    """
+
+    def test_prior_trained_weights_starts_warm(self, tmp_path):
+        model = _make_staging_model(has_staging=False, production_warm=True)
+        stack, mock_create, mock_copy, mock_switch = _staging_patches(tmp_path)
+        with stack:
+            metrics = train_adapter(
+                model=model,
+                tokenizer=MagicMock(),
+                train_dataset=_minimal_dataset(),
+                adapter_name="episodic",
+                training_config=_minimal_tc(),
+                adapter_config=_minimal_ac(),
+                output_dir=tmp_path / "adapter",
+            )
+
+        assert metrics["init"] == "warm"
+
+    def test_no_prior_weights_and_donor_given_starts_from_donor(self, tmp_path):
+        model = _make_staging_model(has_staging=False, production_warm=False)
+        stack, mock_create, mock_copy, mock_switch = _staging_patches(tmp_path)
+        donor_dir = tmp_path / "donor"
+        donor_dir.mkdir()
+        with (
+            stack,
+            patch(
+                "paramem.training.donor.load_donor_into_transient_slot", return_value=None
+            ) as mock_load_donor,
+        ):
+            metrics = train_adapter(
+                model=model,
+                tokenizer=MagicMock(),
+                train_dataset=_minimal_dataset(),
+                adapter_name="episodic",
+                training_config=_minimal_tc(),
+                adapter_config=_minimal_ac(),
+                output_dir=tmp_path / "adapter",
+                donor_checkpoint_dir=donor_dir,
+            )
+
+        assert metrics["init"] == "donor"
+        mock_load_donor.assert_called_once()
+
+    def test_no_prior_weights_and_no_donor_starts_cold(self, tmp_path):
+        model = _make_staging_model(has_staging=False, production_warm=False)
+        stack, mock_create, mock_copy, mock_switch = _staging_patches(tmp_path)
+        with stack:
+            metrics = train_adapter(
+                model=model,
+                tokenizer=MagicMock(),
+                train_dataset=_minimal_dataset(),
+                adapter_name="episodic",
+                training_config=_minimal_tc(),
+                adapter_config=_minimal_ac(),
+                output_dir=tmp_path / "adapter",
+            )
+
+        assert metrics["init"] == "cold"
+
+    def test_donor_load_failure_degrades_to_cold(self, tmp_path):
+        """A donor that fails to load costs only the seed — training starts
+        cold rather than the fold failing."""
+        model = _make_staging_model(has_staging=False, production_warm=False)
+        stack, mock_create, mock_copy, mock_switch = _staging_patches(tmp_path)
+        donor_dir = tmp_path / "donor"
+        donor_dir.mkdir()
+        with (
+            stack,
+            patch(
+                "paramem.training.donor.load_donor_into_transient_slot",
+                side_effect=OSError("donor checkpoint unreadable"),
+            ),
+        ):
+            metrics = train_adapter(
+                model=model,
+                tokenizer=MagicMock(),
+                train_dataset=_minimal_dataset(),
+                adapter_name="episodic",
+                training_config=_minimal_tc(),
+                adapter_config=_minimal_ac(),
+                output_dir=tmp_path / "adapter",
+                donor_checkpoint_dir=donor_dir,
+            )
+
+        assert metrics["init"] == "cold"
+
+    def test_init_recorded_on_abort_too(self, tmp_path):
+        """``metrics["init"]`` is set on every non-exception return, not only
+        on normal completion."""
+        model = _make_staging_model(has_staging=False, production_warm=False)
+        stack, mock_create, mock_copy, mock_switch = _staging_patches(tmp_path, abort_shutdown=True)
         hooks = TrainingHooks(on_shutdown_check=lambda: True)
         with stack:
             metrics = train_adapter(
@@ -1079,15 +1196,12 @@ class TestStagingPromoteContract:
                 adapter_name="episodic",
                 training_config=_minimal_tc(),
                 adapter_config=_minimal_ac(),
-                output_dir=out_dir,
+                output_dir=tmp_path / "adapter",
                 hooks=hooks,
             )
 
         assert metrics.get("aborted") is True
-        assert not scratch.exists(), "staging_resume.json must be deleted on abort"
-        assert not (out_dir / "bg_checkpoint_epoch").exists(), (
-            "bg_checkpoint_epoch must be deleted on abort"
-        )
+        assert metrics["init"] == "cold"
 
 
 # ---------------------------------------------------------------------------
@@ -1221,6 +1335,46 @@ class TestRetainScratchFlag:
         )
         assert call("in_training") in model.delete_adapter.call_args_list, (
             "in_training staging slot must still be deleted on abort regardless of the retain flag"
+        )
+
+    def test_retain_false_default_cleans_checkpoint_and_scratch_on_abort(self, tmp_path):
+        """Default (retain=False): checkpoint-N and staging_resume.json are
+        deleted on an aborted train_adapter call, exactly as they are on a
+        successful one — between success and abort, the flag decides
+        whether on-disk scratch survives. (A raised exception is a third
+        outcome, not covered by this test: it always keeps scratch, no
+        matter what the flag is set to.)
+        """
+        model = _make_staging_model(has_staging=False)
+        out_dir = tmp_path / "adapter_abort_default"
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        trainer_cls = _make_checkpoint_writing_trainer(out_dir)
+        stack, mock_create, mock_copy, mock_switch = _staging_patches(
+            tmp_path, trainer_cls=trainer_cls
+        )
+        hooks = TrainingHooks(on_shutdown_check=lambda: True)
+        with stack:
+            metrics = train_adapter(
+                model=model,
+                tokenizer=MagicMock(),
+                train_dataset=_minimal_dataset(),
+                adapter_name="episodic",
+                training_config=_minimal_tc(),
+                adapter_config=_minimal_ac(),
+                output_dir=out_dir,
+                hooks=hooks,
+            )
+
+        assert metrics.get("aborted") is True
+        assert not (out_dir / "checkpoint-10").exists(), (
+            "checkpoint-10 must be deleted on abort with retain=False (default)"
+        )
+        assert not (out_dir / "staging_resume.json").exists(), (
+            "staging_resume.json must be deleted on abort with retain=False (default)"
+        )
+        assert call("in_training") in model.delete_adapter.call_args_list, (
+            "in_training staging slot must be deleted on abort"
         )
 
     def test_retain_true_abort_then_resume_uses_surviving_checkpoint(self, tmp_path):

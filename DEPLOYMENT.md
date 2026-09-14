@@ -405,7 +405,7 @@ options. A short map of the top-level sections:
 | `personal_referent` | Encoder-based about-speaker-vs-not-about-speaker classifier with exemplars under `configs/personal_referent/<class>.<lang>.txt`. A self-referential query in German, Mandarin, Spanish and the other exemplar languages is recognised as personal and blocked at the cloud-egress gate. Falls back to an English token set when the encoder isn't available. |
 | `abstention` | Deterministic canned-response guard against confabulation on a personal interrogative parametric memory cannot answer. `enabled` (default `true`). Three messages, each `*_file` (default under `configs/prompts/`) with a `*_override` that pins the text inline instead: `response_file` (a known speaker, coverage gap — this query missed their facts), `cold_start_response_file` (a known speaker with no facts yet), `no_identity_response_file` (no speaker resolved at all — fired on the relay path; NOT gated on `enabled`, since refusing there is a structural impossibility — no identity, no store — not a feature toggle). |
 | `text_lang_detection` | fastText `lid.176` detector for the text-only `/chat` path, which carries no language signal of its own (audio turns get one from STT). Eager-loaded at server startup when `enabled` is true; CPU-only, no VRAM cost. One-time setup: `bash scripts/setup/download-langid-model.sh`. Disabled by default so deployments without the model file do not warn. |
-| `mobile_pwa` | Progressive Web App configuration. `enabled` (default `false`): serve the static PWA shell at `/app` and activate per-user cookie/bearer-token auth (see [SECURITY.md — Authentication & authorization](SECURITY.md#authentication--authorization)). `static_dir` (default: bundled `paramem/web/static`): filesystem path to the compiled static bundle. `cookie_name` (default: `paramem_token`): name of the cookie the middleware will accept if the client presents one; the server does not issue this cookie — tokens are carried via the `Authorization: Bearer` header in practice. `push_enabled` (default `false`): enable Web Push lock-screen notifications — set to `true` together with `enabled` to activate the `/push/subscribe` endpoint; the VAPID keypair is auto-generated and persisted (see [SECURITY.md — Authentication & authorization](SECURITY.md#authentication--authorization)). `vapid_contact` (default `mailto:admin@localhost`): operator contact URI in the VAPID JWT; set to your own `mailto:` address. |
+| `mobile_pwa` | Progressive Web App configuration. `enabled` (default `false`): serve the static PWA shell at `/app` and activate per-user cookie/bearer-token auth (see [SECURITY.md — Authentication & authorization](SECURITY.md#authentication--authorization)). `static_dir` (default: bundled `paramem/web/static`): filesystem path to the compiled static bundle. `cookie_name` (default: `paramem_token`): name of the cookie the middleware will accept if the client presents one; the server does not issue this cookie — tokens are carried via the `Authorization: Bearer` header in practice. `push_enabled` (default `false`): activate Web Push subscriptions — set to `true` together with `enabled` to generate and persist a VAPID keypair and activate the `/push/vapid-public-key` and `/push/subscribe` endpoints; the server stores each subscription and sends no notification (see [SECURITY.md — Authentication & authorization](SECURITY.md#authentication--authorization)). |
 | `voice` | Per-speaker greeting cadence and per-language greeting text (`voice.greetings`). |
 | `speaker` | pyannote thresholds, enrollment flow, embedding caps. |
 | `stt`, `tts` | Whisper model + Wyoming port; Piper/MMS voices per language. |
@@ -875,7 +875,7 @@ When in doubt, issue a per-user token for every person who has their own device.
 4. Accept the default name or rename it, then tap **Add**.
 5. Launch the app from the Home Screen icon — it opens full-screen without the Safari chrome.
 
-Web Push requires iOS/iPadOS 16.4 or later. The PWA must be launched from the Home Screen icon (not opened in Safari) to receive push notifications.
+Web Push requires iOS/iPadOS 16.4 or later. The PWA must be launched from the Home Screen icon (not opened in Safari) for the app to subscribe to push.
 
 **Android (Chrome)**
 
@@ -904,7 +904,7 @@ The command prints a terminal QR code encoding a deep-link onboarding URL, a tex
 1. Point the phone's **native camera** at the QR code (or tap the deep-link URL in a message). The camera opens the PWA URL automatically and the PWA stores the token in `localStorage` without any manual entry. Done — skip to step 4.
 2. If native-camera onboarding is not available: open the PWA URL in Safari (iOS) or Chrome (Android) and tap the gear icon (top-right) to open Settings.
 3. Enter the server URL in the **Server URL** field and paste the token into the **Bearer token** field. Tap **Save**.
-4. Grant microphone permission when prompted (for voice), and notification permission when prompted (for Web Push, if enabled).
+4. Grant microphone permission when prompted (for voice), and notification permission when prompted (for Web Push, if enabled) — this lets the app subscribe; the server stores the subscription and sends no notification.
 5. The app is now paired. Text and voice queries carry the member's `speaker_id` automatically.
 
 #### Token revocation
@@ -959,23 +959,23 @@ Responses: `200` with the removal report on success. `409` while consolidating, 
 
 Web Push is opt-in and off by default. To enable it:
 
-1. In `configs/server.yaml`, set `mobile_pwa.push_enabled: true` and update `mobile_pwa.vapid_contact` to a real `mailto:` address (the default `mailto:admin@localhost` is valid but browsers may reject it as non-canonical).
+1. In `configs/server.yaml`, set both `mobile_pwa.enabled: true` and `mobile_pwa.push_enabled: true`.
 2. Restart the server. A VAPID EC P-256 keypair is auto-generated on the first start with push enabled and persisted to `<paths.data>/vapid_keys.json`.
 3. Each PWA client subscribes automatically on the next launch after the token is saved — the client calls `GET /push/vapid-public-key`, then `POST /push/subscribe`, and the server stores the endpoint in `<paths.data>/push_subscriptions.json`.
 
-The VAPID keypair must remain stable: rotating it invalidates all existing browser subscriptions (they will not receive notifications until they re-open the app and re-subscribe). The PWA must be installed to the Home Screen and launched from there — a browser tab does not receive push notifications on iOS.
+The VAPID keypair must remain stable: rotating it invalidates all existing browser subscriptions (they will need to re-open the app and re-subscribe). The PWA must be installed to the Home Screen and launched from there for the subscription to register on iOS.
 
-Push payloads carry no personal content. The notification is a generic ping; the member opens the app to read the actual reply.
+The server stores each subscription and sends no notification.
 
 #### PWA troubleshooting
 
 - **The PWA URL shows a bearer-token prompt / raw API JSON instead of the chat UI.** Either `mobile_pwa.enabled` is `false` in the server config (check `/status`), or you navigated to `/` instead of `/app`. The PWA shell is served at `/app`.
 - **"Enter your bearer token in Settings to get started" appears on every launch.** The token was not saved — tap the gear icon, paste the token, and tap **Save**.
-- **Push notifications do not arrive.**
+- **Subscription not stored.**
   - The PWA must be installed to the Home Screen and launched from the icon, not opened as a browser tab.
-  - On iOS, check Settings → Notifications → ParaMem and confirm notifications are allowed.
+  - On iOS, check Settings → Notifications → ParaMem and confirm notifications are allowed (the browser gates the subscribe call on this permission).
   - On Android, long-press the Home Screen icon → App info → Notifications.
-  - Verify `mobile_pwa.push_enabled: true` and that the VAPID contact is a valid `mailto:` address.
+  - Verify `mobile_pwa.enabled: true` and `mobile_pwa.push_enabled: true`. Both endpoints return 503 while push is disabled, including while `mobile_pwa.enabled: false` with no per-user token ever minted — bearer-token auth is wired only once a per-user token store exists, so in that state neither endpoint checks the bearer token at all and both answer 503 directly. Once a token store is wired, a missing or invalid bearer token is rejected with 401 before either endpoint runs; `POST /push/subscribe` also returns 403 for an authenticated but unattributed token. `GET /push/vapid-public-key` has no 403 path.
 - **Voice (mic button) has no effect or shows "unsupported".**
   - iOS: microphone access for the PWA must be granted in Settings → Privacy & Security → Microphone → Safari.
   - Android: allow microphone in the site permissions (tap the lock icon in the Chrome address bar).

@@ -136,7 +136,6 @@ class TestBackgroundTrainerClose:
         assert bt.model is None, "release() must null model"
         assert bt.tokenizer is None, "release() must null tokenizer"
         assert bt._worker_thread is None, "release() must null _worker_thread"
-        assert bt._current_job is None, "release() must null _current_job"
 
     def test_release_on_fresh_trainer_is_noop(self, tmp_path):
         """release() on a freshly-constructed trainer (no worker started) does not raise."""

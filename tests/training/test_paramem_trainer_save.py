@@ -88,33 +88,6 @@ def _make_staging_model(adapter_name: str = "episodic") -> MagicMock:
     return model
 
 
-def _make_compose_model(adapter_name: str, other_adapters: list[str]) -> MagicMock:
-    """PeftModel stub for compose-training mode (``active_adapters`` supplied).
-
-    ``train_adapter``'s compose branch derives trainable-ness from live tensor
-    ``requires_grad`` flags (the real ``PeftModel.set_requires_grad`` call is
-    mocked out here — a no-op recording call — so the tensors must already
-    carry ``requires_grad=True`` to satisfy the "gradients are live" guard at
-    ``trainer.py`` compose-mode entry).
-    """
-    ac = _minimal_adapter_config()
-    model = MagicMock()
-    cfg = MagicMock(r=ac.rank, target_modules=set(ac.target_modules))
-    model.peft_config = {adapter_name: cfg, **{name: cfg for name in other_adapters}}
-
-    named_params: list[tuple[str, torch.Tensor]] = []
-    for module in sorted(ac.target_modules):
-        t = torch.zeros(1)
-        t.requires_grad_(True)
-        named_params.append((f"base_model.model.{module}.{adapter_name}.weight", t))
-    model.named_parameters.return_value = named_params
-    model.parameters.return_value = [t for _, t in named_params]
-    model.base_model.set_adapter.return_value = None
-    model.set_requires_grad.return_value = None
-    model.save_pretrained.return_value = None
-    return model
-
-
 class _CapturingTrainer:
     """Fake HF Trainer that records the kwargs it was constructed with."""
 
@@ -224,9 +197,9 @@ class TestSaveTargetSelection:
     def setup_method(self):
         _CapturingTrainer.captured_init_kwargs.clear()
 
-    def test_save_target_is_staging_when_use_staging(self, tmp_path):
-        """Default (staging+promote) path trains ``in_training`` — the
-        checkpoint save target must match."""
+    def test_save_target_is_staging_adapter(self, tmp_path):
+        """``train_adapter`` always trains ``in_training`` — the checkpoint
+        save target must match."""
         model = _make_staging_model()
         tokenizer = _make_tokenizer()
 
@@ -246,30 +219,6 @@ class TestSaveTargetSelection:
             )
 
         assert _CapturingTrainer.captured_init_kwargs[0]["save_adapter_name"] == "in_training"
-
-    def test_save_target_is_adapter_name_in_compose_mode(self, tmp_path):
-        """Compose mode (``active_adapters`` supplied) trains *adapter_name*
-        in place — ``in_training`` is never created, so selecting it would
-        raise in PEFT. The save target must be *adapter_name*."""
-        model = _make_compose_model(adapter_name="episodic", other_adapters=["semantic"])
-        tokenizer = _make_tokenizer()
-
-        with (
-            patch("paramem.training.trainer.TrainingArguments", return_value=MagicMock()),
-            patch("paramem.training.trainer.ParamemTrainer", new=_CapturingTrainer),
-        ):
-            train_adapter(
-                model=model,
-                tokenizer=tokenizer,
-                train_dataset=_make_dataset(),
-                adapter_name="episodic",
-                training_config=_minimal_training_config(),
-                adapter_config=_minimal_adapter_config(),
-                output_dir=tmp_path,
-                active_adapters=["episodic", "semantic"],
-            )
-
-        assert _CapturingTrainer.captured_init_kwargs[0]["save_adapter_name"] == "episodic"
 
     def test_lr_decay_steps_threaded_through_unconditionally(self, tmp_path):
         """``lr_decay_steps`` is always passed to ``ParamemTrainer`` (may be

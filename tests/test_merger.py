@@ -1,13 +1,9 @@
 """Tests for knowledge graph merging and entity resolution."""
 
-import tempfile
-from pathlib import Path
-
 import pytest
 
 from paramem.graph.merger import GraphMerger
 from paramem.graph.schema import Entity, Relation, SessionGraph
-from paramem.memory.persistence import save_memory_to_disk
 from paramem.utils.identity import canonical
 
 
@@ -271,27 +267,6 @@ class TestSessionTracking:
 
 
 class TestPersistence:
-    def test_save_and_load(self, merger, session_graph_1):
-        merger.merge(session_graph_1)
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = Path(tmpdir) / "graph.json"
-            save_memory_to_disk(merger.graph, path)
-
-            assert path.exists()
-
-            new_merger = GraphMerger()
-            new_merger.load_graph(path)
-
-            assert new_merger.graph.number_of_nodes() == merger.graph.number_of_nodes()
-            assert new_merger.graph.number_of_edges() == merger.graph.number_of_edges()
-            # Node key is canonical: "alex"
-            assert "alex" in new_merger.graph.nodes
-
-    def test_load_nonexistent(self, merger):
-        graph = merger.load_graph("/nonexistent/path.json")
-        assert graph.number_of_nodes() == 0
-
     def test_fuzzy_tier_case_fold(self):
         """'Alexander' and 'alexander' must merge — canonical key is identical."""
         from paramem.graph.schema import Entity, SessionGraph

@@ -821,7 +821,6 @@ class TestTakePendingRelationsGraphLifetime:
             "episodic": AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"]),
             "semantic": AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"]),
         }
-        loop.wandb_config = None
         loop._thermal_policy = None
         loop.output_dir = tmp_path
         loop.save_cycle_snapshots = False
@@ -1294,7 +1293,6 @@ class TestInterimRefinementGate:
                 speaker_id="spk0",
                 mode="simulate",
                 pending=pending,
-                run_label="s_gate",
                 stamp="20260601T0000",
                 max_interim_count=7,
             )
@@ -1361,7 +1359,6 @@ class TestInterimRefinementGate:
                 speaker_id="spk0",
                 mode="simulate",
                 pending=pending,
-                run_label="s_gate",
                 stamp="20260601T0000",
                 max_interim_count=7,
             )
@@ -2883,7 +2880,6 @@ class TestMergeRegistryRelationsTimestamp:
             "episodic": AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"]),
             "semantic": AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"]),
         }
-        loop.wandb_config = None
         loop._thermal_policy = None
         loop.output_dir = tmp_path
         loop.save_cycle_snapshots = False
@@ -3199,7 +3195,6 @@ class TestRunGraphNormalizationApply:
             "episodic": AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"]),
             "semantic": AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"]),
         }
-        loop.wandb_config = None
         loop._thermal_policy = None
         loop.output_dir = tmp_path
         loop.save_cycle_snapshots = False
@@ -3782,7 +3777,6 @@ class TestRunGraphNormalizationCloudEngine:
             "episodic": AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"]),
             "semantic": AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"]),
         }
-        loop.wandb_config = None
         loop._thermal_policy = None
         loop.output_dir = tmp_path
         loop.save_cycle_snapshots = False
@@ -4186,57 +4180,6 @@ class TestSafePathComponent:
 # ---------------------------------------------------------------------------
 # _run_full_cycle: consume-pending pre-stage extract-loop + mark_consolidated
 # ---------------------------------------------------------------------------
-
-
-class TestRecallBindTelemetry:
-    """Fold-telemetry instrumentation: ``epochs_to_bind`` /
-    ``steps_to_bind`` / ``hit_cap`` derivation from the ``_EarlyStopState``
-    ``_train_tier_adapter`` returns. Pure function, no model/GPU required.
-    """
-
-    def test_none_state_returns_all_none(self):
-        """recall_state=None (early stopping disabled, or entries empty) ->
-        all three fields absent (None) -- the caller omits them from the
-        ring record."""
-        from paramem.training.consolidation import _recall_bind_telemetry
-
-        assert _recall_bind_telemetry(None, n_keys=10, accum=2) == (None, None, None)
-
-    def test_stop_epoch_set_derives_bind_and_steps(self):
-        """A fired early-stop signal derives epochs_to_bind=stop_epoch and
-        steps_to_bind=ceil(n_keys/accum)*epochs_to_bind; hit_cap=False."""
-        from paramem.training.consolidation import _recall_bind_telemetry
-        from paramem.training.early_stop import _EarlyStopState
-
-        state = _EarlyStopState(stop_epoch=12)
-        epochs_to_bind, steps_to_bind, hit_cap = _recall_bind_telemetry(state, n_keys=21, accum=2)
-        assert epochs_to_bind == 12
-        # ceil(21 / 2) = 11; 11 * 12 = 132.
-        assert steps_to_bind == 132
-        assert hit_cap is False
-
-    def test_stop_epoch_none_signals_hit_cap_with_bind_fields_absent(self):
-        """Training ran to the full derived epoch budget without the recall
-        signal ever firing (stop_epoch=None) -> hit_cap=True and
-        epochs_to_bind/steps_to_bind stay None (absent from the record)."""
-        from paramem.training.consolidation import _recall_bind_telemetry
-        from paramem.training.early_stop import _EarlyStopState
-
-        state = _EarlyStopState(stop_epoch=None)
-        epochs_to_bind, steps_to_bind, hit_cap = _recall_bind_telemetry(state, n_keys=3, accum=1)
-        assert epochs_to_bind is None
-        assert steps_to_bind is None
-        assert hit_cap is True
-
-    def test_exact_division_no_remainder(self):
-        """n_keys exactly divisible by accum -- ceil == plain division, no
-        off-by-one from the ceil-division trick."""
-        from paramem.training.consolidation import _recall_bind_telemetry
-        from paramem.training.early_stop import _EarlyStopState
-
-        state = _EarlyStopState(stop_epoch=4)
-        _, steps_to_bind, _ = _recall_bind_telemetry(state, n_keys=10, accum=2)
-        assert steps_to_bind == 20  # ceil(10/2)=5; 5*4=20
 
 
 # ---------------------------------------------------------------------------

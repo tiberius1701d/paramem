@@ -1482,23 +1482,3 @@ class GraphMerger:
         """
         data = nx.node_link_data(self.graph)
         return json.dumps(data, indent=2).encode("utf-8")
-
-    def load_graph(self, path: str | Path) -> nx.MultiDiGraph:
-        """Load cumulative graph from JSON — transparently decrypts
-        age-wrapped content when the daily identity is loaded."""
-        from paramem.backup.encryption import read_maybe_encrypted
-
-        path = Path(path)
-        if not path.exists():
-            logger.info("No existing graph at %s, starting fresh", path)
-            return self.graph
-
-        data = json.loads(read_maybe_encrypted(path).decode("utf-8"))
-        self.graph = nx.node_link_graph(data)
-        logger.info(
-            "Graph loaded from %s: %d nodes, %d edges",
-            path,
-            self.graph.number_of_nodes(),
-            self.graph.number_of_edges(),
-        )
-        return self.graph

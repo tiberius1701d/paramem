@@ -11,11 +11,6 @@ Rule:
   example as a model fixture would drift as deployment patterns evolve and
   break calibrated thresholds.
 
-* ``load_config()`` (from ``paramem.utils.config``) is forbidden in tests/.
-  It reads ``configs/default.yaml`` which pins Qwen 2.5 3B base — unsuitable
-  for any test that exercises structured-output generation. Use
-  ``load_server_config("tests/fixtures/server.yaml")`` instead.
-
 If you hit this lint:
   * You probably copied a fixture from another contract test. The pattern
     other tests should mirror is::
@@ -47,17 +42,6 @@ EXAMPLE_VERIFY_ALLOWLIST = frozenset(
         # Validates that the shipped example loads under all dataclass
         # validators (sanitization.cloud_mode, etc.).
         "tests/server/test_config.py",
-    }
-)
-
-# Tests still using paramem.utils.config.load_config(). The default.yaml
-# retirement arc removes entries here as each test pivots to
-# load_server_config("tests/fixtures/server.yaml"). Only the loader's own
-# meta-test remains: tests/test_config.py exercises load_config() directly
-# and stays here until the loader retires entirely.
-LEGACY_LOAD_CONFIG_ALLOWLIST = frozenset(
-    {
-        "tests/test_config.py",
     }
 )
 
@@ -93,38 +77,5 @@ def test_no_test_loads_example_yaml_outside_allowlist():
         "Tests must not load configs/server.yaml.example as a model fixture "
         "(it drifts as deployment patterns evolve, breaking calibrated "
         "thresholds). Use load_server_config('tests/fixtures/server.yaml') "
-        "instead.\n\nViolations:\n  " + "\n  ".join(violations)
-    )
-
-
-def test_no_test_uses_legacy_load_config():
-    """The training-side ``load_config()`` reads configs/default.yaml which
-    pins Qwen 2.5 3B base — unsuitable for tests that exercise structured-
-    output generation, and slated for retirement.
-
-    Use ``load_server_config("tests/fixtures/server.yaml").model_config``.
-    """
-    pattern = re.compile(r"\bload_config\s*\(")
-    violations: list[str] = []
-
-    for py in _iter_test_files():
-        rel = py.as_posix()
-        if rel in LEGACY_LOAD_CONFIG_ALLOWLIST:
-            continue
-        text = py.read_text()
-        # Skip files that don't import load_config from the training-side module.
-        if "from paramem.utils.config import" not in text and "paramem.utils.config" not in text:
-            continue
-        if "load_config" not in text:
-            continue
-        for line_num, line in enumerate(text.splitlines(), 1):
-            if pattern.search(line):
-                violations.append(f"{rel}:{line_num}: {line.strip()}")
-
-    assert not violations, (
-        "Tests must not call paramem.utils.config.load_config() — it reads "
-        "configs/default.yaml (Qwen 2.5 3B base, unsuitable for tests that "
-        "need structured-output generation; slated for retirement). Use "
-        "load_server_config('tests/fixtures/server.yaml').model_config "
         "instead.\n\nViolations:\n  " + "\n  ".join(violations)
     )

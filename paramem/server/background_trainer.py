@@ -366,8 +366,6 @@ class BackgroundTrainer:
         self,
         *,
         base_shutdown_predicate: Callable[[], bool] | None = None,
-        on_epoch_persist: Callable[[int, str], None] | None = None,
-        on_save_persist: Callable[[int, str], None] | None = None,
     ) -> TrainingHooks:
         """Construct TrainingHooks whose shutdown predicate ORs all signals.
 
@@ -386,8 +384,6 @@ class BackgroundTrainer:
             base_shutdown_predicate: Additional shutdown gate.  When ``None``
                 (the default), only ``_shutdown_requested`` and the abort flag
                 are checked.
-            on_epoch_persist: Passed through to ``TrainingHooks`` unchanged.
-            on_save_persist: Passed through to ``TrainingHooks`` unchanged.
 
         Returns:
             A ``TrainingHooks`` instance with the composed shutdown predicate.
@@ -404,11 +400,7 @@ class BackgroundTrainer:
             evt = abort_ref["event"]
             return evt is not None and evt.is_set()
 
-        return TrainingHooks(
-            on_epoch_persist=on_epoch_persist,
-            on_save_persist=on_save_persist,
-            on_shutdown_check=_shutdown_or_abort,
-        )
+        return TrainingHooks(on_shutdown_check=_shutdown_or_abort)
 
     def release(self) -> None:
         """Stop the worker and drop base-model references so the model can be freed.

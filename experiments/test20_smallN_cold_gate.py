@@ -76,11 +76,6 @@ matching CLI flag overrides them explicitly:
     bucket in today's ``_BUDGET_TABLE``), or ``--lr-decay-steps`` when
     explicit.
 
-A fourth field is always forced regardless of any derived value or CLI
-flag: ``recall_early_stopping=False`` — the fixture ships True, which
-would truncate the run on 100% recall, making the expected step count
-fiction.
-
 ``_expected_optimizer_steps`` is always called with the SAME resolved
 epochs/accum/batch_size the run actually trains with — never a hardcoded
 module constant — so the derived expected-step count and the
@@ -94,22 +89,20 @@ expected value.
 
 Hard assertions (all written into results.json; fail loud if violated)
 ------------------------------------------------------------------------
-1. Realized optimizer steps == expected steps (captured from
-   ``TrainerState``, not assumed from the config).
-2. ``training_config.recall_early_stopping is False`` at the moment of the
-   ``train_adapter`` call.
-3. LoRA-B Frobenius norm is ZERO immediately before training (cold arm —
-   proves cold init) or NON-ZERO immediately before training (warm arm —
-   ``--warm-from`` or ``--donor-init``, both feed the same
-   ``donor_scratch_dir`` mechanism — proves the donor copy landed), and
-   NON-ZERO after training in both arms (proves the adapter actually
-   moved). Norm computation is
-   ``paramem.models.loader.lora_b_frobenius_norm``.
-4. (Warm arm only — ``--warm-from`` or ``--donor-init``) The donor
-   adapter's LoRA-B Frobenius norm is bit-identical immediately before and
-   immediately after each seed's ``train_adapter`` call (donor
-   immutability), and the trainable adapter's name is never a live tier
-   name (``episodic``/``semantic``/``procedural``).
+* The step-count assertion: realized optimizer steps == expected steps
+  (captured from ``TrainerState``, not assumed from the config).
+* The LoRA-B norm assertion: LoRA-B Frobenius norm is ZERO immediately
+  before training (cold arm — proves cold init) or NON-ZERO immediately
+  before training (warm arm — ``--warm-from`` or ``--donor-init``, both
+  feed the same ``donor_scratch_dir`` mechanism — proves the donor copy
+  landed), and NON-ZERO after training in both arms (proves the adapter
+  actually moved). Norm computation is
+  ``paramem.models.loader.lora_b_frobenius_norm``.
+* The donor-immutability assertion: (Warm arm only — ``--warm-from`` or
+  ``--donor-init``) the donor adapter's LoRA-B Frobenius norm is
+  bit-identical immediately before and immediately after each seed's
+  ``train_adapter`` call, and the trainable adapter's name is never a
+  live tier name (``episodic``/``semantic``/``procedural``).
 
 The synthetic key set
 -----------------------
@@ -212,8 +205,9 @@ checkpoint. Either way, the resolved checkpoint slot is
 ``shutil.copytree``'d into ``<run_dir>/donor_scratch/`` exactly once
 (``<run_dir>/donor_source.json`` records the resolved source path + its
 weights SHA-256 so later seeds and ``--resume`` never re-derive it), and
-every downstream mechanism — ``_run_seed``'s Step 1b load, Hard Assertions
-#3/#4, donor immutability — is IDENTICAL to the ``--warm-from`` arm.
+every downstream mechanism — ``_run_seed``'s Step 1b load, the LoRA-B norm
+assertion, and the donor-immutability assertion — is IDENTICAL to the
+``--warm-from`` arm.
 
 ``--lr-decay-steps N`` pins ``TrainingConfig.lr_decay_steps`` so the LR
 scheduler's decay window is comparable across arms run at different
@@ -330,8 +324,8 @@ with the flag on vs off. Expected reading: a WARM pre-training probe that
 emits well-formed JSON echoing the CORRECT key but a WRONG (donor-fact)
 object supports the hypothesis; malformed/garbage warm output weakens it.
 The COLD pre-training probe is the control — LoRA-B is exactly zero
-(Hard Assertion #3), so the adapter is a literal no-op and should behave
-like the bare base model.
+(the LoRA-B norm assertion), so the adapter is a literal no-op and should
+behave like the bare base model.
 
 Infrastructure
 ---------------
@@ -859,10 +853,11 @@ class _StepCaptureCallback(TrainerCallback):
 
     ``train_adapter`` (``paramem/training/trainer.py``) returns
     ``dict(result.metrics)`` — HF's computed metrics (``train_loss``,
-    etc.) — but does not surface ``TrainerState.global_step``. Hard
-    Assertion #1 needs the actual realized optimizer-step count, so this
-    callback reads it directly from ``state`` at ``on_train_end``, the last
-    point at which ``TrainerState`` reflects the completed run.
+    etc.) — but does not surface ``TrainerState.global_step``. The
+    step-count assertion needs the actual realized optimizer-step count,
+    so this callback reads it directly from ``state`` at
+    ``on_train_end``, the last point at which ``TrainerState`` reflects
+    the completed run.
     """
 
     def __init__(self) -> None:
@@ -1042,8 +1037,8 @@ def _build_donor_checkpoint(
             recipe (see above).
         base_training_config: The target tier's ``TrainingConfig``
             (batch_size/lr/scheduler carried through unchanged; only
-            ``num_epochs``/``seed``/``recall_early_stopping``/
-            ``lr_decay_steps``/``gradient_accumulation_steps`` are
+            ``num_epochs``/``seed``/``lr_decay_steps``/
+            ``gradient_accumulation_steps`` are
             overridden for the donor build — see above for why the latter
             two are always derived from ``budget_for(len(entries))``
             regardless of an arm's ``--lr-decay-steps``/``--accum``
@@ -1062,9 +1057,9 @@ def _build_donor_checkpoint(
         with verbatim ``raw_output``), the realized weights SHA-256 (read
         back from the manifest's own ``payload.sha256`` — see below, never
         recomputed), the realized optimizer-step count (asserted equal to
-        the derived expected count — mirrors the arm-side Hard Assertion
-        #1), and the pre/post LoRA-B Frobenius norms (cold-init proof for
-        the build itself). ``slot / DONOR_META_FILENAME``
+        the derived expected count — mirrors the arm-side step-count
+        assertion), and the pre/post LoRA-B Frobenius norms (cold-init
+        proof for the build itself). ``slot / DONOR_META_FILENAME``
         (``"donor_meta.json"``) is also written — ``{seed, recipe,
         n_requested, triples, triples_hash}``, the production donor-identity
         schema, with NO ``weights_sha256`` field: the manifest's own
@@ -1115,7 +1110,6 @@ def _build_donor_checkpoint(
         base_training_config,
         seed=DONOR_DEFAULT_SEED,
         num_epochs=donor_epochs,
-        recall_early_stopping=False,
         # ALWAYS budget_for's derived value for the donor's own training —
         # never inherit an arm's --lr-decay-steps/--accum override (see the
         # docstring above).
@@ -1140,7 +1134,6 @@ def _build_donor_checkpoint(
         training_config=donor_training_cfg,
         adapter_config=donor_adapter_config,
         output_dir=checkpoint_root / ".training_scratch",
-        run_name="test20-donor-build",
         callbacks_extra=[step_cb],
     )
     wall_train = time.time() - t0
@@ -1451,11 +1444,11 @@ def _resolve_donor_source(
     Returns:
         Tuple of ``(model, slot_path, built_fresh, donor_meta)``.
         *built_fresh* is True only for case 3 (a real GPU training run just
-        happened — the caller uses this to insert a cooldown before the
-        first seed, B2). *donor_meta* is :func:`_read_donor_meta`'s return
+        happened — the caller uses this to insert a GPU cooldown before the
+        first seed). *donor_meta* is :func:`_read_donor_meta`'s return
         (``seed``/``n_entries``/``epochs``/``weights_sha256``), used by the
-        caller to recompute ``donor_entries(seed, n_entries)`` for the H1
-        key-overlap recording.
+        caller to recompute ``donor_entries(seed, n_entries)`` for the
+        donor/target key-overlap confound recording.
 
     Raises:
         SystemExit: ``--donor-checkpoint``/the marker's recorded slot is
@@ -1582,7 +1575,7 @@ def _run_donor_build_smoke(
        adapter's LoRA-B Frobenius norm is asserted ``== 0.0`` before the
        copy (fresh cold adapter) and equal to the donor's own norm after
        the copy lands — the same before/after norm proof ``_run_seed``'s
-       Hard Assertion #3 uses. No recall evaluation runs on the seeded
+       LoRA-B norm assertion uses. No recall evaluation runs on the seeded
        adapter (this arm measures GPU feasibility/cost, not recall
        quality). The donor-immutability tier-name guard (the trainable
        adapter name is never a live tier name) runs BEFORE the try block,
@@ -1619,7 +1612,7 @@ def _run_donor_build_smoke(
             recorded verbatim in ``build_results.json``.
     """
     adapter_config = cfg.tier_config_map()["procedural"]
-    base_training_config = dataclasses.replace(cfg.training_config, recall_early_stopping=False)
+    base_training_config = cfg.training_config
 
     build_results_path = run_dir / "build_results.json"
     seed_marker_path = run_dir / DONOR_BUILD_SMOKE_SEED_MARKER_FILENAME
@@ -1954,8 +1947,8 @@ def _run_seed(
       3b. (Warm arm only) ``copy_adapter_weights(model, src="donor",
           dst=adapter_name)`` — copies the donor's LoRA weights into the
           trainable adapter BEFORE training.
-      4. Hard Assertion #3: LoRA-B Frobenius norm immediately before
-         training — ``== 0.0`` for the cold arm (proves cold init),
+      4. The LoRA-B norm assertion: LoRA-B Frobenius norm immediately
+         before training — ``== 0.0`` for the cold arm (proves cold init),
          ``> 0.0`` for the warm arm (proves the donor copy landed). (Warm
          arm only) donor LoRA-B norm captured here as the pre-training
          donor-immutability baseline.
@@ -1975,23 +1968,22 @@ def _run_seed(
          ``gradient_accumulation_steps``/``lr_decay_steps`` (from
          ``paramem.utils.config.budget_for(n_entries)``, overridden by
          ``--epochs``/``--accum``/``--lr-decay-steps`` when explicit — see
-         ``main()``) and ``recall_early_stopping=False``). Hard Assertion
-         #2 re-checked immediately before the call.
+         ``main()``).
       7. Verify the arm's own step-budget derivation
          (``_steps_per_epoch`` * ``num_epochs``) ==
          *expected_optimizer_steps* BEFORE training — a config-drift
          canary independent of the realized-step assertion below.
       8. ``train_adapter`` with ``_StepCaptureCallback`` in
          ``callbacks_extra``.
-      9. Hard Assertion #1: realized optimizer steps
+      9. The step-count assertion: realized optimizer steps
          (``step_cb.global_step``) == *expected_optimizer_steps*.
-      10. Hard Assertion #3 (post-training half): LoRA-B Frobenius norm
-          > 0.0 after training (adapter actually moved), both arms.
-          (Warm arm only) Hard Assertion #4: donor LoRA-B norm is
-          bit-identical to the pre-training baseline (donor immutability).
+      10. The LoRA-B norm assertion (post-training half): LoRA-B
+          Frobenius norm > 0.0 after training (adapter actually moved),
+          both arms. (Warm arm only) The donor-immutability assertion:
+          donor LoRA-B norm is bit-identical to the pre-training baseline.
       11. ``evaluate_indexed_recall`` (gradient_checkpointing
-          disable/re-enable around the call, per CLAUDE.md's generate()
-          rule).
+          disabled before the call and re-enabled after, since HF
+          silently drops the KV cache while checkpointing is active).
       12. Save per-key + summary + all hard-assertion values to disk.
 
     Args:
@@ -2010,8 +2002,7 @@ def _run_seed(
             ``num_epochs``/``gradient_accumulation_steps``/``lr_decay_steps``
             (from ``budget_for(n_entries)``, overridden by
             ``--epochs``/``--accum``/``--lr-decay-steps`` when explicit)
-            and ``recall_early_stopping=False`` already applied (seed is
-            the only remaining per-call override).
+            already applied (seed is the only remaining per-call override).
         run_dir: Run output directory (already arm-scoped); ``seed<N>/``
             subdir created here.
         arm: Arm label (``--arm``, or the derived default) — used in the
@@ -2046,12 +2037,12 @@ def _run_seed(
             a second time). ``None`` for the cold arm.
         donor_key_overlap: (``--donor-init`` only; ``None`` for cold and
             plain ``--warm-from`` arms) ``{"count": int, "donor_objects":
-            {key: object}}`` — the H1 confound record: how many of THIS
-            arm's target keys are also present in the donor's own synthetic
-            population, and what object the donor trained for each
-            overlapping key. The donor's block-0 is bit-identical to the
-            fixed 21-key fixture (``paramem.training.donor``'s module
-            docstring), so a real-production-key arm's overlap is often the
+            {key: object}}`` — the donor/target key-overlap confound record:
+            how many of THIS arm's target keys are also present in the
+            donor's own synthetic population, and what object the donor
+            trained for each overlapping key. The donor's block 0 is the
+            fixed 21-key fixture reproduced verbatim (keys graph101-115 /
+            proc101-106), so a real-production-key arm's overlap is often the
             FULL 21 — the donor may pre-install key -> subject/predicate
             scaffolding (with a DIFFERENT, donor-fictional object) for
             exactly the keys this arm re-trains, so any donor-arm uplift
@@ -2102,22 +2093,23 @@ def _run_seed(
         copy_adapter_weights(model, src=DONOR_ADAPTER_NAME, dst=adapter_name)
         donor_lora_b_norm_before = lora_b_frobenius_norm(model, DONOR_ADAPTER_NAME)
 
-    # Step 4: Hard Assertion #3 — cold init proof (cold arm) / warm-copy
-    # proof (warm arm), pre-training.
+    # Step 4: the LoRA-B norm assertion — cold init proof (cold arm) /
+    # warm-copy proof (warm arm), pre-training.
     lora_b_norm_before = lora_b_frobenius_norm(model, adapter_name)
     if is_warm:
         assert lora_b_norm_before == donor_lora_b_norm_before, (
-            f"Hard Assertion #3 FAILED (pre-training, warm arm): trainable adapter "
-            f"'{adapter_name}' LoRA-B Frobenius norm ({lora_b_norm_before}) != donor "
-            f"'{DONOR_ADAPTER_NAME}' norm ({donor_lora_b_norm_before}) immediately "
-            "after copy_adapter_weights — the seed did not take (or took a "
-            "corrupted copy)."
+            f"LoRA-B norm assertion FAILED (pre-training, warm arm): trainable "
+            f"adapter '{adapter_name}' LoRA-B Frobenius norm ({lora_b_norm_before}) "
+            f"!= donor '{DONOR_ADAPTER_NAME}' norm ({donor_lora_b_norm_before}) "
+            "immediately after copy_adapter_weights — the seed did not take (or "
+            "took a corrupted copy)."
         )
     else:
         assert lora_b_norm_before == 0.0, (
-            f"Hard Assertion #3 FAILED (pre-training): LoRA-B Frobenius norm for "
-            f"'{adapter_name}' is {lora_b_norm_before}, expected 0.0 (cold init). "
-            "create_adapter did not produce a fresh zero-initialised adapter."
+            f"LoRA-B norm assertion FAILED (pre-training): LoRA-B Frobenius norm "
+            f"for '{adapter_name}' is {lora_b_norm_before}, expected 0.0 (cold "
+            "init). create_adapter did not produce a fresh zero-initialised "
+            "adapter."
         )
 
     # Step 4b: (--probe-before-training only) mechanism probe on the
@@ -2149,12 +2141,8 @@ def _run_seed(
     )
     dataset = IndexedDataset(examples)
 
-    # Step 6: per-seed training config; Hard Assertion #2.
+    # Step 6: per-seed training config.
     training_cfg = dataclasses.replace(base_training_config, seed=seed)
-    assert training_cfg.recall_early_stopping is False, (
-        f"Hard Assertion #2 FAILED: training_config.recall_early_stopping="
-        f"{training_cfg.recall_early_stopping}, expected False."
-    )
 
     # Step 7: pre-training step-budget canary.
     n_examples = len(examples)
@@ -2194,7 +2182,6 @@ def _run_seed(
         training_config=training_cfg,
         adapter_config=adapter_config,
         output_dir=seed_dir,
-        run_name=f"test20-{arm}-seed{seed}",
         callbacks_extra=[step_cb],
     )
     wall_train = time.time() - t0
@@ -2205,33 +2192,35 @@ def _run_seed(
         with staged_weights(model, fallback_adapter=adapter_name):
             promote_staging_adapter(model, adapter_name)
 
-    # Step 9: Hard Assertion #1 — realized optimizer steps.
+    # Step 9: the step-count assertion — realized optimizer steps.
     realized_steps = step_cb.global_step
     assert realized_steps is not None, (
-        f"Hard Assertion #1 FAILED: _StepCaptureCallback never fired "
+        f"Step-count assertion FAILED: _StepCaptureCallback never fired "
         f"on_train_end for seed {seed} — no realized step count captured."
     )
     assert realized_steps == expected_optimizer_steps, (
-        f"Hard Assertion #1 FAILED: realized optimizer steps={realized_steps}, "
+        f"Step-count assertion FAILED: realized optimizer steps={realized_steps}, "
         f"expected {expected_optimizer_steps} (arm={arm!r})."
     )
 
-    # Step 10: Hard Assertion #3 (post-training half) — adapter moved, both arms.
+    # Step 10: the LoRA-B norm assertion (post-training half) — adapter
+    # moved, both arms.
     lora_b_norm_after = lora_b_frobenius_norm(model, adapter_name)
     assert lora_b_norm_after > 0.0, (
-        f"Hard Assertion #3 FAILED (post-training): LoRA-B Frobenius norm for "
-        f"'{adapter_name}' is {lora_b_norm_after}, expected > 0.0 (adapter moved)."
+        f"LoRA-B norm assertion FAILED (post-training): LoRA-B Frobenius norm "
+        f"for '{adapter_name}' is {lora_b_norm_after}, expected > 0.0 (adapter "
+        "moved)."
     )
 
-    # Step 10b: (warm arm) Hard Assertion #4 — donor immutability. The donor
-    # is never the staging or production slot for this training event, so
+    # Step 10b: (warm arm) the donor-immutability assertion. The donor is
+    # never the staging or production slot for this training event, so
     # its LoRA-B norm must be bit-identical before and after.
     donor_lora_b_norm_after: float | None = None
     if is_warm:
         donor_lora_b_norm_after = lora_b_frobenius_norm(model, DONOR_ADAPTER_NAME)
         assert donor_lora_b_norm_after == donor_lora_b_norm_before, (
-            f"Hard Assertion #4 FAILED (donor immutability): donor LoRA-B Frobenius "
-            f"norm changed from {donor_lora_b_norm_before} to {donor_lora_b_norm_after} "
+            f"Donor-immutability assertion FAILED: donor LoRA-B Frobenius norm "
+            f"changed from {donor_lora_b_norm_before} to {donor_lora_b_norm_after} "
             f"during seed {seed} training. The donor adapter must never be mutated."
         )
 
@@ -2576,7 +2565,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
             "the resulting 147-entry population) — NOT via paramem.training.donor.build_donor "
             "(that helper needs a live ConsolidationLoop; this standalone experiment trains the "
             "donor itself). Feeds the SAME donor_scratch_dir / copy_adapter_weights mechanism "
-            "--warm-from already uses in _run_seed (Hard Assertions #3/#4 apply unchanged). "
+            "--warm-from already uses in _run_seed (the LoRA-B norm assertion and the "
+            "donor-immutability assertion apply unchanged). "
             "Mutually exclusive with --warm-from (ambiguous donor source)."
         ),
     )
@@ -2782,7 +2772,6 @@ def main() -> None:
         num_epochs=epochs,
         gradient_accumulation_steps=accum,
         lr_decay_steps=lr_decay_steps,
-        recall_early_stopping=False,
     )
     expected_steps = _expected_optimizer_steps(
         n_entries, epochs, accum, base_training_config.batch_size
@@ -2790,7 +2779,7 @@ def main() -> None:
     logger.info(
         "Recipe: rank=%d alpha=%d lr=%.0e target_modules=%s | "
         "batch=%d accum=%d epochs=%d warmup=%d scheduler=%s wd=%.2f "
-        "lr_decay_steps=%s recall_early_stopping=%s | budget_for(%d)=(%d, %d, %s)",
+        "lr_decay_steps=%s | budget_for(%d)=(%d, %d, %s)",
         adapter_config.rank,
         adapter_config.alpha,
         adapter_config.learning_rate,
@@ -2802,7 +2791,6 @@ def main() -> None:
         base_training_config.lr_scheduler_type,
         base_training_config.weight_decay,
         base_training_config.lr_decay_steps,
-        base_training_config.recall_early_stopping,
         n_entries,
         budget_epochs,
         budget_accum,
@@ -2871,7 +2859,6 @@ def main() -> None:
             "num_epochs": epochs,
             "gradient_accumulation_steps": accum,
             "lr_decay_steps": lr_decay_steps,
-            "recall_early_stopping": False,
         },
     }
     run_config_path = run_dir / "run_config.json"
@@ -2989,20 +2976,15 @@ def main() -> None:
                         indent=2,
                     )
 
-        # H1: record the donor<->target key-overlap confound. donor_meta is
+        # Record the donor<->target key-overlap confound. donor_meta is
         # only set for --donor-init (never plain --warm-from, which has no
-        # synthetic entry set to intersect against). The donor's OWN block-0
-        # is bit-identical to the fixed fixture (paramem.training.donor's
-        # module docstring: "the template itself is always block 0 ... keys
-        # graph101-115 / proc101-106 ... reproduced verbatim") — recomputing
-        # donor_entries(seed, n_entries) here is the SAME pure function the
-        # build used, so this reconstructs the exact donor population
-        # without re-reading any file. (The full-overlap donor-init arms in
-        # benchmarking.md's Test 20 ran before this fixture's keys were
-        # remapped, against the fixture's prior graph179-193/proc35-40
-        # numerals — see that section's fixture-provenance note; the
-        # zero-overlap shifted-key arms are the bridge evidence that the
-        # remap does not change this mechanism's behavior.)
+        # synthetic entry set to intersect against). The donor's block 0 is
+        # the fixed 21-key fixture reproduced verbatim (keys graph101-115 /
+        # proc101-106). donor_entries is a pure function of (seed,
+        # n_entries), so recomputing it here reconstructs the exact
+        # population the build trained without reading the donor
+        # checkpoint. (For the fixture's own key numbers the overlap is
+        # the whole target set.)
         donor_key_overlap: dict | None = None
         if args.donor_init and donor_meta is not None:
             donor_full_entries = donor_entries(donor_meta["seed"], donor_meta["n_entries"])
@@ -3021,7 +3003,7 @@ def main() -> None:
                 len(entries),
             )
 
-        # B2: a fresh donor build just ran its own budget_for-derived epoch
+        # A fresh donor build just ran its own budget_for-derived epoch
         # count worth of GPU training (~2220 steps at DONOR_MIN_ENTRIES's
         # 147-entry population, 30 epochs) immediately before the seed loop
         # — cool down before the first seed instead of chaining straight

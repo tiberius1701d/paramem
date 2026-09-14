@@ -23,7 +23,7 @@ from transformers import (
 from transformers.trainer import TRAINING_ARGS_NAME
 
 from paramem.training.thermal_throttle import ThermalPolicy, ThermalThrottleCallback
-from paramem.utils.config import AdapterConfig, TrainingConfig, WandbConfig
+from paramem.utils.config import AdapterConfig, TrainingConfig
 
 logger = logging.getLogger(__name__)
 
@@ -42,38 +42,27 @@ STAGING_ADAPTER = "in_training"
 class TrainingHooks:
     """Caller-supplied behaviour that ``train_adapter`` cannot derive from config.
 
-    The callable fields are converted internally into a single HF
+    The callable field is converted internally into a single HF
     ``TrainerCallback`` (``_HooksAdapterCallback``) that runs BEFORE the
     thermal throttle in the registered callback list.
 
-    All fields default to ``None`` — callers pass only the intents they need:
-
-    - ``on_epoch_persist(epoch, output_dir)``: invoked at every epoch end.
-      Used by RAM-mode to copy the latest checkpoint from /dev/shm to the
-      caller's output_dir at each epoch boundary.
-    - ``on_save_persist(global_step, output_dir)``: invoked whenever HF
-      Trainer saves a checkpoint (``on_save`` event). Fires in addition to
-      ``on_epoch_persist`` at epoch boundaries.
-    - ``on_shutdown_check()``: invoked at every step end and every epoch end;
-      returning ``True`` sets ``control.should_training_stop``. Step-level
-      check enables sub-epoch shutdown granularity.  When constructed via
-      ``BackgroundTrainer.training_hooks_for_job``, this predicate ORs the
-      BG abort event, ``_shutdown_requested``, and the caller's own gate —
-      so abort signals reach the throttle's shutdown_fn without a separate
-      field.
+    ``on_shutdown_check()``: invoked at every step end and every epoch end;
+    returning ``True`` sets ``control.should_training_stop``. Step-level
+    check enables sub-epoch shutdown granularity.  When constructed via
+    ``BackgroundTrainer.training_hooks_for_job``, this predicate ORs the
+    BG abort event, ``_shutdown_requested``, and the caller's own gate —
+    so abort signals reach the throttle's shutdown_fn without a separate
+    field.
     """
 
-    on_epoch_persist: Optional[Callable[[int, str], None]] = None
-    on_save_persist: Optional[Callable[[int, str], None]] = None
     on_shutdown_check: Optional[Callable[[], bool]] = None
 
 
 class _HooksAdapterCallback(TrainerCallback):
     """Routes ``TrainingHooks`` intents to HF callback events.
 
-    The epoch hook (``on_epoch_persist``) is used by the RAM-mode
-    epoch-mirror writer. Shutdown checks (``on_shutdown_check``) fire at
-    both step and epoch boundaries for sub-epoch shutdown granularity.
+    Shutdown checks (``on_shutdown_check``) fire at both step and epoch
+    boundaries for sub-epoch shutdown granularity.
     """
 
     def __init__(self, hooks: TrainingHooks):
@@ -87,18 +76,7 @@ class _HooksAdapterCallback(TrainerCallback):
             )
             control.should_training_stop = True
 
-    def on_save(self, args, state, control, **kwargs):
-        """Fire ``on_save_persist`` whenever HF Trainer writes a checkpoint.
-
-        Fires in addition to ``on_epoch_end`` at epoch boundaries when
-        ``save_strategy="epoch"``; callers that need dedup handle it themselves.
-        """
-        if self._hooks.on_save_persist is not None:
-            self._hooks.on_save_persist(int(state.global_step), args.output_dir)
-
     def on_epoch_end(self, args, state, control, **kwargs):
-        if self._hooks.on_epoch_persist is not None:
-            self._hooks.on_epoch_persist(int(state.global_step), args.output_dir)
         if self._hooks.on_shutdown_check is not None and self._hooks.on_shutdown_check():
             logger.info(
                 "Graceful shutdown requested via TrainingHooks — stopping after epoch %d",
@@ -203,10 +181,9 @@ class ParamemTrainer(Trainer):
         # Adapter to serialize on every _save. Captured as a literal at
         # construction time — NEVER derived from ``model.active_adapter``.
         # Saves are pinned to this trainer instance's own staging adapter
-        # (or the production tier name in compose/direct mode) by name,
-        # so ``_save`` always serializes exactly the adapter this instance
-        # is training regardless of what else is mounted on the shared
-        # ``model``.
+        # by name, so ``_save`` always serializes exactly the adapter this
+        # instance is training regardless of what else is mounted on the
+        # shared ``model``.
         self._save_adapter_name = save_adapter_name
         super().__init__(*args, **kwargs)
 
@@ -251,68 +228,6 @@ class ParamemTrainer(Trainer):
             self.data_collator.tokenizer.save_pretrained(output_dir)
 
         torch.save(self.args, os.path.join(output_dir, TRAINING_ARGS_NAME))
-
-
-class _RamEpochCopyCallback(TrainerCallback):
-    """Copy the latest /dev/shm checkpoint to the caller's output_dir at each epoch.
-
-    Installed by ``train_adapter`` when ``save_steps_ram > 0``.  HF Trainer
-    writes its checkpoints to a ``/dev/shm`` RAM-backed tmpfs directory
-    (``ram_dir``).  At every epoch end this callback finds the highest-numbered
-    ``checkpoint-N`` under ``ram_dir`` and copies it to
-    ``<caller_output_dir>/bg_checkpoint_epoch/checkpoint-N/``, replacing the
-    previous copy.  This gives callers a durable (if one-epoch-stale) copy
-    without paying encrypted-disk IO per step.
-    """
-
-    def __init__(self, ram_dir: Path, caller_output_dir: Path) -> None:
-        """Args:
-        ram_dir: The /dev/shm tmpfs directory where HF Trainer saves checkpoints.
-        caller_output_dir: The caller's original output_dir; epoch copies land
-            under ``<caller_output_dir>/bg_checkpoint_epoch/``.
-        """
-        self._ram_dir = ram_dir
-        self._epoch_dir = caller_output_dir / "bg_checkpoint_epoch"
-
-    def on_epoch_end(self, args, state, control, **kwargs) -> None:
-        """Copy the latest RAM checkpoint to the epoch-persistent directory."""
-        checkpoints = sorted(
-            self._ram_dir.glob("checkpoint-*"),
-            key=lambda p: int(p.name.split("-")[1]) if p.name.split("-")[1].isdigit() else -1,
-        )
-        if not checkpoints:
-            return
-        latest = checkpoints[-1]
-        dest = self._epoch_dir / latest.name
-        if dest.exists():
-            shutil.rmtree(dest)
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(str(latest), str(dest))
-        logger.debug(
-            "RAM-mode: copied %s → %s",
-            latest,
-            dest,
-        )
-
-
-class GracefulShutdownCallback(TrainerCallback):
-    """Stop training cleanly when a shutdown flag is set.
-
-    Checks the flag at each epoch boundary. When set, the trainer
-    finishes the current step, saves state, and exits the training loop.
-    """
-
-    def __init__(self, shutdown_flag: callable):
-        """Args: shutdown_flag — callable returning True when shutdown requested."""
-        self._should_stop = shutdown_flag
-
-    def on_epoch_end(self, args, state, control, **kwargs):
-        if self._should_stop():
-            logger.info(
-                "Graceful shutdown requested — stopping after epoch %d",
-                int(state.epoch),
-            )
-            control.should_training_stop = True
 
 
 # ---------------------------------------------------------------------------
@@ -508,8 +423,6 @@ def _fingerprint_training_config(
     """
     relevant = {
         "save_strategy": training_config.save_strategy,
-        "save_steps": training_config.save_steps,
-        "save_steps_ram": training_config.save_steps_ram,
         "num_epochs": training_config.num_epochs,
         "batch_size": training_config.batch_size,
         "gradient_accumulation_steps": training_config.gradient_accumulation_steps,
@@ -575,17 +488,10 @@ def _resolve_resume_checkpoint(
     """Resolve the best available checkpoint path for a crash-resume.
 
     Reads ``staging_resume.json`` at *scratch_path* and validates it against
-    *fingerprints*.  Returns the highest-priority existing checkpoint path
-    using the 3-way preference:
-
-    1. ``ram_checkpoint_path`` under ``/dev/shm`` — present only when
-       ``save_steps_ram > 0`` and the process has NOT restarted since the
-       interrupted run.
-    2. ``disk_checkpoint_path`` — either the epoch-mirror written by
-       ``_RamEpochCopyCallback`` under ``<output_dir>/bg_checkpoint_epoch/``, or
-       the ``checkpoint-N`` dir written directly under ``output_dir`` by HF
-       Trainer in the default ``save_steps_ram==0`` epoch-save mode.
-       ``_StagingResumeCallback.on_save`` records whichever is present.
+    *fingerprints*.  Returns ``disk_checkpoint_path`` when it is recorded and
+    still exists on disk — the ``checkpoint-N`` dir written directly under
+    ``output_dir`` by HF Trainer's per-epoch save
+    (``_StagingResumeCallback.on_save`` records this pointer).
 
     Returns ``None`` when the file is absent, fingerprints mismatch, or no
     valid checkpoint directory is found.  A previously-recorded dir that was
@@ -607,83 +513,50 @@ def _resolve_resume_checkpoint(
         logger.debug("staging_resume.json config fingerprint mismatch — fresh start")
         return None
 
-    # 2-way preference: RAM → disk epoch mirror
-    for field_name in ("ram_checkpoint_path", "disk_checkpoint_path"):
-        ckpt = state.get(field_name, "")
-        if ckpt and Path(ckpt).is_dir():
-            logger.info("Crash-resume: resolved checkpoint via %s → %s", field_name, ckpt)
-            return ckpt
+    ckpt = state.get("disk_checkpoint_path", "")
+    if ckpt and Path(ckpt).is_dir():
+        logger.info("Crash-resume: resolved checkpoint via disk_checkpoint_path → %s", ckpt)
+        return ckpt
 
     logger.debug("staging_resume.json present but no checkpoint dir found — fresh start")
     return None
 
 
-def _clean_scratch(output_dir: Path, ram_dir: Optional[Path]) -> None:
+def _clean_scratch(output_dir: Path) -> None:
     """Remove transient training scratch directories on normal or abort completion.
 
-    Deletes the HF Trainer checkpoint trees written during training so that
-    subsequent boot integrity checks (which expect adapter slots to contain
-    only ``adapter_model.safetensors`` and ``adapter_config.json``) do not
-    trip on stale ``checkpoint-*`` or ``bg_checkpoint_epoch`` directories.
+    Deletes the HF Trainer ``checkpoint-*`` trees written during training so
+    that subsequent boot integrity checks (which expect adapter slots to
+    contain only ``adapter_model.safetensors`` and ``adapter_config.json``)
+    do not trip on stale checkpoint directories.
 
     On crash, scratch is intentionally preserved to enable crash-resume.
 
     Args:
         output_dir: The caller's ``output_dir`` passed to ``train_adapter``.
             Checkpoint debris under this directory is removed.
-        ram_dir: The ``/dev/shm`` directory created by RAM-mode, or ``None``
-            when RAM mode is disabled.
     """
-    # Epoch-mirror directory written by _RamEpochCopyCallback.
-    epoch_mirror = output_dir / "bg_checkpoint_epoch"
-    if epoch_mirror.exists():
-        shutil.rmtree(epoch_mirror, ignore_errors=True)
-        logger.debug("Cleaned epoch-mirror checkpoint dir: %s", epoch_mirror)
-
-    # Any checkpoint-* directories that HF Trainer may have written directly
-    # to output_dir when save_steps_ram == 0.
     for ckpt_dir in output_dir.glob("checkpoint-*"):
         if ckpt_dir.is_dir():
             shutil.rmtree(ckpt_dir, ignore_errors=True)
             logger.debug("Cleaned checkpoint dir: %s", ckpt_dir)
-
-    # RAM-mode /dev/shm directory.
-    if ram_dir is not None and ram_dir.exists():
-        shutil.rmtree(ram_dir, ignore_errors=True)
-        logger.debug("Cleaned RAM checkpoint dir: %s", ram_dir)
 
 
 def purge_partial_checkpoints(adapters_root: Path) -> list[Path]:
     """Delete every ``checkpoint-*/`` dir under *adapters_root* left mid-crash.
 
     A completed :func:`~paramem.backup.checkpoint_shard.encrypt_checkpoint_dir`
-    pass (fired from ``EncryptCheckpointCallback.on_save``,
-    ``encrypted_checkpoint_callback.py:54-69``) rewrites every file in a
-    ``checkpoint-*/`` tree as an age envelope. Therefore a ``checkpoint-*/``
-    dir containing any plaintext file proves its save was interrupted
-    mid-crash — it is unreferenced garbage (see the publish-after-encrypt
-    ordering invariant: a checkpoint is recorded in ``staging_resume.json``
-    only after ``on_save`` has fully encrypted it).
+    pass (fired from ``EncryptCheckpointCallback.on_save``, which walks
+    ``output_dir.glob("checkpoint-*")`` after every HF Trainer save)
+    rewrites every file in a ``checkpoint-*/`` tree as an age envelope.
+    Therefore a ``checkpoint-*/`` dir containing any plaintext file proves
+    its save was interrupted mid-crash — it is unreferenced garbage: a
+    checkpoint is recorded in ``staging_resume.json`` only after
+    ``on_save`` has fully encrypted it.
 
-    Covers both checkpoint layouts:
-
-    - Disk mode (default, ``save_steps_ram == 0``): HF Trainer writes
-      ``<slot>/checkpoint-N/`` directly under ``output_dir``, and
-      ``EncryptCheckpointCallback.on_save`` encrypts it via a **non-recursive**
-      ``output_dir.glob("checkpoint-*")`` (``encrypted_checkpoint_callback.py:61``).
-    - RAM mode (``save_steps_ram > 0``): HF Trainer's ``args.output_dir`` is
-      the ``/dev/shm`` RAM dir itself, so that same non-recursive glob
-      encrypts ``<ram_dir>/checkpoint-N/`` in place on every ``on_save``.
-      ``_RamEpochCopyCallback.on_epoch_end`` then ``copytree``s whichever
-      ``checkpoint-N`` is newest in the RAM dir to
-      ``<slot>/bg_checkpoint_epoch/checkpoint-N/`` — since ``on_save`` fires
-      within the step, strictly before the later ``on_epoch_end`` event, the
-      RAM-dir source is already fully encrypted by the time it is copied, so
-      the on-disk mirror inherits age-wrapped content even though nothing
-      ever re-globs into ``bg_checkpoint_epoch/`` directly. (Do not "fix" the
-      non-recursive glob at ``encrypted_checkpoint_callback.py:61`` to also
-      walk ``bg_checkpoint_epoch/`` — it is unnecessary and would double
-      -encrypt an already-encrypted mirror.)
+    HF Trainer writes ``<slot>/checkpoint-N/`` directly under ``output_dir``,
+    and ``EncryptCheckpointCallback.on_save`` encrypts it via a
+    **non-recursive** ``output_dir.glob("checkpoint-*")``.
 
     Self-gated: no-op (returns ``[]``, deletes nothing) when the daily age
     identity is not loadable (Security OFF), via
@@ -692,12 +565,12 @@ def purge_partial_checkpoints(adapters_root: Path) -> list[Path]:
     destroy a valid crash-resume checkpoint for no privacy benefit.
 
     After purging, clears any ``staging_resume.json`` pointer
-    (``disk_checkpoint_path`` or ``ram_checkpoint_path``) that resolves
-    inside a purged dir, via the existing :func:`_read_staging_resume` /
-    :func:`_write_staging_resume` round-trip — this makes "nothing
-    references a purged dir" reconciliation-enforced rather than merely
-    inferred from callback ordering. Fully-encrypted checkpoints,
-    ``stage_ledger.json``, and durable slot files are left untouched.
+    (``disk_checkpoint_path``) that resolves inside a purged dir, via the
+    :func:`_read_staging_resume` / :func:`_write_staging_resume` round-trip
+    — this makes "nothing references a purged dir"
+    reconciliation-enforced rather than merely inferred from callback
+    ordering. Fully-encrypted checkpoints, ``stage_ledger.json``, and
+    durable slot files are left untouched.
 
     Args:
         adapters_root: The ``<data>/adapters`` root to scan (same root
@@ -742,21 +615,19 @@ def purge_partial_checkpoints(adapters_root: Path) -> list[Path]:
         if state is None:
             continue
         changed = False
-        for field_name in ("disk_checkpoint_path", "ram_checkpoint_path"):
-            ckpt = state.get(field_name, "")
-            if not ckpt:
-                continue
+        ckpt = state.get("disk_checkpoint_path", "")
+        if ckpt:
             ckpt_resolved = Path(ckpt).resolve()
             if ckpt_resolved in purged_resolved or any(
                 p in ckpt_resolved.parents for p in purged_resolved
             ):
                 logger.warning(
-                    "Clearing dangling %s pointer in %s (%s resolved into a purged checkpoint dir)",
-                    field_name,
+                    "Clearing dangling disk_checkpoint_path pointer in %s "
+                    "(%s resolved into a purged checkpoint dir)",
                     resume_path,
                     ckpt,
                 )
-                state[field_name] = ""
+                state["disk_checkpoint_path"] = ""
                 changed = True
         if changed:
             _write_staging_resume(resume_path, state)
@@ -767,32 +638,30 @@ def purge_partial_checkpoints(adapters_root: Path) -> list[Path]:
 class _StagingResumeCallback(TrainerCallback):
     """Update ``staging_resume.json`` at every HF Trainer checkpoint save.
 
-    Installed by ``train_adapter`` when the staging+promote contract is active.
-    Records the latest checkpoint paths (RAM and disk epoch mirror) so a
-    subsequent crash-resume call can find them.
+    Installed by ``train_adapter`` under the staging+promote contract.
+    Records the latest ``output_dir/checkpoint-N`` path so a subsequent
+    crash-resume call can find it.
 
     Args:
         scratch_path: Path to ``staging_resume.json``.
-        ram_dir: ``/dev/shm`` checkpoint root, or ``None`` when RAM mode is
-            disabled.
-        output_dir: The caller's ``output_dir`` (not the RAM dir).  Used to
-            derive ``disk_checkpoint_path`` under ``bg_checkpoint_epoch/``.
+        output_dir: The caller's ``output_dir``.  Under
+            ``training_config.save_strategy="epoch"`` (the default), HF
+            Trainer writes ``checkpoint-N`` there at every epoch end (and at
+            the step a stop request lands); under ``save_strategy="no"``
+            it writes none, so this callback has nothing to record.
         base_state: The initial state dict written at ``train_adapter`` entry;
-            this callback only updates the checkpoint path fields and
+            this callback only updates the checkpoint path field and
             ``updated_at`` without re-writing the fingerprints.
     """
 
     def __init__(
         self,
         scratch_path: Path,
-        ram_dir: Optional[Path],
         output_dir: Path,
         base_state: dict,
     ) -> None:
         self._scratch_path = scratch_path
-        self._ram_dir = ram_dir
         self._output_dir = output_dir
-        self._epoch_dir = output_dir / "bg_checkpoint_epoch"
         self._base_state = base_state
 
     def _latest_checkpoint(self, search_root: Path) -> str:
@@ -806,31 +675,12 @@ class _StagingResumeCallback(TrainerCallback):
     def on_save(self, args, state, control, **kwargs) -> None:
         """Update scratch state whenever HF Trainer writes a checkpoint.
 
-        Records the latest checkpoint path in the staging resume marker so that
-        a subsequent crash-resume invocation can locate it.  Priority:
-
-        1. ``ram_checkpoint_path`` — set when ``save_steps_ram > 0`` and the
-           RAM dir exists (RAM-mode; unchanged behaviour).
-        2. ``disk_checkpoint_path`` — set from ``bg_checkpoint_epoch/`` when that
-           epoch-mirror dir exists (RAM-copy-back path; unchanged behaviour).
-           Otherwise set from ``output_dir/checkpoint-*`` directly, which is
-           where HF Trainer writes checkpoints in the default ``save_steps_ram==0``
-           epoch-save mode used by the consolidation fold.  Without this branch
-           the fold's epoch checkpoints were never recorded and crash-resume was
-           always inert in that mode.
+        Records the latest ``output_dir/checkpoint-N`` path in the staging
+        resume marker so a subsequent crash-resume invocation can locate it.
         """
         updated = dict(self._base_state)
         updated["updated_at"] = datetime.now(timezone.utc).isoformat()
-
-        if self._ram_dir is not None and self._ram_dir.is_dir():
-            updated["ram_checkpoint_path"] = self._latest_checkpoint(self._ram_dir)
-        if self._epoch_dir.is_dir():
-            updated["disk_checkpoint_path"] = self._latest_checkpoint(self._epoch_dir)
-        else:
-            # Default epoch-save mode (save_steps_ram==0): HF Trainer writes
-            # checkpoint-N directly under output_dir.  Record the latest so
-            # _resolve_resume_checkpoint can find it on a crash-resume.
-            updated["disk_checkpoint_path"] = self._latest_checkpoint(self._output_dir)
+        updated["disk_checkpoint_path"] = self._latest_checkpoint(self._output_dir)
 
         try:
             _write_staging_resume(self._scratch_path, updated)
@@ -845,17 +695,12 @@ def train_adapter(
     adapter_name: str,
     training_config: TrainingConfig,
     adapter_config: AdapterConfig,
-    wandb_config: Optional[WandbConfig] = None,
     output_dir: Optional[str | Path] = None,
-    eval_dataset=None,
-    run_name: Optional[str] = None,
     callbacks_extra: Optional[list] = None,
-    active_adapters: Optional[list[str]] = None,
     resume_from_checkpoint: Optional[str | Path] = None,
     thermal_policy: Optional[ThermalPolicy] = None,
     hooks: Optional[TrainingHooks] = None,
     retain_scratch_until_external_commit: bool = False,
-    warm_start: bool = True,
     donor_checkpoint_dir: "Optional[Path]" = None,
 ) -> dict:
     """Train a LoRA adapter on the given dataset with the staging contract.
@@ -870,8 +715,13 @@ def train_adapter(
     |---|---|---|
     | normal (``aborted`` False) | resident — caller owns it | ``STAGING_ADAPTER`` |
     | abort (``aborted`` True) | deleted here | *adapter_name* |
-    | exception | deleted here (best-effort) | *adapter_name* (best-effort) |
-    | compose mode | never created | as set by the caller |
+    | exception after Step 1 | deleted here (best-effort) | *adapter_name* (best-effort) |
+
+    The exception row covers every step after Step 1: seeding the starting
+    weights, preparing the trainer or a resume checkpoint, and training.  An
+    exception from Step 1 itself propagates without that teardown — when the
+    lifecycle guard refuses a slot already present, that slot belongs to the
+    prior training event and is left in place.
 
     Scratch (``staging_resume.json``, ``checkpoint-N/``) is cleaned on both
     the normal-completion and abort paths unless
@@ -902,16 +752,15 @@ def train_adapter(
     2. Decides the staging slot's starting weights — the ONE point in the
        program where the slot exists and training has not begun, so *this*
        is where a live tier's weights would be written if anything here
-       wrote them; nothing here does.  Four outcomes, keyed on
-       :func:`~paramem.models.loader.has_prior_trained_weights` and the two
-       arguments below:
+       wrote them; nothing here does.  Three outcomes, keyed on
+       :func:`~paramem.models.loader.has_prior_trained_weights` and
+       *donor_checkpoint_dir*:
 
-       | prior trained weights | event | staging starts from | ``init`` |
-       |---|---|---|---|
-       | yes | ``warm_start`` | copy of *adapter_name* (warm) | ``"warm"`` |
-       | yes | not ``warm_start`` | LoRA-zero (already the slot's own init) | ``"cold"`` |
-       | no | ``donor_checkpoint_dir`` set | copy of the donor checkpoint | ``"donor"`` |
-       | no | no valid donor | LoRA-zero (already the slot's own init) | ``"cold"`` |
+       | prior trained weights | staging starts from | ``init`` |
+       |---|---|---|
+       | yes | copy of *adapter_name* (warm) | ``"warm"`` |
+       | no, ``donor_checkpoint_dir`` set | copy of the donor checkpoint | ``"donor"`` |
+       | no, no valid donor | LoRA-zero (already the slot's own init) | ``"cold"`` |
 
        The donor's load → copy → drop-transient triple runs here, in one
        ``finally``, beside the transient slot it seeds — a load or copy
@@ -920,16 +769,20 @@ def train_adapter(
        Recorded on return as ``metrics["init"]``.
     3. Activates the staging slot so HF Trainer trains there exclusively.
     4. Checks for a prior crash-resume via ``staging_resume.json`` and
-       resolves the best available checkpoint (RAM → disk epoch-mirror →
-       legacy, in preference order).
-    5. Runs HF Trainer.
+       resolves the best available checkpoint (``disk_checkpoint_path``).
+    5. Runs HF Trainer, which — under ``training_config.save_strategy="epoch"``
+       (the default) — writes a checkpoint into *output_dir* at every epoch
+       end (and, because the step loop's early break still runs epoch-end
+       handling, at the step a stop request lands); ``save_strategy="no"``
+       writes none.
     6. On normal completion: leaves the staging slot resident and active,
        cleans scratch state (unless the caller retained it).
        On abort: restores the active adapter to *adapter_name* without
        promoting, deletes the staging slot, and cleans scratch state (unless
        the caller retained it, mirroring the normal-completion path).
-       On exception (crash): restores the active adapter to *adapter_name*
-       (best-effort), deletes the staging slot (best-effort), leaves scratch
+       On an exception from any step after Step 1: restores the active
+       adapter to *adapter_name* (best-effort), deletes the staging slot
+       (best-effort), re-raises the exception, and leaves scratch
        intact for the next crash-resume.  PEFT state dies with the process;
        the next process boot enters this function with a fresh
        ``model.peft_config`` (no staging slot present).
@@ -946,10 +799,6 @@ def train_adapter(
       from the probe itself.
     - ``atomic_save_adapter(production)`` to persist the slot durably.
 
-    If ``active_adapters`` is provided, the staging+promote path is skipped
-    and the existing multi-adapter compose-training path runs instead (all
-    listed adapters active; only *adapter_name* receives gradients).
-
     Args:
         model: ``PeftModel`` carrying at least the production adapter named by
             *adapter_name*.  Must NOT carry an existing ``in_training`` slot —
@@ -964,18 +813,10 @@ def train_adapter(
         training_config: Training hyper-parameters.
         adapter_config: LoRA config for the production adapter tier.  Staging
             slot shape is matched to this config.
-        wandb_config: When set and ``wandb_config.enabled`` is ``True``,
-            enables wandb logging.
         output_dir: Directory for HF Trainer outputs (checkpoints, logs).
             Defaults to ``outputs/adapters/<adapter_name>``.
-        eval_dataset: Optional eval dataset; passed through to ``Trainer``.
-        run_name: ``wandb`` run name; defaults to ``paramem-<adapter_name>``.
         callbacks_extra: Optional list of extra HF callbacks appended after
             all cross-cutting callbacks (thermal throttle, recall probe, etc.).
-        active_adapters: When set, activates all listed adapters in the forward
-            pass and skips the staging+promote path (compose-training mode).
-            Only *adapter_name* receives gradients — caller must freeze others
-            via ``set_requires_grad``.
         resume_from_checkpoint: Explicit HF Trainer checkpoint path.  When set,
             it takes precedence over any crash-resume found in
             ``staging_resume.json``.  When ``None`` (default), the function
@@ -984,9 +825,9 @@ def train_adapter(
         thermal_policy: When set, installs a ``ThermalThrottleCallback`` that
             pauses training when GPU temperature exceeds the policy limit.
             Default ``None`` skips the install.
-        hooks: Caller-supplied ``TrainingHooks`` (epoch persist, save
-            persist, shutdown predicate).  Installed before the thermal
-            throttle in the registered callback list.
+        hooks: Caller-supplied ``TrainingHooks`` (shutdown predicate).
+            Installed before the thermal throttle in the registered callback
+            list.
         retain_scratch_until_external_commit: When ``True``, both the
             normal-completion path and the abort path (Step 6) skip
             ``_clean_scratch`` and ``scratch_path.unlink`` so the durable
@@ -998,18 +839,12 @@ def train_adapter(
             tier write does not itself delete scratch); on abort they remain
             so a subsequent training call against the same dataset resumes
             from the last epoch checkpoint instead of restarting the tier.
-            Default ``False`` preserves the existing clean-on-completion
-            behaviour for this function's other two production callers —
-            active-store migration (simulate→train) and donor-build; the
+            Default ``False`` deletes scratch on completion for this
+            function's other two production callers — active-store
+            migration (simulate→train) and donor-build; the
             fold's own tier-training call
             (:meth:`~paramem.training.consolidation.ConsolidationLoop._train_gate_write`)
             passes ``True``.
-        warm_start: ``False`` starts the staging slot at LoRA-zero even when
-            *adapter_name* has prior trained weights, per the four-way table
-            above.  Every production caller (interim, the full-topology
-            fold via ``ConsolidationLoop._train_gate_write`` — a full fold
-            and a reconcile alike) trains at the default ``True``: warm
-            start is uniform, with no cold-start arm.
         donor_checkpoint_dir: A validated donor store directory, or
             ``None``.  Applied ONLY when *adapter_name* has no prior trained
             weights (see the table above) — a tier with prior trained
@@ -1032,68 +867,37 @@ def train_adapter(
           abort holder's event remains set until the caller clears it.
           Callers that do not pass ``hooks`` always see ``aborted=False``.
         - ``init`` (``"warm" | "donor" | "cold"``): the staging slot's
-          starting-weights outcome, decided at Step 2 above.  Absent when
-          ``active_adapters`` is set (compose-training mode never creates a
-          staging slot).
+          starting-weights outcome, decided at Step 2 above.
     """
     if output_dir is None:
         output_dir = Path("outputs") / "adapters" / adapter_name
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Orphan PID sweep: when RAM mode is enabled, clean up /dev/shm directories
-    # left by prior processes that no longer exist (crash/kill between runs).
-    # os.kill(pid, 0) raises ProcessLookupError when the PID is dead; raises
-    # PermissionError when it is alive but owned by another user (leave alone).
-    ram_dir: Path | None = None
-    if training_config.save_steps_ram > 0:
-        for _shm_dir in Path("/dev/shm").glob("paramem-bg-checkpoint-*"):
-            try:
-                _pid = int(_shm_dir.name.split("-")[-1])
-                os.kill(_pid, 0)
-                # PID is alive — leave the directory
-            except ProcessLookupError:
-                shutil.rmtree(_shm_dir, ignore_errors=True)
-                logger.debug("RAM-mode: swept orphan /dev/shm dir %s (PID dead)", _shm_dir)
-            except (ValueError, PermissionError):
-                pass  # non-numeric suffix or alive foreign process — leave alone
-
     # ------------------------------------------------------------------
-    # Staging+promote setup (skipped for compose-training via active_adapters)
+    # Staging+promote setup
     # ------------------------------------------------------------------
-    _use_staging = active_adapters is None
+    # Step 1: Create the transient staging slot for this training event.
+    # ``_ensure_staging_slot`` never rebuilds an existing slot — it raises
+    # RuntimeError when one is already present, which signals missing
+    # cleanup at the prior event's normal-completion, abort, or exception
+    # path (Step 6 below).  It leaves the slot at LoRA-zero — the correct
+    # starting point for the "cold" outcome below without any further
+    # action.
+    _ensure_staging_slot(model, adapter_config)
 
-    if active_adapters is not None:
-        # Activate all adapters in forward pass, frozen by default
-        model.base_model.set_adapter(active_adapters, inference_mode=True)
-        # Unfreeze only the adapter being trained
-        model.set_requires_grad(adapter_name, requires_grad=True)
-        # Verify gradients are live — silent failure here would invalidate results
-        trainable = [n for n, p in model.named_parameters() if p.requires_grad]
-        if not trainable:
-            raise RuntimeError(
-                f"No trainable parameters after activating {active_adapters} "
-                f"and unfreezing '{adapter_name}'"
-            )
-        logger.info(
-            "Compose training: %d adapters active, %d trainable params in '%s'",
-            len(active_adapters),
-            sum(p.numel() for p in model.parameters() if p.requires_grad),
-            adapter_name,
-        )
-    else:
-        # Step 1: Create the transient staging slot for this training event.
-        # ``_ensure_staging_slot`` never rebuilds an existing slot — it raises
-        # RuntimeError when one is already present, which signals missing
-        # cleanup at the prior event's normal-completion, abort, or exception
-        # path (Step 6 below).  It leaves the slot at LoRA-zero — the correct
-        # starting point for both "cold" outcomes below without any further
-        # action.
-        _ensure_staging_slot(model, adapter_config)
-
+    # From here on, every exit is one of the termination paths in this
+    # function's docstring table: normal completion and abort return from
+    # inside this ``try``, and an exception from any later step — seeding
+    # the slot's starting weights, preparing the trainer or a resume
+    # checkpoint, or training itself — lands in the ``except BaseException``
+    # teardown below.  The ``try`` opens only after ``_ensure_staging_slot``
+    # returns, so a lifecycle-guard refusal leaves the slot it found (the
+    # prior training event's) untouched.
+    try:
         # Step 2: Decide the staging slot's starting weights.  This is the
         # ONE point in the program where the slot exists and training has
-        # not begun -- see the four-way table in this function's own
+        # not begun -- see the three-way table in this function's own
         # docstring.  Nothing in this block writes *adapter_name*: a live
         # tier's weights change only at the go-live mount's
         # promote_staging_adapter, never here.
@@ -1101,19 +905,11 @@ def train_adapter(
 
         _staging_init: str
         if has_prior_trained_weights(model, adapter_name):
-            if warm_start:
-                copy_adapter_weights(model, src=adapter_name, dst=STAGING_ADAPTER)
-                _staging_init = "warm"
-                logger.debug(
-                    "Staging: copied production weights %s → %s", adapter_name, STAGING_ADAPTER
-                )
-            else:
-                _staging_init = "cold"
-                logger.info(
-                    "Staging: %s has prior trained weights but warm_start=False "
-                    "(reconcile) — staging starts from LoRA-zero",
-                    adapter_name,
-                )
+            copy_adapter_weights(model, src=adapter_name, dst=STAGING_ADAPTER)
+            _staging_init = "warm"
+            logger.debug(
+                "Staging: copied production weights %s → %s", adapter_name, STAGING_ADAPTER
+            )
         elif donor_checkpoint_dir is not None:
             from paramem.models.loader import drop_adapter_slot
             from paramem.training.donor import (
@@ -1157,245 +953,196 @@ def train_adapter(
         # Step 3: Switch active adapter to staging so HF Trainer trains there.
         model.set_adapter(STAGING_ADAPTER)
 
-    # ------------------------------------------------------------------
-    # Crash-resume: check staging_resume.json (overridden by explicit arg)
-    # ------------------------------------------------------------------
-    scratch_path = output_dir / "staging_resume.json"
-    _effective_resume: Optional[str] = (
-        str(resume_from_checkpoint) if resume_from_checkpoint is not None else None
-    )
-    if _use_staging and _effective_resume is None:
-        # Step 4: Check for a prior interrupted run.
+        # ------------------------------------------------------------------
+        # Crash-resume: check staging_resume.json (overridden by explicit arg)
+        # ------------------------------------------------------------------
+        scratch_path = output_dir / "staging_resume.json"
+        _effective_resume: Optional[str] = (
+            str(resume_from_checkpoint) if resume_from_checkpoint is not None else None
+        )
+        # Fingerprints identify this dataset/config pair for both a resolved
+        # crash-resume checkpoint and the marker written on a fresh start.
         _fingerprints = {
             "dataset": _fingerprint_dataset(train_dataset),
             "config": _fingerprint_training_config(training_config, adapter_config),
         }
-        _resolved = _resolve_resume_checkpoint(scratch_path, _fingerprints)
-        if _resolved is not None:
-            _effective_resume = _resolved
-            logger.info("Crash-resume: will resume from %s", _resolved)
-    elif _use_staging and _effective_resume is not None:
-        # Explicit resume_from_checkpoint — compute fingerprints for marker only.
-        _fingerprints = {
-            "dataset": _fingerprint_dataset(train_dataset),
-            "config": _fingerprint_training_config(training_config, adapter_config),
-        }
-    else:
-        _fingerprints = None  # compose-training path; no scratch marker written
+        if _effective_resume is None:
+            # Step 4: Check for a prior interrupted run.
+            _resolved = _resolve_resume_checkpoint(scratch_path, _fingerprints)
+            if _resolved is not None:
+                _effective_resume = _resolved
+                logger.info("Crash-resume: will resume from %s", _resolved)
 
-    if _use_staging and _fingerprints is not None and _effective_resume is None:
-        # Purge stale checkpoints from a prior crashed or fingerprint-mismatched
-        # run before starting fresh.  A leftover age-encrypted checkpoint-N dir
-        # causes PEFT's ModelCard.load (called from save_pretrained) to crash with
-        # UnicodeDecodeError when it tries to read the binary age header as UTF-8.
-        # ram_dir is not allocated yet at this point, so pass None.
-        logger.info("Fresh start: purging stale checkpoints from %s", output_dir)
-        _clean_scratch(output_dir, ram_dir=None)
-        # No prior checkpoint found; write a fresh staging_resume.json so a
-        # crash during this run leaves a marker for the next invocation.
-        _scratch_state: dict = {
-            "adapter_name": adapter_name,
-            "dataset_fingerprint": _fingerprints["dataset"],
-            "training_config_fingerprint": _fingerprints["config"],
-            "ram_checkpoint_path": "",
-            "disk_checkpoint_path": "",
-            "started_at": datetime.now(timezone.utc).isoformat(),
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-        }
-        try:
-            _write_staging_resume(scratch_path, _scratch_state)
-        except Exception:  # noqa: BLE001  # boundary: filesystem write
-            logger.warning(
-                "Could not write staging_resume.json — crash-resume disabled", exc_info=True
-            )
-            _scratch_state = {}
-    elif _use_staging and _fingerprints is not None and _effective_resume is not None:
-        # Resume case: keep the prior scratch state (already written by a prior
-        # invocation); we do NOT overwrite it with fresh timestamps here so the
-        # fingerprints remain intact for a potential further crash.
-        _scratch_state = _read_staging_resume(scratch_path) or {}
-    else:
-        _scratch_state = {}
+        if _effective_resume is None:
+            # Purge stale checkpoints from a prior crashed or fingerprint-mismatched
+            # run before starting fresh.  A leftover age-encrypted checkpoint-N dir
+            # causes PEFT's ModelCard.load (called from save_pretrained) to crash with
+            # UnicodeDecodeError when it tries to read the binary age header as UTF-8.
+            logger.info("Fresh start: purging stale checkpoints from %s", output_dir)
+            _clean_scratch(output_dir)
+            # No prior checkpoint found; write a fresh staging_resume.json so a
+            # crash during this run leaves a marker for the next invocation.
+            _scratch_state: dict = {
+                "adapter_name": adapter_name,
+                "dataset_fingerprint": _fingerprints["dataset"],
+                "training_config_fingerprint": _fingerprints["config"],
+                "disk_checkpoint_path": "",
+                "started_at": datetime.now(timezone.utc).isoformat(),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+            try:
+                _write_staging_resume(scratch_path, _scratch_state)
+            except Exception:  # noqa: BLE001  # boundary: filesystem write
+                logger.warning(
+                    "Could not write staging_resume.json — crash-resume disabled", exc_info=True
+                )
+                _scratch_state = {}
+        else:
+            # Resume case: keep the prior scratch state (already written by a prior
+            # invocation); we do NOT overwrite it with fresh timestamps here so the
+            # fingerprints remain intact for a potential further crash.
+            _scratch_state = _read_staging_resume(scratch_path) or {}
 
-    report_to = "none"
-    if wandb_config and wandb_config.enabled:
-        report_to = "wandb"
-
-    # When RAM mode is active, route HF Trainer's checkpoints to /dev/shm and
-    # override save_strategy/save_steps so the Trainer actually writes checkpoints.
-    # _RamEpochCopyCallback (registered below) copies each epoch's latest
-    # checkpoint back to <output_dir>/bg_checkpoint_epoch/ for durability.
-    _trainer_output_dir = str(output_dir)
-    _save_strategy = training_config.save_strategy
-    _save_steps = (
-        max(1, training_config.save_steps)
-        if training_config.save_steps > 0
-        # HF default; preserves prior behaviour for callers that did not set save_steps
-        else 500
-    )
-    if training_config.save_steps_ram > 0:
-        ram_dir = Path(f"/dev/shm/paramem-bg-checkpoint-{os.getpid()}")
-        ram_dir.mkdir(parents=True, exist_ok=True)
-        _trainer_output_dir = str(ram_dir)
-        _save_strategy = "steps"
-        _save_steps = training_config.save_steps_ram
-
-    training_args = TrainingArguments(
-        output_dir=_trainer_output_dir,
-        num_train_epochs=training_config.num_epochs,
-        per_device_train_batch_size=training_config.batch_size,
-        gradient_accumulation_steps=training_config.gradient_accumulation_steps,
-        learning_rate=adapter_config.learning_rate,
-        warmup_steps=training_config.warmup_steps,
-        lr_scheduler_type=training_config.lr_scheduler_type,
-        weight_decay=training_config.weight_decay,
-        max_grad_norm=training_config.max_grad_norm,
-        gradient_checkpointing=training_config.gradient_checkpointing,
-        logging_steps=training_config.logging_steps,
-        save_strategy=_save_strategy,
-        save_steps=_save_steps,
-        save_total_limit=training_config.save_total_limit,
-        report_to=report_to,
-        run_name=run_name or f"paramem-{adapter_name}",
-        seed=training_config.seed,
-        bf16=True,
-        remove_unused_columns=False,
-        dataloader_pin_memory=False,
-    )
-
-    if training_config.gradient_checkpointing:
-        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-
-    from paramem.training.encrypted_checkpoint_callback import EncryptCheckpointCallback
-
-    # EncryptCheckpointCallback wraps every HF-written ``checkpoint-<step>/``
-    # file in the age envelope on ``on_save``.  Without it, HF Trainer leaves
-    # plaintext ``adapter_model.safetensors`` files inside ``args.output_dir``
-    # — which the consolidation flow places under ``data/ha/adapters/`` —
-    # and the next server boot's mode-consistency check (which expects
-    # every infra file to be encrypted-or-plaintext consistently with the
-    # rest) fires and refuses startup.  No-op when Security is OFF.  Same
-    # callback :class:`BackgroundTrainer` already uses for its own HF
-    # Trainer; sharing it keeps both code paths posture-consistent.
-    # Callback assembly order is load-bearing (HF iterates registrations in
-    # order at every event). callbacks_extra (call-bound, e.g. recall probe)
-    # trail every other registered callback.
-    callbacks: list = [EncryptCheckpointCallback()]
-    if training_config.early_stopping:
-        callbacks.append(
-            LossEarlyStoppingCallback(
-                loss_threshold=training_config.early_stopping_threshold,
-                epoch_floor=training_config.early_stopping_floor,
-                patience=training_config.early_stopping_patience,
-            )
+        training_args = TrainingArguments(
+            output_dir=str(output_dir),
+            num_train_epochs=training_config.num_epochs,
+            per_device_train_batch_size=training_config.batch_size,
+            gradient_accumulation_steps=training_config.gradient_accumulation_steps,
+            learning_rate=adapter_config.learning_rate,
+            warmup_steps=training_config.warmup_steps,
+            lr_scheduler_type=training_config.lr_scheduler_type,
+            weight_decay=training_config.weight_decay,
+            max_grad_norm=training_config.max_grad_norm,
+            gradient_checkpointing=training_config.gradient_checkpointing,
+            logging_steps=training_config.logging_steps,
+            save_strategy=training_config.save_strategy,
+            save_total_limit=training_config.save_total_limit,
+            report_to="none",
+            seed=training_config.seed,
+            bf16=True,
+            remove_unused_columns=False,
+            dataloader_pin_memory=False,
         )
-    if hooks is not None:
-        callbacks.append(_HooksAdapterCallback(hooks))
-    if thermal_policy is not None:
-        # Route the hooks' shutdown predicate into the throttle's shutdown_fn
-        # so an abort or shutdown signal breaks the throttle's wait loop
-        # cleanly.  The abort event is ORed into on_shutdown_check by
-        # BackgroundTrainer.training_hooks_for_job, so no separate abort_fn
-        # field is needed on ThermalThrottleCallback.
-        shutdown_fn = (
-            hooks.on_shutdown_check
-            if hooks is not None and hooks.on_shutdown_check is not None
-            else (lambda: False)
-        )
-        callbacks.append(
-            ThermalThrottleCallback(
-                thermal_policy,
-                shutdown_fn=shutdown_fn,
-            )
-        )
-    if ram_dir is not None:
-        # Copy the latest RAM checkpoint to the caller's output_dir at each epoch
-        # so there is always a durable (one-epoch-stale) copy available.
-        callbacks.append(_RamEpochCopyCallback(ram_dir, output_dir))
-    if _use_staging and _scratch_state:
-        # Install the staging resume callback AFTER _RamEpochCopyCallback so
-        # the epoch-mirror copy is already written when we record its path.
-        # Also: EncryptCheckpointCallback (seeded first, above) must be
-        # registered before _StagingResumeCallback — a checkpoint pointer is
-        # recorded only after the referenced dir is fully encrypted.
-        # purge_partial_checkpoints' safety proof (referenced ⟹ encrypted ⟹
-        # never purged) rests on this order.
-        callbacks.append(
-            _StagingResumeCallback(
-                scratch_path=scratch_path,
-                ram_dir=ram_dir,
-                output_dir=output_dir,
-                base_state=_scratch_state,
-            )
-        )
-    if callbacks_extra:
-        callbacks.extend(callbacks_extra)
 
-    # Under the staging+promote contract, HF trains the transient ``in_training``
-    # slot, so the recall early-stop probe must measure that slot — not the
-    # caller's production adapter name, which holds un-promoted weights until the
-    # post-train promote.  As the single owner of the staging lifecycle, bind
-    # the probe target explicitly here; the callback never infers it.  No-op
-    # for compose/direct training, where the production adapter trains in place.
-    if _use_staging:
+        if training_config.gradient_checkpointing:
+            model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
+
+        from paramem.training.encrypted_checkpoint_callback import EncryptCheckpointCallback
+
+        # EncryptCheckpointCallback wraps every HF-written ``checkpoint-<step>/``
+        # file in the age envelope on ``on_save``.  Without it, HF Trainer leaves
+        # plaintext ``adapter_model.safetensors`` files inside ``args.output_dir``
+        # — which the consolidation flow places under ``data/ha/adapters/`` —
+        # and the next server boot's mode-consistency check (which expects
+        # every infra file to be encrypted-or-plaintext consistently with the
+        # rest) fires and refuses startup.  No-op when Security is OFF.
+        # Callback assembly order is load-bearing (HF iterates registrations in
+        # order at every event). callbacks_extra (call-bound, e.g. recall probe)
+        # trail every other registered callback.
+        callbacks: list = [EncryptCheckpointCallback()]
+        if training_config.early_stopping:
+            callbacks.append(
+                LossEarlyStoppingCallback(
+                    loss_threshold=training_config.early_stopping_threshold,
+                    epoch_floor=training_config.early_stopping_floor,
+                    patience=training_config.early_stopping_patience,
+                )
+            )
+        if hooks is not None:
+            callbacks.append(_HooksAdapterCallback(hooks))
+        if thermal_policy is not None:
+            # Route the hooks' shutdown predicate into the throttle's shutdown_fn
+            # so an abort or shutdown signal breaks the throttle's wait loop
+            # cleanly.  The abort event is ORed into on_shutdown_check by
+            # BackgroundTrainer.training_hooks_for_job, so no separate abort_fn
+            # field is needed on ThermalThrottleCallback.
+            shutdown_fn = (
+                hooks.on_shutdown_check
+                if hooks is not None and hooks.on_shutdown_check is not None
+                else (lambda: False)
+            )
+            callbacks.append(
+                ThermalThrottleCallback(
+                    thermal_policy,
+                    shutdown_fn=shutdown_fn,
+                )
+            )
+        if _scratch_state:
+            # Install the staging resume callback AFTER EncryptCheckpointCallback
+            # (seeded first, above) — a checkpoint pointer is recorded only after
+            # the referenced dir is fully encrypted.
+            # purge_partial_checkpoints' safety proof (referenced ⟹ encrypted ⟹
+            # never purged) rests on this order.
+            callbacks.append(
+                _StagingResumeCallback(
+                    scratch_path=scratch_path,
+                    output_dir=output_dir,
+                    base_state=_scratch_state,
+                )
+            )
+        if callbacks_extra:
+            callbacks.extend(callbacks_extra)
+
+        # Under the staging+promote contract, HF trains the transient ``in_training``
+        # slot, so the recall early-stop probe must measure that slot — not the
+        # caller's production adapter name, which holds un-promoted weights until the
+        # post-train promote.  As the single owner of the staging lifecycle, bind
+        # the probe target explicitly here; the callback never infers it.
         from paramem.training.early_stop import RecallEarlyStopCallback
 
         for _cb in callbacks:
             if isinstance(_cb, RecallEarlyStopCallback):
                 _cb.set_probe_adapter(STAGING_ADAPTER)
 
-    _save_target = STAGING_ADAPTER if _use_staging else adapter_name
-    trainer = ParamemTrainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
-        data_collator=default_data_collator,
-        callbacks=callbacks,
-        lr_decay_steps=training_config.lr_decay_steps,
-        save_adapter_name=_save_target,
-    )
+        trainer = ParamemTrainer(
+            model=model,
+            args=training_args,
+            train_dataset=train_dataset,
+            data_collator=default_data_collator,
+            callbacks=callbacks,
+            lr_decay_steps=training_config.lr_decay_steps,
+            save_adapter_name=STAGING_ADAPTER,
+        )
 
-    logger.info(
-        "Starting training: adapter=%s (staging=%s), epochs=%d, lr=%e",
-        adapter_name,
-        STAGING_ADAPTER if _use_staging else "compose-mode",
-        training_config.num_epochs,
-        adapter_config.learning_rate,
-    )
+        logger.info(
+            "Starting training: adapter=%s (staging=%s), epochs=%d, lr=%e",
+            adapter_name,
+            STAGING_ADAPTER,
+            training_config.num_epochs,
+            adapter_config.learning_rate,
+        )
 
-    # Step 5: Resolve the effective checkpoint for HF Trainer.
-    ckpt_arg = _effective_resume  # may be None (fresh start) or a path (resume)
+        # Step 5: Resolve the effective checkpoint for HF Trainer.
+        ckpt_arg = _effective_resume  # may be None (fresh start) or a path (resume)
 
-    # When Security is ON, ``EncryptCheckpointCallback`` wrote every file in
-    # the on-disk ``checkpoint-N/`` tree as an age envelope.  HF Trainer's
-    # ``_load_from_checkpoint`` reads safetensors directly via
-    # ``safe_load_file`` and crashes on the age magic with
-    # ``SafetensorError: header too large``.  Materialize the checkpoint into
-    # a ``/dev/shm`` tempdir, decrypting age envelopes en route, hand HF the
-    # plaintext path, then remove the tempdir in ``finally``.  No-op when
-    # Security is OFF (the daily identity isn't available) or when no resume
-    # path was passed.
-    shm_resume_dir: Path | None = None
-    effective_ckpt_arg = ckpt_arg
-    if ckpt_arg is not None:
-        from paramem.backup import key_store as _ks
+        # When Security is ON, ``EncryptCheckpointCallback`` wrote every file in
+        # the on-disk ``checkpoint-N/`` tree as an age envelope.  HF Trainer's
+        # ``_load_from_checkpoint`` reads safetensors directly via
+        # ``safe_load_file`` and crashes on the age magic with
+        # ``SafetensorError: header too large``.  Materialize the checkpoint into
+        # a ``/dev/shm`` tempdir, decrypting age envelopes en route, hand HF the
+        # plaintext path, then remove the tempdir in ``finally``.  No-op when
+        # Security is OFF (the daily identity isn't available) or when no resume
+        # path was passed.
+        shm_resume_dir: Path | None = None
+        effective_ckpt_arg = ckpt_arg
+        if ckpt_arg is not None:
+            from paramem.backup import key_store as _ks
 
-        if _ks.daily_identity_available(_ks.DAILY_KEY_PATH_DEFAULT):
-            from paramem.backup.checkpoint_shard import materialize_checkpoint_to_shm
+            if _ks.daily_identity_available(_ks.DAILY_KEY_PATH_DEFAULT):
+                from paramem.backup.checkpoint_shard import materialize_checkpoint_to_shm
 
-            shm_resume_dir = materialize_checkpoint_to_shm(Path(ckpt_arg))
-            effective_ckpt_arg = str(shm_resume_dir)
-            logger.info(
-                "Materialized encrypted checkpoint %s → %s for HF Trainer load",
-                ckpt_arg,
-                shm_resume_dir,
-            )
+                shm_resume_dir = materialize_checkpoint_to_shm(Path(ckpt_arg))
+                effective_ckpt_arg = str(shm_resume_dir)
+                logger.info(
+                    "Materialized encrypted checkpoint %s → %s for HF Trainer load",
+                    ckpt_arg,
+                    shm_resume_dir,
+                )
 
-    # Step 5 (continued): Run HF Trainer.  The try/except implements the
-    # 3-path post-return decision (normal → promote, abort → no-promote,
-    # crash → preserve scratch).
-    try:
+        # Step 5 (continued): Run HF Trainer.
         try:
             result = trainer.train(resume_from_checkpoint=effective_ckpt_arg)
         finally:
@@ -1414,73 +1161,65 @@ def train_adapter(
             hooks is not None and hooks.on_shutdown_check is not None and hooks.on_shutdown_check()
         )
         metrics["aborted"] = aborted
-        if _use_staging:
-            metrics["init"] = _staging_init
+        metrics["init"] = _staging_init
 
-        if _use_staging:
-            if not aborted:
-                # Step 6: NORMAL completion — leave the staging slot resident
-                # and active.  The caller owns the probe -> verdict -> promote
-                # -> dispose sequence against STAGING_ADAPTER from here; this
-                # function does not promote or delete it.
-                logger.info(
-                    "Staging: training complete — %s resident and active for caller",
-                    STAGING_ADAPTER,
-                )
-            else:
-                # Step 6b: ABORT — restore active adapter, do NOT promote.
-                from paramem.models.loader import drop_adapter_slot, switch_adapter
-
-                switch_adapter(model, adapter_name)
-                logger.info(
-                    "Staging: aborted — production %s unchanged",
-                    adapter_name,
-                )
-                # Delete the staging slot on abort too.  The staging slot is
-                # transient and must not survive past this training event,
-                # otherwise the next event's assert_staging_absent will trip
-                # its lifecycle-invariant guard.  This runs before the scratch
-                # decision below: if it raises, control lands in the ``except
-                # BaseException`` path, which preserves scratch for
-                # crash-resume — the consistent outcome either way.
-                drop_adapter_slot(model, STAGING_ADAPTER, fallback_adapter=adapter_name)
-                logger.info(
-                    "Staging: deleted %s after abort (lifecycle: per-training-event)",
-                    STAGING_ADAPTER,
-                )
-
-            # Scratch fate is the same decision on normal completion and on
-            # abort: honour retain_scratch_until_external_commit.  When True,
-            # normal completion keeps the durable checkpoint-N dir and
-            # staging_resume.json alive until the whole event is disposed
-            # (stage_ledger.dispose — writing a tier's slot does not itself
-            # delete its scratch), enabling a resumed event's already-written
-            # tier to be classified as reused-as-is rather than retrained;
-            # abort keeps the same scratch alive for a different reason —
-            # abort produces no verdict-worthy weights and the event is
-            # never disposed on that path, so a subsequent training call
-            # against the same dataset resumes from the last epoch
-            # checkpoint instead. Default False cleans immediately (existing
-            # behaviour for the active-store-migration and donor-build
-            # callers; the fold's own tier-training call passes True).
-            if not retain_scratch_until_external_commit:
-                if aborted:
-                    logger.info("Staging: aborted — cleaning scratch at %s", output_dir)
-                _clean_scratch(output_dir, ram_dir)
-                scratch_path.unlink(missing_ok=True)
-            elif aborted:
-                logger.info(
-                    "Staging: aborted — scratch retained for resume at %s; a "
-                    "subsequent training call against the same dataset resumes "
-                    "from the last epoch checkpoint",
-                    output_dir,
-                )
-            else:
-                logger.debug("Staging: scratch retained for external commit at %s", output_dir)
+        if not aborted:
+            # Step 6: NORMAL completion — leave the staging slot resident
+            # and active.  The caller owns the probe -> verdict -> promote
+            # -> dispose sequence against STAGING_ADAPTER from here; this
+            # function does not promote or delete it.
+            logger.info(
+                "Staging: training complete — %s resident and active for caller",
+                STAGING_ADAPTER,
+            )
         else:
-            # Compose-training path: clean up RAM dir on success.
-            if not aborted and ram_dir is not None and ram_dir.exists():
-                shutil.rmtree(ram_dir, ignore_errors=False)
+            # Step 6b: ABORT — restore active adapter, do NOT promote.
+            from paramem.models.loader import drop_adapter_slot, switch_adapter
+
+            switch_adapter(model, adapter_name)
+            logger.info(
+                "Staging: aborted — production %s unchanged",
+                adapter_name,
+            )
+            # Delete the staging slot on abort too.  The staging slot is
+            # transient and must not survive past this training event,
+            # otherwise the next event's assert_staging_absent will trip
+            # its lifecycle-invariant guard.  This runs before the scratch
+            # decision below: if it raises, control lands in the ``except
+            # BaseException`` path, which preserves scratch for
+            # crash-resume — the consistent outcome either way.
+            drop_adapter_slot(model, STAGING_ADAPTER, fallback_adapter=adapter_name)
+            logger.info(
+                "Staging: deleted %s after abort (lifecycle: per-training-event)",
+                STAGING_ADAPTER,
+            )
+
+        # Scratch fate is the same decision on normal completion and on
+        # abort: honour retain_scratch_until_external_commit.  When True,
+        # normal completion keeps the durable checkpoint-N dir and
+        # staging_resume.json alive until the whole event is disposed
+        # (stage_ledger.dispose — writing a tier's slot does not itself
+        # delete its scratch); abort keeps the same scratch alive —
+        # abort produces no verdict-worthy weights and the event is
+        # never disposed on that path, so a subsequent training call
+        # against the same dataset resumes from the last epoch
+        # checkpoint instead. Default False cleans immediately: the
+        # active-store-migration and donor-build callers take the default;
+        # the fold's own tier-training call passes True.
+        if not retain_scratch_until_external_commit:
+            if aborted:
+                logger.info("Staging: aborted — cleaning scratch at %s", output_dir)
+            _clean_scratch(output_dir)
+            scratch_path.unlink(missing_ok=True)
+        elif aborted:
+            logger.info(
+                "Staging: aborted — scratch retained for resume at %s; a "
+                "subsequent training call against the same dataset resumes "
+                "from the last epoch checkpoint",
+                output_dir,
+            )
+        else:
+            logger.debug("Staging: scratch retained for external commit at %s", output_dir)
 
         # No final save here.  ``train_adapter`` is responsible only for
         # training; the canonical encrypted slot-dir save is the
@@ -1495,47 +1234,46 @@ def train_adapter(
         # scratch state intentionally preserved for crash-resume.
         # The try/except here is boundary teardown (safe-state restore on
         # exception), not error suppression — the exception is always re-raised.
-        if _use_staging:
-            try:
-                from paramem.models.loader import switch_adapter
+        try:
+            from paramem.models.loader import switch_adapter
 
-                switch_adapter(model, adapter_name)
-                logger.info(
-                    "Staging: exception — restored active adapter to %s (best-effort)",
-                    adapter_name,
-                )
-            except Exception:  # noqa: BLE001  # best-effort: switch may fail if model is in bad state
-                logger.warning(
-                    "Staging: could not restore active adapter to %s after exception",
-                    adapter_name,
-                    exc_info=True,
-                )
-            # Delete the transient in_training VRAM slot.  The normal (Step 6)
-            # path deliberately does NOT do this — it hands the slot back to
-            # the caller resident, for the caller's own probe -> promote ->
-            # dispose sequence.  Only the abort (Step 6b) path and this
-            # exception (Step 6c) path delete it here, because neither has a
-            # caller frame positioned to run that sequence: an abort produced
-            # no verdict-worthy weights, and an exception propagates past the
-            # caller's promote site by definition.  Leaving the slot resident
-            # here trips assert_staging_absent's lifecycle-invariant guard on
-            # the next training event, permanently blocking training until a
-            # restart.  Its own try/except must never replace the in-flight
-            # exception this handler is re-raising below.
-            from paramem.models.loader import drop_adapter_slot
+            switch_adapter(model, adapter_name)
+            logger.info(
+                "Staging: exception — restored active adapter to %s (best-effort)",
+                adapter_name,
+            )
+        except Exception:  # noqa: BLE001  # best-effort: switch may fail if model is in bad state
+            logger.warning(
+                "Staging: could not restore active adapter to %s after exception",
+                adapter_name,
+                exc_info=True,
+            )
+        # Delete the transient in_training VRAM slot.  The normal (Step 6)
+        # path deliberately does NOT do this — it hands the slot back to
+        # the caller resident, for the caller's own probe -> promote ->
+        # dispose sequence.  Only the abort (Step 6b) path and this
+        # exception (Step 6c) path delete it here, because neither has a
+        # caller frame positioned to run that sequence: an abort produced
+        # no verdict-worthy weights, and an exception propagates past the
+        # caller's promote site by definition.  Leaving the slot resident
+        # here trips assert_staging_absent's lifecycle-invariant guard on
+        # the next training event, permanently blocking training until a
+        # restart.  Its own try/except must never replace the in-flight
+        # exception this handler is re-raising below.
+        from paramem.models.loader import drop_adapter_slot
 
-            try:
-                drop_adapter_slot(model, STAGING_ADAPTER, fallback_adapter=adapter_name)
-                logger.info(
-                    "Staging: deleted %s after exception (lifecycle: per-training-event)",
-                    STAGING_ADAPTER,
-                )
-            except Exception:  # noqa: BLE001  # best-effort teardown; original exception must
-                # still propagate — see the try/except above for the same contract.
-                logger.warning(
-                    "Staging: could not delete %s after exception",
-                    STAGING_ADAPTER,
-                    exc_info=True,
-                )
+        try:
+            drop_adapter_slot(model, STAGING_ADAPTER, fallback_adapter=adapter_name)
+            logger.info(
+                "Staging: deleted %s after exception (lifecycle: per-training-event)",
+                STAGING_ADAPTER,
+            )
+        except Exception:  # noqa: BLE001  # best-effort teardown; original exception must
+            # still propagate — this handler never replaces the in-flight exception.
+            logger.warning(
+                "Staging: could not delete %s after exception",
+                STAGING_ADAPTER,
+                exc_info=True,
+            )
         # Do NOT clean scratch — it is needed for crash-resume on next start.
         raise

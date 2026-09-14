@@ -519,7 +519,6 @@ def train_bench_adapter(model, tokenizer, entries: list[dict], num_epochs: int):
         lr_decay_steps=num_epochs * len(examples) // 4,
         weight_decay=0.1,
         gradient_checkpointing=True,
-        recall_early_stopping=False,
     )
     metrics = train_adapter(
         model=model,

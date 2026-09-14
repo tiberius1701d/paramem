@@ -1,4 +1,5 @@
-"""Unit tests for production recall-based early stopping.
+"""Tests for the recall-callback wiring recall-based early stopping depends
+on, and for ``ConsolidationLoop._probe_recall`` itself.
 
 Every production training path routes through the single shared funnel
 ``ConsolidationLoop._train_tier_adapter``, which is the sole call site of
@@ -11,12 +12,15 @@ both ``_maybe_make_recall_callback`` and ``train_adapter``:
       _migrate_tier_simulate_to_train (routed through the funnel so the
       per-fold training-budget derivation applies here too)
 
-Plus the helper itself (Class A) and the structural AST gate (Class F),
-which asserts that every production ``train_adapter`` call site has
+The structural AST gate (``TestProbeTargetIsFullReplaySet``) asserts that
+every production ``train_adapter`` call site has
 ``_maybe_make_recall_callback`` wired in the same function body.
 
-No GPU required.  Mocks `paramem.training.trainer.train_adapter` to capture
-the ``callbacks_extra`` kwarg.
+No GPU required.  ``TestCallSiteWiringSourcePresence`` and
+``TestProbeTargetIsFullReplaySet`` parse the production modules' source with
+``ast`` and never import or run the scanned code.  ``TestProbeRecall`` mocks
+``paramem.training.recall_eval.evaluate_indexed_recall`` against a
+``ConsolidationLoop`` built via ``__new__`` (no ``__init__`` side effects).
 """
 
 from __future__ import annotations
@@ -28,204 +32,12 @@ from unittest.mock import MagicMock
 import pytest
 
 from paramem.training.consolidation import ConsolidationLoop
-from paramem.training.early_stop import RecallEarlyStopCallback
-from paramem.utils.config import (
-    TrainingConfig,
-)
 
 PROJECT_ROOT = Path(__file__).parent.parent
 
 
 # ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def _make_loop(
-    tmp_path: Path,
-    *,
-    recall_early_stopping: bool = False,
-    early_stopping_floor: int = 10,
-    recall_window: int = 3,
-    recall_probe_every_n_epochs: int = 3,
-) -> ConsolidationLoop:
-    """Build a ConsolidationLoop instance with the minimum surface the
-    recall helper needs.
-
-    ``ConsolidationLoop.__init__`` reaches into PEFT internals to set up
-    real adapters; we don't need any of that for the helper unit tests.
-    Bypass init via ``__new__`` and set only the attributes the helper
-    reads: ``model``, ``tokenizer``, ``training_config``, plus
-    ``shutdown_requested`` and ``_thermal_policy`` for the call-site-pattern
-    test below (shutdown flows through TrainingHooks, thermal flows through
-    ThermalPolicy — both nullable in tests that don't exercise them).
-    """
-    loop = ConsolidationLoop.__new__(ConsolidationLoop)
-    loop.model = MagicMock()
-    loop.tokenizer = MagicMock()
-    loop.training_config = TrainingConfig(
-        recall_early_stopping=recall_early_stopping,
-        early_stopping_floor=early_stopping_floor,
-        recall_window=recall_window,
-        recall_probe_every_n_epochs=recall_probe_every_n_epochs,
-    )
-    loop.shutdown_requested = False
-    loop._thermal_policy = None
-    return loop
-
-
-def _kp(n: int = 5) -> list[dict]:
-    """Build n synthetic entry-format entries."""
-    return [
-        {
-            "key": f"graph{i + 1}",
-            "subject": f"S{i + 1}",
-            "predicate": "p",
-            "object": f"O{i + 1}",
-        }
-        for i in range(n)
-    ]
-
-
-# ---------------------------------------------------------------------------
-# Class A — TestMaybeMakeRecallCallback
-# ---------------------------------------------------------------------------
-
-
-class TestMaybeMakeRecallCallback:
-    def test_returns_none_when_flag_off(self, tmp_path: Path) -> None:
-        loop = _make_loop(tmp_path, recall_early_stopping=False)
-        cb, _state = loop._maybe_make_recall_callback(
-            entries=_kp(),
-            adapter_name="episodic",
-            output_dir=tmp_path / "out",
-            phase_name="test",
-            num_epochs=10,
-        )
-        assert cb is None
-
-    def test_returns_none_when_keyed_pairs_empty(self, tmp_path: Path) -> None:
-        loop = _make_loop(tmp_path, recall_early_stopping=True)
-        cb, _state = loop._maybe_make_recall_callback(
-            entries=[],
-            adapter_name="episodic",
-            output_dir=tmp_path / "out",
-            phase_name="test",
-            num_epochs=10,
-        )
-        assert cb is None
-
-    def test_returns_callback_with_correct_policy(self, tmp_path: Path) -> None:
-        loop = _make_loop(
-            tmp_path,
-            recall_early_stopping=True,
-            early_stopping_floor=20,
-            recall_window=5,
-            recall_probe_every_n_epochs=2,
-        )
-        cb, _state = loop._maybe_make_recall_callback(
-            entries=_kp(),
-            adapter_name="episodic",
-            output_dir=tmp_path / "out",
-            phase_name="test",
-            num_epochs=20,
-        )
-        assert isinstance(cb, RecallEarlyStopCallback)
-        # probe_from_epoch is pinned to the signal floor so we don't pay for
-        # pre-floor probes that can never trigger a stop (a single probe is
-        # 12-40× more expensive than a training epoch — see consolidation.py
-        # ::_maybe_make_recall_callback).  Both fields therefore equal
-        # early_stopping_floor for production loops.
-        assert cb._policy.probe_from_epoch == 20
-        assert cb._policy.signal_from_epoch == 20
-        assert cb._policy.window == 5
-        assert cb._policy.probe_every_n_epochs == 2
-
-    def test_callback_paths_routed_to_output_dir(self, tmp_path: Path) -> None:
-        loop = _make_loop(tmp_path, recall_early_stopping=True)
-        out = tmp_path / "out"
-        cb, _state = loop._maybe_make_recall_callback(
-            entries=_kp(),
-            adapter_name="episodic",
-            output_dir=out,
-            phase_name="test",
-            num_epochs=10,
-        )
-        assert cb._progress_path == out / "progress.json"
-        assert cb._epoch_log_path == out / "epoch_log.json"
-        assert cb._first_perfect_log_path is None  # production has no per-key log
-        assert cb._pause_file is None  # production pause via gpu_lock_sync
-
-    def test_num_epochs_propagates_to_callback(self, tmp_path: Path) -> None:
-        """Regression: the callback's progress display (progress.json's
-        total_epochs) must reflect the CALLER'S num_epochs, not
-        training_config.num_epochs.
-
-        num_epochs is a required argument — the sole production caller
-        (_train_tier_adapter) always passes the derived per-fold budget from
-        paramem.utils.config.budget_for, which can differ from
-        training_config.num_epochs (30 by default). A callback that silently
-        fell back to training_config.num_epochs would report the wrong
-        budget to operator-facing progress tooling.
-        """
-        loop = _make_loop(tmp_path, recall_early_stopping=True)
-        assert loop.training_config.num_epochs != 20, (
-            "test precondition: training_config.num_epochs must differ from "
-            "the num_epochs value passed below (20)"
-        )
-        cb, _state = loop._maybe_make_recall_callback(
-            entries=_kp(),
-            adapter_name="episodic",
-            output_dir=tmp_path / "out",
-            phase_name="consolidate-episodic",
-            num_epochs=20,
-        )
-        assert isinstance(cb, RecallEarlyStopCallback)
-        assert cb._num_epochs == 20, (
-            f"callback._num_epochs should be the passed num_epochs (20), "
-            f"got {cb._num_epochs} (training_config.num_epochs={loop.training_config.num_epochs})"
-        )
-
-    def test_callback_target_registry_built_from_keyed_pairs(self, tmp_path: Path) -> None:
-        loop = _make_loop(tmp_path, recall_early_stopping=True)
-        keyed = _kp(7)
-        cb, _state = loop._maybe_make_recall_callback(
-            entries=keyed,
-            adapter_name="episodic",
-            output_dir=tmp_path / "out",
-            phase_name="test",
-            num_epochs=10,
-        )
-        assert len(cb._target_registry) == 7
-        assert set(cb._target_registry.keys()) == {f"graph{i + 1}" for i in range(7)}
-
-
-# ---------------------------------------------------------------------------
-# Helper for B/C/D/E2 — capture callbacks_extra passed to train_adapter
-# ---------------------------------------------------------------------------
-
-
-class _Captured:
-    """Records the (kwargs) of every train_adapter call inside a test."""
-
-    def __init__(self) -> None:
-        self.calls: list[dict] = []
-
-    def __call__(self, *args, **kwargs):
-        self.calls.append(kwargs)
-        return MagicMock(metrics={})
-
-    @property
-    def callbacks_extra(self) -> list:
-        assert self.calls, "train_adapter was not called"
-        return self.calls[-1]["callbacks_extra"]
-
-    def types(self) -> list[type]:
-        return [type(cb) for cb in self.callbacks_extra]
-
-
-# ---------------------------------------------------------------------------
-# Class B — TestCallSiteWiringSourcePresence
+# TestCallSiteWiringSourcePresence
 #
 # The recall callback is wired only through the single shared helper
 # _train_tier_adapter, which every production path calls
@@ -240,7 +52,7 @@ class _Captured:
 #      _migrate_tier_simulate_to_train) calls _train_tier_adapter (they use
 #      the funnel, not a direct bypass).
 #
-# Class F's structural gate (TestProbeTargetIsFullReplaySet) independently
+# TestProbeTargetIsFullReplaySet's structural gate independently
 # checks that every function containing a train_adapter call also contains
 # _maybe_make_recall_callback in the same body — _train_tier_adapter is the
 # sole such function, so the gate continues to enforce the "no training
@@ -323,7 +135,7 @@ class TestCallSiteWiringSourcePresence:
         unified interim slot, not a flat per-cycle procedural train path;
         there is no ``_run_indexed_key_procedural`` function.
         """
-        # The funnel check is already covered by test_site1_unified_cycle_calls_funnel.
+        # Routing through the funnel is covered by test_train_gate_write_calls_funnel.
         # This test guards that _run_indexed_key_procedural does not exist in the module.
         import ast
 
@@ -365,55 +177,7 @@ class TestCallSiteWiringSourcePresence:
 
 
 # ---------------------------------------------------------------------------
-# Class E (subset) — TestCallSiteWiringEnabledVsDisabled
-#
-# Drive a focused unit that exercises the helper-vs-no-helper branch of
-# the wiring by patching train_adapter and calling _maybe_make_recall_callback
-# directly.  Full end-to-end exercise of each call site is the smoke's job.
-# ---------------------------------------------------------------------------
-
-
-class TestEnabledVsDisabledBranch:
-    """When recall_early_stopping is OFF the helper returns ``None`` and
-    call sites pass ``callbacks_extra=None``.  When ON the helper returns a
-    ``RecallEarlyStopCallback`` and call sites pass it through
-    ``callbacks_extra=[recall_cb]``.
-
-    Shutdown flows through ``TrainingHooks.on_shutdown_check``; thermal
-    flows through ``thermal_policy``.  Neither belongs in
-    ``callbacks_extra``, so the call-site list contains at most the recall
-    callback.
-    """
-
-    def test_disabled_callbacks_extra_is_none(self, tmp_path: Path) -> None:
-        loop = _make_loop(tmp_path, recall_early_stopping=False)
-        cb, _state = loop._maybe_make_recall_callback(
-            entries=_kp(),
-            adapter_name="episodic",
-            output_dir=tmp_path,
-            phase_name="test",
-            num_epochs=10,
-        )
-        # Mirror the post-refactor call-site pattern.
-        callbacks_extra = [cb] if cb is not None else None
-        assert callbacks_extra is None
-
-    def test_enabled_passes_recall_callback_only(self, tmp_path: Path) -> None:
-        loop = _make_loop(tmp_path, recall_early_stopping=True)
-        cb, _state = loop._maybe_make_recall_callback(
-            entries=_kp(),
-            adapter_name="episodic",
-            output_dir=tmp_path,
-            phase_name="test",
-            num_epochs=10,
-        )
-        callbacks_extra = [cb] if cb is not None else None
-        assert callbacks_extra is not None
-        assert [type(c) for c in callbacks_extra] == [RecallEarlyStopCallback]
-
-
-# ---------------------------------------------------------------------------
-# Class F — TestProbeTargetIsFullReplaySet
+# TestProbeTargetIsFullReplaySet
 #
 # Structural AST test that scans every production-reachable module and
 # asserts the recall helper is invoked in the same FunctionDef body as
@@ -568,63 +332,7 @@ class TestProbeTargetIsFullReplaySet:
 
 
 # ---------------------------------------------------------------------------
-# Class G — TestCallbackStateTuple
-# Tests for the (callback, state) return seam.
-# ---------------------------------------------------------------------------
-
-
-class TestCallbackStateTuple:
-    """_maybe_make_recall_callback returns (callback, state) so callers can
-    read state.stop_epoch after training to bind fold telemetry — the
-    per-key recall verdict is a separate, later staged-weights probe
-    (ConsolidationLoop._probe_recall), never read off this state."""
-
-    def test_returns_tuple_when_enabled(self, tmp_path: Path) -> None:
-        loop = _make_loop(tmp_path, recall_early_stopping=True)
-        result = loop._maybe_make_recall_callback(
-            entries=_kp(3),
-            adapter_name="episodic",
-            output_dir=tmp_path / "out",
-            phase_name="test",
-            num_epochs=10,
-        )
-        assert isinstance(result, tuple) and len(result) == 2
-        cb, state = result
-        assert isinstance(cb, RecallEarlyStopCallback)
-        assert state is not None
-        # state should initially have no stop signal
-        assert state.stop_epoch is None
-
-    def test_returns_none_none_when_disabled(self, tmp_path: Path) -> None:
-        loop = _make_loop(tmp_path, recall_early_stopping=False)
-        cb, state = loop._maybe_make_recall_callback(
-            entries=_kp(3),
-            adapter_name="episodic",
-            output_dir=tmp_path / "out",
-            phase_name="test",
-            num_epochs=10,
-        )
-        assert cb is None
-        assert state is None
-
-    def test_state_shared_with_callback(self, tmp_path: Path) -> None:
-        """The state returned by the helper is the same object the callback uses."""
-        loop = _make_loop(tmp_path, recall_early_stopping=True)
-        cb, state = loop._maybe_make_recall_callback(
-            entries=_kp(2),
-            adapter_name="episodic",
-            output_dir=tmp_path / "out",
-            phase_name="test",
-            num_epochs=10,
-        )
-        # Mutate through the callback's internal state; the returned state
-        # should reflect the change (same object).
-        cb._state.stop_epoch = 5
-        assert state.stop_epoch == 5
-
-
-# ---------------------------------------------------------------------------
-# Class H — TestProbeRecall
+# TestProbeRecall
 # Tests for the ConsolidationLoop._probe_recall primitive.
 # ---------------------------------------------------------------------------
 

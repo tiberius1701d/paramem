@@ -1,15 +1,14 @@
 """Unit tests for paramem.utils.config.budget_for.
 
 budget_for is the pure, module-level per-fold training-budget derivation on
-paramem.utils.config -- a live, non-archived surface distinct from
-tests/test_config.py (which is scoped to the archived load_config /
-default.yaml loader path). A dedicated file keeps the pure-function unit
-tests out of both the archived-loader file and tests/server/test_config.py
-(which covers YAML-to-TrainingConfig threading, a different concern).
+paramem.utils.config -- a live surface tested independently of
+tests/server/test_config.py (which covers YAML-to-TrainingConfig threading,
+a different concern). A dedicated file keeps these pure-function unit tests
+out of that one.
 
-Derivation is the unconditional standard mechanism (no feature flag; see
-benchmarking.md) -- every call derives epochs/accum/lr_decay_steps from
-n_keys alone. ``budget_for`` takes no ``training_config`` parameter.
+Derivation is the unconditional standard mechanism (no feature flag) --
+every call derives epochs/accum/lr_decay_steps from n_keys alone.
+``budget_for`` takes no ``training_config`` parameter.
 
 No GPU required -- budget_for takes no model/tokenizer arguments.
 """
