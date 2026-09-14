@@ -1201,8 +1201,8 @@ comparison, and checks a run against the last accepted scorecard rather
 than a fixed pass/fail threshold — so a change to the wording the model
 reads, the `scrub`/`allow` lists, or the base model itself can be checked before
 it reaches a deployment. See
-[Cloud-Egress Anonymizer: Detector Choice](benchmarking.md#cloud-egress-anonymizer-detector-choice-2026-09-08)
-for what the accepted scorecard measures and where it stands.
+[Cloud-egress anonymizer: detector choice](benchmarking.md#cloud-egress-anonymizer-detector-choice)
+for what the accepted scorecard measures and the results it records.
 
 Each run records which prompt wording, list of kinds, base model,
 scrubbed-kind selection, test set and token budget it used, and states

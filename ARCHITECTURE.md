@@ -35,7 +35,7 @@
 
 ### Cloud-Egress Anonymizer: Marking Step
 
-Which mechanism reads an outbound text and marks the values that belong to the operator's configured kinds, before code decides what to placeholder and what to leave as written. See [benchmarking](benchmarking.md#cloud-egress-anonymizer-detector-choice-2026-09-08) for the measurements behind this choice.
+Which mechanism reads an outbound text and marks the values that belong to the operator's configured kinds, before code decides what to placeholder and what to leave as written. See [benchmarking](benchmarking.md#cloud-egress-anonymizer-detector-choice) for the measurements behind this choice.
 
 | Option | Pros | Cons | Decision |
 |--------|------|------|----------|
@@ -94,7 +94,7 @@ Per-fact addressable recall using sequential keys in a chat-template JSON format
 
 A reserved low band of keys belongs to a synthetic donor population that seeds every cold fold; real keys are minted above that band, so a real key can never collide with a donor key. The seeding is unconditional — there is no switch.
 
-**Key insight:** keyed retrieval is the reliable interface for parametric recall; un-keyed natural-language questions yield inconsistent results (see `benchmarking.md`). The model learns the pattern `key → JSON` reliably at rank 8.
+**Key insight:** keyed retrieval is the reliable interface for parametric recall. Under the question/answer training format, a natural-language question close to the trained wording is often answered without the key, with accuracy falling as the wording departs further from it; under the production triple format, no natural-question form is trained at all, and un-keyed recall sits at about the base model's own level — measured under a "use only the facts provided" system prompt with no facts actually supplied, so treat that comparison as a floor, not a clean read of the triple adapter alone — see [benchmarking.md → Natural-language access](benchmarking.md#natural-language-access). The model learns the pattern `key → JSON` reliably at rank 8.
 
 The adapter is trained directly on the merged-graph triple — one training example per fact, no intermediate question-generation step. A scalar entity attribute (a phone number, a hobby) is projected into an ordinary attribute-typed fact at extraction time, so it carries the same speaker attribution and assertion window as any other fact, reaches the keyed set the same way, and reinforces and promotes the same way.
 
@@ -538,5 +538,5 @@ Both paths feed the transcript into the same shared turn-handling path as `POST 
 | 8GB VRAM limits batch size and sequence length | Slower training, potential quality impact | QLoRA + gradient checkpointing + gradient accumulation; monitor for quality issues |
 | WSL2 CUDA memory reporting can be inaccurate | Unexpected OOM during training | Set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`; keep training data on Linux filesystem |
 | Multi-adapter simultaneous training not natively batched in PEFT | Must train adapters sequentially per consolidation cycle | Acceptable — each adapter trains independently anyway |
-| Graph extractor quality depends on base model capability | Poor extraction → poor consolidation signal | Extraction runs on the configured base model, so extraction quality moves with model selection and is measured per model |
+| Graph extractor quality depends on base model capability | Poor extraction → poor consolidation signal | Extraction runs on the configured base model, so extraction quality moves with model selection; per-model extraction quality on the shipped pipeline is not measured — see [benchmarking.md → Not measured](benchmarking.md#not-measured) |
 | Key reconstruction quality degrades with many keys | Adapter capacity limits reliable reconstruction | Reconstruction-based replay reinforces active keys each cycle; unreinforced keys are never evicted and fade passively through reconstruction noise as the adapter is retrained around them. |
